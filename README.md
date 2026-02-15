@@ -1,7 +1,5 @@
 <div align="center">
 
-<div align="center">
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="LogoDark.png">
   <source media="(prefers-color-scheme: light)" srcset="LogoLight.png">
@@ -15,7 +13,7 @@
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero_Required-red.svg?style=flat-square)]()
 [![CUDA](https://img.shields.io/badge/CUDA-Supported-76b900.svg?style=flat-square&logo=nvidia)]()
 
-<p align="center">
+<p>
 Modern C23 Deep Learning Engine: Architectural austerity, linear memory topology, and a declarative interface engineered for raw throughput.
 </p>
 
