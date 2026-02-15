@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="LogoDark.png">
-  <source media="(prefers-color-scheme: light)" srcset="LogoLight.png">
+  <source media="(prefers-color-scheme: dark)" srcset="Logo/LogoDark.png">
+  <source media="(prefers-color-scheme: light)" srcset="Logo/LogoLight.png">
   <img alt="Spingalett Logo" src="LogoLight.png">
 </picture>
 
