@@ -10,40 +10,49 @@
 [![CUDA](https://img.shields.io/badge/CUDA-Supported-76b900.svg?style=flat-square&logo=nvidia)]()
 
 <p align="center">
-  <strong>Modern C23 Deep Learning Engine: Zero required dependencies, flat memory architecture, and declarative API designed for maximum performance on any hardware.</strong>
+Modern C23 Deep Learning Engine: Architectural austerity, linear memory topology, and a declarative interface engineered for raw throughput.
 </p>
+
+<!--<a href="https://www.star-history.com/#pka-human/Spingalett&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=pka-human/Spingalett&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=pka-human/Spingalett&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=pka-human/Spingalett&type=date&legend=bottom-right" />
+ </picture>
+</a>-->
 
 </div>
 
-## ⚡ Why Spingalett?
+## Rationale
 
-Machine learning shouldn't require gigabytes of Python dependencies or a virtual environment just to run a simple model. **Spingalett** goes back to the roots of high-performance computing.
-It is a lightweight, user-friendly library written in **Pure C23** that outperforms major frameworks like TensorFlow and PyTorch **up to (TODO: Take an accurate measurement)%** due to reduced overhead and optimized memory management.
+The contemporary machine learning landscape has devolved into a bloated dependency hell. **Spingalett** rejects the premise that one requires gigabytes of Python site-packages or a fragile virtual environment to execute a matrix multiplication.
 
-### Key Features
+This library is a return to the fundamentals of high-performance computing. It is authored in **Pure C23**, deliberately bypassing the overhead of major frameworks like TensorFlow and PyTorch to deliver superior throughput. It is designed for engineers who prefer manual memory management over garbage-collected hand-holding.
 
-*   🚀 **Zero Hard Dependencies:** The core engine runs on pure standard C (libc only). No Python, no NumPy, no bloat.
-*   ⚡ **Hybrid Backend:** Seamlessly switch between optimized CPU and NVIDIA GPU (**cuBLAS / cuDNN**) for extreme performance.
-*   🧠 **Flat Memory Architecture:** Uses a custom "Flattening" technique for tensors, maximizing CPU cache coherency and SIMD usage.
-*   💎 **Modern C23 API:** Uses designated initializers (`.field = value`) for a clean, declarative syntax without the performance cost.
+### Core Competencies
 
-## 🛠 Quick Start
+*   **Dependency Asceticism:** The engine operates strictly on standard C (libc). We do not tolerate external bloatware.
+*   **Hybrid Compute Backend:** Provides seamless interoperability between optimized CPU routines and NVIDIA GPU acceleration (**cuBLAS / cuDNN**), allowing for context-aware performance scaling.
+*   **Linearized Memory Model:** Implements a strict "Flattening" protocol for tensors, forcing data locality to maximize CPU cache coherency and SIMD vectorization efficiency.
+*   **Modern C23 Syntax:** Leverages designated initializers (`.field = value`) to provide a declarative, pseudo-high-level API without sacrificing the raw speed of the underlying binary.
 
-Defining and training a network in C has never looked this clean.
+## 🛠 Usage Specification
+
+Network definition in C23 now achieves a syntactical elegance previously reserved for interpreted languages, yet retains the ruthless efficiency of compiled code.
 
 ```c
 #include "Spingalett/Spingalett.h"
 
 int main() {
-    // 1. Create Network
+    // 1. Instantiation
     NeuralNetwork *nn = new_spingalett(LOSS_MSE);
 
-    // 2. Define Architecture (Declarative Style)
-    layer(nn, 2); // Input layer
-    layer(nn, 4, RELU, WEIGHT_INITIALIZATION_HE); // Hidden layer
-    layer(nn, 1, CT_SIGMOID, WEIGHT_INITIALIZATION_XAVIER); // Output layer
+    // 2. Architecture Definition (Declarative)
+    layer(nn, 2); // Input vector
+    layer(nn, 4, RELU, WEIGHT_INITIALIZATION_HE); // Hidden manifold
+    layer(nn, 1, CT_SIGMOID, WEIGHT_INITIALIZATION_XAVIER); // Output scalar
 
-    // 3. Train
+    // 3. Execution (Training Loop)
     train(
         .net = nn,
         .training_strategy = STRATEGY_FULL_BATCH,
@@ -59,24 +68,24 @@ int main() {
     return 0;
 }
 ```
-
 ## 📦 Building
 
 TODO: WRITE HOW TO BUILD THIS SHIT
 
-## 💬 Philosophy: Why C in 2026?
+## 💬 Why C in 2026?
 
-**Stability. Portability. Control.**
-While Rust is great and Python is convenient, C remains the *lingua franca* of computing. 
-*   **Embed everywhere:** Run your model on a $5 microcontroller or a massive supercomputer without significantly changing the codebase.
-*   **Stable ABI:** Easily wrap Spingalett in Python (`ctypes`), Go, Lua, Rust or C++ if needed.
-*   **Instant Compilation:** No waiting for `cargo` to download the internet.
+**Stability. Portability. Uncompromising Control.**
 
-## 📄 License
+While the industry fetishizes the safety of Rust and the convenience of Python, C remains the immutable substrate of computation.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+*   **Embed everywhere:** Execute your inference on a $2 microcontroller or a supercluster without refactoring.
+*   **ABI Stability:** Spingalett exposes a raw C ABI, making it trivial to wrap in Python (`ctypes`), Go, Rust, or whatever trendy language happens to be popular next week.
+*   **Instant Compilation:** We do not require `cargo` to download half the internet to compile a "Hello, World!".
+
+## 📄 Licensing
+
+This intellectual property is released under the **MIT License**. Refer to the [LICENSE](LICENSE) file for legal specifics. Use it however you want.
 
 <div align="center">
   <sub>Built with ❤️ and pointers by <a href="https://github.com/pka-human">pka_human</a> and contributors</sub>
 </div>
-
