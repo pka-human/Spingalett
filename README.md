@@ -8,7 +8,7 @@
 
 #
 
-[![Standard](https://img.shields.io/badge/C-23-blue.svg?style=flat-square&logo=c)](https://en.wikipedia.org/wiki/C23_(C_standard_revision))
+[![Standard](https://img.shields.io/badge/C-23-blue.svg?style=flat-square)](https://en.wikipedia.org/wiki/C23_(C_standard_revision))
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero_Required-red.svg?style=flat-square)]()
 [![CUDA](https://img.shields.io/badge/CUDA-Supported-76b900.svg?style=flat-square&logo=nvidia)]()
