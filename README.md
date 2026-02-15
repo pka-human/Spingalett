@@ -72,11 +72,11 @@ int main() {
     return 0;
 }
 ```
-## 📦 Building
+## Building
 
 TODO: WRITE HOW TO BUILD THIS SHIT
 
-## 💬 Why C in 2026?
+## Why C in 2026?
 
 **Stability. Portability. Uncompromising Control.**
 
@@ -86,7 +86,7 @@ While the industry fetishizes the safety of Rust and the convenience of Python, 
 *   **ABI Stability:** Spingalett exposes a raw C ABI, making it trivial to wrap in Python (`ctypes`), Go, Rust, or whatever trendy language happens to be popular next week.
 *   **Instant Compilation:** We do not require `cargo` to download half the internet to compile a "Hello, World!".
 
-## 📄 Licensing
+## Licensing
 
 This intellectual property is released under the **MIT License**. Refer to the [LICENSE](LICENSE) file for legal specifics. Use it however you want.
 
