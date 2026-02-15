@@ -1,6 +1,12 @@
 <div align="center">
 
-<img src="Logo.png" alt="Spingalett Logo"/>
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="LogoDark.png">
+  <source media="(prefers-color-scheme: light)" srcset="LogoLight.png">
+  <img alt="Spingalett Logo" src="LogoLight.png">
+</picture>
 
 #
 
