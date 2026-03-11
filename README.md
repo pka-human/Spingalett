@@ -11,10 +11,22 @@
 [![Standard](https://img.shields.io/badge/C-23-blue.svg?style=flat-square)](https://en.wikipedia.org/wiki/C23_(C_standard_revision))
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero_Required-red.svg?style=flat-square)]()
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/TheTesseractProject/tract)
+<!--[![CUDA](https://img.shields.io/badge/CUDA-Supported-76b900.svg?style=flat-square&logo=nvidia)]()-->
 
 <p>
 Modern C23 Deep Learning Engine: Architectural austerity, linear memory topology, and a declarative interface engineered for raw throughput.
 </p>
+
+<!--
+<a href="https://www.star-history.com/#pka-human/Spingalett&type=date&legend=bottom-right">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=pka-human/Spingalett&type=date&theme=dark&legend=bottom-right" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=pka-human/Spingalett&type=date&legend=bottom-right" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=pka-human/Spingalett&type=date&legend=bottom-right" />
+  </picture>
+</a>
+-->
 
 </div>
 
