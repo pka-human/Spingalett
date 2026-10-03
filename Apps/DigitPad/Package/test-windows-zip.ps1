@@ -34,9 +34,8 @@ Write-Host "--classify: exit $($p.ExitCode): $text$(Read-Text $err)"
 if ($p.ExitCode -ne 0 -or $text -notmatch '^prediction 7 ') { throw '--classify did not recognise the 7' }
 
 # ---- 2. the window
-Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+Add-Type -TypeDefinition @'
 using System;
-using System.Drawing;
 using System.Runtime.InteropServices;
 public static class Desktop {
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
@@ -47,13 +46,6 @@ public static class Desktop {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window, uint message, IntPtr w, IntPtr l);
-    public static void Capture(int x, int y, int width, int height, string path) {
-        using (var image = new Bitmap(width, height))
-        using (var g = Graphics.FromImage(image)) {
-            g.CopyFromScreen(x, y, 0, 0, new Size(width, height));
-            image.Save(path);
-        }
-    }
 }
 '@
 
@@ -96,7 +88,14 @@ for ($i = 1; $i -lt $stroke.Count; $i++) {
 Start-Sleep -Seconds 1
 
 if ($Screenshot) {
-    [Desktop]::Capture($origin.X, $origin.Y, $client.Right, $client.Bottom, (Join-Path (Get-Location) $Screenshot))
+    try {                           # for a look at the result; the test does not depend on it
+        Add-Type -AssemblyName System.Drawing
+        $image = [System.Drawing.Bitmap]::new($client.Right, $client.Bottom)
+        $graphics = [System.Drawing.Graphics]::FromImage($image)
+        $graphics.CopyFromScreen($origin.X, $origin.Y, 0, 0, $image.Size)
+        $image.Save((Join-Path (Get-Location) $Screenshot))
+        $graphics.Dispose(); $image.Dispose()
+    } catch { Write-Warning "no screenshot: $_" }
 }
 [void][Desktop]::PostMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_CLOSE
 if (-not $p.WaitForExit(15000)) { $p.Kill(); throw 'DigitPad did not close' }
