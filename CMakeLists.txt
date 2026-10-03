@@ -283,6 +283,43 @@ if(BUILD_EXAMPLE)
 endif()
 
 # ------------------------------------------------------------------------------
+# Apps: DigitPad (draw a digit, see the prediction; needs SDL2) and its trainer
+# ------------------------------------------------------------------------------
+option(BUILD_APPS "Build the DigitPad demo app and its trainer" OFF)
+
+if(BUILD_APPS)
+    set(DIGITPAD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Apps/DigitPad)
+
+    add_executable(DigitPadTrain ${DIGITPAD_DIR}/Train.c)
+    target_link_libraries(DigitPadTrain PRIVATE spingalett)
+
+    find_package(SDL2 CONFIG QUIET)
+    if(TARGET SDL2::SDL2)
+        add_executable(DigitPad ${DIGITPAD_DIR}/DigitPad.c)
+        target_link_libraries(DigitPad PRIVATE spingalett SDL2::SDL2)
+        if(TARGET SDL2::SDL2main)
+            target_link_libraries(DigitPad PRIVATE SDL2::SDL2main)
+        endif()
+        install(TARGETS DigitPad RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    else()
+        message(STATUS "Spingalett: SDL2 not found, DigitPad app not built (DigitPadTrain is)")
+    endif()
+
+    foreach(DIGITPAD_TARGET DigitPadTrain DigitPad)
+        if(TARGET ${DIGITPAD_TARGET} AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(${DIGITPAD_TARGET} PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+        endif()
+        if(TARGET ${DIGITPAD_TARGET} AND UNIX AND NOT APPLE)
+            target_link_libraries(${DIGITPAD_TARGET} PRIVATE m)
+            set_target_properties(${DIGITPAD_TARGET} PROPERTIES
+                BUILD_RPATH "$ORIGIN"
+                INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+            )
+        endif()
+    endforeach()
+endif()
+
+# ------------------------------------------------------------------------------
 # Tests (run with: ctest --test-dir <build> --output-on-failure)
 # ------------------------------------------------------------------------------
 option(BUILD_TESTS "Build the test suite" ON)

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DigitPad
+GenericName=Digit Recognizer
+Comment=Draw a digit and watch a Spingalett neural network recognize it
+Exec=DigitPad
+Icon=digitpad
+Terminal=false
+Categories=Education;Science;ArtificialIntelligence;
+Keywords=MNIST;neural network;handwriting;digit;

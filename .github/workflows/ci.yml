@@ -20,16 +20,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopenblas-dev libomp-dev python3-numpy
+          sudo apt-get install -y libopenblas-dev libomp-dev python3-numpy libsdl2-dev
 
       - name: Configure
         run: |
-          extra=""
+          extra="-DBUILD_APPS=ON"
           if [ "${{ matrix.config }}" = full ]; then
-            extra="-DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
+            extra="$extra -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
           elif [ "${{ matrix.config }}" = generic ]; then
             # baseline x86-64 without AVX: exercises the portable scalar code paths
-            extra="-DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
+            extra="$extra -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
           fi
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} $extra
 
@@ -41,7 +41,9 @@ jobs:
 
       - name: Examples
         working-directory: Bin
-        run: ./XOR
+        run: |
+          ./XOR
+          ./DigitPad --help
 
   sanitizers:
     name: gcc / ASan + UBSan

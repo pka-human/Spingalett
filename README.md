@@ -27,6 +27,7 @@ parameters live in flat contiguous arrays, and models can be saved in reduced pr
 - [Quick start](#quick-start)
 - [Usage](#usage)
 - [Python bindings](#python-bindings)
+- [DigitPad demo](#digitpad-demo)
 - [Performance](#performance)
 - [Project layout](#project-layout)
 - [Status and roadmap](#status-and-roadmap)
@@ -83,6 +84,7 @@ a baseline through `CMAKE_C_FLAGS` (for example `-march=x86-64-v3` for AVX2).
 | `BUILD_WITH_OPENBLAS` | `OFF` | Enable the OpenBLAS backend (found via pkg-config or the default library paths) |
 | `BUILD_EXAMPLE` | `ON` | Build the programs in `Examples/` |
 | `BUILD_TESTS` | `ON` | Build the test suite and register it with CTest |
+| `BUILD_APPS` | `OFF` | Build the DigitPad demo (needs SDL2) and its trainer |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
@@ -358,6 +360,16 @@ with sg.Network(sg.Loss.MSE, [sg.Layer(2),
 
 See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
 
+## DigitPad demo
+
+[Apps/DigitPad](Apps/DigitPad) is a desktop app in which you draw a digit with the mouse and a
+Spingalett network classifies it as you draw. Its 784-1024-512-10 model, trained with on-the-fly
+augmentation through a data generator, reaches 99.27% MNIST test accuracy. The directory contains
+the app, the trainer and a script that packages both the app and the model as a self-contained
+Linux AppImage.
+
+![DigitPad](Apps/DigitPad/screenshot.png)
+
 ## Performance
 
 `Examples/Benchmark.c` measures a 784-512-1000-10 network (925K parameters, ReLU, softmax with
@@ -395,6 +407,7 @@ the same VM.
 Include/Spingalett/   Public header and the CMake-generated configuration header template
 Src/                  Library sources (network, training, SIMD kernels, serialization, ...)
 Examples/             XOR, MNIST, throughput benchmark (C and PyTorch counterpart)
+Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage packaging
 Tests/                Test suite (CTest) and fixtures
 Bindings/Python/      Python bindings
 ```

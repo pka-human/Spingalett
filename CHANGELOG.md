@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [Unreleased]
+
+### Added
+- DigitPad (`Apps/DigitPad`, CMake option `BUILD_APPS`): a desktop app that classifies digits
+  drawn with the mouse, its trainer (99.27% MNIST test accuracy with on-the-fly augmentation) and
+  a script that packages app and model as a Linux AppImage.
+
 ## [0.3.0] - 2026-10-03
 
 ### Added
@@ -79,5 +86,6 @@ changes, which are listed under **Changed**.
 
 Initial release.
 
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/pka-human/Spingalett/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pka-human/Spingalett/compare/0a1dd16...v0.2.0

@@ -1,0 +1,4 @@
+#!/bin/sh
+# AppImage entry point: starts DigitPad from the mounted image.
+here=$(dirname "$(readlink -f "$0")")
+exec "$here/usr/bin/DigitPad" "$@"
