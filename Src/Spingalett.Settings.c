@@ -12,6 +12,11 @@
 #include <omp.h>
 #endif
 
+#if defined(__SSE__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
+#include <xmmintrin.h>
+#define SPINGALETT_FP_MXCSR 1
+#endif
+
 static _Atomic ComputeMode s_compute_mode = COMPUTE_SINGLE_THREADED;
 static _Atomic unsigned s_num_threads = 0;
 
@@ -85,6 +90,38 @@ static ComputeMode fallback_to_single_threaded(ComputeMode requested, const char
     if (!atomic_exchange(&s_fallback_warned[requested], true))
         spingalett_log(LOG_WARNING, "%s requested but not available. Falling back to single-threaded.", name);
     return COMPUTE_SINGLE_THREADED;
+}
+
+/*
+ * Subnormal floats are ~100x slower on x86. Optimizer moments of weights that stop receiving
+ * gradient (dead ReLUs, dropped units) decay geometrically into that range after a few hundred
+ * steps and made per-sample training collapse from ~1500 to ~200 samples/s. Training therefore
+ * flushes denormals to zero (FTZ + DAZ) and restores the caller's mode afterwards. The control
+ * register is per thread, so the training code applies this on every OpenMP worker as well.
+ */
+static _Thread_local unsigned long long s_saved_fp_mode;
+
+void spingalett_fp_flush_denormals_begin(void) {
+#if defined(SPINGALETT_FP_MXCSR)
+    unsigned csr = _mm_getcsr();
+    s_saved_fp_mode = csr;
+    _mm_setcsr(csr | 0x8040u);                      /* FTZ (bit 15) | DAZ (bit 6) */
+#elif defined(__aarch64__) && defined(__GNUC__)
+    unsigned long long fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    s_saved_fp_mode = fpcr;
+    fpcr |= 1ull << 24;                             /* FZ */
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+}
+
+void spingalett_fp_flush_denormals_end(void) {
+#if defined(SPINGALETT_FP_MXCSR)
+    _mm_setcsr((unsigned)s_saved_fp_mode);
+#elif defined(__aarch64__) && defined(__GNUC__)
+    unsigned long long fpcr = s_saved_fp_mode;
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
 }
 
 ComputeMode resolve_compute_mode(void) {

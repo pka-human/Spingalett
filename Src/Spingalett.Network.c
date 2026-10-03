@@ -204,6 +204,42 @@ void layer_struct_arguments(LayerArgs args) {
     (void)spingalett_add_layer(args);
 }
 
+float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode) {
+    memcpy(SPINGALETT_LAYER_PTR(net, 0), input, net->topology[0] * sizeof(float));
+
+    for (uint32_t l = 1; l < net->layers; l++) {
+        uint32_t prev_size = net->topology[l - 1];
+        uint32_t curr_size = net->topology[l];
+        const float *W = SPINGALETT_WEIGHT_MTX_PTR(net, l - 1);
+        const float *b = net->biases + net->bias_offsets[l - 1];
+        const float *x = SPINGALETT_LAYER_PTR(net, l - 1);
+        float *y = SPINGALETT_LAYER_PTR(net, l);
+
+        memcpy(y, b, curr_size * sizeof(float));
+
+#if defined(SPINGALETT_HAS_OPENBLAS)
+        if (mode == COMPUTE_OPENBLAS) {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        (int)curr_size, (int)prev_size,
+                        1.0f, W, (int)prev_size,
+                        x, 1, 1.0f, y, 1);
+        } else
+#endif
+        {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)curr_size * prev_size))
+#endif
+            for (int64_t j = 0; j < (int64_t)curr_size; j++)
+                y[j] += spingalett_dot_product(x, W + (uint64_t)j * prev_size, (uint64_t)prev_size);
+        }
+
+        apply_activation_batch(y, curr_size, net->act_func[l - 1]);
+    }
+    (void)mode;
+
+    return SPINGALETT_LAYER_PTR(net, net->layers - 1);
+}
+
 float *forward_struct_arguments(ForwardArgs args) {
     NeuralNetwork *net = args.net;
     const float *input = args.input;
@@ -218,46 +254,7 @@ float *forward_struct_arguments(ForwardArgs args) {
         return NULL;
     }
 
-    ComputeMode mode = resolve_compute_mode();
-    (void)mode;
-
-    uint32_t in_size = net->topology[0];
-    float *layer0 = SPINGALETT_LAYER_PTR(net, 0);
-    memcpy(layer0, input, in_size * sizeof(float));
-
-    for (uint32_t l = 1; l < net->layers; l++) {
-        uint32_t prev_size = net->topology[l - 1];
-        uint32_t curr_size = net->topology[l];
-        float *W = SPINGALETT_WEIGHT_MTX_PTR(net, l - 1);
-        float *b = net->biases + net->bias_offsets[l - 1];
-        const float *x = SPINGALETT_LAYER_PTR(net, l - 1);
-        float *y = SPINGALETT_LAYER_PTR(net, l);
-        ActivationFunction act = net->act_func[l - 1];
-
-        memcpy(y, b, curr_size * sizeof(float));
-
-#if defined(SPINGALETT_HAS_OPENBLAS)
-        if (mode == COMPUTE_OPENBLAS) {
-            cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                        (int)curr_size, (int)prev_size,
-                        1.0f, W, (int)prev_size,
-                        x, 1, 1.0f, y, 1);
-        } else
-#endif
-        {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(mode == COMPUTE_OPENMP)
-#endif
-            for (uint32_t j = 0; j < curr_size; j++) {
-                const float *row = W + (uint64_t)j * (uint64_t)prev_size;
-                y[j] += spingalett_dot_product(x, row, (uint64_t)prev_size);
-            }
-        }
-
-        apply_activation_batch(y, curr_size, act);
-    }
-
-    return SPINGALETT_LAYER_PTR(net, net->layers - 1);
+    return spingalett_forward_pass(net, input, resolve_compute_mode());
 }
 
 void print_parameters(NeuralNetwork *net) {

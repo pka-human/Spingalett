@@ -159,8 +159,8 @@ typedef struct {
     TrainingStrategy training_strategy;
     OptimizerType optimizer_type;
 
-    float *inputs;
-    float *targets;
+    const float *inputs;
+    const float *targets;
     uint32_t sample_count;
     uint32_t batch_size;
     size_t epochs;
