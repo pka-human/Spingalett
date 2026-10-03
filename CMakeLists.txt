@@ -5,11 +5,13 @@ set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+include(GNUInstallDirs)
+
 # ------------------------------------------------------------------------------
 # Output directories
 # ------------------------------------------------------------------------------
-set(SPINGALETT_BIN_DIR ${CMAKE_SOURCE_DIR}/Bin)
-set(SPINGALETT_LIB_DIR ${CMAKE_SOURCE_DIR}/Lib)
+set(SPINGALETT_BIN_DIR ${CMAKE_SOURCE_DIR}/Bin CACHE PATH "Output directory for executables and shared libraries")
+set(SPINGALETT_LIB_DIR ${CMAKE_SOURCE_DIR}/Lib CACHE PATH "Output directory for static/import libraries")
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${SPINGALETT_BIN_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${SPINGALETT_BIN_DIR})
@@ -34,7 +36,8 @@ target_include_directories(spingalett
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
-        $<INSTALL_INTERFACE:Include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/Spingalett>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_compile_definitions(spingalett PRIVATE SPINGALETT_EXPORTS)
@@ -88,6 +91,8 @@ if(BUILD_WITH_OPENBLAS)
         target_link_libraries(spingalett PRIVATE ${OPENBLAS_PKG_LINK_LIBRARIES})
         target_include_directories(spingalett PRIVATE ${OPENBLAS_PKG_INCLUDE_DIRS})
         set(SPINGALETT_HAS_OPENBLAS ON)
+        set(_spg_blas_inc ${OPENBLAS_PKG_INCLUDE_DIRS})
+        set(_spg_blas_lib ${OPENBLAS_PKG_LINK_LIBRARIES})
         message(STATUS "Spingalett: OpenBLAS enabled via pkg-config (${OPENBLAS_PKG_LINK_LIBRARIES})")
     else()
         find_library(OPENBLAS_LIB NAMES openblas
@@ -102,6 +107,8 @@ if(BUILD_WITH_OPENBLAS)
             target_link_libraries(spingalett PRIVATE ${OPENBLAS_LIB})
             target_include_directories(spingalett PRIVATE ${OPENBLAS_INCLUDE})
             set(SPINGALETT_HAS_OPENBLAS ON)
+            set(_spg_blas_inc ${OPENBLAS_INCLUDE})
+            set(_spg_blas_lib ${OPENBLAS_LIB})
             message(STATUS "Spingalett: OpenBLAS enabled (${OPENBLAS_LIB})")
         else()
             message(WARNING "Spingalett: OpenBLAS requested but not found")
@@ -110,6 +117,17 @@ if(BUILD_WITH_OPENBLAS)
 
     if(SPINGALETT_HAS_OPENBLAS)
         message(STATUS "Spingalett: OpenBLAS uses its own thread pool (pthreads/OpenMP built-in)")
+
+        # Other CBLAS providers lack the OpenBLAS thread API; probe for it.
+        include(CheckSymbolExists)
+        set(CMAKE_REQUIRED_INCLUDES ${_spg_blas_inc})
+        set(CMAKE_REQUIRED_LIBRARIES ${_spg_blas_lib})
+        check_symbol_exists(openblas_set_num_threads "cblas.h" SPINGALETT_OPENBLAS_THREAD_CONTROL)
+        unset(CMAKE_REQUIRED_INCLUDES)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(SPINGALETT_OPENBLAS_THREAD_CONTROL)
+            target_compile_definitions(spingalett PRIVATE SPINGALETT_OPENBLAS_THREAD_CONTROL)
+        endif()
     endif()
 endif()
 
@@ -117,11 +135,6 @@ configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Config.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/Spingalett/Spingalett.Config.h
     @ONLY
-)
-
-target_include_directories(spingalett
-    PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/Spingalett
-
 )
 
 # ------------------------------------------------------------------------------
@@ -253,11 +266,6 @@ if(BUILD_EXAMPLE)
         get_filename_component(EXAMPLE_NAME ${EXAMPLE_SOURCE} NAME_WE)
 
         add_executable(${EXAMPLE_NAME} ${EXAMPLE_SOURCE})
-        target_include_directories(${EXAMPLE_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/Include
-            ${CMAKE_CURRENT_BINARY_DIR}
-            ${CMAKE_CURRENT_BINARY_DIR}/Spingalett
-        )
         target_link_libraries(${EXAMPLE_NAME} PRIVATE spingalett)
 
         if(UNIX AND NOT APPLE)
@@ -270,10 +278,47 @@ if(BUILD_EXAMPLE)
 endif()
 
 # ------------------------------------------------------------------------------
+# Tests (run with: ctest --test-dir <build> --output-on-failure)
+# ------------------------------------------------------------------------------
+option(BUILD_TESTS "Build the test suite" ON)
+
+if(BUILD_TESTS)
+    enable_testing()
+
+    add_executable(SpingalettTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Tests.c)
+    target_link_libraries(SpingalettTests PRIVATE spingalett)
+    target_compile_definitions(SpingalettTests PRIVATE
+        SPINGALETT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Tests/Data")
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(SpingalettTests PRIVATE m)
+        set_target_properties(SpingalettTests PROPERTIES BUILD_RPATH "$ORIGIN")
+    endif()
+
+    foreach(group grad equiv cont sched dropout gen io xor)
+        add_test(NAME core.${group} COMMAND SpingalettTests ${group}
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    endforeach()
+
+    # A sanitizer-instrumented library cannot be loaded into an uninstrumented Python.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND NOT CMAKE_C_FLAGS MATCHES "-fsanitize")
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+                        RESULT_VARIABLE SPINGALETT_NUMPY_MISSING OUTPUT_QUIET ERROR_QUIET)
+        if(SPINGALETT_NUMPY_MISSING EQUAL 0)
+            add_test(NAME python.bindings
+                     COMMAND ${CMAKE_COMMAND} -E env
+                             SPINGALETT_LIBRARY=$<TARGET_FILE:spingalett>
+                             PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/Bindings/Python
+                             ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/test_python_bindings.py)
+        else()
+            message(STATUS "Spingalett: NumPy not found, skipping Python binding tests")
+        endif()
+    endif()
+endif()
+
+# ------------------------------------------------------------------------------
 # Install
 # ------------------------------------------------------------------------------
-include(GNUInstallDirs)
-
 install(TARGETS spingalett
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

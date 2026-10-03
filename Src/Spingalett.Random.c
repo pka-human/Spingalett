@@ -55,6 +55,15 @@ uint32_t rng_next(void) {
     return result;
 }
 
+uint64_t rng_next64(void) {
+    uint64_t hi = rng_next();
+    return (hi << 32) | rng_next();
+}
+
+void spingalett_seed(uint64_t seed) {
+    rng_seed(seed);
+}
+
 float rng_next_float(void) {
     return (float)(rng_next() >> 8) / 16777216.0f;
 }
@@ -73,7 +82,7 @@ float random_normal_weight(void) {
 void spingalett_shuffle_indices(uint32_t *indices, uint32_t n) {
     rng_ensure_seeded();
     for (uint32_t i = n - 1; i > 0; i--) {
-        uint32_t j = rng_next() % (i + 1);
+        uint32_t j = (uint32_t)(((uint64_t)rng_next() * (uint64_t)(i + 1)) >> 32);
         uint32_t tmp = indices[i];
         indices[i] = indices[j];
         indices[j] = tmp;

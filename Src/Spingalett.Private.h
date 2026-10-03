@@ -1,3 +1,8 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
 #pragma once
 
 #include "Spingalett/Spingalett.h"
@@ -10,6 +15,13 @@
 #define SPINGALETT_ERRMSG_MAX 256
 #define SPINGALETT_ALIGNMENT  64
 
+/* Multiply-adds below which forking an OpenMP team costs more than it saves. */
+#define SPINGALETT_OMP_MIN_WORK 32768u
+
+static inline bool spingalett_use_omp(ComputeMode mode, uint64_t work) {
+    return mode == COMPUTE_OPENMP && work >= SPINGALETT_OMP_MIN_WORK;
+}
+
 #define SPINGALETT_NEURON(net, l, j)        ((net)->neurons[(net)->neuron_offsets[l] + (uint64_t)(j)])
 #define SPINGALETT_LAYER_PTR(net, l)        ((net)->neurons + (net)->neuron_offsets[l])
 
@@ -20,6 +32,25 @@
 #define SPINGALETT_GRAD_W_MTX_PTR(net, l)   ((net)->grad_weights + (net)->weight_offsets[l])
 
 void set_error(int code, const char *msg);
+
+/* Training-time dropout state. Masks are a hash of (seed, step, position, layer, unit), so every
+   backend and thread count draws identical masks for the same sample. */
+typedef struct {
+    uint64_t seed;          /* drawn once per train() call */
+    uint64_t step;          /* optimizer step the sample belongs to */
+    uint32_t position;      /* sample index within that step */
+    float   *dmask;         /* per-unit mask * f'(a), laid out like net->neurons */
+} DropoutContext;
+
+bool spingalett_add_layer(LayerArgs args);
+bool spingalett_has_dropout(const NeuralNetwork *net);
+/* dropout == NULL: inference. Otherwise hidden layers with a dropout rate are masked. */
+float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,
+                               const DropoutContext *dropout);
+/* Masks n activations y (outputs of activation act) in place and stores mask * f'(a) in dmask. */
+void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t n,
+                              ActivationFunction act, float rate,
+                              const DropoutContext *ctx, uint32_t layer, uint32_t position);
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
 
@@ -34,6 +65,7 @@ void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total,
 
 void     rng_seed(uint64_t seed);
 uint32_t rng_next(void);
+uint64_t rng_next64(void);
 float    rng_next_float(void);
 
 float random_uniform_weight(void);
@@ -43,30 +75,29 @@ float spingalett_dot_product(const float *restrict a, const float *restrict b, u
 
 void spingalett_shuffle_indices(uint32_t *indices, uint32_t n);
 
-void spingalett_adam_update_avx(float *restrict W, float *restrict mW, float *restrict vW, const float *restrict gW,
-                                uint64_t n, float lr, float beta1, float beta2,
-                                float one_minus_b1, float one_minus_b2,
-                                float m_factor, float v_factor, float epsilon);
+void spingalett_sgd_update(float *restrict W, const float *restrict gW, uint64_t n, float lr, float decay);
+void spingalett_momentum_update(float *restrict W, float *restrict mW, const float *restrict gW, uint64_t n,
+                                float lr, float momentum, float decay);
+void spingalett_rmsprop_update(float *restrict W, float *restrict vW, const float *restrict gW, uint64_t n,
+                               float lr, float beta2, float epsilon, float decay);
+void spingalett_adam_update(float *restrict W, float *restrict mW, float *restrict vW, const float *restrict gW,
+                            uint64_t n, float lr, float beta1, float beta2,
+                            float m_factor, float v_factor, float epsilon,
+                            float decay, float wd_factor);
 
-void spingalett_adamw_update_avx(float *restrict W, float *restrict mW, float *restrict vW, const float *restrict gW,
-                                  uint64_t n, float lr, float beta1, float beta2,
-                                  float one_minus_b1, float one_minus_b2,
-                                  float m_factor, float v_factor, float epsilon,
-                                  float wd_factor);
-
-void spingalett_sgd_update_avx(float *restrict W, const float *restrict gW, uint64_t n, float lr);
-void spingalett_sgd_decay_update_avx(float *restrict W, const float *restrict gW, uint64_t n, float lr, float decay);
-void spingalett_momentum_update_avx(float *restrict W, float *restrict mW, const float *restrict gW, uint64_t n,
-                                     float lr, float momentum, float decay);
-void spingalett_rmsprop_update_avx(float *restrict W, float *restrict vW, const float *restrict gW, uint64_t n,
-                                    float lr, float beta2, float one_minus_b2, float epsilon, float decay);
-
+double spingalett_vec_sumsq(const float *x, uint64_t n);
+float  spingalett_vec_l2norm(const float *x, uint64_t n);
 void spingalett_vec_scale(float *data, uint64_t n, float scale);
-void spingalett_vec_axpy(float *y, const float *x, uint64_t n, float alpha);
+void spingalett_vec_mul(float *restrict y, const float *restrict x, uint64_t n);
+void spingalett_vec_scaled_copy(float *restrict dst, const float *restrict src, uint64_t n, float alpha);
+void spingalett_vec_axpy(float *restrict y, const float *restrict x, uint64_t n, float alpha);
 
 float spingalett_clip_grad_norm(NeuralNetwork *net, float max_norm);
 
 ComputeMode resolve_compute_mode(void);
+
+void spingalett_fp_flush_denormals_begin(void);
+void spingalett_fp_flush_denormals_end(void);
 
 float compute_sample_loss(const float *output, const float *target,
                           uint32_t output_size, LossFunction loss_func,

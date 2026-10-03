@@ -1,3 +1,8 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
 #include "Spingalett.Private.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -8,7 +13,72 @@
 #include <omp.h>
 #endif
 
-static bool check_nan_inf(NeuralNetwork *net) {
+/* Elements per optimizer work item: per-sample gradient rows are built in an L1-resident
+   buffer of this size, and the batch optimizer pass is split into multiples of it. */
+#define OPT_CHUNK 256u
+
+typedef struct {
+    OptimizerType type;
+    float lr;
+    float decay;
+    float momentum;
+    float beta1, beta2, epsilon;
+    float m_factor, v_factor;   /* Adam bias corrections of the current step */
+} OptimizerStep;
+
+static void optimizer_update(const OptimizerStep *o, float *W, float *mW, float *vW,
+                             const float *g, uint64_t n, float decay) {
+    switch (o->type) {
+        case OPTIMIZER_SGD:
+            spingalett_sgd_update(W, g, n, o->lr, decay);
+            break;
+        case OPTIMIZER_MOMENTUM:
+            spingalett_momentum_update(W, mW, g, n, o->lr, o->momentum, decay);
+            break;
+        case OPTIMIZER_RMSPROP:
+            spingalett_rmsprop_update(W, vW, g, n, o->lr, o->beta2, o->epsilon, decay);
+            break;
+        case OPTIMIZER_ADAM:
+            spingalett_adam_update(W, mW, vW, g, n, o->lr, o->beta1, o->beta2,
+                                   o->m_factor, o->v_factor, o->epsilon, decay, 1.0f);
+            break;
+        case OPTIMIZER_ADAMW:
+            spingalett_adam_update(W, mW, vW, g, n, o->lr, o->beta1, o->beta2,
+                                   o->m_factor, o->v_factor, o->epsilon, 0.0f, 1.0f - o->lr * decay);
+            break;
+        default:
+            break;
+    }
+}
+
+/* One optimizer pass over a contiguous parameter array, chunked so OpenMP can split it. */
+static void optimizer_update_array(const OptimizerStep *o, float *W, float *mW, float *vW,
+                                   const float *g, uint64_t n, float decay, ComputeMode mode) {
+    const uint64_t chunk = 64u * OPT_CHUNK;
+    int64_t chunks = (int64_t)((n + chunk - 1) / chunk);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(mode == COMPUTE_OPENMP && chunks > 1)
+#endif
+    for (int64_t c = 0; c < chunks; c++) {
+        uint64_t off = (uint64_t)c * chunk;
+        uint64_t len = (n - off < chunk) ? n - off : chunk;
+        optimizer_update(o, W + off, mW + off, vW + off, g + off, len, decay);
+    }
+    (void)mode;
+}
+
+/* Apply the accumulated (already averaged) gradients of all layers. */
+static void apply_gradients(NeuralNetwork *net, const OptimizerStep *o, float max_grad_norm, ComputeMode mode) {
+    if (max_grad_norm > 0.0f)
+        spingalett_clip_grad_norm(net, max_grad_norm);
+
+    optimizer_update_array(o, net->weights, net->opt_m_weights, net->opt_v_weights,
+                           net->grad_weights, net->total_weights, o->decay, mode);
+    optimizer_update_array(o, net->biases, net->opt_m_biases, net->opt_v_biases,
+                           net->grad_biases, net->total_biases, 0.0f, mode);
+}
+
+static bool check_nan_inf(const NeuralNetwork *net) {
     for (uint64_t i = 0; i < net->total_weights; i++) {
         if (!isfinite(net->weights[i])) return true;
     }
@@ -18,271 +88,220 @@ static bool check_nan_inf(NeuralNetwork *net) {
     return false;
 }
 
-static void compute_deltas(NeuralNetwork *net, float *target, float **deltas, ComputeMode mode) {
-    uint32_t last = net->layers - 1;
-    ActivationFunction last_act = net->act_func[last - 1];
-    uint32_t n_out = net->topology[last];
-
-    if (net->loss_func == LOSS_MSE && last_act == ACT_SOFTMAX) {
-        float sum = 0.0f;
-        for (uint32_t j = 0; j < n_out; j++) {
-            float y = SPINGALETT_NEURON(net, last, j);
-            sum += (y - target[j]) * y;
-        }
-        for (uint32_t i = 0; i < n_out; i++) {
-            float y = SPINGALETT_NEURON(net, last, i);
-            deltas[last][i] = y * ((y - target[i]) - sum);
-        }
-    } else {
-        for (uint32_t i = 0; i < n_out; i++) {
-            float output = SPINGALETT_NEURON(net, last, i);
-            if (net->loss_func == LOSS_CROSS_ENTROPY &&
-                (last_act == ACT_SOFTMAX || last_act == ACT_SIGMOID))
-                deltas[last][i] = output - target[i];
-            else
-                deltas[last][i] = (output - target[i]) * derivative(output, last_act);
-        }
+/* dL/dz of the output layer for one sample. */
+static void output_delta(LossFunction loss, ActivationFunction act,
+                         const float *out, const float *target, float *delta, uint32_t n) {
+    if (loss == LOSS_MSE && act == ACT_SOFTMAX) {
+        float dot = 0.0f;
+        for (uint32_t j = 0; j < n; j++)
+            dot += (out[j] - target[j]) * out[j];
+        for (uint32_t j = 0; j < n; j++)
+            delta[j] = out[j] * ((out[j] - target[j]) - dot);
+        return;
     }
 
-    for (uint32_t l = last - 1; l > 0; l--) {
-        uint32_t cur_sz  = net->topology[l];
-        uint32_t next_sz = net->topology[l + 1];
-        ActivationFunction prev_act = net->act_func[l - 1];
-        float *W = SPINGALETT_WEIGHT_MTX_PTR(net, l);
+    for (uint32_t j = 0; j < n; j++)
+        delta[j] = out[j] - target[j];
 
+    /* Cross-entropy cancels the derivative of a sigmoid/softmax output. */
+    if (!(loss == LOSS_CROSS_ENTROPY && (act == ACT_SOFTMAX || act == ACT_SIGMOID)))
+        apply_derivative_batch(delta, out, (uint64_t)n, act);
+}
+
+/* out[0..cols) = W^T d for a row-major rows x cols matrix W. Column slabs keep the output
+   chunk in L1 and let OpenMP threads own disjoint outputs. Zero deltas (inactive ReLUs) are skipped. */
+static void backproject(float *restrict out, const float *restrict W, const float *restrict d,
+                        uint32_t rows, uint32_t cols, ComputeMode mode) {
 #if defined(SPINGALETT_HAS_OPENBLAS)
-        if (mode == COMPUTE_OPENBLAS) {
-            cblas_sgemv(CblasRowMajor, CblasTrans,
-                        (int)next_sz, (int)cur_sz,
-                        1.0f, W, (int)cur_sz,
-                        deltas[l + 1], 1,
-                        0.0f, deltas[l], 1);
-        } else
-#endif
-        {
-            memset(deltas[l], 0, cur_sz * sizeof(float));
-            for (uint32_t j = 0; j < next_sz; j++) {
-                float d = deltas[l + 1][j];
-                float *w_row = W + (uint64_t)j * (uint64_t)cur_sz;
-                spingalett_vec_axpy(deltas[l], w_row, (uint64_t)cur_sz, d);
-            }
-        }
-
-        for (uint32_t k = 0; k < cur_sz; k++)
-            deltas[l][k] *= derivative(SPINGALETT_NEURON(net, l, k), prev_act);
+    if (mode == COMPUTE_OPENBLAS) {
+        cblas_sgemv(CblasRowMajor, CblasTrans, (int)rows, (int)cols,
+                    1.0f, W, (int)cols, d, 1, 0.0f, out, 1);
+        return;
     }
-
+#endif
+    int64_t slabs = (int64_t)((cols + OPT_CHUNK - 1) / OPT_CHUNK);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)rows * cols) && slabs > 1)
+#endif
+    for (int64_t s = 0; s < slabs; s++) {
+        uint32_t k0 = (uint32_t)s * OPT_CHUNK;
+        uint32_t len = (cols - k0 < OPT_CHUNK) ? cols - k0 : OPT_CHUNK;
+        float *o = out + k0;
+        memset(o, 0, len * sizeof(float));
+        for (uint32_t j = 0; j < rows; j++) {
+            float dj = d[j];
+            if (dj != 0.0f)
+                spingalett_vec_axpy(o, W + (uint64_t)j * cols + k0, (uint64_t)len, dj);
+        }
+    }
     (void)mode;
 }
 
-static void backpropagation(NeuralNetwork *net, float *target, TrainArgs *args, float **deltas,
-                             float *beta1_pow_p, float *beta2_pow_p, ComputeMode mode) {
+/* Back-propagate one sample whose activations are in net->neurons. deltas[l] has
+   topology[l] entries; deltas[0] is never used. dmask (or NULL) holds mask * f'(a) for
+   layers with dropout, laid out like net->neurons. */
+static void compute_deltas(NeuralNetwork *net, const float *target, float **deltas,
+                           const float *dmask, ComputeMode mode) {
     uint32_t last = net->layers - 1;
-    float lr = args->learning_rate;
-    float decay = args->weight_decay;
-    float momentum = args->momentum;
-    float beta1 = args->beta1;
-    float beta2 = args->beta2;
-    float epsilon = args->epsilon;
+    output_delta(net->loss_func, net->act_func[last - 1],
+                 SPINGALETT_LAYER_PTR(net, last), target, deltas[last], net->topology[last]);
 
-    compute_deltas(net, target, deltas, mode);
-
-    net->time_step++;
-    *beta1_pow_p *= beta1;
-    *beta2_pow_p *= beta2;
-
-    for (uint32_t l = 0; l < last; l++) {
-        uint32_t in_sz  = net->topology[l];
-        uint32_t out_sz = net->topology[l + 1];
-        float *W   = SPINGALETT_WEIGHT_MTX_PTR(net, l);
-        float *b   = net->biases + net->bias_offsets[l];
-        float *mW  = net->opt_m_weights + net->weight_offsets[l];
-        float *vW  = net->opt_v_weights + net->weight_offsets[l];
-        float *mB  = net->opt_m_biases  + net->bias_offsets[l];
-        float *vB  = net->opt_v_biases  + net->bias_offsets[l];
-        const float *x = SPINGALETT_LAYER_PTR(net, l);
-        float *delta = deltas[l + 1];
-
-        if (args->optimizer_type == OPTIMIZER_SGD) {
-#if defined(SPINGALETT_HAS_OPENBLAS)
-            if (mode == COMPUTE_OPENBLAS) {
-                if (decay > 0.0f)
-                    cblas_sscal((int)((uint64_t)out_sz * (uint64_t)in_sz),
-                                1.0f - lr * decay, W, 1);
-                cblas_sger(CblasRowMajor, (int)out_sz, (int)in_sz,
-                           -lr, delta, 1, x, 1, W, (int)in_sz);
-            } else
-#endif
-            {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(mode == COMPUTE_OPENMP)
-#endif
-                for (uint32_t j = 0; j < out_sz; j++) {
-                    float dj = delta[j];
-                    float *Wj = W + (uint64_t)j * (uint64_t)in_sz;
-                    for (uint32_t k = 0; k < in_sz; k++) {
-                        float grad = dj * x[k];
-                        if (decay > 0.0f) grad += decay * Wj[k];
-                        Wj[k] -= lr * grad;
-                    }
-                }
-            }
-            for (uint32_t j = 0; j < out_sz; j++)
-                b[j] -= lr * delta[j];
-
-        } else if (args->optimizer_type == OPTIMIZER_MOMENTUM) {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(mode == COMPUTE_OPENMP)
-#endif
-            for (uint32_t j = 0; j < out_sz; j++) {
-                float dj = delta[j];
-                uint64_t row_off = (uint64_t)j * (uint64_t)in_sz;
-                for (uint32_t k = 0; k < in_sz; k++) {
-                    uint64_t idx = row_off + k;
-                    float grad = dj * x[k];
-                    if (decay > 0.0f) grad += decay * W[idx];
-                    mW[idx] = momentum * mW[idx] + grad;
-                    W[idx] -= lr * mW[idx];
-                }
-            }
-            for (uint32_t j = 0; j < out_sz; j++) {
-                mB[j] = momentum * mB[j] + delta[j];
-                b[j] -= lr * mB[j];
-            }
-
-        } else if (args->optimizer_type == OPTIMIZER_ADAM || args->optimizer_type == OPTIMIZER_ADAMW) {
-            float m_factor = 1.0f / (1.0f - *beta1_pow_p);
-            float v_factor = 1.0f / (1.0f - *beta2_pow_p);
-            bool is_adamw = (args->optimizer_type == OPTIMIZER_ADAMW);
-            float one_minus_b1 = 1.0f - beta1;
-            float one_minus_b2 = 1.0f - beta2;
-
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(mode == COMPUTE_OPENMP)
-#endif
-            for (uint32_t j = 0; j < out_sz; j++) {
-                float dj = delta[j];
-                uint64_t row_off = (uint64_t)j * (uint64_t)in_sz;
-                for (uint32_t k = 0; k < in_sz; k++) {
-                    uint64_t idx = row_off + k;
-                    float grad = dj * x[k];
-                    if (is_adamw) {
-                        if (decay > 0.0f) W[idx] *= (1.0f - lr * decay);
-                    } else {
-                        if (decay > 0.0f) grad += decay * W[idx];
-                    }
-                    mW[idx] = beta1 * mW[idx] + one_minus_b1 * grad;
-                    vW[idx] = beta2 * vW[idx] + one_minus_b2 * (grad * grad);
-                    float m_hat = mW[idx] * m_factor;
-                    float v_hat = vW[idx] * v_factor;
-                    W[idx] -= lr * m_hat / sqrtf(v_hat + epsilon);
-                }
-            }
-            for (uint32_t j = 0; j < out_sz; j++) {
-                float grad = delta[j];
-                mB[j] = beta1 * mB[j] + one_minus_b1 * grad;
-                vB[j] = beta2 * vB[j] + one_minus_b2 * (grad * grad);
-                float m_hat = mB[j] * m_factor;
-                float v_hat = vB[j] * v_factor;
-                b[j] -= lr * m_hat / sqrtf(v_hat + epsilon);
-            }
-
-        } else if (args->optimizer_type == OPTIMIZER_RMSPROP) {
-            float one_minus_b2 = 1.0f - beta2;
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(mode == COMPUTE_OPENMP)
-#endif
-            for (uint32_t j = 0; j < out_sz; j++) {
-                float dj = delta[j];
-                uint64_t row_off = (uint64_t)j * (uint64_t)in_sz;
-                for (uint32_t k = 0; k < in_sz; k++) {
-                    uint64_t idx = row_off + k;
-                    float grad = dj * x[k];
-                    if (decay > 0.0f) grad += decay * W[idx];
-                    vW[idx] = beta2 * vW[idx] + one_minus_b2 * (grad * grad);
-                    W[idx] -= lr * grad / sqrtf(vW[idx] + epsilon);
-                }
-            }
-            for (uint32_t j = 0; j < out_sz; j++) {
-                float grad = delta[j];
-                vB[j] = beta2 * vB[j] + one_minus_b2 * (grad * grad);
-                b[j] -= lr * grad / sqrtf(vB[j] + epsilon);
-            }
-        }
+    for (uint32_t l = last - 1; l > 0; l--) {
+        backproject(deltas[l], SPINGALETT_WEIGHT_MTX_PTR(net, l), deltas[l + 1],
+                    net->topology[l + 1], net->topology[l], mode);
+        if (dmask && net->dropout_rates[l] > 0.0f)
+            spingalett_vec_mul(deltas[l], dmask + net->neuron_offsets[l], (uint64_t)net->topology[l]);
+        else
+            apply_derivative_batch(deltas[l], SPINGALETT_LAYER_PTR(net, l),
+                                   (uint64_t)net->topology[l], net->act_func[l - 1]);
     }
 }
 
-static void accumulate_gradients_single(NeuralNetwork *net, float *target, TrainArgs *args, float **deltas, ComputeMode mode) {
-    uint32_t last = net->layers - 1;
-    (void)args;
-
-    compute_deltas(net, target, deltas, mode);
-
-    for (uint32_t l = 0; l < last; l++) {
+/* grad += scale * (delta (x) activations) for one sample. */
+static void accumulate_gradients(NeuralNetwork *net, float **deltas, float scale, ComputeMode mode) {
+    for (uint32_t l = 0; l + 1 < net->layers; l++) {
         uint32_t in_sz  = net->topology[l];
         uint32_t out_sz = net->topology[l + 1];
         float *gW = SPINGALETT_GRAD_W_MTX_PTR(net, l);
-        float *gB = net->grad_biases + net->bias_offsets[l];
         const float *x = SPINGALETT_LAYER_PTR(net, l);
-        float *delta = deltas[l + 1];
+        const float *d = deltas[l + 1];
 
-#if defined(SPINGALETT_HAS_OPENBLAS)
-        if (mode == COMPUTE_OPENBLAS) {
-            cblas_sger(CblasRowMajor, (int)out_sz, (int)in_sz,
-                       1.0f, delta, 1, x, 1, gW, (int)in_sz);
-        } else
-#endif
-        {
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(mode == COMPUTE_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)in_sz * out_sz))
 #endif
-            for (uint32_t j = 0; j < out_sz; j++) {
-                float dj = delta[j];
-                float *gWj = gW + (uint64_t)j * (uint64_t)in_sz;
-                for (uint32_t k = 0; k < in_sz; k++)
-                    gWj[k] += dj * x[k];
+        for (int64_t j = 0; j < (int64_t)out_sz; j++) {
+            float dj = d[j] * scale;
+            if (dj != 0.0f)
+                spingalett_vec_axpy(gW + (uint64_t)j * in_sz, x, (uint64_t)in_sz, dj);
+        }
+        spingalett_vec_axpy(net->grad_biases + net->bias_offsets[l], d, (uint64_t)out_sz, scale);
+    }
+    (void)mode;
+}
+
+/* Global-norm clipping for one sample without materializing its gradient: layer l's weight
+   gradient is the rank-1 product delta[l+1] (x) x[l], so its squared Frobenius norm is
+   |delta|^2 * |x|^2, and the bias gradient adds |delta|^2. Scaling the deltas scales both. */
+static void clip_sample_gradient(NeuralNetwork *net, float **deltas, float max_norm) {
+    double total_sq = 0.0;
+    for (uint32_t l = 0; l + 1 < net->layers; l++) {
+        double x_sq = spingalett_vec_sumsq(SPINGALETT_LAYER_PTR(net, l), net->topology[l]);
+        double d_sq = spingalett_vec_sumsq(deltas[l + 1], net->topology[l + 1]);
+        total_sq += d_sq * (x_sq + 1.0);
+    }
+
+    double norm = sqrt(total_sq);
+    if (isfinite(norm) && norm > (double)max_norm) {
+        float scale = (float)((double)max_norm / norm);
+        for (uint32_t l = 1; l < net->layers; l++)
+            spingalett_vec_scale(deltas[l], net->topology[l], scale);
+    }
+}
+
+/* Per-sample (online) update: the gradient of each weight row is the rank-1 product
+   delta[j] * x, built chunk by chunk in an L1 buffer and fed straight into the optimizer
+   kernel, so the full gradient matrix is never materialized. */
+static void apply_rank1_updates(NeuralNetwork *net, const OptimizerStep *o, float **deltas, ComputeMode mode) {
+    bool plain_sgd = (o->type == OPTIMIZER_SGD && o->decay == 0.0f);
+
+    for (uint32_t l = 0; l + 1 < net->layers; l++) {
+        uint32_t in_sz  = net->topology[l];
+        uint32_t out_sz = net->topology[l + 1];
+        float *W  = SPINGALETT_WEIGHT_MTX_PTR(net, l);
+        float *mW = net->opt_m_weights + net->weight_offsets[l];
+        float *vW = net->opt_v_weights + net->weight_offsets[l];
+        const float *x = SPINGALETT_LAYER_PTR(net, l);
+        const float *d = deltas[l + 1];
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)in_sz * out_sz))
+#endif
+        for (int64_t j = 0; j < (int64_t)out_sz; j++) {
+            float dj = d[j];
+            uint64_t row = (uint64_t)j * in_sz;
+            if (plain_sgd) {
+                if (dj != 0.0f)
+                    spingalett_vec_axpy(W + row, x, (uint64_t)in_sz, -o->lr * dj);
+                continue;
+            }
+            float g[OPT_CHUNK];
+            for (uint32_t k0 = 0; k0 < in_sz; k0 += OPT_CHUNK) {
+                uint32_t len = (in_sz - k0 < OPT_CHUNK) ? in_sz - k0 : OPT_CHUNK;
+                spingalett_vec_scaled_copy(g, x + k0, (uint64_t)len, dj);
+                optimizer_update(o, W + row + k0, mW + row + k0, vW + row + k0, g, (uint64_t)len, o->decay);
             }
         }
 
-        for (uint32_t j = 0; j < out_sz; j++)
-            gB[j] += delta[j];
+        uint64_t boff = net->bias_offsets[l];
+        optimizer_update(o, net->biases + boff, net->opt_m_biases + boff, net->opt_v_biases + boff,
+                         d, (uint64_t)out_sz, 0.0f);
     }
+    (void)mode;
 }
 
 #if defined(SPINGALETT_HAS_OPENBLAS)
 
 typedef struct {
-    float **act;
-    float **delta;
-    float *act_flat;
-    float *delta_flat;
+    float **act;        /* act[0]: the batch inputs; act[l]: [capacity x topology[l]] */
+    float **delta;      /* delta[l] for l >= 1 */
+    float **dmask;      /* dropout mask * f'(a) for hidden layers with dropout, else NULL */
+    float *flat;        /* backing storage for act[1..] and delta[1..] */
+    float *dmask_flat;
+    float *inputs;      /* gather buffer for mini-batches (NULL for full batch) */
+    float *targets;     /* gather buffer for mini-batches (NULL for full batch) */
     float *ones;
     uint32_t capacity;
 } BatchWorkspace;
 
-static BatchWorkspace *batch_workspace_create(NeuralNetwork *net, uint32_t max_batch) {
+static void batch_workspace_free(BatchWorkspace *ws) {
+    if (!ws) return;
+    spingalett_aligned_free(ws->flat);
+    spingalett_aligned_free(ws->dmask_flat);
+    free(ws->dmask);
+    spingalett_aligned_free(ws->inputs);
+    spingalett_aligned_free(ws->targets);
+    spingalett_aligned_free(ws->ones);
+    free(ws->act);
+    free(ws->delta);
+    free(ws);
+}
+
+static BatchWorkspace *batch_workspace_create(const NeuralNetwork *net, uint32_t max_batch, bool gather) {
     BatchWorkspace *ws = (BatchWorkspace *)calloc(1, sizeof(BatchWorkspace));
     if (!ws) return NULL;
 
     ws->capacity = max_batch;
-    ws->act   = (float **)malloc(net->layers * sizeof(float *));
-    ws->delta = (float **)malloc(net->layers * sizeof(float *));
+    ws->act   = (float **)calloc(net->layers, sizeof(float *));
+    ws->delta = (float **)calloc(net->layers, sizeof(float *));
+    ws->dmask = (float **)calloc(net->layers, sizeof(float *));
 
-    size_t total = 0;
-    for (uint32_t l = 0; l < net->layers; l++)
-        total += (size_t)max_batch * (size_t)net->topology[l];
+    size_t per_layer_total = 0, dropout_total = 0;
+    for (uint32_t l = 1; l < net->layers; l++) {
+        per_layer_total += (size_t)max_batch * (size_t)net->topology[l];
+        if (l + 1 < net->layers && net->dropout_rates[l] > 0.0f)
+            dropout_total += (size_t)max_batch * (size_t)net->topology[l];
+    }
 
-    ws->act_flat   = (float *)spingalett_aligned_calloc(total, sizeof(float));
-    ws->delta_flat = (float *)spingalett_aligned_calloc(total, sizeof(float));
-    ws->ones       = (float *)spingalett_aligned_alloc(max_batch * sizeof(float));
+    ws->flat = (float *)spingalett_aligned_calloc(2 * per_layer_total, sizeof(float));
+    if (dropout_total > 0) {
+        ws->dmask_flat = (float *)spingalett_aligned_alloc(dropout_total * sizeof(float));
+        if (!ws->dmask_flat) { batch_workspace_free(ws); return NULL; }
+        size_t doff = 0;
+        for (uint32_t l = 1; l + 1 < net->layers; l++) {
+            if (net->dropout_rates[l] > 0.0f) {
+                ws->dmask[l] = ws->dmask_flat + doff;
+                doff += (size_t)max_batch * (size_t)net->topology[l];
+            }
+        }
+    }
+    ws->ones = (float *)spingalett_aligned_alloc((size_t)max_batch * sizeof(float));
+    if (gather) {
+        ws->inputs  = (float *)spingalett_aligned_alloc((size_t)max_batch * net->topology[0] * sizeof(float));
+        ws->targets = (float *)spingalett_aligned_alloc((size_t)max_batch * net->topology[net->layers - 1] * sizeof(float));
+    }
 
-    if (!ws->act || !ws->delta || !ws->act_flat || !ws->delta_flat || !ws->ones) {
-        spingalett_aligned_free(ws->act_flat);
-        spingalett_aligned_free(ws->delta_flat);
-        spingalett_aligned_free(ws->ones);
-        free(ws->act);
-        free(ws->delta);
-        free(ws);
+    if (!ws->act || !ws->delta || !ws->dmask || !ws->flat || !ws->ones || (gather && (!ws->inputs || !ws->targets))) {
+        batch_workspace_free(ws);
         return NULL;
     }
 
@@ -290,44 +309,30 @@ static BatchWorkspace *batch_workspace_create(NeuralNetwork *net, uint32_t max_b
         ws->ones[i] = 1.0f;
 
     size_t off = 0;
-    for (uint32_t l = 0; l < net->layers; l++) {
+    for (uint32_t l = 1; l < net->layers; l++) {
         size_t sz = (size_t)max_batch * (size_t)net->topology[l];
-        ws->act[l]   = ws->act_flat + off;
-        ws->delta[l] = ws->delta_flat + off;
+        ws->act[l]   = ws->flat + off;
+        ws->delta[l] = ws->flat + per_layer_total + off;
         off += sz;
     }
+    ws->act[0] = ws->inputs;
 
     return ws;
 }
 
-static void batch_workspace_free(BatchWorkspace *ws) {
-    if (!ws) return;
-    spingalett_aligned_free(ws->act_flat);
-    spingalett_aligned_free(ws->delta_flat);
-    spingalett_aligned_free(ws->ones);
-    free(ws->act);
-    free(ws->delta);
-    free(ws);
-}
-
-static void batch_forward(NeuralNetwork *net, BatchWorkspace *ws,
-                          const float *inputs, uint32_t N) {
-    uint32_t in_size = net->topology[0];
-    memcpy(ws->act[0], inputs, (size_t)N * (size_t)in_size * sizeof(float));
-
+static void batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout) {
     for (uint32_t l = 1; l < net->layers; l++) {
         uint32_t prev_size = net->topology[l - 1];
         uint32_t curr_size = net->topology[l];
-        float *W = SPINGALETT_WEIGHT_MTX_PTR(net, l - 1);
-        float *bias = net->biases + net->bias_offsets[l - 1];
-        float *A = ws->act[l - 1];
+        const float *W = SPINGALETT_WEIGHT_MTX_PTR(net, l - 1);
+        const float *bias = net->biases + net->bias_offsets[l - 1];
         float *C = ws->act[l];
         ActivationFunction act = net->act_func[l - 1];
 
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     (int)N, (int)curr_size, (int)prev_size,
                     1.0f,
-                    A, (int)prev_size,
+                    ws->act[l - 1], (int)prev_size,
                     W, (int)prev_size,
                     0.0f,
                     C, (int)curr_size);
@@ -341,66 +346,51 @@ static void batch_forward(NeuralNetwork *net, BatchWorkspace *ws,
         } else {
             apply_activation_bulk(C, (uint64_t)N * (uint64_t)curr_size, act);
         }
+
+        if (dropout && ws->dmask[l]) {
+            for (uint32_t s = 0; s < N; s++) {
+                size_t off = (size_t)s * curr_size;
+                spingalett_dropout_apply(C + off, ws->dmask[l] + off, curr_size, act,
+                                         net->dropout_rates[l], dropout, l, s);
+            }
+        }
     }
 }
 
-static void batch_compute_deltas(NeuralNetwork *net, BatchWorkspace *ws,
-                                  const float *targets, uint32_t N) {
+static void batch_compute_deltas(NeuralNetwork *net, BatchWorkspace *ws, const float *targets, uint32_t N) {
     uint32_t last = net->layers - 1;
     ActivationFunction last_act = net->act_func[last - 1];
     uint32_t n_out = net->topology[last];
-    size_t out_total = (size_t)N * (size_t)n_out;
 
-    float *act_last = ws->act[last];
-    float *delta_last = ws->delta[last];
-
-    if (net->loss_func == LOSS_MSE && last_act == ACT_SOFTMAX) {
-        for (uint32_t s = 0; s < N; s++) {
-            float *a = act_last + (size_t)s * n_out;
-            float *d = delta_last + (size_t)s * n_out;
-            const float *t = targets + (size_t)s * n_out;
-            float sum = 0.0f;
-            for (uint32_t j = 0; j < n_out; j++)
-                sum += (a[j] - t[j]) * a[j];
-            for (uint32_t j = 0; j < n_out; j++)
-                d[j] = a[j] * ((a[j] - t[j]) - sum);
-        }
-    } else if (net->loss_func == LOSS_CROSS_ENTROPY &&
-               (last_act == ACT_SOFTMAX || last_act == ACT_SIGMOID)) {
-        memcpy(delta_last, act_last, out_total * sizeof(float));
-        cblas_saxpy((int)out_total, -1.0f, targets, 1, delta_last, 1);
-    } else {
-        for (size_t i = 0; i < out_total; i++)
-            delta_last[i] = (act_last[i] - targets[i]) * derivative(act_last[i], last_act);
+    for (uint32_t s = 0; s < N; s++) {
+        size_t off = (size_t)s * n_out;
+        output_delta(net->loss_func, last_act, ws->act[last] + off, targets + off, ws->delta[last] + off, n_out);
     }
 
     for (uint32_t l = last - 1; l > 0; l--) {
         uint32_t cur_sz  = net->topology[l];
         uint32_t next_sz = net->topology[l + 1];
-        ActivationFunction prev_act = net->act_func[l - 1];
-        float *W = SPINGALETT_WEIGHT_MTX_PTR(net, l);
 
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     (int)N, (int)cur_sz, (int)next_sz,
                     1.0f,
                     ws->delta[l + 1], (int)next_sz,
-                    W, (int)cur_sz,
+                    SPINGALETT_WEIGHT_MTX_PTR(net, l), (int)cur_sz,
                     0.0f,
                     ws->delta[l], (int)cur_sz);
 
-        uint64_t total_elems = (uint64_t)N * (uint64_t)cur_sz;
-        apply_derivative_batch(ws->delta[l], ws->act[l], total_elems, prev_act);
+        if (ws->dmask[l])
+            spingalett_vec_mul(ws->delta[l], ws->dmask[l], (uint64_t)N * (uint64_t)cur_sz);
+        else
+            apply_derivative_batch(ws->delta[l], ws->act[l], (uint64_t)N * (uint64_t)cur_sz, net->act_func[l - 1]);
     }
 }
 
+/* grad = grad_scale * sum over the batch; overwrites the gradient buffers. */
 static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, float grad_scale) {
-    uint32_t last = net->layers - 1;
-
-    for (uint32_t l = 0; l < last; l++) {
+    for (uint32_t l = 0; l + 1 < net->layers; l++) {
         uint32_t in_sz  = net->topology[l];
         uint32_t out_sz = net->topology[l + 1];
-        float *gW = SPINGALETT_GRAD_W_MTX_PTR(net, l);
-        float *gB = net->grad_biases + net->bias_offsets[l];
 
         cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                     (int)out_sz, (int)in_sz, (int)N,
@@ -408,132 +398,34 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
                     ws->delta[l + 1], (int)out_sz,
                     ws->act[l], (int)in_sz,
                     0.0f,
-                    gW, (int)in_sz);
+                    SPINGALETT_GRAD_W_MTX_PTR(net, l), (int)in_sz);
 
         cblas_sgemv(CblasRowMajor, CblasTrans,
                     (int)N, (int)out_sz,
                     grad_scale, ws->delta[l + 1], (int)out_sz,
                     ws->ones, 1,
-                    0.0f, gB, 1);
+                    0.0f, net->grad_biases + net->bias_offsets[l], 1);
     }
 }
 
-static float batch_compute_loss(NeuralNetwork *net, BatchWorkspace *ws,
-                                 const float *targets, uint32_t N) {
+static float batch_compute_loss(const NeuralNetwork *net, const BatchWorkspace *ws,
+                                const float *targets, uint32_t N) {
     uint32_t last = net->layers - 1;
     uint32_t n_out = net->topology[last];
     ActivationFunction output_act = net->act_func[last - 1];
     float total_error = 0.0f;
 
     for (uint32_t s = 0; s < N; s++) {
-        const float *out = ws->act[last] + (size_t)s * (size_t)n_out;
-        const float *tgt = targets + (size_t)s * (size_t)n_out;
-        total_error += compute_sample_loss(out, tgt, n_out, net->loss_func, output_act);
+        size_t off = (size_t)s * (size_t)n_out;
+        total_error += compute_sample_loss(ws->act[last] + off, targets + off, n_out, net->loss_func, output_act);
     }
 
     return total_error;
 }
 
-#endif
+#endif /* SPINGALETT_HAS_OPENBLAS */
 
-static void apply_gradients_batch_prescaled(NeuralNetwork *net, TrainArgs *args,
-                                             float beta1_pow_t, float beta2_pow_t) {
-    uint32_t last = net->layers - 1;
-    float lr = args->learning_rate;
-    float decay = args->weight_decay;
-    float momentum = args->momentum;
-    float beta1 = args->beta1;
-    float beta2 = args->beta2;
-    float epsilon = args->epsilon;
-    float one_minus_b1 = 1.0f - beta1;
-    float one_minus_b2 = 1.0f - beta2;
-
-    if (args->max_grad_norm > 0.0f)
-        spingalett_clip_grad_norm(net, args->max_grad_norm);
-
-    for (uint32_t l = 0; l < last; l++) {
-        uint32_t in_sz  = net->topology[l];
-        uint32_t out_sz = net->topology[l + 1];
-        uint64_t total_w = (uint64_t)in_sz * (uint64_t)out_sz;
-
-        float *W   = SPINGALETT_WEIGHT_MTX_PTR(net, l);
-        float *gW  = SPINGALETT_GRAD_W_MTX_PTR(net, l);
-        float *b   = net->biases       + net->bias_offsets[l];
-        float *gB  = net->grad_biases  + net->bias_offsets[l];
-        float *mW  = net->opt_m_weights + net->weight_offsets[l];
-        float *vW  = net->opt_v_weights + net->weight_offsets[l];
-        float *mB  = net->opt_m_biases  + net->bias_offsets[l];
-        float *vB  = net->opt_v_biases  + net->bias_offsets[l];
-
-        if (args->optimizer_type == OPTIMIZER_SGD) {
-            if (decay > 0.0f) {
-                spingalett_sgd_decay_update_avx(W, gW, total_w, lr, decay);
-            } else {
-                spingalett_sgd_update_avx(W, gW, total_w, lr);
-            }
-            spingalett_sgd_update_avx(b, gB, (uint64_t)out_sz, lr);
-
-        } else if (args->optimizer_type == OPTIMIZER_MOMENTUM) {
-            spingalett_momentum_update_avx(W, mW, gW, total_w, lr, momentum, decay);
-            spingalett_momentum_update_avx(b, mB, gB, (uint64_t)out_sz, lr, momentum, 0.0f);
-
-        } else if (args->optimizer_type == OPTIMIZER_ADAM || args->optimizer_type == OPTIMIZER_ADAMW) {
-            float m_factor = 1.0f / (1.0f - beta1_pow_t);
-            float v_factor = 1.0f / (1.0f - beta2_pow_t);
-            bool is_adamw = (args->optimizer_type == OPTIMIZER_ADAMW);
-
-            if (is_adamw && decay > 0.0f) {
-                float wd_factor = 1.0f - lr * decay;
-                spingalett_adamw_update_avx(W, mW, vW, gW, total_w,
-                                            lr, beta1, beta2, one_minus_b1, one_minus_b2,
-                                            m_factor, v_factor, epsilon, wd_factor);
-            } else {
-                if (!is_adamw && decay > 0.0f) {
-                    spingalett_vec_axpy(gW, W, total_w, decay);
-                }
-                spingalett_adam_update_avx(W, mW, vW, gW, total_w,
-                                           lr, beta1, beta2, one_minus_b1, one_minus_b2,
-                                           m_factor, v_factor, epsilon);
-            }
-            spingalett_adam_update_avx(b, mB, vB, gB, (uint64_t)out_sz,
-                                       lr, beta1, beta2, one_minus_b1, one_minus_b2,
-                                       m_factor, v_factor, epsilon);
-
-        } else if (args->optimizer_type == OPTIMIZER_RMSPROP) {
-            spingalett_rmsprop_update_avx(W, vW, gW, total_w, lr, beta2, one_minus_b2, epsilon, decay);
-            spingalett_rmsprop_update_avx(b, vB, gB, (uint64_t)out_sz, lr, beta2, one_minus_b2, epsilon, 0.0f);
-        }
-    }
-}
-
-static void apply_gradients_batch(NeuralNetwork *net, TrainArgs *args, uint32_t effective_count,
-                                   float beta1_pow_t, float beta2_pow_t) {
-    uint32_t last = net->layers - 1;
-    float scaler = 1.0f / (float)effective_count;
-
-    for (uint32_t l = 0; l < last; l++) {
-        uint32_t in_sz  = net->topology[l];
-        uint32_t out_sz = net->topology[l + 1];
-        uint64_t total_w = (uint64_t)in_sz * (uint64_t)out_sz;
-        float *gW = SPINGALETT_GRAD_W_MTX_PTR(net, l);
-        float *gB = net->grad_biases + net->bias_offsets[l];
-
-        spingalett_vec_scale(gW, total_w, scaler);
-        spingalett_vec_scale(gB, (uint64_t)out_sz, scaler);
-    }
-
-    apply_gradients_batch_prescaled(net, args, beta1_pow_t, beta2_pow_t);
-
-    for (uint32_t l = 0; l < last; l++) {
-        uint32_t in_sz  = net->topology[l];
-        uint32_t out_sz = net->topology[l + 1];
-        uint64_t total_w = (uint64_t)in_sz * (uint64_t)out_sz;
-        memset(SPINGALETT_GRAD_W_MTX_PTR(net, l), 0, total_w * sizeof(float));
-        memset(net->grad_biases + net->bias_offsets[l], 0, out_sz * sizeof(float));
-    }
-}
-
-static void handle_autosave(NeuralNetwork *net, TrainArgs *args, size_t epoch) {
+static void handle_autosave(NeuralNetwork *net, const TrainArgs *args, size_t epoch) {
     if (!args || args->autosave_mode == AUTOSAVE_OFF) return;
     if (args->autosave_interval == 0 || !args->autosave_path) return;
 
@@ -577,16 +469,227 @@ static void handle_autosave(NeuralNetwork *net, TrainArgs *args, size_t epoch) {
     }
 }
 
+#if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
+/* Multiply-adds per BLAS call below which OpenBLAS's thread pool costs more than it saves
+   (measured: per-sample training of a 784-512-1000-10 net runs 1.5x faster on one thread,
+   a 784-64-64-10 net 3.8x; mini-batches of 32 over 256-wide layers break even). */
+#define BLAS_SINGLE_THREAD_WORK (4u << 20)
+
+static int choose_blas_threads(const NeuralNetwork *net, const TrainArgs *args, uint32_t batch) {
+    if (args->blas_num_threads > 0)
+        return args->blas_num_threads;
+
+    uint64_t widest = 0;
+    for (uint32_t l = 0; l + 1 < net->layers; l++) {
+        uint64_t w = (uint64_t)net->topology[l] * net->topology[l + 1];
+        if (w > widest) widest = w;
+    }
+    if ((uint64_t)batch * widest < BLAS_SINGLE_THREAD_WORK)
+        return 1;
+    return (int)spingalett_get_num_threads();   /* 0 keeps OpenBLAS's own setting */
+}
+#endif
+
+/* Flush-to-zero on the calling thread and, in OpenMP mode, on every worker of the team. */
+static void flush_denormals_begin(ComputeMode mode) {
+    spingalett_fp_flush_denormals_begin();
+#if defined(_OPENMP)
+    if (mode == COMPUTE_OPENMP) {
+#pragma omp parallel
+        if (omp_get_thread_num() != 0) spingalett_fp_flush_denormals_begin();
+    }
+#endif
+    (void)mode;
+}
+
+static void flush_denormals_end(ComputeMode mode) {
+#if defined(_OPENMP)
+    if (mode == COMPUTE_OPENMP) {
+#pragma omp parallel
+        if (omp_get_thread_num() != 0) spingalett_fp_flush_denormals_end();
+    }
+#endif
+    spingalett_fp_flush_denormals_end();
+    (void)mode;
+}
+
 static inline bool should_report(size_t epoch, size_t epochs, size_t interval) {
     return interval > 0 && ((epoch % interval == 0) || (epoch == epochs));
+}
+
+typedef struct {
+    NeuralNetwork *net;
+    TrainArgs *args;
+    ComputeMode mode;
+    OptimizerStep opt;
+    float beta1_pow, beta2_pow;
+
+    bool use_blas_batch;
+    uint32_t batch_size;        /* samples per optimizer step */
+    uint32_t *order;            /* sample order (shuffled per epoch for mini-batches) */
+
+    bool use_generator;
+    uint32_t gen_capacity;      /* samples requested per generator call */
+    float *gen_inputs;          /* generator buffers (alias the BLAS gather buffers) */
+    float *gen_targets;
+    bool gen_owned;
+
+    float **deltas;             /* per-sample path */
+    float *deltas_flat;
+
+    bool use_dropout;
+    DropoutContext dropout;     /* dropout.dmask: per-sample path buffer */
+#if defined(SPINGALETT_HAS_OPENBLAS)
+    BatchWorkspace *ws;         /* BLAS batch path */
+#endif
+} Trainer;
+
+static void trainer_free(Trainer *t) {
+    if (t->gen_owned) {
+        spingalett_aligned_free(t->gen_inputs);
+        spingalett_aligned_free(t->gen_targets);
+    }
+    free(t->order);
+    free(t->deltas);
+    spingalett_aligned_free(t->deltas_flat);
+    spingalett_aligned_free(t->dropout.dmask);
+#if defined(SPINGALETT_HAS_OPENBLAS)
+    batch_workspace_free(t->ws);
+#endif
+}
+
+static bool trainer_alloc(Trainer *t) {
+    NeuralNetwork *net = t->net;
+    uint32_t sample_count = t->args->sample_count;
+
+    if (t->args->training_strategy == STRATEGY_SMALL_BATCH && !t->use_generator) {
+        t->order = (uint32_t *)malloc((size_t)sample_count * sizeof(uint32_t));
+        if (!t->order) return false;
+        for (uint32_t i = 0; i < sample_count; i++)
+            t->order[i] = i;
+    }
+
+#if defined(SPINGALETT_HAS_OPENBLAS)
+    if (t->use_blas_batch) {
+        t->ws = batch_workspace_create(net, t->batch_size, t->order != NULL || t->use_generator);
+        if (!t->ws) return false;
+        t->gen_inputs = t->ws->inputs;      /* the generator writes straight into the workspace */
+        t->gen_targets = t->ws->targets;
+        return true;
+    }
+#endif
+
+    if (t->use_generator) {
+        t->gen_owned = true;
+        t->gen_inputs  = (float *)spingalett_aligned_alloc((size_t)t->gen_capacity * net->topology[0] * sizeof(float));
+        t->gen_targets = (float *)spingalett_aligned_alloc((size_t)t->gen_capacity * net->topology[net->layers - 1] * sizeof(float));
+        if (!t->gen_inputs || !t->gen_targets) return false;
+    }
+
+    t->deltas = (float **)calloc(net->layers, sizeof(float *));
+    t->deltas_flat = (float *)spingalett_aligned_calloc(net->total_neurons, sizeof(float));
+    if (!t->deltas || !t->deltas_flat) return false;
+    if (t->use_dropout) {
+        t->dropout.dmask = (float *)spingalett_aligned_calloc(net->total_neurons, sizeof(float));
+        if (!t->dropout.dmask) return false;
+    }
+    for (uint32_t l = 0; l < net->layers; l++)
+        t->deltas[l] = t->deltas_flat + net->neuron_offsets[l];
+    return true;
+}
+
+static void trainer_begin_step(Trainer *t) {
+    t->net->time_step++;
+    t->beta1_pow *= t->opt.beta1;
+    t->beta2_pow *= t->opt.beta2;
+    t->opt.m_factor = 1.0f / (1.0f - t->beta1_pow);
+    t->opt.v_factor = 1.0f / (1.0f - t->beta2_pow);
+}
+
+/* Trains on rows order[start .. start+count) of inputs/targets (rows start.. directly when order
+   is NULL) and performs the optimizer step(s). Returns the summed loss when need_loss is set. */
+static float trainer_step(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order,
+                          uint32_t start, uint32_t count, bool need_loss) {
+    NeuralNetwork *net = t->net;
+    const TrainArgs *args = t->args;
+    uint32_t in_sz  = net->topology[0];
+    uint32_t out_sz = net->topology[net->layers - 1];
+    ActivationFunction out_act = net->act_func[net->layers - 2];
+    float loss = 0.0f;
+
+#if defined(SPINGALETT_HAS_OPENBLAS)
+    if (t->use_blas_batch) {
+        BatchWorkspace *ws = t->ws;
+        const float *targets;
+        if (order) {
+            for (uint32_t s = 0; s < count; s++) {
+                uint32_t idx = order[start + s];
+                memcpy(ws->inputs + (size_t)s * in_sz, inputs + (size_t)idx * in_sz, in_sz * sizeof(float));
+                memcpy(ws->targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
+            }
+            ws->act[0] = ws->inputs;
+            targets = ws->targets;
+        } else {
+            /* Contiguous rows are read in place; act[0] is never written. */
+            ws->act[0] = (float *)(inputs + (size_t)start * in_sz);
+            targets = targets_in + (size_t)start * out_sz;
+        }
+
+        t->dropout.step = net->time_step;
+        batch_forward(net, ws, count, t->use_dropout ? &t->dropout : NULL);
+        if (need_loss)
+            loss = batch_compute_loss(net, ws, targets, count);
+        batch_compute_deltas(net, ws, targets, count);
+        batch_accumulate_gradients(net, ws, count, 1.0f / (float)count);
+
+        trainer_begin_step(t);
+        apply_gradients(net, &t->opt, args->max_grad_norm, t->mode);
+        return loss;
+    }
+#endif
+
+    bool online = (args->training_strategy == STRATEGY_SAMPLE);
+    float scale = 1.0f / (float)count;
+
+    const DropoutContext *dropout = t->use_dropout ? &t->dropout : NULL;
+
+    for (uint32_t s = 0; s < count; s++) {
+        uint32_t idx = order ? order[start + s] : start + s;
+        const float *target = targets_in + (size_t)idx * out_sz;
+
+        /* Online steps hold one sample each, so its position within the step is 0. */
+        t->dropout.step = net->time_step;
+        t->dropout.position = online ? 0 : s;
+        const float *out = spingalett_forward_pass(net, inputs + (size_t)idx * in_sz, t->mode, dropout);
+
+        if (need_loss)
+            loss += compute_sample_loss(out, target, out_sz, net->loss_func, out_act);
+
+        compute_deltas(net, target, t->deltas, dropout ? t->dropout.dmask : NULL, t->mode);
+
+        if (online) {
+            if (args->max_grad_norm > 0.0f)
+                clip_sample_gradient(net, t->deltas, args->max_grad_norm);
+            trainer_begin_step(t);
+            apply_rank1_updates(net, &t->opt, t->deltas, t->mode);
+        } else {
+            accumulate_gradients(net, t->deltas, scale, t->mode);
+        }
+    }
+
+    if (!online) {
+        trainer_begin_step(t);
+        apply_gradients(net, &t->opt, args->max_grad_norm, t->mode);
+        memset(net->grad_weights, 0, net->total_weights * sizeof(float));
+        memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
+    }
+    return loss;
 }
 
 void train_struct_arguments(TrainArgs args) {
     NeuralNetwork *net = args.net;
     TrainingMode training_mode = args.training_mode;
     TrainingStrategy training_strategy = args.training_strategy;
-    float *inputs = args.inputs;
-    float *targets = args.targets;
     uint32_t sample_count = args.sample_count;
     size_t epochs = args.epochs;
 
@@ -599,14 +702,30 @@ void train_struct_arguments(TrainArgs args) {
     if (args.callback && args.callback_interval == 0)
         args.callback_interval = 1;
 
-    if (training_mode == MODE_GENERATOR_FUNCTION) {
-        set_error(SPINGALETT_ERR_INVALID, "Generator function training mode is not implemented yet");
-        spingalett_log(LOG_ERROR, "Generator function training mode is not implemented yet");
+    if ((unsigned)training_mode >= MODE_COUNT ||
+        (unsigned)training_strategy >= STRATEGY_COUNT ||
+        (unsigned)args.optimizer_type >= OPTIMIZER_COUNT) {
+        set_error(SPINGALETT_ERR_INVALID, "Invalid training mode, strategy or optimizer");
+        spingalett_log(LOG_ERROR, "Invalid training mode, strategy or optimizer");
         return;
     }
 
-    if (!net || sample_count == 0 || epochs == 0 || !inputs || !targets) {
-        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL net/inputs/targets or zero count/epochs)");
+    bool use_generator = (training_mode == MODE_GENERATOR_FUNCTION);
+
+    if (!net || epochs == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL net or zero epochs)");
+        spingalett_log(LOG_ERROR, "Invalid training arguments");
+        return;
+    }
+
+    if (use_generator) {
+        if (!args.generator || (training_strategy == STRATEGY_FULL_BATCH && sample_count == 0)) {
+            set_error(SPINGALETT_ERR_INVALID, "Generator mode needs a generator (and sample_count for full batch)");
+            spingalett_log(LOG_ERROR, "Generator mode needs a generator (and sample_count for full batch)");
+            return;
+        }
+    } else if (sample_count == 0 || !args.inputs || !args.targets) {
+        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL inputs/targets or zero sample count)");
         spingalett_log(LOG_ERROR, "Invalid training arguments");
         return;
     }
@@ -627,7 +746,7 @@ void train_struct_arguments(TrainArgs args) {
 
     if (training_strategy == STRATEGY_SMALL_BATCH && args.batch_size == 0)
         args.batch_size = 32;
-    if (training_strategy == STRATEGY_SMALL_BATCH && args.batch_size > sample_count)
+    if (training_strategy == STRATEGY_SMALL_BATCH && sample_count > 0 && args.batch_size > sample_count)
         args.batch_size = sample_count;
 
     if (args.reset_optimizer) {
@@ -659,8 +778,13 @@ void train_struct_arguments(TrainArgs args) {
 #endif
 
 #if defined(_OPENMP)
-    if (spingalett_get_num_threads() > 0)
+    if (spingalett_get_num_threads() > 0) {
         omp_set_num_threads((int)spingalett_get_num_threads());
+        if (effective_mode == COMPUTE_OPENMP && (int)spingalett_get_num_threads() > omp_get_num_procs())
+            spingalett_log(LOG_WARNING, "%u threads requested but only %d processors are available; "
+                           "oversubscription usually slows training down",
+                           spingalett_get_num_threads(), omp_get_num_procs());
+    }
 #endif
 
     if (training_strategy == STRATEGY_SMALL_BATCH) {
@@ -680,246 +804,138 @@ void train_struct_arguments(TrainArgs args) {
             compute_mode_names[effective_mode < COMPUTE_COUNT ? effective_mode : 0]);
     }
 
-    uint32_t input_node_count = net->topology[0];
-    uint32_t output_node_count = net->topology[net->layers - 1];
-    ActivationFunction output_act = net->act_func[net->layers - 2];
+    Trainer t = {0};
+    t.net = net;
+    t.args = &args;
+    t.mode = effective_mode;
+    t.opt = (OptimizerStep){
+        .type = args.optimizer_type, .lr = args.learning_rate, .decay = args.weight_decay,
+        .momentum = args.momentum, .beta1 = args.beta1, .beta2 = args.beta2, .epsilon = args.epsilon,
+    };
+    // Adam bias correction must continue from the persisted step count; restarting it at 1
+    // on every train() call (or after loading a checkpoint) inflates the first updates ~10x.
+    t.beta1_pow = powf(args.beta1, (float)net->time_step);
+    t.beta2_pow = powf(args.beta2, (float)net->time_step);
 
-    float beta1_pow = 1.0f;
-    float beta2_pow = 1.0f;
+    switch (training_strategy) {
+        case STRATEGY_SAMPLE:      t.batch_size = 1; break;
+        case STRATEGY_SMALL_BATCH: t.batch_size = args.batch_size; break;
+        default:                   t.batch_size = sample_count; break;
+    }
 
+    t.use_generator = use_generator;
+    if (use_generator) {
+        /* Per-sample training pulls chunks of samples and steps after each one. */
+        t.gen_capacity = (training_strategy == STRATEGY_SAMPLE)
+                         ? ((sample_count > 0 && sample_count < 256u) ? sample_count : 256u)
+                         : t.batch_size;
+    }
 #if defined(SPINGALETT_HAS_OPENBLAS)
-    if (effective_mode == COMPUTE_OPENBLAS &&
-        (training_strategy == STRATEGY_FULL_BATCH || training_strategy == STRATEGY_SMALL_BATCH)) {
+    t.use_blas_batch = (effective_mode == COMPUTE_OPENBLAS && training_strategy != STRATEGY_SAMPLE);
+#endif
 
-        uint32_t effective_batch = (training_strategy == STRATEGY_SMALL_BATCH)
-                                   ? args.batch_size : sample_count;
+    if (net->dropout_rates[net->layers - 1] > 0.0f)
+        spingalett_log(LOG_WARNING, "Dropout is not applied to the output layer; ignoring rate %g",
+                       (double)net->dropout_rates[net->layers - 1]);
+    t.use_dropout = spingalett_has_dropout(net);
+    if (t.use_dropout)
+        t.dropout.seed = rng_next64();
 
-        BatchWorkspace *ws = batch_workspace_create(net, effective_batch);
-        if (!ws) {
-            set_error(SPINGALETT_ERR_ALLOC, "Failed to allocate batch workspace");
-            spingalett_log(LOG_ERROR, "Failed to allocate batch workspace");
-            return;
-        }
-
-        uint32_t *shuffle_idx = NULL;
-        float *batch_inputs = NULL;
-        float *batch_targets = NULL;
-
-        if (training_strategy == STRATEGY_SMALL_BATCH) {
-            shuffle_idx = (uint32_t *)malloc(sample_count * sizeof(uint32_t));
-            batch_inputs = (float *)spingalett_aligned_alloc(
-                (size_t)effective_batch * (size_t)input_node_count * sizeof(float));
-            batch_targets = (float *)spingalett_aligned_alloc(
-                (size_t)effective_batch * (size_t)output_node_count * sizeof(float));
-            if (!shuffle_idx || !batch_inputs || !batch_targets) {
-                set_error(SPINGALETT_ERR_ALLOC, "Mini-batch allocation failed");
-                spingalett_log(LOG_ERROR, "Mini-batch allocation failed");
-                free(shuffle_idx);
-                spingalett_aligned_free(batch_inputs);
-                spingalett_aligned_free(batch_targets);
-                batch_workspace_free(ws);
-                return;
-            }
-            for (uint32_t i = 0; i < sample_count; i++)
-                shuffle_idx[i] = i;
-        }
-
-        for (size_t epoch = 1; epoch <= epochs; epoch++) {
-            bool need_loss = should_report(epoch, epochs, args.report_interval) ||
-                             (args.callback && should_report(epoch, epochs, args.callback_interval));
-            float total_error = 0.0f;
-
-            if (training_strategy == STRATEGY_FULL_BATCH) {
-                float grad_scale = 1.0f / (float)sample_count;
-
-                batch_forward(net, ws, inputs, sample_count);
-
-                if (need_loss)
-                    total_error = batch_compute_loss(net, ws, targets, sample_count);
-
-                batch_compute_deltas(net, ws, targets, sample_count);
-                batch_accumulate_gradients(net, ws, sample_count, grad_scale);
-
-                net->time_step++;
-                beta1_pow *= args.beta1;
-                beta2_pow *= args.beta2;
-                apply_gradients_batch_prescaled(net, &args, beta1_pow, beta2_pow);
-            } else {
-                spingalett_shuffle_indices(shuffle_idx, sample_count);
-
-                uint32_t num_batches = (sample_count + effective_batch - 1) / effective_batch;
-
-                for (uint32_t bi = 0; bi < num_batches; bi++) {
-                    uint32_t start = bi * effective_batch;
-                    uint32_t end = start + effective_batch;
-                    if (end > sample_count) end = sample_count;
-                    uint32_t cur_batch = end - start;
-                    float grad_scale = 1.0f / (float)cur_batch;
-
-                    for (uint32_t s = 0; s < cur_batch; s++) {
-                        uint32_t idx = shuffle_idx[start + s];
-                        memcpy(batch_inputs + (size_t)s * input_node_count,
-                               inputs + (size_t)idx * input_node_count,
-                               input_node_count * sizeof(float));
-                        memcpy(batch_targets + (size_t)s * output_node_count,
-                               targets + (size_t)idx * output_node_count,
-                               output_node_count * sizeof(float));
-                    }
-
-                    batch_forward(net, ws, batch_inputs, cur_batch);
-
-                    if (need_loss)
-                        total_error += batch_compute_loss(net, ws, batch_targets, cur_batch);
-
-                    batch_compute_deltas(net, ws, batch_targets, cur_batch);
-                    batch_accumulate_gradients(net, ws, cur_batch, grad_scale);
-
-                    net->time_step++;
-                    beta1_pow *= args.beta1;
-                    beta2_pow *= args.beta2;
-                    apply_gradients_batch_prescaled(net, &args, beta1_pow, beta2_pow);
-                }
-            }
-
-            float current_error = total_error / (float)sample_count;
-
-            if (should_report(epoch, epochs, args.report_interval))
-                spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f", epoch, epochs, (double)current_error);
-
-            if (args.nan_check_interval > 0 && (epoch % args.nan_check_interval == 0)) {
-                if (check_nan_inf(net)) {
-                    spingalett_log(LOG_ERROR, "NaN/Inf detected in weights at epoch %zu, stopping training", epoch);
-                    break;
-                }
-            }
-
-            if (args.autosave_mode != AUTOSAVE_OFF &&
-                args.autosave_interval > 0 &&
-                args.autosave_path &&
-                should_report(epoch, epochs, args.autosave_interval))
-                handle_autosave(net, &args, epoch);
-
-            if (args.callback && should_report(epoch, epochs, args.callback_interval)) {
-                if (args.callback(net, epoch, current_error)) {
-                    spingalett_log(LOG_INFO, "Training interrupted by callback at epoch %zu", epoch);
-                    break;
-                }
-            }
-        }
-
-        free(shuffle_idx);
-        spingalett_aligned_free(batch_inputs);
-        spingalett_aligned_free(batch_targets);
-        batch_workspace_free(ws);
-        spingalett_log(LOG_INFO, "Training completed.");
+    if (!trainer_alloc(&t)) {
+        trainer_free(&t);
+        set_error(SPINGALETT_ERR_ALLOC, "Failed to allocate training buffers");
+        spingalett_log(LOG_ERROR, "Failed to allocate training buffers");
         return;
+    }
+
+    // The accumulating paths add into grad_* and expect it to start at zero; a previous run
+    // on another backend may have left the last batch's gradients there.
+    memset(net->grad_weights, 0, net->total_weights * sizeof(float));
+    memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
+
+    /* STRATEGY_SAMPLE walks the whole set in one call and steps after every sample. */
+    uint32_t step_size = (training_strategy == STRATEGY_SAMPLE) ? sample_count : t.batch_size;
+    uint32_t steps_per_epoch = step_size ? (sample_count + step_size - 1) / step_size : 0;
+
+    flush_denormals_begin(effective_mode);
+
+#if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
+    int saved_blas_threads = 0;
+    if (effective_mode == COMPUTE_OPENBLAS) {
+        int blas_threads = choose_blas_threads(net, &args, t.batch_size);
+        if (blas_threads > 0) {
+            saved_blas_threads = openblas_get_num_threads();
+            openblas_set_num_threads(blas_threads);
+            spingalett_log(LOG_DEBUG, "OpenBLAS threads: %d", blas_threads);
+        }
     }
 #endif
 
-    float **deltas = (float **)malloc(net->layers * sizeof(float *));
-    if (!deltas) {
-        set_error(SPINGALETT_ERR_ALLOC, "Failed to allocate deltas pointer array");
-        spingalett_log(LOG_ERROR, "Failed to allocate deltas");
-        return;
-    }
-    float *deltas_flat = (float *)malloc(net->total_neurons * sizeof(float));
-    if (!deltas_flat) {
-        free(deltas);
-        set_error(SPINGALETT_ERR_ALLOC, "Failed to allocate deltas flat buffer");
-        spingalett_log(LOG_ERROR, "Failed to allocate deltas");
-        return;
-    }
-
-    size_t d_off = 0;
-    for (uint32_t i = 0; i < net->layers; i++) {
-        deltas[i] = deltas_flat + d_off;
-        d_off += net->topology[i];
-    }
-
-    uint32_t *shuffle_idx = NULL;
-    if (training_strategy == STRATEGY_SMALL_BATCH) {
-        shuffle_idx = (uint32_t *)malloc(sample_count * sizeof(uint32_t));
-        if (!shuffle_idx) {
-            free(deltas_flat);
-            free(deltas);
-            set_error(SPINGALETT_ERR_ALLOC, "Failed to allocate shuffle indices");
-            spingalett_log(LOG_ERROR, "Failed to allocate shuffle indices");
-            return;
-        }
-        for (uint32_t i = 0; i < sample_count; i++)
-            shuffle_idx[i] = i;
-    }
+    bool lr_warned = false;
 
     for (size_t epoch = 1; epoch <= epochs; epoch++) {
-        float total_error = 0.0f;
         bool need_loss = should_report(epoch, epochs, args.report_interval) ||
                          (args.callback && should_report(epoch, epochs, args.callback_interval));
+        float total_error = 0.0f;
 
-        if (training_strategy == STRATEGY_SMALL_BATCH) {
-            spingalett_shuffle_indices(shuffle_idx, sample_count);
-
-            uint32_t bs = args.batch_size;
-            uint32_t num_batches = (sample_count + bs - 1) / bs;
-
-            for (uint32_t bi = 0; bi < num_batches; bi++) {
-                uint32_t start = bi * bs;
-                uint32_t end = start + bs;
-                if (end > sample_count) end = sample_count;
-                uint32_t cur_batch = end - start;
-
-                for (uint32_t s = 0; s < cur_batch; s++) {
-                    uint32_t idx = shuffle_idx[start + s];
-                    float *current_input  = inputs  + (size_t)idx * input_node_count;
-                    float *current_target = targets + (size_t)idx * output_node_count;
-
-                    ForwardArgs fwd_args = { .net = net, .input = current_input };
-                    forward_struct_arguments(fwd_args);
-
-                    if (need_loss) {
-                        const float *out_layer = SPINGALETT_LAYER_PTR(net, net->layers - 1);
-                        total_error += compute_sample_loss(out_layer, current_target, output_node_count, net->loss_func, output_act);
-                    }
-
-                    accumulate_gradients_single(net, current_target, &args, deltas, effective_mode);
-                }
-
-                net->time_step++;
-                beta1_pow *= args.beta1;
-                beta2_pow *= args.beta2;
-                apply_gradients_batch(net, &args, cur_batch, beta1_pow, beta2_pow);
-            }
-        } else {
-            for (uint32_t s = 0; s < sample_count; s++) {
-                float *current_input  = inputs  + (size_t)s * input_node_count;
-                float *current_target = targets + (size_t)s * output_node_count;
-
-                ForwardArgs fwd_args = { .net = net, .input = current_input };
-                forward_struct_arguments(fwd_args);
-
-                if (need_loss) {
-                    const float *out_layer = SPINGALETT_LAYER_PTR(net, net->layers - 1);
-                    total_error += compute_sample_loss(out_layer, current_target, output_node_count, net->loss_func, output_act);
-                }
-
-                if (training_strategy == STRATEGY_SAMPLE) {
-                    backpropagation(net, current_target, &args, deltas, &beta1_pow, &beta2_pow, effective_mode);
-                } else {
-                    accumulate_gradients_single(net, current_target, &args, deltas, effective_mode);
-                }
-            }
-
-            if (training_strategy != STRATEGY_SAMPLE) {
-                net->time_step++;
-                beta1_pow *= args.beta1;
-                beta2_pow *= args.beta2;
-                apply_gradients_batch(net, &args, sample_count, beta1_pow, beta2_pow);
+        if (args.lr_scheduler) {
+            float lr = args.lr_scheduler(epoch - 1, epochs, args.learning_rate, args.lr_scheduler_data);
+            if (lr >= 0.0f && isfinite(lr)) {
+                t.opt.lr = lr;
+            } else if (!lr_warned) {
+                lr_warned = true;
+                spingalett_log(LOG_WARNING, "LR scheduler returned %g at epoch %zu; keeping lr=%g",
+                               (double)lr, epoch, (double)t.opt.lr);
             }
         }
 
-        float current_error = total_error / (float)sample_count;
+        uint64_t epoch_samples = 0;
 
-        if (should_report(epoch, epochs, args.report_interval))
-            spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f", epoch, epochs, (double)current_error);
+        if (use_generator) {
+            bool failed = false;
+            for (;;) {
+                uint32_t want = t.gen_capacity;
+                if (sample_count > 0) {
+                    if (epoch_samples >= sample_count) break;
+                    if (sample_count - epoch_samples < want) want = (uint32_t)(sample_count - epoch_samples);
+                }
+                uint32_t got = args.generator(t.gen_inputs, t.gen_targets, want, args.generator_data);
+                if (got == 0) break;
+                if (got > want) {
+                    set_error(SPINGALETT_ERR_INVALID, "Generator returned more samples than requested");
+                    spingalett_log(LOG_ERROR, "Generator returned %u samples for a request of %u; stopping training", got, want);
+                    failed = true;
+                    break;
+                }
+                total_error += trainer_step(&t, t.gen_inputs, t.gen_targets, NULL, 0, got, need_loss);
+                epoch_samples += got;
+                if (training_strategy == STRATEGY_FULL_BATCH) break;
+            }
+            if (failed) break;
+            if (epoch_samples == 0) {
+                spingalett_log(LOG_WARNING, "Generator produced no samples in epoch %zu; stopping training", epoch);
+                break;
+            }
+        } else {
+            if (t.order)
+                spingalett_shuffle_indices(t.order, sample_count);
+
+            for (uint32_t bi = 0; bi < steps_per_epoch; bi++) {
+                uint32_t start = bi * step_size;
+                uint32_t count = (sample_count - start < step_size) ? sample_count - start : step_size;
+                total_error += trainer_step(&t, args.inputs, args.targets, t.order, start, count, need_loss);
+            }
+            epoch_samples = sample_count;
+        }
+
+        float current_error = total_error / (float)epoch_samples;
+
+        if (should_report(epoch, epochs, args.report_interval)) {
+            if (args.lr_scheduler)
+                spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f, LR: %g", epoch, epochs, (double)current_error, (double)t.opt.lr);
+            else
+                spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f", epoch, epochs, (double)current_error);
+        }
 
         if (args.nan_check_interval > 0 && (epoch % args.nan_check_interval == 0)) {
             if (check_nan_inf(net)) {
@@ -928,10 +944,7 @@ void train_struct_arguments(TrainArgs args) {
             }
         }
 
-        if (args.autosave_mode != AUTOSAVE_OFF &&
-            args.autosave_interval > 0 &&
-            args.autosave_path &&
-            should_report(epoch, epochs, args.autosave_interval))
+        if (should_report(epoch, epochs, args.autosave_interval))
             handle_autosave(net, &args, epoch);
 
         if (args.callback && should_report(epoch, epochs, args.callback_interval)) {
@@ -942,8 +955,12 @@ void train_struct_arguments(TrainArgs args) {
         }
     }
 
-    free(shuffle_idx);
-    free(deltas_flat);
-    free(deltas);
+#if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
+    if (saved_blas_threads > 0)
+        openblas_set_num_threads(saved_blas_threads);
+#endif
+
+    flush_denormals_end(effective_mode);
+    trainer_free(&t);
     spingalett_log(LOG_INFO, "Training completed.");
 }

@@ -4,6 +4,7 @@
 */
 
 #include <Spingalett/Spingalett.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -73,7 +74,7 @@ static void run_benchmark(const char *name, ComputeMode mode,
     NeuralNetwork *net = create_network();
     printf("Topology: %d -> %d -> %d -> %d\n",
         INPUT_SIZE, HIDDEN_1, HIDDEN_2, OUTPUT_SIZE);
-    printf("Total Parameters: %lu\n", net->total_weights + net->total_biases);
+    printf("Total Parameters: %" PRIu64 "\n", net->total_weights + net->total_biases);
 
     double start = get_wall_time();
 
@@ -97,15 +98,22 @@ static void run_benchmark(const char *name, ComputeMode mode,
     free_network(net);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     srand(42);
 
     float *inputs = NULL;
     float *targets = NULL;
     generate_synthetic_data(&inputs, &targets);
-    spingalett_set_num_threads(16);
-    printf("\nThreads: %d", spingalett_get_num_threads());
-    
+
+    // Usage: Benchmark [threads]. Defaults to the OpenMP runtime's choice (one per core);
+    // asking for more threads than cores oversubscribes the CPU and slows training down.
+    if (argc > 1)
+        spingalett_set_num_threads((unsigned)strtoul(argv[1], NULL, 10));
+    if (spingalett_get_num_threads() > 0)
+        printf("\nThreads: %u\n", spingalett_get_num_threads());
+    else
+        printf("\nThreads: runtime default\n");
+
     run_benchmark("Single Threaded", COMPUTE_SINGLE_THREADED, inputs, targets);
 
 #if defined(SPINGALETT_HAS_OPENMP)
@@ -113,14 +121,12 @@ int main(void) {
 #else
     printf("\n[SKIP] OpenMP benchmark skipped (library built without OpenMP)\n");
 #endif
-//*/
-    
+
 #if defined(SPINGALETT_HAS_OPENBLAS)
     run_benchmark("OpenBLAS", COMPUTE_OPENBLAS, inputs, targets);
 #else
     printf("\n[SKIP] OpenBLAS benchmark skipped (library built without OpenBLAS)\n");
 #endif
-
 
     free(inputs);
     free(targets);

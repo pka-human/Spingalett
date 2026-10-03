@@ -23,7 +23,7 @@ extern "C" {
 #  define SPINGALETT_API __attribute__((visibility("default")))
 #endif
 
-#define SPINGALETT_FORMAT_VERSION 1
+#define SPINGALETT_FORMAT_VERSION 2
 
 typedef enum {
     LOG_DEBUG,
@@ -133,9 +133,35 @@ typedef struct {
 
     uint64_t time_step;
     LossFunction loss_func;
+
+    float *dropout_rates;           /* per layer, applied to its outputs while training */
 } NeuralNetwork;
 
 typedef bool (*TrainCallback)(NeuralNetwork *net, size_t epoch, float current_error);
+
+/*
+ * Data source for MODE_GENERATOR_FUNCTION. Write up to `requested` samples into `inputs`
+ * ([requested x input size], row-major) and `targets` ([requested x output size]) and return
+ * how many were written; returning 0 ends the epoch. Shuffling and augmentation are up to the
+ * generator. It is called once per mini-batch, once per epoch for full batch (requested =
+ * sample_count), and in chunks for per-sample training.
+ */
+typedef uint32_t (*DataGeneratorFn)(float *inputs, float *targets, uint32_t requested, void *user_data);
+
+/*
+ * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
+ * completed in this train() call (0 for the first), `initial_lr` is TrainArgs.learning_rate.
+ * Returns the learning rate for the coming epoch; negative or NaN results are ignored.
+ */
+typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
+
+/* Parameters of the built-in schedulers, passed as lr_scheduler_data (NULL = defaults). */
+typedef struct {
+    size_t warmup_epochs;   /* linear_warmup, warmup_cosine; 0 = 5% of the run (at least 1) */
+    size_t step_size;       /* step_decay: epochs between decays; 0 = a third of the run */
+    float  gamma;           /* step_decay: decay factor; 0 = 0.1 */
+    float  min_lr;          /* cosine_decay, warmup_cosine: final learning rate; default 0 */
+} LRScheduleParams;
 
 typedef struct {
     LossFunction loss_func;
@@ -146,6 +172,8 @@ typedef struct {
     uint32_t neurons_amount;
     ActivationFunction act_func;
     WeightInitialization weight_initialization;
+    float dropout_rate;             /* [0, 1): inverted dropout on this layer's outputs during
+                                       training; ignored on the input and output layers */
 } LayerArgs;
 
 typedef struct {
@@ -159,9 +187,12 @@ typedef struct {
     TrainingStrategy training_strategy;
     OptimizerType optimizer_type;
 
-    float *inputs;
-    float *targets;
-    uint32_t sample_count;
+    const float *inputs;            /* MODE_ARRAY: [sample_count x input size] */
+    const float *targets;           /* MODE_ARRAY: [sample_count x output size] */
+    DataGeneratorFn generator;      /* MODE_GENERATOR_FUNCTION */
+    void *generator_data;
+    uint32_t sample_count;          /* MODE_ARRAY: number of samples. Generator: samples per epoch
+                                       (0 = until the generator returns 0; required for full batch) */
     uint32_t batch_size;
     size_t epochs;
 
@@ -171,7 +202,7 @@ typedef struct {
     float beta1;
     float beta2;
     float epsilon;
-    float max_grad_norm;
+    float max_grad_norm;            /* clip the global L2 norm of each step's gradient; 0 = off */
 
     bool reset_optimizer;
     size_t nan_check_interval;
@@ -186,6 +217,14 @@ typedef struct {
 
     TrainCallback callback;
     size_t callback_interval;
+
+    LRSchedulerFn lr_scheduler;     /* NULL = constant learning_rate */
+    void *lr_scheduler_data;
+
+    /* OpenBLAS threads used while training (restored afterwards). 0 = auto: one thread when
+       each BLAS call is too small to amortize threading (per-sample training, small nets or
+       mini-batches), otherwise spingalett_set_num_threads() or OpenBLAS's own default. */
+    int blas_num_threads;
 } TrainArgs;
 
 typedef struct {
@@ -211,6 +250,9 @@ SPINGALETT_API void spingalett_set_num_threads(unsigned n);
 SPINGALETT_API void spingalett_set_log_callback(LogCallback cb);
 SPINGALETT_API void spingalett_set_log_level(LogLevel level);
 
+/* Seeds the calling thread's generator (weight init, shuffling, dropout) for reproducible runs. */
+SPINGALETT_API void spingalett_seed(uint64_t seed);
+
 SPINGALETT_API void spingalett_set_verbose(bool enabled);
 SPINGALETT_API bool spingalett_get_verbose(void);
 
@@ -225,6 +267,12 @@ SPINGALETT_API float derivative(float x, ActivationFunction act_func);
 
 #define forward(...) forward_struct_arguments((ForwardArgs){__VA_ARGS__})
 SPINGALETT_API float *forward_struct_arguments(ForwardArgs args);
+
+/* Built-in learning-rate schedules (see LRScheduleParams). */
+SPINGALETT_API float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+SPINGALETT_API float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+SPINGALETT_API float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+SPINGALETT_API float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 
 #define train(...) train_struct_arguments((TrainArgs){__VA_ARGS__})
 SPINGALETT_API void train_struct_arguments(TrainArgs args);

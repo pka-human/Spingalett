@@ -1,0 +1,15 @@
+# Build trees and outputs
+Build/
+build/
+Bin/
+Lib/
+
+# Saved models produced by the examples
+*.nn
+
+# Python bindings
+__pycache__/
+*.egg-info/
+Bindings/Python/build/
+Bindings/Python/dist/
+!Tests/Data/*.nn

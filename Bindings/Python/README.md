@@ -1,0 +1,52 @@
+# Spingalett for Python
+
+Thin `ctypes` bindings over the Spingalett shared library: no compiler is needed to install them,
+only NumPy and a built `libspingalett` (`.so` / `.dylib` / `.dll`).
+
+```bash
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENBLAS=ON
+cmake --build Build --parallel            # produces Bin/libspingalett.so
+pip install ./Bindings/Python
+export SPINGALETT_LIBRARY=$PWD/Bin/libspingalett.so   # or put Bin/ on the library path
+```
+
+Without `SPINGALETT_LIBRARY` the module looks next to itself, then in the repository's `Bin/`
+directory (when imported from a checkout), then on the system library path.
+
+```python
+import numpy as np
+import spingalett as sg
+
+x = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.float32)
+y = np.array([[0], [1], [1], [0]], dtype=np.float32)
+
+sg.set_compute_mode(sg.ComputeMode.OPENBLAS)   # falls back to single-threaded if unavailable
+sg.seed(42)
+
+layers = [
+    sg.Layer(2),
+    sg.Layer(16, sg.Activation.TANH, sg.Init.XAVIER, dropout=0.1),
+    sg.Layer(1, sg.Activation.SIGMOID, sg.Init.XAVIER),
+]
+with sg.Network(sg.Loss.MSE, layers) as net:
+    net.train(x, y, epochs=3000, optimizer=sg.Optimizer.ADAMW, learning_rate=0.02,
+              weight_decay=1e-4, lr_scheduler=sg.WarmupCosine(warmup_epochs=100),
+              callback=lambda net, epoch, err: err < 1e-4, callback_interval=100)
+    print(net.forward(x))          # one row per sample
+    net.save("xor", precision=sg.Precision.FP16)
+
+with sg.Network.load("xor.nn") as net:
+    print(net.topology, net.forward([1, 0]))
+```
+
+| API | Notes |
+|---|---|
+| `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer |
+| `forward(x)` | 1-D input -> vector, 2-D batch -> matrix (copies, safe to keep) |
+| `train(x, y, config=None, **overrides)` | fields of `TrainConfig`; exceptions raised in callbacks stop training and are re-raised |
+| `CosineDecay`, `LinearWarmup`, `StepDecay`, `WarmupCosine` | built-in schedules; any `fn(epoch, total, initial_lr)` works too |
+| `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weight matrix `i` connects layer `i` to `i + 1`, shape `(out, in)` |
+| `save(path, precision, save_optimizer)`, `Network.load(path)` | `.nn` format shared with the C API |
+| `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
+
+Library errors raise `SpingalettError`. A `Network` is not thread-safe: use one per thread.
