@@ -69,6 +69,11 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws);
    layers; samples are numbered position_offset + s for the dropout hash. */
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
+/* Summed loss and number of correctly classified samples (see EvalMetrics) over n samples, in
+   chunks of ws->capacity. ws is an inference workspace; out_buf holds [capacity x output size]. */
+void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
+                               const float *inputs, const float *targets, uint32_t n, ComputeMode mode,
+                               double *loss_sum, uint32_t *correct);
 
 bool spingalett_add_layer(LayerArgs args);
 bool spingalett_has_dropout(const NeuralNetwork *net);
@@ -81,6 +86,12 @@ void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t
                               const DropoutContext *ctx, uint32_t layer, uint32_t position);
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
+
+/* IEEE half and bfloat16 conversions, round to nearest even (Spingalett.Serialize.c). */
+uint16_t spingalett_float_to_fp16(float x);
+float    spingalett_fp16_to_float(uint16_t h);
+uint16_t spingalett_float_to_bf16(float x);
+float    spingalett_bf16_to_float(uint16_t h);
 
 void *spingalett_aligned_alloc(size_t size);
 void *spingalett_aligned_calloc(size_t count, size_t elem_size);

@@ -5,6 +5,54 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.4.0] - 2026-10-03
+
+### Added
+- Validation during training: `val_inputs`, `val_targets` and `val_count` in `TrainArgs` are
+  evaluated after every epoch. The best epoch of a monitored quantity (`monitor`: validation
+  loss or accuracy, or training loss) is tracked; `early_stopping_patience` and
+  `early_stopping_min_delta` stop training when it no longer improves, and
+  `restore_best_weights` ends training with the best epoch's parameters, kept in memory.
+- `evaluate()`: mean loss and accuracy over a data set.
+- A low-level training API for custom loops and losses: `spingalett_trainer_new()`,
+  `spingalett_trainer_forward()`, `spingalett_trainer_backward()` (built-in loss),
+  `spingalett_trainer_backward_output_grads()` (custom loss from dL/d(output)),
+  `spingalett_trainer_step()` with `OptimizerArgs`, `spingalett_trainer_zero_grad()` and
+  `spingalett_train_on_batch()`. Backward passes accumulate, so one step can span several.
+- Data sets: `spingalett_load_idx()` (MNIST format), `spingalett_load_csv()`,
+  `spingalett_dataset_shuffle()`, `spingalett_dataset_split()` and `spingalett_dataset_free()`.
+- Python: `validation_data`, `monitor`, `early_stopping_patience`, `early_stopping_min_delta` and
+  `restore_best_weights` for `Network.train()`, `Network.evaluate()`, `Trainer`,
+  `Network.get_weight_gradients()` / `get_bias_gradients()`, `load_idx()` and `load_csv()`.
+- `.slettd` data set files: `spingalett_save_dataset()`, `spingalett_load_dataset()`,
+  `spingalett_load_dataset_from_memory()` and a streaming reader (`spingalett_dataset_open()`,
+  `spingalett_dataset_read()`, and `spingalett_dataset_generator()` for `train()`). Values are kept
+  in the smallest lossless encoding (8-bit, half, float32, class indices for one-hot targets) or a
+  requested lossy one, and compressed with an adaptive context-model range coder in independently
+  decodable chunks with CRC-32 checksums: the MNIST training set takes 7.8 MB (IDX: 47.1 MB).
+  Specified in `docs/DatasetFormat.md`; `Examples/DatasetTool.c` converts IDX and CSV files. Python:
+  `save_dataset()`, `load_dataset()`, `dataset_info()` and `Network.train_from_file()`.
+- DigitPad (`Apps/DigitPad`, CMake option `BUILD_APPS`): a desktop app that classifies digits
+  drawn with the mouse, its trainer (99.27% MNIST test accuracy with on-the-fly augmentation) and
+  a script that packages app and model as a Linux AppImage.
+
+### Changed
+- The epoch callback is now `bool (*)(NeuralNetwork *, const TrainProgress *, void *user_data)`:
+  `TrainProgress` carries the epoch, training loss, learning rate, validation metrics and the
+  best epoch so far, and `TrainArgs.callback_data` is passed as `user_data`. In Python the
+  callback is `callback(network, progress)`.
+- `train()` returns a `TrainReport` (status, epochs run, last losses and metrics, best epoch);
+  in Python a `TrainResult`.
+- The training loss is computed in every epoch, not only in reported ones.
+- Model files use the extension `.slett` (`SPINGALETT_MODEL_EXTENSION`), appended when a file name
+  has none; files saved as `.nn` load as before.
+- A generator that answers 0 to the first request of an epoch is asked once more before training
+  stops, so generators that mark the end of each pass with a 0 also work with `sample_count`.
+- The shared library's soname carries the minor version while the major version is 0
+  (`libspingalett.so.0.4`), because 0.x minor releases are not ABI compatible.
+- `Examples/MNIST.c` holds out 5,000 training images for validation, keeps the best epoch and
+  evaluates the test set once.
+
 ## [0.3.0] - 2026-10-03
 
 ### Added
@@ -79,5 +127,6 @@ changes, which are listed under **Changed**.
 
 Initial release.
 
+[0.4.0]: https://github.com/pka-human/Spingalett/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pka-human/Spingalett/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pka-human/Spingalett/compare/0a1dd16...v0.2.0

@@ -42,8 +42,45 @@ int main(void) {
     FIELD(TrainArgs, reset_optimizer); FIELD(TrainArgs, nan_check_interval); FIELD(TrainArgs, report_interval);
     FIELD(TrainArgs, autosave_mode); FIELD(TrainArgs, autosave_interval); FIELD(TrainArgs, autosave_path);
     FIELD(TrainArgs, autosave_do_not_save_optimizer); FIELD(TrainArgs, autosave_precision);
-    FIELD(TrainArgs, callback); FIELD(TrainArgs, callback_interval);
-    FIELD(TrainArgs, lr_scheduler); FIELD(TrainArgs, lr_scheduler_data); FIELD(TrainArgs, blas_num_threads);
+    FIELD(TrainArgs, callback); FIELD(TrainArgs, callback_interval); FIELD(TrainArgs, callback_data);
+    FIELD(TrainArgs, lr_scheduler); FIELD(TrainArgs, lr_scheduler_data);
+    FIELD(TrainArgs, val_inputs); FIELD(TrainArgs, val_targets); FIELD(TrainArgs, val_count);
+    FIELD(TrainArgs, monitor); FIELD(TrainArgs, early_stopping_patience); FIELD(TrainArgs, early_stopping_min_delta);
+    FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads);
+
+    SIZE(EvalMetrics); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
+
+    SIZE(TrainProgress);
+    FIELD(TrainProgress, epoch); FIELD(TrainProgress, epochs); FIELD(TrainProgress, train_loss);
+    FIELD(TrainProgress, learning_rate); FIELD(TrainProgress, has_validation); FIELD(TrainProgress, validation);
+    FIELD(TrainProgress, monitor); FIELD(TrainProgress, best_epoch); FIELD(TrainProgress, best_value);
+    FIELD(TrainProgress, improved);
+
+    SIZE(TrainReport);
+    FIELD(TrainReport, status); FIELD(TrainReport, epochs_run); FIELD(TrainReport, train_loss);
+    FIELD(TrainReport, has_validation); FIELD(TrainReport, validation); FIELD(TrainReport, monitor);
+    FIELD(TrainReport, best_epoch); FIELD(TrainReport, best_value); FIELD(TrainReport, restored_best);
+
+    SIZE(EvaluateArgs);
+    FIELD(EvaluateArgs, net); FIELD(EvaluateArgs, inputs); FIELD(EvaluateArgs, targets); FIELD(EvaluateArgs, sample_count);
+
+    SIZE(OptimizerArgs);
+    FIELD(OptimizerArgs, type); FIELD(OptimizerArgs, learning_rate); FIELD(OptimizerArgs, weight_decay);
+    FIELD(OptimizerArgs, momentum); FIELD(OptimizerArgs, beta1); FIELD(OptimizerArgs, beta2);
+    FIELD(OptimizerArgs, epsilon); FIELD(OptimizerArgs, max_grad_norm);
+
+    SIZE(SpingalettDataset);
+    FIELD(SpingalettDataset, count); FIELD(SpingalettDataset, input_size); FIELD(SpingalettDataset, target_size);
+    FIELD(SpingalettDataset, inputs); FIELD(SpingalettDataset, targets);
+
+    SIZE(DatasetSaveOptions);
+    FIELD(DatasetSaveOptions, input_encoding); FIELD(DatasetSaveOptions, target_encoding);
+    FIELD(DatasetSaveOptions, no_compression);
+
+    SIZE(SpingalettDatasetInfo);
+    FIELD(SpingalettDatasetInfo, count); FIELD(SpingalettDatasetInfo, input_size); FIELD(SpingalettDatasetInfo, target_size);
+    FIELD(SpingalettDatasetInfo, input_encoding); FIELD(SpingalettDatasetInfo, target_encoding);
+    FIELD(SpingalettDatasetInfo, chunk_count); FIELD(SpingalettDatasetInfo, file_size);
 
     SIZE(PredictArgs);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);

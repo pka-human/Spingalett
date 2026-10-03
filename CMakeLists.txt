@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.3.0 LANGUAGES C)
+project(Spingalett VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -255,9 +255,15 @@ if(NOT MSVC)
     endif()
 endif()
 
+# Before 1.0 a minor release may break the ABI, so the soname carries major.minor (.so.0.4).
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+else()
+    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR})
+endif()
 set_target_properties(spingalett PROPERTIES
     VERSION ${PROJECT_VERSION}
-    SOVERSION 0
+    SOVERSION ${SPINGALETT_SOVERSION}
 )
 
 # ------------------------------------------------------------------------------
@@ -277,6 +283,43 @@ if(BUILD_EXAMPLE)
             set_target_properties(${EXAMPLE_NAME} PROPERTIES
                 BUILD_RPATH "$ORIGIN"
                 INSTALL_RPATH "$ORIGIN"
+            )
+        endif()
+    endforeach()
+endif()
+
+# ------------------------------------------------------------------------------
+# Apps: DigitPad (draw a digit, see the prediction; needs SDL2) and its trainer
+# ------------------------------------------------------------------------------
+option(BUILD_APPS "Build the DigitPad demo app and its trainer" OFF)
+
+if(BUILD_APPS)
+    set(DIGITPAD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Apps/DigitPad)
+
+    add_executable(DigitPadTrain ${DIGITPAD_DIR}/Train.c)
+    target_link_libraries(DigitPadTrain PRIVATE spingalett)
+
+    find_package(SDL2 CONFIG QUIET)
+    if(TARGET SDL2::SDL2)
+        add_executable(DigitPad ${DIGITPAD_DIR}/DigitPad.c)
+        target_link_libraries(DigitPad PRIVATE spingalett SDL2::SDL2)
+        if(TARGET SDL2::SDL2main)
+            target_link_libraries(DigitPad PRIVATE SDL2::SDL2main)
+        endif()
+        install(TARGETS DigitPad RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    else()
+        message(STATUS "Spingalett: SDL2 not found, DigitPad app not built (DigitPadTrain is)")
+    endif()
+
+    foreach(DIGITPAD_TARGET DigitPadTrain DigitPad)
+        if(TARGET ${DIGITPAD_TARGET} AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(${DIGITPAD_TARGET} PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+        endif()
+        if(TARGET ${DIGITPAD_TARGET} AND UNIX AND NOT APPLE)
+            target_link_libraries(${DIGITPAD_TARGET} PRIVATE m)
+            set_target_properties(${DIGITPAD_TARGET} PROPERTIES
+                BUILD_RPATH "$ORIGIN"
+                INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
             )
         endif()
     endforeach()
@@ -320,7 +363,7 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
-    foreach(group grad equiv cont optim sched dropout gen predict io xor)
+    foreach(group grad equiv cont optim sched dropout gen predict valid step data io xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

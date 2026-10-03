@@ -38,11 +38,13 @@ from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
-    "AutoSave", "LogLevel", "ErrorCode", "Layer", "TrainConfig", "Network", "SpingalettError",
+    "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
+    "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_csv",
+    "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
@@ -119,6 +121,32 @@ class ErrorCode(enum.IntEnum):
     FORMAT_VERSION = 4
 
 
+class Monitor(enum.IntEnum):
+    AUTO = 0            # validation loss with validation data, else training loss
+    TRAIN_LOSS = 1
+    VAL_LOSS = 2
+    VAL_ACCURACY = 3
+
+
+class DatasetEncoding(enum.IntEnum):
+    AUTO = 0            # smallest lossless; one-hot targets become CLASS
+    FLOAT32 = 1
+    FP16 = 2
+    BFLOAT16 = 3
+    U8_UNIT = 4         # q / 255
+    U8_AFFINE = 5       # per-feature 8-bit quantization (lossy)
+    CLASS = 6           # targets: class index of each row
+
+
+class TrainStatus(enum.IntEnum):
+    FAILED = 0
+    COMPLETED = 1
+    EARLY_STOPPED = 2
+    INTERRUPTED = 3
+    DIVERGED = 4
+    NO_DATA = 5
+
+
 class LogLevel(enum.IntEnum):
     DEBUG = 0
     INFO = 1
@@ -162,7 +190,41 @@ class _NeuralNetwork(Structure):
 
 _NetPtr = POINTER(_NeuralNetwork)
 
-_TrainCallbackFn = CFUNCTYPE(c_bool, _NetPtr, c_size_t, c_float)
+
+class _EvalMetrics(Structure):
+    _fields_ = [("loss", c_float), ("accuracy", c_float)]
+
+
+class _TrainProgress(Structure):
+    _fields_ = [
+        ("epoch", c_size_t),
+        ("epochs", c_size_t),
+        ("train_loss", c_float),
+        ("learning_rate", c_float),
+        ("has_validation", c_bool),
+        ("validation", _EvalMetrics),
+        ("monitor", c_int),
+        ("best_epoch", c_size_t),
+        ("best_value", c_float),
+        ("improved", c_bool),
+    ]
+
+
+class _TrainReport(Structure):
+    _fields_ = [
+        ("status", c_int),
+        ("epochs_run", c_size_t),
+        ("train_loss", c_float),
+        ("has_validation", c_bool),
+        ("validation", _EvalMetrics),
+        ("monitor", c_int),
+        ("best_epoch", c_size_t),
+        ("best_value", c_float),
+        ("restored_best", c_bool),
+    ]
+
+
+_TrainCallbackFn = CFUNCTYPE(c_bool, _NetPtr, POINTER(_TrainProgress), c_void_p)
 _LRSchedulerFn = CFUNCTYPE(c_float, c_size_t, c_size_t, c_float, c_void_p)
 _LogCallbackFn = CFUNCTYPE(None, c_int, c_char_p)
 _DataGeneratorFn = CFUNCTYPE(c_uint32, POINTER(c_float), POINTER(c_float), c_uint32, c_void_p)
@@ -217,8 +279,16 @@ class _TrainArgs(Structure):
         ("autosave_precision", c_int),
         ("callback", _TrainCallbackFn),
         ("callback_interval", c_size_t),
+        ("callback_data", c_void_p),
         ("lr_scheduler", _LRSchedulerFn),
         ("lr_scheduler_data", c_void_p),
+        ("val_inputs", POINTER(c_float)),
+        ("val_targets", POINTER(c_float)),
+        ("val_count", c_uint32),
+        ("monitor", c_int),
+        ("early_stopping_patience", c_size_t),
+        ("early_stopping_min_delta", c_float),
+        ("restore_best_weights", c_bool),
         ("blas_num_threads", c_int),
     ]
 
@@ -229,6 +299,54 @@ class _PredictArgs(Structure):
         ("inputs", POINTER(c_float)),
         ("sample_count", c_uint32),
         ("outputs", POINTER(c_float)),
+    ]
+
+
+class _EvaluateArgs(Structure):
+    _fields_ = [
+        ("net", _NetPtr),
+        ("inputs", POINTER(c_float)),
+        ("targets", POINTER(c_float)),
+        ("sample_count", c_uint32),
+    ]
+
+
+class _OptimizerArgs(Structure):
+    _fields_ = [
+        ("type", c_int),
+        ("learning_rate", c_float),
+        ("weight_decay", c_float),
+        ("momentum", c_float),
+        ("beta1", c_float),
+        ("beta2", c_float),
+        ("epsilon", c_float),
+        ("max_grad_norm", c_float),
+    ]
+
+
+class _Dataset(Structure):
+    _fields_ = [
+        ("count", c_uint32),
+        ("input_size", c_uint32),
+        ("target_size", c_uint32),
+        ("inputs", POINTER(c_float)),
+        ("targets", POINTER(c_float)),
+    ]
+
+
+class _DatasetSaveOptions(Structure):
+    _fields_ = [("input_encoding", c_int), ("target_encoding", c_int), ("no_compression", c_bool)]
+
+
+class _DatasetInfo(Structure):
+    _fields_ = [
+        ("count", c_uint32),
+        ("input_size", c_uint32),
+        ("target_size", c_uint32),
+        ("input_encoding", c_int),
+        ("target_encoding", c_int),
+        ("chunk_count", c_uint32),
+        ("file_size", c_uint64),
     ]
 
 
@@ -255,9 +373,10 @@ class _LRScheduleParams(Structure):
 def _library_names() -> List[str]:
     if sys.platform.startswith("win"):
         return ["spingalett.dll", "libspingalett.dll"]
+    abi = ".".join(__version__.split(".")[:2])     # the soname carries major.minor before 1.0
     if sys.platform == "darwin":
-        return ["libspingalett.dylib", "libspingalett.0.dylib"]
-    return ["libspingalett.so", "libspingalett.so.0"]
+        return ["libspingalett.dylib", f"libspingalett.{abi}.dylib"]
+    return ["libspingalett.so", f"libspingalett.so.{abi}"]
 
 
 def _load_library() -> ctypes.CDLL:
@@ -312,7 +431,25 @@ _new = _bind("new_spingalett_struct_arguments", _NetPtr, [_NeuralNetworkArgs])
 _layer = _bind("layer_struct_arguments", None, [_LayerArgs])
 _forward = _bind("forward_struct_arguments", POINTER(c_float), [_ForwardArgs])
 _predict = _bind("predict_struct_arguments", c_bool, [_PredictArgs])
-_train = _bind("train_struct_arguments", None, [_TrainArgs])
+_train = _bind("train_struct_arguments", _TrainReport, [_TrainArgs])
+_evaluate = _bind("evaluate_struct_arguments", _EvalMetrics, [_EvaluateArgs])
+_TrainerPtr = c_void_p
+_trainer_new = _bind("spingalett_trainer_new", _TrainerPtr, [_NetPtr, c_uint32])
+_trainer_free = _bind("spingalett_trainer_free", None, [_TrainerPtr])
+_trainer_forward = _bind("spingalett_trainer_forward", POINTER(c_float), [_TrainerPtr, POINTER(c_float), c_uint32])
+_trainer_backward = _bind("spingalett_trainer_backward", c_float, [_TrainerPtr, POINTER(c_float)])
+_trainer_backward_grads = _bind("spingalett_trainer_backward_output_grads", c_bool, [_TrainerPtr, POINTER(c_float)])
+_trainer_step = _bind("spingalett_trainer_step", c_bool, [_TrainerPtr, POINTER(_OptimizerArgs)])
+_trainer_zero_grad = _bind("spingalett_trainer_zero_grad", None, [_TrainerPtr])
+_load_idx = _bind("spingalett_load_idx", c_bool, [c_char_p, c_char_p, c_uint32, POINTER(_Dataset)])
+_load_csv = _bind("spingalett_load_csv", c_bool, [c_char_p, c_uint32, c_uint32, POINTER(_Dataset)])
+_dataset_free = _bind("spingalett_dataset_free", None, [POINTER(_Dataset)])
+_save_dataset = _bind("spingalett_save_dataset", c_bool, [POINTER(_Dataset), c_char_p, POINTER(_DatasetSaveOptions)])
+_load_dataset = _bind("spingalett_load_dataset", c_bool, [c_char_p, POINTER(_Dataset)])
+_dataset_open = _bind("spingalett_dataset_open", c_void_p, [c_char_p, c_bool])
+_dataset_close = _bind("spingalett_dataset_close", None, [c_void_p])
+_dataset_info = _bind("spingalett_dataset_info", _DatasetInfo, [c_void_p])
+_dataset_generator = _DataGeneratorFn(ctypes.cast(_lib.spingalett_dataset_generator, c_void_p).value)
 _save = _bind("save_spingalett_struct_arguments", None, [_SaveArgs])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
 _free = _bind("free_network", None, [_NetPtr])
@@ -474,6 +611,11 @@ Schedule = Union[_BuiltinSchedule, Callable[[int, int, float], float]]
 
 # --------------------------------------------------------------------------- high-level API
 
+@dataclasses.dataclass(frozen=True)
+class _NativeGenerator:
+    fn: object      # a _DataGeneratorFn pointing into the library
+    data: object
+
 @dataclasses.dataclass
 class Layer:
     """Layer description. Activation, init and dropout are ignored for the input layer."""
@@ -481,6 +623,44 @@ class Layer:
     activation: Activation = Activation.SIGMOID
     init: Init = Init.RANDOM
     dropout: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Metrics:
+    """Mean loss and accuracy over a data set (see :meth:`Network.evaluate`)."""
+    loss: float
+    accuracy: float
+
+
+@dataclasses.dataclass(frozen=True)
+class Progress:
+    """State of a training run, passed to ``TrainConfig.callback``."""
+    epoch: int                      # epochs completed (1-based)
+    epochs: int
+    train_loss: float
+    learning_rate: float
+    validation: Optional[Metrics]   # after this epoch, when validation data was given
+    monitor: Monitor
+    best_epoch: int
+    best_value: float
+    improved: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainResult:
+    """Outcome of :meth:`Network.train`."""
+    status: TrainStatus
+    epochs_run: int
+    train_loss: float
+    validation: Optional[Metrics]   # metrics of the last epoch
+    monitor: Monitor
+    best_epoch: int                 # 0 when nothing was monitored
+    best_value: float
+    restored_best: bool
+
+
+def _metrics(m: _EvalMetrics) -> Metrics:
+    return Metrics(float(m.loss), float(m.accuracy))
 
 
 @dataclasses.dataclass
@@ -502,8 +682,12 @@ class TrainConfig:
     nan_check_interval: int = 0
     report_interval: int = 0
     lr_scheduler: Optional[Schedule] = None
-    callback: Optional[Callable[["Network", int, float], Optional[bool]]] = None
+    callback: Optional[Callable[["Network", Progress], Optional[bool]]] = None
     callback_interval: int = 0
+    monitor: Monitor = Monitor.AUTO
+    early_stopping_patience: int = 0    # stop after this many epochs without improvement
+    early_stopping_min_delta: float = 0.0
+    restore_best_weights: bool = False  # end with the parameters of the best epoch
     autosave_mode: AutoSave = AutoSave.OFF
     autosave_interval: int = 0
     autosave_path: Optional[str] = None
@@ -679,27 +863,54 @@ class Network:
 
     __call__ = forward
 
+    def evaluate(self, inputs, targets) -> Metrics:
+        """Mean loss (as reported by training) and accuracy over a data set. Accuracy compares
+        the argmax of outputs and targets; with a single output, their side of 0.5."""
+        x, y = self._pair(inputs, targets, "")
+        return _metrics(_call(_evaluate, _EvaluateArgs(self._ptr, _float_ptr(x), _float_ptr(y), x.shape[0])))
+
+    def _pair(self, inputs, targets, what: str):
+        x = _as_matrix(inputs, self.input_size, what + "inputs")
+        y = _as_matrix(targets, self.output_size, what + "targets")
+        if x.shape[0] != y.shape[0]:
+            raise ValueError(f"{what}inputs have {x.shape[0]} rows but {what}targets have {y.shape[0]}")
+        if x.shape[0] == 0:
+            raise ValueError(f"no {what or 'training '}samples")
+        return x, y
+
+    def get_weight_gradients(self, index: int) -> np.ndarray:
+        """Copy of the accumulated gradient of weight matrix ``index`` (see :class:`Trainer`)."""
+        i = self._check_connection(index)
+        n = self._net
+        rows, cols = n.topology[i + 1], n.topology[i]
+        base = ctypes.addressof(n.grad_weights.contents) + n.weight_offsets[i] * 4
+        return np.ctypeslib.as_array((c_float * (rows * cols)).from_address(base)).reshape(rows, cols).copy()
+
+    def get_bias_gradients(self, index: int) -> np.ndarray:
+        i = self._check_connection(index)
+        n = self._net
+        base = ctypes.addressof(n.grad_biases.contents) + n.bias_offsets[i] * 4
+        return np.ctypeslib.as_array((c_float * n.topology[i + 1]).from_address(base)).copy()
+
     # ---- training
-    def train(self, inputs, targets, config: Optional[TrainConfig] = None, **overrides) -> None:
+    def train(self, inputs, targets, config: Optional[TrainConfig] = None, validation_data=None,
+              **overrides) -> TrainResult:
         """Train on ``inputs`` (n, input_size) and ``targets`` (n, output_size).
 
         Parameters come from ``config`` (a :class:`TrainConfig`) and/or keyword overrides with the
         same names, e.g. ``net.train(x, y, epochs=100, optimizer=Optimizer.ADAMW)``.
-        ``callback(network, epoch, error)`` may return True to stop early;
+        ``validation_data=(x_val, y_val)`` is evaluated after every epoch and drives
+        ``early_stopping_patience`` and ``restore_best_weights``.
+        ``callback(network, progress)`` receives a :class:`Progress` and may return True to stop;
         ``lr_scheduler`` is a built-in schedule or ``fn(epoch, total_epochs, initial_lr) -> lr``.
         """
         cfg = dataclasses.replace(config or TrainConfig(), **overrides)
-        x = _as_matrix(inputs, self.input_size, "inputs")
-        y = _as_matrix(targets, self.output_size, "targets")
-        if x.shape[0] != y.shape[0]:
-            raise ValueError(f"inputs have {x.shape[0]} rows but targets have {y.shape[0]}")
-        if x.shape[0] == 0:
-            raise ValueError("no training samples")
-        self._run(cfg, _MODE_ARRAY, x, y, x.shape[0], None)
+        x, y = self._pair(inputs, targets, "")
+        return self._run(cfg, _MODE_ARRAY, x, y, x.shape[0], None, validation_data)
 
     def train_from_generator(self, generator: Callable[[np.ndarray, np.ndarray], int],
                              config: Optional[TrainConfig] = None, samples_per_epoch: int = 0,
-                             **overrides) -> None:
+                             validation_data=None, **overrides) -> TrainResult:
         """Train on data produced on demand.
 
         ``generator(inputs, targets)`` receives writable float32 arrays of shape
@@ -711,9 +922,26 @@ class Network:
         cfg = dataclasses.replace(config or TrainConfig(), **overrides)
         if cfg.strategy == Strategy.FULL_BATCH and samples_per_epoch <= 0:
             raise ValueError("full-batch training from a generator needs samples_per_epoch")
-        self._run(cfg, _MODE_GENERATOR, None, None, int(samples_per_epoch), generator)
+        return self._run(cfg, _MODE_GENERATOR, None, None, int(samples_per_epoch), generator, validation_data)
 
-    def _run(self, cfg: TrainConfig, mode: int, x, y, sample_count: int, generator) -> None:
+    def train_from_file(self, path, config: Optional[TrainConfig] = None, shuffle: bool = True,
+                        validation_data=None, **overrides) -> TrainResult:
+        """Train on a .slettd data set file, streamed chunk by chunk by the C reader (no Python
+        call per batch, memory for one chunk). ``shuffle`` reorders chunks and samples each epoch."""
+        cfg = dataclasses.replace(config or TrainConfig(), **overrides)
+        reader = _call(_dataset_open, _encode_path(path), bool(shuffle))
+        try:
+            info = _dataset_info(reader)
+            if (info.input_size, info.target_size) != (self.input_size, self.output_size):
+                raise ValueError(f"{path!s} has {info.input_size} inputs and {info.target_size} targets, "
+                                 f"the network {self.input_size} and {self.output_size}")
+            return self._run(cfg, _MODE_GENERATOR, None, None, int(info.count),
+                             _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
+        finally:
+            _dataset_close(reader)
+
+    def _run(self, cfg: TrainConfig, mode: int, x, y, sample_count: int, generator,
+             validation_data) -> TrainResult:
         pending: List[BaseException] = []
         keep = []  # C callback objects must outlive the call
 
@@ -721,11 +949,15 @@ class Network:
         if cfg.callback is not None:
             user_cb = cfg.callback
 
-            def on_epoch(_net_ptr, epoch, error):
+            def on_epoch(_net_ptr, progress_ptr, _ud):
                 if pending:
                     return True
                 try:
-                    return bool(user_cb(self, int(epoch), float(error)))
+                    p = progress_ptr.contents
+                    progress = Progress(int(p.epoch), int(p.epochs), float(p.train_loss), float(p.learning_rate),
+                                        _metrics(p.validation) if p.has_validation else None, Monitor(p.monitor),
+                                        int(p.best_epoch), float(p.best_value), bool(p.improved))
+                    return bool(user_cb(self, progress))
                 except BaseException as exc:  # re-raised once train() returns
                     pending.append(exc)
                     return True
@@ -752,8 +984,10 @@ class Network:
             c_sched = _LRSchedulerFn(schedule)
             keep.append(c_sched)
 
-        c_gen = _DataGeneratorFn()
-        if generator is not None:
+        c_gen, c_gen_data = _DataGeneratorFn(), None
+        if isinstance(generator, _NativeGenerator):
+            c_gen, c_gen_data = generator.fn, generator.data
+        elif generator is not None:
             n_in, n_out = self.input_size, self.output_size
 
             def produce(in_ptr, tg_ptr, requested, _ud):
@@ -774,6 +1008,9 @@ class Network:
             keep.append(c_gen)
 
         autosave_path = _encode_path(cfg.autosave_path) if cfg.autosave_path else None
+        xv = yv = None
+        if validation_data is not None:
+            xv, yv = self._pair(validation_data[0], validation_data[1], "validation ")
 
         args = _TrainArgs(
             net=self._ptr,
@@ -783,7 +1020,7 @@ class Network:
             inputs=_float_ptr(x) if x is not None else None,
             targets=_float_ptr(y) if y is not None else None,
             generator=c_gen,
-            generator_data=None,
+            generator_data=c_gen_data,
             sample_count=sample_count,
             batch_size=int(cfg.batch_size),
             do_not_shuffle=not cfg.shuffle,
@@ -807,16 +1044,26 @@ class Network:
             callback_interval=int(cfg.callback_interval),
             lr_scheduler=c_sched,
             lr_scheduler_data=c_sched_data,
+            val_inputs=_float_ptr(xv) if xv is not None else None,
+            val_targets=_float_ptr(yv) if yv is not None else None,
+            val_count=xv.shape[0] if xv is not None else 0,
+            monitor=int(cfg.monitor),
+            early_stopping_patience=int(cfg.early_stopping_patience),
+            early_stopping_min_delta=float(cfg.early_stopping_min_delta),
+            restore_best_weights=bool(cfg.restore_best_weights),
             blas_num_threads=int(cfg.blas_num_threads),
         )
-        _call(_train, args)
+        r = _call(_train, args)
         del keep
         if pending:
             raise pending[0]
+        return TrainResult(TrainStatus(r.status), int(r.epochs_run), float(r.train_loss),
+                           _metrics(r.validation) if r.has_validation else None, Monitor(r.monitor),
+                           int(r.best_epoch), float(r.best_value), bool(r.restored_best))
 
     # ---- persistence
     def save(self, path, precision: Precision = Precision.FLOAT32, save_optimizer: bool = True) -> None:
-        """Save to ``path`` (".nn" is appended when there is no extension)."""
+        """Save to ``path`` (".slett" is appended when there is no extension)."""
         _call(_save, _SaveArgs(self._ptr, _encode_path(path), not save_optimizer, int(precision)))
 
     def print_parameters(self) -> None:
@@ -826,3 +1073,155 @@ class Network:
         if not getattr(self, "_ptr", None):
             return "<spingalett.Network (closed)>"
         return f"<spingalett.Network {self.topology} loss={self.loss.name} params={self.num_parameters}>"
+
+
+# --------------------------------------------------------------------------- low-level training
+
+class Trainer:
+    """Forward, backward and optimizer steps under your control: custom losses, gradient
+    accumulation, custom loops. Backward passes add the per-sample gradients up; :meth:`step`
+    applies their mean and clears them. Optimizer state lives in the network (shared with
+    :meth:`Network.train`).
+
+    ::
+
+        with sg.Trainer(net, max_batch=64) as tr:
+            out = tr.forward(xb)
+            tr.backward_output_grads(dloss_dout(out, yb))   # or tr.backward(yb) for the built-in loss
+            tr.step(optimizer=sg.Optimizer.ADAM, learning_rate=1e-3)
+    """
+
+    def __init__(self, network: Network, max_batch: int):
+        network._net  # raise if closed
+        self._network = network          # keeps the network alive
+        self._ptr = _call(_trainer_new, network._ptr, int(max_batch))
+        self.max_batch = int(max_batch)
+        self._rows = 0
+
+    def close(self) -> None:
+        ptr = getattr(self, "_ptr", None)
+        if ptr:
+            self._ptr = None
+            _trainer_free(ptr)
+
+    def __enter__(self) -> "Trainer":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _handle(self):
+        if not getattr(self, "_ptr", None):
+            raise ValueError("trainer is closed")
+        self._network._net  # raise if the network was closed
+        return self._ptr
+
+    def forward(self, inputs) -> np.ndarray:
+        """Training-mode forward pass (dropout active); returns a copy of the outputs."""
+        net = self._network
+        x = _as_matrix(inputs, net.input_size, "inputs")
+        ptr = _call(_trainer_forward, self._handle(), _float_ptr(x), x.shape[0])
+        self._rows = x.shape[0]
+        out = np.empty((x.shape[0], net.output_size), dtype=np.float32)
+        ctypes.memmove(out.ctypes.data, ptr, out.nbytes)
+        return out
+
+    def backward(self, targets) -> float:
+        """Back-propagates the network's loss for the last forward pass; returns the summed loss."""
+        y = _as_matrix(targets, self._network.output_size, "targets")
+        if y.shape[0] != self._rows:
+            raise ValueError(f"targets have {y.shape[0]} rows, the last forward pass had {self._rows}")
+        return float(_call(_trainer_backward, self._handle(), _float_ptr(y)))
+
+    def backward_output_grads(self, output_grads) -> None:
+        """Back-propagates a custom loss given dL/d(output) for every sample of the last forward pass."""
+        g = _as_matrix(output_grads, self._network.output_size, "output_grads")
+        if g.shape[0] != self._rows:
+            raise ValueError(f"output_grads have {g.shape[0]} rows, the last forward pass had {self._rows}")
+        _call(_trainer_backward_grads, self._handle(), _float_ptr(g))
+
+    def step(self, optimizer: Optimizer = Optimizer.ADAM, learning_rate: float = 0.01, weight_decay: float = 0.0,
+             momentum: float = 0.0, beta1: float = 0.0, beta2: float = 0.0, epsilon: float = 0.0,
+             max_grad_norm: float = 0.0) -> None:
+        """Optimizer step with the mean accumulated gradient; zero values take the library defaults."""
+        opt = _OptimizerArgs(int(optimizer), learning_rate, weight_decay, momentum, beta1, beta2, epsilon, max_grad_norm)
+        _call(_trainer_step, self._handle(), ctypes.byref(opt))
+
+    def zero_grad(self) -> None:
+        _trainer_zero_grad(self._handle())
+
+    def train_on_batch(self, inputs, targets, **optimizer) -> float:
+        """Forward, backward and step on one batch; returns its mean loss."""
+        self.forward(inputs)
+        loss = self.backward(targets)
+        self.step(**optimizer)
+        return loss / self._rows
+
+
+# --------------------------------------------------------------------------- data sets
+
+def _take_dataset(ds: _Dataset):
+    try:
+        x = np.ctypeslib.as_array(ds.inputs, shape=(ds.count, ds.input_size)).copy()
+        y = np.ctypeslib.as_array(ds.targets, shape=(ds.count, ds.target_size)).copy()
+    finally:
+        _dataset_free(ctypes.byref(ds))
+    return x, y
+
+
+def load_idx(images_path, labels_path, num_classes: int = 0):
+    """Read an IDX pair (the MNIST format) as ``(inputs, one_hot_targets)`` float32 arrays.
+    Unsigned-byte images are scaled to [0, 1]; ``num_classes`` 0 = largest label + 1."""
+    ds = _Dataset()
+    _call(_load_idx, _encode_path(images_path), _encode_path(labels_path), int(num_classes), ctypes.byref(ds))
+    return _take_dataset(ds)
+
+
+def load_csv(path, target_columns: int = 1, num_classes: int = 0):
+    """Read a numeric CSV file as ``(inputs, targets)``: the last ``target_columns`` columns are
+    targets; with ``num_classes`` > 0 the single target column is one-hot encoded."""
+    ds = _Dataset()
+    _call(_load_csv, _encode_path(path), int(target_columns), int(num_classes), ctypes.byref(ds))
+    return _take_dataset(ds)
+
+
+def save_dataset(path, inputs, targets, input_encoding: DatasetEncoding = DatasetEncoding.AUTO,
+                 target_encoding: DatasetEncoding = DatasetEncoding.AUTO, compress: bool = True) -> None:
+    """Write ``(inputs, targets)`` to a .slettd file (".slettd" is appended when there is no
+    extension). AUTO picks the smallest lossless encoding; FP16, BFLOAT16 and U8_AFFINE are lossy."""
+    x = np.ascontiguousarray(inputs, dtype=np.float32)
+    y = np.ascontiguousarray(targets, dtype=np.float32)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
+    if x.ndim != 2 or y.ndim != 2 or x.shape[0] != y.shape[0] or x.shape[0] == 0:
+        raise ValueError(f"inputs {x.shape} and targets {y.shape} must be non-empty matrices with the same rows")
+    ds = _Dataset(x.shape[0], x.shape[1], y.shape[1], _float_ptr(x), _float_ptr(y))
+    opts = _DatasetSaveOptions(int(input_encoding), int(target_encoding), not compress)
+    _call(_save_dataset, ctypes.byref(ds), _encode_path(path), ctypes.byref(opts))
+
+
+def load_dataset(path):
+    """Read a .slettd file as ``(inputs, targets)`` float32 arrays."""
+    ds = _Dataset()
+    _call(_load_dataset, _encode_path(path), ctypes.byref(ds))
+    return _take_dataset(ds)
+
+
+def dataset_info(path) -> dict:
+    """Header of a .slettd file: sample count, sizes, encodings, chunks and file size."""
+    reader = _call(_dataset_open, _encode_path(path), False)
+    try:
+        i = _dataset_info(reader)
+        return {"count": i.count, "input_size": i.input_size, "target_size": i.target_size,
+                "input_encoding": DatasetEncoding(i.input_encoding), "target_encoding": DatasetEncoding(i.target_encoding),
+                "chunk_count": i.chunk_count, "file_size": i.file_size}
+    finally:
+        _dataset_close(reader)
