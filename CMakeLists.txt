@@ -278,6 +278,45 @@ if(BUILD_EXAMPLE)
 endif()
 
 # ------------------------------------------------------------------------------
+# Tests (run with: ctest --test-dir <build> --output-on-failure)
+# ------------------------------------------------------------------------------
+option(BUILD_TESTS "Build the test suite" ON)
+
+if(BUILD_TESTS)
+    enable_testing()
+
+    add_executable(SpingalettTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Tests.c)
+    target_link_libraries(SpingalettTests PRIVATE spingalett)
+    target_compile_definitions(SpingalettTests PRIVATE
+        SPINGALETT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Tests/Data")
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(SpingalettTests PRIVATE m)
+        set_target_properties(SpingalettTests PROPERTIES BUILD_RPATH "$ORIGIN")
+    endif()
+
+    foreach(group grad equiv cont sched dropout io xor)
+        add_test(NAME core.${group} COMMAND SpingalettTests ${group}
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    endforeach()
+
+    # A sanitizer-instrumented library cannot be loaded into an uninstrumented Python.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND NOT CMAKE_C_FLAGS MATCHES "-fsanitize")
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+                        RESULT_VARIABLE SPINGALETT_NUMPY_MISSING OUTPUT_QUIET ERROR_QUIET)
+        if(SPINGALETT_NUMPY_MISSING EQUAL 0)
+            add_test(NAME python.bindings
+                     COMMAND ${CMAKE_COMMAND} -E env
+                             SPINGALETT_LIBRARY=$<TARGET_FILE:spingalett>
+                             PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/Bindings/Python
+                             ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/test_python_bindings.py)
+        else()
+            message(STATUS "Spingalett: NumPy not found, skipping Python binding tests")
+        endif()
+    endif()
+endif()
+
+# ------------------------------------------------------------------------------
 # Install
 # ------------------------------------------------------------------------------
 install(TARGETS spingalett
