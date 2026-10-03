@@ -43,10 +43,13 @@ with sg.Network.load("xor.nn") as net:
 |---|---|
 | `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer |
 | `forward(x)` | 1-D input -> vector, 2-D batch -> matrix (copies, safe to keep) |
-| `train(x, y, config=None, **overrides)` | fields of `TrainConfig`; exceptions raised in callbacks stop training and are re-raised |
+| `train(x, y, config=None, **overrides)` | fields of `TrainConfig` (e.g. `epochs`, `strategy`, `batch_size`, `shuffle`); exceptions raised in callbacks stop training and are re-raised |
+| `train_from_generator(fn, samples_per_epoch=0, ...)` | `fn(inputs, targets)` fills the given arrays and returns the number of rows; 0 ends the epoch |
 | `CosineDecay`, `LinearWarmup`, `StepDecay`, `WarmupCosine` | built-in schedules; any `fn(epoch, total, initial_lr)` works too |
 | `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weight matrix `i` connects layer `i` to `i + 1`, shape `(out, in)` |
 | `save(path, precision, save_optimizer)`, `Network.load(path)` | `.nn` format shared with the C API |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
 
-Library errors raise `SpingalettError`. A `Network` is not thread-safe: use one per thread.
+Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bindings check on import
+that the library has the same major.minor version (`library_version()`), because they mirror its
+struct layouts. A `Network` is not thread-safe: use one per thread.

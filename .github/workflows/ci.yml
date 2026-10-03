@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
-        config: [minimal, full]
+        config: [minimal, full, generic]
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +27,9 @@ jobs:
           extra=""
           if [ "${{ matrix.config }}" = full ]; then
             extra="-DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
+          elif [ "${{ matrix.config }}" = generic ]; then
+            # baseline x86-64 without AVX: exercises the portable scalar code paths
+            extra="-DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
           fi
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} $extra
 

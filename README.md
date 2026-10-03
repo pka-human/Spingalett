@@ -43,7 +43,7 @@ weight. Python bindings are included.
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
-| Initialization | Uniform, Xavier/LeCun normal, He normal |
+| Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Backends | Single-threaded (AVX/AVX2/FMA), OpenMP, OpenBLAS |
 | Serialization | FP32, FP16, BF16, INT8, INT4, INT2; optional optimizer state; versioned format |
 | Bindings | Python (ctypes + NumPy) |
@@ -71,7 +71,9 @@ cmake --install Build --prefix /usr/local
 ```
 
 The shared library and the example programs are written to `Bin/`, import libraries to `Lib/`.
-Release builds use `-march=native`, so binaries are tuned for the build machine.
+By default the library is compiled with `-march=native` and therefore tuned for the build
+machine; for redistributable binaries, configure with `-DSPINGALETT_NATIVE_ARCH=OFF` and choose
+a baseline through `CMAKE_C_FLAGS` (for example `-march=x86-64-v3` for AVX2).
 
 | CMake option | Default | Description |
 |---|---|---|
@@ -79,11 +81,21 @@ Release builds use `-march=native`, so binaries are tuned for the build machine.
 | `BUILD_WITH_OPENBLAS` | `OFF` | Enable the OpenBLAS backend (found via pkg-config or the default library paths) |
 | `BUILD_EXAMPLE` | `ON` | Build the programs in `Examples/` |
 | `BUILD_TESTS` | `ON` | Build the test suite and register it with CTest |
+| `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
 
-Projects that add Spingalett with `add_subdirectory()` only need to link the `spingalett`
-target; include paths, including the generated `Spingalett.Config.h`, are propagated.
+An installed Spingalett is found with CMake's `find_package`; projects that vendor the
+repository can use `add_subdirectory()` instead. Both provide the target `Spingalett::spingalett`,
+which carries the include paths:
+
+```cmake
+find_package(Spingalett 0.2 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+target_link_libraries(my_app PRIVATE Spingalett::spingalett)
+```
+
+The headers define `SPINGALETT_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `_STRING`;
+`spingalett_version()` returns the version of the library actually loaded.
 
 ## Quick start
 
@@ -138,7 +150,7 @@ one being the input layer. `LayerArgs` fields:
 |---|---|
 | `neurons_amount` | Layer width |
 | `act_func` | Activation of this layer (ignored for the input layer) |
-| `weight_initialization` | `RANDOM` (uniform in [-1, 1]), `XAVIER` (normal, variance 1/fan_in), `HE` (normal, variance 2/fan_in), `NONE` (zeros) |
+| `weight_initialization` | `RANDOM` (uniform in [-1, 1]), `XAVIER` (Glorot normal, variance 2/(fan_in + fan_out)), `HE` (normal, variance 2/fan_in), `LECUN` (normal, variance 1/fan_in), `NONE` (zeros) |
 | `dropout_rate` | Probability in [0, 1) of zeroing each output of this layer during training |
 
 Biases start at zero. Softmax is only allowed in the output layer. Leaky ReLU uses a slope of
@@ -156,12 +168,13 @@ It is not applied to the input or output layer.
 |---|---|---|
 | `inputs`, `targets`, `sample_count` | required | Row-major arrays of `sample_count` samples |
 | `epochs` | required | Number of passes over the data |
-| `training_strategy` | `STRATEGY_SAMPLE` | `STRATEGY_SAMPLE` (one step per sample, in order), `STRATEGY_FULL_BATCH`, `STRATEGY_SMALL_BATCH` (reshuffled every epoch) |
+| `training_strategy` | `STRATEGY_SAMPLE` | `STRATEGY_SAMPLE` (one step per sample), `STRATEGY_FULL_BATCH`, `STRATEGY_SMALL_BATCH` |
 | `batch_size` | 32 | Mini-batch size |
+| `do_not_shuffle` | false | Per-sample and mini-batch training reshuffle the samples every epoch unless set |
 | `optimizer_type` | `OPTIMIZER_SGD` | `SGD`, `MOMENTUM`, `RMSPROP`, `ADAM`, `ADAMW` |
 | `learning_rate` | 0.01 | Base learning rate |
 | `momentum` | 0.9 | Momentum coefficient |
-| `beta1`, `beta2`, `epsilon` | 0.9, 0.999, 1e-8 | Adam/RMSProp moment parameters |
+| `beta1`, `beta2`, `epsilon` | 0.9, 0.999, 1e-8 | Adam/RMSProp moment parameters; epsilon is added to the square root of the second moment, as in PyTorch |
 | `weight_decay` | 0 | L2 penalty; decoupled (`w *= 1 - lr * wd`) for AdamW. Biases are not decayed |
 | `max_grad_norm` | 0 (off) | Clip the global L2 norm of every step's gradient |
 | `lr_scheduler`, `lr_scheduler_data` | none | Learning-rate schedule, see below |
@@ -174,7 +187,8 @@ It is not applied to the input or output layer.
 | `blas_num_threads` | 0 (auto) | OpenBLAS threads during training, see [Backends](#backends-and-threading) |
 
 The reported loss is averaged over the samples of an epoch: the sum of squared errors per sample
-for MSE, and categorical (softmax) or binary (sigmoid) cross-entropy otherwise.
+for MSE, and categorical (softmax) or binary (sigmoid) cross-entropy otherwise. Cross-entropy
+requires a softmax or sigmoid output layer; `train()` rejects other combinations.
 
 Optimizer state (moment estimates and the step counter used for Adam's bias correction) is stored
 in the network, so training can be resumed by calling `train()` again or after loading a
@@ -284,8 +298,15 @@ if (!net)
     fprintf(stderr, "%s (code %d)\n", spingalett_last_error_message(), spingalett_last_error_code());
 ```
 
-Error codes are `SPINGALETT_OK`, `SPINGALETT_ERR_ALLOC` and `SPINGALETT_ERR_INVALID`. The error
-state is not cleared by successful calls.
+| Code | Meaning |
+|---|---|
+| `SPINGALETT_OK` | No error |
+| `SPINGALETT_ERR_ALLOC` | Out of memory |
+| `SPINGALETT_ERR_INVALID` | Invalid argument or file contents |
+| `SPINGALETT_ERR_FILE_IO` | A file could not be opened, read or written, or is truncated |
+| `SPINGALETT_ERR_FORMAT_VERSION` | The model file uses an unsupported format version |
+
+The error state is not cleared by successful calls.
 
 Log messages go to stdout (warnings and errors to stderr) unless redirected with
 `spingalett_set_log_callback(void (*)(LogLevel, const char *))`. `spingalett_set_log_level()` sets
@@ -354,8 +375,9 @@ Bindings/Python/      Python bindings
 
 ## Status and roadmap
 
-Spingalett is at version 0.1; the C API and the in-memory `NeuralNetwork` layout may still change
-between minor versions. Saved models are versioned and remain loadable.
+Spingalett is at version 0.2; the C API and the in-memory `NeuralNetwork` layout may still change
+between minor versions (see [CHANGELOG.md](CHANGELOG.md)). Saved models are versioned and remain
+loadable.
 
 Planned work, roughly in order:
 

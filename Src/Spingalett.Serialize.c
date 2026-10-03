@@ -344,7 +344,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
 
     FILE *fp = fopen(target_filename, "wb");
     if (!fp) {
-        set_error(SPINGALETT_ERR_INVALID, "save: cannot open file for writing");
+        set_error(SPINGALETT_ERR_FILE_IO, "save: cannot open file for writing");
         free(allocated_filename);
         return;
     }
@@ -383,7 +383,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
         write_ok = false;
 
     if (!write_ok) {
-        set_error(SPINGALETT_ERR_INVALID, "save: failed to write header");
+        set_error(SPINGALETT_ERR_FILE_IO, "save: failed to write header");
         spingalett_log(LOG_ERROR, "Failed to write file header to %s", target_filename);
         fclose(fp);
         free(allocated_filename);
@@ -420,7 +420,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
     if (fclose(fp) != 0) write_ok = false;
 
     if (!write_ok) {
-        set_error(SPINGALETT_ERR_INVALID, "save: write error (disk full?)");
+        set_error(SPINGALETT_ERR_FILE_IO, "save: write error (disk full?)");
         spingalett_log(LOG_ERROR, "Write error saving to %s", target_filename);
     } else {
         spingalett_log(LOG_INFO, "Network saved to %s", target_filename);
@@ -442,20 +442,20 @@ NeuralNetwork *load_spingalett(const char *filename) {
 
     FILE *fp = fopen(filename, "rb");
     if (!fp) {
-        set_error(SPINGALETT_ERR_INVALID, "load: cannot open file for reading");
+        set_error(SPINGALETT_ERR_FILE_IO, "load: cannot open file for reading");
         return NULL;
     }
 
     uint16_t format_version = 0;
     if (fread(&format_version, sizeof(uint16_t), 1, fp) != 1) {
-        set_error(SPINGALETT_ERR_INVALID, "load: failed to read format version");
+        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read format version");
         fclose(fp);
         return NULL;
     }
 
     /* v1: no dropout section (read as rate 0). v2: per-layer dropout rates after the activations. */
     if (format_version < 1 || format_version > SPINGALETT_FORMAT_VERSION) {
-        set_error(SPINGALETT_ERR_INVALID, "load: unsupported format version");
+        set_error(SPINGALETT_ERR_FORMAT_VERSION, "load: unsupported format version");
         spingalett_log(LOG_ERROR, "Unsupported file format version %u (supported: 1..%u)", (unsigned)format_version, (unsigned)SPINGALETT_FORMAT_VERSION);
         fclose(fp);
         return NULL;
@@ -463,7 +463,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
 
     uint32_t layers = 0;
     if (fread(&layers, sizeof(uint32_t), 1, fp) != 1) {
-        set_error(SPINGALETT_ERR_INVALID, "load: failed to read layer count");
+        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read layer count");
         fclose(fp);
         return NULL;
     }
@@ -483,7 +483,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
 
     uint8_t has_optimizer = 0;
     if (fread(&has_optimizer, sizeof(uint8_t), 1, fp) != 1) {
-        set_error(SPINGALETT_ERR_INVALID, "load: failed to read optimizer flag");
+        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read optimizer flag");
         fclose(fp);
         return NULL;
     }
@@ -491,7 +491,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
     uint64_t ts = 0;
     if (has_optimizer) {
         if (fread(&ts, sizeof(uint64_t), 1, fp) != 1) {
-            set_error(SPINGALETT_ERR_INVALID, "load: failed to read time step");
+            set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read time step");
             fclose(fp);
             return NULL;
         }
@@ -513,7 +513,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
     }
 
     if (fread(topology, sizeof(uint32_t), layers, fp) != layers) {
-        set_error(SPINGALETT_ERR_INVALID, "load: failed to read topology");
+        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read topology");
         free(topology);
         fclose(fp);
         return NULL;
@@ -631,7 +631,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
     fclose(fp);
 
     if (!read_ok) {
-        set_error(SPINGALETT_ERR_INVALID, "load: file appears truncated or corrupt");
+        set_error(SPINGALETT_ERR_FILE_IO, "load: file is truncated");
         spingalett_log(LOG_ERROR, "Network file is truncated or corrupt: %s", filename);
         free_network(net);
         return NULL;

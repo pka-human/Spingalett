@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.1.0 LANGUAGES C)
+project(Spingalett VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -30,6 +30,7 @@ set(SPINGALETT_HAS_CUDA OFF)
 file(GLOB SPINGALETT_SOURCES "Src/*.c")
 
 add_library(spingalett SHARED ${SPINGALETT_SOURCES})
+add_library(Spingalett::spingalett ALIAS spingalett)
 
 target_include_directories(spingalett
     PRIVATE Src
@@ -142,6 +143,10 @@ configure_file(
 # ------------------------------------------------------------------------------
 include(CheckCCompilerFlag)
 
+# -march=native tunes the library for the build machine. Turn it off for binaries that must run
+# elsewhere and pick a baseline through CMAKE_C_FLAGS instead (e.g. -march=x86-64-v3 for AVX2).
+option(SPINGALETT_NATIVE_ARCH "Optimize for the build machine (-march=native)" ON)
+
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(spingalett PRIVATE
         -Wall -Wextra -Wpedantic
@@ -194,7 +199,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         )
     endif()
 
-    if(NOT WIN32)
+    if(SPINGALETT_NATIVE_ARCH AND NOT WIN32)
         target_compile_options(spingalett PRIVATE
             $<$<NOT:$<CONFIG:Debug>>:-march=native -mtune=native>
         )
@@ -310,6 +315,15 @@ if(BUILD_TESTS)
                              SPINGALETT_LIBRARY=$<TARGET_FILE:spingalett>
                              PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/Bindings/Python
                              ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/test_python_bindings.py)
+
+            add_executable(SpingalettLayout ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Layout.c)
+            target_link_libraries(SpingalettLayout PRIVATE spingalett)
+            add_test(NAME python.layout
+                     COMMAND ${CMAKE_COMMAND} -E env
+                             SPINGALETT_LIBRARY=$<TARGET_FILE:spingalett>
+                             PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/Bindings/Python
+                             ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/test_python_layout.py
+                             $<TARGET_FILE:SpingalettLayout>)
         else()
             message(STATUS "Spingalett: NumPy not found, skipping Python binding tests")
         endif()
@@ -317,15 +331,35 @@ if(BUILD_TESTS)
 endif()
 
 # ------------------------------------------------------------------------------
-# Install
+# Install (headers, library and a CMake package: find_package(Spingalett))
 # ------------------------------------------------------------------------------
+include(CMakePackageConfigHelpers)
+
 install(TARGETS spingalett
+    EXPORT SpingalettTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-install(DIRECTORY Include/Spingalett DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY Include/Spingalett DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        PATTERN "*.in" EXCLUDE)
 install(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/Spingalett/Spingalett.Config.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/Spingalett
 )
+
+set(SPINGALETT_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/Spingalett)
+install(EXPORT SpingalettTargets NAMESPACE Spingalett:: DESTINATION ${SPINGALETT_CMAKE_DIR})
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/SpingalettConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
+    INSTALL_DESTINATION ${SPINGALETT_CMAKE_DIR}
+)
+# Before 1.0 a minor release may change the API, so only the same major.minor is compatible.
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
+    COMPATIBILITY SameMinorVersion
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
+        DESTINATION ${SPINGALETT_CMAKE_DIR})

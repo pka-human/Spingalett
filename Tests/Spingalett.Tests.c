@@ -246,6 +246,36 @@ static bool truncate_file(const char *path, long drop) {
     return ok;
 }
 
+static void error_codes(void) {
+    char expected[32];
+    snprintf(expected, sizeof expected, "%d.%d.%d", SPINGALETT_VERSION_MAJOR, SPINGALETT_VERSION_MINOR, SPINGALETT_VERSION_PATCH);
+    CHECK(strcmp(spingalett_version(), expected) == 0 && strcmp(spingalett_version(), SPINGALETT_VERSION_STRING) == 0,
+          "library version %s vs headers %s", spingalett_version(), expected);
+
+    spingalett_clear_error();
+    CHECK(load_spingalett("spingalett_test_missing.nn") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO,
+          "missing file: code %d", spingalett_last_error_code());
+
+    FILE *f = fopen("spingalett_test_future.nn", "wb");
+    uint16_t future = SPINGALETT_FORMAT_VERSION + 1;
+    fwrite(&future, sizeof future, 1, f);
+    fclose(f);
+    spingalett_clear_error();
+    CHECK(load_spingalett("spingalett_test_future.nn") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FORMAT_VERSION,
+          "future format version: code %d", spingalett_last_error_code());
+    remove("spingalett_test_future.nn");
+
+    /* cross-entropy needs a softmax or sigmoid output; otherwise the gradient would be wrong */
+    float x[2] = {0.5f, -0.5f}, y[2] = {1.0f, 0.0f};
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(net, 2); layer(net, 2, ACT_TANH);
+    spingalett_clear_error();
+    train(.net = net, .inputs = x, .targets = y, .sample_count = 1, .epochs = 1);
+    CHECK(spingalett_last_error_code() == SPINGALETT_ERR_INVALID && net->time_step == 0, "CE + tanh output must be rejected");
+    free_network(net);
+    printf("  error codes checked (library %s)\n", spingalett_version());
+}
+
 static void load_robustness(void) {
     L ls[] = {{6, ACT_NONE}, {10, ACT_RELU}, {3, ACT_SIGMOID}};
     NeuralNetwork *a = build(LOSS_MSE, ls, 3, NULL, NULL);
@@ -816,6 +846,7 @@ int main(int argc, char **argv) {
         roundtrip(PRECISION_BFLOAT16, 8e-3f);
         roundtrip(PRECISION_INT8, 1.5e-2f);
         load_robustness();
+        error_codes();
     }
     if (!*only || !strcmp(only, "xor")) {
         printf("[xor convergence]\n");

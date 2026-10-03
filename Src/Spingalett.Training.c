@@ -738,6 +738,14 @@ void train_struct_arguments(TrainArgs args) {
         return;
     }
 
+    ActivationFunction output_act = net->act_func[net->layers - 2];
+    if (net->loss_func == LOSS_CROSS_ENTROPY && output_act != ACT_SOFTMAX && output_act != ACT_SIGMOID) {
+        set_error(SPINGALETT_ERR_INVALID, "Cross-entropy loss needs a softmax or sigmoid output layer");
+        spingalett_log(LOG_ERROR, "Cross-entropy loss needs a softmax or sigmoid output layer (got %s)",
+                       act_func_names[output_act]);
+        return;
+    }
+
     for (uint32_t l = 1; l < net->layers - 1; l++) {
         if (net->act_func[l - 1] == ACT_SOFTMAX) {
             set_error(SPINGALETT_ERR_INVALID, "Softmax is not supported in hidden layers");

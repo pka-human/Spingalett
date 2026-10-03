@@ -236,9 +236,14 @@ typedef struct {
     PrecisionMode precision;
 } SaveArgs;
 
-#define SPINGALETT_OK           0
-#define SPINGALETT_ERR_ALLOC    1
-#define SPINGALETT_ERR_INVALID  2
+#define SPINGALETT_OK                   0
+#define SPINGALETT_ERR_ALLOC            1   /* out of memory */
+#define SPINGALETT_ERR_INVALID          2   /* invalid argument or file contents */
+#define SPINGALETT_ERR_FILE_IO          3   /* file could not be opened, read or written, or is truncated */
+#define SPINGALETT_ERR_FORMAT_VERSION   4   /* model file written by an unsupported format version */
+
+/* Library version (the header's SPINGALETT_VERSION_* macros describe the headers in use). */
+SPINGALETT_API const char *spingalett_version(void);
 
 SPINGALETT_API int spingalett_last_error_code(void);
 SPINGALETT_API const char *spingalett_last_error_message(void);

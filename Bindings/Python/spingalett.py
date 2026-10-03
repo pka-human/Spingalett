@@ -38,14 +38,14 @@ from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
-    "AutoSave", "LogLevel", "Layer", "TrainConfig", "Network", "SpingalettError",
+    "AutoSave", "LogLevel", "ErrorCode", "Layer", "TrainConfig", "Network", "SpingalettError",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads",
-    "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path",
+    "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
 ]
 
 
@@ -109,6 +109,14 @@ class AutoSave(enum.IntEnum):
     OFF = 0
     OVERWRITE = 1
     NEW_FILES = 2
+
+
+class ErrorCode(enum.IntEnum):
+    OK = 0
+    ALLOC = 1
+    INVALID = 2
+    FILE_IO = 3
+    FORMAT_VERSION = 4
 
 
 class LogLevel(enum.IntEnum):
@@ -270,6 +278,19 @@ def _load_library() -> ctypes.CDLL:
 
 _lib = _load_library()
 
+# The bindings mirror C struct layouts, which may change between minor releases before 1.0:
+# refuse to run against a library of another major.minor version instead of corrupting memory.
+try:
+    _version_fn = _lib.spingalett_version
+except AttributeError:
+    raise ImportError(f"{_lib._name} predates Spingalett 0.2; rebuild the library") from None
+_version_fn.restype = c_char_p
+_version_fn.argtypes = []
+_LIBRARY_VERSION = _version_fn().decode()
+if _LIBRARY_VERSION.split(".")[:2] != __version__.split(".")[:2]:
+    raise ImportError(f"spingalett bindings {__version__} require library version "
+                      f"{'.'.join(__version__.split('.')[:2])}.x, but {_lib._name} is {_LIBRARY_VERSION}")
+
 
 def _bind(name, restype, argtypes):
     fn = getattr(_lib, name)
@@ -306,6 +327,11 @@ def library_path() -> str:
     return _lib._name
 
 
+def library_version() -> str:
+    """Version of the loaded shared library."""
+    return _LIBRARY_VERSION
+
+
 # --------------------------------------------------------------------------- errors
 
 class SpingalettError(RuntimeError):
@@ -313,7 +339,10 @@ class SpingalettError(RuntimeError):
 
     def __init__(self, code: int, message: str):
         super().__init__(f"{message} (code {code})")
-        self.code = code
+        try:
+            self.code = ErrorCode(code)
+        except ValueError:
+            self.code = code
 
 
 def _call(fn, *args):
