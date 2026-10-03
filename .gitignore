@@ -12,3 +12,4 @@ __pycache__/
 *.egg-info/
 Bindings/Python/build/
 Bindings/Python/dist/
+!Tests/Data/*.nn
