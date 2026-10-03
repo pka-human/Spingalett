@@ -28,8 +28,8 @@ with `--appimage-extract-and-run`.
 ## Running on Windows
 
 Unpack `DigitPad-<version>-windows-x86_64.zip` anywhere and start `DigitPad.exe` (64-bit
-Windows 10 or 11). The folder holds the program, the model, `libspingalett.dll`, `SDL2.dll` and
-the MinGW runtime DLL they load, with a `README.txt` and the licences. The program is not signed,
+Windows 10 or 11). The folder holds the program, the model, `libspingalett.dll` and `SDL2.dll`,
+with a `README.txt` and the licences. The program is not signed,
 so SmartScreen may stop it the first time: **More info**, then **Run anyway**.
 
 | Input | Action |
