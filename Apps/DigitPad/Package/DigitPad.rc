@@ -1,0 +1,43 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* Windows resources of DigitPad.exe: the icon (digitpad.svg rendered at 16 to 256 pixels), the
+ * version information Explorer shows, and the application manifest. */
+
+#include <winver.h>
+#include <Spingalett/Spingalett.Config.h>
+
+1 ICON "digitpad.ico"
+
+/* RT_MANIFEST, CREATEPROCESS_MANIFEST_RESOURCE_ID */
+1 24 "DigitPad.manifest"
+
+1 VERSIONINFO
+FILEVERSION SPINGALETT_VERSION_MAJOR, SPINGALETT_VERSION_MINOR, SPINGALETT_VERSION_PATCH, 0
+PRODUCTVERSION SPINGALETT_VERSION_MAJOR, SPINGALETT_VERSION_MINOR, SPINGALETT_VERSION_PATCH, 0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "DigitPad: handwritten digit recognition with Spingalett"
+            VALUE "FileVersion", SPINGALETT_VERSION_STRING
+            VALUE "InternalName", "DigitPad"
+            VALUE "LegalCopyright", "Copyright (c) 2026 pka_human. MIT License."
+            VALUE "OriginalFilename", "DigitPad.exe"
+            VALUE "ProductName", "Spingalett DigitPad"
+            VALUE "ProductVersion", SPINGALETT_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,9 +1,10 @@
 name: Release
 
-# Builds, tests and packages the library on every supported platform. On a pull request this only
-# checks that everything builds and packages; pushing a tag vX.Y.Z publishes a GitHub release with
-# the archives. workflow_dispatch (re)publishes an existing tag, optionally without binaries for
-# versions that predate this workflow.
+# Builds, tests and packages the library on every supported platform, and DigitPad as a Linux
+# AppImage and a Windows zip around one trained model. On a pull request this only checks that
+# everything builds and packages; pushing a tag vX.Y.Z publishes a GitHub release with the files.
+# workflow_dispatch (re)publishes an existing tag, optionally without binaries for versions that
+# predate this workflow. Only the highest version is marked as the latest release.
 
 on:
   push:
@@ -12,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to publish, e.g. v0.4.0
+        description: Existing tag to publish, e.g. v0.4.1
         required: true
       binaries:
         description: Build and attach binaries
@@ -168,11 +169,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: release-${{ matrix.name }}
           path: ${{ env.ARCHIVE }}.*
           if-no-files-found: error
 
-  appimage:
+  # the DigitPad model, trained once for the AppImage and the Windows zip
+  model:
     needs: version
     if: needs.version.outputs.binaries == 'true'
     runs-on: ubuntu-24.04
@@ -180,34 +182,101 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.ref }}
+      - name: Train (2 epochs on pull requests, the full 60 for releases)
+        run: |
+          epochs=60
+          [ "${{ needs.version.outputs.publish }}" = true ] || epochs=2
+          sh Examples/download_mnist.sh mnist
+          cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=ON -DBUILD_WITH_OPENMP=ON \
+            -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF
+          cmake --build Build --parallel --target DigitPadTrain
+          Bin/DigitPadTrain mnist mnist.slett "$epochs"
+          cat mnist.slett.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: mnist.slett*
+          if-no-files-found: error
+
+  appimage:
+    needs: [version, model]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: model
       - name: Dependencies (SDL2 build headers)
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev \
             libxfixes-dev libwayland-dev libxkbcommon-dev libdecor-0-dev wayland-protocols libegl-dev \
             libgl-dev libgles-dev libdrm-dev libgbm-dev
-      - name: Build (2 epochs on pull requests, the full 60 for releases)
-        run: |
-          epochs=60
-          [ "${{ needs.version.outputs.publish }}" = true ] || epochs=2
-          Apps/DigitPad/Package/build-appimage.sh --epochs "$epochs" --work build/appimage
+      - name: Build
+        run: Apps/DigitPad/Package/build-appimage.sh --model model/mnist.slett --work build/appimage
       - name: Smoke test
         run: |
           image=$(ls build/appimage/DigitPad-*-x86_64.AppImage)
           APPIMAGE_EXTRACT_AND_RUN=1 "$image" --help | grep -q classify
-          cat build/appimage/mnist.slett.info
+          APPIMAGE_EXTRACT_AND_RUN=1 "$image" --classify Apps/DigitPad/Package/seven.pgm | tee result.txt
+          grep -q "^prediction 7 " result.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: appimage
+          name: release-appimage
           path: build/appimage/DigitPad-*-x86_64.AppImage
           if-no-files-found: error
 
+  digitpad-windows:
+    needs: [version, model]
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: model
+      - name: MSYS2 (UCRT64 GCC, SDL2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-SDL2
+      - name: Build
+        run: Apps/DigitPad/Package/build-windows-zip.sh --model model/mnist.slett --work build/windows
+      - name: Test (command line, then drawing a 7 in the window)
+        shell: pwsh
+        run: |
+          $zip = (Get-Item build/windows/DigitPad-*-windows-x86_64.zip).FullName
+          Apps/DigitPad/Package/test-windows-zip.ps1 $zip -Screenshot digitpad-windows.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: digitpad-windows-screenshot
+          path: digitpad-windows.png
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-digitpad-windows
+          path: build/windows/DigitPad-*-windows-x86_64.zip
+          if-no-files-found: error
+
   publish:
-    needs: [version, package, appimage]
+    needs: [version, package, model, appimage, digitpad-windows]
     if: >-
       always() && needs.version.outputs.publish == 'true' &&
       (needs.package.result == 'success' || needs.package.result == 'skipped') &&
-      (needs.appimage.result == 'success' || needs.appimage.result == 'skipped')
+      (needs.model.result == 'success' || needs.model.result == 'skipped') &&
+      (needs.appimage.result == 'success' || needs.appimage.result == 'skipped') &&
+      (needs.digitpad-windows.result == 'success' || needs.digitpad-windows.result == 'skipped')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -226,6 +295,7 @@ jobs:
         if: needs.version.outputs.binaries == 'true'
         with:
           path: dist
+          pattern: release-*
           merge-multiple: true
       - name: Notes and checksums
         run: |
@@ -237,9 +307,14 @@ jobs:
       - name: Publish
         run: |
           files=(dist/*); [ -e "${files[0]}" ] || files=()
+          # "Latest" only for the highest version, so that publishing an older tag keeps it
+          highest=$(git ls-remote --tags --refs origin 'v*' | sed 's|.*refs/tags/||' | sort -V | tail -n 1)
+          latest=false; [ "$TAG" = "$highest" ] && latest=true
+          echo "highest tag $highest; $TAG latest: $latest"
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release edit "$TAG" --title "Spingalett $VERSION" --notes-file notes.md
+            gh release edit "$TAG" --title "Spingalett $VERSION" --notes-file notes.md --latest="$latest"
             if [ ${#files[@]} -gt 0 ]; then gh release upload "$TAG" "${files[@]}" --clobber; fi
           else
-            gh release create "$TAG" --verify-tag --title "Spingalett $VERSION" --notes-file notes.md "${files[@]}"
+            gh release create "$TAG" --verify-tag --title "Spingalett $VERSION" --notes-file notes.md \
+              --latest="$latest" "${files[@]}"
           fi

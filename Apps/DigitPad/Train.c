@@ -157,7 +157,12 @@ int main(int argc, char **argv) {
            report.best_epoch, 100.0 * (double)report.best_value, 100.0 * (double)test.accuracy,
            100.0 * (double)robust.accuracy, now() - started);
 
+    spingalett_clear_error();
     save_spingalett(.net = net, .filename = output, .do_not_save_optimizer = true);
+    if (spingalett_last_error_code() != SPINGALETT_OK) {
+        fprintf(stderr, "cannot save %s: %s\n", output, spingalett_last_error_message());
+        return 1;
+    }
     char info[1100];
     snprintf(info, sizeof info, "%s.info", output);
     FILE *f = fopen(info, "w");

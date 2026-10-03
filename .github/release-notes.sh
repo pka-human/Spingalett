@@ -27,6 +27,7 @@ cat <<EOF
 | \`spingalett-$version-windows-x86_64-v3.zip\` | the same for CPUs with AVX2 and FMA |
 | \`spingalett-$version-macos-universal.tar.gz\` | macOS 11 or newer, Apple silicon and Intel (single-threaded: no OpenMP) |
 | \`DigitPad-$version-x86_64.AppImage\` | the digit-drawing demo with a trained model, for x86-64 Linux with glibc 2.34+ |
+| \`DigitPad-$version-windows-x86_64.zip\` | the same demo for 64-bit Windows 10 and 11: unpack it and start \`DigitPad.exe\` |
 | \`SHA256SUMS\` | checksums of all files |
 
 Every archive holds \`include/\`, \`lib/\` (with a CMake package: \`find_package(Spingalett $(echo "$version" | cut -d. -f1-2))\`
@@ -34,5 +35,6 @@ with \`CMAKE_PREFIX_PATH\` pointing at the extracted directory), \`bin/DatasetTo
 CHANGELOG. The Windows archives contain \`bin/libspingalett.dll\` with import libraries for MinGW
 (\`lib/libspingalett.dll.a\`) and MSVC (\`lib/spingalett.lib\`). Python users point
 \`SPINGALETT_LIBRARY\` at the shared library and install the bindings from the source archive
-(\`pip install ./Bindings/Python\`).
+(\`pip install ./Bindings/Python\`). DigitPad is not signed: on Windows, SmartScreen may ask for
+**More info**, then **Run anyway**.
 EOF

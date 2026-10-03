@@ -500,8 +500,8 @@ See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
 [Apps/DigitPad](Apps/DigitPad) is a desktop app in which you draw a digit with the mouse and a
 Spingalett network classifies it as you draw. Its 784-1024-512-10 model, trained with on-the-fly
 augmentation through a data generator, reaches 99.27% MNIST test accuracy. The directory contains
-the app, the trainer and a script that packages both the app and the model as a self-contained
-Linux AppImage.
+the app, the trainer and scripts that package the app and the model as a self-contained Linux
+AppImage and as a Windows zip; every release attaches both.
 
 ![DigitPad](Apps/DigitPad/screenshot.png)
 

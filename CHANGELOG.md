@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.4.1] - 2026-10-03
+
+### Added
+- DigitPad for Windows. `Apps/DigitPad/Package/build-windows-zip.sh` builds
+  `DigitPad-<version>-windows-x86_64.zip`: `DigitPad.exe`, the trained model, `libspingalett.dll`,
+  `SDL2.dll` and the runtime DLLs they load (collected from the import tables), a `README.txt` and
+  the licences. It runs in an MSYS2 UCRT64 shell or cross-compiles on Linux with MinGW-w64.
+  Releases attach the zip next to the AppImage.
+- `DigitPad.exe` is a GUI program with an icon, version information and a manifest that selects
+  UTF-8 as the process code page, so the model loads from folders with non-ASCII names. It prints
+  `--help`, `--classify` and `--verbose` output to the console it was started from.
+- `Apps/DigitPad/Package/test-windows-zip.ps1`: unpacks the zip into a folder with a non-ASCII
+  name, classifies `seven.pgm`, then opens the window, draws a 7 with the mouse and checks the
+  prediction.
+
+### Changed
+- The release workflow trains the DigitPad model once and packages the same model in the AppImage
+  and the Windows zip. Both are tested by classifying `seven.pgm`.
+- A release published for an older tag through `workflow_dispatch` is no longer marked as the
+  latest release.
+- DigitPad decides whether to double its window from the usable display area instead of the
+  display mode.
+
+### Fixed
+- `DigitPadTrain` exits with an error when it cannot write the model, instead of reporting
+  success.
+- DigitPad `--classify` reports errors on stderr only, without opening a message box. The footer
+  shows the model's file name after a `\` as well as a `/`.
+- DigitPad links `SDL2main` before SDL2, which MinGW requires.
+
 ## [0.4.0] - 2026-10-03
 
 ### Added
@@ -139,6 +169,7 @@ changes, which are listed under **Changed**.
 
 Initial release.
 
+[0.4.1]: https://github.com/pka-human/Spingalett/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/pka-human/Spingalett/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pka-human/Spingalett/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pka-human/Spingalett/compare/0a1dd16...v0.2.0
