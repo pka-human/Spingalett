@@ -8,7 +8,7 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad equiv cont sched dropout gen io xor (default: all)
+ *   Spingalett.Tests [group]     groups: grad equiv cont optim sched dropout gen predict io xor (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
  * gradients from a single SGD step with lr = 1 (W_before - W_after). Everything is seeded, so
@@ -120,6 +120,14 @@ static float max_abs_diff(const float *a, const float *b, uint64_t n) {
     float m = 0; for (uint64_t i = 0; i < n; i++) { float d = fabsf(a[i] - b[i]); if (d > m) m = d; } return m;
 }
 
+/* RMSProp divides every gradient by its own running magnitude (sqrt(v) + eps with eps = 1e-8, as
+   in PyTorch): a gradient at rounding-noise level still gets a sizeable step whose sign is set by
+   rounding, so backends that sum in a different order drift apart by ~1e-4 relative to the total
+   weight movement (~1 here). The other optimizers agree to ~1e-6. */
+static float tolerance_for(OptimizerType opt, float usual) {
+    return opt == OPTIMIZER_RMSPROP ? 2e-3f : usual;
+}
+
 // Train identical nets in every backend; weights must agree.
 static void equivalence(OptimizerType opt, TrainingStrategy strat, float decay, float clip) {
     L ls[] = {{12, ACT_NONE}, {16, ACT_TANH}, {9, ACT_SIGMOID}, {4, ACT_SOFTMAX}};
@@ -133,6 +141,7 @@ static void equivalence(OptimizerType opt, TrainingStrategy strat, float decay, 
     for (int m = 0; m < 3; m++) {
         spingalett_set_compute_mode(modes[m]);
         NeuralNetwork *net = build(LOSS_CROSS_ENTROPY, ls, 4, ref->weights, ref->biases);
+        spingalett_seed(21);
         train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 20, .learning_rate = 0.01f,
               .optimizer_type = opt, .training_strategy = strat, .batch_size = N, .weight_decay = decay, .max_grad_norm = clip);
         res[m] = malloc(net->total_weights * 4);
@@ -141,7 +150,7 @@ static void equivalence(OptimizerType opt, TrainingStrategy strat, float decay, 
     }
     float d1 = max_abs_diff(res[0], res[1], ref->total_weights), d2 = max_abs_diff(res[0], res[2], ref->total_weights);
     printf("  equivalence opt=%d strat=%d decay=%.3f clip=%.2f: |st-omp|=%.2e |st-blas|=%.2e\n", opt, strat, decay, clip, d1, d2);
-    CHECK(d1 < 1e-4f && d2 < 1e-4f, "equivalence opt=%d strat=%d", opt, strat);
+    CHECK(d1 < tolerance_for(opt, 1e-4f) && d2 < tolerance_for(opt, 1e-4f), "equivalence opt=%d strat=%d", opt, strat);
     for (int m = 0; m < 3; m++) free(res[m]);
     free_network(ref); free(x); free(y);
 }
@@ -158,7 +167,7 @@ static void strategy_consistency(OptimizerType opt, float decay, float clip) {
     train(.net = b, .inputs = x, .targets = y, .sample_count = 1, .epochs = 15, .learning_rate = 0.01f, .optimizer_type = opt, .weight_decay = decay, .max_grad_norm = clip, .training_strategy = STRATEGY_FULL_BATCH);
     float d = max_abs_diff(a->weights, b->weights, a->total_weights);
     printf("  sample vs full-batch opt=%d decay=%.2f clip=%.2f: %.2e\n", opt, decay, clip, d);
-    CHECK(d < 1e-6f, "strategy consistency opt=%d decay=%.2f clip=%.2f diff %.3e", opt, decay, clip, d);
+    CHECK(d < tolerance_for(opt, 1e-6f), "strategy consistency opt=%d decay=%.2f clip=%.2f diff %.3e", opt, decay, clip, d);
     free_network(a); free_network(b); free(x); free(y);
 }
 
@@ -180,6 +189,38 @@ static void clip_norm(TrainingStrategy strat, ComputeMode mode) {
     printf("  clip strat=%d mode=%d: |step| = %.6f (expected 0.010000)\n", strat, mode, sqrt(sq));
     CHECK(fabs(sqrt(sq) - 0.01) < 1e-5, "clip strat=%d mode=%d step norm %.6f", strat, mode, sqrt(sq));
     free_network(a); free(x); free(y); free(w0); free(b0);
+}
+
+/* Batches larger than the internal chunk (2048 samples) accumulate their gradient over chunks:
+   one full-batch SGD step on 5000 samples must equal the sample-weighted mean of the gradients of
+   its three chunks computed separately. */
+static void chunked_batches(ComputeMode mode) {
+    L ls[] = {{7, ACT_NONE}, {11, ACT_TANH}, {3, ACT_SOFTMAX}};
+    const uint32_t N = 5000, parts[3][2] = {{0, 2048}, {2048, 2048}, {4096, 904}};
+    float *x, *y; lcg_state = 9001;
+    make_data(N, 7, 3, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *ref = build(LOSS_CROSS_ENTROPY, ls, 3, NULL, NULL);
+    uint64_t nw = ref->total_weights;
+    double *expected = calloc(nw, sizeof(double));
+    for (int p = 0; p < 3; p++) {
+        NeuralNetwork *n = build(LOSS_CROSS_ENTROPY, ls, 3, ref->weights, ref->biases);
+        train(.net = n, .inputs = x + (size_t)parts[p][0] * 7, .targets = y + (size_t)parts[p][0] * 3,
+              .sample_count = parts[p][1], .epochs = 1, .learning_rate = 1.0f, .optimizer_type = OPTIMIZER_SGD,
+              .training_strategy = STRATEGY_FULL_BATCH);
+        for (uint64_t i = 0; i < nw; i++)
+            expected[i] += ((double)ref->weights[i] - n->weights[i]) * parts[p][1] / N;
+        free_network(n);
+    }
+    NeuralNetwork *full = build(LOSS_CROSS_ENTROPY, ls, 3, ref->weights, ref->biases);
+    train(.net = full, .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 1.0f,
+          .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+    double worst = 0;
+    for (uint64_t i = 0; i < nw; i++)
+        worst = fmax(worst, fabs(((double)ref->weights[i] - full->weights[i]) - expected[i]));
+    printf("  chunked full batch (5000 = 2048+2048+904) mode=%d: max |diff| %.2e\n", mode, worst);
+    CHECK(worst < 1e-6, "chunked batch accumulation mode=%d (%.3e)", mode, worst);
+    free(expected); free_network(full); free_network(ref); free(x); free(y);
 }
 
 // Training 10 epochs at once must equal 5 + 5 (optimizer state persists in the net).
@@ -237,6 +278,36 @@ static bool truncate_file(const char *path, long drop) {
     return ok;
 }
 
+static void error_codes(void) {
+    char expected[32];
+    snprintf(expected, sizeof expected, "%d.%d.%d", SPINGALETT_VERSION_MAJOR, SPINGALETT_VERSION_MINOR, SPINGALETT_VERSION_PATCH);
+    CHECK(strcmp(spingalett_version(), expected) == 0 && strcmp(spingalett_version(), SPINGALETT_VERSION_STRING) == 0,
+          "library version %s vs headers %s", spingalett_version(), expected);
+
+    spingalett_clear_error();
+    CHECK(load_spingalett("spingalett_test_missing.nn") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO,
+          "missing file: code %d", spingalett_last_error_code());
+
+    FILE *f = fopen("spingalett_test_future.nn", "wb");
+    uint16_t future = SPINGALETT_FORMAT_VERSION + 1;
+    fwrite(&future, sizeof future, 1, f);
+    fclose(f);
+    spingalett_clear_error();
+    CHECK(load_spingalett("spingalett_test_future.nn") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FORMAT_VERSION,
+          "future format version: code %d", spingalett_last_error_code());
+    remove("spingalett_test_future.nn");
+
+    /* cross-entropy needs a softmax or sigmoid output; otherwise the gradient would be wrong */
+    float x[2] = {0.5f, -0.5f}, y[2] = {1.0f, 0.0f};
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(net, 2); layer(net, 2, ACT_TANH);
+    spingalett_clear_error();
+    train(.net = net, .inputs = x, .targets = y, .sample_count = 1, .epochs = 1);
+    CHECK(spingalett_last_error_code() == SPINGALETT_ERR_INVALID && net->time_step == 0, "CE + tanh output must be rejected");
+    free_network(net);
+    printf("  error codes checked (library %s)\n", spingalett_version());
+}
+
 static void load_robustness(void) {
     L ls[] = {{6, ACT_NONE}, {10, ACT_RELU}, {3, ACT_SIGMOID}};
     NeuralNetwork *a = build(LOSS_MSE, ls, 3, NULL, NULL);
@@ -290,12 +361,12 @@ static void schedulers(void) {
         NeuralNetwork *b = build(LOSS_MSE, ls, 3, a->weights, a->biases);
         sched_calls = 0;
         train(.net = a, .inputs = x, .targets = y, .sample_count = 8, .epochs = 6, .learning_rate = 0.3f,
-              .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[st], .lr_scheduler = one_shot);
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[st], .lr_scheduler = one_shot, .do_not_shuffle = true);
         train(.net = b, .inputs = x, .targets = y, .sample_count = 8, .epochs = 1, .learning_rate = 0.3f,
-              .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[st]);
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[st], .do_not_shuffle = true);
         /* epoch 1 returns -1 (ignored => lr stays 0.3), so a ran 2 effective epochs; b one more */
         train(.net = b, .inputs = x, .targets = y, .sample_count = 8, .epochs = 1, .learning_rate = 0.3f,
-              .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[st]);
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[st], .do_not_shuffle = true);
         float d = max_abs_diff(a->weights, b->weights, a->total_weights);
         printf("  scheduler integration strat=%d: calls=%zu last_epoch=%zu total=%zu diff=%.2e\n", strats[st], sched_calls, sched_last_epoch, sched_total, d);
         CHECK(sched_calls == 6 && sched_last_epoch == 5 && sched_total == 6, "scheduler call sequence");
@@ -488,6 +559,127 @@ static void dropout_xor(void) {
     free_network(net);
 }
 
+/* ---------------- initialization, optimizer formulas, shuffling ---------------- */
+static double weight_std(WeightInitialization wi, uint32_t in, uint32_t out) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(net, in);
+    layer(net, out, ACT_TANH, wi);
+    double s = 0, s2 = 0; uint64_t n = net->total_weights;
+    for (uint64_t i = 0; i < n; i++) { s += net->weights[i]; s2 += (double)net->weights[i] * net->weights[i]; }
+    free_network(net);
+    return sqrt(s2 / n - (s / n) * (s / n));
+}
+
+static void initialization(void) {
+    spingalett_seed(8);
+    struct { WeightInitialization wi; double expected; const char *name; } cases[] = {
+        {WEIGHT_INITIALIZATION_XAVIER, sqrt(2.0 / (400 + 600)), "xavier/glorot"},
+        {WEIGHT_INITIALIZATION_HE,     sqrt(2.0 / 400),         "he"},
+        {WEIGHT_INITIALIZATION_LECUN,  sqrt(1.0 / 400),         "lecun"},
+        {WEIGHT_INITIALIZATION_RANDOM, sqrt(1.0 / 3.0),         "uniform[-1,1]"},
+    };
+    for (int c = 0; c < 4; c++) {
+        double sd = weight_std(cases[c].wi, 400, 600);
+        printf("  init %-14s std %.5f (expected %.5f)\n", cases[c].name, sd, cases[c].expected);
+        CHECK(fabs(sd / cases[c].expected - 1.0) < 0.01, "init %s std %.5f", cases[c].name, sd);
+    }
+}
+
+/* First step from zero moments: Adam moves by lr * g / (|g| + eps), RMSProp by
+   lr * g / (sqrt(1 - beta2) * |g| + eps). The gradient comes from an SGD step with lr = 1024
+   (a power of two, so dividing it out is exact and small gradients keep their precision). */
+static void optimizer_first_step(OptimizerType opt) {
+    L ls[] = {{5, ACT_NONE}, {7, ACT_TANH}, {3, ACT_SIGMOID}};
+    float *x, *y; lcg_state = 404;
+    make_data(4, 5, 3, LOSS_MSE, ACT_SIGMOID, &x, &y);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    NeuralNetwork *g = build(LOSS_MSE, ls, 3, NULL, NULL);
+    for (uint64_t i = 0; i < g->total_weights; i++) g->weights[i] *= (i % 7 == 0) ? 1e-4f : 1.0f;  /* include tiny gradients */
+    NeuralNetwork *a = build(LOSS_MSE, ls, 3, g->weights, g->biases);
+    uint64_t nw = g->total_weights;
+    float *w0 = malloc(nw * 4); memcpy(w0, g->weights, nw * 4);
+    train(.net = g, .inputs = x, .targets = y, .sample_count = 4, .epochs = 1, .learning_rate = 1024.0f,
+          .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+    const float lr = 0.01f, eps = 1e-8f;
+    train(.net = a, .inputs = x, .targets = y, .sample_count = 4, .epochs = 1, .learning_rate = lr,
+          .optimizer_type = opt, .training_strategy = STRATEGY_FULL_BATCH);
+    double worst = 0, tiny_ratio = 0; int tiny = 0;
+    for (uint64_t i = 0; i < nw; i++) {
+        double grad = ((double)w0[i] - g->weights[i]) / 1024.0;
+        double denom = (opt == OPTIMIZER_RMSPROP ? sqrt(1.0 - 0.999) : 1.0) * fabs(grad) + eps;
+        double expect = lr * grad / denom, got = (double)w0[i] - a->weights[i];
+        double err = fabs(got - expect) / fmax(fabs(expect), 1e-7);
+        if (err > worst) worst = err;
+        if (fabs(grad) < 1e-4 && fabs(grad) > 1e-7) { tiny++; tiny_ratio = fmax(tiny_ratio, fabs(got) / (lr * (opt == OPTIMIZER_RMSPROP ? 31.6 : 1.0))); }
+    }
+    printf("  first %s step: max rel. error %.2e (%d tiny gradients, max |step|/expected %.3f)\n",
+           opt == OPTIMIZER_RMSPROP ? "RMSProp" : opt == OPTIMIZER_ADAM ? "Adam" : "AdamW", worst, tiny, tiny_ratio);
+    CHECK(worst < 2e-4, "first-step formula opt=%d (rel. error %.3e)", opt, worst);
+    free(w0); free(x); free(y); free_network(g); free_network(a);
+}
+
+static void shuffling(void) {
+    L ls[] = {{5, ACT_NONE}, {9, ACT_TANH}, {3, ACT_SIGMOID}};
+    float *x, *y; lcg_state = 55;
+    make_data(12, 5, 3, LOSS_MSE, ACT_SIGMOID, &x, &y);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    NeuralNetwork *ref = build(LOSS_MSE, ls, 3, NULL, NULL);
+    TrainingStrategy strats[] = {STRATEGY_SAMPLE, STRATEGY_SMALL_BATCH};
+    for (int s = 0; s < 2; s++) {
+        NeuralNetwork *n[3];
+        for (int k = 0; k < 3; k++) {
+            n[k] = build(LOSS_MSE, ls, 3, ref->weights, ref->biases);
+            spingalett_seed(k == 2 ? 2 : 1);
+            train(.net = n[k], .inputs = x, .targets = y, .sample_count = 12, .epochs = 3, .batch_size = 4,
+                  .learning_rate = 0.05f, .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[s]);
+        }
+        NeuralNetwork *fixed = build(LOSS_MSE, ls, 3, ref->weights, ref->biases);
+        train(.net = fixed, .inputs = x, .targets = y, .sample_count = 12, .epochs = 3, .batch_size = 4,
+              .learning_rate = 0.05f, .optimizer_type = OPTIMIZER_SGD, .training_strategy = strats[s], .do_not_shuffle = true);
+        uint64_t nw = ref->total_weights;
+        float same = max_abs_diff(n[0]->weights, n[1]->weights, nw);
+        float other_seed = max_abs_diff(n[0]->weights, n[2]->weights, nw);
+        float vs_fixed = max_abs_diff(n[0]->weights, fixed->weights, nw);
+        printf("  shuffle strat=%d: same seed %.1e, other seed %.1e, vs fixed order %.1e\n", strats[s], same, other_seed, vs_fixed);
+        CHECK(same == 0.0f && other_seed > 1e-5f && vs_fixed > 1e-5f, "shuffling strat=%d", strats[s]);
+        for (int k = 0; k < 3; k++) free_network(n[k]);
+        free_network(fixed);
+    }
+    free_network(ref); free(x); free(y);
+}
+
+/* ---------------- batched inference ---------------- */
+static void predict_matches_forward(ComputeMode mode) {
+    const uint32_t N = 4500;            /* > one internal chunk */
+    float *x, *y; lcg_state = 1234;
+    make_data(N, 9, 4, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(net, 9);
+    layer(net, 37, ACT_RELU, WEIGHT_INITIALIZATION_HE, 0.5f);     /* dropout must not apply */
+    layer(net, 21, ACT_TANH, WEIGHT_INITIALIZATION_XAVIER);
+    layer(net, 4, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() - 0.5f;
+    float *out = malloc((size_t)N * 4 * sizeof(float));
+    for (size_t i = 0; i < (size_t)N * 4; i++) out[i] = NAN;
+    spingalett_clear_error();
+    bool ok = predict(.net = net, .inputs = x, .sample_count = N, .outputs = out);
+    float worst = 0;
+    for (uint32_t s = 0; s < N; s++) {
+        const float *o = forward(net, x + (size_t)s * 9);
+        for (int k = 0; k < 4; k++) {
+            float d = fabsf(o[k] - out[(size_t)s * 4 + k]);
+            if (!(d <= worst)) worst = d;
+        }
+    }
+    printf("  predict == forward, mode=%d, %u samples: max |diff| %.2e\n", mode, N, worst);
+    CHECK(ok && worst < 1e-5f, "predict mode=%d diff %.3e", mode, worst);
+    CHECK(predict(.net = net, .inputs = x, .sample_count = 0, .outputs = out), "empty predict");
+    CHECK(!predict(.net = net, .inputs = NULL, .sample_count = 3, .outputs = out) &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "predict without inputs must fail");
+    free(out); free(x); free(y); free_network(net);
+}
+
 /* ---------------- generator mode ---------------- */
 typedef struct {
     const float *x, *y;
@@ -543,7 +735,7 @@ static void generator_mode(ComputeMode mode) {
         GenState g = {.x = x, .y = y, .n = N, .in = 6, .out = 3, .mode = strats[s] == STRATEGY_FULL_BATCH ? 4 : 0};
         spingalett_seed(5);
         train(.net = a, .inputs = x, .targets = y, .sample_count = N, .epochs = 7, .learning_rate = 0.01f,
-              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = strats[s]);
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = strats[s], .do_not_shuffle = true);
         spingalett_seed(5);
         train(.net = b, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &g,
               .sample_count = strats[s] == STRATEGY_FULL_BATCH ? N : 0, .epochs = 7, .learning_rate = 0.01f,
@@ -677,7 +869,16 @@ int main(int argc, char **argv) {
         OptimizerType opts[] = {OPTIMIZER_SGD, OPTIMIZER_MOMENTUM, OPTIMIZER_RMSPROP, OPTIMIZER_ADAM, OPTIMIZER_ADAMW};
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) { clip_norm(STRATEGY_SAMPLE, cm[m]); clip_norm(STRATEGY_FULL_BATCH, cm[m]); }
+        for (int m = 0; m < 3; m++) chunked_batches(cm[m]);
         for (int o = 0; o < 5; o++) { strategy_consistency(opts[o], 0.05f, 0.0f); strategy_consistency(opts[o], 0.0f, 0.02f); }
+    }
+    if (!*only || !strcmp(only, "optim")) {
+        printf("[initialization, optimizer formulas, shuffling]\n");
+        initialization();
+        optimizer_first_step(OPTIMIZER_ADAM);
+        optimizer_first_step(OPTIMIZER_ADAMW);
+        optimizer_first_step(OPTIMIZER_RMSPROP);
+        shuffling();
     }
     if (!*only || !strcmp(only, "sched")) {
         printf("[lr schedulers]\n");
@@ -703,6 +904,11 @@ int main(int argc, char **argv) {
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) generator_mode(cm[m]);
     }
+    if (!*only || !strcmp(only, "predict")) {
+        printf("[batched inference]\n");
+        ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+        for (int m = 0; m < 3; m++) predict_matches_forward(cm[m]);
+    }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");
         roundtrip(PRECISION_FLOAT32, 0.0f);
@@ -710,6 +916,7 @@ int main(int argc, char **argv) {
         roundtrip(PRECISION_BFLOAT16, 8e-3f);
         roundtrip(PRECISION_INT8, 1.5e-2f);
         load_robustness();
+        error_codes();
     }
     if (!*only || !strcmp(only, "xor")) {
         printf("[xor convergence]\n");

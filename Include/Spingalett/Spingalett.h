@@ -53,10 +53,11 @@ typedef enum {
 } LossFunction;
 
 typedef enum {
-    WEIGHT_INITIALIZATION_RANDOM,
-    WEIGHT_INITIALIZATION_XAVIER,
-    WEIGHT_INITIALIZATION_HE,
-    WEIGHT_INITIALIZATION_NONE,
+    WEIGHT_INITIALIZATION_RANDOM,   /* uniform in [-1, 1] */
+    WEIGHT_INITIALIZATION_XAVIER,   /* Glorot normal: variance 2 / (fan_in + fan_out) */
+    WEIGHT_INITIALIZATION_HE,       /* He normal: variance 2 / fan_in */
+    WEIGHT_INITIALIZATION_NONE,     /* zeros */
+    WEIGHT_INITIALIZATION_LECUN,    /* LeCun normal: variance 1 / fan_in */
     WEIGHT_INITIALIZATION_COUNT
 } WeightInitialization;
 
@@ -194,6 +195,7 @@ typedef struct {
     uint32_t sample_count;          /* MODE_ARRAY: number of samples. Generator: samples per epoch
                                        (0 = until the generator returns 0; required for full batch) */
     uint32_t batch_size;
+    bool do_not_shuffle;            /* keep sample order (per-sample and mini-batch training) */
     size_t epochs;
 
     float learning_rate;
@@ -229,14 +231,26 @@ typedef struct {
 
 typedef struct {
     NeuralNetwork *net;
+    const float *inputs;            /* [sample_count x input size] */
+    uint32_t sample_count;
+    float *outputs;                 /* [sample_count x output size] */
+} PredictArgs;
+
+typedef struct {
+    NeuralNetwork *net;
     const char *filename;
     bool do_not_save_optimizer;
     PrecisionMode precision;
 } SaveArgs;
 
-#define SPINGALETT_OK           0
-#define SPINGALETT_ERR_ALLOC    1
-#define SPINGALETT_ERR_INVALID  2
+#define SPINGALETT_OK                   0
+#define SPINGALETT_ERR_ALLOC            1   /* out of memory */
+#define SPINGALETT_ERR_INVALID          2   /* invalid argument or file contents */
+#define SPINGALETT_ERR_FILE_IO          3   /* file could not be opened, read or written, or is truncated */
+#define SPINGALETT_ERR_FORMAT_VERSION   4   /* model file written by an unsupported format version */
+
+/* Library version (the header's SPINGALETT_VERSION_* macros describe the headers in use). */
+SPINGALETT_API const char *spingalett_version(void);
 
 SPINGALETT_API int spingalett_last_error_code(void);
 SPINGALETT_API const char *spingalett_last_error_message(void);
@@ -273,6 +287,11 @@ SPINGALETT_API float spingalett_lr_cosine_decay(size_t epoch, size_t total_epoch
 SPINGALETT_API float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+
+/* Batched inference: writes the outputs of all samples. Uses matrix-matrix products on every
+   backend, so it is much faster than calling forward() per sample. Returns false on error. */
+#define predict(...) predict_struct_arguments((PredictArgs){__VA_ARGS__})
+SPINGALETT_API bool predict_struct_arguments(PredictArgs args);
 
 #define train(...) train_struct_arguments((TrainArgs){__VA_ARGS__})
 SPINGALETT_API void train_struct_arguments(TrainArgs args);

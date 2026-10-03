@@ -9,6 +9,10 @@
 static _Thread_local int last_error_code = SPINGALETT_OK;
 static _Thread_local char last_error_message[SPINGALETT_ERRMSG_MAX];
 
+const char *spingalett_version(void) {
+    return SPINGALETT_VERSION_STRING;
+}
+
 int spingalett_last_error_code(void) {
     return last_error_code;
 }

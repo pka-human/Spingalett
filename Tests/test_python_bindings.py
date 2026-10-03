@@ -109,7 +109,8 @@ with tempfile.TemporaryDirectory() as d:
     try:
         sg.Network.load(os.path.join(d, "missing.nn")); check(False, "missing file loaded")
     except sg.SpingalettError as e:
-        check("cannot open" in str(e), f"error message: {e}")
+        check("cannot open" in str(e) and e.code == sg.ErrorCode.FILE_IO, f"error: {e} code {e.code!r}")
+check(sg.library_version() == sg.__version__, f"library {sg.library_version()} vs bindings {sg.__version__}")
 
 # generator mode
 sg.set_compute_mode(sg.ComputeMode.OPENBLAS)

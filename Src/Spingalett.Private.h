@@ -33,6 +33,7 @@ static inline bool spingalett_use_omp(ComputeMode mode, uint64_t work) {
 
 void set_error(int code, const char *msg);
 
+
 /* Training-time dropout state. Masks are a hash of (seed, step, position, layer, unit), so every
    backend and thread count draws identical masks for the same sample. */
 typedef struct {
@@ -41,6 +42,33 @@ typedef struct {
     uint32_t position;      /* sample index within that step */
     float   *dmask;         /* per-unit mask * f'(a), laid out like net->neurons */
 } DropoutContext;
+
+/* Samples per batch-path chunk: bounds workspace memory (full-batch training over a large dataset
+   runs in chunks whose gradients are accumulated) while keeping the GEMMs large. */
+#define SPINGALETT_BATCH_CHUNK 2048u
+
+typedef struct SpingalettGemmScratch SpingalettGemmScratch;
+
+/* Activations (and, when training, deltas and dropout masks) for up to `capacity` samples. */
+typedef struct {
+    float **act;            /* act[0]: inputs of the chunk; act[l]: [capacity x topology[l]] */
+    float **delta;          /* training only: delta[l] for l >= 1 */
+    float **dmask;          /* training only: dropout mask * f'(a) per hidden layer with dropout */
+    float *flat;            /* storage of act[1..] (and delta[1..]) */
+    float *dmask_flat;
+    float *inputs;          /* gather buffers for shuffled mini-batches, or NULL */
+    float *targets;
+    SpingalettGemmScratch *gemm;
+    uint32_t capacity;
+} BatchWorkspace;
+
+BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint32_t capacity,
+                                                  bool training, bool gather, ComputeMode mode);
+void spingalett_batch_workspace_free(BatchWorkspace *ws);
+/* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
+   layers; samples are numbered position_offset + s for the dropout hash. */
+void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
+                              const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
 bool spingalett_has_dropout(const NeuralNetwork *net);
@@ -87,6 +115,36 @@ void spingalett_adam_update(float *restrict W, float *restrict mW, float *restri
 
 double spingalett_vec_sumsq(const float *x, uint64_t n);
 float  spingalett_vec_l2norm(const float *x, uint64_t n);
+/* Native SGEMM (Spingalett.GEMM.c): C = alpha * op(A) * op(B) + beta * C, row-major. The scratch
+   holds packing buffers for `threads` threads and may be reused across calls; NULL allocates a
+   temporary one. */
+SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads);
+void spingalett_gemm_scratch_free(SpingalettGemmScratch *scratch);
+void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                            uint32_t M, uint32_t N, uint32_t K, float alpha,
+                            const float *A, size_t lda, const float *B, size_t ldb,
+                            float beta, float *C, size_t ldc, bool parallel);
+
+/* Multiply-adds below which a GEMM runs on one thread. */
+#define SPINGALETT_GEMM_PARALLEL_WORK (1u << 18)
+
+/* GEMM on the selected backend: OpenBLAS when requested and available, the native kernels
+   otherwise (multi-threaded in OpenMP mode). */
+static inline void spingalett_gemm(SpingalettGemmScratch *scratch, ComputeMode mode, bool trans_a, bool trans_b,
+                                   uint32_t M, uint32_t N, uint32_t K, float alpha,
+                                   const float *A, size_t lda, const float *B, size_t ldb,
+                                   float beta, float *C, size_t ldc) {
+#if defined(SPINGALETT_HAS_OPENBLAS)
+    if (mode == COMPUTE_OPENBLAS) {
+        cblas_sgemm(CblasRowMajor, trans_a ? CblasTrans : CblasNoTrans, trans_b ? CblasTrans : CblasNoTrans,
+                    (int)M, (int)N, (int)K, alpha, A, (int)lda, B, (int)ldb, beta, C, (int)ldc);
+        return;
+    }
+#endif
+    bool parallel = mode == COMPUTE_OPENMP && (uint64_t)M * N * K >= SPINGALETT_GEMM_PARALLEL_WORK;
+    spingalett_gemm_native(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel);
+}
+
 void spingalett_vec_scale(float *data, uint64_t n, float scale);
 void spingalett_vec_mul(float *restrict y, const float *restrict x, uint64_t n);
 void spingalett_vec_scaled_copy(float *restrict dst, const float *restrict src, uint64_t n, float alpha);

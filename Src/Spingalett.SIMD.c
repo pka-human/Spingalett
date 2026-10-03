@@ -408,8 +408,9 @@ void spingalett_vec_axpy(float *restrict y, const float *restrict x, uint64_t n,
 /*
  * Optimizer kernels. Weight decay is the classic coupled L2 term (g' = g + decay * w) for
  * every optimizer except AdamW, which instead passes decay = 0 and a decoupled
- * wd_factor = 1 - lr * weight_decay. The same kernels serve the per-sample and batch paths,
- * so both strategies follow identical update rules.
+ * wd_factor = 1 - lr * weight_decay. Epsilon is added to the square root of the second
+ * moment (sqrt(v) + eps), as in PyTorch and TensorFlow. The same kernels serve the
+ * per-sample and batch paths, so both strategies follow identical update rules.
  */
 
 void spingalett_sgd_update(float *restrict W, const float *restrict gW, uint64_t n, float lr, float decay) {
@@ -463,14 +464,14 @@ void spingalett_rmsprop_update(float *restrict W, float *restrict vW, const floa
         __m256 g = FMADD256(v_decay, w, _mm256_loadu_ps(gW + i));
         __m256 v = FMADD256(v_b2, _mm256_loadu_ps(vW + i), _mm256_mul_ps(v_1mb2, _mm256_mul_ps(g, g)));
         _mm256_storeu_ps(vW + i, v);
-        __m256 step = _mm256_div_ps(g, _mm256_sqrt_ps(_mm256_add_ps(v, v_eps)));
+        __m256 step = _mm256_div_ps(g, _mm256_add_ps(_mm256_sqrt_ps(v), v_eps));
         _mm256_storeu_ps(W + i, FNMADD256(v_lr, step, w));
     }
 #endif
     for (; i < n; i++) {
         float g = gW[i] + decay * W[i];
         vW[i] = beta2 * vW[i] + one_minus_b2 * (g * g);
-        W[i] -= lr * (g / sqrtf(vW[i] + epsilon));
+        W[i] -= lr * (g / (sqrtf(vW[i]) + epsilon));
     }
 }
 
@@ -499,8 +500,8 @@ void spingalett_adam_update(float *restrict W, float *restrict mW, float *restri
         __m256 v = FMADD256(v_b2, _mm256_loadu_ps(vW + i), _mm256_mul_ps(v_1mb2, _mm256_mul_ps(g, g)));
         _mm256_storeu_ps(mW + i, m);
         _mm256_storeu_ps(vW + i, v);
-        __m256 v_hat = FMADD256(v, v_vf, v_eps);
-        __m256 step = _mm256_div_ps(_mm256_mul_ps(m, v_mf), _mm256_sqrt_ps(v_hat));
+        __m256 denom = _mm256_add_ps(_mm256_sqrt_ps(_mm256_mul_ps(v, v_vf)), v_eps);
+        __m256 step = _mm256_div_ps(_mm256_mul_ps(m, v_mf), denom);
         _mm256_storeu_ps(W + i, FNMADD256(v_lr, step, _mm256_mul_ps(w, v_wd)));
     }
 #endif
@@ -509,8 +510,8 @@ void spingalett_adam_update(float *restrict W, float *restrict mW, float *restri
         mW[i] = beta1 * mW[i] + one_minus_b1 * g;
         vW[i] = beta2 * vW[i] + one_minus_b2 * (g * g);
         float m_hat = mW[i] * m_factor;
-        float v_hat = vW[i] * v_factor + epsilon;
-        W[i] = W[i] * wd_factor - lr * (m_hat / sqrtf(v_hat));
+        float v_hat = vW[i] * v_factor;
+        W[i] = W[i] * wd_factor - lr * (m_hat / (sqrtf(v_hat) + epsilon));
     }
 }
 
