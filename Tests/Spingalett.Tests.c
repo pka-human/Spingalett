@@ -191,6 +191,38 @@ static void clip_norm(TrainingStrategy strat, ComputeMode mode) {
     free_network(a); free(x); free(y); free(w0); free(b0);
 }
 
+/* Batches larger than the internal chunk (2048 samples) accumulate their gradient over chunks:
+   one full-batch SGD step on 5000 samples must equal the sample-weighted mean of the gradients of
+   its three chunks computed separately. */
+static void chunked_batches(ComputeMode mode) {
+    L ls[] = {{7, ACT_NONE}, {11, ACT_TANH}, {3, ACT_SOFTMAX}};
+    const uint32_t N = 5000, parts[3][2] = {{0, 2048}, {2048, 2048}, {4096, 904}};
+    float *x, *y; lcg_state = 9001;
+    make_data(N, 7, 3, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *ref = build(LOSS_CROSS_ENTROPY, ls, 3, NULL, NULL);
+    uint64_t nw = ref->total_weights;
+    double *expected = calloc(nw, sizeof(double));
+    for (int p = 0; p < 3; p++) {
+        NeuralNetwork *n = build(LOSS_CROSS_ENTROPY, ls, 3, ref->weights, ref->biases);
+        train(.net = n, .inputs = x + (size_t)parts[p][0] * 7, .targets = y + (size_t)parts[p][0] * 3,
+              .sample_count = parts[p][1], .epochs = 1, .learning_rate = 1.0f, .optimizer_type = OPTIMIZER_SGD,
+              .training_strategy = STRATEGY_FULL_BATCH);
+        for (uint64_t i = 0; i < nw; i++)
+            expected[i] += ((double)ref->weights[i] - n->weights[i]) * parts[p][1] / N;
+        free_network(n);
+    }
+    NeuralNetwork *full = build(LOSS_CROSS_ENTROPY, ls, 3, ref->weights, ref->biases);
+    train(.net = full, .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 1.0f,
+          .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+    double worst = 0;
+    for (uint64_t i = 0; i < nw; i++)
+        worst = fmax(worst, fabs(((double)ref->weights[i] - full->weights[i]) - expected[i]));
+    printf("  chunked full batch (5000 = 2048+2048+904) mode=%d: max |diff| %.2e\n", mode, worst);
+    CHECK(worst < 1e-6, "chunked batch accumulation mode=%d (%.3e)", mode, worst);
+    free(expected); free_network(full); free_network(ref); free(x); free(y);
+}
+
 // Training 10 epochs at once must equal 5 + 5 (optimizer state persists in the net).
 static void continuation(OptimizerType opt) {
     L ls[] = {{5, ACT_NONE}, {7, ACT_TANH}, {3, ACT_SIGMOID}};
@@ -805,6 +837,7 @@ int main(int argc, char **argv) {
         OptimizerType opts[] = {OPTIMIZER_SGD, OPTIMIZER_MOMENTUM, OPTIMIZER_RMSPROP, OPTIMIZER_ADAM, OPTIMIZER_ADAMW};
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) { clip_norm(STRATEGY_SAMPLE, cm[m]); clip_norm(STRATEGY_FULL_BATCH, cm[m]); }
+        for (int m = 0; m < 3; m++) chunked_batches(cm[m]);
         for (int o = 0; o < 5; o++) { strategy_consistency(opts[o], 0.05f, 0.0f); strategy_consistency(opts[o], 0.0f, 0.02f); }
     }
     if (!*only || !strcmp(only, "optim")) {

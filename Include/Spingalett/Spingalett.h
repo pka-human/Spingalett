@@ -231,6 +231,13 @@ typedef struct {
 
 typedef struct {
     NeuralNetwork *net;
+    const float *inputs;            /* [sample_count x input size] */
+    uint32_t sample_count;
+    float *outputs;                 /* [sample_count x output size] */
+} PredictArgs;
+
+typedef struct {
+    NeuralNetwork *net;
     const char *filename;
     bool do_not_save_optimizer;
     PrecisionMode precision;
@@ -280,6 +287,11 @@ SPINGALETT_API float spingalett_lr_cosine_decay(size_t epoch, size_t total_epoch
 SPINGALETT_API float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+
+/* Batched inference: writes the outputs of all samples. Uses matrix-matrix products on every
+   backend, so it is much faster than calling forward() per sample. Returns false on error. */
+#define predict(...) predict_struct_arguments((PredictArgs){__VA_ARGS__})
+SPINGALETT_API bool predict_struct_arguments(PredictArgs args);
 
 #define train(...) train_struct_arguments((TrainArgs){__VA_ARGS__})
 SPINGALETT_API void train_struct_arguments(TrainArgs args);

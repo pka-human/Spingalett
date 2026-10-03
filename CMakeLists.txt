@@ -299,6 +299,27 @@ if(BUILD_TESTS)
         set_target_properties(SpingalettTests PROPERTIES BUILD_RPATH "$ORIGIN")
     endif()
 
+    # White-box GEMM test: compiles the kernel source itself with the library's ISA flags.
+    add_executable(SpingalettGemmTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.GemmTests.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.GEMM.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Memory.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Error.c)
+    target_include_directories(SpingalettGemmTests PRIVATE Src ${CMAKE_CURRENT_SOURCE_DIR}/Include
+                               ${CMAKE_CURRENT_BINARY_DIR}/Spingalett)
+    if(SPINGALETT_NATIVE_ARCH AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
+        target_compile_options(SpingalettGemmTests PRIVATE -O2 -march=native)
+    endif()
+    if(SPINGALETT_HAS_OPENMP AND TARGET OpenMP::OpenMP_C)
+        target_link_libraries(SpingalettGemmTests PRIVATE OpenMP::OpenMP_C)
+    endif()
+    if(SPINGALETT_HAS_OPENBLAS)
+        target_include_directories(SpingalettGemmTests PRIVATE ${_spg_blas_inc})
+    endif()
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(SpingalettGemmTests PRIVATE m)
+    endif()
+    add_test(NAME core.gemm COMMAND SpingalettGemmTests)
+
     foreach(group grad equiv cont optim sched dropout gen io xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
