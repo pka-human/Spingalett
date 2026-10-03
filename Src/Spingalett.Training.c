@@ -528,6 +528,12 @@ typedef struct {
     uint32_t batch_size;        /* samples per optimizer step */
     uint32_t *order;            /* sample order (shuffled per epoch for mini-batches) */
 
+    bool use_generator;
+    uint32_t gen_capacity;      /* samples requested per generator call */
+    float *gen_inputs;          /* generator buffers (alias the BLAS gather buffers) */
+    float *gen_targets;
+    bool gen_owned;
+
     float **deltas;             /* per-sample path */
     float *deltas_flat;
 
@@ -539,6 +545,10 @@ typedef struct {
 } Trainer;
 
 static void trainer_free(Trainer *t) {
+    if (t->gen_owned) {
+        spingalett_aligned_free(t->gen_inputs);
+        spingalett_aligned_free(t->gen_targets);
+    }
     free(t->order);
     free(t->deltas);
     spingalett_aligned_free(t->deltas_flat);
@@ -552,7 +562,7 @@ static bool trainer_alloc(Trainer *t) {
     NeuralNetwork *net = t->net;
     uint32_t sample_count = t->args->sample_count;
 
-    if (t->args->training_strategy == STRATEGY_SMALL_BATCH) {
+    if (t->args->training_strategy == STRATEGY_SMALL_BATCH && !t->use_generator) {
         t->order = (uint32_t *)malloc((size_t)sample_count * sizeof(uint32_t));
         if (!t->order) return false;
         for (uint32_t i = 0; i < sample_count; i++)
@@ -561,10 +571,20 @@ static bool trainer_alloc(Trainer *t) {
 
 #if defined(SPINGALETT_HAS_OPENBLAS)
     if (t->use_blas_batch) {
-        t->ws = batch_workspace_create(net, t->batch_size, t->args->training_strategy == STRATEGY_SMALL_BATCH);
-        return t->ws != NULL;
+        t->ws = batch_workspace_create(net, t->batch_size, t->order != NULL || t->use_generator);
+        if (!t->ws) return false;
+        t->gen_inputs = t->ws->inputs;      /* the generator writes straight into the workspace */
+        t->gen_targets = t->ws->targets;
+        return true;
     }
 #endif
+
+    if (t->use_generator) {
+        t->gen_owned = true;
+        t->gen_inputs  = (float *)spingalett_aligned_alloc((size_t)t->gen_capacity * net->topology[0] * sizeof(float));
+        t->gen_targets = (float *)spingalett_aligned_alloc((size_t)t->gen_capacity * net->topology[net->layers - 1] * sizeof(float));
+        if (!t->gen_inputs || !t->gen_targets) return false;
+    }
 
     t->deltas = (float **)calloc(net->layers, sizeof(float *));
     t->deltas_flat = (float *)spingalett_aligned_calloc(net->total_neurons, sizeof(float));
@@ -586,9 +606,10 @@ static void trainer_begin_step(Trainer *t) {
     t->opt.v_factor = 1.0f / (1.0f - t->beta2_pow);
 }
 
-/* Trains on the samples order[start .. start+count) (or start.. directly when order is NULL)
-   and performs the optimizer step(s). Returns the summed loss when need_loss is set. */
-static float trainer_step(Trainer *t, uint32_t start, uint32_t count, bool need_loss) {
+/* Trains on rows order[start .. start+count) of inputs/targets (rows start.. directly when order
+   is NULL) and performs the optimizer step(s). Returns the summed loss when need_loss is set. */
+static float trainer_step(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order,
+                          uint32_t start, uint32_t count, bool need_loss) {
     NeuralNetwork *net = t->net;
     const TrainArgs *args = t->args;
     uint32_t in_sz  = net->topology[0];
@@ -600,17 +621,18 @@ static float trainer_step(Trainer *t, uint32_t start, uint32_t count, bool need_
     if (t->use_blas_batch) {
         BatchWorkspace *ws = t->ws;
         const float *targets;
-        if (t->order) {
+        if (order) {
             for (uint32_t s = 0; s < count; s++) {
-                uint32_t idx = t->order[start + s];
-                memcpy(ws->inputs + (size_t)s * in_sz, args->inputs + (size_t)idx * in_sz, in_sz * sizeof(float));
-                memcpy(ws->targets + (size_t)s * out_sz, args->targets + (size_t)idx * out_sz, out_sz * sizeof(float));
+                uint32_t idx = order[start + s];
+                memcpy(ws->inputs + (size_t)s * in_sz, inputs + (size_t)idx * in_sz, in_sz * sizeof(float));
+                memcpy(ws->targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
             }
+            ws->act[0] = ws->inputs;
             targets = ws->targets;
         } else {
-            /* Full batch reads the caller's arrays in place; act[0] is never written. */
-            ws->act[0] = (float *)(args->inputs + (size_t)start * in_sz);
-            targets = args->targets + (size_t)start * out_sz;
+            /* Contiguous rows are read in place; act[0] is never written. */
+            ws->act[0] = (float *)(inputs + (size_t)start * in_sz);
+            targets = targets_in + (size_t)start * out_sz;
         }
 
         t->dropout.step = net->time_step;
@@ -632,13 +654,13 @@ static float trainer_step(Trainer *t, uint32_t start, uint32_t count, bool need_
     const DropoutContext *dropout = t->use_dropout ? &t->dropout : NULL;
 
     for (uint32_t s = 0; s < count; s++) {
-        uint32_t idx = t->order ? t->order[start + s] : start + s;
-        const float *target = args->targets + (size_t)idx * out_sz;
+        uint32_t idx = order ? order[start + s] : start + s;
+        const float *target = targets_in + (size_t)idx * out_sz;
 
         /* Online steps hold one sample each, so its position within the step is 0. */
         t->dropout.step = net->time_step;
         t->dropout.position = online ? 0 : s;
-        const float *out = spingalett_forward_pass(net, args->inputs + (size_t)idx * in_sz, t->mode, dropout);
+        const float *out = spingalett_forward_pass(net, inputs + (size_t)idx * in_sz, t->mode, dropout);
 
         if (need_loss)
             loss += compute_sample_loss(out, target, out_sz, net->loss_func, out_act);
@@ -688,14 +710,22 @@ void train_struct_arguments(TrainArgs args) {
         return;
     }
 
-    if (training_mode == MODE_GENERATOR_FUNCTION) {
-        set_error(SPINGALETT_ERR_INVALID, "Generator function training mode is not implemented yet");
-        spingalett_log(LOG_ERROR, "Generator function training mode is not implemented yet");
+    bool use_generator = (training_mode == MODE_GENERATOR_FUNCTION);
+
+    if (!net || epochs == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL net or zero epochs)");
+        spingalett_log(LOG_ERROR, "Invalid training arguments");
         return;
     }
 
-    if (!net || sample_count == 0 || epochs == 0 || !args.inputs || !args.targets) {
-        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL net/inputs/targets or zero count/epochs)");
+    if (use_generator) {
+        if (!args.generator || (training_strategy == STRATEGY_FULL_BATCH && sample_count == 0)) {
+            set_error(SPINGALETT_ERR_INVALID, "Generator mode needs a generator (and sample_count for full batch)");
+            spingalett_log(LOG_ERROR, "Generator mode needs a generator (and sample_count for full batch)");
+            return;
+        }
+    } else if (sample_count == 0 || !args.inputs || !args.targets) {
+        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL inputs/targets or zero sample count)");
         spingalett_log(LOG_ERROR, "Invalid training arguments");
         return;
     }
@@ -716,7 +746,7 @@ void train_struct_arguments(TrainArgs args) {
 
     if (training_strategy == STRATEGY_SMALL_BATCH && args.batch_size == 0)
         args.batch_size = 32;
-    if (training_strategy == STRATEGY_SMALL_BATCH && args.batch_size > sample_count)
+    if (training_strategy == STRATEGY_SMALL_BATCH && sample_count > 0 && args.batch_size > sample_count)
         args.batch_size = sample_count;
 
     if (args.reset_optimizer) {
@@ -792,6 +822,14 @@ void train_struct_arguments(TrainArgs args) {
         case STRATEGY_SMALL_BATCH: t.batch_size = args.batch_size; break;
         default:                   t.batch_size = sample_count; break;
     }
+
+    t.use_generator = use_generator;
+    if (use_generator) {
+        /* Per-sample training pulls chunks of samples and steps after each one. */
+        t.gen_capacity = (training_strategy == STRATEGY_SAMPLE)
+                         ? ((sample_count > 0 && sample_count < 256u) ? sample_count : 256u)
+                         : t.batch_size;
+    }
 #if defined(SPINGALETT_HAS_OPENBLAS)
     t.use_blas_batch = (effective_mode == COMPUTE_OPENBLAS && training_strategy != STRATEGY_SAMPLE);
 #endif
@@ -817,7 +855,7 @@ void train_struct_arguments(TrainArgs args) {
 
     /* STRATEGY_SAMPLE walks the whole set in one call and steps after every sample. */
     uint32_t step_size = (training_strategy == STRATEGY_SAMPLE) ? sample_count : t.batch_size;
-    uint32_t steps_per_epoch = (sample_count + step_size - 1) / step_size;
+    uint32_t steps_per_epoch = step_size ? (sample_count + step_size - 1) / step_size : 0;
 
     flush_denormals_begin(effective_mode);
 
@@ -851,16 +889,46 @@ void train_struct_arguments(TrainArgs args) {
             }
         }
 
-        if (t.order)
-            spingalett_shuffle_indices(t.order, sample_count);
+        uint64_t epoch_samples = 0;
 
-        for (uint32_t bi = 0; bi < steps_per_epoch; bi++) {
-            uint32_t start = bi * step_size;
-            uint32_t count = (sample_count - start < step_size) ? sample_count - start : step_size;
-            total_error += trainer_step(&t, start, count, need_loss);
+        if (use_generator) {
+            bool failed = false;
+            for (;;) {
+                uint32_t want = t.gen_capacity;
+                if (sample_count > 0) {
+                    if (epoch_samples >= sample_count) break;
+                    if (sample_count - epoch_samples < want) want = (uint32_t)(sample_count - epoch_samples);
+                }
+                uint32_t got = args.generator(t.gen_inputs, t.gen_targets, want, args.generator_data);
+                if (got == 0) break;
+                if (got > want) {
+                    set_error(SPINGALETT_ERR_INVALID, "Generator returned more samples than requested");
+                    spingalett_log(LOG_ERROR, "Generator returned %u samples for a request of %u; stopping training", got, want);
+                    failed = true;
+                    break;
+                }
+                total_error += trainer_step(&t, t.gen_inputs, t.gen_targets, NULL, 0, got, need_loss);
+                epoch_samples += got;
+                if (training_strategy == STRATEGY_FULL_BATCH) break;
+            }
+            if (failed) break;
+            if (epoch_samples == 0) {
+                spingalett_log(LOG_WARNING, "Generator produced no samples in epoch %zu; stopping training", epoch);
+                break;
+            }
+        } else {
+            if (t.order)
+                spingalett_shuffle_indices(t.order, sample_count);
+
+            for (uint32_t bi = 0; bi < steps_per_epoch; bi++) {
+                uint32_t start = bi * step_size;
+                uint32_t count = (sample_count - start < step_size) ? sample_count - start : step_size;
+                total_error += trainer_step(&t, args.inputs, args.targets, t.order, start, count, need_loss);
+            }
+            epoch_samples = sample_count;
         }
 
-        float current_error = total_error / (float)sample_count;
+        float current_error = total_error / (float)epoch_samples;
 
         if (should_report(epoch, epochs, args.report_interval)) {
             if (args.lr_scheduler)

@@ -119,6 +119,7 @@ class LogLevel(enum.IntEnum):
 
 
 _MODE_ARRAY = 0
+_MODE_GENERATOR = 1
 
 
 # --------------------------------------------------------------------------- C structs
@@ -155,6 +156,7 @@ _NetPtr = POINTER(_NeuralNetwork)
 _TrainCallbackFn = CFUNCTYPE(c_bool, _NetPtr, c_size_t, c_float)
 _LRSchedulerFn = CFUNCTYPE(c_float, c_size_t, c_size_t, c_float, c_void_p)
 _LogCallbackFn = CFUNCTYPE(None, c_int, c_char_p)
+_DataGeneratorFn = CFUNCTYPE(c_uint32, POINTER(c_float), POINTER(c_float), c_uint32, c_void_p)
 
 
 class _NeuralNetworkArgs(Structure):
@@ -183,6 +185,8 @@ class _TrainArgs(Structure):
         ("optimizer_type", c_int),
         ("inputs", POINTER(c_float)),
         ("targets", POINTER(c_float)),
+        ("generator", _DataGeneratorFn),
+        ("generator_data", c_void_p),
         ("sample_count", c_uint32),
         ("batch_size", c_uint32),
         ("epochs", c_size_t),
@@ -644,7 +648,25 @@ class Network:
             raise ValueError(f"inputs have {x.shape[0]} rows but targets have {y.shape[0]}")
         if x.shape[0] == 0:
             raise ValueError("no training samples")
+        self._run(cfg, _MODE_ARRAY, x, y, x.shape[0], None)
 
+    def train_from_generator(self, generator: Callable[[np.ndarray, np.ndarray], int],
+                             config: Optional[TrainConfig] = None, samples_per_epoch: int = 0,
+                             **overrides) -> None:
+        """Train on data produced on demand.
+
+        ``generator(inputs, targets)`` receives writable float32 arrays of shape
+        (requested, input_size) and (requested, output_size), fills the first rows and returns how
+        many it wrote; returning 0 ends the epoch. It is called once per mini-batch, once per epoch
+        for full batch (``samples_per_epoch`` rows requested; required), and in chunks for
+        per-sample training. ``samples_per_epoch`` > 0 also caps the epoch length.
+        """
+        cfg = dataclasses.replace(config or TrainConfig(), **overrides)
+        if cfg.strategy == Strategy.FULL_BATCH and samples_per_epoch <= 0:
+            raise ValueError("full-batch training from a generator needs samples_per_epoch")
+        self._run(cfg, _MODE_GENERATOR, None, None, int(samples_per_epoch), generator)
+
+    def _run(self, cfg: TrainConfig, mode: int, x, y, sample_count: int, generator) -> None:
         pending: List[BaseException] = []
         keep = []  # C callback objects must outlive the call
 
@@ -683,16 +705,39 @@ class Network:
             c_sched = _LRSchedulerFn(schedule)
             keep.append(c_sched)
 
+        c_gen = _DataGeneratorFn()
+        if generator is not None:
+            n_in, n_out = self.input_size, self.output_size
+
+            def produce(in_ptr, tg_ptr, requested, _ud):
+                if pending:
+                    return 0
+                try:
+                    xs = np.ctypeslib.as_array(in_ptr, shape=(requested, n_in))
+                    ys = np.ctypeslib.as_array(tg_ptr, shape=(requested, n_out))
+                    count = int(generator(xs, ys))
+                    if not 0 <= count <= requested:
+                        raise ValueError(f"generator returned {count} for a request of {requested}")
+                    return count
+                except BaseException as exc:
+                    pending.append(exc)
+                    return 0
+
+            c_gen = _DataGeneratorFn(produce)
+            keep.append(c_gen)
+
         autosave_path = _encode_path(cfg.autosave_path) if cfg.autosave_path else None
 
         args = _TrainArgs(
             net=self._ptr,
-            training_mode=_MODE_ARRAY,
+            training_mode=mode,
             training_strategy=int(cfg.strategy),
             optimizer_type=int(cfg.optimizer),
-            inputs=_float_ptr(x),
-            targets=_float_ptr(y),
-            sample_count=x.shape[0],
+            inputs=_float_ptr(x) if x is not None else None,
+            targets=_float_ptr(y) if y is not None else None,
+            generator=c_gen,
+            generator_data=None,
+            sample_count=sample_count,
             batch_size=int(cfg.batch_size),
             epochs=int(cfg.epochs),
             learning_rate=float(cfg.learning_rate),

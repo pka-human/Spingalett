@@ -111,6 +111,41 @@ with tempfile.TemporaryDirectory() as d:
     except sg.SpingalettError as e:
         check("cannot open" in str(e), f"error message: {e}")
 
+# generator mode
+sg.set_compute_mode(sg.ComputeMode.OPENBLAS)
+rng2 = np.random.default_rng(7)
+gx = rng2.normal(size=(30, 4)).astype(np.float32); gy = np.eye(2, dtype=np.float32)[rng2.integers(0, 2, 30)]
+def make(): 
+    sg.seed(9)
+    return sg.Network(sg.Loss.CROSS_ENTROPY, [4, sg.Layer(10, sg.Activation.TANH, sg.Init.XAVIER, dropout=0.2), sg.Layer(2, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
+with make() as a, make() as b:
+    sg.seed(3); a.train(gx, gy, epochs=6, optimizer=sg.Optimizer.ADAM)
+    def full(xs, ys):
+        xs[:30] = gx; ys[:30] = gy; return 30
+    sg.seed(3); b.train_from_generator(full, epochs=6, optimizer=sg.Optimizer.ADAM, samples_per_epoch=30)
+    check(np.array_equal(a.get_weights(0), b.get_weights(0)) and a.time_step == b.time_step == 6, "generator full batch == array full batch")
+    calls = []
+    class Stream:
+        pos = 0
+        def __call__(self, xs, ys):
+            calls.append(len(xs))
+            n = min(len(xs), 30 - self.pos)
+            xs[:n] = gx[self.pos:self.pos + n]; ys[:n] = gy[self.pos:self.pos + n]
+            self.pos = self.pos + n if n else 0       # 0 rows ends the epoch; rewind for the next one
+            return n
+    b.train_from_generator(Stream(), epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=8)
+    check(calls[:5] == [8, 8, 8, 8, 8] and b.time_step == 6 + 8, f"mini-batch generator calls {calls} steps {b.time_step}")
+    def broken(xs, ys): raise KeyError("data source failed")
+    try:
+        b.train_from_generator(broken, epochs=3, strategy=sg.Strategy.MINI_BATCH); check(False, "generator exception swallowed")
+    except KeyError:
+        pass
+    try:
+        b.train_from_generator(full, epochs=1); check(False, "full batch without samples_per_epoch accepted")
+    except ValueError:
+        pass
+sg.set_compute_mode(sg.ComputeMode.SINGLE_THREADED)
+
 # logging callback
 msgs = []
 sg.set_verbose(True); sg.set_log_callback(lambda lvl, m: msgs.append((lvl, m)))

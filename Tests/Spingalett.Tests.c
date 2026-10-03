@@ -8,7 +8,7 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad equiv cont sched dropout io xor (default: all)
+ *   Spingalett.Tests [group]     groups: grad equiv cont sched dropout gen io xor (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
  * gradients from a single SGD step with lr = 1 (W_before - W_after). Everything is seeded, so
@@ -488,6 +488,133 @@ static void dropout_xor(void) {
     free_network(net);
 }
 
+/* ---------------- generator mode ---------------- */
+typedef struct {
+    const float *x, *y;
+    uint32_t n, in, out, pos;
+    uint32_t calls, requested[64];
+    int mode;                       /* 0 = dataset once per epoch (then return 0), 1 = endless,
+                                       2 = overflow, 3 = empty, 4 = restart on every call (full batch) */
+} GenState;
+
+static uint32_t serve(float *inputs, float *targets, uint32_t requested, void *ud) {
+    GenState *g = ud;
+    if (g->calls < 64) g->requested[g->calls] = requested;
+    g->calls++;
+    if (g->mode == 3) return 0;
+    if (g->mode == 2) return requested + 1;
+    if (g->mode == 4) g->pos = 0;
+    uint32_t count = 0;
+    while (count < requested) {
+        if (g->pos == g->n) {
+            if (g->mode == 0) break;
+            g->pos = 0;
+        }
+        memcpy(inputs + (size_t)count * g->in, g->x + (size_t)g->pos * g->in, g->in * sizeof(float));
+        memcpy(targets + (size_t)count * g->out, g->y + (size_t)g->pos * g->out, g->out * sizeof(float));
+        g->pos++; count++;
+    }
+    if (g->mode == 0 && count == 0) g->pos = 0;   /* epoch end reported; start over next time */
+    return count;
+}
+
+static NeuralNetwork *gen_net(const float *w, const float *b) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(net, 6);
+    layer(net, 20, ACT_TANH, WEIGHT_INITIALIZATION_XAVIER, 0.3f);
+    layer(net, 11, ACT_RELU, WEIGHT_INITIALIZATION_HE);
+    layer(net, 3, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    if (w) { memcpy(net->weights, w, net->total_weights * 4); memcpy(net->biases, b, net->total_biases * 4); }
+    else for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = frand() - 0.5f;
+    return net;
+}
+
+static void generator_mode(ComputeMode mode) {
+    const uint32_t N = 22, B = 8;
+    float *x, *y; lcg_state = 314;
+    make_data(N, 6, 3, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *ref = gen_net(NULL, NULL);
+
+    /* full batch and per-sample: generator == array mode (dropout masks included) */
+    TrainingStrategy strats[] = {STRATEGY_FULL_BATCH, STRATEGY_SAMPLE};
+    for (int s = 0; s < 2; s++) {
+        NeuralNetwork *a = gen_net(ref->weights, ref->biases), *b = gen_net(ref->weights, ref->biases);
+        GenState g = {.x = x, .y = y, .n = N, .in = 6, .out = 3, .mode = strats[s] == STRATEGY_FULL_BATCH ? 4 : 0};
+        spingalett_seed(5);
+        train(.net = a, .inputs = x, .targets = y, .sample_count = N, .epochs = 7, .learning_rate = 0.01f,
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = strats[s]);
+        spingalett_seed(5);
+        train(.net = b, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &g,
+              .sample_count = strats[s] == STRATEGY_FULL_BATCH ? N : 0, .epochs = 7, .learning_rate = 0.01f,
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = strats[s]);
+        float d = max_abs_diff(a->weights, b->weights, a->total_weights);
+        printf("  generator == array, mode=%d strat=%d: diff %.2e, steps %llu/%llu, calls %u\n", mode, strats[s], d,
+               (unsigned long long)a->time_step, (unsigned long long)b->time_step, g.calls);
+        CHECK(d < 1e-6f && a->time_step == b->time_step, "generator vs array mode=%d strat=%d", mode, strats[s]);
+        free_network(a); free_network(b);
+    }
+
+    /* mini-batches: E epochs from the generator == one full-batch train() per consecutive chunk */
+    {
+        NeuralNetwork *a = gen_net(ref->weights, ref->biases), *b = gen_net(ref->weights, ref->biases);
+        GenState g = {.x = x, .y = y, .n = N, .in = 6, .out = 3};
+        spingalett_seed(6);
+        train(.net = b, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &g,
+              .epochs = 3, .batch_size = B, .learning_rate = 0.01f, .optimizer_type = OPTIMIZER_ADAMW,
+              .weight_decay = 0.01f, .training_strategy = STRATEGY_SMALL_BATCH);
+        /* the dropout seed is drawn once per train() call, so compare without dropout */
+        a->dropout_rates[1] = 0.0f; NeuralNetwork *c = gen_net(ref->weights, ref->biases); c->dropout_rates[1] = 0.0f;
+        GenState g2 = {.x = x, .y = y, .n = N, .in = 6, .out = 3};
+        train(.net = c, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &g2,
+              .epochs = 3, .batch_size = B, .learning_rate = 0.01f, .optimizer_type = OPTIMIZER_ADAMW,
+              .weight_decay = 0.01f, .training_strategy = STRATEGY_SMALL_BATCH);
+        for (int e = 0; e < 3; e++)
+            for (uint32_t s = 0; s < N; s += B) {
+                uint32_t cnt = N - s < B ? N - s : B;
+                train(.net = a, .inputs = x + (size_t)s * 6, .targets = y + (size_t)s * 3, .sample_count = cnt, .epochs = 1,
+                      .learning_rate = 0.01f, .optimizer_type = OPTIMIZER_ADAMW, .weight_decay = 0.01f,
+                      .training_strategy = STRATEGY_FULL_BATCH);
+            }
+        float d = max_abs_diff(a->weights, c->weights, a->total_weights);
+        printf("  generator mini-batches == chunked full batches, mode=%d: diff %.2e, steps %llu (expected 9), requests %u,%u,%u,%u\n",
+               mode, d, (unsigned long long)c->time_step, g2.requested[0], g2.requested[1], g2.requested[2], g2.requested[3]);
+        CHECK(d < 1e-6f && c->time_step == 9 && b->time_step == 9, "generator mini-batch mode=%d", mode);
+        CHECK(g2.requested[0] == B && g2.requested[3] == B, "mini-batch requests");
+        free_network(a); free_network(b); free_network(c);
+    }
+
+    /* endless generator, epoch length capped by sample_count: requests 4, 4, 2 per epoch */
+    {
+        NeuralNetwork *a = gen_net(ref->weights, ref->biases);
+        GenState g = {.x = x, .y = y, .n = N, .in = 6, .out = 3, .mode = 1};
+        train(.net = a, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &g,
+              .sample_count = 10, .epochs = 2, .batch_size = 4, .training_strategy = STRATEGY_SMALL_BATCH);
+        CHECK(g.calls == 6 && g.requested[0] == 4 && g.requested[1] == 4 && g.requested[2] == 2 && g.requested[5] == 2 && a->time_step == 6,
+              "epoch cap: calls %u requests %u,%u,%u steps %llu", g.calls, g.requested[0], g.requested[1], g.requested[2], (unsigned long long)a->time_step);
+        free_network(a);
+    }
+
+    /* misbehaving generators */
+    {
+        NeuralNetwork *a = gen_net(ref->weights, ref->biases);
+        GenState over = {.mode = 2}, empty = {.mode = 3};
+        spingalett_clear_error();
+        train(.net = a, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &over,
+              .epochs = 5, .batch_size = 4, .training_strategy = STRATEGY_SMALL_BATCH);
+        CHECK(spingalett_last_error_code() == SPINGALETT_ERR_INVALID && a->time_step == 0 && over.calls == 1, "overflowing generator must stop training");
+        train(.net = a, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &empty,
+              .epochs = 5, .training_strategy = STRATEGY_SMALL_BATCH);
+        CHECK(a->time_step == 0 && empty.calls == 1, "empty generator must stop training");
+        spingalett_clear_error();
+        train(.net = a, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &empty,
+              .epochs = 1, .training_strategy = STRATEGY_FULL_BATCH);
+        CHECK(spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "full batch without sample_count must be rejected");
+        free_network(a);
+    }
+    free_network(ref); free(x); free(y);
+}
+
 static void xor_converges(OptimizerType opt, TrainingStrategy strat, ComputeMode mode) {
     float x[] = {0,0, 0,1, 1,0, 1,1}, y[] = {0,1,1,0};
     spingalett_set_compute_mode(mode);
@@ -570,6 +697,11 @@ int main(int argc, char **argv) {
         dropout_equivalence(STRATEGY_SAMPLE, 0);
         dropout_misc();
         dropout_xor();
+    }
+    if (!*only || !strcmp(only, "gen")) {
+        printf("[generator mode]\n");
+        ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+        for (int m = 0; m < 3; m++) generator_mode(cm[m]);
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");

@@ -140,6 +140,15 @@ typedef struct {
 typedef bool (*TrainCallback)(NeuralNetwork *net, size_t epoch, float current_error);
 
 /*
+ * Data source for MODE_GENERATOR_FUNCTION. Write up to `requested` samples into `inputs`
+ * ([requested x input size], row-major) and `targets` ([requested x output size]) and return
+ * how many were written; returning 0 ends the epoch. Shuffling and augmentation are up to the
+ * generator. It is called once per mini-batch, once per epoch for full batch (requested =
+ * sample_count), and in chunks for per-sample training.
+ */
+typedef uint32_t (*DataGeneratorFn)(float *inputs, float *targets, uint32_t requested, void *user_data);
+
+/*
  * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
  * completed in this train() call (0 for the first), `initial_lr` is TrainArgs.learning_rate.
  * Returns the learning rate for the coming epoch; negative or NaN results are ignored.
@@ -178,9 +187,12 @@ typedef struct {
     TrainingStrategy training_strategy;
     OptimizerType optimizer_type;
 
-    const float *inputs;
-    const float *targets;
-    uint32_t sample_count;
+    const float *inputs;            /* MODE_ARRAY: [sample_count x input size] */
+    const float *targets;           /* MODE_ARRAY: [sample_count x output size] */
+    DataGeneratorFn generator;      /* MODE_GENERATOR_FUNCTION */
+    void *generator_data;
+    uint32_t sample_count;          /* MODE_ARRAY: number of samples. Generator: samples per epoch
+                                       (0 = until the generator returns 0; required for full batch) */
     uint32_t batch_size;
     size_t epochs;
 
