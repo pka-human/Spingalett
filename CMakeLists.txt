@@ -5,11 +5,13 @@ set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+include(GNUInstallDirs)
+
 # ------------------------------------------------------------------------------
 # Output directories
 # ------------------------------------------------------------------------------
-set(SPINGALETT_BIN_DIR ${CMAKE_SOURCE_DIR}/Bin)
-set(SPINGALETT_LIB_DIR ${CMAKE_SOURCE_DIR}/Lib)
+set(SPINGALETT_BIN_DIR ${CMAKE_SOURCE_DIR}/Bin CACHE PATH "Output directory for executables and shared libraries")
+set(SPINGALETT_LIB_DIR ${CMAKE_SOURCE_DIR}/Lib CACHE PATH "Output directory for static/import libraries")
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${SPINGALETT_BIN_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${SPINGALETT_BIN_DIR})
@@ -34,7 +36,8 @@ target_include_directories(spingalett
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
-        $<INSTALL_INTERFACE:Include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/Spingalett>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_compile_definitions(spingalett PRIVATE SPINGALETT_EXPORTS)
@@ -117,11 +120,6 @@ configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Config.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/Spingalett/Spingalett.Config.h
     @ONLY
-)
-
-target_include_directories(spingalett
-    PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/Spingalett
-
 )
 
 # ------------------------------------------------------------------------------
@@ -253,11 +251,6 @@ if(BUILD_EXAMPLE)
         get_filename_component(EXAMPLE_NAME ${EXAMPLE_SOURCE} NAME_WE)
 
         add_executable(${EXAMPLE_NAME} ${EXAMPLE_SOURCE})
-        target_include_directories(${EXAMPLE_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/Include
-            ${CMAKE_CURRENT_BINARY_DIR}
-            ${CMAKE_CURRENT_BINARY_DIR}/Spingalett
-        )
         target_link_libraries(${EXAMPLE_NAME} PRIVATE spingalett)
 
         if(UNIX AND NOT APPLE)
@@ -272,8 +265,6 @@ endif()
 # ------------------------------------------------------------------------------
 # Install
 # ------------------------------------------------------------------------------
-include(GNUInstallDirs)
-
 install(TARGETS spingalett
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

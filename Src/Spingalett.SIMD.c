@@ -1,3 +1,8 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
 #include "Spingalett.Private.h"
 #include <math.h>
 #include <float.h>

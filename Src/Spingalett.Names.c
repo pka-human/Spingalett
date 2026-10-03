@@ -14,7 +14,7 @@ const char * const loss_func_names[] = {
 };
 
 const char * const training_strategy_names[] = {
-    "SGD", "FULL_BATCH", "SMALL_BATCH"
+    "SAMPLE", "FULL_BATCH", "SMALL_BATCH"
 };
 
 const char * const training_mode_names[] = {
