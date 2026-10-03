@@ -137,6 +137,21 @@ typedef struct {
 
 typedef bool (*TrainCallback)(NeuralNetwork *net, size_t epoch, float current_error);
 
+/*
+ * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
+ * completed in this train() call (0 for the first), `initial_lr` is TrainArgs.learning_rate.
+ * Returns the learning rate for the coming epoch; negative or NaN results are ignored.
+ */
+typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
+
+/* Parameters of the built-in schedulers, passed as lr_scheduler_data (NULL = defaults). */
+typedef struct {
+    size_t warmup_epochs;   /* linear_warmup, warmup_cosine; 0 = 5% of the run (at least 1) */
+    size_t step_size;       /* step_decay: epochs between decays; 0 = a third of the run */
+    float  gamma;           /* step_decay: decay factor; 0 = 0.1 */
+    float  min_lr;          /* cosine_decay, warmup_cosine: final learning rate; default 0 */
+} LRScheduleParams;
+
 typedef struct {
     LossFunction loss_func;
 } NeuralNetworkArgs;
@@ -186,6 +201,9 @@ typedef struct {
 
     TrainCallback callback;
     size_t callback_interval;
+
+    LRSchedulerFn lr_scheduler;     /* NULL = constant learning_rate */
+    void *lr_scheduler_data;
 } TrainArgs;
 
 typedef struct {
@@ -225,6 +243,12 @@ SPINGALETT_API float derivative(float x, ActivationFunction act_func);
 
 #define forward(...) forward_struct_arguments((ForwardArgs){__VA_ARGS__})
 SPINGALETT_API float *forward_struct_arguments(ForwardArgs args);
+
+/* Built-in learning-rate schedules (see LRScheduleParams). */
+SPINGALETT_API float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+SPINGALETT_API float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+SPINGALETT_API float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+SPINGALETT_API float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 
 #define train(...) train_struct_arguments((TrainArgs){__VA_ARGS__})
 SPINGALETT_API void train_struct_arguments(TrainArgs args);

@@ -743,10 +743,23 @@ void train_struct_arguments(TrainArgs args) {
 
     flush_denormals_begin(effective_mode);
 
+    bool lr_warned = false;
+
     for (size_t epoch = 1; epoch <= epochs; epoch++) {
         bool need_loss = should_report(epoch, epochs, args.report_interval) ||
                          (args.callback && should_report(epoch, epochs, args.callback_interval));
         float total_error = 0.0f;
+
+        if (args.lr_scheduler) {
+            float lr = args.lr_scheduler(epoch - 1, epochs, args.learning_rate, args.lr_scheduler_data);
+            if (lr >= 0.0f && isfinite(lr)) {
+                t.opt.lr = lr;
+            } else if (!lr_warned) {
+                lr_warned = true;
+                spingalett_log(LOG_WARNING, "LR scheduler returned %g at epoch %zu; keeping lr=%g",
+                               (double)lr, epoch, (double)t.opt.lr);
+            }
+        }
 
         if (t.order)
             spingalett_shuffle_indices(t.order, sample_count);
@@ -759,8 +772,12 @@ void train_struct_arguments(TrainArgs args) {
 
         float current_error = total_error / (float)sample_count;
 
-        if (should_report(epoch, epochs, args.report_interval))
-            spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f", epoch, epochs, (double)current_error);
+        if (should_report(epoch, epochs, args.report_interval)) {
+            if (args.lr_scheduler)
+                spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f, LR: %g", epoch, epochs, (double)current_error, (double)t.opt.lr);
+            else
+                spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f", epoch, epochs, (double)current_error);
+        }
 
         if (args.nan_check_interval > 0 && (epoch % args.nan_check_interval == 0)) {
             if (check_nan_inf(net)) {
