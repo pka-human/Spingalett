@@ -1,0 +1,245 @@
+name: Release
+
+# Builds, tests and packages the library on every supported platform. On a pull request this only
+# checks that everything builds and packages; pushing a tag vX.Y.Z publishes a GitHub release with
+# the archives. workflow_dispatch (re)publishes an existing tag, optionally without binaries for
+# versions that predate this workflow.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish, e.g. v0.4.0
+        required: true
+      binaries:
+        description: Build and attach binaries
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      ref: ${{ steps.v.outputs.ref }}
+      publish: ${{ steps.v.outputs.publish }}
+      binaries: ${{ steps.v.outputs.binaries }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - id: v
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          version=$(sed -n 's/^project(Spingalett VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          publish=false; binaries=true; ref=$GITHUB_SHA
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            publish=true
+            ref=$TAG
+            if [ "$TAG" != "v$version" ]; then
+              echo "::error::tag $TAG does not match the project version $version"
+              exit 1
+            fi
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "${{ inputs.binaries }}" != true ]; then binaries=false; fi
+          { echo "version=$version"; echo "ref=$ref"; echo "publish=$publish"; echo "binaries=$binaries"; } >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: version
+    if: needs.version.outputs.binaries == 'true'
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,      os: ubuntu-24.04,     flags: '' }
+          - { name: linux-x86_64-v3,   os: ubuntu-24.04,     flags: '-march=x86-64-v3' }
+          - { name: linux-aarch64,     os: ubuntu-24.04-arm, flags: '' }
+          - { name: windows-x86_64,    os: windows-2022,     flags: '' }
+          - { name: windows-x86_64-v3, os: windows-2022,     flags: '-march=x86-64-v3' }
+          - { name: macos-universal,   os: macos-14,         flags: '' }
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.os, 'windows') && 'msys2 {0}' || 'bash' }}
+    env:
+      ARCHIVE: spingalett-${{ needs.version.outputs.version }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+
+      - name: MSYS2 (UCRT64 GCC)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-tools-git zip
+
+      - name: OpenMP runtime (MSYS2)
+        if: runner.os == 'Windows'
+        run: |
+          # GCC's libgomp may come in its own package; install it when the repository has one
+          for p in mingw-w64-ucrt-x86_64-gcc-libgomp mingw-w64-ucrt-x86_64-libgomp; do
+            if pacman -Si "$p" > /dev/null 2>&1; then pacman -S --noconfirm --needed "$p"; fi
+          done
+          pacman -Ss gomp || true
+          ls /ucrt64/bin/libgomp* /ucrt64/lib/libgomp* /ucrt64/lib/gcc/x86_64-w64-mingw32/*/libgomp* 2>/dev/null || true
+
+      - name: Configure
+        run: |
+          root=$PWD; [ "$RUNNER_OS" = Windows ] && root=$(cygpath -m "$PWD")    # native CMake, MSYS shell
+          args=(-DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF "-DCMAKE_C_FLAGS=${{ matrix.flags }}"
+                -DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE")
+          case "${{ matrix.name }}" in
+            macos-*)   args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0) ;;
+            windows-*) args+=(-G Ninja -DBUILD_WITH_OPENMP=ON) ;;
+            *)         args+=(-DBUILD_WITH_OPENMP=ON) ;;
+          esac
+          cmake -S . -B Build "${args[@]}"
+          # OpenMP is requested everywhere but macOS: a build without it must not be published
+          if [ "$RUNNER_OS" != macOS ] && ! grep -q "define SPINGALETT_HAS_OPENMP" Build/Spingalett/Spingalett.Config.h; then
+            grep -n -i -B2 -A25 "openmp" Build/CMakeFiles/CMakeConfigureLog.yaml | tail -120 || true
+            echo "::error::OpenMP was requested but not found"
+            exit 1
+          fi
+
+      - name: Build
+        run: cmake --build Build --parallel
+
+      - name: Test
+        run: ctest --test-dir Build --output-on-failure
+
+      - name: Install
+        run: |
+          cmake --install Build
+          cp LICENSE CHANGELOG.md README.md "$ARCHIVE/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            # the MinGW runtime DLLs the library and DatasetTool load (libgomp, libwinpthread, ...)
+            ldd "$ARCHIVE/bin/libspingalett.dll" "$ARCHIVE/bin/DatasetTool.exe" |
+              awk '$3 ~ /^\/ucrt64\// { print $3 }' | sort -u | xargs -r cp -t "$ARCHIVE/bin/"
+            ls "$ARCHIVE/bin"
+            (cd "$ARCHIVE/lib" && gendef ../bin/libspingalett.dll && mv libspingalett.def spingalett.def)
+          fi
+
+      - name: MSVC import library
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: MSVC import library and consumer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          lib /nologo /def:$env:ARCHIVE\lib\spingalett.def /name:libspingalett.dll /machine:x64 /out:$env:ARCHIVE\lib\spingalett.lib
+          Remove-Item $env:ARCHIVE\lib\spingalett.exp -ErrorAction SilentlyContinue
+          # an MSVC program links against the MinGW-built DLL through the import library
+          cl /nologo /std:c11 /I $env:ARCHIVE\include Examples\XOR.c /Fe:xor_msvc.exe /link $env:ARCHIVE\lib\spingalett.lib
+          $env:PATH = "$PWD\$env:ARCHIVE\bin;$env:PATH"
+          .\xor_msvc.exe | Select-String "Passed"
+
+      - name: Consumer (find_package)
+        run: |
+          mkdir consumer
+          cp Examples/XOR.c consumer/xor.c
+          printf '%s\n' 'cmake_minimum_required(VERSION 3.21)' 'project(consumer C)' \
+            'find_package(Spingalett ${{ needs.version.outputs.version }} REQUIRED)' \
+            'add_executable(xor xor.c)' 'target_link_libraries(xor PRIVATE Spingalett::spingalett)' > consumer/CMakeLists.txt
+          root=$PWD; gen=()
+          if [ "$RUNNER_OS" = Windows ]; then root=$(cygpath -m "$PWD"); gen=(-G Ninja); fi
+          cmake -S consumer -B consumer/build "${gen[@]}" -DCMAKE_PREFIX_PATH="$root/$ARCHIVE"
+          cmake --build consumer/build
+          export PATH="$PWD/$ARCHIVE/bin:$PATH"
+          (cd consumer/build && ./xor | grep "Passed: 4/4")
+          { "$ARCHIVE/bin/DatasetTool" || true; } 2>&1 | grep -q usage      # no arguments: usage, exit 2
+
+      - name: Archive
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then zip -qr "$ARCHIVE.zip" "$ARCHIVE"; else tar -czf "$ARCHIVE.tar.gz" "$ARCHIVE"; fi
+          ls -l "$ARCHIVE".*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ARCHIVE }}.*
+          if-no-files-found: error
+
+  appimage:
+    needs: version
+    if: needs.version.outputs.binaries == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Dependencies (SDL2 build headers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev \
+            libxfixes-dev libwayland-dev libxkbcommon-dev libdecor-0-dev wayland-protocols libegl-dev \
+            libgl-dev libgles-dev libdrm-dev libgbm-dev
+      - name: Build (2 epochs on pull requests, the full 60 for releases)
+        run: |
+          epochs=60
+          [ "${{ needs.version.outputs.publish }}" = true ] || epochs=2
+          Apps/DigitPad/Package/build-appimage.sh --epochs "$epochs" --work build/appimage
+      - name: Smoke test
+        run: |
+          image=$(ls build/appimage/DigitPad-*-x86_64.AppImage)
+          APPIMAGE_EXTRACT_AND_RUN=1 "$image" --help | grep -q classify
+          cat build/appimage/mnist.slett.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: build/appimage/DigitPad-*-x86_64.AppImage
+          if-no-files-found: error
+
+  publish:
+    needs: [version, package, appimage]
+    if: >-
+      always() && needs.version.outputs.publish == 'true' &&
+      (needs.package.result == 'success' || needs.package.result == 'skipped') &&
+      (needs.appimage.result == 'success' || needs.appimage.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.version.outputs.ref }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/checkout@v4          # the notes script may be newer than the tag
+        with:
+          path: tools
+      - uses: actions/download-artifact@v4
+        if: needs.version.outputs.binaries == 'true'
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Notes and checksums
+        run: |
+          binaries=${{ needs.version.outputs.binaries == 'true' && '1' || '0' }}
+          sh tools/.github/release-notes.sh "$VERSION" "$binaries" > notes.md
+          mkdir -p dist
+          if [ -n "$(ls dist)" ]; then (cd dist && sha256sum * > SHA256SUMS); fi
+          cat notes.md; ls -l dist
+      - name: Publish
+        run: |
+          files=(dist/*); [ -e "${files[0]}" ] || files=()
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --title "Spingalett $VERSION" --notes-file notes.md
+            if [ ${#files[@]} -gt 0 ]; then gh release upload "$TAG" "${files[@]}" --clobber; fi
+          else
+            gh release create "$TAG" --verify-tag --title "Spingalett $VERSION" --notes-file notes.md "${files[@]}"
+          fi

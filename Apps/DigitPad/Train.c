@@ -18,6 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#if !defined(TIME_UTC) && defined(_WIN32)
+#include <windows.h>
+#endif
 
 #define VALIDATION 5000
 
@@ -55,9 +58,18 @@ static uint32_t augmented_batch(float *inputs, float *targets, uint32_t requeste
 
 /* ---- progress ---- */
 static double now(void) {
+#if defined(TIME_UTC)                    /* C11 timespec_get; some Windows C runtimes lack it */
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#elif defined(_WIN32)
+    LARGE_INTEGER frequency, counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    return (double)clock() / CLOCKS_PER_SEC;
+#endif
 }
 
 static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *started) {

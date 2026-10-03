@@ -8,14 +8,14 @@
 #include <string.h>
 #include <stdint.h>
 
-#if defined(_MSC_VER)
+#if defined(_WIN32)
 #include <malloc.h>
 #endif
 
 void *spingalett_aligned_alloc(size_t size) {
     if (size == 0) size = SPINGALETT_ALIGNMENT;
     size = (size + SPINGALETT_ALIGNMENT - 1) & ~((size_t)SPINGALETT_ALIGNMENT - 1);
-#if defined(_MSC_VER)
+#if defined(_WIN32)        /* MSVC and MinGW: the Windows C runtime has no aligned_alloc */
     return _aligned_malloc(size, SPINGALETT_ALIGNMENT);
 #elif defined(__APPLE__) || defined(__ANDROID__)
     void *ptr = NULL;
@@ -36,7 +36,7 @@ void *spingalett_aligned_calloc(size_t count, size_t elem_size) {
 
 void spingalett_aligned_free(void *ptr) {
     if (!ptr) return;
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     _aligned_free(ptr);
 #else
     free(ptr);

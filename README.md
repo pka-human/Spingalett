@@ -55,7 +55,15 @@ parameters live in flat contiguous arrays, and models can be saved in reduced pr
 
 ## Building
 
-Requirements: CMake 3.21 or newer and a compiler with C23 support. GCC 13 and Clang 18 are tested
+Prebuilt libraries for Linux (x86-64 and ARM64), Windows and macOS are attached to every
+[release](https://github.com/pka-human/Spingalett/releases): each archive contains the headers,
+the shared library, a CMake package and `DatasetTool`. Extract one and point CMake at it with
+`-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with `-I<dir>/include -L<dir>/lib
+-lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
+`-v3` build with the AVX2/FMA kernels; the Windows DLL ships with import libraries for MinGW and
+MSVC.
+
+To build from source: requirements: CMake 3.21 or newer and a compiler with C23 support. GCC 13 and Clang 18 are tested
 in CI; MSVC 19.36 or newer is expected to work but is not tested. OpenMP and OpenBLAS are
 optional.
 
@@ -99,6 +107,9 @@ which carries the include paths:
 find_package(Spingalett 0.3 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
+
+Programs that compile the library's sources into themselves, or link it statically, define
+`SPINGALETT_STATIC` so that the headers do not declare the API as imported from a DLL.
 
 The headers define `SPINGALETT_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `_STRING`;
 `spingalett_version()` returns the version of the library actually loaded.
