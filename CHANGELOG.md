@@ -32,6 +32,11 @@ changes, which are listed under **Changed**.
   decodable chunks with CRC-32 checksums: the MNIST training set takes 7.8 MB (IDX: 47.1 MB).
   Specified in `docs/DatasetFormat.md`; `Examples/DatasetTool.c` converts IDX and CSV files. Python:
   `save_dataset()`, `load_dataset()`, `dataset_info()` and `Network.train_from_file()`.
+- Prebuilt release archives for Linux x86-64 (baseline and AVX2/FMA builds) and ARM64, Windows
+  x86-64 (MinGW-built DLL with MinGW and MSVC import libraries) and macOS (universal), built,
+  tested and published by `.github/workflows/release.yml` for every tag. `DatasetTool` is
+  installed with the library.
+- `SPINGALETT_STATIC`: define it when compiling the sources into a program or a static library.
 - DigitPad (`Apps/DigitPad`, CMake option `BUILD_APPS`): a desktop app that classifies digits
   drawn with the mouse, its trainer (99.27% MNIST test accuracy with on-the-fly augmentation) and
   a script that packages app and model as a Linux AppImage.
@@ -52,6 +57,13 @@ changes, which are listed under **Changed**.
   (`libspingalett.so.0.4`), because 0.x minor releases are not ABI compatible.
 - `Examples/MNIST.c` holds out 5,000 training images for validation, keeps the best epoch and
   evaluates the test set once.
+
+### Fixed
+- Windows builds with MinGW: aligned buffers came from `aligned_alloc`, which the Windows C
+  runtime does not provide, and were released with `free()`; they now use `_aligned_malloc` and
+  `_aligned_free`, as MSVC builds already did.
+- The examples measure time with a fallback where C11 `timespec_get` is missing (some Windows C
+  runtimes).
 
 ## [0.3.0] - 2026-10-03
 

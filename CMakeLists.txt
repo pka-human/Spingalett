@@ -286,6 +286,14 @@ if(BUILD_EXAMPLE)
             )
         endif()
     endforeach()
+
+    # DatasetTool is a utility rather than a demo: install it next to the library.
+    if(APPLE)
+        set_target_properties(DatasetTool PROPERTIES INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+    elseif(UNIX)
+        set_target_properties(DatasetTool PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    install(TARGETS DatasetTool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # ------------------------------------------------------------------------------
@@ -349,6 +357,7 @@ if(BUILD_TESTS)
                    ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Error.c)
     target_include_directories(SpingalettGemmTests PRIVATE Src ${CMAKE_CURRENT_SOURCE_DIR}/Include
                                ${CMAKE_CURRENT_BINARY_DIR}/Spingalett)
+    target_compile_definitions(SpingalettGemmTests PRIVATE SPINGALETT_STATIC)
     if(SPINGALETT_NATIVE_ARCH AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
         target_compile_options(SpingalettGemmTests PRIVATE -O2 -march=native)
     endif()
@@ -370,7 +379,7 @@ if(BUILD_TESTS)
 
     # A sanitizer-instrumented library cannot be loaded into an uninstrumented Python.
     find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND AND NOT CMAKE_C_FLAGS MATCHES "-fsanitize")
+    if(Python3_Interpreter_FOUND AND NOT CMAKE_C_FLAGS MATCHES "-fsanitize" AND NOT CMAKE_CROSSCOMPILING)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
                         RESULT_VARIABLE SPINGALETT_NUMPY_MISSING OUTPUT_QUIET ERROR_QUIET)
         if(SPINGALETT_NUMPY_MISSING EQUAL 0)

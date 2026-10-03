@@ -13,7 +13,9 @@
 extern "C" {
 #endif
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(SPINGALETT_STATIC)              /* static library, or sources compiled into the program */
+#  define SPINGALETT_API
+#elif defined(_WIN32) || defined(__CYGWIN__)
 #  ifdef SPINGALETT_EXPORTS
 #    define SPINGALETT_API __declspec(dllexport)
 #  else

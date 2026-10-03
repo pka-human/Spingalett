@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#if !defined(TIME_UTC) && defined(_WIN32)
+#include <windows.h>
+#endif
 
 #define INPUT_SIZE  784
 #define HIDDEN_1    512
@@ -29,9 +32,18 @@
 #define MINI_BATCH  64
 
 static double now(void) {
+#if defined(TIME_UTC)                    /* C11 timespec_get; some Windows C runtimes lack it */
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#elif defined(_WIN32)
+    LARGE_INTEGER frequency, counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    return (double)clock() / CLOCKS_PER_SEC;
+#endif
 }
 
 static void generate_synthetic_data(float **inputs, float **targets) {
