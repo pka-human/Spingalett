@@ -811,6 +811,10 @@ TrainReport train_struct_arguments(TrainArgs args) {
                     if (sample_count - epoch_samples < want) want = (uint32_t)(sample_count - epoch_samples);
                 }
                 uint32_t got = args.generator(t.gen_inputs, t.gen_targets, want, args.generator_data);
+                /* A generator that ends its passes with a 0 (such as spingalett_dataset_generator) answers
+                   0 first when the previous epoch, cut by sample_count, never asked past its last sample. */
+                if (got == 0 && epoch_samples == 0)
+                    got = args.generator(t.gen_inputs, t.gen_targets, want, args.generator_data);
                 if (got == 0) break;
                 if (got > want) {
                     set_error(SPINGALETT_ERR_INVALID, "Generator returned more samples than requested");

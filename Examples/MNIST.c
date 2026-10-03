@@ -10,7 +10,7 @@
  *   Bin/MNIST data/mnist [epochs] [st|omp|blas]
  *
  * Holds out 5,000 training images for validation, keeps the weights of the epoch with the best
- * validation accuracy, reports the test accuracy once at the end and saves the model to mnist.nn.
+ * validation accuracy, reports the test accuracy once at the end and saves the model to mnist.slett.
  */
 
 #include <Spingalett/Spingalett.h>
@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
            report.best_epoch, 100.0 * (double)report.best_value);
     printf("test accuracy: %.2f%%  (test loss %.4f)\n", 100.0 * (double)test.accuracy, (double)test.loss);
 
-    save_spingalett(.net = net, .filename = "mnist.nn", .do_not_save_optimizer = true);
+    save_spingalett(.net = net, .filename = "mnist.slett", .do_not_save_optimizer = true);
     free_network(net);
     spingalett_dataset_free(&train_set);
     spingalett_dataset_free(&val_set);

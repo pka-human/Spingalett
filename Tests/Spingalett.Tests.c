@@ -247,9 +247,16 @@ static void roundtrip(PrecisionMode p, float tol) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     NeuralNetwork *a = build(LOSS_MSE, ls, 3, NULL, NULL);
     for (uint64_t i = 0; i < a->total_biases; i++) a->biases[i] = frand() - 0.5f;
-    save_spingalett(.net = a, .filename = "spingalett_test_roundtrip.nn", .precision = p);
-    NeuralNetwork *b = load_spingalett("spingalett_test_roundtrip.nn");
-    remove("spingalett_test_roundtrip.nn");
+    save_spingalett(.net = a, .filename = "spingalett_test_roundtrip.slett", .precision = p);
+    NeuralNetwork *b = load_spingalett("spingalett_test_roundtrip.slett");
+    remove("spingalett_test_roundtrip.slett");
+    if (p == PRECISION_FLOAT32) {   /* a name without extension gets SPINGALETT_MODEL_EXTENSION */
+        save_spingalett(.net = a, .filename = "spingalett_test_noext");
+        FILE *f = fopen("spingalett_test_noext" SPINGALETT_MODEL_EXTENSION, "rb");
+        CHECK(f != NULL, "save without extension should write spingalett_test_noext.slett");
+        if (f) fclose(f);
+        remove("spingalett_test_noext" SPINGALETT_MODEL_EXTENSION);
+    }
     CHECK(b != NULL, "load returned NULL for precision %d", p);
     if (b) {
         float dw = max_abs_diff(a->weights, b->weights, a->total_weights);
@@ -286,17 +293,17 @@ static void error_codes(void) {
           "library version %s vs headers %s", spingalett_version(), expected);
 
     spingalett_clear_error();
-    CHECK(load_spingalett("spingalett_test_missing.nn") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO,
+    CHECK(load_spingalett("spingalett_test_missing.slett") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO,
           "missing file: code %d", spingalett_last_error_code());
 
-    FILE *f = fopen("spingalett_test_future.nn", "wb");
+    FILE *f = fopen("spingalett_test_future.slett", "wb");
     uint16_t future = SPINGALETT_FORMAT_VERSION + 1;
     fwrite(&future, sizeof future, 1, f);
     fclose(f);
     spingalett_clear_error();
-    CHECK(load_spingalett("spingalett_test_future.nn") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FORMAT_VERSION,
+    CHECK(load_spingalett("spingalett_test_future.slett") == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FORMAT_VERSION,
           "future format version: code %d", spingalett_last_error_code());
-    remove("spingalett_test_future.nn");
+    remove("spingalett_test_future.slett");
 
     /* cross-entropy needs a softmax or sigmoid output; otherwise the gradient would be wrong */
     float x[2] = {0.5f, -0.5f}, y[2] = {1.0f, 0.0f};
@@ -312,17 +319,17 @@ static void error_codes(void) {
 static void load_robustness(void) {
     L ls[] = {{6, ACT_NONE}, {10, ACT_RELU}, {3, ACT_SIGMOID}};
     NeuralNetwork *a = build(LOSS_MSE, ls, 3, NULL, NULL);
-    save_spingalett(.net = a, .filename = "spingalett_test_robust.nn");
+    save_spingalett(.net = a, .filename = "spingalett_test_robust.slett");
     layer(.net = NULL, .neurons_amount = 3);              /* leaves a sticky error behind */
-    NeuralNetwork *b = load_spingalett("spingalett_test_robust.nn");
+    NeuralNetwork *b = load_spingalett("spingalett_test_robust.slett");
     CHECK(b != NULL, "load failed after an unrelated earlier error");
     if (b) free_network(b);
-    CHECK(truncate_file("spingalett_test_robust.nn", 7), "could not truncate test file");
+    CHECK(truncate_file("spingalett_test_robust.slett", 7), "could not truncate test file");
     spingalett_clear_error();
-    NeuralNetwork *c = load_spingalett("spingalett_test_robust.nn");
+    NeuralNetwork *c = load_spingalett("spingalett_test_robust.slett");
     CHECK(c == NULL && spingalett_last_error_code() != SPINGALETT_OK, "truncated file must fail to load");
     if (c) free_network(c);
-    remove("spingalett_test_robust.nn");
+    remove("spingalett_test_robust.slett");
     printf("  load robustness checked\n");
     free_network(a);
 }
@@ -517,9 +524,9 @@ static void dropout_misc(void) {
     CHECK(b->layers == 3, "negative dropout must be rejected");
 
     /* v2 roundtrip keeps the rates */
-    save_spingalett(.net = a, .filename = "spingalett_test_dropout.nn");
-    NeuralNetwork *c = load_spingalett("spingalett_test_dropout.nn");
-    remove("spingalett_test_dropout.nn");
+    save_spingalett(.net = a, .filename = "spingalett_test_dropout.slett");
+    NeuralNetwork *c = load_spingalett("spingalett_test_dropout.slett");
+    remove("spingalett_test_dropout.slett");
     CHECK(c && c->dropout_rates[1] == 0.5f && c->dropout_rates[2] == 0.5f && c->dropout_rates[0] == 0.0f, "dropout rates not persisted");
     if (c) free_network(c);
 
@@ -798,7 +805,8 @@ static void generator_mode(ComputeMode mode) {
         CHECK(spingalett_last_error_code() == SPINGALETT_ERR_INVALID && a->time_step == 0 && over.calls == 1, "overflowing generator must stop training");
         train(.net = a, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &empty,
               .epochs = 5, .training_strategy = STRATEGY_SMALL_BATCH);
-        CHECK(a->time_step == 0 && empty.calls == 1, "empty generator must stop training");
+        /* a 0 in answer to an epoch's first request is retried once, then training stops */
+        CHECK(a->time_step == 0 && empty.calls == 2, "empty generator must stop training (calls %u)", empty.calls);
         spingalett_clear_error();
         train(.net = a, .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve, .generator_data = &empty,
               .epochs = 1, .training_strategy = STRATEGY_FULL_BATCH);
@@ -1104,6 +1112,7 @@ static void datasets(void) {
     ok = ok && spingalett_dataset_split(&d, 2, &tail);
     CHECK(ok && d.count == 3 && tail.count == 2 && tail.input_size == 6 && tail.target_size == 5, "dataset split");
     CHECK(ok && fabsf(tail.inputs[0] - 144 / 255.0f) < 1e-7f && tail.targets[0 * 5 + 4] == 1.0f, "dataset split contents");
+    spingalett_dataset_free(&tail);
     CHECK(!spingalett_load_idx("spingalett_test_images.idx", "spingalett_test_labels.idx", 3, &tail) &&
           spingalett_last_error_code() == SPINGALETT_ERR_INVALID && tail.count == 0, "IDX label beyond num_classes");
     spingalett_dataset_free(&d);
@@ -1161,6 +1170,259 @@ static void datasets(void) {
     CHECK(!spingalett_load_csv("spingalett_test.csv", 1, 2, &d), "ragged CSV");
     remove("spingalett_test.csv");
     CHECK(!spingalett_load_csv("spingalett_test_missing.csv", 1, 0, &d) && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO, "missing CSV");
+}
+
+
+/* ---------------- .slettd data set files ---------------- */
+
+static uint32_t test_crc32(const unsigned char *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+static unsigned char *read_file(const char *path, long *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); *size = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char *b = malloc((size_t)*size + 1);
+    if (b && fread(b, 1, (size_t)*size, f) != (size_t)*size) { free(b); b = NULL; }
+    fclose(f);
+    return b;
+}
+
+static void write_file(const char *path, const unsigned char *b, long size) {
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(b, 1, (size_t)size, f); fclose(f); }
+}
+
+static bool same_dataset(const SpingalettDataset *a, const SpingalettDataset *b) {
+    return a->count == b->count && a->input_size == b->input_size && a->target_size == b->target_size &&
+           !memcmp(a->inputs, b->inputs, (size_t)a->count * a->input_size * sizeof(float)) &&
+           !memcmp(a->targets, b->targets, (size_t)a->count * a->target_size * sizeof(float));
+}
+
+static SpingalettDatasetInfo file_info(const char *path) {
+    SpingalettDatasetReader *r = spingalett_dataset_open(path, false);
+    SpingalettDatasetInfo info = spingalett_dataset_info(r);
+    spingalett_dataset_close(r);
+    return info;
+}
+
+/* Saves d, loads it back from the file and from memory; returns the max abs input difference. */
+static float ds_roundtrip(const char *name, const SpingalettDataset *d, DatasetEncoding in_enc, DatasetEncoding tg_enc,
+                          bool raw, DatasetEncoding want_in, DatasetEncoding want_tg, SpingalettDataset *out) {
+    const char *path = "spingalett_test_ds.slettd";
+    DatasetSaveOptions o = {.input_encoding = in_enc, .target_encoding = tg_enc, .no_compression = raw};
+    bool ok = spingalett_save_dataset(d, path, &o);
+    SpingalettDatasetInfo info = file_info(path);
+    long size = 0;
+    unsigned char *bytes = read_file(path, &size);
+    SpingalettDataset m;
+    ok = ok && spingalett_load_dataset(path, out) && bytes && spingalett_load_dataset_from_memory(bytes, (size_t)size, &m);
+    float diff = INFINITY;
+    if (ok) {
+        diff = max_abs_diff(d->inputs, out->inputs, (uint64_t)d->count * d->input_size);
+        CHECK(same_dataset(out, &m), "%s: memory load differs from file load", name);
+        spingalett_dataset_free(&m);
+    }
+    double raw_bytes = (double)d->count * (d->input_size + d->target_size) * 4;
+    printf("  slettd %-24s %8ld bytes (%5.1f%% of float32), encodings %d/%d, chunks %u, max input error %.2e\n",
+           name, size, 100.0 * size / raw_bytes, info.input_encoding, info.target_encoding, info.chunk_count, (double)diff);
+    CHECK(ok && info.input_encoding == want_in && info.target_encoding == want_tg && (uint64_t)size == info.file_size,
+          "%s: save/load failed or wrong encodings (%d/%d): %s", name, info.input_encoding, info.target_encoding,
+          spingalett_last_error_message());
+    free(bytes);
+    remove(path);
+    return diff;
+}
+
+static void make_ds(SpingalettDataset *d, uint32_t count, uint32_t in, uint32_t out) {
+    d->count = count; d->input_size = in; d->target_size = out;
+    d->inputs = calloc((size_t)count * in, sizeof(float));
+    d->targets = calloc((size_t)count * out, sizeof(float));
+}
+
+static void dataset_files(void) {
+    /* 8-bit "images" scaled to [0, 1] with one-hot labels: stored losslessly as bytes and class indices */
+    SpingalettDataset img, back;
+    make_ds(&img, 3000, 784, 10);
+    lcg_state = 4;
+    for (uint32_t i = 0; i < img.count; i++) {
+        int cx = 6 + (int)(frand() * 16), cy = 6 + (int)(frand() * 16), r = 3 + (int)(frand() * 5);
+        for (int y = 0; y < 28; y++)
+            for (int x = 0; x < 28; x++) {
+                int dd = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+                int v = dd < r * r ? 255 - dd * 4 : 0;
+                img.inputs[(size_t)i * 784 + y * 28 + x] = (float)(v < 0 ? 0 : v) / 255.0f;
+            }
+        img.targets[(size_t)i * 10 + i % 10] = 1.0f;
+    }
+    float e = ds_roundtrip("u8 images, one-hot", &img, DATASET_ENCODING_AUTO, DATASET_ENCODING_AUTO, false,
+                           DATASET_ENCODING_U8_UNIT, DATASET_ENCODING_CLASS, &back);
+    CHECK(e == 0.0f && same_dataset(&img, &back), "u8 images must round-trip bit for bit");
+    spingalett_dataset_free(&back);
+    e = ds_roundtrip("u8 images, stored", &img, DATASET_ENCODING_AUTO, DATASET_ENCODING_AUTO, true,
+                     DATASET_ENCODING_U8_UNIT, DATASET_ENCODING_CLASS, &back);
+    CHECK(e == 0.0f && same_dataset(&img, &back), "stored u8 images must round-trip bit for bit");
+    spingalett_dataset_free(&back);
+
+    /* arbitrary floats: FLOAT32 is lossless; FP16, BF16 and U8_AFFINE stay within their precision */
+    SpingalettDataset fl;
+    make_ds(&fl, 2500, 13, 3);
+    for (size_t i = 0; i < (size_t)fl.count * 13; i++) fl.inputs[i] = (frand() - 0.5f) * 40.0f * (float)(1 + i % 13);
+    for (size_t i = 0; i < (size_t)fl.count * 3; i++) fl.targets[i] = frand() * 2 - 1;
+    e = ds_roundtrip("float32", &fl, DATASET_ENCODING_AUTO, DATASET_ENCODING_AUTO, false,
+                     DATASET_ENCODING_FLOAT32, DATASET_ENCODING_FLOAT32, &back);
+    CHECK(e == 0.0f && same_dataset(&fl, &back), "float32 must round-trip bit for bit");
+    spingalett_dataset_free(&back);
+    float worst_rel = 0;
+    e = ds_roundtrip("fp16 (lossy)", &fl, DATASET_ENCODING_FP16, DATASET_ENCODING_AUTO, false,
+                     DATASET_ENCODING_FP16, DATASET_ENCODING_FLOAT32, &back);
+    for (size_t i = 0; i < (size_t)fl.count * 13; i++)
+        if (fabsf(fl.inputs[i]) > 1e-3f) worst_rel = fmaxf(worst_rel, fabsf(back.inputs[i] - fl.inputs[i]) / fabsf(fl.inputs[i]));
+    CHECK(worst_rel <= 1.0f / 2048 + 1e-7f, "fp16 relative error %.3e", (double)worst_rel);
+    spingalett_dataset_free(&back);
+    worst_rel = 0;
+    ds_roundtrip("bfloat16 (lossy)", &fl, DATASET_ENCODING_BFLOAT16, DATASET_ENCODING_BFLOAT16, false,
+                 DATASET_ENCODING_BFLOAT16, DATASET_ENCODING_BFLOAT16, &back);
+    for (size_t i = 0; i < (size_t)fl.count * 13; i++)
+        if (fabsf(fl.inputs[i]) > 1e-3f) worst_rel = fmaxf(worst_rel, fabsf(back.inputs[i] - fl.inputs[i]) / fabsf(fl.inputs[i]));
+    CHECK(worst_rel <= 1.0f / 256 + 1e-7f, "bf16 relative error %.3e", (double)worst_rel);
+    spingalett_dataset_free(&back);
+    e = ds_roundtrip("u8 affine (lossy)", &fl, DATASET_ENCODING_U8_AFFINE, DATASET_ENCODING_AUTO, false,
+                     DATASET_ENCODING_U8_AFFINE, DATASET_ENCODING_FLOAT32, &back);
+    bool within = true;
+    for (uint32_t f = 0; f < 13; f++) {
+        float lo = INFINITY, hi = -INFINITY;
+        for (uint32_t r = 0; r < fl.count; r++) { lo = fminf(lo, fl.inputs[r * 13 + f]); hi = fmaxf(hi, fl.inputs[r * 13 + f]); }
+        float half_step = (hi - lo) / 255.0f / 2 * 1.001f + 1e-6f * fabsf(hi);
+        for (uint32_t r = 0; r < fl.count; r++) within = within && fabsf(back.inputs[r * 13 + f] - fl.inputs[r * 13 + f]) <= half_step;
+    }
+    CHECK(within, "u8 affine error beyond half a quantization step");
+    spingalett_dataset_free(&back);
+
+    /* values that are halves are stored as FP16 without loss; many classes need 2-byte indices */
+    SpingalettDataset hv;
+    make_ds(&hv, 700, 5, 300);
+    for (size_t i = 0; i < (size_t)hv.count * 5; i++) hv.inputs[i] = (float)((int)(frand() * 2000) - 1000) / 8.0f;
+    for (uint32_t i = 0; i < hv.count; i++) hv.targets[(size_t)i * 300 + (i * 37) % 300] = 1.0f;
+    e = ds_roundtrip("halves, 300 classes", &hv, DATASET_ENCODING_AUTO, DATASET_ENCODING_AUTO, false,
+                     DATASET_ENCODING_FP16, DATASET_ENCODING_CLASS, &back);
+    CHECK(e == 0.0f && same_dataset(&hv, &back), "fp16-exact data and 300 classes must round-trip exactly");
+    spingalett_dataset_free(&back);
+    spingalett_dataset_free(&hv);
+
+    /* corruption and truncation are detected */
+    CHECK(spingalett_save_dataset(&img, "spingalett_test_ds", NULL), "save without extension");
+    long size = 0;
+    unsigned char *good = read_file("spingalett_test_ds" SPINGALETT_DATASET_EXTENSION, &size);
+    CHECK(good != NULL, "save without extension should write spingalett_test_ds.slettd");
+    if (good) {
+        SpingalettDataset bad;
+        unsigned char *copy = malloc((size_t)size);
+        long cases[] = {size / 2, 20, 70};       /* chunk data, header field, index */
+        for (int c = 0; c < 3; c++) {
+            memcpy(copy, good, (size_t)size);
+            copy[cases[c]] ^= 0x10;
+            CHECK(!spingalett_load_dataset_from_memory(copy, (size_t)size, &bad) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+                  bad.count == 0, "flipped bit at %ld not detected", cases[c]);
+        }
+        CHECK(!spingalett_load_dataset_from_memory(good, (size_t)size - 1, &bad) && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO,
+              "truncated data set not detected");
+        memcpy(copy, good, (size_t)size);
+        copy[6] = 2;                             /* a future format version, with a valid checksum */
+        uint32_t crc = test_crc32(copy, 60);
+        for (int k = 0; k < 4; k++) copy[60 + k] = (unsigned char)(crc >> (8 * k));
+        CHECK(!spingalett_load_dataset_from_memory(copy, (size_t)size, &bad) && spingalett_last_error_code() == SPINGALETT_ERR_FORMAT_VERSION,
+              "future format version not reported");
+        write_file("spingalett_test_bad.slettd", copy, 40);
+        CHECK(!spingalett_load_dataset("spingalett_test_bad.slettd", &bad) && spingalett_dataset_open("spingalett_test_bad.slettd", false) == NULL,
+              "file shorter than a header accepted");
+        remove("spingalett_test_bad.slettd");
+        CHECK(!spingalett_load_dataset("spingalett_test_missing.slettd", &bad) && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO,
+              "missing data set file");
+        free(copy);
+        free(good);
+    }
+
+    /* streaming: every sample exactly once per pass, in file order or shuffled anew each pass */
+    for (int shuffled = 0; shuffled < 2; shuffled++) {
+        spingalett_seed(11);
+        SpingalettDatasetReader *r = spingalett_dataset_open("spingalett_test_ds.slettd", shuffled);
+        float *xi = malloc(97 * 784 * sizeof(float)), *yi = malloc(97 * 10 * sizeof(float));
+        uint32_t *seen = calloc(img.count, sizeof(uint32_t)), first[2] = {0, 0};
+        bool exact = r != NULL, ordered = true;
+        for (int pass = 0; pass < 2 && r; pass++) {
+            uint32_t total = 0, got;
+            while ((got = spingalett_dataset_read(r, xi, yi, 97)) > 0) {
+                for (uint32_t k = 0; k < got; k++) {
+                    /* find the sample by its label and pixels (labels repeat every 10, pixels identify it) */
+                    uint32_t idx = UINT32_MAX, label = 0;
+                    for (uint32_t c = 1; c < 10; c++) if (yi[(size_t)k * 10 + c] > yi[(size_t)k * 10 + label]) label = c;
+                    for (uint32_t j = label; j < img.count && idx == UINT32_MAX; j += 10)
+                        if (!seen[j] || seen[j] == (uint32_t)pass)
+                            if (!memcmp(img.inputs + (size_t)j * 784, xi + (size_t)k * 784, 784 * sizeof(float))) idx = j;
+                    exact = exact && idx != UINT32_MAX;
+                    if (idx != UINT32_MAX) {
+                        seen[idx]++;
+                        exact = exact && !memcmp(img.targets + (size_t)idx * 10, yi + (size_t)k * 10, 10 * sizeof(float));
+                        ordered = ordered && idx == total + k;
+                        if (total + k == 0) first[pass] = idx;
+                    }
+                }
+                total += got;
+            }
+            exact = exact && total == img.count;
+        }
+        for (uint32_t j = 0; j < img.count; j++) exact = exact && seen[j] == 2;
+        printf("  slettd reader shuffle=%d: exact=%d in_order=%d first samples %u, %u\n", shuffled, exact, ordered, first[0], first[1]);
+        CHECK(exact && (shuffled ? !ordered && first[0] != first[1] : ordered), "dataset reader (shuffle %d)", shuffled);
+        spingalett_dataset_close(r);
+        free(xi); free(yi); free(seen);
+    }
+
+    /* the reader as a train() generator matches training on the arrays */
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    NeuralNetwork *a = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY), *b = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    for (int n = 0; n < 2; n++) {
+        NeuralNetwork *net = n ? b : a;
+        layer(net, 784);
+        layer(net, 32, ACT_RELU, WEIGHT_INITIALIZATION_HE);
+        layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    }
+    memcpy(b->weights, a->weights, a->total_weights * sizeof(float));
+    train(.net = a, .inputs = img.inputs, .targets = img.targets, .sample_count = img.count, .epochs = 2,
+          .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 64, .do_not_shuffle = true, .optimizer_type = OPTIMIZER_ADAM);
+    SpingalettDatasetReader *r = spingalett_dataset_open("spingalett_test_ds.slettd", false);
+    TrainReport rep = train(.net = b, .training_mode = MODE_GENERATOR_FUNCTION, .generator = spingalett_dataset_generator,
+                            .generator_data = r, .epochs = 2, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 64,
+                            .optimizer_type = OPTIMIZER_ADAM);
+    float dw = max_abs_diff(a->weights, b->weights, a->total_weights);
+    printf("  slettd generator training: status %d, steps %llu vs %llu, |a-b| %.1e\n", rep.status,
+           (unsigned long long)b->time_step, (unsigned long long)a->time_step, (double)dw);
+    CHECK(rep.status == TRAIN_COMPLETED && a->time_step == b->time_step && dw == 0.0f, "training from a .slettd reader");
+    /* epochs delimited by sample_count (needed for full batch) never ask past a pass's last sample */
+    for (int st = 0; st < 2; st++) {
+        uint64_t steps = b->time_step;
+        rep = train(.net = b, .training_mode = MODE_GENERATOR_FUNCTION, .generator = spingalett_dataset_generator,
+                    .generator_data = r, .sample_count = img.count, .epochs = 3,
+                    .training_strategy = st ? STRATEGY_FULL_BATCH : STRATEGY_SMALL_BATCH, .batch_size = 64,
+                    .optimizer_type = OPTIMIZER_ADAM);
+        uint64_t want = st ? 3 : 3 * ((img.count + 63) / 64);
+        CHECK(rep.status == TRAIN_COMPLETED && rep.epochs_run == 3 && b->time_step - steps == want,
+              "reader with sample_count (strategy %d): status %d, %llu steps", st, rep.status,
+              (unsigned long long)(b->time_step - steps));
+    }
+    spingalett_dataset_close(r);
+    free_network(a); free_network(b);
+
+    remove("spingalett_test_ds.slettd");
+    spingalett_dataset_free(&img);
+    spingalett_dataset_free(&fl);
 }
 
 int main(int argc, char **argv) {
@@ -1275,6 +1537,7 @@ int main(int argc, char **argv) {
     if (!*only || !strcmp(only, "data")) {
         printf("[data sets]\n");
         datasets();
+        dataset_files();
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");

@@ -363,7 +363,7 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
-    foreach(group grad equiv cont optim sched dropout gen predict io xor)
+    foreach(group grad equiv cont optim sched dropout gen predict valid step data io xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

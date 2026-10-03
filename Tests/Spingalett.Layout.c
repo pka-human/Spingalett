@@ -73,6 +73,15 @@ int main(void) {
     FIELD(SpingalettDataset, count); FIELD(SpingalettDataset, input_size); FIELD(SpingalettDataset, target_size);
     FIELD(SpingalettDataset, inputs); FIELD(SpingalettDataset, targets);
 
+    SIZE(DatasetSaveOptions);
+    FIELD(DatasetSaveOptions, input_encoding); FIELD(DatasetSaveOptions, target_encoding);
+    FIELD(DatasetSaveOptions, no_compression);
+
+    SIZE(SpingalettDatasetInfo);
+    FIELD(SpingalettDatasetInfo, count); FIELD(SpingalettDatasetInfo, input_size); FIELD(SpingalettDatasetInfo, target_size);
+    FIELD(SpingalettDatasetInfo, input_encoding); FIELD(SpingalettDatasetInfo, target_encoding);
+    FIELD(SpingalettDatasetInfo, chunk_count); FIELD(SpingalettDatasetInfo, file_size);
+
     SIZE(PredictArgs);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
 

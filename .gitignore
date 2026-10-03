@@ -4,8 +4,10 @@ build/
 Bin/
 Lib/
 
-# Saved models produced by the examples
+# Models and data sets produced by the examples
 *.nn
+*.slett
+*.slettd
 
 # Python bindings
 __pycache__/

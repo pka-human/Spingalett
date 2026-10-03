@@ -33,12 +33,12 @@ with `--appimage-extract-and-run`.
 Command-line options:
 
 ```
-DigitPad [--verbose] [model.nn]            open the window; --verbose prints each prediction
-DigitPad --classify image.pgm [model.nn]   classify a binary PGM image and exit
+DigitPad [--verbose] [model.slett]            open the window; --verbose prints each prediction
+DigitPad --classify image.pgm [model.slett]   classify a binary PGM image and exit
 ```
 
-Without a model argument the app uses `$DIGITPAD_MODEL`, then `../share/digitpad/mnist.nn`
-relative to the executable, then `mnist.nn` next to it.
+Without a model argument the app uses `$DIGITPAD_MODEL`, then `../share/digitpad/mnist.slett`
+relative to the executable, then `mnist.slett` next to it.
 
 ## How a drawing becomes an input
 
@@ -64,20 +64,20 @@ cmake --build Build --parallel
 
 # train a model: about 2.5 minutes for 60 epochs with OpenMP on a 4-core machine
 sh Examples/download_mnist.sh data/mnist
-Bin/DigitPadTrain data/mnist mnist.nn 60
+Bin/DigitPadTrain data/mnist mnist.slett 60
 
-Bin/DigitPad mnist.nn
+Bin/DigitPad mnist.slett
 ```
 
 `DigitPadTrain` keeps the last 5,000 training images for validation, saves the epoch with the best
 validation accuracy and finally reports test accuracy, clean and distorted. It also writes
-`mnist.nn.info`, the one-line description shown in the app's footer.
+`mnist.slett.info`, the one-line description shown in the app's footer.
 
 ## Building the AppImage
 
 ```bash
 Apps/DigitPad/Package/build-appimage.sh                    # downloads MNIST and trains a model
-Apps/DigitPad/Package/build-appimage.sh --model mnist.nn   # packages an existing model
+Apps/DigitPad/Package/build-appimage.sh --model mnist.slett   # packages an existing model
 ```
 
 The script builds SDL2 from source as a static library with only its video subsystem (X11,

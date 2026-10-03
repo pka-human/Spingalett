@@ -6,10 +6,10 @@
 /*
  * DigitPad: draw a digit with the mouse and watch a Spingalett network classify it as you draw.
  *
- *   DigitPad [--verbose] [model.nn]          interactive window
- *   DigitPad --classify image.pgm [model.nn] classify a binary PGM drawing and exit
+ *   DigitPad [--verbose] [model.slett]          interactive window
+ *   DigitPad --classify image.pgm [model.slett] classify a binary PGM drawing and exit
  *
- * The model is looked up next to the executable (../share/digitpad/mnist.nn, then mnist.nn)
+ * The model is looked up next to the executable (../share/digitpad/mnist.slett, then mnist.slett)
  * unless given on the command line or in $DIGITPAD_MODEL. The whole UI is rendered in software
  * into one framebuffer that SDL2 only presents, with glyphs from an embedded font atlas, so at
  * run time the program needs nothing beyond SDL2 and libspingalett.
@@ -339,14 +339,14 @@ static bool find_model(const char *arg, char *out, size_t size) {
     const char *env = getenv("DIGITPAD_MODEL");
     if (env && *env) { snprintf(out, size, "%s", env); return file_exists(out); }
     char *base = SDL_GetBasePath();
-    const char *candidates[] = {"../share/digitpad/mnist.nn", "mnist.nn"};
+    const char *candidates[] = {"../share/digitpad/mnist.slett", "mnist.slett"};
     bool found = false;
     for (size_t i = 0; base && !found && i < sizeof candidates / sizeof *candidates; i++) {
         snprintf(out, size, "%s%s", base, candidates[i]);
         found = file_exists(out);
     }
     SDL_free(base);
-    if (!found) snprintf(out, size, "mnist.nn");
+    if (!found) snprintf(out, size, "mnist.slett");
     return found;
 }
 
@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--verbose")) verbose = true;
         else if (!strcmp(argv[i], "--classify") && i + 1 < argc) classify_path = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: %s [--verbose] [model.nn]\n       %s --classify image.pgm [model.nn]\n", argv[0], argv[0]);
+            printf("usage: %s [--verbose] [model.slett]\n       %s --classify image.pgm [model.slett]\n", argv[0], argv[0]);
             return 0;
         } else model_arg = argv[i];
     }

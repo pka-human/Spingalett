@@ -5,9 +5,9 @@
 # and a static SDL2 whose X11/Wayland/OpenGL backends are loaded at run time, so the image
 # needs nothing on the host beyond glibc and the desktop's own display libraries.
 #
-#   Apps/DigitPad/Package/build-appimage.sh [--model FILE.nn] [--epochs N] [--work DIR]
+#   Apps/DigitPad/Package/build-appimage.sh [--model FILE.slett] [--epochs N] [--work DIR]
 #
-#   --model FILE.nn  package this model (and FILE.nn.info, if present) instead of training one
+#   --model FILE.slett  package this model (and FILE.slett.info, if present) instead of training one
 #   --epochs N       epochs for the model trained when --model is not given (default 60)
 #   --work DIR       build directory (default build/appimage)
 #
@@ -69,7 +69,7 @@ grep -q "define SDL_VIDEO_DRIVER_WAYLAND 1" "$config" ||
 
 # ---- 2. the model
 if [ -z "$model" ]; then
-    model="$work/mnist.nn"
+    model="$work/mnist.slett"
     if [ ! -f "$model" ]; then
         step "training the model ($epochs epochs)"
         sh "$root/Examples/download_mnist.sh" "$work/mnist"
@@ -100,8 +100,8 @@ DESTDIR="$appdir" cmake --install "$work/build" >/dev/null
 rm -rf "$appdir/usr/include" "$appdir/usr/lib/cmake" "$appdir/usr/lib/libspingalett.so"
 share="$appdir/usr/share"
 mkdir -p "$share/digitpad" "$share/applications" "$share/icons/hicolor/scalable/apps" "$share/doc/digitpad"
-cp "$model" "$share/digitpad/mnist.nn"
-if [ -f "$model.info" ]; then cp "$model.info" "$share/digitpad/mnist.nn.info"; fi
+cp "$model" "$share/digitpad/mnist.slett"
+if [ -f "$model.info" ]; then cp "$model.info" "$share/digitpad/mnist.slett.info"; fi
 cp "$pkg/DigitPad.desktop" "$share/applications/"
 cp "$pkg/digitpad.svg" "$share/icons/hicolor/scalable/apps/"
 cp "$root/LICENSE" "$share/doc/digitpad/LICENSE"

@@ -76,7 +76,7 @@ int main(void) {
     free_network(nn);
 
     printf("\n--- Loading saved model ---\n");
-    NeuralNetwork *loaded = load_spingalett("xor_model.nn");
+    NeuralNetwork *loaded = load_spingalett("xor_model.slett");
     if (loaded) {
         spingalett_set_verbose(false);
 

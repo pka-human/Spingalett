@@ -9,7 +9,7 @@
 #include <string.h>
 #include <math.h>
 
-static uint16_t float_to_fp16(float x) {
+uint16_t spingalett_float_to_fp16(float x) {
     uint32_t f;
     memcpy(&f, &x, sizeof(float));
 
@@ -41,7 +41,7 @@ static uint16_t float_to_fp16(float x) {
     return (uint16_t)(sign | h);
 }
 
-static float fp16_to_float(uint16_t h) {
+float spingalett_fp16_to_float(uint16_t h) {
     uint32_t sign  = ((uint32_t)(h & 0x8000u)) << 16;
     uint32_t h_exp = (h >> 10) & 0x1Fu;
     uint32_t h_man = h & 0x03FFu;
@@ -70,7 +70,7 @@ static float fp16_to_float(uint16_t h) {
     return result;
 }
 
-static uint16_t float_to_bf16(float x) {
+uint16_t spingalett_float_to_bf16(float x) {
     uint32_t f;
     memcpy(&f, &x, sizeof(float));
     if ((f & 0x7FFFFFFFu) > 0x7F800000u)         /* NaN: keep it a (quiet) NaN */
@@ -79,7 +79,7 @@ static uint16_t float_to_bf16(float x) {
     return (uint16_t)(f >> 16);
 }
 
-static float bf16_to_float(uint16_t h) {
+float spingalett_bf16_to_float(uint16_t h) {
     uint32_t f = ((uint32_t)h) << 16;
     float x;
     memcpy(&x, &f, sizeof(float));
@@ -94,7 +94,7 @@ static bool write_array_compressed(const float *data, uint64_t size, PrecisionMo
     if (precision == PRECISION_FP16) {
         uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "FP16 write buffer allocation failed"); return false; }
-        for (uint64_t i = 0; i < size; i++) buf[i] = float_to_fp16(data[i]);
+        for (uint64_t i = 0; i < size; i++) buf[i] = spingalett_float_to_fp16(data[i]);
         bool ok = fwrite(buf, sizeof(uint16_t), size, fp) == size;
         free(buf);
         return ok;
@@ -103,7 +103,7 @@ static bool write_array_compressed(const float *data, uint64_t size, PrecisionMo
     if (precision == PRECISION_BFLOAT16) {
         uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "BF16 write buffer allocation failed"); return false; }
-        for (uint64_t i = 0; i < size; i++) buf[i] = float_to_bf16(data[i]);
+        for (uint64_t i = 0; i < size; i++) buf[i] = spingalett_float_to_bf16(data[i]);
         bool ok = fwrite(buf, sizeof(uint16_t), size, fp) == size;
         free(buf);
         return ok;
@@ -204,7 +204,7 @@ static bool read_array_compressed(float *data, uint64_t size, PrecisionMode prec
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "FP16 read buffer allocation failed"); return false; }
         bool ok = fread(buf, sizeof(uint16_t), size, fp) == size;
         if (ok) {
-            for (uint64_t i = 0; i < size; i++) data[i] = fp16_to_float(buf[i]);
+            for (uint64_t i = 0; i < size; i++) data[i] = spingalett_fp16_to_float(buf[i]);
         }
         free(buf);
         return ok;
@@ -215,7 +215,7 @@ static bool read_array_compressed(float *data, uint64_t size, PrecisionMode prec
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "BF16 read buffer allocation failed"); return false; }
         bool ok = fread(buf, sizeof(uint16_t), size, fp) == size;
         if (ok) {
-            for (uint64_t i = 0; i < size; i++) data[i] = bf16_to_float(buf[i]);
+            for (uint64_t i = 0; i < size; i++) data[i] = spingalett_bf16_to_float(buf[i]);
         }
         free(buf);
         return ok;
@@ -332,13 +332,13 @@ void save_spingalett_struct_arguments(SaveArgs args) {
 
     if (!has_ext) {
         size_t len = strlen(target_filename);
-        allocated_filename = (char *)malloc(len + 4);
+        allocated_filename = (char *)malloc(len + sizeof SPINGALETT_MODEL_EXTENSION);
         if (!allocated_filename) {
             set_error(SPINGALETT_ERR_ALLOC, "save: filename allocation failed");
             return;
         }
         strcpy(allocated_filename, target_filename);
-        strcat(allocated_filename, ".nn");
+        strcat(allocated_filename, SPINGALETT_MODEL_EXTENSION);
         target_filename = allocated_filename;
     }
 

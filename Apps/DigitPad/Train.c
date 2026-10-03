@@ -10,7 +10,7 @@
  * 5,000 training images are held out to select the best epoch, whose weights train() restores;
  * the test set is evaluated once.
  *
- *   DigitPadTrain <mnist-dir> <output.nn> [epochs]
+ *   DigitPadTrain <mnist-dir> <output.slett> [epochs]
  */
 
 #include "Digits.h"
@@ -70,7 +70,7 @@ static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *started) 
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <mnist-dir> <output.nn> [epochs]\n", argv[0]);
+        fprintf(stderr, "usage: %s <mnist-dir> <output.slett> [epochs]\n", argv[0]);
         return 1;
     }
     size_t epochs = argc > 3 ? (size_t)strtoul(argv[3], NULL, 10) : 40;

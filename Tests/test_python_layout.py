@@ -14,6 +14,7 @@ MIRRORS = {
     "SaveArgs": sg._SaveArgs, "LRScheduleParams": sg._LRScheduleParams, "PredictArgs": sg._PredictArgs,
     "EvalMetrics": sg._EvalMetrics, "TrainProgress": sg._TrainProgress, "TrainReport": sg._TrainReport,
     "EvaluateArgs": sg._EvaluateArgs, "OptimizerArgs": sg._OptimizerArgs, "SpingalettDataset": sg._Dataset,
+    "DatasetSaveOptions": sg._DatasetSaveOptions, "SpingalettDatasetInfo": sg._DatasetInfo,
 }
 
 lines = subprocess.run([sys.argv[1]], check=True, capture_output=True, text=True).stdout.splitlines()

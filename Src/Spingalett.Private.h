@@ -87,6 +87,12 @@ void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
 
+/* IEEE half and bfloat16 conversions, round to nearest even (Spingalett.Serialize.c). */
+uint16_t spingalett_float_to_fp16(float x);
+float    spingalett_fp16_to_float(uint16_t h);
+uint16_t spingalett_float_to_bf16(float x);
+float    spingalett_bf16_to_float(uint16_t h);
+
 void *spingalett_aligned_alloc(size_t size);
 void *spingalett_aligned_calloc(size_t count, size_t elem_size);
 void  spingalett_aligned_free(void *ptr);

@@ -44,13 +44,13 @@ parameters live in flat contiguous arrays, and models can be saved in reduced pr
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
-| Data | IDX (MNIST) and CSV readers, shuffling, hold-out splits |
+| Data | `.slettd` data set files (compact, lossless by default, streamable into training), IDX (MNIST) and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `forward()`, batched `predict()`, `evaluate()` (loss and accuracy) |
 | Backends | Built-in matrix kernels (AVX-512, AVX/FMA, portable C), single-threaded or OpenMP; OpenBLAS |
-| Serialization | FP32, FP16, BF16, INT8, INT4, INT2; optional optimizer state; versioned format |
+| Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2; optional optimizer state; versioned format |
 | Bindings | Python (ctypes + NumPy) |
 
 ## Building
@@ -135,7 +135,7 @@ int main(void) {
         printf("%.0f XOR %.0f = %.4f\n", inputs[i][0], inputs[i][1], out[0]);
     }
 
-    save_spingalett(.net = net, .filename = "xor");             /* writes xor.nn */
+    save_spingalett(.net = net, .filename = "xor");             /* writes xor.slett */
     free_network(net);
     return 0;
 }
@@ -322,6 +322,40 @@ one-hot encoded. `spingalett_load_csv(path, target_columns, num_classes, &d)` re
 comma-separated files; a non-numeric first line is skipped as a header, the last `target_columns`
 columns are the targets, and with `num_classes > 0` a single label column is one-hot encoded.
 
+### Data set files
+
+`.slettd` is Spingalett's own data set format: binary, compact and loaded straight into a
+`SpingalettDataset`. By default every stream is stored in the smallest encoding that keeps all
+values exact (8-bit `q / 255` for image data, IEEE half, or float32; one-hot targets as class
+indices) and compressed with an adaptive context-model range coder that learns which earlier
+values predict the next, such as the pixel above in an image. Lossy FP16, BF16 and per-feature
+8-bit encodings are available on request. Files consist of independently decodable chunks with
+CRC-32 checksums, so they load in parallel with OpenMP and can be streamed into `train()` with only
+one chunk in memory:
+
+```c
+spingalett_save_dataset(&train_set, "mnist-train", NULL);         /* writes mnist-train.slettd */
+SpingalettDataset d;
+spingalett_load_dataset("mnist-train.slettd", &d);                 /* bit-identical to train_set */
+
+SpingalettDatasetReader *r = spingalett_dataset_open("mnist-train.slettd", true);   /* shuffled */
+train(.net = net, .training_mode = MODE_GENERATOR_FUNCTION, .generator = spingalett_dataset_generator,
+      .generator_data = r, .epochs = 10, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);
+spingalett_dataset_close(r);
+```
+
+| MNIST training set (60,000 images and labels) | Size |
+|---|---:|
+| float32 in memory | 190.6 MB |
+| IDX files | 47.1 MB |
+| images only, `gzip -9` / `xz -9` | 9.7 / 7.9 MB |
+| `.slettd` (lossless) | 7.8 MB |
+
+`spingalett_load_dataset_from_memory()` reads a file image already in memory, and
+`Bin/DatasetTool` converts IDX and CSV files (`DatasetTool idx <images> <labels> out.slettd`) and
+prints a file's layout (`DatasetTool info file.slettd`). The format is specified in
+[docs/DatasetFormat.md](docs/DatasetFormat.md).
+
 ### Inference
 
 `forward(net, input)` evaluates one sample and returns a pointer to the output layer inside the
@@ -344,11 +378,12 @@ Dropout is not applied during inference.
 ### Saving and loading
 
 ```c
-save_spingalett(.net = net, .filename = "model.nn", .precision = PRECISION_FP16, .do_not_save_optimizer = true);
-NeuralNetwork *net = load_spingalett("model.nn");
+save_spingalett(.net = net, .filename = "model.slett", .precision = PRECISION_FP16, .do_not_save_optimizer = true);
+NeuralNetwork *net = load_spingalett("model.slett");
 ```
 
-`.nn` is appended when the filename has no extension. Weights, biases and, unless disabled, the
+Models are stored in `.slett` files; the extension is appended when the filename has none, and
+files written under the former `.nn` name load unchanged. Weights, biases and, unless disabled, the
 optimizer state are stored in the selected precision:
 
 | Precision | Storage per value | Notes |
@@ -403,7 +438,7 @@ Functions report failures through a thread-local error state instead of return c
 
 ```c
 spingalett_clear_error();
-NeuralNetwork *net = load_spingalett("model.nn");
+NeuralNetwork *net = load_spingalett("model.slett");
 if (!net)
     fprintf(stderr, "%s (code %d)\n", spingalett_last_error_message(), spingalett_last_error_code());
 ```
@@ -496,7 +531,8 @@ VM.
 ```
 Include/Spingalett/   Public header and the CMake-generated configuration header template
 Src/                  Library sources (network, training, SIMD kernels, serialization, ...)
-Examples/             XOR, MNIST, throughput benchmark (C and PyTorch counterpart)
+Examples/             XOR, MNIST, throughput benchmark (C and PyTorch counterpart), DatasetTool
+docs/                 File format specifications
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage packaging
 Tests/                Test suite (CTest) and fixtures
 Bindings/Python/      Python bindings

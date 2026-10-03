@@ -25,6 +25,10 @@ extern "C" {
 
 #define SPINGALETT_FORMAT_VERSION 2
 
+/* File name extensions: models (save_spingalett appends it when the name has none) and data sets. */
+#define SPINGALETT_MODEL_EXTENSION   ".slett"
+#define SPINGALETT_DATASET_EXTENSION ".slettd"
+
 typedef enum {
     LOG_DEBUG,
     LOG_INFO,
@@ -196,7 +200,8 @@ typedef struct {
 /*
  * Data source for MODE_GENERATOR_FUNCTION. Write up to `requested` samples into `inputs`
  * ([requested x input size], row-major) and `targets` ([requested x output size]) and return
- * how many were written; returning 0 ends the epoch. Shuffling and augmentation are up to the
+ * how many were written; returning 0 ends the epoch (a 0 in answer to the first request of an
+ * epoch is retried once before training stops). Shuffling and augmentation are up to the
  * generator. It is called once per mini-batch, once per epoch for full batch (requested =
  * sample_count), and in chunks for per-sample training.
  */
@@ -450,6 +455,61 @@ SPINGALETT_API void spingalett_dataset_shuffle(SpingalettDataset *dataset);
 /* Moves the last count samples into *tail, e.g. to hold out a validation set. */
 SPINGALETT_API bool spingalett_dataset_split(SpingalettDataset *dataset, uint32_t count, SpingalettDataset *tail);
 SPINGALETT_API void spingalett_dataset_free(SpingalettDataset *dataset);
+
+/*
+ * .slettd data set files: compact binary storage that loads straight into a SpingalettDataset.
+ * Values are stored in the smallest encoding chosen per stream (inputs, targets) and compressed
+ * with an adaptive context-model range coder, in independently decodable chunks with CRC-32
+ * checksums. They can be loaded whole (chunks decode in parallel with OpenMP) or streamed into
+ * train() as a generator. See docs/DatasetFormat.md for the layout.
+ */
+typedef enum {
+    DATASET_ENCODING_AUTO,          /* the smallest lossless one of U8_UNIT, FP16 and FLOAT32;
+                                       one-hot target rows are stored as CLASS */
+    DATASET_ENCODING_FLOAT32,
+    DATASET_ENCODING_FP16,          /* IEEE half; lossy unless every value is a half */
+    DATASET_ENCODING_BFLOAT16,      /* lossy: 8 mantissa bits */
+    DATASET_ENCODING_U8_UNIT,       /* q / 255 for q in 0..255, exact for 8-bit data in [0, 1] */
+    DATASET_ENCODING_U8_AFFINE,     /* per feature min + q * (max - min) / 255: lossy 8-bit quantization */
+    DATASET_ENCODING_CLASS,         /* targets only: the argmax of each row, stored as a class index */
+    DATASET_ENCODING_COUNT
+} DatasetEncoding;
+
+typedef struct {
+    DatasetEncoding input_encoding;
+    DatasetEncoding target_encoding;
+    bool no_compression;            /* store the encoded bytes as they are (fastest to read) */
+} DatasetSaveOptions;
+
+typedef struct {
+    uint32_t count, input_size, target_size;
+    DatasetEncoding input_encoding, target_encoding;
+    uint32_t chunk_count;
+    uint64_t file_size;
+} SpingalettDatasetInfo;
+
+/* Streams the samples of a .slettd file chunk by chunk. */
+typedef struct SpingalettDatasetReader SpingalettDatasetReader;
+
+/* Writes dataset to path (SPINGALETT_DATASET_EXTENSION is appended when the name has none);
+   options NULL = all defaults. */
+SPINGALETT_API bool spingalett_save_dataset(const SpingalettDataset *dataset, const char *path,
+                                            const DatasetSaveOptions *options);
+SPINGALETT_API bool spingalett_load_dataset(const char *path, SpingalettDataset *dataset);
+/* Same, from a file image in memory (e.g. a const array in flash); data is not modified. */
+SPINGALETT_API bool spingalett_load_dataset_from_memory(const void *data, size_t size, SpingalettDataset *dataset);
+
+/* A reader keeps one decoded chunk in memory. With shuffle, every pass visits the chunks and the
+   samples within each chunk in a new random order (library generator, see spingalett_seed). */
+SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open(const char *path, bool shuffle);
+SPINGALETT_API void spingalett_dataset_close(SpingalettDatasetReader *reader);
+SPINGALETT_API SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDatasetReader *reader);
+/* Copies up to max_samples samples; returns how many. Returns 0 once a pass is complete (or on
+   error, which is sticky); the next call starts a new pass. */
+SPINGALETT_API uint32_t spingalett_dataset_read(SpingalettDatasetReader *reader, float *inputs, float *targets,
+                                                uint32_t max_samples);
+/* A DataGeneratorFn over a reader, for .generator = spingalett_dataset_generator, .generator_data = reader. */
+SPINGALETT_API uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader);
 
 SPINGALETT_API void print_parameters(NeuralNetwork *net);
 SPINGALETT_API void free_network(NeuralNetwork *net);

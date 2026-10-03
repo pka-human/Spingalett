@@ -147,6 +147,34 @@ with tempfile.TemporaryDirectory() as d:
     except sg.SpingalettError as e:
         check(e.code == sg.ErrorCode.FILE_IO, "missing csv error code")
 
+# .slettd data set files: exact round trip, encodings, training straight from the file
+with tempfile.TemporaryDirectory() as d:
+    px = (rng.integers(0, 256, size=(500, 64)) * (rng.random((500, 64)) < 0.3)).astype(np.float32) / 255
+    py = np.eye(4, dtype=np.float32)[rng.integers(0, 4, 500)]
+    path = os.path.join(d, "set")
+    sg.save_dataset(path, px, py)
+    info = sg.dataset_info(path + ".slettd")
+    lx, ly = sg.load_dataset(path + ".slettd")
+    check(np.array_equal(lx, px) and np.array_equal(ly, py), "slettd round trip")
+    check(info["input_encoding"] == sg.DatasetEncoding.U8_UNIT and info["target_encoding"] == sg.DatasetEncoding.CLASS
+          and info["count"] == 500 and info["file_size"] < px.nbytes // 8, f"slettd info {info}")
+    sg.save_dataset(os.path.join(d, "h.slettd"), px * 3.3, py, input_encoding=sg.DatasetEncoding.FP16)
+    hx, _ = sg.load_dataset(os.path.join(d, "h.slettd"))
+    check(np.array_equal(hx, (px * 3.3).astype(np.float16).astype(np.float32)), "slettd fp16 == numpy float16 rounding")
+    with small(8) as a, small(8) as b:
+        a.train(px[:, :3], py[:, :2], epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=50, shuffle=False, optimizer=sg.Optimizer.ADAM)
+        sg.save_dataset(os.path.join(d, "t.slettd"), px[:, :3], py[:, :2])
+        r = b.train_from_file(os.path.join(d, "t.slettd"), shuffle=False, epochs=2, strategy=sg.Strategy.MINI_BATCH,
+                              batch_size=50, optimizer=sg.Optimizer.ADAM)
+        check(r.status == sg.TrainStatus.COMPLETED and np.array_equal(a.get_weights(0), b.get_weights(0)),
+              f"train_from_file == train on arrays ({r.status})")
+        r = b.train_from_file(os.path.join(d, "t.slettd"), epochs=3, strategy=sg.Strategy.FULL_BATCH)
+        check(r.status == sg.TrainStatus.COMPLETED and r.epochs_run == 3, f"train_from_file full batch {r}")
+    try:
+        sg.load_dataset(os.path.join(d, "missing.slettd")); check(False, "missing data set loaded")
+    except sg.SpingalettError as e:
+        check(e.code == sg.ErrorCode.FILE_IO, "missing data set error code")
+
 # dropout + save/load + precision
 with tempfile.TemporaryDirectory() as d:
     sg.seed(3)
@@ -157,14 +185,14 @@ with tempfile.TemporaryDirectory() as d:
     check(np.all(np.abs(out - y) < 0.25), f"xor with dropout: {out.ravel()}")
     path = os.path.join(d, "model")
     net.save(path)
-    with sg.Network.load(path + ".nn") as loaded:
+    with sg.Network.load(path + ".slett") as loaded:
         check(np.array_equal(loaded.forward(x), out) and loaded.dropout_rates == net.dropout_rates and loaded.time_step == net.time_step, "fp32 roundtrip")
-    net.save(os.path.join(d, "h.nn"), precision=sg.Precision.FP16, save_optimizer=False)
-    with sg.Network.load(os.path.join(d, "h.nn")) as half:
+    net.save(os.path.join(d, "h.slett"), precision=sg.Precision.FP16, save_optimizer=False)
+    with sg.Network.load(os.path.join(d, "h.slett")) as half:
         check(np.allclose(half.get_weights(0), net.get_weights(0).astype(np.float16), atol=0, rtol=0), "fp16 save == numpy float16 rounding")
     net.close()
     try:
-        sg.Network.load(os.path.join(d, "missing.nn")); check(False, "missing file loaded")
+        sg.Network.load(os.path.join(d, "missing.slett")); check(False, "missing file loaded")
     except sg.SpingalettError as e:
         check("cannot open" in str(e) and e.code == sg.ErrorCode.FILE_IO, f"error: {e} code {e.code!r}")
 check(sg.library_version() == sg.__version__, f"library {sg.library_version()} vs bindings {sg.__version__}")

@@ -44,6 +44,7 @@ __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_csv",
+    "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
@@ -125,6 +126,16 @@ class Monitor(enum.IntEnum):
     TRAIN_LOSS = 1
     VAL_LOSS = 2
     VAL_ACCURACY = 3
+
+
+class DatasetEncoding(enum.IntEnum):
+    AUTO = 0            # smallest lossless; one-hot targets become CLASS
+    FLOAT32 = 1
+    FP16 = 2
+    BFLOAT16 = 3
+    U8_UNIT = 4         # q / 255
+    U8_AFFINE = 5       # per-feature 8-bit quantization (lossy)
+    CLASS = 6           # targets: class index of each row
 
 
 class TrainStatus(enum.IntEnum):
@@ -323,6 +334,22 @@ class _Dataset(Structure):
     ]
 
 
+class _DatasetSaveOptions(Structure):
+    _fields_ = [("input_encoding", c_int), ("target_encoding", c_int), ("no_compression", c_bool)]
+
+
+class _DatasetInfo(Structure):
+    _fields_ = [
+        ("count", c_uint32),
+        ("input_size", c_uint32),
+        ("target_size", c_uint32),
+        ("input_encoding", c_int),
+        ("target_encoding", c_int),
+        ("chunk_count", c_uint32),
+        ("file_size", c_uint64),
+    ]
+
+
 class _SaveArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
@@ -417,6 +444,12 @@ _trainer_zero_grad = _bind("spingalett_trainer_zero_grad", None, [_TrainerPtr])
 _load_idx = _bind("spingalett_load_idx", c_bool, [c_char_p, c_char_p, c_uint32, POINTER(_Dataset)])
 _load_csv = _bind("spingalett_load_csv", c_bool, [c_char_p, c_uint32, c_uint32, POINTER(_Dataset)])
 _dataset_free = _bind("spingalett_dataset_free", None, [POINTER(_Dataset)])
+_save_dataset = _bind("spingalett_save_dataset", c_bool, [POINTER(_Dataset), c_char_p, POINTER(_DatasetSaveOptions)])
+_load_dataset = _bind("spingalett_load_dataset", c_bool, [c_char_p, POINTER(_Dataset)])
+_dataset_open = _bind("spingalett_dataset_open", c_void_p, [c_char_p, c_bool])
+_dataset_close = _bind("spingalett_dataset_close", None, [c_void_p])
+_dataset_info = _bind("spingalett_dataset_info", _DatasetInfo, [c_void_p])
+_dataset_generator = _DataGeneratorFn(ctypes.cast(_lib.spingalett_dataset_generator, c_void_p).value)
 _save = _bind("save_spingalett_struct_arguments", None, [_SaveArgs])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
 _free = _bind("free_network", None, [_NetPtr])
@@ -577,6 +610,11 @@ Schedule = Union[_BuiltinSchedule, Callable[[int, int, float], float]]
 
 
 # --------------------------------------------------------------------------- high-level API
+
+@dataclasses.dataclass(frozen=True)
+class _NativeGenerator:
+    fn: object      # a _DataGeneratorFn pointing into the library
+    data: object
 
 @dataclasses.dataclass
 class Layer:
@@ -886,6 +924,22 @@ class Network:
             raise ValueError("full-batch training from a generator needs samples_per_epoch")
         return self._run(cfg, _MODE_GENERATOR, None, None, int(samples_per_epoch), generator, validation_data)
 
+    def train_from_file(self, path, config: Optional[TrainConfig] = None, shuffle: bool = True,
+                        validation_data=None, **overrides) -> TrainResult:
+        """Train on a .slettd data set file, streamed chunk by chunk by the C reader (no Python
+        call per batch, memory for one chunk). ``shuffle`` reorders chunks and samples each epoch."""
+        cfg = dataclasses.replace(config or TrainConfig(), **overrides)
+        reader = _call(_dataset_open, _encode_path(path), bool(shuffle))
+        try:
+            info = _dataset_info(reader)
+            if (info.input_size, info.target_size) != (self.input_size, self.output_size):
+                raise ValueError(f"{path!s} has {info.input_size} inputs and {info.target_size} targets, "
+                                 f"the network {self.input_size} and {self.output_size}")
+            return self._run(cfg, _MODE_GENERATOR, None, None, int(info.count),
+                             _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
+        finally:
+            _dataset_close(reader)
+
     def _run(self, cfg: TrainConfig, mode: int, x, y, sample_count: int, generator,
              validation_data) -> TrainResult:
         pending: List[BaseException] = []
@@ -930,8 +984,10 @@ class Network:
             c_sched = _LRSchedulerFn(schedule)
             keep.append(c_sched)
 
-        c_gen = _DataGeneratorFn()
-        if generator is not None:
+        c_gen, c_gen_data = _DataGeneratorFn(), None
+        if isinstance(generator, _NativeGenerator):
+            c_gen, c_gen_data = generator.fn, generator.data
+        elif generator is not None:
             n_in, n_out = self.input_size, self.output_size
 
             def produce(in_ptr, tg_ptr, requested, _ud):
@@ -964,7 +1020,7 @@ class Network:
             inputs=_float_ptr(x) if x is not None else None,
             targets=_float_ptr(y) if y is not None else None,
             generator=c_gen,
-            generator_data=None,
+            generator_data=c_gen_data,
             sample_count=sample_count,
             batch_size=int(cfg.batch_size),
             do_not_shuffle=not cfg.shuffle,
@@ -1007,7 +1063,7 @@ class Network:
 
     # ---- persistence
     def save(self, path, precision: Precision = Precision.FLOAT32, save_optimizer: bool = True) -> None:
-        """Save to ``path`` (".nn" is appended when there is no extension)."""
+        """Save to ``path`` (".slett" is appended when there is no extension)."""
         _call(_save, _SaveArgs(self._ptr, _encode_path(path), not save_optimizer, int(precision)))
 
     def print_parameters(self) -> None:
@@ -1133,3 +1189,39 @@ def load_csv(path, target_columns: int = 1, num_classes: int = 0):
     ds = _Dataset()
     _call(_load_csv, _encode_path(path), int(target_columns), int(num_classes), ctypes.byref(ds))
     return _take_dataset(ds)
+
+
+def save_dataset(path, inputs, targets, input_encoding: DatasetEncoding = DatasetEncoding.AUTO,
+                 target_encoding: DatasetEncoding = DatasetEncoding.AUTO, compress: bool = True) -> None:
+    """Write ``(inputs, targets)`` to a .slettd file (".slettd" is appended when there is no
+    extension). AUTO picks the smallest lossless encoding; FP16, BFLOAT16 and U8_AFFINE are lossy."""
+    x = np.ascontiguousarray(inputs, dtype=np.float32)
+    y = np.ascontiguousarray(targets, dtype=np.float32)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
+    if x.ndim != 2 or y.ndim != 2 or x.shape[0] != y.shape[0] or x.shape[0] == 0:
+        raise ValueError(f"inputs {x.shape} and targets {y.shape} must be non-empty matrices with the same rows")
+    ds = _Dataset(x.shape[0], x.shape[1], y.shape[1], _float_ptr(x), _float_ptr(y))
+    opts = _DatasetSaveOptions(int(input_encoding), int(target_encoding), not compress)
+    _call(_save_dataset, ctypes.byref(ds), _encode_path(path), ctypes.byref(opts))
+
+
+def load_dataset(path):
+    """Read a .slettd file as ``(inputs, targets)`` float32 arrays."""
+    ds = _Dataset()
+    _call(_load_dataset, _encode_path(path), ctypes.byref(ds))
+    return _take_dataset(ds)
+
+
+def dataset_info(path) -> dict:
+    """Header of a .slettd file: sample count, sizes, encodings, chunks and file size."""
+    reader = _call(_dataset_open, _encode_path(path), False)
+    try:
+        i = _dataset_info(reader)
+        return {"count": i.count, "input_size": i.input_size, "target_size": i.target_size,
+                "input_encoding": DatasetEncoding(i.input_encoding), "target_encoding": DatasetEncoding(i.target_encoding),
+                "chunk_count": i.chunk_count, "file_size": i.file_size}
+    finally:
+        _dataset_close(reader)
