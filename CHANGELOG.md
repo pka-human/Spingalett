@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.3.0] - 2026-10-03
+
+### Added
+- Native single-precision matrix multiplication with AVX-512, AVX/FMA and portable C kernels and
+  OpenMP parallelism. Batch training and inference no longer need OpenBLAS to run as
+  matrix-matrix products.
+- `predict()`: batched inference over many samples (Python: `Network.forward` on a 2-D array).
+- `Examples/MNIST.c` (with `Examples/download_mnist.sh`): an MLP reaching about 98% test
+  accuracy in a few seconds.
+- `Examples/benchmark_pytorch.py`, the PyTorch counterpart of `Examples/Benchmark.c`.
+
+### Changed
+- Full-batch and mini-batch training use matrix-matrix products in every compute mode; OpenBLAS
+  is one of two GEMM providers. Without OpenBLAS, full-batch training of the benchmark network is
+  about 7x faster than in 0.2 and on par with OpenBLAS when using OpenMP.
+- Large batches are processed in chunks of 2048 samples whose gradients are accumulated, which
+  bounds the memory used by full-batch training on large datasets.
+- `Examples/Benchmark.c` reports full-batch, mini-batch and inference throughput per backend.
+
 ## [0.2.0] - 2026-10-03
 
 ### Added
@@ -60,4 +79,5 @@ changes, which are listed under **Changed**.
 
 Initial release.
 
+[0.3.0]: https://github.com/pka-human/Spingalett/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pka-human/Spingalett/compare/0a1dd16...v0.2.0

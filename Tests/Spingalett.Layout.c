@@ -45,6 +45,9 @@ int main(void) {
     FIELD(TrainArgs, callback); FIELD(TrainArgs, callback_interval);
     FIELD(TrainArgs, lr_scheduler); FIELD(TrainArgs, lr_scheduler_data); FIELD(TrainArgs, blas_num_threads);
 
+    SIZE(PredictArgs);
+    FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
+
     SIZE(SaveArgs);
     FIELD(SaveArgs, net); FIELD(SaveArgs, filename); FIELD(SaveArgs, do_not_save_optimizer); FIELD(SaveArgs, precision);
 

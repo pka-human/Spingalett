@@ -8,7 +8,7 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad equiv cont optim sched dropout gen io xor (default: all)
+ *   Spingalett.Tests [group]     groups: grad equiv cont optim sched dropout gen predict io xor (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
  * gradients from a single SGD step with lr = 1 (W_before - W_after). Everything is seeded, so
@@ -648,6 +648,38 @@ static void shuffling(void) {
     free_network(ref); free(x); free(y);
 }
 
+/* ---------------- batched inference ---------------- */
+static void predict_matches_forward(ComputeMode mode) {
+    const uint32_t N = 4500;            /* > one internal chunk */
+    float *x, *y; lcg_state = 1234;
+    make_data(N, 9, 4, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(net, 9);
+    layer(net, 37, ACT_RELU, WEIGHT_INITIALIZATION_HE, 0.5f);     /* dropout must not apply */
+    layer(net, 21, ACT_TANH, WEIGHT_INITIALIZATION_XAVIER);
+    layer(net, 4, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() - 0.5f;
+    float *out = malloc((size_t)N * 4 * sizeof(float));
+    for (size_t i = 0; i < (size_t)N * 4; i++) out[i] = NAN;
+    spingalett_clear_error();
+    bool ok = predict(.net = net, .inputs = x, .sample_count = N, .outputs = out);
+    float worst = 0;
+    for (uint32_t s = 0; s < N; s++) {
+        const float *o = forward(net, x + (size_t)s * 9);
+        for (int k = 0; k < 4; k++) {
+            float d = fabsf(o[k] - out[(size_t)s * 4 + k]);
+            if (!(d <= worst)) worst = d;
+        }
+    }
+    printf("  predict == forward, mode=%d, %u samples: max |diff| %.2e\n", mode, N, worst);
+    CHECK(ok && worst < 1e-5f, "predict mode=%d diff %.3e", mode, worst);
+    CHECK(predict(.net = net, .inputs = x, .sample_count = 0, .outputs = out), "empty predict");
+    CHECK(!predict(.net = net, .inputs = NULL, .sample_count = 3, .outputs = out) &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "predict without inputs must fail");
+    free(out); free(x); free(y); free_network(net);
+}
+
 /* ---------------- generator mode ---------------- */
 typedef struct {
     const float *x, *y;
@@ -871,6 +903,11 @@ int main(int argc, char **argv) {
         printf("[generator mode]\n");
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) generator_mode(cm[m]);
+    }
+    if (!*only || !strcmp(only, "predict")) {
+        printf("[batched inference]\n");
+        ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+        for (int m = 0; m < 3; m++) predict_matches_forward(cm[m]);
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");

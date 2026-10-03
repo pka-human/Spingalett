@@ -13,3 +13,4 @@ __pycache__/
 Bindings/Python/build/
 Bindings/Python/dist/
 !Tests/Data/*.nn
+data/

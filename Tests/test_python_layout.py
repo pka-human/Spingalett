@@ -11,7 +11,7 @@ import spingalett as sg
 MIRRORS = {
     "NeuralNetwork": sg._NeuralNetwork, "NeuralNetworkArgs": sg._NeuralNetworkArgs,
     "LayerArgs": sg._LayerArgs, "ForwardArgs": sg._ForwardArgs, "TrainArgs": sg._TrainArgs,
-    "SaveArgs": sg._SaveArgs, "LRScheduleParams": sg._LRScheduleParams,
+    "SaveArgs": sg._SaveArgs, "LRScheduleParams": sg._LRScheduleParams, "PredictArgs": sg._PredictArgs,
 }
 
 lines = subprocess.run([sys.argv[1]], check=True, capture_output=True, text=True).stdout.splitlines()

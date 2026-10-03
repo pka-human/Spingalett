@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -223,6 +223,15 @@ class _TrainArgs(Structure):
     ]
 
 
+class _PredictArgs(Structure):
+    _fields_ = [
+        ("net", _NetPtr),
+        ("inputs", POINTER(c_float)),
+        ("sample_count", c_uint32),
+        ("outputs", POINTER(c_float)),
+    ]
+
+
 class _SaveArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
@@ -302,6 +311,7 @@ def _bind(name, restype, argtypes):
 _new = _bind("new_spingalett_struct_arguments", _NetPtr, [_NeuralNetworkArgs])
 _layer = _bind("layer_struct_arguments", None, [_LayerArgs])
 _forward = _bind("forward_struct_arguments", POINTER(c_float), [_ForwardArgs])
+_predict = _bind("predict_struct_arguments", c_bool, [_PredictArgs])
 _train = _bind("train_struct_arguments", None, [_TrainArgs])
 _save = _bind("save_spingalett_struct_arguments", None, [_SaveArgs])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
@@ -651,16 +661,21 @@ class Network:
 
     # ---- inference
     def forward(self, inputs) -> np.ndarray:
-        """Run inference. A 1-D input returns one output vector; a 2-D batch returns one row per sample."""
+        """Run inference. A 1-D input returns one output vector; a 2-D batch returns one row per
+        sample and runs as a single batched call (matrix-matrix products on every backend)."""
         n_in, n_out = self.input_size, self.output_size
         arr = np.ascontiguousarray(inputs, dtype=np.float32)
         single = arr.ndim == 1 and arr.size == n_in
         batch = _as_matrix(arr, n_in, "inputs")
         out = np.empty((batch.shape[0], n_out), dtype=np.float32)
-        for row in range(batch.shape[0]):
-            ptr = _call(_forward, _ForwardArgs(self._ptr, _float_ptr(batch[row])))
-            ctypes.memmove(out[row].ctypes.data, ptr, n_out * 4)
-        return out[0] if single else out
+        if single:
+            ptr = _call(_forward, _ForwardArgs(self._ptr, _float_ptr(batch[0])))
+            ctypes.memmove(out.ctypes.data, ptr, n_out * 4)
+            return out[0]
+        if batch.shape[0]:
+            self._net  # raise if closed
+            _call(_predict, _PredictArgs(self._ptr, _float_ptr(batch), batch.shape[0], _float_ptr(out)))
+        return out
 
     __call__ = forward
 

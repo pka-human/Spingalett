@@ -42,7 +42,7 @@ with sg.Network.load("xor.nn") as net:
 | API | Notes |
 |---|---|
 | `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer |
-| `forward(x)` | 1-D input -> vector, 2-D batch -> matrix (copies, safe to keep) |
+| `forward(x)` | 1-D input -> vector, 2-D batch -> matrix (one batched `predict()` call; results are copies) |
 | `train(x, y, config=None, **overrides)` | fields of `TrainConfig` (e.g. `epochs`, `strategy`, `batch_size`, `shuffle`); exceptions raised in callbacks stop training and are re-raised |
 | `train_from_generator(fn, samples_per_epoch=0, ...)` | `fn(inputs, targets)` fills the given arrays and returns the number of rows; 0 ends the epoch |
 | `CosineDecay`, `LinearWarmup`, `StepDecay`, `WarmupCosine` | built-in schedules; any `fn(epoch, total, initial_lr)` works too |
