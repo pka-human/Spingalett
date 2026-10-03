@@ -205,7 +205,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         )
     endif()
 
-    if(NOT WIN32)
+    if(APPLE)                                   # ld64: no --gc-sections or -s
+        target_link_options(spingalett PRIVATE
+            $<$<CONFIG:Release>:-Wl,-dead_strip -Wl,-x>
+            $<$<CONFIG:RelWithDebInfo>:-Wl,-dead_strip>
+        )
+    elseif(NOT WIN32)
         target_link_options(spingalett PRIVATE
             $<$<CONFIG:Release>:-s -Wl,--gc-sections>
             $<$<CONFIG:RelWithDebInfo>:-Wl,--gc-sections>

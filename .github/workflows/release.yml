@@ -85,6 +85,16 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-tools-git zip
 
+      - name: OpenMP runtime (MSYS2)
+        if: runner.os == 'Windows'
+        run: |
+          # GCC's libgomp may come in its own package; install it when the repository has one
+          for p in mingw-w64-ucrt-x86_64-gcc-libgomp mingw-w64-ucrt-x86_64-libgomp; do
+            if pacman -Si "$p" > /dev/null 2>&1; then pacman -S --noconfirm --needed "$p"; fi
+          done
+          pacman -Ss gomp || true
+          ls /ucrt64/bin/libgomp* /ucrt64/lib/libgomp* /ucrt64/lib/gcc/x86_64-w64-mingw32/*/libgomp* 2>/dev/null || true
+
       - name: Configure
         run: |
           root=$PWD; [ "$RUNNER_OS" = Windows ] && root=$(cygpath -m "$PWD")    # native CMake, MSYS shell
@@ -96,6 +106,12 @@ jobs:
             *)         args+=(-DBUILD_WITH_OPENMP=ON) ;;
           esac
           cmake -S . -B Build "${args[@]}"
+          # OpenMP is requested everywhere but macOS: a build without it must not be published
+          if [ "$RUNNER_OS" != macOS ] && ! grep -q "define SPINGALETT_HAS_OPENMP" Build/Spingalett/Spingalett.Config.h; then
+            grep -n -i -B2 -A25 "openmp" Build/CMakeFiles/CMakeConfigureLog.yaml | tail -120 || true
+            echo "::error::OpenMP was requested but not found"
+            exit 1
+          fi
 
       - name: Build
         run: cmake --build Build --parallel
@@ -108,7 +124,10 @@ jobs:
           cmake --install Build
           cp LICENSE CHANGELOG.md README.md "$ARCHIVE/"
           if [ "$RUNNER_OS" = Windows ]; then
-            for dll in libgomp-1.dll libwinpthread-1.dll libgcc_s_seh-1.dll; do cp "/ucrt64/bin/$dll" "$ARCHIVE/bin/"; done
+            # the MinGW runtime DLLs the library and DatasetTool load (libgomp, libwinpthread, ...)
+            ldd "$ARCHIVE/bin/libspingalett.dll" "$ARCHIVE/bin/DatasetTool.exe" |
+              awk '$3 ~ /^\/ucrt64\// { print $3 }' | sort -u | xargs -r cp -t "$ARCHIVE/bin/"
+            ls "$ARCHIVE/bin"
             (cd "$ARCHIVE/lib" && gendef ../bin/libspingalett.dll && mv libspingalett.def spingalett.def)
           fi
 

@@ -21,7 +21,7 @@ static _Atomic ComputeMode s_compute_mode = COMPUTE_SINGLE_THREADED;
 static _Atomic unsigned s_num_threads = 0;
 
 static _Atomic LogLevel s_log_level = LOG_INFO;
-static _Atomic(LogCallback) s_log_callback = NULL;
+static _Atomic(LogCallback) s_log_callback;     /* zero-initialized: no callback (AppleClang rejects = NULL) */
 static _Atomic bool s_verbose = true;
 
 ComputeMode spingalett_get_compute_mode(void) {
