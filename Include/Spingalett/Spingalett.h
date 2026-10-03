@@ -204,6 +204,11 @@ typedef struct {
 
     LRSchedulerFn lr_scheduler;     /* NULL = constant learning_rate */
     void *lr_scheduler_data;
+
+    /* OpenBLAS threads used while training (restored afterwards). 0 = auto: one thread when
+       each BLAS call is too small to amortize threading (per-sample training, small nets or
+       mini-batches), otherwise spingalett_set_num_threads() or OpenBLAS's own default. */
+    int blas_num_threads;
 } TrainArgs;
 
 typedef struct {

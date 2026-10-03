@@ -434,6 +434,27 @@ static void handle_autosave(NeuralNetwork *net, const TrainArgs *args, size_t ep
     }
 }
 
+#if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
+/* Multiply-adds per BLAS call below which OpenBLAS's thread pool costs more than it saves
+   (measured: per-sample training of a 784-512-1000-10 net runs 1.5x faster on one thread,
+   a 784-64-64-10 net 3.8x; mini-batches of 32 over 256-wide layers break even). */
+#define BLAS_SINGLE_THREAD_WORK (4u << 20)
+
+static int choose_blas_threads(const NeuralNetwork *net, const TrainArgs *args, uint32_t batch) {
+    if (args->blas_num_threads > 0)
+        return args->blas_num_threads;
+
+    uint64_t widest = 0;
+    for (uint32_t l = 0; l + 1 < net->layers; l++) {
+        uint64_t w = (uint64_t)net->topology[l] * net->topology[l + 1];
+        if (w > widest) widest = w;
+    }
+    if ((uint64_t)batch * widest < BLAS_SINGLE_THREAD_WORK)
+        return 1;
+    return (int)spingalett_get_num_threads();   /* 0 keeps OpenBLAS's own setting */
+}
+#endif
+
 /* Flush-to-zero on the calling thread and, in OpenMP mode, on every worker of the team. */
 static void flush_denormals_begin(ComputeMode mode) {
     spingalett_fp_flush_denormals_begin();
@@ -743,6 +764,18 @@ void train_struct_arguments(TrainArgs args) {
 
     flush_denormals_begin(effective_mode);
 
+#if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
+    int saved_blas_threads = 0;
+    if (effective_mode == COMPUTE_OPENBLAS) {
+        int blas_threads = choose_blas_threads(net, &args, t.batch_size);
+        if (blas_threads > 0) {
+            saved_blas_threads = openblas_get_num_threads();
+            openblas_set_num_threads(blas_threads);
+            spingalett_log(LOG_DEBUG, "OpenBLAS threads: %d", blas_threads);
+        }
+    }
+#endif
+
     bool lr_warned = false;
 
     for (size_t epoch = 1; epoch <= epochs; epoch++) {
@@ -796,6 +829,11 @@ void train_struct_arguments(TrainArgs args) {
             }
         }
     }
+
+#if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
+    if (saved_blas_threads > 0)
+        openblas_set_num_threads(saved_blas_threads);
+#endif
 
     flush_denormals_end(effective_mode);
     trainer_free(&t);
