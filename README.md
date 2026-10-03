@@ -42,11 +42,13 @@ parameters live in flat contiguous arrays, and models can be saved in reduced pr
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs) |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
-| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator |
+| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; validation with early stopping and best-weight restore |
+| Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
+| Data | IDX (MNIST) and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
-| Inference | Per-sample `forward()` and batched `predict()` |
+| Inference | Per-sample `forward()`, batched `predict()`, `evaluate()` (loss and accuracy) |
 | Backends | Built-in matrix kernels (AVX-512, AVX/FMA, portable C), single-threaded or OpenMP; OpenBLAS |
 | Serialization | FP32, FP16, BF16, INT8, INT4, INT2; optional optimizer state; versioned format |
 | Bindings | Python (ctypes + NumPy) |
@@ -189,7 +191,11 @@ It is not applied to the input or output layer.
 | `reset_optimizer` | false | Clear moment estimates and the step counter before training |
 | `nan_check_interval` | 0 (off) | Stop when weights become NaN/Inf, checked every N epochs |
 | `report_interval` | 0 (off) | Log the training loss every N epochs |
-| `callback`, `callback_interval` | none, 1 | `bool cb(NeuralNetwork *, size_t epoch, float loss)`; return `true` to stop |
+| `callback`, `callback_interval`, `callback_data` | none, 1, NULL | `bool cb(NeuralNetwork *, const TrainProgress *, void *callback_data)`; return `true` to stop |
+| `val_inputs`, `val_targets`, `val_count` | none | Validation set, evaluated after every epoch |
+| `monitor` | `MONITOR_AUTO` | Quantity that selects the best epoch: validation loss if there is validation data, else training loss; or `MONITOR_TRAIN_LOSS`, `MONITOR_VAL_LOSS`, `MONITOR_VAL_ACCURACY` |
+| `early_stopping_patience`, `early_stopping_min_delta` | 0 (off), 0 | Stop after this many epochs without an improvement larger than `min_delta` |
+| `restore_best_weights` | false | End with the weights and biases of the best epoch, kept in memory |
 | `autosave_mode`, `autosave_interval`, `autosave_path` | off | Periodic checkpoints (`AUTOSAVE_OVERWRITE` or `AUTOSAVE_NEW_FILES`, which appends `_epoch_N`) |
 | `autosave_precision`, `autosave_do_not_save_optimizer` | FP32, false | Checkpoint format |
 | `blas_num_threads` | 0 (auto) | OpenBLAS threads during training, see [Backends](#backends-and-threading) |
@@ -202,6 +208,38 @@ Optimizer state (moment estimates and the step counter used for Adam's bias corr
 in the network, so training can be resumed by calling `train()` again or after loading a
 checkpoint that includes the optimizer state.
 
+`train()` returns a `TrainReport`: `status` (`TRAIN_COMPLETED`, `TRAIN_EARLY_STOPPED`,
+`TRAIN_INTERRUPTED` by the callback, `TRAIN_DIVERGED` on NaN/Inf, `TRAIN_NO_DATA` from a
+generator, or `TRAIN_FAILED` with the reason in `spingalett_last_error_message()`), `epochs_run`,
+the last epoch's training loss and validation metrics, and the best epoch with its value.
+
+### Validation and early stopping
+
+With a validation set, `train()` evaluates loss and accuracy after every epoch and tracks the best
+epoch of the monitored quantity. Early stopping ends training once it has not improved for
+`early_stopping_patience` epochs, and `restore_best_weights` resets the parameters to those of the
+best epoch however training ended (completion, early stopping, the callback or divergence); the
+best parameters are kept in memory, which costs one copy of the weights and biases.
+
+```c
+static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *log) {
+    fprintf(log, "epoch %zu: loss %.4f, val accuracy %.2f%%%s\n", p->epoch, p->train_loss,
+            100 * p->validation.accuracy, p->improved ? " (best)" : "");
+    return false;
+}
+
+TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 100,
+                      .training_strategy = STRATEGY_SMALL_BATCH, .optimizer_type = OPTIMIZER_ADAMW,
+                      .val_inputs = xv, .val_targets = yv, .val_count = nv,
+                      .monitor = MONITOR_VAL_ACCURACY, .early_stopping_patience = 5,
+                      .restore_best_weights = true, .callback = on_epoch, .callback_data = stdout);
+printf("stopped after %zu epochs, kept epoch %zu\n", r.epochs_run, r.best_epoch);
+```
+
+The callback's `TrainProgress` carries the epoch, training loss, learning rate, validation
+metrics, the best epoch so far and whether this epoch improved on it. Accuracy compares the
+argmax of the outputs with that of the targets; with a single output, it checks that both are on
+the same side of 0.5.
 ### Learning-rate schedules
 
 ```c
@@ -239,6 +277,51 @@ training (requesting `sample_count` samples, which is then required) and in chun
 training. In this mode `sample_count` optionally caps the number of samples per epoch, which
 allows endless generators. Shuffling and augmentation are the generator's responsibility.
 
+### Custom training loops and losses
+
+`train()` covers the usual loops; for anything else, a `SpingalettTrainer` exposes the steps.
+`spingalett_trainer_forward()` runs a training-mode forward pass (dropout active) and returns the
+outputs; `spingalett_trainer_backward()` back-propagates the network's own loss, and
+`spingalett_trainer_backward_output_grads()` a custom one given dL/d(output) per sample. Backward
+passes add up the per-sample gradients in `net->grad_weights` and `net->grad_biases`, and
+`spingalett_trainer_step()` applies their mean with the given optimizer, so one step can span
+several backward passes:
+
+```c
+SpingalettTrainer *tr = spingalett_trainer_new(net, 64);          /* up to 64 samples per pass */
+OptimizerArgs adam = {.type = OPTIMIZER_ADAM, .learning_rate = 1e-3f};
+for (size_t s = 0; s < n; s += 64) {
+    const float *out = spingalett_trainer_forward(tr, x + s * in_size, 64);
+    for (size_t i = 0; i < 64 * out_size; i++)                    /* e.g. a weighted MSE */
+        grad[i] = weight[i % out_size] * (out[i] - y[s * out_size + i]);
+    spingalett_trainer_backward_output_grads(tr, grad);
+    spingalett_trainer_step(tr, &adam);
+}
+spingalett_trainer_free(tr);
+```
+
+`spingalett_train_on_batch()` combines forward, backward with the built-in loss and step. A loop
+of it over unshuffled mini-batches reproduces `train()` with `STRATEGY_SMALL_BATCH`, including the
+dropout masks. Optimizer state and the step counter are the network's, shared with `train()`.
+
+### Data sets
+
+```c
+SpingalettDataset train_set, val_set;
+spingalett_load_idx("train-images-idx3-ubyte", "train-labels-idx1-ubyte", 10, &train_set);
+spingalett_dataset_shuffle(&train_set);                 /* optional, uses spingalett_seed() */
+spingalett_dataset_split(&train_set, 5000, &val_set);   /* last 5,000 samples -> val_set */
+/* ... train(.inputs = train_set.inputs, .targets = train_set.targets, .sample_count = train_set.count, ...) */
+spingalett_dataset_free(&train_set);
+spingalett_dataset_free(&val_set);
+```
+
+`spingalett_load_idx()` reads the IDX format used by MNIST: unsigned-byte samples of any shape
+are flattened and scaled to [0, 1] (float and double files are read unchanged), and labels are
+one-hot encoded. `spingalett_load_csv(path, target_columns, num_classes, &d)` reads numeric,
+comma-separated files; a non-numeric first line is skipped as a header, the last `target_columns`
+columns are the targets, and with `num_classes > 0` a single label column is one-hot encoded.
+
 ### Inference
 
 `forward(net, input)` evaluates one sample and returns a pointer to the output layer inside the
@@ -248,6 +331,12 @@ with matrix-matrix products and is the faster choice for more than a handful of 
 ```c
 float *outputs = malloc(count * output_size * sizeof(float));
 predict(.net = net, .inputs = inputs, .sample_count = count, .outputs = outputs);   /* false on error */
+```
+
+`evaluate()` returns the mean loss (as reported by training) and the accuracy over a data set:
+
+```c
+EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y, .sample_count = n);
 ```
 
 Dropout is not applied during inference.
@@ -398,8 +487,9 @@ and 7.5x faster with OpenMP. Against 0.1, per-sample training (`STRATEGY_SAMPLE`
 faster, mainly because denormals are flushed to zero during training.
 
 `Examples/MNIST.c` trains a 784-256-128-10 network with dropout (AdamW, cosine schedule,
-mini-batches of 128) to 98.3% test accuracy in 3.6 s: 10 epochs over 60,000 images with OpenMP on
-the same VM.
+mini-batches of 128) on 55,000 images, keeps the epoch with the best accuracy on the other 5,000
+and reaches 98.2% test accuracy after 10 epochs, which take a few seconds with OpenMP on the same
+VM.
 
 ## Project layout
 
@@ -414,15 +504,19 @@ Bindings/Python/      Python bindings
 
 ## Status and roadmap
 
-Spingalett is at version 0.3; the C API and the in-memory `NeuralNetwork` layout may still change
-between minor versions (see [CHANGELOG.md](CHANGELOG.md)). Saved models are versioned and remain
+Spingalett is at version 0.4; the C API and the in-memory `NeuralNetwork` layout may still change
+between minor versions (see [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname
+carries the minor version (`libspingalett.so.0.4`). Saved models are versioned and remain
 loadable.
 
 Planned work, roughly in order:
 
-- 0.4: validation data, metrics and early stopping; dataset readers (IDX, CSV, binary files)
-- 0.5: an opaque network handle and a layer abstraction; batch normalization, 2D convolution and
-  pooling layers
+- 0.5, deployment: INT8 weights kept in memory with integer matrix-vector kernels (today INT8,
+  INT4 and INT2 only shrink the file and are expanded to FP32 on load), per-row quantization
+  scales, loading a model from a memory buffer, exporting a model as a C header, and an
+  inference-only build without training code, file I/O or OpenMP for microcontrollers
+- 0.6: an opaque network handle and a layer abstraction; batch normalization, 2D convolution and
+  pooling layers, each with numerical gradient checks
 - 1.0: API freeze, C++ wrapper
 - Later: CUDA backend, ARM NEON kernels, further language bindings
 

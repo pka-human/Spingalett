@@ -9,6 +9,7 @@
 #include "Spingalett.Private.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -150,4 +151,67 @@ bool predict_struct_arguments(PredictArgs args) {
 
     spingalett_batch_workspace_free(ws);
     return true;
+}
+
+static bool sample_correct(const float *out, const float *target, uint32_t n) {
+    if (n == 1)
+        return (out[0] >= 0.5f) == (target[0] >= 0.5f);
+    uint32_t best_out = 0, best_target = 0;
+    for (uint32_t k = 1; k < n; k++) {
+        if (out[k] > out[best_out]) best_out = k;
+        if (target[k] > target[best_target]) best_target = k;
+    }
+    return best_out == best_target;
+}
+
+void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
+                               const float *inputs, const float *targets, uint32_t n, ComputeMode mode,
+                               double *loss_sum, uint32_t *correct) {
+    uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
+    ActivationFunction out_act = net->act_func[net->layers - 2];
+    double loss = 0.0;
+    uint32_t hits = 0;
+    for (uint32_t start = 0; start < n; start += ws->capacity) {
+        uint32_t count = n - start < ws->capacity ? n - start : ws->capacity;
+        ws->act[0] = (float *)(inputs + (size_t)start * in_sz);              /* read only */
+        ws->act[net->layers - 1] = out_buf;
+        spingalett_batch_forward(net, ws, count, NULL, 0, mode);
+        for (uint32_t s = 0; s < count; s++) {
+            const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * out_sz;
+            loss += compute_sample_loss(o, t, out_sz, net->loss_func, out_act);
+            hits += sample_correct(o, t, out_sz);
+        }
+    }
+    *loss_sum = loss;
+    *correct = hits;
+}
+
+EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
+    EvalMetrics m = {NAN, NAN};
+    NeuralNetwork *net = args.net;
+    if (!net || !args.inputs || !args.targets || args.sample_count == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "evaluate: net, inputs or targets is NULL, or sample_count is 0");
+        return m;
+    }
+    if (net->layers < 2) {
+        set_error(SPINGALETT_ERR_INVALID, "evaluate: network must have at least 2 layers");
+        return m;
+    }
+
+    ComputeMode mode = resolve_compute_mode();
+    uint32_t capacity = args.sample_count < SPINGALETT_BATCH_CHUNK ? args.sample_count : SPINGALETT_BATCH_CHUNK;
+    BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
+    float *out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
+    if (ws && out) {
+        double loss;
+        uint32_t correct;
+        spingalett_batch_evaluate(net, ws, out, args.inputs, args.targets, args.sample_count, mode, &loss, &correct);
+        m.loss = (float)(loss / args.sample_count);
+        m.accuracy = (float)correct / (float)args.sample_count;
+    } else {
+        set_error(SPINGALETT_ERR_ALLOC, "evaluate: workspace allocation failed");
+    }
+    spingalett_aligned_free(out);
+    spingalett_batch_workspace_free(ws);
+    return m;
 }

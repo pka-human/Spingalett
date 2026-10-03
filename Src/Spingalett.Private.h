@@ -69,6 +69,11 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws);
    layers; samples are numbered position_offset + s for the dropout hash. */
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
+/* Summed loss and number of correctly classified samples (see EvalMetrics) over n samples, in
+   chunks of ws->capacity. ws is an inference workspace; out_buf holds [capacity x output size]. */
+void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
+                               const float *inputs, const float *targets, uint32_t n, ComputeMode mode,
+                               double *loss_sum, uint32_t *correct);
 
 bool spingalett_add_layer(LayerArgs args);
 bool spingalett_has_dropout(const NeuralNetwork *net);

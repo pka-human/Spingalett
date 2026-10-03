@@ -217,19 +217,43 @@ static void apply_rank1_updates(NeuralNetwork *net, const OptimizerStep *o, floa
     (void)mode;
 }
 
+/* dL/dz of the output layer from a caller-supplied dL/d(output): the vector-Jacobian product of
+   the output activation, y * (g - g.y) for softmax. */
+static void output_delta_from_grad(ActivationFunction act, const float *out, const float *grad,
+                                   float *delta, uint32_t n) {
+    if (act == ACT_SOFTMAX) {
+        float dot = 0.0f;
+        for (uint32_t j = 0; j < n; j++)
+            dot += grad[j] * out[j];
+        for (uint32_t j = 0; j < n; j++)
+            delta[j] = out[j] * (grad[j] - dot);
+        return;
+    }
+    memcpy(delta, grad, n * sizeof(float));
+    apply_derivative_batch(delta, out, (uint64_t)n, act);
+}
+
 /* ---- batch path (all backends): see Spingalett.Batch.c for the workspace and forward pass ---- */
 
-static void batch_compute_deltas(NeuralNetwork *net, BatchWorkspace *ws, const float *targets, uint32_t N,
-                                 ComputeMode mode) {
+/* Output deltas of N samples from targets (the network's loss) or from dL/d(output) rows. */
+static void batch_output_deltas(NeuralNetwork *net, BatchWorkspace *ws, const float *targets,
+                                const float *output_grads, uint32_t N) {
     uint32_t last = net->layers - 1;
     ActivationFunction last_act = net->act_func[last - 1];
     uint32_t n_out = net->topology[last];
 
     for (uint32_t s = 0; s < N; s++) {
         size_t off = (size_t)s * n_out;
-        output_delta(net->loss_func, last_act, ws->act[last] + off, targets + off, ws->delta[last] + off, n_out);
+        if (output_grads)
+            output_delta_from_grad(last_act, ws->act[last] + off, output_grads + off, ws->delta[last] + off, n_out);
+        else
+            output_delta(net->loss_func, last_act, ws->act[last] + off, targets + off, ws->delta[last] + off, n_out);
     }
+}
 
+/* Propagates the output deltas back through the hidden layers. */
+static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode) {
+    uint32_t last = net->layers - 1;
     for (uint32_t l = last - 1; l > 0; l--) {
         uint32_t cur_sz  = net->topology[l];
         uint32_t next_sz = net->topology[l + 1];
@@ -402,6 +426,10 @@ typedef struct {
     bool use_dropout;
     DropoutContext dropout;     /* dropout.dmask: per-sample path buffer */
     BatchWorkspace *ws;         /* batch path */
+
+    BatchWorkspace *val_ws;     /* validation: inference workspace and output rows */
+    float *val_out;
+    float *best_params;         /* restore_best_weights: weights then biases of the best epoch */
 } Trainer;
 
 static void trainer_free(Trainer *t) {
@@ -412,6 +440,9 @@ static void trainer_free(Trainer *t) {
     spingalett_aligned_free(t->deltas_flat);
     spingalett_aligned_free(t->dropout.dmask);
     spingalett_batch_workspace_free(t->ws);
+    spingalett_batch_workspace_free(t->val_ws);
+    spingalett_aligned_free(t->val_out);
+    free(t->best_params);
 }
 
 static bool trainer_alloc(Trainer *t) {
@@ -425,6 +456,18 @@ static bool trainer_alloc(Trainer *t) {
         if (!t->order) return false;
         for (uint32_t i = 0; i < sample_count; i++)
             t->order[i] = i;
+    }
+
+    if (t->args->val_count > 0) {
+        uint32_t capacity = t->args->val_count < SPINGALETT_BATCH_CHUNK ? t->args->val_count : SPINGALETT_BATCH_CHUNK;
+        t->val_ws = spingalett_batch_workspace_create(net, capacity, false, false, t->mode);
+        t->val_out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
+        if (!t->val_ws || !t->val_out) return false;
+    }
+
+    if (t->args->restore_best_weights) {
+        t->best_params = (float *)malloc((size_t)(net->total_weights + net->total_biases) * sizeof(float));
+        if (!t->best_params) return false;
     }
 
     if (t->use_generator) {
@@ -460,9 +503,9 @@ static void trainer_begin_step(Trainer *t) {
 }
 
 /* Trains on rows order[start .. start+count) of inputs/targets (rows start.. directly when order
-   is NULL) and performs the optimizer step(s). Returns the summed loss when need_loss is set. */
+   is NULL) and performs the optimizer step(s). Returns the summed loss. */
 static float trainer_step(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order,
-                          uint32_t start, uint32_t count, bool need_loss) {
+                          uint32_t start, uint32_t count) {
     NeuralNetwork *net = t->net;
     const TrainArgs *args = t->args;
     uint32_t in_sz  = net->topology[0];
@@ -494,9 +537,9 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
             }
 
             spingalett_batch_forward(net, ws, n, dropout, c0, t->mode);
-            if (need_loss)
-                loss += batch_compute_loss(net, ws, targets, n);
-            batch_compute_deltas(net, ws, targets, n, t->mode);
+            loss += batch_compute_loss(net, ws, targets, n);
+            batch_output_deltas(net, ws, targets, NULL, n);
+            batch_backprop_hidden(net, ws, n, t->mode);
             batch_accumulate_gradients(net, ws, n, 1.0f / (float)count, c0 == 0 ? 0.0f : 1.0f, t->mode);
         }
 
@@ -517,8 +560,7 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
         t->dropout.position = 0;
         const float *out = spingalett_forward_pass(net, inputs + (size_t)idx * in_sz, t->mode, dropout);
 
-        if (need_loss)
-            loss += compute_sample_loss(out, target, out_sz, net->loss_func, out_act);
+        loss += compute_sample_loss(out, target, out_sz, net->loss_func, out_act);
 
         compute_deltas(net, target, t->deltas, dropout ? t->dropout.dmask : NULL, t->mode);
 
@@ -530,7 +572,44 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
     return loss;
 }
 
-void train_struct_arguments(TrainArgs args) {
+/* Checks that a network can be trained; logs and sets the error otherwise. */
+static bool check_trainable(const NeuralNetwork *net) {
+    if (!net || net->layers < 2) {
+        set_error(SPINGALETT_ERR_INVALID, "Network must have at least 2 layers for training");
+        spingalett_log(LOG_ERROR, "Network must have at least 2 layers for training");
+        return false;
+    }
+
+    ActivationFunction output_act = net->act_func[net->layers - 2];
+    if (net->loss_func == LOSS_CROSS_ENTROPY && output_act != ACT_SOFTMAX && output_act != ACT_SIGMOID) {
+        set_error(SPINGALETT_ERR_INVALID, "Cross-entropy loss needs a softmax or sigmoid output layer");
+        spingalett_log(LOG_ERROR, "Cross-entropy loss needs a softmax or sigmoid output layer (got %s)",
+                       act_func_names[output_act]);
+        return false;
+    }
+
+    for (uint32_t l = 1; l < net->layers - 1; l++) {
+        if (net->act_func[l - 1] == ACT_SOFTMAX) {
+            set_error(SPINGALETT_ERR_INVALID, "Softmax is not supported in hidden layers");
+            spingalett_log(LOG_ERROR, "Softmax in hidden layer %u is not supported. Use softmax only in the output layer.", l);
+            return false;
+        }
+    }
+    return true;
+}
+
+static TrainReport train_failed(const char *message) {
+    set_error(SPINGALETT_ERR_INVALID, message);
+    spingalett_log(LOG_ERROR, "%s", message);
+    return (TrainReport){.status = TRAIN_FAILED};
+}
+
+static void copy_params(float *dst_w, float *dst_b, const float *src_w, const float *src_b, const NeuralNetwork *net) {
+    memcpy(dst_w, src_w, net->total_weights * sizeof(float));
+    memcpy(dst_b, src_b, net->total_biases * sizeof(float));
+}
+
+TrainReport train_struct_arguments(TrainArgs args) {
     NeuralNetwork *net = args.net;
     TrainingMode training_mode = args.training_mode;
     TrainingStrategy training_strategy = args.training_strategy;
@@ -548,58 +627,55 @@ void train_struct_arguments(TrainArgs args) {
 
     if ((unsigned)training_mode >= MODE_COUNT ||
         (unsigned)training_strategy >= STRATEGY_COUNT ||
-        (unsigned)args.optimizer_type >= OPTIMIZER_COUNT) {
-        set_error(SPINGALETT_ERR_INVALID, "Invalid training mode, strategy or optimizer");
-        spingalett_log(LOG_ERROR, "Invalid training mode, strategy or optimizer");
-        return;
-    }
+        (unsigned)args.optimizer_type >= OPTIMIZER_COUNT ||
+        (unsigned)args.monitor >= MONITOR_COUNT)
+        return train_failed("Invalid training mode, strategy, optimizer or monitor");
 
     bool use_generator = (training_mode == MODE_GENERATOR_FUNCTION);
 
-    if (!net || epochs == 0) {
-        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL net or zero epochs)");
-        spingalett_log(LOG_ERROR, "Invalid training arguments");
-        return;
-    }
+    if (!net || epochs == 0)
+        return train_failed("Invalid training arguments (NULL net or zero epochs)");
 
     if (use_generator) {
-        if (!args.generator || (training_strategy == STRATEGY_FULL_BATCH && sample_count == 0)) {
-            set_error(SPINGALETT_ERR_INVALID, "Generator mode needs a generator (and sample_count for full batch)");
-            spingalett_log(LOG_ERROR, "Generator mode needs a generator (and sample_count for full batch)");
-            return;
-        }
+        if (!args.generator || (training_strategy == STRATEGY_FULL_BATCH && sample_count == 0))
+            return train_failed("Generator mode needs a generator (and sample_count for full batch)");
     } else if (sample_count == 0 || !args.inputs || !args.targets) {
-        set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL inputs/targets or zero sample count)");
-        spingalett_log(LOG_ERROR, "Invalid training arguments");
-        return;
+        return train_failed("Invalid training arguments (NULL inputs/targets or zero sample count)");
     }
 
-    if (net->layers < 2) {
-        set_error(SPINGALETT_ERR_INVALID, "Network must have at least 2 layers for training");
-        spingalett_log(LOG_ERROR, "Network must have at least 2 layers for training");
-        return;
-    }
+    bool has_validation = args.val_count > 0;
+    if (has_validation && (!args.val_inputs || !args.val_targets))
+        return train_failed("val_count is set but val_inputs or val_targets is NULL");
 
-    ActivationFunction output_act = net->act_func[net->layers - 2];
-    if (net->loss_func == LOSS_CROSS_ENTROPY && output_act != ACT_SOFTMAX && output_act != ACT_SIGMOID) {
-        set_error(SPINGALETT_ERR_INVALID, "Cross-entropy loss needs a softmax or sigmoid output layer");
-        spingalett_log(LOG_ERROR, "Cross-entropy loss needs a softmax or sigmoid output layer (got %s)",
-                       act_func_names[output_act]);
-        return;
-    }
+    MonitorMetric monitor = args.monitor;
+    if (monitor == MONITOR_AUTO)
+        monitor = has_validation ? MONITOR_VAL_LOSS : MONITOR_TRAIN_LOSS;
+    if ((monitor == MONITOR_VAL_LOSS || monitor == MONITOR_VAL_ACCURACY) && !has_validation)
+        return train_failed("Monitoring a validation metric needs validation data (val_inputs, val_targets, val_count)");
+    bool monitoring = has_validation || args.early_stopping_patience > 0 || args.restore_best_weights;
+    bool higher_is_better = (monitor == MONITOR_VAL_ACCURACY);
+    float min_delta = fabsf(args.early_stopping_min_delta);
 
-    for (uint32_t l = 1; l < net->layers - 1; l++) {
-        if (net->act_func[l - 1] == ACT_SOFTMAX) {
-            set_error(SPINGALETT_ERR_INVALID, "Softmax is not supported in hidden layers");
-            spingalett_log(LOG_ERROR, "Softmax in hidden layer %u is not supported. Use softmax only in the output layer.", l);
-            return;
-        }
-    }
+    if (!check_trainable(net))
+        return (TrainReport){.status = TRAIN_FAILED};
 
     if (training_strategy == STRATEGY_SMALL_BATCH && args.batch_size == 0)
         args.batch_size = 32;
     if (training_strategy == STRATEGY_SMALL_BATCH && sample_count > 0 && args.batch_size > sample_count)
         args.batch_size = sample_count;
+
+    ComputeMode effective_mode = resolve_compute_mode();
+
+#if defined(SPINGALETT_HAS_OPENBLAS)
+    if (effective_mode == COMPUTE_OPENBLAS) {
+        for (uint32_t l = 0; l < net->layers; l++) {
+            if (net->topology[l] > (uint32_t)INT32_MAX)
+                return train_failed("Layer size exceeds BLAS int limit");
+        }
+        if (sample_count > (uint32_t)INT32_MAX)
+            return train_failed("Sample count exceeds BLAS int limit");
+    }
+#endif
 
     if (args.reset_optimizer) {
         memset(net->opt_m_weights, 0, net->total_weights * sizeof(float));
@@ -609,25 +685,6 @@ void train_struct_arguments(TrainArgs args) {
         net->time_step = 0;
         spingalett_log(LOG_INFO, "Optimizer state reset");
     }
-
-    ComputeMode effective_mode = resolve_compute_mode();
-
-#if defined(SPINGALETT_HAS_OPENBLAS)
-    if (effective_mode == COMPUTE_OPENBLAS) {
-        for (uint32_t l = 0; l < net->layers; l++) {
-            if (net->topology[l] > (uint32_t)INT32_MAX) {
-                spingalett_log(LOG_ERROR, "Layer %u size %u exceeds BLAS int limit", l, net->topology[l]);
-                set_error(SPINGALETT_ERR_INVALID, "Layer size exceeds BLAS int limit");
-                return;
-            }
-        }
-        if (sample_count > (uint32_t)INT32_MAX) {
-            spingalett_log(LOG_ERROR, "Sample count %u exceeds BLAS int limit", sample_count);
-            set_error(SPINGALETT_ERR_INVALID, "Sample count exceeds BLAS int limit");
-            return;
-        }
-    }
-#endif
 
 #if defined(_OPENMP)
     if (spingalett_get_num_threads() > 0) {
@@ -695,7 +752,7 @@ void train_struct_arguments(TrainArgs args) {
         trainer_free(&t);
         set_error(SPINGALETT_ERR_ALLOC, "Failed to allocate training buffers");
         spingalett_log(LOG_ERROR, "Failed to allocate training buffers");
-        return;
+        return (TrainReport){.status = TRAIN_FAILED};
     }
 
     // The accumulating paths add into grad_* and expect it to start at zero; a previous run
@@ -721,11 +778,15 @@ void train_struct_arguments(TrainArgs args) {
     }
 #endif
 
+    TrainReport report = {
+        .status = TRAIN_COMPLETED, .train_loss = NAN, .has_validation = has_validation,
+        .validation = {NAN, NAN}, .monitor = monitor, .best_value = NAN,
+    };
+    float best = higher_is_better ? -INFINITY : INFINITY;
+    size_t epochs_without_improvement = 0;
     bool lr_warned = false;
 
     for (size_t epoch = 1; epoch <= epochs; epoch++) {
-        bool need_loss = should_report(epoch, epochs, args.report_interval) ||
-                         (args.callback && should_report(epoch, epochs, args.callback_interval));
         float total_error = 0.0f;
 
         if (args.lr_scheduler) {
@@ -757,13 +818,14 @@ void train_struct_arguments(TrainArgs args) {
                     failed = true;
                     break;
                 }
-                total_error += trainer_step(&t, t.gen_inputs, t.gen_targets, NULL, 0, got, need_loss);
+                total_error += trainer_step(&t, t.gen_inputs, t.gen_targets, NULL, 0, got);
                 epoch_samples += got;
                 if (training_strategy == STRATEGY_FULL_BATCH) break;
             }
-            if (failed) break;
+            if (failed) { report.status = TRAIN_FAILED; break; }
             if (epoch_samples == 0) {
                 spingalett_log(LOG_WARNING, "Generator produced no samples in epoch %zu; stopping training", epoch);
+                report.status = TRAIN_NO_DATA;
                 break;
             }
         } else {
@@ -773,36 +835,88 @@ void train_struct_arguments(TrainArgs args) {
             for (uint32_t bi = 0; bi < steps_per_epoch; bi++) {
                 uint32_t start = bi * step_size;
                 uint32_t count = (sample_count - start < step_size) ? sample_count - start : step_size;
-                total_error += trainer_step(&t, args.inputs, args.targets, t.order, start, count, need_loss);
+                total_error += trainer_step(&t, args.inputs, args.targets, t.order, start, count);
             }
             epoch_samples = sample_count;
         }
 
-        float current_error = total_error / (float)epoch_samples;
+        report.epochs_run = epoch;
+        report.train_loss = total_error / (float)epoch_samples;
 
-        if (should_report(epoch, epochs, args.report_interval)) {
-            if (args.lr_scheduler)
-                spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f, LR: %g", epoch, epochs, (double)current_error, (double)t.opt.lr);
-            else
-                spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f", epoch, epochs, (double)current_error);
+        if (args.nan_check_interval > 0 && (epoch % args.nan_check_interval == 0) && check_nan_inf(net)) {
+            spingalett_log(LOG_ERROR, "NaN/Inf detected in weights at epoch %zu, stopping training", epoch);
+            report.status = TRAIN_DIVERGED;
+            break;
         }
 
-        if (args.nan_check_interval > 0 && (epoch % args.nan_check_interval == 0)) {
-            if (check_nan_inf(net)) {
-                spingalett_log(LOG_ERROR, "NaN/Inf detected in weights at epoch %zu, stopping training", epoch);
-                break;
+        if (has_validation) {
+            double loss;
+            uint32_t correct;
+            spingalett_batch_evaluate(net, t.val_ws, t.val_out, args.val_inputs, args.val_targets, args.val_count,
+                                      effective_mode, &loss, &correct);
+            report.validation.loss = (float)(loss / args.val_count);
+            report.validation.accuracy = (float)correct / (float)args.val_count;
+        }
+
+        bool improved = false;
+        if (monitoring) {
+            float value = monitor == MONITOR_TRAIN_LOSS ? report.train_loss
+                        : monitor == MONITOR_VAL_LOSS   ? report.validation.loss
+                                                        : report.validation.accuracy;
+            improved = higher_is_better ? value > best + min_delta : value < best - min_delta;
+            if (report.best_epoch == 0 && isfinite(value))
+                improved = true;    /* the first finite value is the first best, whatever min_delta */
+            if (improved) {
+                best = value;
+                report.best_epoch = epoch;
+                report.best_value = value;
+                epochs_without_improvement = 0;
+                if (t.best_params)
+                    copy_params(t.best_params, t.best_params + net->total_weights, net->weights, net->biases, net);
+            } else {
+                epochs_without_improvement++;
             }
+        }
+
+        if (should_report(epoch, epochs, args.report_interval)) {
+            char lr_text[32] = "", val_text[64] = "";
+            if (args.lr_scheduler)
+                snprintf(lr_text, sizeof lr_text, ", LR: %g", (double)t.opt.lr);
+            if (has_validation)
+                snprintf(val_text, sizeof val_text, ", Val loss: %f, Val accuracy: %.2f%%",
+                         (double)report.validation.loss, 100.0 * (double)report.validation.accuracy);
+            spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f%s%s%s", epoch, epochs, (double)report.train_loss,
+                           val_text, lr_text, improved && monitoring ? " (best)" : "");
         }
 
         if (should_report(epoch, epochs, args.autosave_interval))
             handle_autosave(net, &args, epoch);
 
         if (args.callback && should_report(epoch, epochs, args.callback_interval)) {
-            if (args.callback(net, epoch, current_error)) {
+            TrainProgress progress = {
+                .epoch = epoch, .epochs = epochs, .train_loss = report.train_loss, .learning_rate = t.opt.lr,
+                .has_validation = has_validation, .validation = report.validation, .monitor = monitor,
+                .best_epoch = report.best_epoch, .best_value = report.best_value, .improved = improved,
+            };
+            if (args.callback(net, &progress, args.callback_data)) {
                 spingalett_log(LOG_INFO, "Training interrupted by callback at epoch %zu", epoch);
+                report.status = TRAIN_INTERRUPTED;
                 break;
             }
         }
+
+        if (args.early_stopping_patience > 0 && epochs_without_improvement >= args.early_stopping_patience) {
+            spingalett_log(LOG_INFO, "Early stopping at epoch %zu: no improvement since epoch %zu",
+                           epoch, report.best_epoch);
+            report.status = TRAIN_EARLY_STOPPED;
+            break;
+        }
+    }
+
+    if (t.best_params && report.best_epoch > 0 && report.best_epoch != report.epochs_run) {
+        copy_params(net->weights, net->biases, t.best_params, t.best_params + net->total_weights, net);
+        report.restored_best = true;
+        spingalett_log(LOG_INFO, "Restored the weights of epoch %zu", report.best_epoch);
     }
 
 #if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
@@ -813,4 +927,159 @@ void train_struct_arguments(TrainArgs args) {
     flush_denormals_end(effective_mode);
     trainer_free(&t);
     spingalett_log(LOG_INFO, "Training completed.");
+    return report;
+}
+
+/* ---- low-level training API ---- */
+
+struct SpingalettTrainer {
+    NeuralNetwork *net;
+    ComputeMode mode;           /* resolved when the trainer was created */
+    BatchWorkspace *ws;         /* training workspace for max_batch samples (inputs copied in) */
+    bool use_dropout;
+    DropoutContext dropout;
+    uint32_t pending;           /* samples of the last forward pass, until it is back-propagated */
+    uint32_t accumulated;       /* samples in the network's gradient since the last step */
+};
+
+SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch) {
+    if (max_batch == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_new: max_batch is 0");
+        return NULL;
+    }
+    if (!check_trainable(net))
+        return NULL;
+    SpingalettTrainer *tr = (SpingalettTrainer *)calloc(1, sizeof(SpingalettTrainer));
+    if (!tr) {
+        set_error(SPINGALETT_ERR_ALLOC, "spingalett_trainer_new: allocation failed");
+        return NULL;
+    }
+    tr->net = net;
+    tr->mode = resolve_compute_mode();
+    tr->use_dropout = spingalett_has_dropout(net);
+    if (tr->use_dropout)
+        tr->dropout.seed = rng_next64();
+    tr->ws = spingalett_batch_workspace_create(net, max_batch, true, true, tr->mode);
+    if (!tr->ws) {
+        free(tr);
+        set_error(SPINGALETT_ERR_ALLOC, "spingalett_trainer_new: workspace allocation failed");
+        return NULL;
+    }
+    return tr;
+}
+
+void spingalett_trainer_free(SpingalettTrainer *tr) {
+    if (!tr) return;
+    spingalett_batch_workspace_free(tr->ws);
+    free(tr);
+}
+
+const float *spingalett_trainer_forward(SpingalettTrainer *tr, const float *inputs, uint32_t count) {
+    if (!tr || !inputs || count == 0 || count > tr->ws->capacity) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_forward: NULL argument, or count is 0 or above max_batch");
+        return NULL;
+    }
+    NeuralNetwork *net = tr->net;
+    BatchWorkspace *ws = tr->ws;
+    memcpy(ws->inputs, inputs, (size_t)count * net->topology[0] * sizeof(float));
+    ws->act[0] = ws->inputs;
+
+    /* Masks depend on the step and on the sample's position within it, as in train(). */
+    tr->dropout.step = net->time_step;
+    flush_denormals_begin(tr->mode);
+    spingalett_batch_forward(net, ws, count, tr->use_dropout ? &tr->dropout : NULL, tr->accumulated, tr->mode);
+    flush_denormals_end(tr->mode);
+    tr->pending = count;
+    return ws->act[net->layers - 1];
+}
+
+static bool trainer_backward(SpingalettTrainer *tr, const float *targets, const float *output_grads, float *loss) {
+    if (!tr || !(targets || output_grads)) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_backward: NULL argument");
+        return false;
+    }
+    if (tr->pending == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_backward: no forward pass to back-propagate");
+        return false;
+    }
+    NeuralNetwork *net = tr->net;
+    uint32_t n = tr->pending;
+    if (loss)
+        *loss = batch_compute_loss(net, tr->ws, targets, n);
+
+    flush_denormals_begin(tr->mode);
+    batch_output_deltas(net, tr->ws, targets, output_grads, n);
+    batch_backprop_hidden(net, tr->ws, n, tr->mode);
+    batch_accumulate_gradients(net, tr->ws, n, 1.0f, tr->accumulated == 0 ? 0.0f : 1.0f, tr->mode);
+    flush_denormals_end(tr->mode);
+
+    tr->accumulated += n;
+    tr->pending = 0;
+    return true;
+}
+
+float spingalett_trainer_backward(SpingalettTrainer *tr, const float *targets) {
+    float loss = NAN;
+    return trainer_backward(tr, targets, NULL, &loss) ? loss : NAN;
+}
+
+bool spingalett_trainer_backward_output_grads(SpingalettTrainer *tr, const float *output_grads) {
+    return trainer_backward(tr, NULL, output_grads, NULL);
+}
+
+void spingalett_trainer_zero_grad(SpingalettTrainer *tr) {
+    if (!tr) return;
+    memset(tr->net->grad_weights, 0, tr->net->total_weights * sizeof(float));
+    memset(tr->net->grad_biases, 0, tr->net->total_biases * sizeof(float));
+    tr->accumulated = 0;
+    tr->pending = 0;
+}
+
+bool spingalett_trainer_step(SpingalettTrainer *tr, const OptimizerArgs *optimizer) {
+    if (!tr || !optimizer || (unsigned)optimizer->type >= OPTIMIZER_COUNT) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_step: NULL argument or invalid optimizer");
+        return false;
+    }
+    if (tr->accumulated == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_step: no gradient accumulated since the last step");
+        return false;
+    }
+    NeuralNetwork *net = tr->net;
+    OptimizerStep o = {
+        .type = optimizer->type,
+        .lr = optimizer->learning_rate > 0.0f ? optimizer->learning_rate : 0.01f,
+        .decay = optimizer->weight_decay,
+        .momentum = optimizer->momentum > 0.0f ? optimizer->momentum : 0.9f,
+        .beta1 = optimizer->beta1 > 0.0f ? optimizer->beta1 : 0.9f,
+        .beta2 = optimizer->beta2 > 0.0f ? optimizer->beta2 : 0.999f,
+        .epsilon = optimizer->epsilon > 0.0f ? optimizer->epsilon : 1e-8f,
+    };
+    net->time_step++;
+    o.m_factor = 1.0f / (1.0f - powf(o.beta1, (float)net->time_step));
+    o.v_factor = 1.0f / (1.0f - powf(o.beta2, (float)net->time_step));
+
+    flush_denormals_begin(tr->mode);
+    float scale = 1.0f / (float)tr->accumulated;
+    spingalett_vec_scale(net->grad_weights, net->total_weights, scale);
+    spingalett_vec_scale(net->grad_biases, net->total_biases, scale);
+    apply_gradients(net, &o, optimizer->max_grad_norm, tr->mode);
+    flush_denormals_end(tr->mode);
+
+    tr->accumulated = 0;
+    tr->pending = 0;
+    return true;
+}
+
+float spingalett_train_on_batch(SpingalettTrainer *tr, const float *inputs, const float *targets,
+                                uint32_t count, const OptimizerArgs *optimizer) {
+    if (!targets) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_train_on_batch: targets is NULL");
+        return NAN;
+    }
+    if (!spingalett_trainer_forward(tr, inputs, count))
+        return NAN;
+    float loss = spingalett_trainer_backward(tr, targets);
+    if (isnan(loss) || !spingalett_trainer_step(tr, optimizer))
+        return NAN;
+    return loss / (float)count;
 }

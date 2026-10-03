@@ -111,10 +111,11 @@ ln -s digitpad.svg "$appdir/.DirIcon"
 cp "$pkg/AppRun" "$appdir/AppRun"
 chmod 755 "$appdir/AppRun"
 
+lib=$(find "$appdir/usr/lib" -name 'libspingalett.so.*' -type f | head -n 1)
 echo "shared libraries DigitPad needs from the host:"
-readelf -d "$appdir/usr/bin/DigitPad" "$appdir/usr/lib/libspingalett.so.0" |
+readelf -d "$appdir/usr/bin/DigitPad" "$lib" |
     sed -n 's/.*(NEEDED).*\[\(.*\)\]/  \1/p' | sort -u | grep -v libspingalett
-glibc=$( (objdump -T "$appdir/usr/bin/DigitPad"; objdump -T "$appdir/usr/lib/libspingalett.so.0") |
+glibc=$( (objdump -T "$appdir/usr/bin/DigitPad"; objdump -T "$lib") |
     grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
 echo "minimum glibc: $glibc"
 

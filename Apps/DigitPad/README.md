@@ -13,8 +13,8 @@ randomly distorted copy of it.
 ## Running the AppImage
 
 ```bash
-chmod +x DigitPad-0.3.0-x86_64.AppImage
-./DigitPad-0.3.0-x86_64.AppImage
+chmod +x DigitPad-*-x86_64.AppImage
+./DigitPad-*-x86_64.AppImage
 ```
 
 The image contains the app, `libspingalett`, a static SDL2 and the model. It needs an x86-64

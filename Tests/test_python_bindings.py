@@ -60,13 +60,14 @@ x = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.float32); y = np.array([
 # callback: early stop + epochs seen
 seen = []
 with sg.Network(sg.Loss.MSE, [2, sg.Layer(4, sg.Activation.TANH), sg.Layer(1)]) as net:
-    net.train(x, y, epochs=100, callback=lambda n, e, err: (seen.append((e, err)), e >= 7)[1], callback_interval=1)
+    r = net.train(x, y, epochs=100, callback=lambda n, p: (seen.append((p.epoch, p.train_loss)), p.epoch >= 7)[1], callback_interval=1)
     check([e for e, _ in seen] == list(range(1, 8)), f"early stop at epoch 7: {[e for e, _ in seen]}")
     check(net.time_step == 7, f"time_step after early stop: {net.time_step}")
+    check(r.status == sg.TrainStatus.INTERRUPTED and r.epochs_run == 7 and abs(r.train_loss - seen[-1][1]) < 1e-7, f"train result {r}")
     # exception inside a callback stops training and is re-raised
     class Boom(Exception): pass
-    def bad_cb(n, e, err):
-        if e == 3: raise Boom("stop")
+    def bad_cb(n, p):
+        if p.epoch == 3: raise Boom("stop")
     try:
         net.train(x, y, epochs=50, callback=bad_cb); check(False, "exception not propagated")
     except Boom:
@@ -89,6 +90,62 @@ with sg.Network(sg.Loss.MSE, [2, sg.Layer(4, sg.Activation.TANH), sg.Layer(1)]) 
     try:
         net.train(x, y, epochs=1, optimizer=99); check(False, "invalid optimizer accepted")
     except (sg.SpingalettError, ValueError): pass
+
+# validation, early stopping, best weights, evaluate
+rng3 = np.random.default_rng(11)
+vx = rng3.normal(size=(40, 3)).astype(np.float32)
+vy = (vx[:, :1] > 0).astype(np.float32)
+with sg.Network(sg.Loss.CROSS_ENTROPY, [3, sg.Layer(8, sg.Activation.TANH, sg.Init.XAVIER), sg.Layer(1, sg.Activation.SIGMOID, sg.Init.XAVIER)]) as net:
+    snapshots, progress = {}, []
+    def keep(n, p):
+        progress.append(p); snapshots[p.epoch] = n.get_weights(0)
+    # the validation targets are inverted: validation loss gets worse as training improves
+    r = net.train(vx, vy, epochs=60, optimizer=sg.Optimizer.ADAM, learning_rate=0.05, validation_data=(vx, 1 - vy),
+                  early_stopping_patience=3, restore_best_weights=True, callback=keep)
+    check(r.status == sg.TrainStatus.EARLY_STOPPED and r.epochs_run == r.best_epoch + 3 and r.restored_best
+          and r.monitor == sg.Monitor.VAL_LOSS, f"early stopping result {r}")
+    check(np.array_equal(net.get_weights(0), snapshots[r.best_epoch]), "restored weights are the best epoch's")
+    check(all(p.validation is not None for p in progress) and progress[r.best_epoch - 1].improved, "progress validation metrics")
+    m = net.evaluate(vx, 1 - vy)
+    check(isinstance(m, sg.Metrics) and abs(m.loss - r.best_value) < 1e-5, f"evaluate {m} vs best {r.best_value}")
+    acc = float(((net.forward(vx) >= 0.5) == (vy >= 0.5)).mean())
+    check(abs(net.evaluate(vx, vy).accuracy - acc) < 1e-6, "evaluate accuracy")
+    try:
+        net.train(vx, vy, epochs=2, monitor=sg.Monitor.VAL_ACCURACY); check(False, "validation monitor without data")
+    except sg.SpingalettError: pass
+
+# low-level trainer: custom loss gradients equal the built-in ones; step matches train()
+def small(seed_value):
+    sg.seed(seed_value)
+    return sg.Network(sg.Loss.CROSS_ENTROPY, [3, sg.Layer(6, sg.Activation.RELU, sg.Init.HE), sg.Layer(2, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
+ty = np.eye(2, dtype=np.float32)[(vx[:, 0] > 0).astype(int)]
+with small(5) as a, small(5) as b:
+    with sg.Trainer(a, max_batch=40) as tr:
+        tr.forward(vx); tr.backward(ty)
+        g_builtin = a.get_weight_gradients(0)
+        tr.zero_grad()
+        out = tr.forward(vx); tr.backward_output_grads(-ty / out)
+        check(np.allclose(a.get_weight_gradients(0), g_builtin, atol=1e-5), "custom output gradients")
+        tr.zero_grad()
+        losses = [tr.train_on_batch(vx[i:i + 10], ty[i:i + 10], optimizer=sg.Optimizer.ADAM, learning_rate=0.01) for i in range(0, 40, 10)]
+        try:
+            tr.backward(ty[:10]); check(False, "backward without forward accepted")
+        except sg.SpingalettError: pass
+    b.train(vx, ty, epochs=1, optimizer=sg.Optimizer.ADAM, learning_rate=0.01, strategy=sg.Strategy.MINI_BATCH, batch_size=10, shuffle=False)
+    check(np.allclose(a.get_weights(0), b.get_weights(0), atol=1e-6) and a.time_step == b.time_step == 4 and all(np.isfinite(losses)),
+          "Trainer.train_on_batch == train() mini-batches")
+
+# data set readers
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "data.csv")
+    with open(path, "w") as f:
+        f.write("x0,x1,label\n" + "".join(f"{i},{i * 2},{i % 2}\n" for i in range(9)))
+    cx, cy = sg.load_csv(path, target_columns=1, num_classes=2)
+    check(cx.shape == (9, 2) and cy.shape == (9, 2) and cx[4, 1] == 8 and cy[3, 1] == 1, f"load_csv {cx.shape} {cy.shape}")
+    try:
+        sg.load_csv(os.path.join(d, "missing.csv")); check(False, "missing csv loaded")
+    except sg.SpingalettError as e:
+        check(e.code == sg.ErrorCode.FILE_IO, "missing csv error code")
 
 # dropout + save/load + precision
 with tempfile.TemporaryDirectory() as d:

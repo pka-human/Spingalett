@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.3.0 LANGUAGES C)
+project(Spingalett VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -255,9 +255,15 @@ if(NOT MSVC)
     endif()
 endif()
 
+# Before 1.0 a minor release may break the ABI, so the soname carries major.minor (.so.0.4).
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+else()
+    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR})
+endif()
 set_target_properties(spingalett PROPERTIES
     VERSION ${PROJECT_VERSION}
-    SOVERSION 0
+    SOVERSION ${SPINGALETT_SOVERSION}
 )
 
 # ------------------------------------------------------------------------------

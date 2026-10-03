@@ -5,12 +5,41 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-03
 
 ### Added
+- Validation during training: `val_inputs`, `val_targets` and `val_count` in `TrainArgs` are
+  evaluated after every epoch. The best epoch of a monitored quantity (`monitor`: validation
+  loss or accuracy, or training loss) is tracked; `early_stopping_patience` and
+  `early_stopping_min_delta` stop training when it no longer improves, and
+  `restore_best_weights` ends training with the best epoch's parameters, kept in memory.
+- `evaluate()`: mean loss and accuracy over a data set.
+- A low-level training API for custom loops and losses: `spingalett_trainer_new()`,
+  `spingalett_trainer_forward()`, `spingalett_trainer_backward()` (built-in loss),
+  `spingalett_trainer_backward_output_grads()` (custom loss from dL/d(output)),
+  `spingalett_trainer_step()` with `OptimizerArgs`, `spingalett_trainer_zero_grad()` and
+  `spingalett_train_on_batch()`. Backward passes accumulate, so one step can span several.
+- Data sets: `spingalett_load_idx()` (MNIST format), `spingalett_load_csv()`,
+  `spingalett_dataset_shuffle()`, `spingalett_dataset_split()` and `spingalett_dataset_free()`.
+- Python: `validation_data`, `monitor`, `early_stopping_patience`, `early_stopping_min_delta` and
+  `restore_best_weights` for `Network.train()`, `Network.evaluate()`, `Trainer`,
+  `Network.get_weight_gradients()` / `get_bias_gradients()`, `load_idx()` and `load_csv()`.
 - DigitPad (`Apps/DigitPad`, CMake option `BUILD_APPS`): a desktop app that classifies digits
   drawn with the mouse, its trainer (99.27% MNIST test accuracy with on-the-fly augmentation) and
   a script that packages app and model as a Linux AppImage.
+
+### Changed
+- The epoch callback is now `bool (*)(NeuralNetwork *, const TrainProgress *, void *user_data)`:
+  `TrainProgress` carries the epoch, training loss, learning rate, validation metrics and the
+  best epoch so far, and `TrainArgs.callback_data` is passed as `user_data`. In Python the
+  callback is `callback(network, progress)`.
+- `train()` returns a `TrainReport` (status, epochs run, last losses and metrics, best epoch);
+  in Python a `TrainResult`.
+- The training loss is computed in every epoch, not only in reported ones.
+- The shared library's soname carries the minor version while the major version is 0
+  (`libspingalett.so.0.4`), because 0.x minor releases are not ABI compatible.
+- `Examples/MNIST.c` holds out 5,000 training images for validation, keeps the best epoch and
+  evaluates the test set once.
 
 ## [0.3.0] - 2026-10-03
 
@@ -86,6 +115,6 @@ changes, which are listed under **Changed**.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v0.3.0...HEAD
+[0.4.0]: https://github.com/pka-human/Spingalett/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pka-human/Spingalett/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pka-human/Spingalett/compare/0a1dd16...v0.2.0
