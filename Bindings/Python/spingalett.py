@@ -68,10 +68,11 @@ class Loss(enum.IntEnum):
 
 
 class Init(enum.IntEnum):
-    RANDOM = 0
-    XAVIER = 1
-    HE = 2
-    NONE = 3
+    RANDOM = 0      # uniform in [-1, 1]
+    XAVIER = 1      # Glorot normal, variance 2 / (fan_in + fan_out)
+    HE = 2          # He normal, variance 2 / fan_in
+    NONE = 3        # zeros
+    LECUN = 4       # LeCun normal, variance 1 / fan_in
 
 
 class Strategy(enum.IntEnum):
@@ -189,6 +190,7 @@ class _TrainArgs(Structure):
         ("generator_data", c_void_p),
         ("sample_count", c_uint32),
         ("batch_size", c_uint32),
+        ("do_not_shuffle", c_bool),
         ("epochs", c_size_t),
         ("learning_rate", c_float),
         ("weight_decay", c_float),
@@ -450,6 +452,7 @@ class TrainConfig:
     optimizer: Optimizer = Optimizer.ADAM
     learning_rate: float = 0.01
     batch_size: int = 0
+    shuffle: bool = True            # reshuffle every epoch (per-sample and mini-batch, array data)
     weight_decay: float = 0.0
     momentum: float = 0.0
     beta1: float = 0.0
@@ -739,6 +742,7 @@ class Network:
             generator_data=None,
             sample_count=sample_count,
             batch_size=int(cfg.batch_size),
+            do_not_shuffle=not cfg.shuffle,
             epochs=int(cfg.epochs),
             learning_rate=float(cfg.learning_rate),
             weight_decay=float(cfg.weight_decay),

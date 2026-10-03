@@ -166,17 +166,21 @@ bool spingalett_add_layer(LayerArgs args) {
             memcpy(t_vb, net->opt_v_biases,  net->total_biases * sizeof(float));
         }
 
+        /* Standard deviations: Glorot sqrt(2 / (fan_in + fan_out)), He sqrt(2 / fan_in),
+           LeCun sqrt(1 / fan_in). */
         float scale = 1.0f;
         if (wi == WEIGHT_INITIALIZATION_XAVIER)
-            scale = sqrtf(1.0f / (float)prev_neurons);
+            scale = sqrtf(2.0f / ((float)prev_neurons + (float)neurons_amount));
         else if (wi == WEIGHT_INITIALIZATION_HE)
             scale = sqrtf(2.0f / (float)prev_neurons);
+        else if (wi == WEIGHT_INITIALIZATION_LECUN)
+            scale = sqrtf(1.0f / (float)prev_neurons);
 
         for (uint64_t idx = 0; idx < add_w; idx++) {
             uint64_t pos = net->total_weights + idx;
             if (wi == WEIGHT_INITIALIZATION_RANDOM)
                 t_w[pos] = random_uniform_weight();
-            else if (wi == WEIGHT_INITIALIZATION_XAVIER || wi == WEIGHT_INITIALIZATION_HE)
+            else if (wi != WEIGHT_INITIALIZATION_NONE)
                 t_w[pos] = random_normal_weight() * scale;
         }
     }

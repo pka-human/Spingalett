@@ -526,7 +526,7 @@ typedef struct {
 
     bool use_blas_batch;
     uint32_t batch_size;        /* samples per optimizer step */
-    uint32_t *order;            /* sample order (shuffled per epoch for mini-batches) */
+    uint32_t *order;            /* sample order, reshuffled every epoch (NULL = in order) */
 
     bool use_generator;
     uint32_t gen_capacity;      /* samples requested per generator call */
@@ -562,7 +562,9 @@ static bool trainer_alloc(Trainer *t) {
     NeuralNetwork *net = t->net;
     uint32_t sample_count = t->args->sample_count;
 
-    if (t->args->training_strategy == STRATEGY_SMALL_BATCH && !t->use_generator) {
+    TrainingStrategy strategy = t->args->training_strategy;
+    if ((strategy == STRATEGY_SMALL_BATCH || strategy == STRATEGY_SAMPLE) &&
+        !t->use_generator && !t->args->do_not_shuffle) {
         t->order = (uint32_t *)malloc((size_t)sample_count * sizeof(uint32_t));
         if (!t->order) return false;
         for (uint32_t i = 0; i < sample_count; i++)

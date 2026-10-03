@@ -26,7 +26,7 @@ const char * const optimizer_names[] = {
 };
 
 const char * const weight_initialization_names[] = {
-    "RANDOM", "XAVIER", "HE", "NONE"
+    "RANDOM", "XAVIER", "HE", "NONE", "LECUN"
 };
 
 const char * const precision_names[] = {

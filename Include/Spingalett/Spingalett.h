@@ -53,10 +53,11 @@ typedef enum {
 } LossFunction;
 
 typedef enum {
-    WEIGHT_INITIALIZATION_RANDOM,
-    WEIGHT_INITIALIZATION_XAVIER,
-    WEIGHT_INITIALIZATION_HE,
-    WEIGHT_INITIALIZATION_NONE,
+    WEIGHT_INITIALIZATION_RANDOM,   /* uniform in [-1, 1] */
+    WEIGHT_INITIALIZATION_XAVIER,   /* Glorot normal: variance 2 / (fan_in + fan_out) */
+    WEIGHT_INITIALIZATION_HE,       /* He normal: variance 2 / fan_in */
+    WEIGHT_INITIALIZATION_NONE,     /* zeros */
+    WEIGHT_INITIALIZATION_LECUN,    /* LeCun normal: variance 1 / fan_in */
     WEIGHT_INITIALIZATION_COUNT
 } WeightInitialization;
 
@@ -194,6 +195,7 @@ typedef struct {
     uint32_t sample_count;          /* MODE_ARRAY: number of samples. Generator: samples per epoch
                                        (0 = until the generator returns 0; required for full batch) */
     uint32_t batch_size;
+    bool do_not_shuffle;            /* keep sample order (per-sample and mini-batch training) */
     size_t epochs;
 
     float learning_rate;

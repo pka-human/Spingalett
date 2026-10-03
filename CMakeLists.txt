@@ -294,7 +294,7 @@ if(BUILD_TESTS)
         set_target_properties(SpingalettTests PROPERTIES BUILD_RPATH "$ORIGIN")
     endif()
 
-    foreach(group grad equiv cont sched dropout gen io xor)
+    foreach(group grad equiv cont optim sched dropout gen io xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()
