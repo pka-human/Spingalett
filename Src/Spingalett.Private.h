@@ -68,6 +68,8 @@ void spingalett_adam_update(float *restrict W, float *restrict mW, float *restri
                             float m_factor, float v_factor, float epsilon,
                             float decay, float wd_factor);
 
+double spingalett_vec_sumsq(const float *x, uint64_t n);
+float  spingalett_vec_l2norm(const float *x, uint64_t n);
 void spingalett_vec_scale(float *data, uint64_t n, float scale);
 void spingalett_vec_scaled_copy(float *restrict dst, const float *restrict src, uint64_t n, float alpha);
 void spingalett_vec_axpy(float *restrict y, const float *restrict x, uint64_t n, float alpha);

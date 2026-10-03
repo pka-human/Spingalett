@@ -174,6 +174,25 @@ static void accumulate_gradients(NeuralNetwork *net, float **deltas, float scale
     (void)mode;
 }
 
+/* Global-norm clipping for one sample without materializing its gradient: layer l's weight
+   gradient is the rank-1 product delta[l+1] (x) x[l], so its squared Frobenius norm is
+   |delta|^2 * |x|^2, and the bias gradient adds |delta|^2. Scaling the deltas scales both. */
+static void clip_sample_gradient(NeuralNetwork *net, float **deltas, float max_norm) {
+    double total_sq = 0.0;
+    for (uint32_t l = 0; l + 1 < net->layers; l++) {
+        double x_sq = spingalett_vec_sumsq(SPINGALETT_LAYER_PTR(net, l), net->topology[l]);
+        double d_sq = spingalett_vec_sumsq(deltas[l + 1], net->topology[l + 1]);
+        total_sq += d_sq * (x_sq + 1.0);
+    }
+
+    double norm = sqrt(total_sq);
+    if (isfinite(norm) && norm > (double)max_norm) {
+        float scale = (float)((double)max_norm / norm);
+        for (uint32_t l = 1; l < net->layers; l++)
+            spingalett_vec_scale(deltas[l], net->topology[l], scale);
+    }
+}
+
 /* Per-sample (online) update: the gradient of each weight row is the rank-1 product
    delta[j] * x, built chunk by chunk in an L1 buffer and fed straight into the optimizer
    kernel, so the full gradient matrix is never materialized. */
@@ -556,6 +575,8 @@ static float trainer_step(Trainer *t, uint32_t start, uint32_t count, bool need_
         compute_deltas(net, target, t->deltas, t->mode);
 
         if (online) {
+            if (args->max_grad_norm > 0.0f)
+                clip_sample_gradient(net, t->deltas, args->max_grad_norm);
             trainer_begin_step(t);
             apply_rank1_updates(net, &t->opt, t->deltas, t->mode);
         } else {

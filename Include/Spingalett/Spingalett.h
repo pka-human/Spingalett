@@ -171,7 +171,7 @@ typedef struct {
     float beta1;
     float beta2;
     float epsilon;
-    float max_grad_norm;
+    float max_grad_norm;            /* clip the global L2 norm of each step's gradient; 0 = off */
 
     bool reset_optimizer;
     size_t nan_check_interval;

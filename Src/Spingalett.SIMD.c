@@ -292,6 +292,41 @@ float spingalett_dot_product(const float *restrict a, const float *restrict b, u
 #endif
 }
 
+/* Sum of squares. Float lanes accumulate blocks of 4096 elements, block sums are added in
+   double, so the result stays accurate for parameter vectors of any size. */
+double spingalett_vec_sumsq(const float *x, uint64_t n) {
+    const uint64_t block = 4096u;
+    double total = 0.0;
+    for (uint64_t b = 0; b < n; b += block) {
+        uint64_t end = (n - b < block) ? n : b + block;
+        uint64_t i = b;
+        float sum = 0.0f;
+#if defined(__AVX__)
+        __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+        __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+        for (; i + 32u <= end; i += 32u) {
+            __m256 a0 = _mm256_loadu_ps(x + i),       a1 = _mm256_loadu_ps(x + i + 8u);
+            __m256 a2 = _mm256_loadu_ps(x + i + 16u), a3 = _mm256_loadu_ps(x + i + 24u);
+            s0 = FMADD256(a0, a0, s0); s1 = FMADD256(a1, a1, s1);
+            s2 = FMADD256(a2, a2, s2); s3 = FMADD256(a3, a3, s3);
+        }
+        for (; i + 8u <= end; i += 8u) {
+            __m256 a = _mm256_loadu_ps(x + i);
+            s0 = FMADD256(a, a, s0);
+        }
+        sum = hsum256_ps(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
+#endif
+        for (; i < end; i++)
+            sum += x[i] * x[i];
+        total += (double)sum;
+    }
+    return total;
+}
+
+float spingalett_vec_l2norm(const float *x, uint64_t n) {
+    return (float)sqrt(spingalett_vec_sumsq(x, n));
+}
+
 void spingalett_vec_scale(float *data, uint64_t n, float scale) {
     uint64_t i = 0;
 #if defined(__AVX__)
@@ -438,11 +473,12 @@ float spingalett_clip_grad_norm(NeuralNetwork *net, float max_norm) {
     if (max_norm <= 0.0f) return 0.0f;
 
     /* Gradients of all layers are contiguous, so the global norm covers two flat arrays. */
-    float total_sq = spingalett_dot_product(net->grad_weights, net->grad_weights, net->total_weights)
-                   + spingalett_dot_product(net->grad_biases, net->grad_biases, net->total_biases);
+    double total_sq = spingalett_vec_sumsq(net->grad_weights, net->total_weights)
+                    + spingalett_vec_sumsq(net->grad_biases, net->total_biases);
 
-    float grad_norm = sqrtf(total_sq);
-    if (grad_norm > max_norm) {
+    float grad_norm = (float)sqrt(total_sq);
+    /* A non-finite norm is left alone so the NaN check can report the divergence. */
+    if (isfinite(grad_norm) && grad_norm > max_norm) {
         float scale = max_norm / grad_norm;
         spingalett_vec_scale(net->grad_weights, net->total_weights, scale);
         spingalett_vec_scale(net->grad_biases, net->total_biases, scale);
