@@ -23,7 +23,7 @@ extern "C" {
 #  define SPINGALETT_API __attribute__((visibility("default")))
 #endif
 
-#define SPINGALETT_FORMAT_VERSION 1
+#define SPINGALETT_FORMAT_VERSION 2
 
 typedef enum {
     LOG_DEBUG,
@@ -133,6 +133,8 @@ typedef struct {
 
     uint64_t time_step;
     LossFunction loss_func;
+
+    float *dropout_rates;           /* per layer, applied to its outputs while training */
 } NeuralNetwork;
 
 typedef bool (*TrainCallback)(NeuralNetwork *net, size_t epoch, float current_error);
@@ -161,6 +163,8 @@ typedef struct {
     uint32_t neurons_amount;
     ActivationFunction act_func;
     WeightInitialization weight_initialization;
+    float dropout_rate;             /* [0, 1): inverted dropout on this layer's outputs during
+                                       training; ignored on the input and output layers */
 } LayerArgs;
 
 typedef struct {
@@ -233,6 +237,9 @@ SPINGALETT_API void spingalett_set_num_threads(unsigned n);
 
 SPINGALETT_API void spingalett_set_log_callback(LogCallback cb);
 SPINGALETT_API void spingalett_set_log_level(LogLevel level);
+
+/* Seeds the calling thread's generator (weight init, shuffling, dropout) for reproducible runs. */
+SPINGALETT_API void spingalett_seed(uint64_t seed);
 
 SPINGALETT_API void spingalett_set_verbose(bool enabled);
 SPINGALETT_API bool spingalett_get_verbose(void);

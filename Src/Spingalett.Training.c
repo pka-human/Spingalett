@@ -138,8 +138,10 @@ static void backproject(float *restrict out, const float *restrict W, const floa
 }
 
 /* Back-propagate one sample whose activations are in net->neurons. deltas[l] has
-   topology[l] entries; deltas[0] is never used. */
-static void compute_deltas(NeuralNetwork *net, const float *target, float **deltas, ComputeMode mode) {
+   topology[l] entries; deltas[0] is never used. dmask (or NULL) holds mask * f'(a) for
+   layers with dropout, laid out like net->neurons. */
+static void compute_deltas(NeuralNetwork *net, const float *target, float **deltas,
+                           const float *dmask, ComputeMode mode) {
     uint32_t last = net->layers - 1;
     output_delta(net->loss_func, net->act_func[last - 1],
                  SPINGALETT_LAYER_PTR(net, last), target, deltas[last], net->topology[last]);
@@ -147,8 +149,11 @@ static void compute_deltas(NeuralNetwork *net, const float *target, float **delt
     for (uint32_t l = last - 1; l > 0; l--) {
         backproject(deltas[l], SPINGALETT_WEIGHT_MTX_PTR(net, l), deltas[l + 1],
                     net->topology[l + 1], net->topology[l], mode);
-        apply_derivative_batch(deltas[l], SPINGALETT_LAYER_PTR(net, l),
-                               (uint64_t)net->topology[l], net->act_func[l - 1]);
+        if (dmask && net->dropout_rates[l] > 0.0f)
+            spingalett_vec_mul(deltas[l], dmask + net->neuron_offsets[l], (uint64_t)net->topology[l]);
+        else
+            apply_derivative_batch(deltas[l], SPINGALETT_LAYER_PTR(net, l),
+                                   (uint64_t)net->topology[l], net->act_func[l - 1]);
     }
 }
 
@@ -239,7 +244,9 @@ static void apply_rank1_updates(NeuralNetwork *net, const OptimizerStep *o, floa
 typedef struct {
     float **act;        /* act[0]: the batch inputs; act[l]: [capacity x topology[l]] */
     float **delta;      /* delta[l] for l >= 1 */
+    float **dmask;      /* dropout mask * f'(a) for hidden layers with dropout, else NULL */
     float *flat;        /* backing storage for act[1..] and delta[1..] */
+    float *dmask_flat;
     float *inputs;      /* gather buffer for mini-batches (NULL for full batch) */
     float *targets;     /* gather buffer for mini-batches (NULL for full batch) */
     float *ones;
@@ -249,6 +256,8 @@ typedef struct {
 static void batch_workspace_free(BatchWorkspace *ws) {
     if (!ws) return;
     spingalett_aligned_free(ws->flat);
+    spingalett_aligned_free(ws->dmask_flat);
+    free(ws->dmask);
     spingalett_aligned_free(ws->inputs);
     spingalett_aligned_free(ws->targets);
     spingalett_aligned_free(ws->ones);
@@ -264,19 +273,34 @@ static BatchWorkspace *batch_workspace_create(const NeuralNetwork *net, uint32_t
     ws->capacity = max_batch;
     ws->act   = (float **)calloc(net->layers, sizeof(float *));
     ws->delta = (float **)calloc(net->layers, sizeof(float *));
+    ws->dmask = (float **)calloc(net->layers, sizeof(float *));
 
-    size_t per_layer_total = 0;
-    for (uint32_t l = 1; l < net->layers; l++)
+    size_t per_layer_total = 0, dropout_total = 0;
+    for (uint32_t l = 1; l < net->layers; l++) {
         per_layer_total += (size_t)max_batch * (size_t)net->topology[l];
+        if (l + 1 < net->layers && net->dropout_rates[l] > 0.0f)
+            dropout_total += (size_t)max_batch * (size_t)net->topology[l];
+    }
 
     ws->flat = (float *)spingalett_aligned_calloc(2 * per_layer_total, sizeof(float));
+    if (dropout_total > 0) {
+        ws->dmask_flat = (float *)spingalett_aligned_alloc(dropout_total * sizeof(float));
+        if (!ws->dmask_flat) { batch_workspace_free(ws); return NULL; }
+        size_t doff = 0;
+        for (uint32_t l = 1; l + 1 < net->layers; l++) {
+            if (net->dropout_rates[l] > 0.0f) {
+                ws->dmask[l] = ws->dmask_flat + doff;
+                doff += (size_t)max_batch * (size_t)net->topology[l];
+            }
+        }
+    }
     ws->ones = (float *)spingalett_aligned_alloc((size_t)max_batch * sizeof(float));
     if (gather) {
         ws->inputs  = (float *)spingalett_aligned_alloc((size_t)max_batch * net->topology[0] * sizeof(float));
         ws->targets = (float *)spingalett_aligned_alloc((size_t)max_batch * net->topology[net->layers - 1] * sizeof(float));
     }
 
-    if (!ws->act || !ws->delta || !ws->flat || !ws->ones || (gather && (!ws->inputs || !ws->targets))) {
+    if (!ws->act || !ws->delta || !ws->dmask || !ws->flat || !ws->ones || (gather && (!ws->inputs || !ws->targets))) {
         batch_workspace_free(ws);
         return NULL;
     }
@@ -296,7 +320,7 @@ static BatchWorkspace *batch_workspace_create(const NeuralNetwork *net, uint32_t
     return ws;
 }
 
-static void batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N) {
+static void batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout) {
     for (uint32_t l = 1; l < net->layers; l++) {
         uint32_t prev_size = net->topology[l - 1];
         uint32_t curr_size = net->topology[l];
@@ -321,6 +345,14 @@ static void batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N) {
                 apply_softmax(C + (size_t)s * curr_size, curr_size);
         } else {
             apply_activation_bulk(C, (uint64_t)N * (uint64_t)curr_size, act);
+        }
+
+        if (dropout && ws->dmask[l]) {
+            for (uint32_t s = 0; s < N; s++) {
+                size_t off = (size_t)s * curr_size;
+                spingalett_dropout_apply(C + off, ws->dmask[l] + off, curr_size, act,
+                                         net->dropout_rates[l], dropout, l, s);
+            }
         }
     }
 }
@@ -347,7 +379,10 @@ static void batch_compute_deltas(NeuralNetwork *net, BatchWorkspace *ws, const f
                     0.0f,
                     ws->delta[l], (int)cur_sz);
 
-        apply_derivative_batch(ws->delta[l], ws->act[l], (uint64_t)N * (uint64_t)cur_sz, net->act_func[l - 1]);
+        if (ws->dmask[l])
+            spingalett_vec_mul(ws->delta[l], ws->dmask[l], (uint64_t)N * (uint64_t)cur_sz);
+        else
+            apply_derivative_batch(ws->delta[l], ws->act[l], (uint64_t)N * (uint64_t)cur_sz, net->act_func[l - 1]);
     }
 }
 
@@ -495,6 +530,9 @@ typedef struct {
 
     float **deltas;             /* per-sample path */
     float *deltas_flat;
+
+    bool use_dropout;
+    DropoutContext dropout;     /* dropout.dmask: per-sample path buffer */
 #if defined(SPINGALETT_HAS_OPENBLAS)
     BatchWorkspace *ws;         /* BLAS batch path */
 #endif
@@ -504,6 +542,7 @@ static void trainer_free(Trainer *t) {
     free(t->order);
     free(t->deltas);
     spingalett_aligned_free(t->deltas_flat);
+    spingalett_aligned_free(t->dropout.dmask);
 #if defined(SPINGALETT_HAS_OPENBLAS)
     batch_workspace_free(t->ws);
 #endif
@@ -530,6 +569,10 @@ static bool trainer_alloc(Trainer *t) {
     t->deltas = (float **)calloc(net->layers, sizeof(float *));
     t->deltas_flat = (float *)spingalett_aligned_calloc(net->total_neurons, sizeof(float));
     if (!t->deltas || !t->deltas_flat) return false;
+    if (t->use_dropout) {
+        t->dropout.dmask = (float *)spingalett_aligned_calloc(net->total_neurons, sizeof(float));
+        if (!t->dropout.dmask) return false;
+    }
     for (uint32_t l = 0; l < net->layers; l++)
         t->deltas[l] = t->deltas_flat + net->neuron_offsets[l];
     return true;
@@ -570,7 +613,8 @@ static float trainer_step(Trainer *t, uint32_t start, uint32_t count, bool need_
             targets = args->targets + (size_t)start * out_sz;
         }
 
-        batch_forward(net, ws, count);
+        t->dropout.step = net->time_step;
+        batch_forward(net, ws, count, t->use_dropout ? &t->dropout : NULL);
         if (need_loss)
             loss = batch_compute_loss(net, ws, targets, count);
         batch_compute_deltas(net, ws, targets, count);
@@ -585,15 +629,21 @@ static float trainer_step(Trainer *t, uint32_t start, uint32_t count, bool need_
     bool online = (args->training_strategy == STRATEGY_SAMPLE);
     float scale = 1.0f / (float)count;
 
+    const DropoutContext *dropout = t->use_dropout ? &t->dropout : NULL;
+
     for (uint32_t s = 0; s < count; s++) {
         uint32_t idx = t->order ? t->order[start + s] : start + s;
         const float *target = args->targets + (size_t)idx * out_sz;
-        const float *out = spingalett_forward_pass(net, args->inputs + (size_t)idx * in_sz, t->mode);
+
+        /* Online steps hold one sample each, so its position within the step is 0. */
+        t->dropout.step = net->time_step;
+        t->dropout.position = online ? 0 : s;
+        const float *out = spingalett_forward_pass(net, args->inputs + (size_t)idx * in_sz, t->mode, dropout);
 
         if (need_loss)
             loss += compute_sample_loss(out, target, out_sz, net->loss_func, out_act);
 
-        compute_deltas(net, target, t->deltas, t->mode);
+        compute_deltas(net, target, t->deltas, dropout ? t->dropout.dmask : NULL, t->mode);
 
         if (online) {
             if (args->max_grad_norm > 0.0f)
@@ -745,6 +795,13 @@ void train_struct_arguments(TrainArgs args) {
 #if defined(SPINGALETT_HAS_OPENBLAS)
     t.use_blas_batch = (effective_mode == COMPUTE_OPENBLAS && training_strategy != STRATEGY_SAMPLE);
 #endif
+
+    if (net->dropout_rates[net->layers - 1] > 0.0f)
+        spingalett_log(LOG_WARNING, "Dropout is not applied to the output layer; ignoring rate %g",
+                       (double)net->dropout_rates[net->layers - 1]);
+    t.use_dropout = spingalett_has_dropout(net);
+    if (t.use_dropout)
+        t.dropout.seed = rng_next64();
 
     if (!trainer_alloc(&t)) {
         trainer_free(&t);

@@ -33,8 +33,24 @@ static inline bool spingalett_use_omp(ComputeMode mode, uint64_t work) {
 
 void set_error(int code, const char *msg);
 
+/* Training-time dropout state. Masks are a hash of (seed, step, position, layer, unit), so every
+   backend and thread count draws identical masks for the same sample. */
+typedef struct {
+    uint64_t seed;          /* drawn once per train() call */
+    uint64_t step;          /* optimizer step the sample belongs to */
+    uint32_t position;      /* sample index within that step */
+    float   *dmask;         /* per-unit mask * f'(a), laid out like net->neurons */
+} DropoutContext;
+
 bool spingalett_add_layer(LayerArgs args);
-float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode);
+bool spingalett_has_dropout(const NeuralNetwork *net);
+/* dropout == NULL: inference. Otherwise hidden layers with a dropout rate are masked. */
+float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,
+                               const DropoutContext *dropout);
+/* Masks n activations y (outputs of activation act) in place and stores mask * f'(a) in dmask. */
+void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t n,
+                              ActivationFunction act, float rate,
+                              const DropoutContext *ctx, uint32_t layer, uint32_t position);
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
 
@@ -49,6 +65,7 @@ void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total,
 
 void     rng_seed(uint64_t seed);
 uint32_t rng_next(void);
+uint64_t rng_next64(void);
 float    rng_next_float(void);
 
 float random_uniform_weight(void);
@@ -71,6 +88,7 @@ void spingalett_adam_update(float *restrict W, float *restrict mW, float *restri
 double spingalett_vec_sumsq(const float *x, uint64_t n);
 float  spingalett_vec_l2norm(const float *x, uint64_t n);
 void spingalett_vec_scale(float *data, uint64_t n, float scale);
+void spingalett_vec_mul(float *restrict y, const float *restrict x, uint64_t n);
 void spingalett_vec_scaled_copy(float *restrict dst, const float *restrict src, uint64_t n, float alpha);
 void spingalett_vec_axpy(float *restrict y, const float *restrict x, uint64_t n, float alpha);
 

@@ -338,6 +338,51 @@ void spingalett_vec_scale(float *data, uint64_t n, float scale) {
         data[i] *= scale;
 }
 
+void spingalett_vec_mul(float *restrict y, const float *restrict x, uint64_t n) {
+    uint64_t i = 0;
+#if defined(__AVX__)
+    for (; i + 8u <= n; i += 8u)
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(x + i)));
+#endif
+    for (; i < n; i++)
+        y[i] *= x[i];
+}
+
+/* lowbias32 (Wellons): a fast 32-bit bijective hash with good avalanche. */
+static inline uint32_t hash32(uint32_t x) {
+    x ^= x >> 16; x *= 0x7FEB352Du;
+    x ^= x >> 15; x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static inline uint64_t mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t n,
+                              ActivationFunction act, float rate,
+                              const DropoutContext *ctx, uint32_t layer, uint32_t position) {
+    /* Unit j is kept when hash(base + j * golden) >= rate * 2^32. */
+    uint32_t base = (uint32_t)(mix64(ctx->seed ^ mix64(ctx->step * 0x9E3779B97F4A7C15ull +
+                                     ((uint64_t)position << 20) + layer)) >> 32);
+    uint32_t threshold = (uint32_t)((double)rate * 4294967296.0);
+    float scale = 1.0f / (1.0f - rate);
+
+    float m[256];
+    for (uint32_t k0 = 0; k0 < n; k0 += 256u) {
+        uint32_t len = (n - k0 < 256u) ? n - k0 : 256u;
+        for (uint32_t j = 0; j < len; j++)
+            m[j] = hash32(base + (k0 + j) * 0x9E3779B9u) >= threshold ? scale : 0.0f;
+        /* The derivative is taken from the unmasked activation, then both are masked. */
+        memcpy(dmask + k0, m, len * sizeof(float));
+        apply_derivative_batch(dmask + k0, y + k0, (uint64_t)len, act);
+        spingalett_vec_mul(y + k0, m, (uint64_t)len);
+    }
+}
+
 void spingalett_vec_scaled_copy(float *restrict dst, const float *restrict src, uint64_t n, float alpha) {
     uint64_t i = 0;
 #if defined(__AVX__)

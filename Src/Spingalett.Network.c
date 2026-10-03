@@ -49,9 +49,15 @@ bool spingalett_add_layer(LayerArgs args) {
     uint32_t neurons_amount = args.neurons_amount;
     ActivationFunction act_func = args.act_func;
     WeightInitialization wi = args.weight_initialization;
+    float dropout_rate = args.dropout_rate;
 
     if (!net || neurons_amount == 0) {
         set_error(SPINGALETT_ERR_INVALID, "Net is NULL or neurons amount is 0");
+        return false;
+    }
+
+    if (!(dropout_rate >= 0.0f && dropout_rate < 1.0f)) {
+        set_error(SPINGALETT_ERR_INVALID, "Dropout rate must be in [0, 1)");
         return false;
     }
 
@@ -59,6 +65,10 @@ bool spingalett_add_layer(LayerArgs args) {
 
     if (nl == 1) {
         spingalett_log(LOG_INFO, "Layer #0: Neurons amount: %u", neurons_amount);
+        if (dropout_rate > 0.0f) {
+            spingalett_log(LOG_WARNING, "Dropout is not applied to the input layer; ignoring rate %g", (double)dropout_rate);
+            dropout_rate = 0.0f;
+        }
     } else {
         if ((unsigned)act_func >= ACT_COUNT) {
             set_error(SPINGALETT_ERR_INVALID, "Invalid activation function");
@@ -68,8 +78,12 @@ bool spingalett_add_layer(LayerArgs args) {
             set_error(SPINGALETT_ERR_INVALID, "Invalid weight initialization");
             return false;
         }
-        spingalett_log(LOG_INFO, "Layer #%u: Neurons amount: %u, Activation function: %s, Weight initialization: %s",
-            nl - 1, neurons_amount, act_func_names[act_func], weight_initialization_names[wi]);
+        if (dropout_rate > 0.0f)
+            spingalett_log(LOG_INFO, "Layer #%u: Neurons amount: %u, Activation function: %s, Weight initialization: %s, Dropout: %g",
+                nl - 1, neurons_amount, act_func_names[act_func], weight_initialization_names[wi], (double)dropout_rate);
+        else
+            spingalett_log(LOG_INFO, "Layer #%u: Neurons amount: %u, Activation function: %s, Weight initialization: %s",
+                nl - 1, neurons_amount, act_func_names[act_func], weight_initialization_names[wi]);
     }
 
     uint32_t prev_neurons = (net->layers > 0) ? net->topology[net->layers - 1] : 0;
@@ -85,6 +99,7 @@ bool spingalett_add_layer(LayerArgs args) {
     uint64_t           *t_woff    = (uint64_t *)           calloc(nl, sizeof(uint64_t));
     uint64_t           *t_boff    = (uint64_t *)           calloc(nl, sizeof(uint64_t));
     float              *t_neurons = (float *)              spingalett_aligned_calloc(new_tn, sizeof(float));
+    float              *t_drop    = (float *)              malloc(nl * sizeof(float));
 
     ActivationFunction *t_act     = NULL;
     float *t_w = NULL, *t_b = NULL;
@@ -104,12 +119,12 @@ bool spingalett_add_layer(LayerArgs args) {
         t_vb  = (float *)spingalett_aligned_calloc(new_tb, sizeof(float));
     }
 
-    bool ok = t_topo && t_noff && t_woff && t_boff && t_neurons;
+    bool ok = t_topo && t_noff && t_woff && t_boff && t_neurons && t_drop;
     if (nl > 1)
         ok = ok && t_act && t_w && t_b && t_gw && t_gb && t_mw && t_mb && t_vw && t_vb;
 
     if (!ok) {
-        free(t_topo); free(t_noff); free(t_woff); free(t_boff);
+        free(t_topo); free(t_noff); free(t_woff); free(t_boff); free(t_drop);
         spingalett_aligned_free(t_neurons);
         if (nl > 1) {
             free(t_act);
@@ -125,6 +140,10 @@ bool spingalett_add_layer(LayerArgs args) {
     if (net->layers > 0)
         memcpy(t_topo, net->topology, net->layers * sizeof(uint32_t));
     t_topo[net->layers] = neurons_amount;
+
+    if (net->layers > 0)
+        memcpy(t_drop, net->dropout_rates, net->layers * sizeof(float));
+    t_drop[net->layers] = dropout_rate;
 
     if (net->total_neurons > 0)
         memcpy(t_neurons, net->neurons, net->total_neurons * sizeof(float));
@@ -164,6 +183,7 @@ bool spingalett_add_layer(LayerArgs args) {
 
     free(net->topology);
     free(net->act_func);
+    free(net->dropout_rates);
     free(net->neuron_offsets);
     free(net->weight_offsets);
     free(net->bias_offsets);
@@ -180,6 +200,7 @@ bool spingalett_add_layer(LayerArgs args) {
     net->layers         = nl;
     net->topology       = t_topo;
     net->act_func       = t_act;
+    net->dropout_rates  = t_drop;
     net->neuron_offsets  = t_noff;
     net->weight_offsets  = t_woff;
     net->bias_offsets    = t_boff;
@@ -204,7 +225,14 @@ void layer_struct_arguments(LayerArgs args) {
     (void)spingalett_add_layer(args);
 }
 
-float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode) {
+bool spingalett_has_dropout(const NeuralNetwork *net) {
+    for (uint32_t l = 1; l + 1 < net->layers; l++)
+        if (net->dropout_rates[l] > 0.0f) return true;
+    return false;
+}
+
+float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,
+                               const DropoutContext *dropout) {
     memcpy(SPINGALETT_LAYER_PTR(net, 0), input, net->topology[0] * sizeof(float));
 
     for (uint32_t l = 1; l < net->layers; l++) {
@@ -234,6 +262,11 @@ float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMo
         }
 
         apply_activation_batch(y, curr_size, net->act_func[l - 1]);
+
+        if (dropout && l + 1 < net->layers && net->dropout_rates[l] > 0.0f)
+            spingalett_dropout_apply(y, dropout->dmask + net->neuron_offsets[l], curr_size,
+                                     net->act_func[l - 1], net->dropout_rates[l],
+                                     dropout, l, dropout->position);
     }
     (void)mode;
 
@@ -254,7 +287,7 @@ float *forward_struct_arguments(ForwardArgs args) {
         return NULL;
     }
 
-    return spingalett_forward_pass(net, input, resolve_compute_mode());
+    return spingalett_forward_pass(net, input, resolve_compute_mode(), NULL);
 }
 
 void print_parameters(NeuralNetwork *net) {
@@ -268,10 +301,10 @@ void print_parameters(NeuralNetwork *net) {
     for (uint32_t i = 0; i < net->layers - 1; i++) {
         uint32_t from_layer = i;
         uint32_t to_layer = i + 1;
-        spingalett_log(LOG_INFO, "[Connection: Layer %u (%u neurons) -> Layer %u (%u neurons), activation function: %s]",
+        spingalett_log(LOG_INFO, "[Connection: Layer %u (%u neurons) -> Layer %u (%u neurons), activation function: %s, dropout: %g]",
             from_layer, net->topology[from_layer],
             to_layer, net->topology[to_layer],
-            act_func_names[net->act_func[i]]);
+            act_func_names[net->act_func[i]], (double)net->dropout_rates[to_layer]);
         spingalett_log(LOG_INFO, "  Biases (Thresholds) for Layer %u:", to_layer);
         for (uint32_t k = 0; k < net->topology[to_layer]; k++) {
             spingalett_log(LOG_INFO, "    Neuron %u bias: %12.6g", k, (double)SPINGALETT_BIAS(net, i, k));
@@ -307,6 +340,7 @@ void free_network(NeuralNetwork *net) {
     free(net->bias_offsets);
     free(net->topology);
     free(net->act_func);
+    free(net->dropout_rates);
     free(net);
     spingalett_log(LOG_DEBUG, "Memory freed.");
 }

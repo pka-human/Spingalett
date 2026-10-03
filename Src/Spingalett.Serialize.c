@@ -378,6 +378,10 @@ void save_spingalett_struct_arguments(SaveArgs args) {
         if (fwrite(&act, sizeof(uint8_t), 1, fp) != 1) write_ok = false;
     }
 
+    /* v2: dropout rate of every non-input layer */
+    if (write_ok && fwrite(net->dropout_rates + 1, sizeof(float), net->layers - 1, fp) != net->layers - 1)
+        write_ok = false;
+
     if (!write_ok) {
         set_error(SPINGALETT_ERR_INVALID, "save: failed to write header");
         spingalett_log(LOG_ERROR, "Failed to write file header to %s", target_filename);
@@ -449,9 +453,10 @@ NeuralNetwork *load_spingalett(const char *filename) {
         return NULL;
     }
 
-    if (format_version != SPINGALETT_FORMAT_VERSION) {
+    /* v1: no dropout section (read as rate 0). v2: per-layer dropout rates after the activations. */
+    if (format_version < 1 || format_version > SPINGALETT_FORMAT_VERSION) {
         set_error(SPINGALETT_ERR_INVALID, "load: unsupported format version");
-        spingalett_log(LOG_ERROR, "Unsupported file format version %u (expected %u)", (unsigned)format_version, (unsigned)SPINGALETT_FORMAT_VERSION);
+        spingalett_log(LOG_ERROR, "Unsupported file format version %u (supported: 1..%u)", (unsigned)format_version, (unsigned)SPINGALETT_FORMAT_VERSION);
         fclose(fp);
         return NULL;
     }
@@ -534,6 +539,28 @@ NeuralNetwork *load_spingalett(const char *filename) {
         act_func_array[i] = (ActivationFunction)act;
     }
 
+    float *dropout_array = (float *)calloc(layers, sizeof(float));
+    if (!dropout_array) {
+        set_error(SPINGALETT_ERR_ALLOC, "load: dropout array allocation failed");
+        free(topology);
+        free(act_func_array);
+        fclose(fp);
+        return NULL;
+    }
+    if (format_version >= 2) {
+        bool ok = fread(dropout_array + 1, sizeof(float), layers - 1, fp) == layers - 1;
+        for (uint32_t l = 1; ok && l < layers; l++)
+            ok = dropout_array[l] >= 0.0f && dropout_array[l] < 1.0f;
+        if (!ok) {
+            set_error(SPINGALETT_ERR_INVALID, "load: invalid dropout rates");
+            free(topology);
+            free(act_func_array);
+            free(dropout_array);
+            fclose(fp);
+            return NULL;
+        }
+    }
+
     uint64_t total_weights = 0;
     uint64_t total_biases = 0;
     for (uint32_t l = 0; l < layers - 1; l++) {
@@ -546,6 +573,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
         set_error(SPINGALETT_ERR_ALLOC, "load: network creation failed");
         free(topology);
         free(act_func_array);
+        free(dropout_array);
         fclose(fp);
         return NULL;
     }
@@ -558,10 +586,12 @@ NeuralNetwork *load_spingalett(const char *filename) {
         if (l > 0)
             largs.act_func = act_func_array[l - 1];
         largs.weight_initialization = WEIGHT_INITIALIZATION_NONE;
+        largs.dropout_rate = dropout_array[l];
 
         if (!spingalett_add_layer(largs)) {
             free(topology);
             free(act_func_array);
+            free(dropout_array);
             free_network(net);
             fclose(fp);
             return NULL;
@@ -569,6 +599,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
     }
 
     free(topology);
+    free(dropout_array);
 
     bool read_ok = true;
     for (uint32_t l = 0; l < net->layers - 1 && read_ok; l++) {
