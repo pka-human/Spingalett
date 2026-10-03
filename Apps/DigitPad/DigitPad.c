@@ -13,6 +13,9 @@
  * unless given on the command line or in $DIGITPAD_MODEL. The whole UI is rendered in software
  * into one framebuffer that SDL2 only presents, with glyphs from an embedded font atlas, so at
  * run time the program needs nothing beyond SDL2 and libspingalett.
+ *
+ * On Windows it is a GUI program: it opens no console of its own, but prints to the console it
+ * was started from (--help, --classify, --verbose).
  */
 
 #include "Digits.h"
@@ -21,6 +24,10 @@
 #include <Spingalett/Spingalett.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #define WIN_W 880
 #define WIN_H 584
@@ -350,6 +357,13 @@ static bool find_model(const char *arg, char *out, size_t size) {
     return found;
 }
 
+static const char *base_name(const char *path) {
+    const char *name = path;
+    for (const char *c = path; *c; c++)
+        if (*c == '/' || *c == '\\') name = c + 1;
+    return name;
+}
+
 static void read_model_info(const char *model) {
     char path[4200];
     snprintf(path, sizeof path, "%s.info", model);
@@ -357,8 +371,7 @@ static void read_model_info(const char *model) {
     if (f && fgets(model_info, sizeof model_info, f)) {
         model_info[strcspn(model_info, "\r\n")] = 0;
     } else {
-        const char *name = strrchr(model, '/');
-        snprintf(model_info, sizeof model_info, "model: %.200s", name ? name + 1 : model);
+        snprintf(model_info, sizeof model_info, "model: %.200s", base_name(model));
     }
     if (f) fclose(f);
 }
@@ -426,23 +439,40 @@ static int classify_file(NeuralNetwork *net, const char *path) {
 
 /* ---------------------------------------------------------------- main */
 
+static bool gui = true;              /* false for --classify: errors go to stderr only */
+
 static void fatal(const char *message) {
     fprintf(stderr, "DigitPad: %s\n", message);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DigitPad", message, NULL);
+    if (gui) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DigitPad", message, NULL);
 }
 
+#if defined(_WIN32)
+/* A GUI-subsystem program starts without standard streams unless its parent redirected them;
+ * when it was started from a console, write to that console. */
+static void attach_parent_console(void) {
+    if (GetStdHandle(STD_OUTPUT_HANDLE) || !AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    if (!freopen("CONOUT$", "w", stdout) || !freopen("CONOUT$", "w", stderr)) return;
+    printf("\n");                   /* the shell has already printed its next prompt */
+}
+#endif
+
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    attach_parent_console();
+#endif
     const char *model_arg = NULL, *classify_path = NULL;
     bool verbose = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--verbose")) verbose = true;
         else if (!strcmp(argv[i], "--classify") && i + 1 < argc) classify_path = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: %s [--verbose] [model.slett]\n       %s --classify image.pgm [model.slett]\n", argv[0], argv[0]);
+            const char *self = base_name(argv[0]);
+            printf("usage: %s [--verbose] [model.slett]\n       %s --classify image.pgm [model.slett]\n", self, self);
             return 0;
         } else model_arg = argv[i];
     }
 
+    gui = classify_path == NULL;
     spingalett_set_verbose(false);
     char model_path[4096];
     bool found = find_model(model_arg, model_path, sizeof model_path);
@@ -464,9 +494,11 @@ int main(int argc, char **argv) {
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fatal(SDL_GetError()); free_network(net); return 1; }
 
+    /* double the window on tall screens; the usable bounds are in window coordinates on every
+     * platform (Windows reports scaled values to programs that are not DPI-aware) */
     int scale = 1;
-    SDL_DisplayMode mode;
-    if (SDL_GetDesktopDisplayMode(0, &mode) == 0 && mode.h >= 2 * WIN_H + 400) scale = 2;
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.h >= 2 * WIN_H + 300) scale = 2;
     SDL_Window *window = SDL_CreateWindow("DigitPad - Spingalett", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                           WIN_W * scale, WIN_H * scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : NULL;
