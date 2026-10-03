@@ -9,19 +9,19 @@
 
 void apply_softmax(float *layer, uint32_t size) {
     float max_val = -FLT_MAX;
-    for (uint16_t i = 0; i < size; i++) {
+    for (uint32_t i = 0; i < size; i++) {
         if (layer[i] > max_val) max_val = layer[i];
     }
 
     float sum = 0.0f;
-    for (uint16_t i = 0; i < size; i++) {
+    for (uint32_t i = 0; i < size; i++) {
         layer[i] = expf(layer[i] - max_val);
         sum += layer[i];
     }
 
     if (sum > 0.0f) {
         float inv = 1.0f / sum;
-        for (uint16_t i = 0; i < size; i++) layer[i] *= inv;
+        for (uint32_t i = 0; i < size; i++) layer[i] *= inv;
     }
 }
 

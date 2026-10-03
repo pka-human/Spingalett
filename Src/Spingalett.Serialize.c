@@ -13,33 +13,32 @@ static uint16_t float_to_fp16(float x) {
     uint32_t f;
     memcpy(&f, &x, sizeof(float));
 
-    uint32_t sign  = (f >> 16) & 0x8000u;
-    uint32_t f_exp = (f >> 23) & 0xFFu;
-    uint32_t f_man = f & 0x007FFFFFu;
+    uint16_t sign = (uint16_t)((f >> 16) & 0x8000u);
+    uint32_t absf = f & 0x7FFFFFFFu;
 
-    if (f_exp == 0)
-        return (uint16_t)sign;
-
-    if (f_exp == 255) {
-        if (f_man == 0) return (uint16_t)(sign | 0x7C00u);
-        return (uint16_t)(sign | 0x7E00u);
-    }
-
-    int32_t exp = (int32_t)f_exp - 127;
-
-    if (exp > 15)
+    if (absf >= 0x7F800000u)                     /* Inf / NaN */
+        return (uint16_t)(sign | (absf > 0x7F800000u ? 0x7E00u : 0x7C00u));
+    if (absf >= 0x477FF000u)                     /* >= 65520 rounds to Inf */
         return (uint16_t)(sign | 0x7C00u);
 
-    if (exp < -24)
-        return (uint16_t)sign;
-
-    if (exp < -14) {
-        uint32_t full = 0x00800000u | f_man;
-        int32_t shift = -1 - exp;
-        return (uint16_t)(sign | (uint16_t)(full >> shift));
+    if (absf < 0x38800000u) {                    /* below 2^-14: FP16 subnormal or zero */
+        if (absf < 0x33000000u)                  /* below 2^-25 rounds to zero */
+            return sign;
+        uint32_t shift = 126u - (absf >> 23);    /* 14..24 */
+        uint32_t man   = (absf & 0x007FFFFFu) | 0x00800000u;
+        uint32_t h     = man >> shift;
+        uint32_t rem   = man & ((1u << shift) - 1u);
+        uint32_t half  = 1u << (shift - 1u);
+        if (rem > half || (rem == half && (h & 1u))) h++;
+        return (uint16_t)(sign | h);
     }
 
-    return (uint16_t)(sign | ((uint32_t)(exp + 15) << 10) | (f_man >> 13));
+    /* Normal: rebias the exponent, round the dropped 13 mantissa bits to nearest-even.
+       A carry out of the mantissa correctly bumps the exponent. */
+    uint32_t h   = (absf - 0x38000000u) >> 13;
+    uint32_t rem = absf & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+    return (uint16_t)(sign | h);
 }
 
 static float fp16_to_float(uint16_t h) {
@@ -74,6 +73,9 @@ static float fp16_to_float(uint16_t h) {
 static uint16_t float_to_bf16(float x) {
     uint32_t f;
     memcpy(&f, &x, sizeof(float));
+    if ((f & 0x7FFFFFFFu) > 0x7F800000u)         /* NaN: keep it a (quiet) NaN */
+        return (uint16_t)((f >> 16) | 0x0040u);
+    f += 0x7FFFu + ((f >> 16) & 1u);             /* round to nearest-even */
     return (uint16_t)(f >> 16);
 }
 
@@ -84,7 +86,7 @@ static float bf16_to_float(uint16_t h) {
     return x;
 }
 
-static bool write_array_compressed(float *data, uint32_t size, PrecisionMode precision, FILE *fp) {
+static bool write_array_compressed(const float *data, uint64_t size, PrecisionMode precision, FILE *fp) {
     if (precision == PRECISION_FLOAT32) {
         return fwrite(data, sizeof(float), size, fp) == size;
     }
@@ -92,7 +94,7 @@ static bool write_array_compressed(float *data, uint32_t size, PrecisionMode pre
     if (precision == PRECISION_FP16) {
         uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "FP16 write buffer allocation failed"); return false; }
-        for (uint32_t i = 0; i < size; i++) buf[i] = float_to_fp16(data[i]);
+        for (uint64_t i = 0; i < size; i++) buf[i] = float_to_fp16(data[i]);
         bool ok = fwrite(buf, sizeof(uint16_t), size, fp) == size;
         free(buf);
         return ok;
@@ -101,7 +103,7 @@ static bool write_array_compressed(float *data, uint32_t size, PrecisionMode pre
     if (precision == PRECISION_BFLOAT16) {
         uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "BF16 write buffer allocation failed"); return false; }
-        for (uint32_t i = 0; i < size; i++) buf[i] = float_to_bf16(data[i]);
+        for (uint64_t i = 0; i < size; i++) buf[i] = float_to_bf16(data[i]);
         bool ok = fwrite(buf, sizeof(uint16_t), size, fp) == size;
         free(buf);
         return ok;
@@ -109,7 +111,7 @@ static bool write_array_compressed(float *data, uint32_t size, PrecisionMode pre
 
     if (precision == PRECISION_INT8) {
         float max_val = 0.0f;
-        for (uint32_t i = 0; i < size; i++) {
+        for (uint64_t i = 0; i < size; i++) {
             float a = fabsf(data[i]);
             if (a > max_val) max_val = a;
         }
@@ -118,7 +120,7 @@ static bool write_array_compressed(float *data, uint32_t size, PrecisionMode pre
         int8_t *buf = (int8_t *)calloc(size, sizeof(int8_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT8 write buffer allocation failed"); return false; }
         if (max_val > 0.0f) {
-            for (uint32_t i = 0; i < size; i++)
+            for (uint64_t i = 0; i < size; i++)
                 buf[i] = (int8_t)roundf((data[i] / max_val) * 127.0f);
         }
         bool ok = fwrite(buf, sizeof(int8_t), size, fp) == size;
@@ -128,24 +130,24 @@ static bool write_array_compressed(float *data, uint32_t size, PrecisionMode pre
 
     if (precision == PRECISION_INT4) {
         float max_val = 0.0f;
-        for (uint32_t i = 0; i < size; i++) {
+        for (uint64_t i = 0; i < size; i++) {
             float a = fabsf(data[i]);
             if (a > max_val) max_val = a;
         }
         if (fwrite(&max_val, sizeof(float), 1, fp) != 1) return false;
 
-        uint32_t byte_count = (size + 1) / 2;
+        uint64_t byte_count = (size + 1) / 2;
         uint8_t *buf = (uint8_t *)calloc(byte_count, sizeof(uint8_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT4 write buffer allocation failed"); return false; }
 
         if (max_val > 0.0f) {
-            for (uint32_t i = 0; i < size; i++) {
+            for (uint64_t i = 0; i < size; i++) {
                 float scaled = (data[i] / max_val) * 7.0f;
                 int8_t q = (int8_t)roundf(scaled);
                 if (q > 7) q = 7;
                 if (q < -8) q = -8;
                 uint8_t uq = (uint8_t)(q & 0x0Fu);
-                uint32_t bi = i / 2;
+                uint64_t bi = i / 2;
                 if ((i & 1u) == 0u)
                     buf[bi] |= uq;
                 else
@@ -160,25 +162,25 @@ static bool write_array_compressed(float *data, uint32_t size, PrecisionMode pre
 
     if (precision == PRECISION_INT2) {
         float max_val = 0.0f;
-        for (uint32_t i = 0; i < size; i++) {
+        for (uint64_t i = 0; i < size; i++) {
             float a = fabsf(data[i]);
             if (a > max_val) max_val = a;
         }
         if (fwrite(&max_val, sizeof(float), 1, fp) != 1) return false;
 
-        uint32_t byte_count = (size + 3) / 4;
+        uint64_t byte_count = (size + 3) / 4;
         uint8_t *buf = (uint8_t *)calloc(byte_count, sizeof(uint8_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT2 write buffer allocation failed"); return false; }
 
         if (max_val > 0.0f) {
-            for (uint32_t i = 0; i < size; i++) {
+            for (uint64_t i = 0; i < size; i++) {
                 float scaled = data[i] / max_val;
                 int8_t q;
                 if (scaled > 0.5f) q = 1;
                 else if (scaled < -0.5f) q = -1;
                 else q = 0;
                 uint8_t uq = (uint8_t)((uint8_t)q & 0x03u);
-                uint32_t bi = i / 4;
+                uint64_t bi = i / 4;
                 uint8_t shift = (uint8_t)((i % 4) * 2u);
                 buf[bi] |= (uint8_t)(uq << shift);
             }
@@ -192,7 +194,7 @@ static bool write_array_compressed(float *data, uint32_t size, PrecisionMode pre
     return false;
 }
 
-static bool read_array_compressed(float *data, uint32_t size, PrecisionMode precision, FILE *fp) {
+static bool read_array_compressed(float *data, uint64_t size, PrecisionMode precision, FILE *fp) {
     if (precision == PRECISION_FLOAT32) {
         return fread(data, sizeof(float), size, fp) == size;
     }
@@ -202,7 +204,7 @@ static bool read_array_compressed(float *data, uint32_t size, PrecisionMode prec
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "FP16 read buffer allocation failed"); return false; }
         bool ok = fread(buf, sizeof(uint16_t), size, fp) == size;
         if (ok) {
-            for (uint32_t i = 0; i < size; i++) data[i] = fp16_to_float(buf[i]);
+            for (uint64_t i = 0; i < size; i++) data[i] = fp16_to_float(buf[i]);
         }
         free(buf);
         return ok;
@@ -213,7 +215,7 @@ static bool read_array_compressed(float *data, uint32_t size, PrecisionMode prec
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "BF16 read buffer allocation failed"); return false; }
         bool ok = fread(buf, sizeof(uint16_t), size, fp) == size;
         if (ok) {
-            for (uint32_t i = 0; i < size; i++) data[i] = bf16_to_float(buf[i]);
+            for (uint64_t i = 0; i < size; i++) data[i] = bf16_to_float(buf[i]);
         }
         free(buf);
         return ok;
@@ -229,7 +231,7 @@ static bool read_array_compressed(float *data, uint32_t size, PrecisionMode prec
 
         if (ok) {
             if (max_val > 0.0f) {
-                for (uint32_t i = 0; i < size; i++)
+                for (uint64_t i = 0; i < size; i++)
                     data[i] = ((float)buf[i] / 127.0f) * max_val;
             } else {
                 memset(data, 0, size * sizeof(float));
@@ -243,15 +245,15 @@ static bool read_array_compressed(float *data, uint32_t size, PrecisionMode prec
         float max_val = 0.0f;
         if (fread(&max_val, sizeof(float), 1, fp) != 1) return false;
 
-        uint32_t byte_count = (size + 1) / 2;
+        uint64_t byte_count = (size + 1) / 2;
         uint8_t *buf = (uint8_t *)malloc(byte_count * sizeof(uint8_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT4 read buffer allocation failed"); return false; }
         bool ok = fread(buf, sizeof(uint8_t), byte_count, fp) == byte_count;
 
         if (ok) {
             if (max_val > 0.0f) {
-                for (uint32_t i = 0; i < size; i++) {
-                    uint32_t bi = i / 2;
+                for (uint64_t i = 0; i < size; i++) {
+                    uint64_t bi = i / 2;
                     uint8_t packed = buf[bi];
                     uint8_t uq = ((i & 1u) == 0u) ? (packed & 0x0Fu) : (packed >> 4);
                     int8_t q = (uq & 0x08u) ? (int8_t)(uq | 0xF0u) : (int8_t)uq;
@@ -270,15 +272,15 @@ static bool read_array_compressed(float *data, uint32_t size, PrecisionMode prec
         float max_val = 0.0f;
         if (fread(&max_val, sizeof(float), 1, fp) != 1) return false;
 
-        uint32_t byte_count = (size + 3) / 4;
+        uint64_t byte_count = (size + 3) / 4;
         uint8_t *buf = (uint8_t *)malloc(byte_count * sizeof(uint8_t));
         if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT2 read buffer allocation failed"); return false; }
         bool ok = fread(buf, sizeof(uint8_t), byte_count, fp) == byte_count;
 
         if (ok) {
             if (max_val > 0.0f) {
-                for (uint32_t i = 0; i < size; i++) {
-                    uint32_t bi = i / 4;
+                for (uint64_t i = 0; i < size; i++) {
+                    uint64_t bi = i / 4;
                     uint8_t shift = (uint8_t)((i % 4) * 2u);
                     uint8_t uq = (buf[bi] >> shift) & 0x03u;
                     int8_t q = (uq & 0x02u) ? (int8_t)(uq | 0xFCu) : (int8_t)uq;
@@ -307,6 +309,11 @@ static const char *find_last_separator(const char *path) {
 void save_spingalett_struct_arguments(SaveArgs args) {
     if (!args.net || !args.filename) {
         set_error(SPINGALETT_ERR_INVALID, "save: net or filename is NULL");
+        return;
+    }
+
+    if (args.net->layers < 2) {
+        set_error(SPINGALETT_ERR_INVALID, "save: network must have at least 2 layers");
         return;
     }
 
@@ -387,7 +394,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
         uint32_t out_dim = net->topology[l + 1];
         uint64_t woff    = net->weight_offsets[l];
         uint64_t boff    = net->bias_offsets[l];
-        uint32_t wcount  = in_dim * out_dim;
+        uint64_t wcount  = (uint64_t)in_dim * (uint64_t)out_dim;
 
         total_weights += wcount;
         total_biases  += out_dim;
@@ -406,7 +413,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
         }
     }
 
-    fclose(fp);
+    if (fclose(fp) != 0) write_ok = false;
 
     if (!write_ok) {
         set_error(SPINGALETT_ERR_INVALID, "save: write error (disk full?)");
@@ -551,9 +558,8 @@ NeuralNetwork *load_spingalett(const char *filename) {
         if (l > 0)
             largs.act_func = act_func_array[l - 1];
         largs.weight_initialization = WEIGHT_INITIALIZATION_NONE;
-        layer_struct_arguments(largs);
 
-        if (spingalett_last_error_code() != SPINGALETT_OK) {
+        if (!spingalett_add_layer(largs)) {
             free(topology);
             free(act_func_array);
             free_network(net);
@@ -570,7 +576,7 @@ NeuralNetwork *load_spingalett(const char *filename) {
         uint32_t out_dim = net->topology[l + 1];
         uint64_t woff    = net->weight_offsets[l];
         uint64_t boff    = net->bias_offsets[l];
-        uint32_t wcount  = in_dim * out_dim;
+        uint64_t wcount  = (uint64_t)in_dim * (uint64_t)out_dim;
 
         read_ok = read_array_compressed(net->weights + woff, wcount, precision, fp);
 
@@ -595,7 +601,9 @@ NeuralNetwork *load_spingalett(const char *filename) {
 
     if (!read_ok) {
         set_error(SPINGALETT_ERR_INVALID, "load: file appears truncated or corrupt");
-        spingalett_log(LOG_WARNING, "Network file may be truncated: %s", filename);
+        spingalett_log(LOG_ERROR, "Network file is truncated or corrupt: %s", filename);
+        free_network(net);
+        return NULL;
     }
 
     spingalett_log(LOG_INFO, "Network loaded from %s", filename);

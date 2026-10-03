@@ -610,6 +610,14 @@ void train_struct_arguments(TrainArgs args) {
         return;
     }
 
+    if ((unsigned)training_mode >= MODE_COUNT ||
+        (unsigned)training_strategy >= STRATEGY_COUNT ||
+        (unsigned)args.optimizer_type >= OPTIMIZER_COUNT) {
+        set_error(SPINGALETT_ERR_INVALID, "Invalid training mode, strategy or optimizer");
+        spingalett_log(LOG_ERROR, "Invalid training mode, strategy or optimizer");
+        return;
+    }
+
     if (!net || sample_count == 0 || epochs == 0 || !inputs || !targets) {
         set_error(SPINGALETT_ERR_INVALID, "Invalid training arguments (NULL net/inputs/targets or zero count/epochs)");
         spingalett_log(LOG_ERROR, "Invalid training arguments");
@@ -689,8 +697,15 @@ void train_struct_arguments(TrainArgs args) {
     uint32_t output_node_count = net->topology[net->layers - 1];
     ActivationFunction output_act = net->act_func[net->layers - 2];
 
-    float beta1_pow = 1.0f;
-    float beta2_pow = 1.0f;
+    // Adam bias correction must continue from the persisted step count; restarting it at 1
+    // on every train() call (or after loading a checkpoint) inflates the first updates ~10x.
+    float beta1_pow = powf(args.beta1, (float)net->time_step);
+    float beta2_pow = powf(args.beta2, (float)net->time_step);
+
+    // The accumulating paths add into grad_* and expect it to start at zero; a previous run
+    // on another backend may have left the last batch's gradients there.
+    memset(net->grad_weights, 0, net->total_weights * sizeof(float));
+    memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
 
 #if defined(SPINGALETT_HAS_OPENBLAS)
     if (effective_mode == COMPUTE_OPENBLAS &&

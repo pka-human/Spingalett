@@ -26,6 +26,8 @@
 
 void set_error(int code, const char *msg);
 
+bool spingalett_add_layer(LayerArgs args);
+
 void spingalett_log(LogLevel level, const char *fmt, ...);
 
 void *spingalett_aligned_alloc(size_t size);

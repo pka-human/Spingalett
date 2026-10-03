@@ -24,7 +24,7 @@ ComputeMode spingalett_get_compute_mode(void) {
 }
 
 void spingalett_set_compute_mode(ComputeMode mode) {
-    if (mode < COMPUTE_COUNT)
+    if ((unsigned)mode < COMPUTE_COUNT)
         atomic_store(&s_compute_mode, mode);
 }
 
@@ -75,8 +75,16 @@ void spingalett_log(LogLevel level, const char *fmt, ...) {
     } else {
         FILE *out = (level >= LOG_WARNING) ? stderr : stdout;
         static const char *level_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "NONE"};
-        fprintf(out, "[%s] %s\n", level_names[level < LOG_NONE ? level : LOG_NONE], buf);
+        fprintf(out, "[%s] %s\n", level_names[(unsigned)level < LOG_NONE ? level : LOG_NONE], buf);
     }
+}
+
+static _Atomic bool s_fallback_warned[COMPUTE_COUNT];
+
+static ComputeMode fallback_to_single_threaded(ComputeMode requested, const char *name) {
+    if (!atomic_exchange(&s_fallback_warned[requested], true))
+        spingalett_log(LOG_WARNING, "%s requested but not available. Falling back to single-threaded.", name);
+    return COMPUTE_SINGLE_THREADED;
 }
 
 ComputeMode resolve_compute_mode(void) {
@@ -85,22 +93,19 @@ ComputeMode resolve_compute_mode(void) {
     switch (mode) {
         case COMPUTE_OPENMP:
 #if !defined(_OPENMP)
-            spingalett_log(LOG_WARNING, "OpenMP requested but not available. Falling back to single-threaded.");
-            return COMPUTE_SINGLE_THREADED;
+            return fallback_to_single_threaded(mode, "OpenMP");
 #else
             return mode;
 #endif
         case COMPUTE_OPENBLAS:
 #if !defined(SPINGALETT_HAS_OPENBLAS)
-            spingalett_log(LOG_WARNING, "OpenBLAS requested but not available. Falling back to single-threaded.");
-            return COMPUTE_SINGLE_THREADED;
+            return fallback_to_single_threaded(mode, "OpenBLAS");
 #else
             return mode;
 #endif
         case COMPUTE_CUDA:
 #if !defined(SPINGALETT_HAS_CUDA)
-            spingalett_log(LOG_WARNING, "CUDA requested but not available. Falling back to single-threaded.");
-            return COMPUTE_SINGLE_THREADED;
+            return fallback_to_single_threaded(mode, "CUDA");
 #else
             return mode;
 #endif

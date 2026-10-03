@@ -44,7 +44,7 @@ NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs args) {
     return net;
 }
 
-void layer_struct_arguments(LayerArgs args) {
+bool spingalett_add_layer(LayerArgs args) {
     NeuralNetwork *net = args.net;
     uint32_t neurons_amount = args.neurons_amount;
     ActivationFunction act_func = args.act_func;
@@ -52,7 +52,7 @@ void layer_struct_arguments(LayerArgs args) {
 
     if (!net || neurons_amount == 0) {
         set_error(SPINGALETT_ERR_INVALID, "Net is NULL or neurons amount is 0");
-        return;
+        return false;
     }
 
     uint32_t nl = net->layers + 1;
@@ -62,11 +62,11 @@ void layer_struct_arguments(LayerArgs args) {
     } else {
         if ((unsigned)act_func >= ACT_COUNT) {
             set_error(SPINGALETT_ERR_INVALID, "Invalid activation function");
-            return;
+            return false;
         }
         if ((unsigned)wi >= WEIGHT_INITIALIZATION_COUNT) {
             set_error(SPINGALETT_ERR_INVALID, "Invalid weight initialization");
-            return;
+            return false;
         }
         spingalett_log(LOG_INFO, "Layer #%u: Neurons amount: %u, Activation function: %s, Weight initialization: %s",
             nl - 1, neurons_amount, act_func_names[act_func], weight_initialization_names[wi]);
@@ -119,7 +119,7 @@ void layer_struct_arguments(LayerArgs args) {
             spingalett_aligned_free(t_vw); spingalett_aligned_free(t_vb);
         }
         set_error(SPINGALETT_ERR_ALLOC, "Layer allocation failed");
-        return;
+        return false;
     }
 
     if (net->layers > 0)
@@ -197,19 +197,29 @@ void layer_struct_arguments(LayerArgs args) {
     net->total_biases    = new_tb;
 
     compute_offsets(net);
+    return true;
+}
+
+void layer_struct_arguments(LayerArgs args) {
+    (void)spingalett_add_layer(args);
 }
 
 float *forward_struct_arguments(ForwardArgs args) {
     NeuralNetwork *net = args.net;
     const float *input = args.input;
-    ComputeMode mode = resolve_compute_mode();
 
-    if (!net || !input) return NULL;
+    if (!net || !input) {
+        set_error(SPINGALETT_ERR_INVALID, "forward: net or input is NULL");
+        return NULL;
+    }
 
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "Network must have at least 2 layers for forward pass");
         return NULL;
     }
+
+    ComputeMode mode = resolve_compute_mode();
+    (void)mode;
 
     uint32_t in_size = net->topology[0];
     float *layer0 = SPINGALETT_LAYER_PTR(net, 0);
@@ -251,6 +261,10 @@ float *forward_struct_arguments(ForwardArgs args) {
 }
 
 void print_parameters(NeuralNetwork *net) {
+    if (!net || net->layers < 2) {
+        set_error(SPINGALETT_ERR_INVALID, "print_parameters: network must have at least 2 layers");
+        return;
+    }
     spingalett_log(LOG_INFO, "========== DEBUG NETWORK PARAMETERS ==========");
     spingalett_log(LOG_INFO, "Loss Function: %s", loss_func_names[net->loss_func]);
 
