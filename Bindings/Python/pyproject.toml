@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spingalett"
-version = "0.4.1"
+version = "0.5.0"
 description = "Python (ctypes) bindings for the Spingalett C23 deep learning engine"
 readme = "README.md"
 license = {text = "MIT"}

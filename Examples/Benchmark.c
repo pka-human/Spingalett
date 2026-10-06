@@ -11,6 +11,9 @@
  *   mini-batch   1 epoch, batches of 64 (313 optimizer steps)
  *   inference    predict() over all samples
  *
+ * and then the network as a deployment model in every precision: the latency of one sample with
+ * spingalett_model_run (against forward()) and the throughput of spingalett_model_predict.
+ *
  * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workload in PyTorch.
  */
 
@@ -102,6 +105,59 @@ static void run_benchmark(const char *name, ComputeMode mode, const float *input
     printf("%-16s %14.0f %14.0f %14.0f\n", name, full, mini, infer);
 }
 
+/* Seconds per call of fn over the samples in turn, for about a third of a second. */
+static double latency(int (*fn)(void *ctx, const float *input), void *ctx, const float *inputs) {
+    uint32_t runs = 0;
+    double start = now(), elapsed;
+    do {
+        fn(ctx, inputs + (size_t)(runs % SAMPLES) * INPUT_SIZE);
+        runs++;
+    } while ((elapsed = now() - start) < 0.3);
+    return elapsed / runs;
+}
+
+static int run_forward(void *net, const float *input) {
+    return forward(.net = (NeuralNetwork *)net, .input = input) ? 0 : 1;
+}
+
+typedef struct { const SpingalettModel *model; void *workspace; float out[OUTPUT_SIZE]; } RunContext;
+
+static int run_model(void *ctx, const float *input) {
+    RunContext *c = (RunContext *)ctx;
+    return spingalett_model_run(c->model, input, c->out, c->workspace);
+}
+
+static void deployment_benchmark(const float *inputs) {
+    static const char *names[] = {"FLOAT32", "FP16", "BFLOAT16", "INT8", "INT4", "INT2"};
+    NeuralNetwork *net = create_network();
+    float *outputs = (float *)malloc((size_t)SAMPLES * OUTPUT_SIZE * sizeof(float));
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    printf("\n%-16s %14s %14s %14s\n", "deployment", "bytes", "one sample us", "batched/s");
+    printf("%-16s %14s %14.1f\n", "forward()", "", latency(run_forward, net, inputs) * 1e6);
+    for (int p = 0; p < PRECISION_COUNT; p++) {
+        SpingalettModel *model = spingalett_model_from_network(net, (PrecisionMode)p);
+        if (!model) continue;
+        RunContext ctx = {model, malloc(model->workspace_size), {0}};
+        double single = latency(run_model, &ctx, inputs);
+#if defined(SPINGALETT_HAS_OPENMP)
+        spingalett_set_compute_mode(COMPUTE_OPENMP);
+#endif
+        double batched = 0;
+        for (int rep = 0; rep < 3; rep++) {           /* best of three */
+            double start = now();
+            spingalett_model_predict(model, inputs, SAMPLES, outputs);
+            double rate = SAMPLES / (now() - start);
+            if (rate > batched) batched = rate;
+        }
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        printf("%-16s %14zu %14.1f %14.0f\n", names[p], model->image_size, single * 1e6, batched);
+        free(ctx.workspace);
+        spingalett_model_free(model);
+    }
+    free(outputs);
+    free_network(net);
+}
+
 int main(int argc, char **argv) {
     srand(42);
     spingalett_set_verbose(false);
@@ -129,6 +185,7 @@ int main(int argc, char **argv) {
 #if defined(SPINGALETT_HAS_OPENBLAS)
     run_benchmark("OpenBLAS", COMPUTE_OPENBLAS, inputs, targets);
 #endif
+    deployment_benchmark(inputs);
 
     free(inputs);
     free(targets);

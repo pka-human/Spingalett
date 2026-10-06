@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.4.1 LANGUAGES C)
+project(Spingalett VERSION 0.5.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -16,6 +16,15 @@ set(SPINGALETT_LIB_DIR ${CMAKE_SOURCE_DIR}/Lib CACHE PATH "Output directory for 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${SPINGALETT_BIN_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${SPINGALETT_BIN_DIR})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${SPINGALETT_LIB_DIR})
+
+# ------------------------------------------------------------------------------
+# Inference-only build: the engine of Spingalett.Inference.h and nothing else
+# ------------------------------------------------------------------------------
+option(SPINGALETT_INFERENCE_ONLY "Build only the inference engine: no training, file I/O, OpenMP or heap" OFF)
+if(SPINGALETT_INFERENCE_ONLY)
+    include(cmake/InferenceOnly.cmake)
+    return()
+endif()
 
 # ------------------------------------------------------------------------------
 # Feature flags (populated below, used for config header)
@@ -249,6 +258,14 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(spingalett PRIVATE m)
 endif()
 
+# The inference engine and batched model inference compute in IEEE order (no reassociation,
+# reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
+    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c
+        PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
+endif()
+
 if(NOT MSVC)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_result)
@@ -292,13 +309,15 @@ if(BUILD_EXAMPLE)
         endif()
     endforeach()
 
-    # DatasetTool is a utility rather than a demo: install it next to the library.
-    if(APPLE)
-        set_target_properties(DatasetTool PROPERTIES INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
-    elseif(UNIX)
-        set_target_properties(DatasetTool PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
-    endif()
-    install(TARGETS DatasetTool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # DatasetTool and ModelTool are utilities rather than demos: install them next to the library.
+    foreach(SPINGALETT_TOOL DatasetTool ModelTool)
+        if(APPLE)
+            set_target_properties(${SPINGALETT_TOOL} PROPERTIES INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+        elseif(UNIX)
+            set_target_properties(${SPINGALETT_TOOL} PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+        endif()
+        install(TARGETS ${SPINGALETT_TOOL} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endforeach()
 endif()
 
 # ------------------------------------------------------------------------------
@@ -353,6 +372,10 @@ if(BUILD_TESTS)
 
     add_executable(SpingalettTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Tests.c)
     target_link_libraries(SpingalettTests PRIVATE spingalett)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        # the deployment tests recompute the engine's arithmetic and compare it bit for bit
+        target_compile_options(SpingalettTests PRIVATE -ffp-contract=off)
+    endif()
     target_compile_definitions(SpingalettTests PRIVATE
         SPINGALETT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Tests/Data")
     if(UNIX AND NOT APPLE)
@@ -382,10 +405,15 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
-    foreach(group grad equiv cont optim sched dropout gen predict valid step data io xor)
+    foreach(group grad equiv cont optim sched dropout gen predict valid step data io model xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()
+
+    # The inference engine on its own, also running models exported as C headers.
+    include(cmake/SpingalettEngine.cmake)
+    spingalett_engine_library(SpingalettEngine)
+    spingalett_engine_tests(SpingalettEngine SpingalettTests)
 
     # A sanitizer-instrumented library cannot be loaded into an uninstrumented Python.
     find_package(Python3 COMPONENTS Interpreter QUIET)

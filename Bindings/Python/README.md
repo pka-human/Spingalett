@@ -47,6 +47,10 @@ with sg.Network(sg.Loss.CROSS_ENTROPY, [784, sg.Layer(128, sg.Activation.RELU, s
 
 with sg.Network.load("xor.slett") as net:
     print(net.topology, net.forward([1, 0]))
+    # deployment: a read-only INT8 model with integer kernels, and a C header for firmware
+    with net.to_model(sg.Precision.INT8) as model:
+        print(model.predict([1, 0]), model.layers, model.size)
+    net.export_c_header("xor_model.h", "xor_model", sg.Precision.INT8)
 ```
 
 | API | Notes |
@@ -63,8 +67,15 @@ with sg.Network.load("xor.slett") as net:
 | `CosineDecay`, `LinearWarmup`, `StepDecay`, `WarmupCosine` | built-in schedules; any `fn(epoch, total, initial_lr)` works too |
 | `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weight matrix `i` connects layer `i` to `i + 1`, shape `(out, in)` |
 | `save(path, precision, save_optimizer)`, `Network.load(path)` | `.slett` files, shared with the C API |
+| `to_bytes(precision, save_optimizer=False)`, `Network.from_bytes(data)` | the same files as `bytes` |
+| `to_model(precision=INT8)` | a `Model`: read-only, computes in its precision (integer kernels for INT8, INT4, INT2) |
+| `Model.load(path)`, `Model.from_bytes(data)`, `model.to_bytes()` | models from and to `.slett` files of any version |
+| `model.predict(x)` / `model(x)`, `model.evaluate(x, y)` | 1-D input -> vector, 2-D batch -> matrix; `Metrics(loss, accuracy)` |
+| `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision)` per layer; image and C workspace bytes |
+| `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
 
 Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bindings check on import
 that the library has the same major.minor version (`library_version()`), because they mirror its
-struct layouts. A `Network` is not thread-safe: use one per thread.
+struct layouts. A `Network` is not thread-safe: use one per thread. A `Model` is read-only and can
+be shared between threads.

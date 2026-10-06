@@ -38,11 +38,12 @@ from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
+    "Model", "LayerInfo",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
@@ -359,6 +360,32 @@ class _SaveArgs(Structure):
     ]
 
 
+class _Model(Structure):
+    _fields_ = [
+        ("input_size", c_uint32),
+        ("output_size", c_uint32),
+        ("layer_count", c_uint32),
+        ("loss", c_int),
+        ("workspace_size", c_size_t),
+        ("image", c_void_p),
+        ("image_size", c_size_t),
+        ("max_width_", c_uint32),
+        ("owner_", c_void_p),
+    ]
+
+
+_ModelPtr = POINTER(_Model)
+
+
+class _LayerInfo(Structure):
+    _fields_ = [
+        ("inputs", c_uint32),
+        ("outputs", c_uint32),
+        ("activation", c_int),
+        ("precision", c_int),
+    ]
+
+
 class _LRScheduleParams(Structure):
     _fields_ = [
         ("warmup_epochs", c_size_t),
@@ -451,6 +478,17 @@ _dataset_close = _bind("spingalett_dataset_close", None, [c_void_p])
 _dataset_info = _bind("spingalett_dataset_info", _DatasetInfo, [c_void_p])
 _dataset_generator = _DataGeneratorFn(ctypes.cast(_lib.spingalett_dataset_generator, c_void_p).value)
 _save = _bind("save_spingalett_struct_arguments", None, [_SaveArgs])
+_save_to_memory = _bind("spingalett_save_to_memory", c_void_p, [_NetPtr, c_int, c_bool, POINTER(c_size_t)])
+_load_from_memory = _bind("load_spingalett_from_memory", _NetPtr, [c_char_p, c_size_t])
+_free_memory = _bind("spingalett_free", None, [c_void_p])
+_export_c_header = _bind("spingalett_export_c_header", c_bool, [_NetPtr, c_char_p, c_char_p, c_int])
+_model_from_network = _bind("spingalett_model_from_network", _ModelPtr, [_NetPtr, c_int])
+_model_load = _bind("spingalett_model_load", _ModelPtr, [c_char_p])
+_model_from_memory = _bind("spingalett_model_from_memory", _ModelPtr, [c_char_p, c_size_t])
+_model_free = _bind("spingalett_model_free", None, [_ModelPtr])
+_model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
+_model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, POINTER(c_float), c_uint32, POINTER(c_float)])
+_model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, POINTER(c_float), POINTER(c_float), c_uint32])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
 _free = _bind("free_network", None, [_NetPtr])
 _print_parameters = _bind("print_parameters", None, [_NetPtr])
@@ -1066,6 +1104,38 @@ class Network:
         """Save to ``path`` (".slett" is appended when there is no extension)."""
         _call(_save, _SaveArgs(self._ptr, _encode_path(path), not save_optimizer, int(precision)))
 
+    def to_bytes(self, precision: Precision = Precision.FLOAT32, save_optimizer: bool = False) -> bytes:
+        """The .slett file :meth:`save` would write, as bytes."""
+        size = c_size_t()
+        self._net  # raise if closed
+        ptr = _call(_save_to_memory, self._ptr, int(precision), bool(save_optimizer), ctypes.byref(size))
+        try:
+            return ctypes.string_at(ptr, size.value)
+        finally:
+            _free_memory(ptr)
+
+    @classmethod
+    def from_bytes(cls, data) -> "Network":
+        """A network from the bytes of a .slett file of any format version."""
+        data = bytes(data)
+        ptr = _call(_load_from_memory, data, len(data))
+        if not ptr:
+            raise SpingalettError(-1, "could not load the network")
+        return cls._wrap(ptr)
+
+    # ---- deployment
+    def to_model(self, precision: Precision = Precision.INT8) -> "Model":
+        """A read-only copy for inference that computes in ``precision`` (see :class:`Model`)."""
+        self._net
+        return Model._wrap(_call(_model_from_network, self._ptr, int(precision)))
+
+    def export_c_header(self, path, name: str, precision: Precision = Precision.INT8) -> None:
+        """Write the network in ``precision`` as a C header for firmware: a ``static const uint8_t
+        name[]`` holding the model image and NAME_SIZE, NAME_INPUTS, NAME_OUTPUTS and NAME_WORKSPACE
+        macros (see Spingalett.Inference.h)."""
+        self._net
+        _call(_export_c_header, self._ptr, _encode_path(path), name.encode(), int(precision))
+
     def print_parameters(self) -> None:
         _call(_print_parameters, self._ptr)
 
@@ -1073,6 +1143,138 @@ class Network:
         if not getattr(self, "_ptr", None):
             return "<spingalett.Network (closed)>"
         return f"<spingalett.Network {self.topology} loss={self.loss.name} params={self.num_parameters}>"
+
+
+# --------------------------------------------------------------------------- deployment models
+
+@dataclasses.dataclass(frozen=True)
+class LayerInfo:
+    """One weight layer of a :class:`Model`."""
+    inputs: int
+    outputs: int
+    activation: Activation
+    precision: Precision
+
+
+class Model:
+    """A read-only network for inference that computes in the precision its weights are stored in:
+    INT8, INT4 and INT2 layers quantize their input to 8 bits per sample and use integer kernels,
+    FLOAT32, FP16 and BFLOAT16 layers compute in float. Create one with :meth:`Network.to_model`,
+    :meth:`Model.load` or :meth:`Model.from_bytes`; :meth:`to_bytes` gives the .slett image, which
+    the standalone C engine runs in place."""
+
+    def __init__(self):
+        raise TypeError("use Network.to_model, Model.load or Model.from_bytes")
+
+    @classmethod
+    def _wrap(cls, ptr) -> "Model":
+        if not ptr:
+            raise SpingalettError(-1, "could not create the model")
+        model = cls.__new__(cls)
+        model._ptr = ptr
+        return model
+
+    @classmethod
+    def load(cls, path) -> "Model":
+        """Read a .slett file; files of older format versions are converted in their precision."""
+        return cls._wrap(_call(_model_load, _encode_path(path)))
+
+    @classmethod
+    def from_bytes(cls, data) -> "Model":
+        """A model from the bytes of a .slett file (copied)."""
+        data = bytes(data)
+        return cls._wrap(_call(_model_from_memory, data, len(data)))
+
+    # ---- lifetime
+    def close(self) -> None:
+        ptr = getattr(self, "_ptr", None)
+        if ptr:
+            self._ptr = None
+            _model_free(ptr)
+
+    def __enter__(self) -> "Model":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @property
+    def _model(self) -> _Model:
+        if not getattr(self, "_ptr", None):
+            raise ValueError("model is closed")
+        return self._ptr.contents
+
+    # ---- description
+    @property
+    def input_size(self) -> int:
+        return int(self._model.input_size)
+
+    @property
+    def output_size(self) -> int:
+        return int(self._model.output_size)
+
+    @property
+    def loss(self) -> Loss:
+        return Loss(self._model.loss)
+
+    @property
+    def size(self) -> int:
+        """Bytes of the model image."""
+        return int(self._model.image_size)
+
+    @property
+    def workspace_size(self) -> int:
+        """Bytes of workspace the C engine's spingalett_model_run needs per thread."""
+        return int(self._model.workspace_size)
+
+    @property
+    def layers(self) -> List[LayerInfo]:
+        out = []
+        for i in range(self._model.layer_count):
+            info = _LayerInfo()
+            _model_layer(self._ptr, i, ctypes.byref(info))
+            out.append(LayerInfo(int(info.inputs), int(info.outputs), Activation(info.activation), Precision(info.precision)))
+        return out
+
+    def to_bytes(self) -> bytes:
+        """The model image: a .slett file (format version 3)."""
+        m = self._model
+        return ctypes.string_at(m.image, m.image_size)
+
+    # ---- inference
+    def predict(self, inputs) -> np.ndarray:
+        """Outputs for one sample (1-D input) or a batch (one row per sample)."""
+        n_in = self.input_size
+        arr = np.ascontiguousarray(inputs, dtype=np.float32)
+        single = arr.ndim == 1 and arr.size == n_in
+        batch = _as_matrix(arr, n_in, "inputs")
+        out = np.empty((batch.shape[0], self.output_size), dtype=np.float32)
+        if batch.shape[0]:
+            _call(_model_predict, self._ptr, _float_ptr(batch), batch.shape[0], _float_ptr(out))
+        return out[0] if single else out
+
+    __call__ = predict
+
+    def evaluate(self, inputs, targets) -> Metrics:
+        """Mean loss and accuracy over a data set, as :meth:`Network.evaluate` computes them."""
+        x = _as_matrix(inputs, self.input_size, "inputs")
+        y = _as_matrix(targets, self.output_size, "targets")
+        if x.shape[0] != y.shape[0] or x.shape[0] == 0:
+            raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
+        return _metrics(_call(_model_evaluate, self._ptr, _float_ptr(x), _float_ptr(y), x.shape[0]))
+
+    def __repr__(self) -> str:
+        if not getattr(self, "_ptr", None):
+            return "<spingalett.Model (closed)>"
+        shape = [self.input_size] + [l.outputs for l in self.layers]
+        precisions = sorted({l.precision.name for l in self.layers})
+        return f"<spingalett.Model {shape} {'/'.join(precisions)} {self.size} bytes>"
 
 
 # --------------------------------------------------------------------------- low-level training

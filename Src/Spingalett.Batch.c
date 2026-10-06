@@ -153,7 +153,7 @@ bool predict_struct_arguments(PredictArgs args) {
     return true;
 }
 
-static bool sample_correct(const float *out, const float *target, uint32_t n) {
+bool spingalett_sample_correct(const float *out, const float *target, uint32_t n) {
     if (n == 1)
         return (out[0] >= 0.5f) == (target[0] >= 0.5f);
     uint32_t best_out = 0, best_target = 0;
@@ -179,7 +179,7 @@ void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *ou
         for (uint32_t s = 0; s < count; s++) {
             const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * out_sz;
             loss += compute_sample_loss(o, t, out_sz, net->loss_func, out_act);
-            hits += sample_correct(o, t, out_sz);
+            hits += spingalett_sample_correct(o, t, out_sz);
         }
     }
     *loss_sum = loss;

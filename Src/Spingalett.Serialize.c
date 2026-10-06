@@ -3,299 +3,201 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
+/*
+ * .slett model files. Writing produces format version 3 (docs/ModelFormat.md): a header, a layer
+ * table and 16-byte aligned sections, little-endian, with per-row scales for the integer precisions
+ * and CRC-32 checksums, so that a file image doubles as an in-place inference model. Reading also
+ * accepts versions 1 and 2 (native byte order, one scale per tensor).
+ */
+
 #include "Spingalett.Private.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
-uint16_t spingalett_float_to_fp16(float x) {
-    uint32_t f;
-    memcpy(&f, &x, sizeof(float));
+/* ------------------------------------------------------------------------- writing (format 3) */
 
-    uint16_t sign = (uint16_t)((f >> 16) & 0x8000u);
-    uint32_t absf = f & 0x7FFFFFFFu;
-
-    if (absf >= 0x7F800000u)                     /* Inf / NaN */
-        return (uint16_t)(sign | (absf > 0x7F800000u ? 0x7E00u : 0x7C00u));
-    if (absf >= 0x477FF000u)                     /* >= 65520 rounds to Inf */
-        return (uint16_t)(sign | 0x7C00u);
-
-    if (absf < 0x38800000u) {                    /* below 2^-14: FP16 subnormal or zero */
-        if (absf < 0x33000000u)                  /* below 2^-25 rounds to zero */
-            return sign;
-        uint32_t shift = 126u - (absf >> 23);    /* 14..24 */
-        uint32_t man   = (absf & 0x007FFFFFu) | 0x00800000u;
-        uint32_t h     = man >> shift;
-        uint32_t rem   = man & ((1u << shift) - 1u);
-        uint32_t half  = 1u << (shift - 1u);
-        if (rem > half || (rem == half && (h & 1u))) h++;
-        return (uint16_t)(sign | h);
+static float row_abs_max(const float *w, uint32_t n, bool *finite) {
+    float amax = 0.0f;
+    *finite = true;
+    for (uint32_t i = 0; i < n; i++) {
+        float a = fabsf(w[i]);
+        if (!(a <= FLT_MAX)) *finite = false;
+        else if (a > amax) amax = a;
     }
-
-    /* Normal: rebias the exponent, round the dropped 13 mantissa bits to nearest-even.
-       A carry out of the mantissa correctly bumps the exponent. */
-    uint32_t h   = (absf - 0x38000000u) >> 13;
-    uint32_t rem = absf & 0x1FFFu;
-    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
-    return (uint16_t)(sign | h);
+    return amax;
 }
 
-float spingalett_fp16_to_float(uint16_t h) {
-    uint32_t sign  = ((uint32_t)(h & 0x8000u)) << 16;
-    uint32_t h_exp = (h >> 10) & 0x1Fu;
-    uint32_t h_man = h & 0x03FFu;
-    uint32_t f;
-
-    if (h_exp == 0) {
-        if (h_man == 0) {
-            f = sign;
-        } else {
-            h_exp = 1;
-            while (!(h_man & 0x0400u)) {
-                h_man <<= 1;
-                h_exp++;
-            }
-            h_man &= 0x03FFu;
-            f = sign | ((uint32_t)(114 - h_exp) << 23) | (h_man << 13);
-        }
-    } else if (h_exp == 31) {
-        f = (h_man == 0) ? (sign | 0x7F800000u) : (sign | 0x7FC00000u);
-    } else {
-        f = sign | ((h_exp + 112) << 23) | (h_man << 13);
-    }
-
-    float result;
-    memcpy(&result, &f, sizeof(float));
-    return result;
+static int8_t quantize_value(float v, float inv, int limit) {
+    long q = lrintf(v * inv);
+    return (int8_t)(q > limit ? limit : (q < -limit ? -limit : q));
 }
 
-uint16_t spingalett_float_to_bf16(float x) {
-    uint32_t f;
-    memcpy(&f, &x, sizeof(float));
-    if ((f & 0x7FFFFFFFu) > 0x7F800000u)         /* NaN: keep it a (quiet) NaN */
-        return (uint16_t)((f >> 16) | 0x0040u);
-    f += 0x7FFFu + ((f >> 16) & 1u);             /* round to nearest-even */
-    return (uint16_t)(f >> 16);
+/* Stores one weight row in `precision` at dst; returns its scale (0 for the float formats). A row
+   with a NaN or infinite weight gets scale NaN, so it reads back as NaN rather than silently. */
+static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, uint8_t *dst) {
+    bool finite;
+    float amax;
+    switch (precision) {
+        case PRECISION_FLOAT32:
+            memcpy(dst, w, (size_t)n * 4u);
+            return 0.0f;
+        case PRECISION_FP16:
+            for (uint32_t i = 0; i < n; i++) slett_put16(dst + 2u * i, spingalett_float_to_fp16(w[i]));
+            return 0.0f;
+        case PRECISION_BFLOAT16:
+            for (uint32_t i = 0; i < n; i++) slett_put16(dst + 2u * i, spingalett_float_to_bf16(w[i]));
+            return 0.0f;
+        case PRECISION_INT8:
+            amax = row_abs_max(w, n, &finite);
+            if (!finite || amax == 0.0f) return finite ? 0.0f : NAN;       /* dst is zeroed */
+            for (uint32_t i = 0; i < n; i++) dst[i] = (uint8_t)quantize_value(w[i], 127.0f / amax, 127);
+            return amax / 127.0f;
+        case PRECISION_INT4:
+            amax = row_abs_max(w, n, &finite);
+            if (!finite || amax == 0.0f) return finite ? 0.0f : NAN;
+            for (uint32_t i = 0; i < n; i++) {
+                uint8_t code = (uint8_t)quantize_value(w[i], 7.0f / amax, 7) & 0x0Fu;
+                dst[i / 2u] |= (uint8_t)(i & 1u ? code << 4 : code);
+            }
+            return amax / 7.0f;
+        case PRECISION_INT2: {
+            /* Ternary weights (Li and Liu, 2016): threshold 0.7 * mean |w|; the scale is the mean
+               magnitude of the weights above it. */
+            double total = 0.0;
+            finite = true;
+            for (uint32_t i = 0; i < n; i++) {
+                float a = fabsf(w[i]);
+                if (!(a <= FLT_MAX)) finite = false;
+                total += a;
+            }
+            if (!finite) return NAN;
+            float threshold = (float)(0.7 * total / n);
+            double kept = 0.0;
+            uint32_t count = 0;
+            for (uint32_t i = 0; i < n; i++)
+                if (fabsf(w[i]) > threshold) { kept += fabsf(w[i]); count++; }
+            if (count == 0) return 0.0f;
+            for (uint32_t i = 0; i < n; i++) {
+                uint8_t code = w[i] > threshold ? 1u : (w[i] < -threshold ? 3u : 0u);
+                dst[i / 4u] |= (uint8_t)(code << ((i & 3u) * 2u));
+            }
+            return (float)(kept / count);
+        }
+        default:
+            return 0.0f;
+    }
 }
 
-float spingalett_bf16_to_float(uint16_t h) {
-    uint32_t f = ((uint32_t)h) << 16;
-    float x;
-    memcpy(&x, &f, sizeof(float));
-    return x;
+void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precision, bool save_optimizer, size_t *size) {
+    if (size) *size = 0;
+    if (!net || !size) {
+        set_error(SPINGALETT_ERR_INVALID, "save: net or size is NULL");
+        return NULL;
+    }
+    if (net->layers < 2 || net->layers > SLETT_MAX_LAYERS) {
+        set_error(SPINGALETT_ERR_INVALID, "save: network must have 2 to 65536 layers");
+        return NULL;
+    }
+    if ((unsigned)precision >= PRECISION_COUNT) {
+        set_error(SPINGALETT_ERR_INVALID, "save: invalid precision mode");
+        return NULL;
+    }
+    if (!spingalett_host_is_little_endian()) {
+        set_error(SPINGALETT_ERR_INVALID, "save: format 3 needs a little-endian host");
+        return NULL;
+    }
+    uint32_t L = net->layers - 1;              /* weight layers */
+    if (spingalett_precision_is_int(precision))
+        for (uint32_t l = 0; l < L; l++)
+            if (net->topology[l] > SLETT_MAX_INT_INPUTS) {
+                set_error(SPINGALETT_ERR_INVALID, "save: integer precisions allow at most 131072 inputs per layer");
+                return NULL;
+            }
+
+    uint64_t *off = (uint64_t *)malloc((size_t)L * 4u * sizeof(uint64_t));   /* weights, scales, biases, optimizer */
+    if (!off) {
+        set_error(SPINGALETT_ERR_ALLOC, "save: allocation failed");
+        return NULL;
+    }
+    uint64_t pos = slett_align(SLETT_HEADER_SIZE + (uint64_t)L * SLETT_LAYER_ENTRY_SIZE);
+    for (uint32_t l = 0; l < L; l++) {
+        uint32_t in = net->topology[l], out = net->topology[l + 1];
+        off[4 * l] = pos;
+        pos = slett_align(pos + spingalett_slett_row_bytes(precision, in) * out);
+        off[4 * l + 1] = 0;
+        if (spingalett_precision_is_int(precision)) {
+            off[4 * l + 1] = pos;
+            pos = slett_align(pos + (uint64_t)out * 4u);
+        }
+        off[4 * l + 2] = pos;
+        pos = slett_align(pos + (uint64_t)out * 4u);
+        off[4 * l + 3] = 0;
+        if (save_optimizer) {
+            off[4 * l + 3] = pos;
+            pos = slett_align(pos + ((uint64_t)in * out * 2u + (uint64_t)out * 2u) * 4u);
+        }
+    }
+    if (pos > (uint64_t)SIZE_MAX - SPINGALETT_ALIGNMENT) {
+        free(off);
+        set_error(SPINGALETT_ERR_ALLOC, "save: network too large for memory");
+        return NULL;
+    }
+    uint8_t *img = (uint8_t *)spingalett_aligned_calloc((size_t)pos, 1);
+    if (!img) {
+        free(off);
+        set_error(SPINGALETT_ERR_ALLOC, "save: image allocation failed");
+        return NULL;
+    }
+
+    memcpy(img, SLETT_MAGIC, 6);
+    slett_put16(img + 6, 3);
+    slett_put32(img + 8, net->layers);
+    img[12] = (uint8_t)net->loss_func;
+    img[13] = save_optimizer ? SLETT_FLAG_OPTIMIZER : 0u;
+    slett_put64(img + 16, save_optimizer ? net->time_step : 0u);
+    slett_put64(img + 24, pos);
+
+    for (uint32_t l = 0; l < L; l++) {
+        uint32_t in = net->topology[l], out = net->topology[l + 1];
+        uint8_t *e = img + SLETT_HEADER_SIZE + (size_t)l * SLETT_LAYER_ENTRY_SIZE;
+        slett_put32(e, in);
+        slett_put32(e + 4, out);
+        e[8] = (uint8_t)net->act_func[l];
+        e[9] = (uint8_t)precision;
+        uint32_t dropout;
+        memcpy(&dropout, &net->dropout_rates[l + 1], 4);
+        slett_put32(e + 12, dropout);
+        for (int k = 0; k < 4; k++) slett_put64(e + 16 + 8 * k, off[4 * l + k]);
+
+        const float *W = net->weights + net->weight_offsets[l];
+        size_t row = (size_t)spingalett_slett_row_bytes(precision, in);
+        for (uint32_t j = 0; j < out; j++) {
+            float scale = quantize_row(W + (size_t)j * in, in, precision, img + off[4 * l] + (size_t)j * row);
+            if (off[4 * l + 1]) memcpy(img + off[4 * l + 1] + 4u * (size_t)j, &scale, 4);
+        }
+        memcpy(img + off[4 * l + 2], net->biases + net->bias_offsets[l], (size_t)out * 4u);
+        if (save_optimizer) {
+            uint8_t *o = img + off[4 * l + 3];
+            size_t wbytes = (size_t)in * out * 4u, bbytes = (size_t)out * 4u;
+            memcpy(o, net->opt_m_weights + net->weight_offsets[l], wbytes);
+            memcpy(o + wbytes, net->opt_v_weights + net->weight_offsets[l], wbytes);
+            memcpy(o + 2u * wbytes, net->opt_m_biases + net->bias_offsets[l], bbytes);
+            memcpy(o + 2u * wbytes + bbytes, net->opt_v_biases + net->bias_offsets[l], bbytes);
+        }
+    }
+    free(off);
+
+    slett_put32(img + 56, spingalett_crc32(0, img + SLETT_HEADER_SIZE, (size_t)pos - SLETT_HEADER_SIZE));
+    slett_put32(img + 60, spingalett_crc32(0, img, 60));
+    *size = (size_t)pos;
+    return img;
 }
 
-static bool write_array_compressed(const float *data, uint64_t size, PrecisionMode precision, FILE *fp) {
-    if (precision == PRECISION_FLOAT32) {
-        return fwrite(data, sizeof(float), size, fp) == size;
-    }
-
-    if (precision == PRECISION_FP16) {
-        uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "FP16 write buffer allocation failed"); return false; }
-        for (uint64_t i = 0; i < size; i++) buf[i] = spingalett_float_to_fp16(data[i]);
-        bool ok = fwrite(buf, sizeof(uint16_t), size, fp) == size;
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_BFLOAT16) {
-        uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "BF16 write buffer allocation failed"); return false; }
-        for (uint64_t i = 0; i < size; i++) buf[i] = spingalett_float_to_bf16(data[i]);
-        bool ok = fwrite(buf, sizeof(uint16_t), size, fp) == size;
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_INT8) {
-        float max_val = 0.0f;
-        for (uint64_t i = 0; i < size; i++) {
-            float a = fabsf(data[i]);
-            if (a > max_val) max_val = a;
-        }
-        if (fwrite(&max_val, sizeof(float), 1, fp) != 1) return false;
-
-        int8_t *buf = (int8_t *)calloc(size, sizeof(int8_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT8 write buffer allocation failed"); return false; }
-        if (max_val > 0.0f) {
-            for (uint64_t i = 0; i < size; i++)
-                buf[i] = (int8_t)roundf((data[i] / max_val) * 127.0f);
-        }
-        bool ok = fwrite(buf, sizeof(int8_t), size, fp) == size;
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_INT4) {
-        float max_val = 0.0f;
-        for (uint64_t i = 0; i < size; i++) {
-            float a = fabsf(data[i]);
-            if (a > max_val) max_val = a;
-        }
-        if (fwrite(&max_val, sizeof(float), 1, fp) != 1) return false;
-
-        uint64_t byte_count = (size + 1) / 2;
-        uint8_t *buf = (uint8_t *)calloc(byte_count, sizeof(uint8_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT4 write buffer allocation failed"); return false; }
-
-        if (max_val > 0.0f) {
-            for (uint64_t i = 0; i < size; i++) {
-                float scaled = (data[i] / max_val) * 7.0f;
-                int8_t q = (int8_t)roundf(scaled);
-                if (q > 7) q = 7;
-                if (q < -8) q = -8;
-                uint8_t uq = (uint8_t)(q & 0x0Fu);
-                uint64_t bi = i / 2;
-                if ((i & 1u) == 0u)
-                    buf[bi] |= uq;
-                else
-                    buf[bi] |= (uint8_t)(uq << 4);
-            }
-        }
-
-        bool ok = fwrite(buf, sizeof(uint8_t), byte_count, fp) == byte_count;
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_INT2) {
-        float max_val = 0.0f;
-        for (uint64_t i = 0; i < size; i++) {
-            float a = fabsf(data[i]);
-            if (a > max_val) max_val = a;
-        }
-        if (fwrite(&max_val, sizeof(float), 1, fp) != 1) return false;
-
-        uint64_t byte_count = (size + 3) / 4;
-        uint8_t *buf = (uint8_t *)calloc(byte_count, sizeof(uint8_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT2 write buffer allocation failed"); return false; }
-
-        if (max_val > 0.0f) {
-            for (uint64_t i = 0; i < size; i++) {
-                float scaled = data[i] / max_val;
-                int8_t q;
-                if (scaled > 0.5f) q = 1;
-                else if (scaled < -0.5f) q = -1;
-                else q = 0;
-                uint8_t uq = (uint8_t)((uint8_t)q & 0x03u);
-                uint64_t bi = i / 4;
-                uint8_t shift = (uint8_t)((i % 4) * 2u);
-                buf[bi] |= (uint8_t)(uq << shift);
-            }
-        }
-
-        bool ok = fwrite(buf, sizeof(uint8_t), byte_count, fp) == byte_count;
-        free(buf);
-        return ok;
-    }
-
-    return false;
-}
-
-static bool read_array_compressed(float *data, uint64_t size, PrecisionMode precision, FILE *fp) {
-    if (precision == PRECISION_FLOAT32) {
-        return fread(data, sizeof(float), size, fp) == size;
-    }
-
-    if (precision == PRECISION_FP16) {
-        uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "FP16 read buffer allocation failed"); return false; }
-        bool ok = fread(buf, sizeof(uint16_t), size, fp) == size;
-        if (ok) {
-            for (uint64_t i = 0; i < size; i++) data[i] = spingalett_fp16_to_float(buf[i]);
-        }
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_BFLOAT16) {
-        uint16_t *buf = (uint16_t *)malloc(size * sizeof(uint16_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "BF16 read buffer allocation failed"); return false; }
-        bool ok = fread(buf, sizeof(uint16_t), size, fp) == size;
-        if (ok) {
-            for (uint64_t i = 0; i < size; i++) data[i] = spingalett_bf16_to_float(buf[i]);
-        }
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_INT8) {
-        float max_val = 0.0f;
-        if (fread(&max_val, sizeof(float), 1, fp) != 1) return false;
-
-        int8_t *buf = (int8_t *)malloc(size * sizeof(int8_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT8 read buffer allocation failed"); return false; }
-        bool ok = fread(buf, sizeof(int8_t), size, fp) == size;
-
-        if (ok) {
-            if (max_val > 0.0f) {
-                for (uint64_t i = 0; i < size; i++)
-                    data[i] = ((float)buf[i] / 127.0f) * max_val;
-            } else {
-                memset(data, 0, size * sizeof(float));
-            }
-        }
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_INT4) {
-        float max_val = 0.0f;
-        if (fread(&max_val, sizeof(float), 1, fp) != 1) return false;
-
-        uint64_t byte_count = (size + 1) / 2;
-        uint8_t *buf = (uint8_t *)malloc(byte_count * sizeof(uint8_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT4 read buffer allocation failed"); return false; }
-        bool ok = fread(buf, sizeof(uint8_t), byte_count, fp) == byte_count;
-
-        if (ok) {
-            if (max_val > 0.0f) {
-                for (uint64_t i = 0; i < size; i++) {
-                    uint64_t bi = i / 2;
-                    uint8_t packed = buf[bi];
-                    uint8_t uq = ((i & 1u) == 0u) ? (packed & 0x0Fu) : (packed >> 4);
-                    int8_t q = (uq & 0x08u) ? (int8_t)(uq | 0xF0u) : (int8_t)uq;
-                    data[i] = ((float)q / 7.0f) * max_val;
-                }
-            } else {
-                memset(data, 0, size * sizeof(float));
-            }
-        }
-
-        free(buf);
-        return ok;
-    }
-
-    if (precision == PRECISION_INT2) {
-        float max_val = 0.0f;
-        if (fread(&max_val, sizeof(float), 1, fp) != 1) return false;
-
-        uint64_t byte_count = (size + 3) / 4;
-        uint8_t *buf = (uint8_t *)malloc(byte_count * sizeof(uint8_t));
-        if (!buf) { set_error(SPINGALETT_ERR_ALLOC, "INT2 read buffer allocation failed"); return false; }
-        bool ok = fread(buf, sizeof(uint8_t), byte_count, fp) == byte_count;
-
-        if (ok) {
-            if (max_val > 0.0f) {
-                for (uint64_t i = 0; i < size; i++) {
-                    uint64_t bi = i / 4;
-                    uint8_t shift = (uint8_t)((i % 4) * 2u);
-                    uint8_t uq = (buf[bi] >> shift) & 0x03u;
-                    int8_t q = (uq & 0x02u) ? (int8_t)(uq | 0xFCu) : (int8_t)uq;
-                    data[i] = (float)q * max_val;
-                }
-            } else {
-                memset(data, 0, size * sizeof(float));
-            }
-        }
-
-        free(buf);
-        return ok;
-    }
-
-    return false;
+void spingalett_free(void *ptr) {
+    spingalett_aligned_free(ptr);
 }
 
 static const char *find_last_separator(const char *path) {
@@ -312,126 +214,332 @@ void save_spingalett_struct_arguments(SaveArgs args) {
         return;
     }
 
-    if (args.net->layers < 2) {
-        set_error(SPINGALETT_ERR_INVALID, "save: network must have at least 2 layers");
-        return;
-    }
-
-    if ((unsigned)args.precision >= PRECISION_COUNT) {
-        set_error(SPINGALETT_ERR_INVALID, "save: invalid precision mode");
-        return;
-    }
-
     char *allocated_filename = NULL;
     const char *target_filename = args.filename;
-
     const char *dot = strrchr(target_filename, '.');
     const char *last_sep = find_last_separator(target_filename);
-
-    bool has_ext = (dot && (!last_sep || dot > last_sep));
-
-    if (!has_ext) {
+    if (!(dot && (!last_sep || dot > last_sep))) {
         size_t len = strlen(target_filename);
         allocated_filename = (char *)malloc(len + sizeof SPINGALETT_MODEL_EXTENSION);
         if (!allocated_filename) {
             set_error(SPINGALETT_ERR_ALLOC, "save: filename allocation failed");
             return;
         }
-        strcpy(allocated_filename, target_filename);
-        strcat(allocated_filename, SPINGALETT_MODEL_EXTENSION);
+        memcpy(allocated_filename, target_filename, len);
+        memcpy(allocated_filename + len, SPINGALETT_MODEL_EXTENSION, sizeof SPINGALETT_MODEL_EXTENSION);
         target_filename = allocated_filename;
+    }
+
+    size_t size = 0;
+    void *img = spingalett_save_to_memory(args.net, args.precision, !args.do_not_save_optimizer, &size);
+    if (!img) {
+        free(allocated_filename);
+        return;
     }
 
     FILE *fp = fopen(target_filename, "wb");
     if (!fp) {
         set_error(SPINGALETT_ERR_FILE_IO, "save: cannot open file for writing");
-        free(allocated_filename);
-        return;
-    }
-
-    NeuralNetwork *net = args.net;
-    bool write_ok = true;
-
-    uint16_t format_version = SPINGALETT_FORMAT_VERSION;
-    if (fwrite(&format_version, sizeof(uint16_t), 1, fp) != 1) write_ok = false;
-
-    if (write_ok && fwrite(&net->layers, sizeof(uint32_t), 1, fp) != 1) write_ok = false;
-
-    uint8_t loss_type = (uint8_t)net->loss_func;
-    if (write_ok && fwrite(&loss_type, sizeof(uint8_t), 1, fp) != 1) write_ok = false;
-
-    uint8_t has_optimizer = args.do_not_save_optimizer ? 0 : 1;
-    if (write_ok && fwrite(&has_optimizer, sizeof(uint8_t), 1, fp) != 1) write_ok = false;
-
-    if (write_ok && has_optimizer) {
-        uint64_t ts = net->time_step;
-        if (fwrite(&ts, sizeof(uint64_t), 1, fp) != 1) write_ok = false;
-    }
-
-    uint8_t precision_type = (uint8_t)args.precision;
-    if (write_ok && fwrite(&precision_type, sizeof(uint8_t), 1, fp) != 1) write_ok = false;
-
-    if (write_ok && fwrite(net->topology, sizeof(uint32_t), net->layers, fp) != net->layers) write_ok = false;
-
-    for (uint32_t i = 0; i < net->layers - 1 && write_ok; i++) {
-        uint8_t act = (uint8_t)net->act_func[i];
-        if (fwrite(&act, sizeof(uint8_t), 1, fp) != 1) write_ok = false;
-    }
-
-    /* v2: dropout rate of every non-input layer */
-    if (write_ok && fwrite(net->dropout_rates + 1, sizeof(float), net->layers - 1, fp) != net->layers - 1)
-        write_ok = false;
-
-    if (!write_ok) {
-        set_error(SPINGALETT_ERR_FILE_IO, "save: failed to write header");
-        spingalett_log(LOG_ERROR, "Failed to write file header to %s", target_filename);
-        fclose(fp);
-        free(allocated_filename);
-        return;
-    }
-
-    uint64_t total_weights = 0;
-    uint64_t total_biases = 0;
-
-    for (uint32_t l = 0; l < net->layers - 1 && write_ok; l++) {
-        uint32_t in_dim  = net->topology[l];
-        uint32_t out_dim = net->topology[l + 1];
-        uint64_t woff    = net->weight_offsets[l];
-        uint64_t boff    = net->bias_offsets[l];
-        uint64_t wcount  = (uint64_t)in_dim * (uint64_t)out_dim;
-
-        total_weights += wcount;
-        total_biases  += out_dim;
-
-        if (!write_array_compressed(net->weights + woff, wcount, args.precision, fp)) write_ok = false;
-
-        if (write_ok && has_optimizer) {
-            if (!write_array_compressed(net->opt_m_weights + woff, wcount, args.precision, fp)) write_ok = false;
-            if (write_ok && !write_array_compressed(net->opt_v_weights + woff, wcount, args.precision, fp)) write_ok = false;
-        }
-
-        if (write_ok && !write_array_compressed(net->biases + boff, out_dim, args.precision, fp)) write_ok = false;
-        if (write_ok && has_optimizer) {
-            if (!write_array_compressed(net->opt_m_biases + boff, out_dim, args.precision, fp)) write_ok = false;
-            if (write_ok && !write_array_compressed(net->opt_v_biases + boff, out_dim, args.precision, fp)) write_ok = false;
-        }
-    }
-
-    if (fclose(fp) != 0) write_ok = false;
-
-    if (!write_ok) {
-        set_error(SPINGALETT_ERR_FILE_IO, "save: write error (disk full?)");
-        spingalett_log(LOG_ERROR, "Write error saving to %s", target_filename);
     } else {
-        spingalett_log(LOG_INFO, "Network saved to %s", target_filename);
-        spingalett_log(LOG_INFO, "Save info: format=v%u, layers=%u, weights=%llu, biases=%llu, precision=%s, optimizer=%s",
-            (unsigned)format_version, net->layers,
-            (unsigned long long)total_weights, (unsigned long long)total_biases,
-            precision_names[precision_type],
-            has_optimizer ? "ON" : "OFF");
+        bool ok = fwrite(img, 1, size, fp) == size;
+        if (fclose(fp) != 0) ok = false;
+        if (!ok) {
+            set_error(SPINGALETT_ERR_FILE_IO, "save: write error (disk full?)");
+            spingalett_log(LOG_ERROR, "Write error saving to %s", target_filename);
+        } else {
+            spingalett_log(LOG_INFO, "Network saved to %s", target_filename);
+            spingalett_log(LOG_INFO, "Save info: format=v%u, layers=%u, weights=%llu, biases=%llu, precision=%s, optimizer=%s, bytes=%zu",
+                (unsigned)SPINGALETT_FORMAT_VERSION, args.net->layers,
+                (unsigned long long)args.net->total_weights, (unsigned long long)args.net->total_biases,
+                precision_names[args.precision], args.do_not_save_optimizer ? "OFF" : "ON", size);
+        }
     }
-
+    spingalett_free(img);
     free(allocated_filename);
+}
+
+/* ------------------------------------------------------------------------- reading */
+
+void *spingalett_read_file(const char *path, size_t *size) {
+    *size = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        set_error(SPINGALETT_ERR_FILE_IO, "load: cannot open file for reading");
+        return NULL;
+    }
+    long length = -1;
+    if (fseek(fp, 0, SEEK_END) == 0) length = ftell(fp);
+    if (length < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        set_error(SPINGALETT_ERR_FILE_IO, "load: cannot determine the file size");
+        return NULL;
+    }
+    void *data = spingalett_aligned_alloc((size_t)length);
+    if (!data) {
+        fclose(fp);
+        set_error(SPINGALETT_ERR_ALLOC, "load: file buffer allocation failed");
+        return NULL;
+    }
+    bool ok = fread(data, 1, (size_t)length, fp) == (size_t)length;
+    fclose(fp);
+    if (!ok) {
+        spingalett_aligned_free(data);
+        set_error(SPINGALETT_ERR_FILE_IO, "load: read error");
+        return NULL;
+    }
+    *size = (size_t)length;
+    return data;
+}
+
+/* Builds an empty network of the given shape (weights zero). */
+static NeuralNetwork *make_network(LossFunction loss, uint32_t layers, const uint32_t *topology,
+                                   const ActivationFunction *act, const float *dropout) {
+    NeuralNetwork *net = new_spingalett_struct_arguments((NeuralNetworkArgs){ .loss_func = loss });
+    if (!net) return NULL;
+    for (uint32_t l = 0; l < layers; l++) {
+        LayerArgs largs = {0};
+        largs.net = net;
+        largs.neurons_amount = topology[l];
+        if (l > 0) largs.act_func = act[l - 1];
+        largs.weight_initialization = WEIGHT_INITIALIZATION_NONE;
+        largs.dropout_rate = dropout[l];
+        if (!spingalett_add_layer(largs)) {
+            free_network(net);
+            return NULL;
+        }
+    }
+    return net;
+}
+
+static NeuralNetwork *load_v3(const uint8_t *p, size_t size, PrecisionMode *precision) {
+    SlettInfo info;
+    if (spingalett_slett_validate(p, size, &info) != SPINGALETT_OK) return NULL;
+
+    uint32_t L = info.layers - 1;
+    uint32_t *topology = (uint32_t *)malloc((size_t)info.layers * sizeof(uint32_t));
+    ActivationFunction *act = (ActivationFunction *)malloc((size_t)L * sizeof(ActivationFunction));
+    float *dropout = (float *)calloc(info.layers, sizeof(float));
+    NeuralNetwork *net = NULL;
+    if (topology && act && dropout) {
+        for (uint32_t l = 0; l < L; l++) {
+            SlettLayer e;
+            spingalett_slett_layer(p, l, &e);
+            topology[l] = e.inputs;
+            topology[l + 1] = e.outputs;
+            act[l] = e.activation;
+            dropout[l + 1] = e.dropout;
+            if (l == 0) *precision = e.precision;
+        }
+        net = make_network(info.loss, info.layers, topology, act, dropout);
+    } else {
+        set_error(SPINGALETT_ERR_ALLOC, "load: allocation failed");
+    }
+    free(topology);
+    free(act);
+    free(dropout);
+    if (!net) return NULL;
+
+    int8_t *codes = NULL;
+    for (uint32_t l = 0; l < L; l++) {
+        SlettLayer e;
+        spingalett_slett_layer(p, l, &e);
+        float *W = net->weights + net->weight_offsets[l];
+        const uint8_t *src = p + e.weights;
+        size_t row = (size_t)spingalett_slett_row_bytes(e.precision, e.inputs);
+        if (e.precision == PRECISION_INT4 || e.precision == PRECISION_INT2) {
+            int8_t *grown = (int8_t *)realloc(codes, e.inputs);
+            if (!grown) {
+                free(codes);
+                free_network(net);
+                set_error(SPINGALETT_ERR_ALLOC, "load: allocation failed");
+                return NULL;
+            }
+            codes = grown;
+        }
+        for (uint32_t j = 0; j < e.outputs; j++) {
+            float *dst = W + (size_t)j * e.inputs;
+            const uint8_t *r = src + (size_t)j * row;
+            float scale = 0.0f;
+            if (spingalett_precision_is_int(e.precision)) memcpy(&scale, p + e.scales + 4u * (size_t)j, 4);
+            switch (e.precision) {
+                case PRECISION_FLOAT32:
+                    memcpy(dst, r, (size_t)e.inputs * 4u);
+                    break;
+                case PRECISION_FP16:
+                    for (uint32_t k = 0; k < e.inputs; k++) dst[k] = spingalett_fp16_to_float(slett_get16(r + 2u * k));
+                    break;
+                case PRECISION_BFLOAT16:
+                    for (uint32_t k = 0; k < e.inputs; k++) dst[k] = spingalett_bf16_to_float(slett_get16(r + 2u * k));
+                    break;
+                case PRECISION_INT8:
+                    for (uint32_t k = 0; k < e.inputs; k++) dst[k] = (float)(int8_t)r[k] * scale;
+                    break;
+                default:
+                    if (e.precision == PRECISION_INT4) spingalett_unpack_int4(r, codes, e.inputs);
+                    else spingalett_unpack_int2(r, codes, e.inputs);
+                    for (uint32_t k = 0; k < e.inputs; k++) dst[k] = (float)codes[k] * scale;
+                    break;
+            }
+        }
+        memcpy(net->biases + net->bias_offsets[l], p + e.biases, (size_t)e.outputs * 4u);
+        if (info.flags & SLETT_FLAG_OPTIMIZER) {
+            const uint8_t *o = p + e.optimizer;
+            size_t wbytes = (size_t)e.inputs * e.outputs * 4u, bbytes = (size_t)e.outputs * 4u;
+            memcpy(net->opt_m_weights + net->weight_offsets[l], o, wbytes);
+            memcpy(net->opt_v_weights + net->weight_offsets[l], o + wbytes, wbytes);
+            memcpy(net->opt_m_biases + net->bias_offsets[l], o + 2u * wbytes, bbytes);
+            memcpy(net->opt_v_biases + net->bias_offsets[l], o + 2u * wbytes + bbytes, bbytes);
+        }
+    }
+    free(codes);
+    net->time_step = info.time_step;
+    return net;
+}
+
+/* Versions 1 and 2: native byte order, every array in the file's precision with one scale per
+   array for the integer precisions. */
+typedef struct {
+    const uint8_t *p;
+    size_t left;
+} Cursor;
+
+static bool take(Cursor *c, void *dst, size_t n) {
+    if (n > c->left) return false;
+    memcpy(dst, c->p, n);
+    c->p += n;
+    c->left -= n;
+    return true;
+}
+
+static bool read_legacy_array(Cursor *c, float *data, uint64_t size, PrecisionMode precision) {
+    if (precision == PRECISION_FLOAT32)
+        return size <= c->left / 4u && take(c, data, (size_t)size * 4u);
+    if (precision == PRECISION_FP16 || precision == PRECISION_BFLOAT16) {
+        if (size > c->left / 2u) return false;
+        for (uint64_t i = 0; i < size; i++) {
+            uint16_t h;
+            take(c, &h, 2);
+            data[i] = precision == PRECISION_FP16 ? spingalett_fp16_to_float(h) : spingalett_bf16_to_float(h);
+        }
+        return true;
+    }
+    float max_val;
+    if (!take(c, &max_val, 4)) return false;
+    uint64_t bytes = precision == PRECISION_INT8 ? size : (precision == PRECISION_INT4 ? (size + 1) / 2 : (size + 3) / 4);
+    if (bytes > c->left) return false;
+    const uint8_t *b = c->p;
+    for (uint64_t i = 0; i < size; i++) {
+        if (!(max_val > 0.0f)) { data[i] = 0.0f; continue; }
+        if (precision == PRECISION_INT8) {
+            data[i] = ((float)(int8_t)b[i] / 127.0f) * max_val;
+        } else if (precision == PRECISION_INT4) {
+            unsigned uq = (i & 1u) ? (unsigned)(b[i / 2] >> 4) : (unsigned)(b[i / 2] & 0x0Fu);
+            data[i] = ((float)((int)(uq ^ 8u) - 8) / 7.0f) * max_val;
+        } else {
+            unsigned uq = (b[i / 4] >> ((i % 4) * 2u)) & 3u;
+            data[i] = (float)((int)(uq ^ 2u) - 2) * max_val;
+        }
+    }
+    c->p += bytes;
+    c->left -= (size_t)bytes;
+    return true;
+}
+
+static NeuralNetwork *load_legacy(const uint8_t *data, size_t size, PrecisionMode *precision) {
+    Cursor c = {data, size};
+    uint16_t version = 0;
+    uint32_t layers = 0;
+    uint8_t loss = 0, has_optimizer = 0, prec = 0;
+    uint64_t ts = 0;
+    take(&c, &version, 2);
+    if (!take(&c, &layers, 4) || !take(&c, &loss, 1) || !take(&c, &has_optimizer, 1) ||
+        (has_optimizer && !take(&c, &ts, 8)) || !take(&c, &prec, 1)) {
+        set_error(SPINGALETT_ERR_FILE_IO, "load: file is truncated");
+        return NULL;
+    }
+    if (layers < 2 || layers > SLETT_MAX_LAYERS || loss >= LOSS_COUNT || prec >= PRECISION_COUNT) {
+        set_error(SPINGALETT_ERR_INVALID, "load: invalid header");
+        return NULL;
+    }
+    *precision = (PrecisionMode)prec;
+
+    uint32_t *topology = (uint32_t *)malloc((size_t)layers * sizeof(uint32_t));
+    ActivationFunction *act = (ActivationFunction *)malloc((size_t)(layers - 1) * sizeof(ActivationFunction));
+    float *dropout = (float *)calloc(layers, sizeof(float));
+    NeuralNetwork *net = NULL;
+    bool ok = topology && act && dropout;
+    if (!ok) set_error(SPINGALETT_ERR_ALLOC, "load: allocation failed");
+    if (ok && !take(&c, topology, (size_t)layers * 4u)) {
+        set_error(SPINGALETT_ERR_FILE_IO, "load: file is truncated");
+        ok = false;
+    }
+    for (uint32_t i = 0; ok && i < layers; i++)
+        if (topology[i] == 0) { set_error(SPINGALETT_ERR_INVALID, "load: invalid topology"); ok = false; }
+    for (uint32_t i = 0; ok && i + 1 < layers; i++) {
+        uint8_t a;
+        if (!take(&c, &a, 1) || a >= ACT_COUNT) { set_error(SPINGALETT_ERR_INVALID, "load: invalid activation function"); ok = false; }
+        else act[i] = (ActivationFunction)a;
+    }
+    if (ok && version >= 2) {                         /* v2: dropout rate of every non-input layer */
+        ok = take(&c, dropout + 1, (size_t)(layers - 1) * 4u);
+        for (uint32_t l = 1; ok && l < layers; l++) ok = dropout[l] >= 0.0f && dropout[l] < 1.0f;
+        if (!ok) set_error(SPINGALETT_ERR_INVALID, "load: invalid dropout rates");
+    }
+    if (ok) net = make_network((LossFunction)loss, layers, topology, act, dropout);
+    free(topology);
+    free(act);
+    free(dropout);
+    if (!net) return NULL;
+    net->time_step = ts;
+
+    bool read_ok = true;
+    for (uint32_t l = 0; l + 1 < layers && read_ok; l++) {
+        uint64_t wcount = (uint64_t)net->topology[l] * net->topology[l + 1], bcount = net->topology[l + 1];
+        uint64_t woff = net->weight_offsets[l], boff = net->bias_offsets[l];
+        read_ok = read_legacy_array(&c, net->weights + woff, wcount, *precision);
+        if (read_ok && has_optimizer)
+            read_ok = read_legacy_array(&c, net->opt_m_weights + woff, wcount, *precision) &&
+                      read_legacy_array(&c, net->opt_v_weights + woff, wcount, *precision);
+        if (read_ok) read_ok = read_legacy_array(&c, net->biases + boff, bcount, *precision);
+        if (read_ok && has_optimizer)
+            read_ok = read_legacy_array(&c, net->opt_m_biases + boff, bcount, *precision) &&
+                      read_legacy_array(&c, net->opt_v_biases + boff, bcount, *precision);
+    }
+    if (!read_ok) {
+        set_error(SPINGALETT_ERR_FILE_IO, "load: file is truncated");
+        free_network(net);
+        return NULL;
+    }
+    return net;
+}
+
+NeuralNetwork *spingalett_load_from_memory_ex(const void *data, size_t size, PrecisionMode *precision) {
+    PrecisionMode dummy;
+    if (!precision) precision = &dummy;
+    if (!data) {
+        set_error(SPINGALETT_ERR_INVALID, "load: data is NULL");
+        return NULL;
+    }
+    const uint8_t *p = (const uint8_t *)data;
+    if (size >= 6 && memcmp(p, SLETT_MAGIC, 6) == 0)
+        return load_v3(p, size, precision);
+    uint16_t version = 0;
+    if (size < 2) {
+        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read format version");
+        return NULL;
+    }
+    memcpy(&version, p, 2);
+    if (version != 1 && version != 2) {
+        set_error(SPINGALETT_ERR_FORMAT_VERSION, "load: unsupported format version");
+        spingalett_log(LOG_ERROR, "Unsupported file format version %u (supported: 1..%u)", (unsigned)version,
+                       (unsigned)SPINGALETT_FORMAT_VERSION);
+        return NULL;
+    }
+    return load_legacy(p, size, precision);
+}
+
+NeuralNetwork *load_spingalett_from_memory(const void *data, size_t size) {
+    return spingalett_load_from_memory_ex(data, size, NULL);
 }
 
 NeuralNetwork *load_spingalett(const char *filename) {
@@ -439,210 +547,19 @@ NeuralNetwork *load_spingalett(const char *filename) {
         set_error(SPINGALETT_ERR_INVALID, "load: filename is NULL");
         return NULL;
     }
-
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        set_error(SPINGALETT_ERR_FILE_IO, "load: cannot open file for reading");
-        return NULL;
-    }
-
-    uint16_t format_version = 0;
-    if (fread(&format_version, sizeof(uint16_t), 1, fp) != 1) {
-        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read format version");
-        fclose(fp);
-        return NULL;
-    }
-
-    /* v1: no dropout section (read as rate 0). v2: per-layer dropout rates after the activations. */
-    if (format_version < 1 || format_version > SPINGALETT_FORMAT_VERSION) {
-        set_error(SPINGALETT_ERR_FORMAT_VERSION, "load: unsupported format version");
-        spingalett_log(LOG_ERROR, "Unsupported file format version %u (supported: 1..%u)", (unsigned)format_version, (unsigned)SPINGALETT_FORMAT_VERSION);
-        fclose(fp);
-        return NULL;
-    }
-
-    uint32_t layers = 0;
-    if (fread(&layers, sizeof(uint32_t), 1, fp) != 1) {
-        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read layer count");
-        fclose(fp);
-        return NULL;
-    }
-
-    if (layers < 2) {
-        set_error(SPINGALETT_ERR_INVALID, "load: network must have at least 2 layers");
-        fclose(fp);
-        return NULL;
-    }
-
-    uint8_t loss_type = 0;
-    if (fread(&loss_type, sizeof(uint8_t), 1, fp) != 1 || loss_type >= LOSS_COUNT) {
-        set_error(SPINGALETT_ERR_INVALID, "load: invalid loss type");
-        fclose(fp);
-        return NULL;
-    }
-
-    uint8_t has_optimizer = 0;
-    if (fread(&has_optimizer, sizeof(uint8_t), 1, fp) != 1) {
-        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read optimizer flag");
-        fclose(fp);
-        return NULL;
-    }
-
-    uint64_t ts = 0;
-    if (has_optimizer) {
-        if (fread(&ts, sizeof(uint64_t), 1, fp) != 1) {
-            set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read time step");
-            fclose(fp);
-            return NULL;
-        }
-    }
-
-    uint8_t precision_type = 0;
-    if (fread(&precision_type, sizeof(uint8_t), 1, fp) != 1 || precision_type >= PRECISION_COUNT) {
-        set_error(SPINGALETT_ERR_INVALID, "load: invalid precision type");
-        fclose(fp);
-        return NULL;
-    }
-    PrecisionMode precision = (PrecisionMode)precision_type;
-
-    uint32_t *topology = (uint32_t *)malloc(sizeof(uint32_t) * layers);
-    if (!topology) {
-        set_error(SPINGALETT_ERR_ALLOC, "load: topology allocation failed");
-        fclose(fp);
-        return NULL;
-    }
-
-    if (fread(topology, sizeof(uint32_t), layers, fp) != layers) {
-        set_error(SPINGALETT_ERR_FILE_IO, "load: failed to read topology");
-        free(topology);
-        fclose(fp);
-        return NULL;
-    }
-
-    ActivationFunction *act_func_array = (ActivationFunction *)malloc(sizeof(ActivationFunction) * (layers - 1));
-    if (!act_func_array) {
-        set_error(SPINGALETT_ERR_ALLOC, "load: activation function array allocation failed");
-        free(topology);
-        fclose(fp);
-        return NULL;
-    }
-
-    for (uint32_t i = 0; i < layers - 1; i++) {
-        uint8_t act = 0;
-        if (fread(&act, sizeof(uint8_t), 1, fp) != 1 || act >= ACT_COUNT) {
-            set_error(SPINGALETT_ERR_INVALID, "load: invalid activation function");
-            free(topology);
-            free(act_func_array);
-            fclose(fp);
-            return NULL;
-        }
-        act_func_array[i] = (ActivationFunction)act;
-    }
-
-    float *dropout_array = (float *)calloc(layers, sizeof(float));
-    if (!dropout_array) {
-        set_error(SPINGALETT_ERR_ALLOC, "load: dropout array allocation failed");
-        free(topology);
-        free(act_func_array);
-        fclose(fp);
-        return NULL;
-    }
-    if (format_version >= 2) {
-        bool ok = fread(dropout_array + 1, sizeof(float), layers - 1, fp) == layers - 1;
-        for (uint32_t l = 1; ok && l < layers; l++)
-            ok = dropout_array[l] >= 0.0f && dropout_array[l] < 1.0f;
-        if (!ok) {
-            set_error(SPINGALETT_ERR_INVALID, "load: invalid dropout rates");
-            free(topology);
-            free(act_func_array);
-            free(dropout_array);
-            fclose(fp);
-            return NULL;
-        }
-    }
-
-    uint64_t total_weights = 0;
-    uint64_t total_biases = 0;
-    for (uint32_t l = 0; l < layers - 1; l++) {
-        total_weights += (uint64_t)topology[l] * (uint64_t)topology[l + 1];
-        total_biases  += (uint64_t)topology[l + 1];
-    }
-
-    NeuralNetwork *net = new_spingalett_struct_arguments((NeuralNetworkArgs){ .loss_func = (LossFunction)loss_type });
+    size_t size = 0;
+    void *data = spingalett_read_file(filename, &size);
+    if (!data) return NULL;
+    PrecisionMode precision = PRECISION_FLOAT32;
+    NeuralNetwork *net = spingalett_load_from_memory_ex(data, size, &precision);
+    spingalett_aligned_free(data);
     if (!net) {
-        set_error(SPINGALETT_ERR_ALLOC, "load: network creation failed");
-        free(topology);
-        free(act_func_array);
-        free(dropout_array);
-        fclose(fp);
+        spingalett_log(LOG_ERROR, "Could not load %s: %s", filename, spingalett_last_error_message());
         return NULL;
     }
-    net->time_step = ts;
-
-    for (uint32_t l = 0; l < layers; l++) {
-        LayerArgs largs = {0};
-        largs.net = net;
-        largs.neurons_amount = topology[l];
-        if (l > 0)
-            largs.act_func = act_func_array[l - 1];
-        largs.weight_initialization = WEIGHT_INITIALIZATION_NONE;
-        largs.dropout_rate = dropout_array[l];
-
-        if (!spingalett_add_layer(largs)) {
-            free(topology);
-            free(act_func_array);
-            free(dropout_array);
-            free_network(net);
-            fclose(fp);
-            return NULL;
-        }
-    }
-
-    free(topology);
-    free(dropout_array);
-
-    bool read_ok = true;
-    for (uint32_t l = 0; l < net->layers - 1 && read_ok; l++) {
-        uint32_t in_dim  = net->topology[l];
-        uint32_t out_dim = net->topology[l + 1];
-        uint64_t woff    = net->weight_offsets[l];
-        uint64_t boff    = net->bias_offsets[l];
-        uint64_t wcount  = (uint64_t)in_dim * (uint64_t)out_dim;
-
-        read_ok = read_array_compressed(net->weights + woff, wcount, precision, fp);
-
-        if (has_optimizer && read_ok) {
-            read_ok = read_array_compressed(net->opt_m_weights + woff, wcount, precision, fp);
-            if (read_ok)
-                read_ok = read_array_compressed(net->opt_v_weights + woff, wcount, precision, fp);
-        }
-
-        if (read_ok)
-            read_ok = read_array_compressed(net->biases + boff, out_dim, precision, fp);
-
-        if (has_optimizer && read_ok) {
-            read_ok = read_array_compressed(net->opt_m_biases + boff, out_dim, precision, fp);
-            if (read_ok)
-                read_ok = read_array_compressed(net->opt_v_biases + boff, out_dim, precision, fp);
-        }
-    }
-
-    free(act_func_array);
-    fclose(fp);
-
-    if (!read_ok) {
-        set_error(SPINGALETT_ERR_FILE_IO, "load: file is truncated");
-        spingalett_log(LOG_ERROR, "Network file is truncated or corrupt: %s", filename);
-        free_network(net);
-        return NULL;
-    }
-
     spingalett_log(LOG_INFO, "Network loaded from %s", filename);
-    spingalett_log(LOG_INFO, "Load info: format=v%u, layers=%u, weights=%llu, biases=%llu, precision=%s, optimizer=%s",
-        (unsigned)format_version, layers,
-        (unsigned long long)total_weights, (unsigned long long)total_biases,
-        precision_type < PRECISION_COUNT ? precision_names[precision_type] : "UNKNOWN",
-        has_optimizer ? "ON" : "OFF");
-
+    spingalett_log(LOG_INFO, "Load info: layers=%u, weights=%llu, biases=%llu, precision=%s",
+        net->layers, (unsigned long long)net->total_weights, (unsigned long long)net->total_biases,
+        precision_names[precision]);
     return net;
 }

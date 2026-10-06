@@ -8,28 +8,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "Spingalett.Config.h"
+#include "Spingalett.Inference.h"   /* SPINGALETT_API, shared enums, error codes, the inference engine */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#if defined(SPINGALETT_STATIC)              /* static library, or sources compiled into the program */
-#  define SPINGALETT_API
-#elif defined(_WIN32) || defined(__CYGWIN__)
-#  ifdef SPINGALETT_EXPORTS
-#    define SPINGALETT_API __declspec(dllexport)
-#  else
-#    define SPINGALETT_API __declspec(dllimport)
-#  endif
-#else
-#  define SPINGALETT_API __attribute__((visibility("default")))
-#endif
-
-#define SPINGALETT_FORMAT_VERSION 2
-
-/* File name extensions: models (save_spingalett appends it when the name has none) and data sets. */
-#define SPINGALETT_MODEL_EXTENSION   ".slett"
-#define SPINGALETT_DATASET_EXTENSION ".slettd"
 
 typedef enum {
     LOG_DEBUG,
@@ -40,23 +23,6 @@ typedef enum {
 } LogLevel;
 
 typedef void (*LogCallback)(LogLevel level, const char *message);
-
-typedef enum {
-    ACT_SIGMOID,
-    ACT_RELU,
-    ACT_TANH,
-    ACT_LEAKY_RELU,
-    ACT_FOO52,
-    ACT_SOFTMAX,
-    ACT_NONE,
-    ACT_COUNT
-} ActivationFunction;
-
-typedef enum {
-    LOSS_MSE,
-    LOSS_CROSS_ENTROPY,
-    LOSS_COUNT
-} LossFunction;
 
 typedef enum {
     WEIGHT_INITIALIZATION_RANDOM,   /* uniform in [-1, 1] */
@@ -96,16 +62,6 @@ typedef enum {
     COMPUTE_CUDA,
     COMPUTE_COUNT
 } ComputeMode;
-
-typedef enum {
-    PRECISION_FLOAT32,
-    PRECISION_FP16,
-    PRECISION_BFLOAT16,
-    PRECISION_INT8,
-    PRECISION_INT4,
-    PRECISION_INT2,
-    PRECISION_COUNT
-} PrecisionMode;
 
 typedef enum {
     AUTOSAVE_OFF,
@@ -347,12 +303,6 @@ typedef struct {
     float *targets;                 /* [count x target_size] */
 } SpingalettDataset;
 
-#define SPINGALETT_OK                   0
-#define SPINGALETT_ERR_ALLOC            1   /* out of memory */
-#define SPINGALETT_ERR_INVALID          2   /* invalid argument or file contents */
-#define SPINGALETT_ERR_FILE_IO          3   /* file could not be opened, read or written, or is truncated */
-#define SPINGALETT_ERR_FORMAT_VERSION   4   /* model file written by an unsupported format version */
-
 /* Library version (the header's SPINGALETT_VERSION_* macros describe the headers in use). */
 SPINGALETT_API const char *spingalett_version(void);
 
@@ -437,7 +387,52 @@ SPINGALETT_API float spingalett_train_on_batch(SpingalettTrainer *trainer, const
 #define save_spingalett(...) save_spingalett_struct_arguments((SaveArgs){__VA_ARGS__})
 SPINGALETT_API void save_spingalett_struct_arguments(SaveArgs args);
 
+/* Reads a .slett file of any format version (1 to SPINGALETT_FORMAT_VERSION). Quantized weights are
+   expanded to float. */
 SPINGALETT_API NeuralNetwork *load_spingalett(const char *filename);
+
+/* The bytes save_spingalett writes, in memory (aligned to 64 bytes, so they also serve as a model
+   image for spingalett_model_init). *size receives their count. Release with spingalett_free.
+   Returns NULL on error. */
+SPINGALETT_API void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precision,
+                                               bool save_optimizer, size_t *size);
+/* Reads a .slett file image of any format version from memory; data is not modified and need not
+   be aligned. */
+SPINGALETT_API NeuralNetwork *load_spingalett_from_memory(const void *data, size_t size);
+/* Releases memory the library returned (spingalett_save_to_memory). */
+SPINGALETT_API void spingalett_free(void *ptr);
+
+/*
+ * Deployment. A SpingalettModel (Spingalett.Inference.h) is a read-only network that computes in the
+ * precision its weights are stored in: INT8, INT4 and INT2 layers use integer kernels. The functions
+ * below create models that own their image; release them with spingalett_model_free. Models made by
+ * spingalett_model_init over a caller's image need no release.
+ */
+
+/* A network quantized (or converted) to precision for inference. */
+SPINGALETT_API SpingalettModel *spingalett_model_from_network(const NeuralNetwork *net, PrecisionMode precision);
+/* Reads a .slett file. Images of format version 3 are used as stored; older ones are converted
+   in the precision they were saved in. */
+SPINGALETT_API SpingalettModel *spingalett_model_load(const char *path);
+/* Same, from an image in memory, which is copied. */
+SPINGALETT_API SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
+SPINGALETT_API void spingalett_model_free(SpingalettModel *model);
+/* Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all
+   threads in COMPUTE_OPENMP mode. Returns false on error. */
+SPINGALETT_API bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count,
+                                             float *outputs);
+/* Mean loss (the model's loss function, as evaluate() computes it) and accuracy over a data set. */
+SPINGALETT_API EvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs,
+                                                     const float *targets, uint32_t count);
+
+/*
+ * Writes net, in precision and without optimizer state, as a C header for compiling the model into
+ * a program or firmware: a 16-byte aligned `static const uint8_t name[]` holding the .slett image,
+ * and macros NAME_SIZE, NAME_INPUTS, NAME_OUTPUTS and NAME_WORKSPACE (bytes for
+ * spingalett_model_run), where NAME is name in upper case. name must be a C identifier.
+ */
+SPINGALETT_API bool spingalett_export_c_header(const NeuralNetwork *net, const char *path, const char *name,
+                                               PrecisionMode precision);
 
 /* Data sets. The readers fill *dataset (free it with spingalett_dataset_free) and return false
    on error, leaving it empty. */
