@@ -18,6 +18,15 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${SPINGALETT_BIN_DIR})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${SPINGALETT_LIB_DIR})
 
 # ------------------------------------------------------------------------------
+# Inference-only build: the engine of Spingalett.Inference.h and nothing else
+# ------------------------------------------------------------------------------
+option(SPINGALETT_INFERENCE_ONLY "Build only the inference engine: no training, file I/O, OpenMP or heap" OFF)
+if(SPINGALETT_INFERENCE_ONLY)
+    include(cmake/InferenceOnly.cmake)
+    return()
+endif()
+
+# ------------------------------------------------------------------------------
 # Feature flags (populated below, used for config header)
 # ------------------------------------------------------------------------------
 set(SPINGALETT_HAS_OPENMP OFF)
@@ -300,13 +309,15 @@ if(BUILD_EXAMPLE)
         endif()
     endforeach()
 
-    # DatasetTool is a utility rather than a demo: install it next to the library.
-    if(APPLE)
-        set_target_properties(DatasetTool PROPERTIES INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
-    elseif(UNIX)
-        set_target_properties(DatasetTool PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
-    endif()
-    install(TARGETS DatasetTool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # DatasetTool and ModelTool are utilities rather than demos: install them next to the library.
+    foreach(SPINGALETT_TOOL DatasetTool ModelTool)
+        if(APPLE)
+            set_target_properties(${SPINGALETT_TOOL} PROPERTIES INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+        elseif(UNIX)
+            set_target_properties(${SPINGALETT_TOOL} PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+        endif()
+        install(TARGETS ${SPINGALETT_TOOL} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endforeach()
 endif()
 
 # ------------------------------------------------------------------------------
@@ -394,6 +405,11 @@ if(BUILD_TESTS)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()
+
+    # The inference engine on its own, also running models exported as C headers.
+    include(cmake/SpingalettEngine.cmake)
+    spingalett_engine_library(SpingalettEngine)
+    spingalett_engine_tests(SpingalettEngine SpingalettTests)
 
     # A sanitizer-instrumented library cannot be loaded into an uninstrumented Python.
     find_package(Python3 COMPONENTS Interpreter QUIET)

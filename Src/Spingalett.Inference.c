@@ -430,7 +430,7 @@ int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
         memcpy(&wa, a + k, 4);
         memcpy(&wb, b + k, 4);
         sum = __smlad(__sxtb16(wa), __sxtb16(wb), sum);
-        sum = __smlad(__sxtb16(__ror(wa, 8)), __sxtb16(__ror(wb, 8)), sum);
+        sum = __smlad(__sxtb16((wa >> 8) | (wa << 24)), __sxtb16((wb >> 8) | (wb << 24)), sum);   /* bytes 1 and 3 */
     }
 #endif
     for (; k < n; k++) sum += (int32_t)a[k] * (int32_t)b[k];

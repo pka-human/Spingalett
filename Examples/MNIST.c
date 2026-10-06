@@ -10,7 +10,8 @@
  *   Bin/MNIST data/mnist [epochs] [st|omp|blas]
  *
  * Holds out 5,000 training images for validation, keeps the weights of the epoch with the best
- * validation accuracy, reports the test accuracy once at the end and saves the model to mnist.slett.
+ * validation accuracy, reports the test accuracy once at the end, saves the model to mnist.slett
+ * and shows what quantizing it for deployment costs in accuracy and gains in size.
  */
 
 #include <Spingalett/Spingalett.h>
@@ -120,6 +121,17 @@ int main(int argc, char **argv) {
            report.epochs_run, wall, (double)train_set.count * (double)report.epochs_run / wall,
            report.best_epoch, 100.0 * (double)report.best_value);
     printf("test accuracy: %.2f%%  (test loss %.4f)\n", 100.0 * (double)test.accuracy, (double)test.loss);
+
+    /* the same network as a deployment model in other precisions (see ModelTool eval) */
+    const PrecisionMode quantized[] = {PRECISION_FP16, PRECISION_INT8, PRECISION_INT4};
+    const char *names[] = {"FP16", "INT8", "INT4"};
+    for (int q = 0; q < 3; q++) {
+        SpingalettModel *model = spingalett_model_from_network(net, quantized[q]);
+        if (!model) continue;
+        EvalMetrics m = spingalett_model_evaluate(model, test_set.inputs, test_set.targets, test_set.count);
+        printf("%s model: %zu bytes, test accuracy %.2f%%\n", names[q], model->image_size, 100.0 * (double)m.accuracy);
+        spingalett_model_free(model);
+    }
 
     save_spingalett(.net = net, .filename = "mnist.slett", .do_not_save_optimizer = true);
     free_network(net);
