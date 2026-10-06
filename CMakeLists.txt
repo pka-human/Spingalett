@@ -372,6 +372,10 @@ if(BUILD_TESTS)
 
     add_executable(SpingalettTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Tests.c)
     target_link_libraries(SpingalettTests PRIVATE spingalett)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        # the deployment tests recompute the engine's arithmetic and compare it bit for bit
+        target_compile_options(SpingalettTests PRIVATE -ffp-contract=off)
+    endif()
     target_compile_definitions(SpingalettTests PRIVATE
         SPINGALETT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Tests/Data")
     if(UNIX AND NOT APPLE)
