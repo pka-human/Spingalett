@@ -239,6 +239,45 @@ with sg.Network(sg.Loss.MSE, [2, 3]) as net: pass
 sg.set_log_callback(None); sg.set_verbose(False)
 check(any("Creating new network" in m for _, m in msgs) and all(isinstance(l, sg.LogLevel) for l, _ in msgs), f"log callback {msgs[:2]}")
 
+# deployment models
+sg.seed(5)
+with sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Layer(12), sg.Layer(20, sg.Activation.RELU, sg.Init.HE),
+                                       sg.Layer(5, sg.Activation.SOFTMAX, sg.Init.XAVIER)]) as net:
+    x = rng.normal(size=(40, 12)).astype(np.float32)
+    ref = net.forward(x)
+    blob = net.to_bytes()
+    check(blob[:6] == b"SLETTM" and len(blob) % 16 == 0, "to_bytes: format 3 image")
+    with sg.Network.from_bytes(blob) as back:
+        check(np.array_equal(back.forward(x), ref), "from_bytes round trip")
+    for p, tol in ((sg.Precision.FLOAT32, 1e-6), (sg.Precision.FP16, 3e-3), (sg.Precision.INT8, 2e-2), (sg.Precision.INT4, 0.2)):
+        with net.to_model(p) as m:
+            out = m.predict(x)
+            check(m.input_size == 12 and m.output_size == 5 and m.loss == sg.Loss.CROSS_ENTROPY and
+                  [l.precision for l in m.layers] == [p, p] and m.layers[0].activation == sg.Activation.RELU,
+                  f"model description {m!r}")
+            check(np.abs(out - ref).max() < tol, f"model {p.name} vs network: {np.abs(out - ref).max():.2e}")
+            check(np.array_equal(m(x[7]), out[7]), "model single sample")
+            metrics = m.evaluate(x, ref)
+            check(0 <= metrics.accuracy <= 1 and math.isfinite(metrics.loss), "model evaluate")
+            with sg.Model.from_bytes(m.to_bytes()) as copy:
+                check(np.array_equal(copy.predict(x), out), "model to_bytes / from_bytes")
+    with tempfile.TemporaryDirectory() as d:
+        net.save(os.path.join(d, "net"), precision=sg.Precision.INT8, save_optimizer=False)
+        with sg.Model.load(os.path.join(d, "net.slett")) as m:
+            check(m.layers[0].precision == sg.Precision.INT8 and m.size == len(net.to_bytes(sg.Precision.INT8)),
+                  "Model.load of an INT8 file")
+        net.export_c_header(os.path.join(d, "model.h"), "my_model", sg.Precision.INT4)
+        text = open(os.path.join(d, "model.h")).read()
+        check("static const uint8_t my_model[MY_MODEL_SIZE]" in text and "#define MY_MODEL_INPUTS 12u" in text, "C header")
+        try:
+            net.export_c_header(os.path.join(d, "bad.h"), "not-an-identifier"); check(False, "bad header name accepted")
+        except sg.SpingalettError as e:
+            check(e.code == sg.ErrorCode.INVALID, "bad header name error code")
+try:
+    sg.Model.from_bytes(b"SLETTM" + bytes(100)); check(False, "corrupt model accepted")
+except sg.SpingalettError:
+    pass
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")
