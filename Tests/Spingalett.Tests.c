@@ -8,7 +8,7 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad equiv cont optim sched dropout gen predict valid step data io xor
+ *   Spingalett.Tests [group]     groups: grad equiv cont optim sched dropout gen predict valid step data io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -1425,6 +1425,352 @@ static void dataset_files(void) {
     spingalett_dataset_free(&fl);
 }
 
+
+/* ---------------------------------------------------------------- deployment models (format 3) */
+
+/* Fields of a .slett format 3 image, read as docs/ModelFormat.md describes them. */
+static uint32_t rd32(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t rd64(const uint8_t *p) { return rd32(p) | (uint64_t)rd32(p + 4) << 32; }
+static float rdf(const uint8_t *p) { uint32_t u = rd32(p); float f; memcpy(&f, &u, 4); return f; }
+static void wr32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+
+/* Rewrites both checksums of a `len`-byte image after a deliberate change. */
+static void reseal(uint8_t *img, size_t len) {
+    uint64_t size = rd64(img + 24);
+    if (size < 64 || size > len) size = len;
+    wr32(img + 56, test_crc32(img + 64, (size_t)size - 64));
+    wr32(img + 60, test_crc32(img, 60));
+}
+
+typedef struct { uint32_t in, out; int act, prec; uint64_t w, s, b, o; } Entry;
+static Entry image_layer(const uint8_t *img, uint32_t i) {
+    const uint8_t *e = img + 64 + 48 * (size_t)i;
+    Entry r = {rd32(e), rd32(e + 4), e[8], e[9], rd64(e + 16), rd64(e + 24), rd64(e + 32), rd64(e + 40)};
+    return r;
+}
+
+static double half_value(uint16_t h) {
+    int e = (h >> 10) & 31, m = h & 1023;
+    double v = e == 0 ? ldexp(m, -24) : ldexp(1024 + m, e - 25);
+    return h & 0x8000 ? -v : v;
+}
+
+static int stored_code(const uint8_t *img, Entry e, uint32_t j, uint32_t k) {
+    if (e.prec == PRECISION_INT8) return (int8_t)img[e.w + (uint64_t)j * e.in + k];
+    if (e.prec == PRECISION_INT4) {
+        uint8_t b = img[e.w + (uint64_t)j * ((e.in + 1) / 2) + k / 2];
+        return (int)(((k & 1) ? b >> 4 : b & 15) ^ 8) - 8;
+    }
+    uint8_t b = img[e.w + (uint64_t)j * ((e.in + 3) / 4) + k / 4];
+    return (int)(((b >> (2 * (k % 4))) & 3) ^ 2) - 2;
+}
+
+static double stored_weight(const uint8_t *img, Entry e, uint32_t j, uint32_t k) {
+    uint64_t i = (uint64_t)j * e.in + k;
+    if (e.prec == PRECISION_FLOAT32) return rdf(img + e.w + 4 * i);
+    if (e.prec == PRECISION_FP16) return half_value((uint16_t)(img[e.w + 2 * i] | img[e.w + 2 * i + 1] << 8));
+    if (e.prec == PRECISION_BFLOAT16) { uint32_t u = (uint32_t)(img[e.w + 2 * i] | img[e.w + 2 * i + 1] << 8) << 16; float f; memcpy(&f, &u, 4); return f; }
+    return stored_code(img, e, j, k) * (double)rdf(img + e.s + 4 * (uint64_t)j);
+}
+
+/* What the engine computes for one weight layer without activation, from the stored image:
+   integer layers quantize x like the engine (scale = max |x| / 127, nearest even) and accumulate
+   exactly, which must match bit for bit; float layers accumulate in double, so `bound` receives a
+   bound on the rounding error. */
+static void reference_layer(const uint8_t *img, Entry e, const float *x, float *y, double *bound) {
+    if (e.prec >= PRECISION_INT8) {
+        float amax = 0;
+        for (uint32_t k = 0; k < e.in; k++) if (fabsf(x[k]) > amax) amax = fabsf(x[k]);
+        float a = amax / 127.0f, inv = amax > 0 ? 127.0f / amax : 0;
+        int8_t *q = malloc(e.in);
+        for (uint32_t k = 0; k < e.in; k++) q[k] = (int8_t)lrintf(x[k] * inv);
+        for (uint32_t j = 0; j < e.out; j++) {
+            int64_t acc = 0;
+            for (uint32_t k = 0; k < e.in; k++) acc += (int64_t)stored_code(img, e, j, k) * q[k];
+            float rs = rdf(img + e.s + 4 * (uint64_t)j), bias = rdf(img + e.b + 4 * (uint64_t)j);
+            y[j] = bias + (rs * a) * (float)acc;
+            bound[j] = 0;
+        }
+        free(q);
+    } else {
+        for (uint32_t j = 0; j < e.out; j++) {
+            double acc = rdf(img + e.b + 4 * (uint64_t)j), mag = fabs(acc);
+            for (uint32_t k = 0; k < e.in; k++) { double t = stored_weight(img, e, j, k) * x[k]; acc += t; mag += fabs(t); }
+            y[j] = (float)acc;
+            bound[j] = 1e-6 * mag + 1e-30;
+        }
+    }
+}
+
+/* One layer (no activation) per size: the engine against the image, with rows of very different
+   magnitudes (per-row scales), a zero row, and an all-zero sample. Covers every vector tail. */
+static void model_kernels(PrecisionMode p) {
+    static const uint32_t sizes[] = {1, 3, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257, 300, 513, 784, 1031};
+    uint32_t N = 6, worst_exact = 0; double worst = 0; lcg_state = 99 + p;
+    for (size_t t = 0; t < sizeof sizes / sizeof *sizes; t++) {
+        uint32_t K = sizes[t];
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(net, K); layer(net, N, ACT_NONE);
+        for (uint32_t j = 0; j < N; j++)
+            for (uint32_t k = 0; k < K; k++)
+                net->weights[(size_t)j * K + k] = j == 2 ? 0.0f : (frand() * 2 - 1) * powf(10.0f, (float)j - 2.0f);
+        for (uint32_t j = 0; j < N; j++) net->biases[j] = frand() - 0.5f;
+        SpingalettModel *m = spingalett_model_from_network(net, p);
+        size_t size = 0;
+        uint8_t *img = spingalett_save_to_memory(net, p, false, &size);
+        CHECK(m && img && size == m->image_size && !memcmp(img, m->image, size), "kernels p=%d K=%u: model image", p, K);
+        if (!m || !img) { free_network(net); spingalett_model_free(m); spingalett_free(img); continue; }
+        void *ws = malloc(m->workspace_size);           /* exact size: ASan catches overruns */
+        float *x = malloc(K * sizeof(float)), y[6], r[6]; double bound[6];
+        for (int s = 0; s < 3; s++) {
+            for (uint32_t k = 0; k < K; k++) x[k] = s == 2 ? 0.0f : (frand() * 2 - 1) * (s ? 0.01f : 3.0f);
+            int rc = spingalett_model_run(m, x, y, ws);
+            reference_layer(img, image_layer(img, 0), x, r, bound);
+            for (uint32_t j = 0; j < N; j++) {
+                double d = fabs((double)y[j] - r[j]);
+                if (bound[j] == 0) { if (d != 0) worst_exact++; }
+                else if (d / bound[j] > worst) worst = d / bound[j];
+            }
+            CHECK(rc == SPINGALETT_OK, "kernels p=%d K=%u: run failed", p, K);
+        }
+        free(ws); free(x); spingalett_free(img); spingalett_model_free(m); free_network(net);
+    }
+    printf("  kernels precision=%d: %s\n", p, p >= PRECISION_INT8 ? (worst_exact ? "MISMATCH" : "bit-exact") : (worst <= 1 ? "within rounding" : "OFF"));
+    CHECK(worst_exact == 0 && worst <= 1.0, "kernels precision %d: %u inexact integer outputs, float error %.2f x bound", p, worst_exact, worst);
+}
+
+static NeuralNetwork *deploy_net(void) {
+    L ls[] = {{64, ACT_NONE}, {48, ACT_RELU}, {37, ACT_TANH}, {29, ACT_LEAKY_RELU}, {10, ACT_SOFTMAX}};
+    lcg_state = 2024;
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    for (int i = 0; i < 5; i++) layer(.net = net, .neurons_amount = ls[i].n, .act_func = ls[i].act);
+    for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.35f;
+    for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() * 0.2f - 0.1f;
+    return net;
+}
+
+/* Quantized models against the float network, and batched predict against single runs. */
+static void model_inference(PrecisionMode p, float tol) {
+    NeuralNetwork *net = deploy_net();
+    uint32_t N = 300, in = 64, out = 10;                 /* two predict chunks */
+    float *x = malloc((size_t)N * in * sizeof(float)), *ref = malloc((size_t)N * out * sizeof(float));
+    float *one = malloc((size_t)N * out * sizeof(float)), *batch = malloc((size_t)N * out * sizeof(float));
+    for (size_t i = 0; i < (size_t)N * in; i++) x[i] = frand() * 2 - 1;
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    predict(.net = net, .inputs = x, .sample_count = N, .outputs = ref);
+
+    SpingalettModel *m = spingalett_model_from_network(net, p);
+    CHECK(m && m->input_size == in && m->output_size == out && m->layer_count == 4 && m->loss == LOSS_CROSS_ENTROPY,
+          "inference p=%d: model fields", p);
+    if (!m) { free(x); free(ref); free(one); free(batch); free_network(net); return; }
+    SpingalettLayerInfo li;
+    CHECK(spingalett_model_layer(m, 1, &li) && li.inputs == 48 && li.outputs == 37 && li.activation == ACT_TANH &&
+          li.precision == p && !spingalett_model_layer(m, 4, &li), "inference p=%d: layer info", p);
+
+    void *ws = malloc(m->workspace_size);
+    for (uint32_t s = 0; s < N; s++) spingalett_model_run(m, x + (size_t)s * in, one + (size_t)s * out, ws);
+    free(ws);
+    float qerr = max_abs_diff(ref, one, (size_t)N * out);
+    uint32_t agree = 0;
+    for (uint32_t s = 0; s < N; s++) {
+        uint32_t a = 0, b = 0;
+        for (uint32_t k = 1; k < out; k++) {
+            if (ref[s * out + k] > ref[s * out + a]) a = k;
+            if (one[s * out + k] > one[s * out + b]) b = k;
+        }
+        agree += a == b;
+    }
+
+    ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+    float worst = 0;
+    for (int c = 0; c < 3; c++) {
+        spingalett_set_compute_mode(cm[c]);
+        memset(batch, 0, (size_t)N * out * sizeof(float));
+        CHECK(spingalett_model_predict(m, x, N, batch), "inference p=%d: predict failed", p);
+        float d = max_abs_diff(one, batch, (size_t)N * out);
+        if (d > worst) worst = d;
+    }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    bool integer = p >= PRECISION_INT8;
+    printf("  inference precision=%d: max|q - fp32| = %.2e, argmax agrees %u/%u, |predict - run| = %.1e\n", p, qerr, agree, N, worst);
+    /* random weights give near ties, so argmax agreement is only a sanity check here; Examples/MNIST.c
+       measures accuracy on real data */
+    uint32_t min_agree = p == PRECISION_INT2 ? 30u : (p == PRECISION_INT4 ? 80u : 97u);
+    CHECK(qerr <= tol && agree * 100 >= N * min_agree, "inference p=%d: error %.3e, agreement %u/%u", p, qerr, agree, N);
+    CHECK(integer ? worst == 0.0f : worst < 1e-5f, "inference p=%d: predict differs from run by %.3e", p, worst);
+
+    EvalMetrics e1 = evaluate(.net = net, .inputs = x, .targets = ref, .sample_count = N);
+    EvalMetrics e2 = spingalett_model_evaluate(m, x, ref, N);
+    if (p == PRECISION_FLOAT32)
+        CHECK(fabsf(e1.loss - e2.loss) < 1e-5f && e1.accuracy == e2.accuracy, "inference: model_evaluate %.6f/%.3f vs %.6f/%.3f",
+              e2.loss, e2.accuracy, e1.loss, e1.accuracy);
+    else
+        CHECK(isfinite(e2.loss) && fabsf(e2.accuracy - (float)agree / N) < 1e-6f, "inference p=%d: model_evaluate", p);
+
+    spingalett_model_free(m);
+    free(x); free(ref); free(one); free(batch); free_network(net);
+}
+
+/* The validator must reject every damaged image without reading out of bounds. */
+static void model_validation(void) {
+    NeuralNetwork *net = deploy_net();
+    size_t size = 0;
+    uint8_t *img = spingalett_save_to_memory(net, PRECISION_INT8, true, &size);
+    uint8_t *buf = malloc(size + 8);
+    SpingalettModel m;
+    int failures_before = failures;
+
+    CHECK(spingalett_model_init(&m, img, size) == SPINGALETT_OK, "validation: intact image rejected");
+    CHECK(spingalett_model_init(&m, img, size + 4096) == SPINGALETT_OK && m.image_size == size, "validation: larger region");
+    for (size_t i = 0; i < size; i++) {                         /* every truncation */
+        memcpy(buf, img, i);
+        int rc = spingalett_model_init(&m, buf, i);
+        if (rc == SPINGALETT_OK) { CHECK(0, "validation: image truncated to %zu bytes accepted", i); break; }
+    }
+    for (size_t i = 0; i < size; i += (i < 64 + 4 * 48 ? 1 : 97)) {   /* flipped bits */
+        memcpy(buf, img, size);
+        buf[i] ^= (uint8_t)(1u << (i % 8));
+        if (spingalett_model_init(&m, buf, size) == SPINGALETT_OK) { CHECK(0, "validation: flipped byte %zu accepted", i); break; }
+    }
+    memcpy(buf + 1, img, size);
+    CHECK(spingalett_model_init(&m, buf + 1, size) == SPINGALETT_ERR_INVALID, "validation: misaligned image accepted");
+
+    /* inconsistent contents with valid checksums */
+    struct { size_t at; uint32_t value; const char *what; } bad[] = {
+        {64 + 48 + 0, 47, "inputs differ from the previous layer's outputs"},
+        {64 + 4, 0, "zero outputs"},
+        {64 + 16, 3, "misaligned weights"},
+        {64 + 32, 0xFFFFFF00u, "biases beyond the image"},
+        {64 + 24, 0, "integer layer without scales"},
+        {8, 1, "single layer"},
+        {8, 7, "more layers than entries"},
+        {64 + 8, ACT_COUNT, "unknown activation"},
+        {64 + 9, PRECISION_COUNT, "unknown precision"},
+        {64 + 12, 0x3F800000u, "dropout rate 1"},
+        {24, 63, "file size below the header"},
+    };
+    for (size_t t = 0; t < sizeof bad / sizeof *bad; t++) {
+        memcpy(buf, img, size);
+        if (bad[t].at == 64 + 8 || bad[t].at == 64 + 9) buf[bad[t].at] = (uint8_t)bad[t].value;
+        else wr32(buf + bad[t].at, bad[t].value);
+        if (bad[t].at == 24) wr32(buf + 28, 0);
+        reseal(buf, size);
+        int rc = spingalett_model_init(&m, buf, size);
+        CHECK(rc != SPINGALETT_OK, "validation: %s accepted", bad[t].what);
+    }
+
+    memcpy(buf, img, size);
+    buf[6] = 4;                                                  /* a future format version */
+    reseal(buf, size);
+    CHECK(spingalett_model_init(&m, buf, size) == SPINGALETT_ERR_FORMAT_VERSION, "validation: future version");
+    CHECK(spingalett_model_init(NULL, img, size) == SPINGALETT_ERR_INVALID && spingalett_model_init(&m, NULL, size) == SPINGALETT_ERR_INVALID,
+          "validation: NULL arguments");
+    CHECK(load_spingalett_from_memory(buf, size) == NULL && spingalett_last_error_code() == SPINGALETT_ERR_FORMAT_VERSION,
+          "validation: load of a future version");
+
+    /* the full library's loaders accept unaligned copies */
+    memcpy(buf + 1, img, size);
+    NeuralNetwork *b = load_spingalett_from_memory(buf + 1, size);
+    SpingalettModel *owned = spingalett_model_from_memory(buf + 1, size);
+    CHECK(b && owned, "validation: unaligned copy not loaded");
+    spingalett_model_free(owned);
+    if (b) free_network(b);
+
+    CHECK(spingalett_save_to_memory(NULL, PRECISION_INT8, false, &size) == NULL &&
+          spingalett_save_to_memory(net, PRECISION_COUNT, false, &size) == NULL && size == 0, "validation: save arguments");
+    NeuralNetwork *wide = new_spingalett(.loss_func = LOSS_MSE);
+    layer(wide, 131073); layer(wide, 1, ACT_NONE);
+    CHECK(spingalett_model_from_network(wide, PRECISION_INT8) == NULL && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "validation: integer layer with 131073 inputs");
+    SpingalettModel *f32 = spingalett_model_from_network(wide, PRECISION_FLOAT32);
+    CHECK(f32 != NULL, "validation: float layer with 131073 inputs");
+    spingalett_model_free(f32);
+    free_network(wide);
+
+    printf("  model validation %s\n", failures == failures_before ? "checked" : "FAILED");
+    free(buf); spingalett_free(img); free_network(net);
+}
+
+/* Optimizer state, legacy files, NaN inputs and C header export. */
+static void model_files(void) {
+    float x[16 * 6], y[16 * 3];
+    lcg_state = 31;
+    for (int i = 0; i < 16 * 6; i++) x[i] = frand() * 2 - 1;
+    for (int i = 0; i < 16 * 3; i++) y[i] = frand();
+    L ls[] = {{6, ACT_NONE}, {9, ACT_TANH}, {3, ACT_SIGMOID}};
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    NeuralNetwork *a = build(LOSS_MSE, ls, 3, NULL, NULL);
+    train(.net = a, .inputs = x, .targets = y, .sample_count = 16, .epochs = 5, .optimizer_type = OPTIMIZER_ADAM, .learning_rate = 0.01f, .training_strategy = STRATEGY_FULL_BATCH);
+    size_t size = 0;
+    void *img = spingalett_save_to_memory(a, PRECISION_FLOAT32, true, &size);
+    NeuralNetwork *b = load_spingalett_from_memory(img, size);
+    CHECK(b && b->time_step == a->time_step, "files: optimizer state not restored");
+    if (b) {
+        train(.net = a, .inputs = x, .targets = y, .sample_count = 16, .epochs = 5, .optimizer_type = OPTIMIZER_ADAM, .learning_rate = 0.01f, .training_strategy = STRATEGY_FULL_BATCH);
+        train(.net = b, .inputs = x, .targets = y, .sample_count = 16, .epochs = 5, .optimizer_type = OPTIMIZER_ADAM, .learning_rate = 0.01f, .training_strategy = STRATEGY_FULL_BATCH);
+        float d = max_abs_diff(a->weights, b->weights, a->total_weights);
+        printf("  files: training resumed from memory differs by %.1e\n", d);
+        CHECK(d == 0.0f, "files: resumed training differs by %.3e", d);
+        free_network(b);
+    }
+    spingalett_free(img);
+
+    /* a version 1 file runs as a model in its own precision */
+    NeuralNetwork *v1 = load_spingalett(SPINGALETT_TEST_DATA_DIR "/xor_v1.nn");
+    SpingalettModel *mv1 = spingalett_model_load(SPINGALETT_TEST_DATA_DIR "/xor_v1.nn");
+    CHECK(v1 && mv1, "files: xor_v1.nn as a model");
+    if (v1 && mv1) {
+        float in[2] = {1, 0}, out[1];
+        float *f = forward(.net = v1, .input = in);
+        CHECK(spingalett_model_run(mv1, in, out, NULL) == SPINGALETT_OK && fabsf(out[0] - f[0]) < 1e-6f,
+              "files: xor_v1 model output %.6f vs %.6f", out[0], f[0]);
+    }
+    spingalett_model_free(mv1);
+    if (v1) free_network(v1);
+
+    /* NaN in, NaN out, in every precision */
+    for (int p = 0; p < PRECISION_COUNT; p++) {
+        SpingalettModel *m = spingalett_model_from_network(a, (PrecisionMode)p);
+        float in[6] = {0.1f, NAN, 0.3f, 0, 0, 0}, out[3];
+        CHECK(m && spingalett_model_run(m, in, out, NULL) == SPINGALETT_OK && isnan(out[0]), "files: NaN input, precision %d", p);
+        spingalett_model_free(m);
+    }
+
+    /* C header: the array holds the image, the macros the sizes */
+    const char *path = "spingalett_test_model.h";
+    CHECK(spingalett_export_c_header(a, path, "test_model", PRECISION_INT4), "files: export failed");
+    CHECK(!spingalett_export_c_header(a, path, "1model", PRECISION_INT4) && !spingalett_export_c_header(a, path, "a-b", PRECISION_INT4) &&
+          !spingalett_export_c_header(a, path, NULL, PRECISION_INT4), "files: invalid names accepted");
+    SpingalettModel *m = spingalett_model_from_network(a, PRECISION_INT4);
+    FILE *f = fopen(path, "r");
+    char line[512];
+    unsigned long hsize = 0, hin = 0, hout = 0, hws = 0;
+    size_t count = 0;
+    bool data = false, same = m != NULL;
+    while (f && fgets(line, sizeof line, f)) {
+        sscanf(line, "#define TEST_MODEL_SIZE %luu", &hsize);
+        sscanf(line, "#define TEST_MODEL_INPUTS %luu", &hin);
+        sscanf(line, "#define TEST_MODEL_OUTPUTS %luu", &hout);
+        sscanf(line, "#define TEST_MODEL_WORKSPACE %luu", &hws);
+        if (strstr(line, "static const uint8_t test_model[TEST_MODEL_SIZE] = {")) { data = true; continue; }
+        if (!data) continue;
+        if (line[0] == '}') break;
+        for (char *c = line; (c = strstr(c, "0x")) != NULL; c += 4) {
+            unsigned v;
+            sscanf(c, "0x%2x", &v);
+            if (!m || count >= m->image_size || ((const uint8_t *)m->image)[count] != v) same = false;
+            count++;
+        }
+    }
+    if (f) fclose(f);
+    remove(path);
+    CHECK(m && same && count == m->image_size && hsize == m->image_size && hin == 6 && hout == 3 && hws == m->workspace_size,
+          "files: header contents (%zu bytes, size %lu, in %lu, out %lu, workspace %lu)", count, hsize, hin, hout, hws);
+    printf("  files: optimizer state, version 1 model, NaN and C header checked\n");
+    spingalett_model_free(m);
+    free_network(a);
+}
+
 int main(int argc, char **argv) {
     const char *only = argc > 1 ? argv[1] : "";
     spingalett_set_verbose(false);
@@ -1547,6 +1893,18 @@ int main(int argc, char **argv) {
         roundtrip(PRECISION_INT8, 1.5e-2f);
         load_robustness();
         error_codes();
+    }
+    if (!*only || !strcmp(only, "model")) {
+        printf("[deployment models]\n");
+        for (int p = 0; p < PRECISION_COUNT; p++) model_kernels((PrecisionMode)p);
+        model_inference(PRECISION_FLOAT32, 1e-5f);
+        model_inference(PRECISION_FP16, 2e-3f);
+        model_inference(PRECISION_BFLOAT16, 2e-2f);
+        model_inference(PRECISION_INT8, 3e-2f);
+        model_inference(PRECISION_INT4, 0.1f);
+        model_inference(PRECISION_INT2, 0.5f);
+        model_validation();
+        model_files();
     }
     if (!*only || !strcmp(only, "xor")) {
         printf("[xor convergence]\n");

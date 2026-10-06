@@ -41,26 +41,8 @@ static uint64_t get64(const uint8_t *p) { return (uint64_t)get32(p) | (uint64_t)
 static uint32_t float_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static float bits_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
-/* ---------------------------------------------------------------- CRC-32 (IEEE, reflected) */
-
-static uint32_t crc_table[256];
-static bool crc_ready;
-
-static void crc_init(void) {
-    if (crc_ready) return;
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
-        crc_table[i] = c;
-    }
-    crc_ready = true;
-}
-
-static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n) {
-    crc = ~crc;
-    for (size_t i = 0; i < n; i++) crc = crc_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    return ~crc;
-}
+/* CRC-32: spingalett_crc32 (Spingalett.Inference.c), shared with model files. */
+#define crc32_update spingalett_crc32
 
 /* ---------------------------------------------------------------- range coder */
 
@@ -625,7 +607,6 @@ static char *with_extension(const char *path) {
 }
 
 bool spingalett_save_dataset(const SpingalettDataset *d, const char *path, const DatasetSaveOptions *options) {
-    crc_init();
     unit_init();
     DatasetSaveOptions opt = options ? *options : (DatasetSaveOptions){0};
     if (!d || !path || !d->inputs || !d->targets || d->count == 0 || d->input_size == 0 || d->target_size == 0)
@@ -755,7 +736,6 @@ static bool alloc_dataset(SpingalettDataset *d, const Layout *L) {
 }
 
 bool spingalett_load_dataset_from_memory(const void *data, size_t size, SpingalettDataset *dataset) {
-    crc_init();
     unit_init();
     if (!dataset) return fail(SPINGALETT_ERR_INVALID, "spingalett_load_dataset: dataset is NULL");
     memset(dataset, 0, sizeof *dataset);
@@ -883,7 +863,6 @@ static void reader_start_pass(SpingalettDatasetReader *r) {
 }
 
 SpingalettDatasetReader *spingalett_dataset_open(const char *path, bool shuffle) {
-    crc_init();
     unit_init();
     SpingalettDatasetReader *r = (SpingalettDatasetReader *)calloc(1, sizeof *r);
     if (!r) { fail(SPINGALETT_ERR_ALLOC, "spingalett_dataset_open: out of memory"); return NULL; }

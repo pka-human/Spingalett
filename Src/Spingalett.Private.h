@@ -6,6 +6,7 @@
 #pragma once
 
 #include "Spingalett/Spingalett.h"
+#include "Spingalett.Engine.h"
 #include <stdint.h>
 
 #if defined(SPINGALETT_HAS_OPENBLAS)
@@ -87,11 +88,13 @@ void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
 
-/* IEEE half and bfloat16 conversions, round to nearest even (Spingalett.Serialize.c). */
-uint16_t spingalett_float_to_fp16(float x);
-float    spingalett_fp16_to_float(uint16_t h);
-uint16_t spingalett_float_to_bf16(float x);
-float    spingalett_bf16_to_float(uint16_t h);
+/* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
+   spingalett_aligned_free). NULL on error, with the error set. */
+void *spingalett_read_file(const char *path, size_t *size);
+/* load_spingalett_from_memory that also reports the precision of the first weight layer. */
+NeuralNetwork *spingalett_load_from_memory_ex(const void *data, size_t size, PrecisionMode *precision);
+/* Whether a sample counts as correctly classified (see EvalMetrics). */
+bool spingalett_sample_correct(const float *output, const float *target, uint32_t n);
 
 void *spingalett_aligned_alloc(size_t size);
 void *spingalett_aligned_calloc(size_t count, size_t elem_size);

@@ -249,6 +249,14 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(spingalett PRIVATE m)
 endif()
 
+# The inference engine and batched model inference compute in IEEE order (no reassociation,
+# reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
+    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c
+        PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
+endif()
+
 if(NOT MSVC)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_result)
@@ -382,7 +390,7 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
-    foreach(group grad equiv cont optim sched dropout gen predict valid step data io xor)
+    foreach(group grad equiv cont optim sched dropout gen predict valid step data io model xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()
