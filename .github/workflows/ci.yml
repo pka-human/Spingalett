@@ -69,3 +69,62 @@ jobs:
 
       - name: Test
         run: ctest --test-dir Build --output-on-failure
+
+  inference-only:
+    name: inference engine alone
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The engine as C99, C11 and C17 (gcc, clang)
+        run: |
+          for cc in gcc clang; do
+            for std in c99 c11 c17; do
+              $cc -std=$std -Wall -Wextra -Wpedantic -Werror -O2 -DSPINGALETT_INFERENCE_ONLY \
+                -IInclude -ISrc -c Src/Spingalett.Inference.c -o /dev/null
+            done
+          done
+
+      - name: Configure, build, test (SPINGALETT_INFERENCE_ONLY)
+        run: |
+          cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DSPINGALETT_INFERENCE_ONLY=ON -DCMAKE_INSTALL_PREFIX=$PWD/prefix
+          cmake --build Build --parallel
+          ctest --test-dir Build --output-on-failure
+          cmake --install Build
+
+      - name: Consumer (find_package)
+        run: |
+          mkdir consumer
+          printf '%s\n' 'cmake_minimum_required(VERSION 3.21)' 'project(consumer C)' \
+            'find_package(Spingalett REQUIRED)' 'add_executable(c main.c)' \
+            'target_link_libraries(c PRIVATE Spingalett::spingalett)' > consumer/CMakeLists.txt
+          printf '%s\n' '#include <Spingalett/Spingalett.Inference.h>' \
+            'int main(void) { SpingalettModel m; return spingalett_model_init(&m, "x", 1) == SPINGALETT_ERR_INVALID ? 0 : 1; }' \
+            > consumer/main.c
+          cmake -S consumer -B consumer/build -DCMAKE_PREFIX_PATH=$PWD/prefix
+          cmake --build consumer/build
+          consumer/build/c
+
+  embedded:
+    name: Cortex-M4 (QEMU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi qemu-system-arm
+
+      - name: Library, ModelTool and an MNIST model
+        run: |
+          cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON -DBUILD_TESTS=OFF
+          cmake --build Build --parallel --target MNIST ModelTool
+          sh Examples/download_mnist.sh data/mnist
+          Bin/MNIST data/mnist 3
+          Bin/ModelTool eval mnist.slett data/mnist/t10k-images-idx3-ubyte data/mnist/t10k-labels-idx1-ubyte
+
+      - name: Run on the Cortex-M4 (INT8, INT4)
+        run: |
+          Examples/Embedded/run-qemu.sh mnist.slett data/mnist --precision int8 --work build/embedded-int8
+          Examples/Embedded/run-qemu.sh mnist.slett data/mnist --precision int4 --work build/embedded-int4

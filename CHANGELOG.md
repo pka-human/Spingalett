@@ -5,6 +5,55 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.5.0] - 2026-10-06
+
+### Added
+- Deployment models (`SpingalettModel`): read-only networks that keep their weights in the
+  precision they are stored in and compute with them. INT8, INT4 and INT2 layers quantize their
+  input to 8 bits per sample and accumulate int8 x int8 products in 32-bit integers, with kernels
+  for AVX2 (with VNNI where the compiler targets it), SSE2, NEON (with the dot-product extension
+  where available), the Arm DSP extension and portable C; FP32, FP16 and BF16 layers compute in
+  float. One sample through the 784-512-1000-10 benchmark network takes 20 us in INT8 against
+  131 us with `forward()`; INT8 and INT4 keep the MNIST accuracy of the example networks.
+  `spingalett_model_from_network()`, `spingalett_model_load()`, `spingalett_model_from_memory()`,
+  `spingalett_model_predict()` (batched, OpenMP; identical to single runs),
+  `spingalett_model_evaluate()` and `spingalett_model_free()`.
+- The inference engine, `Spingalett.Inference.h` with `Src/Spingalett.Inference.c`: checks a
+  `.slett` image (`spingalett_model_init()`) and runs it in place (`spingalett_model_run()`) with a
+  workspace from the caller, without allocation, I/O or global state, so images can live in flash.
+  Compiled with `-DSPINGALETT_INFERENCE_ONLY` it needs nothing beyond `memcpy`, `memset`, `expf`,
+  `tanhf` and `lrintf` (about 6 KB of code on a Cortex-M4); the CMake option
+  `SPINGALETT_INFERENCE_ONLY` builds the library as the engine alone.
+- `spingalett_save_to_memory()`, `load_spingalett_from_memory()` and `spingalett_free()`.
+- `spingalett_export_c_header()`: a model as a C header (aligned byte array plus size, input,
+  output and workspace macros) for compiling it into firmware.
+- `ModelTool` (`Examples/ModelTool.c`, installed with the library): `info`, `convert`, `header`,
+  `eval` (accuracy in every precision) and `bench`.
+- `Examples/Embedded`: MNIST on a Cortex-M4F under QEMU, the INT8 model in flash and 2.8 KB of RAM.
+- `docs/ModelFormat.md`, the specification of the model format.
+- Python: `Model` (`load`, `from_bytes`, `predict`, `evaluate`, `layers`, `to_bytes`),
+  `Network.to_model()`, `Network.to_bytes()`, `Network.from_bytes()` and
+  `Network.export_c_header()`.
+- `Examples/MNIST.c` reports the accuracy of the trained network in FP16, INT8 and INT4;
+  `Examples/Benchmark.c` measures deployment models in every precision.
+
+### Changed
+- Model files are written in format version 3: a magic number, a layer table and 16-byte aligned
+  sections, little-endian, with CRC-32 checksums of the header and the contents. Files of versions
+  1 and 2 still load; 0.4 cannot read files written by 0.5.
+- Integer precisions store one scale per weight row instead of one per tensor; INT2 uses ternary
+  thresholds (0.7 of the mean magnitude per row) with the mean magnitude of the kept weights as the
+  scale. Biases are always stored in float, and so is the optimizer state.
+- `load_spingalett()` reads the file into memory and parses it there; damaged files fail with
+  `SPINGALETT_ERR_INVALID` (checksum or layout) or `SPINGALETT_ERR_FILE_IO` (truncated).
+- `ActivationFunction`, `LossFunction`, `PrecisionMode`, the error codes and `SPINGALETT_API` are
+  defined in `Spingalett.Inference.h`, which `Spingalett.h` includes.
+- The shared library's soname is `libspingalett.so.0.5`.
+
+### Fixed
+- Data set files opened from several threads at once raced on the CRC-32 table, which was built on
+  first use; it is now a constant shared with the model format.
+
 ## [0.4.1] - 2026-10-03
 
 ### Added
@@ -169,6 +218,7 @@ changes, which are listed under **Changed**.
 
 Initial release.
 
+[0.5.0]: https://github.com/pka-human/Spingalett/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/pka-human/Spingalett/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/pka-human/Spingalett/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pka-human/Spingalett/compare/v0.2.0...v0.3.0

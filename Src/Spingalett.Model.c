@@ -91,7 +91,7 @@ void spingalett_model_free(SpingalettModel *model) {
 
 /* ------------------------------------------------------------------------- batched inference */
 
-#define MODEL_CHUNK 256u                        /* samples per pass through the layers */
+#define MODEL_CHUNK 1024u                        /* samples per pass through the layers */
 
 typedef struct {
     float *act[2];                              /* [chunk x max_width] each */

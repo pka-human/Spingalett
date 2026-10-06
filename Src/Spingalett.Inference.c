@@ -437,7 +437,6 @@ int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
     return sum;
 }
 
-
 void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n, int32_t acc[4]) {
 #if defined(SPG_AVX2)
     __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;

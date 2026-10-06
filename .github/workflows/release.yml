@@ -125,8 +125,8 @@ jobs:
           cmake --install Build
           cp LICENSE CHANGELOG.md README.md "$ARCHIVE/"
           if [ "$RUNNER_OS" = Windows ]; then
-            # the MinGW runtime DLLs the library and DatasetTool load (libgomp, libwinpthread, ...)
-            ldd "$ARCHIVE/bin/libspingalett.dll" "$ARCHIVE/bin/DatasetTool.exe" |
+            # the MinGW runtime DLLs the library and the tools load (libgomp, libwinpthread, ...)
+            ldd "$ARCHIVE/bin/libspingalett.dll" "$ARCHIVE/bin/DatasetTool.exe" "$ARCHIVE/bin/ModelTool.exe" |
               awk '$3 ~ /^\/ucrt64\// { print $3 }' | sort -u | xargs -r cp -t "$ARCHIVE/bin/"
             ls "$ARCHIVE/bin"
             (cd "$ARCHIVE/lib" && gendef ../bin/libspingalett.dll && mv libspingalett.def spingalett.def)
@@ -161,6 +161,7 @@ jobs:
           export PATH="$PWD/$ARCHIVE/bin:$PATH"
           (cd consumer/build && ./xor | grep "Passed: 4/4")
           { "$ARCHIVE/bin/DatasetTool" || true; } 2>&1 | grep -q usage      # no arguments: usage, exit 2
+          { "$ARCHIVE/bin/ModelTool" || true; } 2>&1 | grep -q usage
 
       - name: Archive
         run: |
@@ -171,6 +172,33 @@ jobs:
         with:
           name: release-${{ matrix.name }}
           path: ${{ env.ARCHIVE }}.*
+          if-no-files-found: error
+
+  # the inference engine's three source files, for firmware projects
+  engine:
+    needs: version
+    if: needs.version.outputs.binaries == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Archive
+        run: |
+          dir=spingalett-${{ needs.version.outputs.version }}-inference-engine
+          mkdir -p $dir/Include/Spingalett $dir/Src
+          cp Include/Spingalett/Spingalett.Inference.h $dir/Include/Spingalett/
+          cp Src/Spingalett.Inference.c Src/Spingalett.Engine.h $dir/Src/
+          cp LICENSE $dir/
+          cp Examples/Embedded/README.md $dir/README.md
+          # it must build on its own, as C99, without warnings
+          gcc -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 -DSPINGALETT_INFERENCE_ONLY -I$dir/Include -c $dir/Src/Spingalett.Inference.c -o /dev/null
+          zip -qr $dir.zip $dir
+          ls -l $dir.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-engine
+          path: spingalett-*-inference-engine.zip
           if-no-files-found: error
 
   # the DigitPad model, trained once for the AppImage and the Windows zip
@@ -270,10 +298,11 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [version, package, model, appimage, digitpad-windows]
+    needs: [version, package, engine, model, appimage, digitpad-windows]
     if: >-
       always() && needs.version.outputs.publish == 'true' &&
       (needs.package.result == 'success' || needs.package.result == 'skipped') &&
+      (needs.engine.result == 'success' || needs.engine.result == 'skipped') &&
       (needs.model.result == 'success' || needs.model.result == 'skipped') &&
       (needs.appimage.result == 'success' || needs.appimage.result == 'skipped') &&
       (needs.digitpad-windows.result == 'success' || needs.digitpad-windows.result == 'skipped')

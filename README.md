@@ -16,9 +16,11 @@
 Spingalett is a neural-network library written in C23 for training and running fully connected
 networks on the CPU. It depends only on the C standard library: batch training and inference run
 as matrix-matrix products on built-in AVX-512, AVX2 or portable kernels, with OpenMP and OpenBLAS
-as optional build-time accelerators. Networks are declared with C23 designated initializers, all
-parameters live in flat contiguous arrays, and models can be saved in reduced precision down to
-2 bits per weight. Python bindings are included.
+as optional build-time accelerators. Networks are declared with C23 designated initializers and all
+parameters live in flat contiguous arrays. For deployment, a trained network becomes a read-only
+model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
+integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
+alike. Python bindings are included.
 
 ## Contents
 
@@ -26,6 +28,7 @@ parameters live in flat contiguous arrays, and models can be saved in reduced pr
 - [Building](#building)
 - [Quick start](#quick-start)
 - [Usage](#usage)
+- [Deployment](#deployment)
 - [Python bindings](#python-bindings)
 - [DigitPad demo](#digitpad-demo)
 - [Performance](#performance)
@@ -49,15 +52,16 @@ parameters live in flat contiguous arrays, and models can be saved in reduced pr
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `forward()`, batched `predict()`, `evaluate()` (loss and accuracy) |
+| Deployment | Read-only models in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX2/VNNI, SSE2, NEON, Arm DSP); run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
 | Backends | Built-in matrix kernels (AVX-512, AVX/FMA, portable C), single-threaded or OpenMP; OpenBLAS |
-| Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2; optional optimizer state; versioned format |
+| Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Bindings | Python (ctypes + NumPy) |
 
 ## Building
 
 Prebuilt libraries for Linux (x86-64 and ARM64), Windows and macOS are attached to every
 [release](https://github.com/pka-human/Spingalett/releases): each archive contains the headers,
-the shared library, a CMake package and `DatasetTool`. Extract one and point CMake at it with
+the shared library, a CMake package, `DatasetTool` and `ModelTool`. Extract one and point CMake at it with
 `-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with `-I<dir>/include -L<dir>/lib
 -lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
 `-v3` build with the AVX2/FMA kernels; the Windows DLL ships with import libraries for MinGW and
@@ -95,6 +99,7 @@ a baseline through `CMAKE_C_FLAGS` (for example `-march=x86-64-v3` for AVX2).
 | `BUILD_EXAMPLE` | `ON` | Build the programs in `Examples/` |
 | `BUILD_TESTS` | `ON` | Build the test suite and register it with CTest |
 | `BUILD_APPS` | `OFF` | Build the DigitPad demo (needs SDL2) and its trainer |
+| `SPINGALETT_INFERENCE_ONLY` | `OFF` | Build only the inference engine (`Spingalett.Inference.h`) as a static library: no training, file I/O, OpenMP or heap |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
@@ -104,7 +109,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.3 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.5 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -394,19 +399,29 @@ NeuralNetwork *net = load_spingalett("model.slett");
 ```
 
 Models are stored in `.slett` files; the extension is appended when the filename has none, and
-files written under the former `.nn` name load unchanged. Weights, biases and, unless disabled, the
-optimizer state are stored in the selected precision:
+files written under the former `.nn` name load unchanged. Weights are stored in the selected
+precision; biases and, unless disabled, the optimizer state in float:
 
-| Precision | Storage per value | Notes |
+| Precision | Storage per weight | Notes |
 |---|---|---|
 | `PRECISION_FLOAT32` | 4 bytes | Lossless |
 | `PRECISION_FP16`, `PRECISION_BFLOAT16` | 2 bytes | Round to nearest even |
-| `PRECISION_INT8`, `PRECISION_INT4` | 1 byte, 4 bits | Symmetric, one scale per tensor |
-| `PRECISION_INT2` | 2 bits | Ternary {-scale, 0, +scale} |
+| `PRECISION_INT8`, `PRECISION_INT4` | 1 byte, 4 bits | Symmetric, one scale per weight row (output unit) |
+| `PRECISION_INT2` | 2 bits | Ternary {-scale, 0, +scale}, one scale per row |
 
-The file format is versioned (`SPINGALETT_FORMAT_VERSION`, currently 2); version 1 files remain
-loadable. Values are stored in native byte order. `load_spingalett()` returns `NULL` for missing
-or truncated files and for files with an invalid header.
+The same bytes can be produced and read in memory:
+
+```c
+size_t size;
+void *image = spingalett_save_to_memory(net, PRECISION_INT8, false, &size);   /* free with spingalett_free */
+NeuralNetwork *copy = load_spingalett_from_memory(image, size);
+```
+
+The file format is versioned (`SPINGALETT_FORMAT_VERSION`, currently 3) and specified in
+[docs/ModelFormat.md](docs/ModelFormat.md): little-endian, with 16-byte aligned sections and CRC-32
+checksums, so that a file image can be executed in place (see [Deployment](#deployment)). Files of
+versions 1 and 2 remain loadable. `load_spingalett()` returns `NULL` for missing, truncated or
+corrupt files and for files with an invalid header.
 
 ### Backends and threading
 
@@ -468,6 +483,88 @@ Log messages go to stdout (warnings and errors to stderr) unless redirected with
 `spingalett_set_log_callback(void (*)(LogLevel, const char *))`. `spingalett_set_log_level()` sets
 the minimum level and `spingalett_set_verbose(false)` suppresses everything below warnings.
 
+## Deployment
+
+A `NeuralNetwork` is built for training: float parameters, gradients and optimizer state. To run a
+trained network, turn it into a model, a read-only network that keeps its weights in the precision
+they are stored in and computes with them:
+
+```c
+SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);   /* or spingalett_model_load("model.slett") */
+spingalett_model_predict(model, inputs, count, outputs);                         /* batched, multi-threaded */
+EvalMetrics m = spingalett_model_evaluate(model, inputs, targets, count);
+spingalett_model_free(model);
+```
+
+INT8, INT4 and INT2 layers run in integer arithmetic: each layer quantizes its input to 8 bits per
+sample (the largest magnitude maps to 127), multiplies it with the weights in 32-bit integers
+(AVX2 with VNNI where available, SSE2, NEON with the dot-product extension where available, the Arm
+DSP extension, or portable C) and rescales each output by its weight row's scale. FP32, FP16 and
+BF16 layers compute in float, converting the weights as they read them. Batched prediction
+computes exactly what single runs compute, on every backend and platform.
+
+Accuracy on the 10,000 MNIST test images (`ModelTool eval`):
+
+| Network | FP32 | FP16 | INT8 | INT4 | INT2 |
+|---|---:|---:|---:|---:|---:|
+| 784-256-128-10, `Examples/MNIST.c` (5 epochs) | 97.86% | 97.86% | 97.87% | 97.71% | 95.15% |
+| Model size | 941 KB | 471 KB | 238 KB | 121 KB | 62 KB |
+| 784-1024-512-10, DigitPad | 99.27% | 99.27% | 99.27% | 99.32% | 79.93% |
+
+INT8 and INT4 keep the accuracy of these networks; INT2 (ternary weights without
+quantization-aware training) suits small layers. One sample through the 784-512-1000-10 benchmark
+network on one thread (`Bin/Benchmark`, Intel Xeon @ 2.80 GHz):
+
+| | `forward()` | FP32 model | FP16 | INT8 | INT4 |
+|---|---:|---:|---:|---:|---:|
+| Microseconds per sample | 131 | 136 | 90 | 20 | 80 |
+| Weights | 3.7 MB | 3.7 MB | 1.9 MB | 0.9 MB | 0.5 MB |
+
+### Running in place
+
+A model is a view of a `.slett` image (format version 3). `spingalett_model_init()` checks an image
+(header, bounds, CRC-32) and copies nothing; `spingalett_model_run()` evaluates one sample with a
+workspace from the caller and allocates nothing either:
+
+```c
+SpingalettModel model;                                    /* a plain struct: no release needed */
+if (spingalett_model_init(&model, image, size) != SPINGALETT_OK) { /* damaged or wrong image */ }
+float *workspace = malloc(model.workspace_size);          /* one per thread */
+spingalett_model_run(&model, input, output, workspace);
+```
+
+The image can come from `spingalett_save_to_memory()`, a file read into memory, an array compiled
+into the program or memory-mapped flash; it must stay valid while the model is used. These two
+functions and `spingalett_model_layer()` make up the inference engine, declared in
+`Spingalett.Inference.h` (included by `Spingalett.h`).
+
+### Microcontrollers and C headers
+
+```bash
+Bin/ModelTool header model.slett model.h my_model --precision int8    # or spingalett_export_c_header()
+```
+
+writes the image as a 16-byte aligned `static const uint8_t my_model[]` with the macros
+`MY_MODEL_SIZE`, `MY_MODEL_INPUTS`, `MY_MODEL_OUTPUTS` and `MY_MODEL_WORKSPACE`. The engine itself,
+`Src/Spingalett.Inference.c` with `Include/Spingalett/Spingalett.Inference.h` and
+`Src/Spingalett.Engine.h`, compiles on its own with `-DSPINGALETT_INFERENCE_ONLY`: no training
+code, no file I/O, no OpenMP, no heap and no global state, about 6 KB of code on a Cortex-M4.
+CMake builds it alone with `-DSPINGALETT_INFERENCE_ONLY=ON`. [Examples/Embedded](Examples/Embedded)
+runs the MNIST model on a Cortex-M4F in QEMU with the weights in flash and 2.8 KB of RAM.
+
+### ModelTool
+
+`Examples/ModelTool.c`, installed with the library:
+
+```
+ModelTool info model.slett                              layers, precisions, sizes, workspace
+ModelTool convert in.slett out.slett --precision int8   any format version, as format 3
+ModelTool header model.slett model.h name [--precision P]
+ModelTool eval model.slett data.slettd                  accuracy and loss in every precision
+ModelTool eval model.slett images labels                (an IDX pair, such as MNIST)
+ModelTool bench model.slett                             latency and throughput in every precision
+```
+
 ## Python bindings
 
 `Bindings/Python` contains pure-Python bindings built on `ctypes` and NumPy; nothing is compiled
@@ -491,6 +588,8 @@ with sg.Network(sg.Loss.MSE, [sg.Layer(2),
     net.train(x, y, epochs=3000, optimizer=sg.Optimizer.ADAM, learning_rate=0.02,
               lr_scheduler=sg.CosineDecay())
     print(net.forward(x))
+    with net.to_model(sg.Precision.INT8) as model:       # deployment model, integer kernels
+        print(model.predict(x), model.size, "bytes")
 ```
 
 See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
@@ -540,32 +639,32 @@ VM.
 ## Project layout
 
 ```
-Include/Spingalett/   Public header and the CMake-generated configuration header template
-Src/                  Library sources (network, training, SIMD kernels, serialization, ...)
-Examples/             XOR, MNIST, throughput benchmark (C and PyTorch counterpart), DatasetTool
-docs/                 File format specifications
-Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage packaging
+Include/Spingalett/   Public headers (Spingalett.h, the inference engine's Spingalett.Inference.h)
+                      and the CMake-generated configuration header template
+Src/                  Library sources (network, training, kernels, serialization, inference engine, ...)
+Examples/             XOR, MNIST, throughput benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
+Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
+docs/                 File format specifications (models, data sets)
+Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
 Bindings/Python/      Python bindings
+cmake/                CMake package and inference-only build helpers
 ```
 
 ## Status and roadmap
 
-Spingalett is at version 0.4; the C API and the in-memory `NeuralNetwork` layout may still change
+Spingalett is at version 0.5; the C API and the in-memory `NeuralNetwork` layout may still change
 between minor versions (see [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname
-carries the minor version (`libspingalett.so.0.4`). Saved models are versioned and remain
-loadable.
+carries the minor version (`libspingalett.so.0.5`). Saved models are versioned and remain
+loadable; the inference engine and model format version 3 are meant to stay stable from here on.
 
 Planned work, roughly in order:
 
-- 0.5, deployment: INT8 weights kept in memory with integer matrix-vector kernels (today INT8,
-  INT4 and INT2 only shrink the file and are expanded to FP32 on load), per-row quantization
-  scales, loading a model from a memory buffer, exporting a model as a C header, and an
-  inference-only build without training code, file I/O or OpenMP for microcontrollers
 - 0.6: an opaque network handle and a layer abstraction; batch normalization, 2D convolution and
-  pooling layers, each with numerical gradient checks
+  pooling layers, each with numerical gradient checks and integer inference kernels
 - 1.0: API freeze, C++ wrapper
-- Later: CUDA backend, ARM NEON kernels, further language bindings
+- Later: quantization-aware training, CUDA backend, NEON kernels for training, further language
+  bindings
 
 ## Contributing
 
