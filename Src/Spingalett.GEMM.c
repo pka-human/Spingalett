@@ -95,6 +95,11 @@ SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads) {
     return s;
 }
 
+size_t spingalett_gemm_scratch_bytes(int threads) {
+    if (threads < 1) threads = 1;
+    return ((size_t)KC * NC + (size_t)threads * MC_MAX * KC) * sizeof(float);
+}
+
 void spingalett_gemm_scratch_free(SpingalettGemmScratch *s) {
     if (!s) return;
     spingalett_aligned_free(s->b_pack);
@@ -530,36 +535,125 @@ static inline void dot_block(const float *const a[DOT_RA], const float *const b[
         }
 }
 
+#if DOT_RA > 1
+/* d[r] = row a . row b_r for r < 4, computed exactly as dot_block computes one of its rows, so
+   that a row's results do not depend on the rows it is computed with. */
+static inline void dot_block1(const float *a, const float *const b[4], uint32_t n, float d[4]) {
+    uint32_t k = 0;
+#if defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
+    for (; k + 16 <= n; k += 16) {
+        __m512 x = _mm512_loadu_ps(a + k);
+        acc0 = _mm512_fmadd_ps(x, _mm512_loadu_ps(b[0] + k), acc0);
+        acc1 = _mm512_fmadd_ps(x, _mm512_loadu_ps(b[1] + k), acc1);
+        acc2 = _mm512_fmadd_ps(x, _mm512_loadu_ps(b[2] + k), acc2);
+        acc3 = _mm512_fmadd_ps(x, _mm512_loadu_ps(b[3] + k), acc3);
+    }
+    d[0] = _mm512_reduce_add_ps(acc0);
+    d[1] = _mm512_reduce_add_ps(acc1);
+    d[2] = _mm512_reduce_add_ps(acc2);
+    d[3] = _mm512_reduce_add_ps(acc3);
+#else   /* AVX */
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (; k + 8 <= n; k += 8) {
+        __m256 x = _mm256_loadu_ps(a + k);
+        for (int r = 0; r < 4; r++) {
+#if defined(__FMA__)
+            acc[r] = _mm256_fmadd_ps(x, _mm256_loadu_ps(b[r] + k), acc[r]);
+#else
+            acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(x, _mm256_loadu_ps(b[r] + k)));
+#endif
+        }
+    }
+    for (int r = 0; r < 4; r++) {
+        float t[8];
+        _mm256_storeu_ps(t, acc[r]);
+        d[r] = ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+    }
+#endif
+    for (; k < n; k++) {
+        float x = a[k];
+        d[0] += x * b[0][k]; d[1] += x * b[1][k]; d[2] += x * b[2][k]; d[3] += x * b[3][k];
+    }
+}
+#else
+static inline void dot_block1(const float *a, const float *const b[4], uint32_t n, float d[4]) {
+    const float *rows[1] = {a};
+    float t[1][4];
+    dot_block(rows, b, n, t);
+    memcpy(d, t[0], sizeof t[0]);
+}
+#endif
+
+/* Products with at most SMALL_M rows from row-major operands (a dense layer run on one sample or
+   a few) take the dot products as well, rather than packing all of op(B) for so few rows: each
+   row of B is read once per DOT_RA rows of A, and short rows cost less in reductions than packing
+   would. Threads split the columns. */
+#define SMALL_M (2u * DOT_RA)
+
+static void gemm_small_m(int threads, uint32_t M, uint32_t N, uint32_t K, float alpha, const float *A, size_t lda,
+                         const float *B, size_t ldb, float beta, float *C, size_t ldc, const SpingalettGemmHooks *hooks) {
+    const uint32_t span = 64;                           /* columns per work item and epilogue call */
+    const int64_t items = (int64_t)((N + span - 1) / span);
+    (void)threads;
+    SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1 && items > 1,
+        for (int64_t it = 0; it < items; it++) {
+            uint32_t j0 = (uint32_t)it * span, j1 = N - j0 < span ? N : j0 + span;
+            for (uint32_t i = 0; i < M; i += DOT_RA) {
+                uint32_t ra = M - i < DOT_RA ? M - i : DOT_RA;
+                const float *a[DOT_RA];
+                for (uint32_t t = 0; t < DOT_RA; t++) a[t] = A + (size_t)(i + (t < ra ? t : 0)) * lda;
+                for (uint32_t j = j0; j < j1; j += 4) {
+                    uint32_t rows = j1 - j < 4 ? j1 - j : 4;
+                    const float *b[4];
+                    for (uint32_t r = 0; r < 4; r++) b[r] = B + (size_t)(j + (r < rows ? r : 0)) * ldb;
+                    float d[DOT_RA][4];
+                    if (ra < DOT_RA)
+                        for (uint32_t t = 0; t < ra; t++) dot_block1(a[t], b, K, d[t]);
+                    else
+                        dot_block(a, b, K, d);
+                    for (uint32_t t = 0; t < ra; t++) {
+                        float *c = C + (size_t)(i + t) * ldc + j;
+                        for (uint32_t r = 0; r < rows; r++)
+                            c[r] = alpha * d[t][r] + (beta == 0.0f ? 0.0f : beta * c[r]);
+                    }
+                }
+            }
+            if (hooks && hooks->epilogue)
+                hooks->epilogue(hooks->epilogue_ctx, 0, M, j0, j1 - j0, C + j0, ldc);
+        }
+    );
+}
+
 static void gemm_small_n(int threads, uint32_t M, uint32_t N, uint32_t K, float alpha, const float *A, size_t lda,
                          const float *B, size_t ldb, float beta, float *C, size_t ldc, const SpingalettGemmHooks *hooks) {
     const uint32_t block = 16;                          /* rows per work item and epilogue call */
     const int64_t blocks = (int64_t)((M + block - 1) / block);
     (void)threads;
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(threads) if(threads > 1 && blocks > 1)
-#endif
-    for (int64_t bi = 0; bi < blocks; bi++) {
-        uint32_t i0 = (uint32_t)bi * block, i1 = M - i0 < block ? M : i0 + block;
-        for (uint32_t i = i0; i < i1; i += DOT_RA) {
-            uint32_t ra = i1 - i < DOT_RA ? i1 - i : DOT_RA;
-            const float *a[DOT_RA];
-            for (uint32_t t = 0; t < DOT_RA; t++) a[t] = A + (size_t)(i + (t < ra ? t : 0)) * lda;  /* rows past the block repeat */
-            for (uint32_t j0 = 0; j0 < N; j0 += 4) {
-                uint32_t rows = N - j0 < 4 ? N - j0 : 4;
-                const float *b[4];
-                for (uint32_t r = 0; r < 4; r++) b[r] = B + (size_t)(j0 + (r < rows ? r : 0)) * ldb;
-                float d[DOT_RA][4];
-                dot_block(a, b, K, d);
-                for (uint32_t t = 0; t < ra; t++) {
-                    float *c = C + (size_t)(i + t) * ldc + j0;
-                    for (uint32_t r = 0; r < rows; r++)
-                        c[r] = alpha * d[t][r] + (beta == 0.0f ? 0.0f : beta * c[r]);
+    SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1 && blocks > 1,
+        for (int64_t bi = 0; bi < blocks; bi++) {
+            uint32_t i0 = (uint32_t)bi * block, i1 = M - i0 < block ? M : i0 + block;
+            for (uint32_t i = i0; i < i1; i += DOT_RA) {
+                uint32_t ra = i1 - i < DOT_RA ? i1 - i : DOT_RA;
+                const float *a[DOT_RA];
+                for (uint32_t t = 0; t < DOT_RA; t++) a[t] = A + (size_t)(i + (t < ra ? t : 0)) * lda;  /* rows past the block repeat */
+                for (uint32_t j0 = 0; j0 < N; j0 += 4) {
+                    uint32_t rows = N - j0 < 4 ? N - j0 : 4;
+                    const float *b[4];
+                    for (uint32_t r = 0; r < 4; r++) b[r] = B + (size_t)(j0 + (r < rows ? r : 0)) * ldb;
+                    float d[DOT_RA][4];
+                    dot_block(a, b, K, d);
+                    for (uint32_t t = 0; t < ra; t++) {
+                        float *c = C + (size_t)(i + t) * ldc + j0;
+                        for (uint32_t r = 0; r < rows; r++)
+                            c[r] = alpha * d[t][r] + (beta == 0.0f ? 0.0f : beta * c[r]);
+                    }
                 }
             }
+            if (hooks && hooks->epilogue)
+                hooks->epilogue(hooks->epilogue_ctx, i0, i1 - i0, 0, N, C + (size_t)i0 * ldc, ldc);
         }
-        if (hooks && hooks->epilogue)
-            hooks->epilogue(hooks->epilogue_ctx, i0, i1 - i0, 0, N, C + (size_t)i0 * ldc, ldc);
-    }
+    );
 }
 
 /* The multiplication with this translation unit's kernels (scratch is not NULL, M, N, K > 0). */
@@ -587,6 +681,11 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
     if (N <= SMALL_N && K >= SMALL_N_MIN_K && !trans_a && trans_b && !a_src && !b_src) {
         /* one parallel loop without barriers: worth threads at a quarter of the usual work */
         gemm_small_n(parallel && work >= SPINGALETT_GEMM_PARALLEL_WORK / 4u ? scratch->threads : 1, M, N, K, alpha,
+                     A, lda, B, ldb, beta, C, ldc, hooks);
+        return;
+    }
+    if (M <= SMALL_M && !trans_a && trans_b && !a_src && !b_src) {
+        gemm_small_m(parallel && work >= SPINGALETT_GEMM_PARALLEL_WORK / 4u ? scratch->threads : 1, M, N, K, alpha,
                      A, lda, B, ldb, beta, C, ldc, hooks);
         return;
     }
