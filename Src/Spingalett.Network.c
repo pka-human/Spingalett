@@ -106,7 +106,6 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerSh
         if (conv && (in->channels % groups != 0 || args->filters % groups != 0))
             return layer_error("Convolution groups must divide the input channels and the filters");
         shape->groups = groups;
-        if (groups > 1) return layer_error("Grouped convolutions are not supported yet");
         shape->kernel_h = kh; shape->kernel_w = kw;
         shape->stride_h = sh; shape->stride_w = sw;
         shape->pad_h = ph; shape->pad_w = pw;
@@ -270,9 +269,10 @@ bool spingalett_add_layer(LayerArgs args) {
 
         /* Standard deviations: Glorot sqrt(2 / (fan_in + fan_out)), He sqrt(2 / fan_in),
            LeCun sqrt(1 / fan_in); a filter's fan-in is its window, its fan-out the window times
-           the filters. */
+           the filters of its group. */
         float fan_in = (float)row_len;
-        float fan_out = shape.type == LAYER_CONV2D ? (float)shape.kernel_h * (float)shape.kernel_w * (float)rows : (float)rows;
+        float fan_out = shape.type == LAYER_CONV2D
+                      ? (float)shape.kernel_h * (float)shape.kernel_w * (float)(rows / shape.groups) : (float)rows;
         float scale = 1.0f;
         if (wi == WEIGHT_INITIALIZATION_XAVIER)
             scale = sqrtf(2.0f / (fan_in + fan_out));

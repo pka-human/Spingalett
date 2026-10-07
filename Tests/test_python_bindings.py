@@ -418,6 +418,48 @@ with tempfile.TemporaryDirectory() as d:
               f"folded model layers: {m.layers}")
         check(np.abs(m.predict(xt) - bn.forward(xt)).max() < 1e-4, "folded model matches the network")
 
+# grouped and depthwise convolutions against numpy, round trip, models
+def np_group_conv(x, w, b, stride, pad, groups):   # w (F, kh, kw, C / groups)
+    C, F = x.shape[2], w.shape[0]
+    cg, fg = C // groups, F // groups
+    return np.concatenate([np_conv(x[:, :, g * cg:(g + 1) * cg], w[g * fg:(g + 1) * fg], b[g * fg:(g + 1) * fg], stride, pad)
+                           for g in range(groups)], axis=2)
+
+sg.seed(11)
+gnet = sg.Network(sg.Loss.MSE, [sg.Input(7, 6, 4), sg.Conv2D(8, 3, padding=1, activation=sg.Activation.TANH, groups=2),
+                                sg.Conv2D(16, 3, stride=2, activation=sg.Activation.RELU, groups=8),
+                                sg.Layer(2, sg.Activation.NONE, sg.Init.XAVIER)])
+check(gnet.layers[1].groups == 2 and gnet.get_weights(0).shape == (8, 3, 3, 2) and gnet.get_weights(1).shape == (16, 3, 3, 1),
+      f"grouped conv descriptions and weight shapes: {gnet.layers}")
+
+def np_gnet(net, x):
+    out = []
+    for s in x:
+        a = np.tanh(np_group_conv(s.reshape(7, 6, 4).astype(np.float64), net.get_weights(0), net.get_biases(0), 1, 1, 2))
+        a = np.maximum(np_group_conv(a, net.get_weights(1), net.get_biases(1), 2, 0, 8), 0)
+        out.append(net.get_weights(2).astype(np.float64) @ a.reshape(-1) + net.get_biases(2))
+    return np.array(out)
+
+xg = rng.normal(size=(5, 7 * 6 * 4)).astype(np.float32)
+for mode in (sg.ComputeMode.SINGLE_THREADED, sg.ComputeMode.OPENMP):
+    sg.set_compute_mode(mode)
+    check(np.allclose(gnet.forward(xg), np_gnet(gnet, xg), atol=1e-5), f"grouped conv forward vs numpy ({mode.name})")
+sg.set_compute_mode(sg.ComputeMode.SINGLE_THREADED)
+yg = rng.normal(size=(5, 2)).astype(np.float32)
+before = gnet.evaluate(xg, yg).loss
+gnet.train(xg, yg, epochs=30, optimizer=sg.Optimizer.ADAM, learning_rate=0.01)
+check(gnet.evaluate(xg, yg).loss < before * 0.5, "grouped network trains")
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "grouped.slett")
+    gnet.save(path)
+    check(open(path, "rb").read()[6] == 5, "grouped networks are saved as format version 5")
+    with sg.Network.load(path) as back:
+        check(back.layers == gnet.layers and np.array_equal(back.forward(xg), gnet.forward(xg)), "grouped save/load round trip")
+    with gnet.to_model(sg.Precision.INT8) as m:
+        check(m.layers[0].groups == 2 and m.layers[1].groups == 8, f"grouped model layers: {m.layers}")
+        p = m.predict(xg)
+        check(np.array_equal(p[3], m(xg[3])) and np.abs(p - gnet.forward(xg)).max() < 0.1, "grouped INT8 model")
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")

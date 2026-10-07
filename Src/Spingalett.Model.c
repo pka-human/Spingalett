@@ -156,7 +156,7 @@ static bool predict_workspace_create(const SpingalettModel *model, uint32_t chun
         if (L.type == LAYER_BATCH_NORM && L.out_c > norm_channels) norm_channels = L.out_c;
         if (L.rows == 0 || L.type == LAYER_BATCH_NORM) continue;      /* pooling, normalization */
         bool conv = L.type == LAYER_CONV2D;
-        bool columns = slett_conv_columns(&L);
+        bool columns = slett_conv_columns(&L) || slett_conv_depthwise(&L);     /* transposed filters */
         if (spingalett_precision_is_int(L.precision)) {
             if (L.inputs > int_inputs) int_inputs = L.inputs;
             uint32_t per_thread = columns ? L.rows * 4u : L.row_len;     /* one pixel's sums, or a window */
@@ -185,7 +185,8 @@ static bool predict_workspace_create(const SpingalettModel *model, uint32_t chun
         if (conv && spingalett_precision_is_int(L.precision) && (columns || L.precision != PRECISION_INT8)) {
             int8_t *u = (int8_t *)spingalett_aligned_alloc(n);
             if (!u) return false;
-            if (columns) {                      /* filter-major, as the engine runs short windows */
+            if (columns) {                      /* filter-major, as the engine runs short windows and
+                                                   depthwise convolutions */
                 spingalett_conv_transpose_filters(image, &L, u);
             } else {
                 size_t row = (size_t)spingalett_slett_row_bytes(L.precision, L.row_len);
@@ -269,11 +270,32 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const in
 #endif
         uint64_t s = (uint64_t)item / pixels, p = (uint64_t)item % pixels;
         const int8_t *xq = w->xq + (size_t)s * in, *win = xq + p * C;
-        if (slett_conv_columns(L)) {
+        if (slett_conv_columns(L) || slett_conv_depthwise(L)) {
             int32_t *acc = (int32_t *)(void *)(w->window + (size_t)t * w->window_stride);
             float *ys = y + (size_t)s * out + p * OC;
-            spingalett_conv_columns_i8(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), filters, acc);
+            if (slett_conv_columns(L))
+                spingalett_conv_columns_i8(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), filters, acc);
+            else
+                spingalett_conv_depthwise_i8(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), filters, acc);
             for (uint32_t j = 0; j < OC; j++) ys[j] = spingalett_int_output(bias[j], scale[j], w->xs[s], acc[j]);
+            continue;
+        }
+        if (L->groups > 1) {                    /* each group's filters with the window of its channels */
+            const uint32_t OG = OC / L->groups;
+            int8_t *window = w->window + (size_t)t * w->window_stride;
+            float *ys = y + (size_t)s * out + p * OC;
+            for (uint32_t g = 0; g < L->groups; g++) {
+                spingalett_gather_group_window(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), g, window, 1);
+                for (uint32_t j = g * OG, e = j + OG; j < e; j += 4) {
+                    uint32_t rows = e - j < 4u ? e - j : 4u;
+                    const int8_t *block = filters + (size_t)j * K;
+                    int32_t acc[4];
+                    if (rows == 4) spingalett_dot_i8_rows4(block, K, window, K, acc);
+                    else for (uint32_t r = 0; r < rows; r++) acc[r] = spingalett_dot_i8(block + (size_t)r * K, window, K);
+                    for (uint32_t r = 0; r < rows; r++)
+                        ys[j + r] = spingalett_int_output(bias[j + r], scale[j + r], w->xs[s], acc[r]);
+                }
+            }
             continue;
         }
         if (!pointwise) {

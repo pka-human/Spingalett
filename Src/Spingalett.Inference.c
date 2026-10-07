@@ -1450,10 +1450,113 @@ static void conv_forward_columns(const uint8_t *image, const SlettLayer *L, cons
     }
 }
 
+void spingalett_gather_group_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, uint32_t g,
+                                    void *window, size_t elem) {
+    const uint32_t C = L->in_c, CG = C / L->groups;
+    const size_t run = (size_t)CG * elem;
+    uint8_t *d = (uint8_t *)window;
+    int64_t ih0 = (int64_t)oh * L->stride_h - L->pad_h, iw0 = (int64_t)ow * L->stride_w - L->pad_w;
+    for (uint32_t kh = 0; kh < L->kernel_h; kh++)
+        for (uint32_t kw = 0; kw < L->kernel_w; kw++, d += run) {
+            int64_t ih = ih0 + kh, iw = iw0 + kw;
+            if (ih < 0 || ih >= (int64_t)L->in_h || iw < 0 || iw >= (int64_t)L->in_w) { memset(d, 0, run); continue; }
+            memcpy(d, (const uint8_t *)x + (((size_t)ih * L->in_w + (size_t)iw) * C + (size_t)g * CG) * elem, run);
+        }
+}
+
+/* Each filter of a depthwise convolution reads channel j / m (m filters per channel). */
+#define DEPTHWISE_SUMS(T, x, wt, acc)                                                                \
+    do {                                                                                            \
+        const uint32_t R = L->rows, C = L->in_c, m = R / C;                                         \
+        for (uint32_t j = 0; j < R; j++) (acc)[j] = 0;                                              \
+        int64_t ih0 = (int64_t)oh * L->stride_h - L->pad_h, iw0 = (int64_t)ow * L->stride_w - L->pad_w; \
+        for (uint32_t kh = 0; kh < L->kernel_h; kh++) {                                             \
+            int64_t ih = ih0 + kh;                                                                  \
+            if (ih < 0 || ih >= (int64_t)L->in_h) continue;                                         \
+            for (uint32_t kw = 0; kw < L->kernel_w; kw++) {                                         \
+                int64_t iw = iw0 + kw;                                                              \
+                if (iw < 0 || iw >= (int64_t)L->in_w) continue;                                     \
+                const T *v = (x) + ((size_t)ih * L->in_w + (size_t)iw) * C;                         \
+                const T *w = (wt) + ((size_t)kh * L->kernel_w + kw) * R;                            \
+                if (m == 1) for (uint32_t c = 0; c < C; c++) (acc)[c] += DEPTHWISE_PRODUCT(v[c], w[c]); \
+                else for (uint32_t c = 0; c < C; c++)                                               \
+                    for (uint32_t i = 0; i < m; i++) (acc)[c * m + i] += DEPTHWISE_PRODUCT(v[c], w[c * m + i]); \
+            }                                                                                       \
+        }                                                                                           \
+    } while (0)
+
+#define DEPTHWISE_PRODUCT(v, w) (int32_t)((int16_t)(v) * (int16_t)(w))
+
+void spingalett_conv_depthwise_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
+                                  int32_t *acc) {
+    DEPTHWISE_SUMS(int8_t, xq, wt, acc);
+}
+
+#undef DEPTHWISE_PRODUCT
+#define DEPTHWISE_PRODUCT(v, w) ((v) * (w))
+
+static void conv_depthwise_f32(const float *x, const SlettLayer *L, uint32_t oh, uint32_t ow, const float *wt,
+                               float *acc) {
+    DEPTHWISE_SUMS(float, x, wt, acc);
+}
+
+/* A depthwise convolution on one sample (scratch: the transposed filters, then one pixel's sums). */
+static void conv_forward_depthwise(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
+                                   void *scratch) {
+    const uint32_t R = L->rows;
+    const bool is_int = spingalett_precision_is_int(L->precision);
+    const float *bias = (const float *)(const void *)(image + L->biases);
+    void *sums = (uint8_t *)scratch + slett_align((uint64_t)L->row_len * R * (is_int ? 1u : 4u));
+    spingalett_conv_transpose_filters(image, L, scratch);
+    const float *scale = is_int ? (const float *)(const void *)(image + L->scales) : NULL;
+    float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    for (uint32_t oh = 0; oh < L->out_h; oh++)
+        for (uint32_t ow = 0; ow < L->out_w; ow++) {
+            float *o = y + ((size_t)oh * L->out_w + ow) * R;
+            if (is_int) {
+                int32_t *acc = (int32_t *)sums;
+                spingalett_conv_depthwise_i8(xq, L, oh, ow, (const int8_t *)scratch, acc);
+                for (uint32_t j = 0; j < R; j++) o[j] = spingalett_int_output(bias[j], scale[j], x_scale, acc[j]);
+            } else {
+                float *acc = (float *)sums;
+                conv_depthwise_f32(x, L, oh, ow, (const float *)scratch, acc);
+                for (uint32_t j = 0; j < R; j++) o[j] = bias[j] + acc[j];
+            }
+        }
+}
+
+/* A grouped convolution on one sample: each group's filters dotted with the window of its channels. */
+static void conv_forward_grouped(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
+                                 void *window) {
+    const uint32_t G = L->groups, OG = L->rows / G, K = L->row_len;
+    const bool is_int = spingalett_precision_is_int(L->precision), packed = is_int && L->precision != PRECISION_INT8;
+    const uint32_t per_byte = L->precision == PRECISION_INT4 ? 2u : 4u;
+    float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    for (uint32_t oh = 0; oh < L->out_h; oh++)
+        for (uint32_t ow = 0; ow < L->out_w; ow++) {
+            float *o = y + ((size_t)oh * L->out_w + ow) * L->rows;
+            for (uint32_t g = 0; g < G; g++) {
+                spingalett_gather_group_window(is_int ? (const void *)xq : (const void *)x, L, oh, ow, g, window,
+                                               is_int ? 1u : 4u);
+                int32_t xsum = packed ? permute_activations((int8_t *)window, K, per_byte) : 0;
+                weight_rows(image, L, g * OG, OG, (const float *)window, (const int8_t *)window, x_scale, xsum,
+                            o + (size_t)g * OG);
+            }
+        }
+}
+
 /* A convolution on one sample: each output pixel is its filters' dot products with its window. */
 static void conv_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq, void *window) {
     if (slett_conv_columns(L)) {
         conv_forward_columns(image, L, x, y, xq, window);
+        return;
+    }
+    if (slett_conv_depthwise(L)) {
+        conv_forward_depthwise(image, L, x, y, xq, window);
+        return;
+    }
+    if (L->groups > 1) {
+        conv_forward_grouped(image, L, x, y, xq, window);
         return;
     }
     const uint32_t OC = L->rows, K = L->row_len;

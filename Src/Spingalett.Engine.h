@@ -109,15 +109,22 @@ void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, ui
 #define SLETT_COLUMN_WINDOW 32u
 
 static inline bool slett_conv_columns(const SlettLayer *L) {
-    return L->type == LAYER_CONV2D && L->row_len < SLETT_COLUMN_WINDOW;
+    return L->type == LAYER_CONV2D && L->groups == 1 && L->row_len < SLETT_COLUMN_WINDOW;
+}
+
+/* Depthwise convolutions (one input channel per group) run channel-major: their filters are
+   transposed tap by tap, wt[t * rows + j], and each output pixel accumulates all filters at once. */
+static inline bool slett_conv_depthwise(const SlettLayer *L) {
+    return L->type == LAYER_CONV2D && L->groups > 1 && L->in_c == L->groups;
 }
 
 /* Bytes of engine scratch layer L needs: a convolution its transposed filters and one pixel's sums,
-   or a gathered window; batch normalization its coefficients (0 for other layers). */
+   or a gathered window (of its group's channels); batch normalization its coefficients (0 for
+   other layers). */
 static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
     if (L->type == LAYER_BATCH_NORM) return (uint64_t)L->out_c * 8u;
     if (L->type != LAYER_CONV2D) return 0;
-    if (!slett_conv_columns(L)) return (uint64_t)L->row_len * 4u;
+    if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) return (uint64_t)L->row_len * 4u;
     uint64_t elem = spingalett_precision_is_int(L->precision) ? 1u : 4u;
     return slett_align((uint64_t)L->row_len * L->rows * elem) + (uint64_t)L->rows * 4u;
 }
@@ -125,6 +132,14 @@ static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
 /* The filters of convolution L transposed, wt[k * rows + j] = weight k of filter j: the stored
    codes as bytes for integer precisions, floats otherwise. */
 void spingalett_conv_transpose_filters(const uint8_t *image, const SlettLayer *L, void *wt);
+/* The integer sums of output pixel (oh, ow) of depthwise convolution L with transposed filters wt,
+   from its quantized input xq (one sum per filter). */
+void spingalett_conv_depthwise_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
+                                  int32_t *acc);
+/* The window of output pixel (oh, ow) over the channels of group g of convolution L (as
+   spingalett_gather_window, kernel_h x kernel_w x in_c / groups values). */
+void spingalett_gather_group_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, uint32_t g,
+                                    void *window, size_t elem);
 /* The integer sums of output pixel (oh, ow) of convolution L with transposed filters wt, from its
    quantized input xq (one sum per filter). */
 void spingalett_conv_columns_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,

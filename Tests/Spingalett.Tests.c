@@ -171,6 +171,31 @@ static NeuralNetwork *conv_net(int which) {
             avg_pool2d(.net = net, .kernel = 4);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_SIGMOID);
             return net;
+        case 5:     /* depthwise with a multiplier of 2, then a pointwise convolution */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 6, .width = 6, .channels = 3);
+            conv2d(.net = net, .filters = 6, .kernel = 3, .padding = 1, .groups = 3, .act_func = ACT_TANH);
+            conv2d(.net = net, .filters = 4, .kernel = 1, .act_func = ACT_RELU);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            return net;
+        case 6:     /* two groups with rectangular strided windows, a grouped pointwise convolution */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 5, .width = 6, .channels = 4);
+            conv2d(.net = net, .filters = 6, .kernel_h = 2, .kernel_w = 3, .stride = 2, .padding_w = 1, .groups = 2,
+                   .act_func = ACT_TANH);
+            avg_pool2d(.net = net, .kernel = 2, .stride = 1, .padding = 1);
+            conv2d(.net = net, .filters = 4, .kernel = 1, .groups = 2, .act_func = ACT_SIGMOID);
+            layer(.net = net, .neurons_amount = 2, .act_func = ACT_NONE);
+            return net;
+        case 7:     /* depthwise, strided, padded, after the input and before max pooling */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 7, .width = 7, .channels = 5);
+            conv2d(.net = net, .filters = 5, .kernel = 3, .stride = 2, .padding = 1, .groups = 5,
+                   .act_func = ACT_LEAKY_RELU);
+            max_pool2d(.net = net, .kernel = 2);
+            conv2d(.net = net, .filters = 5, .kernel = 1, .groups = 5, .act_func = ACT_FOO52);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SIGMOID);
+            return net;
         default:    /* one input channel, more filters than window weights (the weight gradient is
                        multiplied the other way round), ReLU into max pooling */
             net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
@@ -283,7 +308,7 @@ static void conv_api(void) {
 static void deterministic_threads(void) {
     static const ComputeMode modes[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENMP, COMPUTE_OPENMP};
     static const unsigned threads[] = {1, 1, 3, 4};
-    for (int kind = 0; kind < 2; kind++) {
+    for (int kind = 0; kind < 3; kind++) {
         float *ref = NULL;
         uint64_t count = 0;
         bool same = true;
@@ -301,6 +326,12 @@ static void deterministic_threads(void) {
                 avg_pool2d(.net = net, .kernel = 2, .stride = 1);
                 conv2d(.net = net, .filters = 5, .kernel = 3, .stride = 2, .act_func = ACT_SIGMOID);
                 layer(.net = net, .neurons_amount = 13, .act_func = ACT_TANH);
+                layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            } else if (kind == 2) { /* grouped and depthwise convolutions (multiplier 2) */
+                layer(.net = net, .height = 9, .width = 8, .channels = 8);
+                conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .groups = 4, .act_func = ACT_TANH);
+                conv2d(.net = net, .filters = 32, .kernel = 3, .stride = 2, .groups = 16, .act_func = ACT_RELU);
+                avg_pool2d(.net = net, .kernel = 2);
                 layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
             } else {                /* wide dense layers of odd sizes */
                 layer(.net = net, .neurons_amount = 300);
@@ -324,9 +355,9 @@ static void deterministic_threads(void) {
             }
             free(x); free(y); free_network(net);
         }
-        CHECK(same, "%s training differs between thread counts or compute modes", kind ? "dense" : "convolution");
-        printf("  %s training: identical on 1, 3 and 4 threads and single-threaded%s\n", kind ? "dense" : "convolution",
-               same ? "" : " -- NO");
+        static const char *const kinds[] = {"convolution", "dense", "grouped convolution"};
+        CHECK(same, "%s training differs between thread counts or compute modes", kinds[kind]);
+        printf("  %s training: identical on 1, 3 and 4 threads and single-threaded%s\n", kinds[kind], same ? "" : " -- NO");
         free(ref);
     }
     spingalett_set_num_threads(4);
@@ -2107,16 +2138,18 @@ static int export_test_headers(const char *dir) {
 /* ---------------------------------------------------------------- convolution models (format 4) */
 
 
-/* A version 4 layer table entry with its input shape (header or previous entry). */
+/* A version 4 or 5 layer table entry with its input shape (header or previous entry); groups is 1
+   for version 4 convolutions. */
 typedef struct { uint32_t in, out; int act, prec, type; uint64_t w, s, b, o;
-                 uint32_t ih, iw, ic, oh, ow, oc, kh, kw, sh, sw, ph, pw; } Entry4;
+                 uint32_t ih, iw, ic, oh, ow, oc, kh, kw, sh, sw, ph, pw, groups; } Entry4;
 static Entry4 image_layer4(const uint8_t *img, uint32_t i) {
-    const uint8_t *e = img + 64 + 64 * (size_t)i;
+    const size_t size = rd16(img + 6) >= 5 ? 80 : 64;
+    const uint8_t *e = img + 64 + size * i;
     Entry4 r = {rd32(e), rd32(e + 4), e[8], e[9], e[10], rd64(e + 16), rd64(e + 24), rd64(e + 32), rd64(e + 40),
                 0, 0, 0, rd16(e + 48), rd16(e + 50), 0, rd16(e + 52), rd16(e + 54), rd16(e + 56), rd16(e + 58),
-                rd16(e + 60), rd16(e + 62)};
-    r.ih = i ? rd16(e - 64 + 48) : rd32(img + 32);
-    r.iw = i ? rd16(e - 64 + 50) : rd32(img + 36);
+                rd16(e + 60), rd16(e + 62), size == 80 ? rd32(e + 64) : e[10] == LAYER_CONV2D};
+    r.ih = i ? rd16(e - size + 48) : rd32(img + 32);
+    r.iw = i ? rd16(e - size + 50) : rd32(img + 36);
     r.ic = r.in / (r.ih * r.iw);
     r.oc = r.out / (r.oh * r.ow);
     return r;
@@ -2124,7 +2157,7 @@ static Entry4 image_layer4(const uint8_t *img, uint32_t i) {
 
 /* Weight k of filter j of a stored convolution, decoded as docs/ModelFormat.md describes. */
 static double conv_weight(const uint8_t *img, Entry4 e, uint32_t j, uint32_t k) {
-    Entry as_dense = {e.kh * e.kw * e.ic, e.oc, e.act, e.prec, e.w, e.s, e.b, e.o};
+    Entry as_dense = {e.kh * e.kw * (e.ic / e.groups), e.oc, e.act, e.prec, e.w, e.s, e.b, e.o};
     return stored_weight(img, as_dense, j, k);
 }
 
@@ -2141,7 +2174,8 @@ static void reference_conv(const uint8_t *img, Entry4 e, const float *x, float *
         float inv = amax > 0 ? 127.0f / amax : 0;
         for (uint32_t k = 0; k < e.in; k++) q[k] = (int8_t)lrintf(x[k] * inv);
     }
-    Entry as_dense = {e.kh * e.kw * e.ic, e.oc, e.act, e.prec, e.w, e.s, e.b, e.o};
+    const uint32_t cg = e.ic / e.groups, og = e.oc / e.groups;      /* channels and filters per group */
+    Entry as_dense = {e.kh * e.kw * cg, e.oc, e.act, e.prec, e.w, e.s, e.b, e.o};
     for (uint32_t oh = 0; oh < e.oh; oh++)
         for (uint32_t ow = 0; ow < e.ow; ow++)
             for (uint32_t j = 0; j < e.oc; j++) {
@@ -2151,9 +2185,9 @@ static void reference_conv(const uint8_t *img, Entry4 e, const float *x, float *
                     for (uint32_t kw = 0; kw < e.kw; kw++) {
                         int64_t ih = (int64_t)oh * e.sh - e.ph + kh, iw = (int64_t)ow * e.sw - e.pw + kw;
                         if (ih < 0 || iw < 0 || ih >= e.ih || iw >= e.iw) continue;
-                        for (uint32_t c = 0; c < e.ic; c++) {
-                            uint32_t k = (kh * e.kw + kw) * e.ic + c;
-                            size_t xi = ((size_t)ih * e.iw + (size_t)iw) * e.ic + c;
+                        for (uint32_t c = 0; c < cg; c++) {
+                            uint32_t k = (kh * e.kw + kw) * cg + c;
+                            size_t xi = ((size_t)ih * e.iw + (size_t)iw) * e.ic + (j / og) * cg + c;
                             if (integer) acc += (int64_t)stored_code(img, as_dense, j, k) * q[xi];
                             else { double t = conv_weight(img, e, j, k) * x[xi]; facc += t; mag += fabs(t); }
                         }
@@ -2174,17 +2208,21 @@ static void reference_conv(const uint8_t *img, Entry4 e, const float *x, float *
    not a multiple of four, padding, strides, rectangular and pointwise windows, windows shorter and
    longer than SLETT_COLUMN_WINDOW, zero inputs). */
 static void model_conv_kernels(PrecisionMode p) {
-    static const struct { uint32_t h, w, c, f, kh, kw, sh, sw, ph, pw; } g[] = {
-        {6, 5, 4, 9, 3, 3, 2, 2, 1, 1}, {7, 7, 1, 13, 3, 3, 1, 1, 1, 1}, {5, 8, 3, 4, 2, 3, 1, 2, 0, 1},
-        {4, 4, 33, 6, 1, 1, 1, 1, 0, 0}, {9, 3, 17, 5, 4, 2, 3, 1, 2, 1}, {3, 3, 70, 3, 3, 3, 1, 1, 0, 0},
-        {10, 10, 2, 40, 2, 2, 2, 2, 0, 0}, {6, 6, 3, 16, 3, 3, 1, 1, 1, 1}, {5, 5, 1, 64, 5, 5, 1, 1, 2, 2},
+    static const struct { uint32_t h, w, c, f, kh, kw, sh, sw, ph, pw, groups; } g[] = {
+        {6, 5, 4, 9, 3, 3, 2, 2, 1, 1, 1}, {7, 7, 1, 13, 3, 3, 1, 1, 1, 1, 1}, {5, 8, 3, 4, 2, 3, 1, 2, 0, 1, 1},
+        {4, 4, 33, 6, 1, 1, 1, 1, 0, 0, 1}, {9, 3, 17, 5, 4, 2, 3, 1, 2, 1, 1}, {3, 3, 70, 3, 3, 3, 1, 1, 0, 0, 1},
+        {10, 10, 2, 40, 2, 2, 2, 2, 0, 0, 1}, {6, 6, 3, 16, 3, 3, 1, 1, 1, 1, 1}, {5, 5, 1, 64, 5, 5, 1, 1, 2, 2, 1},
+        /* depthwise (multipliers 1 and 2), grouped, grouped pointwise */
+        {6, 5, 20, 20, 3, 3, 1, 1, 1, 1, 20}, {7, 6, 3, 6, 3, 3, 2, 2, 1, 1, 3}, {9, 9, 16, 16, 5, 5, 2, 2, 2, 2, 16},
+        {5, 8, 4, 6, 2, 3, 1, 2, 0, 1, 2}, {4, 4, 32, 64, 1, 1, 1, 1, 0, 0, 8}, {6, 6, 48, 24, 3, 3, 1, 1, 1, 1, 4},
     };
     uint32_t inexact = 0; double worst = 0; lcg_state = 515 + p;
     for (size_t t = 0; t < sizeof g / sizeof *g; t++) {
         NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
         layer(.net = net, .height = g[t].h, .width = g[t].w, .channels = g[t].c);
         conv2d(.net = net, .filters = g[t].f, .kernel_h = g[t].kh, .kernel_w = g[t].kw, .stride_h = g[t].sh,
-               .stride_w = g[t].sw, .padding_h = g[t].ph, .padding_w = g[t].pw, .act_func = ACT_NONE);
+               .stride_w = g[t].sw, .padding_h = g[t].ph, .padding_w = g[t].pw, .groups = g[t].groups,
+               .act_func = ACT_NONE);
         for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * (i % 7 == 0 ? 2.0f : 0.3f);
         for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() - 0.5f;
         SpingalettModel *m = spingalett_model_from_network(net, p);
@@ -2206,6 +2244,14 @@ static void model_conv_kernels(PrecisionMode p) {
                 if (bound[j] == 0) { if (d != 0) inexact++; }
                 else if (d / bound[j] > worst) worst = d / bound[j];
             }
+            /* batched prediction (two copies of the sample) computes what a run computes */
+            float *xx = malloc(2 * (size_t)in * sizeof(float)), *yy = malloc(2 * (size_t)out * sizeof(float));
+            memcpy(xx, x, in * sizeof(float)); memcpy(xx + in, x, in * sizeof(float));
+            CHECK(spingalett_model_predict(m, xx, 2, yy), "conv kernels p=%d: predict failed", p);
+            float pd = fmaxf(max_abs_diff(yy, y, out), max_abs_diff(yy + out, y, out));
+            CHECK(p >= PRECISION_INT8 ? pd == 0.0f : pd < 1e-4f, "conv kernels p=%d geometry %zu: predict differs from run by %g",
+                  p, t, pd);
+            free(xx); free(yy);
         }
         free(ws); free(x); free(y); free(r); free(bound);
         spingalett_model_free(m); free_network(net);
@@ -2797,9 +2843,10 @@ int main(int argc, char **argv) {
         }
         static const char *conv_names[] = {"conv same/maxpool/softmax", "conv stride/avgpool/1x1",
                                            "conv rect/maxpool overlap", "conv deep relu/foo52/gap",
-                                           "conv narrow window/relu/maxpool"};
+                                           "conv narrow window/relu/maxpool", "depthwise x2/pointwise",
+                                           "groups 2/rect/grouped 1x1", "depthwise strided/maxpool"};
         for (int m = 0; m < 3; m++) for (int s = 0; s < 3; s++)
-            for (int c = 0; c < 5; c++) {
+            for (int c = 0; c < 8; c++) {
                 lcg_state = 1000 + c;
                 gradcheck_net(conv_names[c], conv_net(c), modes[m], strats[s]);
             }
