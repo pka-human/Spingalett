@@ -77,10 +77,15 @@ static double now(void) {
 #endif
 }
 
-static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *started) {
+typedef struct { double started, last; } EpochClock;   /* when training began, when the last epoch ended */
+
+static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *data) {
     (void)net;
-    printf("epoch %3zu  loss %.4f  validation %.2f%%%s  (%.0f s)\n", p->epoch, (double)p->train_loss,
-           100.0 * (double)p->validation.accuracy, p->improved ? "  *" : "", now() - *(const double *)started);
+    EpochClock *clock = data;
+    double t = now();
+    printf("epoch %3zu  loss %.4f  validation %.2f%%%s  (%.0f s, %.0f s in all)\n", p->epoch, (double)p->train_loss,
+           100.0 * (double)p->validation.accuracy, p->improved ? "  *" : "", t - clock->last, t - clock->started);
+    clock->last = t;
     fflush(stdout);
     return false;
 }
@@ -130,7 +135,8 @@ int main(int argc, char **argv) {
     LRScheduleParams schedule = {.warmup_epochs = 1, .min_lr = 1e-5f};
     printf("training a convolutional network (%llu parameters) on %u augmented samples per epoch, %u held out\n",
            (unsigned long long)spingalett_parameter_count(net), train_set.count, val_set.count);
-    double started = now();
+    double t0 = now();
+    EpochClock clock = {t0, t0};
     TrainReport report = train(
         .net = net,
         .training_mode = MODE_GENERATOR_FUNCTION,
@@ -152,7 +158,7 @@ int main(int argc, char **argv) {
         .monitor = MONITOR_VAL_ACCURACY,
         .restore_best_weights = true,
         .callback = on_epoch,
-        .callback_data = &started
+        .callback_data = &clock
     );
     if (report.status == TRAIN_FAILED) {
         fprintf(stderr, "training failed: %s\n", spingalett_last_error_message());
@@ -170,7 +176,7 @@ int main(int argc, char **argv) {
                                   .sample_count = test_set.count);
     printf("best epoch %zu: validation %.2f%%, test %.2f%%, distorted test %.2f%% (%.0f s)\n",
            report.best_epoch, 100.0 * (double)report.best_value, 100.0 * (double)test.accuracy,
-           100.0 * (double)robust.accuracy, now() - started);
+           100.0 * (double)robust.accuracy, now() - clock.started);
 
     spingalett_clear_error();
     save_spingalett(.net = net, .filename = output, .do_not_save_optimizer = true);

@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [Unreleased]
+
+### Changed
+- `DigitPadTrain` prints each epoch's time and the time since training began.
+
 ## [0.8.0] - Unreleased
 
 Deeper convolutional networks: batch normalization, grouped and depthwise convolutions, image
