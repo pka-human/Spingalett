@@ -815,6 +815,19 @@ static inline void pool_block_forward(const float *restrict xs, float *restrict 
                                       uint32_t len, bool max) {
     float acc[POOL_BLOCK];
     const float *first = xs + ((size_t)h0 * W + w0) * C + c0;
+    float inv = max ? 1.0f : 1.0f / (float)((h1 - h0) * (w1 - w0));
+    if (len == POOL_BLOCK) {
+        /* a whole block: the same steps without a test per channel, so that they vectorize */
+        for (uint32_t c = 0; c < POOL_BLOCK; c++) acc[c] = first[c];
+        for (uint32_t h = h0; h < h1; h++)
+            for (uint32_t w = (h == h0 ? w0 + 1 : w0); w < w1; w++) {
+                const float *v = xs + ((size_t)h * W + w) * C + c0;
+                if (max) { for (uint32_t c = 0; c < POOL_BLOCK; c++) acc[c] = v[c] > acc[c] ? v[c] : acc[c]; }
+                else     { for (uint32_t c = 0; c < POOL_BLOCK; c++) acc[c] += v[c]; }
+            }
+        for (uint32_t c = 0; c < POOL_BLOCK; c++) o[c] = acc[c] * inv;
+        return;
+    }
     for (uint32_t c = 0; c < POOL_BLOCK; c++) acc[c] = c < len ? first[c] : 0.0f;
     for (uint32_t h = h0; h < h1; h++)
         for (uint32_t w = (h == h0 ? w0 + 1 : w0); w < w1; w++) {
@@ -822,7 +835,6 @@ static inline void pool_block_forward(const float *restrict xs, float *restrict 
             if (max) { for (uint32_t c = 0; c < POOL_BLOCK; c++) if (c < len && v[c] > acc[c]) acc[c] = v[c]; }
             else     { for (uint32_t c = 0; c < POOL_BLOCK; c++) if (c < len) acc[c] += v[c]; }
         }
-    float inv = max ? 1.0f : 1.0f / (float)((h1 - h0) * (w1 - w0));
     for (uint32_t c = 0; c < POOL_BLOCK; c++) if (c < len) o[c] = acc[c] * inv;
 }
 

@@ -421,6 +421,12 @@ static void activate_samples(float *y, uint32_t n, uint32_t size, ActivationFunc
 /* The outputs of n integer rows for SPINGALETT_I8_TILE vectors (count of them real) against their
    interleaved rows: vector i of the tile (in w->tile of thread t, its bytes in place) goes to ys[i]
    with activation scale xs[i]. */
+/* The outputs of `rows` integer sums (restrict: no overlap to check before every vector). */
+static inline void int_outputs(float *restrict y, const float *restrict bias, const float *restrict scale,
+                               float x_scale, const int32_t *restrict a, uint32_t rows) {
+    for (uint32_t j = 0; j < rows; j++) y[j] = spingalett_int_output(bias[j], scale[j], x_scale, a[j]);
+}
+
 static void tile_outputs(const int8_t *interleaved, const int32_t *sums, const float *bias, const float *scale,
                          uint32_t rows, uint32_t n, PredictWorkspace *w, int t, uint32_t count, float *const ys[],
                          const float xs[]) {
@@ -428,11 +434,7 @@ static void tile_outputs(const int8_t *interleaved, const int32_t *sums, const f
     int32_t *acc = (int32_t *)(void *)(tile + w->tile_sums);
     const uint32_t R = spingalett_i8_interleaved_rows(rows);
     spingalett_i8_interleaved_tile(interleaved, sums, rows, n, tile, spingalett_i8_interleaved_len(n), acc, R);
-    for (uint32_t i = 0; i < count; i++) {
-        const int32_t *a = acc + (size_t)i * R;
-        float *y = ys[i], x_scale = xs[i];
-        for (uint32_t j = 0; j < rows; j++) y[j] = spingalett_int_output(bias[j], scale[j], x_scale, a[j]);
-    }
+    for (uint32_t i = 0; i < count; i++) int_outputs(ys[i], bias, scale, xs[i], acc + (size_t)i * R, rows);
 }
 
 static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, const float *x,

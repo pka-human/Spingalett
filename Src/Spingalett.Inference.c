@@ -1111,6 +1111,19 @@ float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q) {
 #if defined(SPG_AVX)
     __m256 vmax = _mm256_setzero_ps(), vbad = _mm256_setzero_ps();
     const __m256 sign = _mm256_set1_ps(-0.0f), big = _mm256_set1_ps(FLT_MAX);
+    /* four maxima side by side, then together (the largest magnitude does not depend on the order) */
+    __m256 m1 = vmax, m2 = vmax, m3 = vmax;
+    for (; k + 32u <= n; k += 32u) {
+        __m256 a0 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k)), a1 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k + 8));
+        __m256 a2 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k + 16)), a3 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k + 24));
+        vbad = _mm256_or_ps(vbad, _mm256_or_ps(_mm256_or_ps(_mm256_cmp_ps(a0, big, _CMP_NLE_UQ), _mm256_cmp_ps(a1, big, _CMP_NLE_UQ)),
+                                               _mm256_or_ps(_mm256_cmp_ps(a2, big, _CMP_NLE_UQ), _mm256_cmp_ps(a3, big, _CMP_NLE_UQ))));
+        vmax = _mm256_max_ps(vmax, a0);
+        m1 = _mm256_max_ps(m1, a1);
+        m2 = _mm256_max_ps(m2, a2);
+        m3 = _mm256_max_ps(m3, a3);
+    }
+    vmax = _mm256_max_ps(_mm256_max_ps(vmax, m1), _mm256_max_ps(m2, m3));
     for (; k + 8u <= n; k += 8u) {
         __m256 a = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k));
         vbad = _mm256_or_ps(vbad, _mm256_cmp_ps(a, big, _CMP_NLE_UQ));     /* NaN or infinite */
@@ -1491,6 +1504,10 @@ void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, u
         int64_t ih = ih0 + kh;
         if (ih < 0 || ih >= (int64_t)L->in_h || a == b) { memset(d, 0, run); continue; }
         const uint8_t *src = (const uint8_t *)x + ((size_t)ih * L->in_w + (size_t)(iw0 + a)) * C * elem;
+        if (a == 0 && b == (int64_t)KW) {       /* the whole row is inside: one copy */
+            memcpy(d, src, run);
+            continue;
+        }
         memset(d, 0, (size_t)a * C * elem);
         memcpy(d + (size_t)a * C * elem, src, (size_t)(b - a) * C * elem);
         memset(d + (size_t)b * C * elem, 0, (size_t)(KW - b) * C * elem);
