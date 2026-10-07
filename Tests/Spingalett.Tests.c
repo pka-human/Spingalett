@@ -2200,6 +2200,92 @@ static void model_inference(PrecisionMode p, float tol) {
 }
 
 /* The validator must reject every damaged image without reading out of bounds. */
+#if !defined(_WIN32)
+#include <pthread.h>
+
+typedef struct {
+    const SpingalettModel *model;
+    const float *x;
+    float *const *expect;               /* outputs for each count in counts */
+    const uint32_t *counts;
+    uint32_t sizes, seed;
+    bool same;
+} PredictJob;
+
+static void *predict_job(void *arg) {
+    PredictJob *j = (PredictJob *)arg;
+    float *y = malloc((size_t)40 * j->model->output_size * sizeof(float));
+    j->same = y != NULL;
+    for (uint32_t r = 0; r < 40 && j->same; r++) {
+        uint32_t k = (r * 5 + j->seed) % j->sizes, n = j->counts[k];
+        j->same = spingalett_model_predict(j->model, j->x, n, y) &&
+                  !memcmp(y, j->expect[k], (size_t)n * j->model->output_size * sizeof(float));
+    }
+    free(y);
+    return NULL;
+}
+#endif
+
+/* Models prepare their weights once and keep a workspace between calls: results are the same for
+   repeated calls of any size, for a model that owns nothing (spingalett_model_init over the same
+   image, which prepares on every call), and for calls from several threads at once. */
+static void model_shared(void) {
+    spingalett_seed(41);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .groups = 8, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    max_pool2d(.net = net, .kernel = 2);
+    layer(net, 24, ACT_RELU, WEIGHT_INITIALIZATION_HE);
+    layer(net, 5, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    static const uint32_t counts[] = {1, 2, 5, 12, 13, 40};
+    enum { SIZES = sizeof counts / sizeof *counts };
+    float *x = malloc((size_t)40 * 192 * sizeof(float));
+    lcg_state = 9;
+    for (size_t i = 0; i < (size_t)40 * 192; i++) x[i] = frand();
+    ComputeMode mode = spingalett_get_compute_mode();
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    for (int p = 0; p < PRECISION_COUNT; p++) {
+        SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+        float *expect[SIZES], *y = malloc((size_t)40 * 5 * sizeof(float));
+        bool same = m && y;
+        for (int k = 0; k < SIZES; k++) {
+            expect[k] = malloc((size_t)counts[k] * 5 * sizeof(float));
+            same = same && expect[k] && spingalett_model_predict(m, x, counts[k], expect[k]);
+        }
+        SpingalettModel bare;
+        same = same && spingalett_model_init(&bare, m->image, m->image_size) == SPINGALETT_OK;
+        for (int k = SIZES; k-- > 0 && same;) {      /* in the other order, on both models */
+            same = spingalett_model_predict(m, x, counts[k], y) && !memcmp(y, expect[k], (size_t)counts[k] * 5 * sizeof(float));
+            same = same && spingalett_model_predict(&bare, x, counts[k], y) &&
+                   !memcmp(y, expect[k], (size_t)counts[k] * 5 * sizeof(float));
+        }
+        CHECK(same, "model p=%d: repeated predictions or a model without an owner differ", p);
+#if !defined(_WIN32)
+        PredictJob jobs[4];
+        pthread_t threads[4];
+        int started = 0;
+        for (int t = 0; t < 4 && same; t++) {
+            jobs[t] = (PredictJob){m, x, expect, counts, SIZES, (uint32_t)t * 3u, false};
+            if (pthread_create(&threads[t], NULL, predict_job, &jobs[t]) == 0) started++;
+        }
+        bool threaded = started == 4;
+        for (int t = 0; t < started; t++) {
+            pthread_join(threads[t], NULL);
+            threaded = threaded && jobs[t].same;
+        }
+        CHECK(!same || threaded, "model p=%d: predictions from several threads differ", p);
+#endif
+        for (int k = 0; k < SIZES; k++) free(expect[k]);
+        free(y);
+        spingalett_model_free(m);
+    }
+    spingalett_set_compute_mode(mode);
+    free(x);
+    free_network(net);
+    printf("  shared models: repeated, unowned and concurrent predictions agree\n");
+}
+
 static void model_validation(void) {
     NeuralNetwork *net = deploy_net();
     size_t size = 0;
@@ -3298,6 +3384,7 @@ int main(int argc, char **argv) {
         model_inference(PRECISION_INT8, 3e-2f);
         model_inference(PRECISION_INT4, 0.1f);
         model_inference(PRECISION_INT2, 0.5f);
+        model_shared();
         model_validation();
         model_files();
         for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);

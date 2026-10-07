@@ -435,6 +435,9 @@ if(BUILD_TESTS)
         target_link_libraries(SpingalettTests PRIVATE m)
         set_target_properties(SpingalettTests PROPERTIES BUILD_RPATH "$ORIGIN")
     endif()
+    if(NOT WIN32)
+        target_link_libraries(SpingalettTests PRIVATE Threads::Threads)     # predictions from several threads
+    endif()
 
     # White-box GEMM test: compiles the kernel source itself with the library's ISA flags.
     add_executable(SpingalettGemmTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.GemmTests.c

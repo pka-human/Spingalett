@@ -288,7 +288,11 @@ with sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Layer(12), sg.Layer(20, sg.Activation
                   [l.precision for l in m.layers] == [p, p] and m.layers[0].activation == sg.Activation.RELU,
                   f"model description {m!r}")
             check(np.abs(out - ref).max() < tol, f"model {p.name} vs network: {np.abs(out - ref).max():.2e}")
-            check(np.array_equal(m(x[7]), out[7]), "model single sample")
+            # integer models compute a sample exactly as in a batch; float ones may round differently
+            # (one sample or a few run through dot products)
+            single = m(x[7])
+            check(np.array_equal(single, out[7]) if p in (sg.Precision.INT8, sg.Precision.INT4)
+                  else np.allclose(single, out[7], rtol=1e-5, atol=1e-6), "model single sample")
             metrics = m.evaluate(x, ref)
             check(0 <= metrics.accuracy <= 1 and math.isfinite(metrics.loss), "model evaluate")
             with sg.Model.from_bytes(m.to_bytes()) as copy:

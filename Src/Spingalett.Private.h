@@ -24,6 +24,26 @@ static inline bool spingalett_use_omp(ComputeMode mode, uint64_t work) {
     return mode == COMPUTE_OPENMP && work >= SPINGALETT_OMP_MIN_WORK;
 }
 
+/* SPINGALETT_PARALLEL_FOR(cond, for (...) body) runs the loop on the OpenMP threads (static
+   schedule) when cond holds, and as plain code otherwise: a parallel region whose if clause is
+   false still costs about 0.2 us to enter, more than many of the loops it would guard. The _THREADS
+   form also names the number of threads. Bodies cannot hold preprocessor lines; they get their
+   thread's number from spingalett_thread_num(). */
+#define SPINGALETT_PRAGMA(x) _Pragma(#x)
+#if defined(_OPENMP)
+#include <omp.h>
+#define SPINGALETT_PARALLEL_FOR(cond, ...) \
+    do { if (cond) { SPINGALETT_PRAGMA(omp parallel for schedule(static)) __VA_ARGS__ } else { __VA_ARGS__ } } while (0)
+#define SPINGALETT_PARALLEL_FOR_THREADS(threads, cond, ...) \
+    do { if (cond) { SPINGALETT_PRAGMA(omp parallel for schedule(static) num_threads(threads)) __VA_ARGS__ } \
+         else { __VA_ARGS__ } } while (0)
+static inline int spingalett_thread_num(void) { return omp_get_thread_num(); }
+#else
+#define SPINGALETT_PARALLEL_FOR(cond, ...) do { (void)(cond); __VA_ARGS__ } while (0)
+#define SPINGALETT_PARALLEL_FOR_THREADS(threads, cond, ...) do { (void)(threads); (void)(cond); __VA_ARGS__ } while (0)
+static inline int spingalett_thread_num(void) { return 0; }
+#endif
+
 #define SPINGALETT_NEURON(net, l, j)        ((net)->neurons[(net)->neuron_offsets[l] + (uint64_t)(j)])
 #define SPINGALETT_LAYER_PTR(net, l)        ((net)->neurons + (net)->neuron_offsets[l])
 
@@ -234,6 +254,8 @@ typedef struct {
 
 SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads);
 void spingalett_gemm_scratch_free(SpingalettGemmScratch *scratch);
+/* Bytes a scratch for `threads` threads holds when it is created. */
+size_t spingalett_gemm_scratch_bytes(int threads);
 void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             const float *A, size_t lda, const float *B, size_t ldb,
