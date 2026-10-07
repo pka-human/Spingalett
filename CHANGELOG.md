@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.6.0] - 2026-10-07
+
+A performance release: the same API and file formats, faster kernels.
+
+### Added
+- Run-time choice of matrix kernels on x86-64. Libraries built without `-march=native` with GCC
+  or Clang (the release packages among them) also contain the GEMM kernels for AVX2+FMA and for
+  AVX-512 and run the best set the processor supports. On a Cascade Lake core the baseline x86-64
+  package now trains 3.6 to 4.9 times as fast and infers 5 times as fast. The CMake option
+  `SPINGALETT_CPU_DISPATCH` (on by default) controls it.
+- `spingalett_cpu_kernels()` names the matrix kernels in use (`"AVX-512"`, `"AVX2"`, `"AVX"`,
+  `"SSE2"`, `"NEON"` or `"C"`); Python: `cpu_kernels()`. `Bin/Benchmark` prints it.
+
+### Changed
+- GEMM: the last row panel of a block runs a kernel of 8 or 4 rows (AVX-512) or 4 or 2 rows (AVX)
+  instead of computing zero rows; transposed operands are packed with SIMD transposes; a call is
+  one OpenMP parallel region, and products with few rows (mini-batches) pack their shared operand
+  once for all threads, which then split the columns. A 64-row product runs 35% faster on one
+  thread and 55% faster on four; mini-batch training (784-512-1000-10, batches of 64, Adam) is 36%
+  faster on four threads and 5% faster on one. Threads still split the result only by rows and
+  columns, so results do not depend on the thread count.
+- Batch training applies the optimizer to each layer as soon as its gradient is complete, while
+  the gradient is still in cache (steps with gradient clipping keep the old order).
+- Inference engine: INT4 and INT2 codes are decoded in registers with AVX2 and NEON, against
+  activations permuted once per layer into the order the codes are decoded in; four weight rows
+  share every activation load in all precisions. One sample through 784-512-1000-10 takes 18 us in
+  INT4 (61 before) and 17 us in INT2 (177 before); through 784-256-128-10, 5 us in INT4 and INT2
+  (17 and 44 before) and 10.5 us in FP16 and BF16 (16 and 18 before). Results are unchanged: the
+  integer kernels remain bit-exact and batched prediction still equals single runs.
+- The shared library's soname is `libspingalett.so.0.6`.
+
 ## [0.5.0] - 2026-10-06
 
 ### Added
@@ -218,6 +249,7 @@ changes, which are listed under **Changed**.
 
 Initial release.
 
+[0.6.0]: https://github.com/pka-human/Spingalett/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/pka-human/Spingalett/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/pka-human/Spingalett/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/pka-human/Spingalett/compare/v0.3.0...v0.4.0
