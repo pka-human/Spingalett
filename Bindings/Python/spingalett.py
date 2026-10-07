@@ -387,7 +387,7 @@ class _Model(Structure):
         ("image_size", c_size_t),
         ("max_width_", c_uint32),
         ("max_int_inputs_", c_uint32),
-        ("max_window_", c_uint32),
+        ("conv_scratch_", c_size_t),
         ("owner_", c_void_p),
     ]
 
@@ -402,6 +402,9 @@ class _LayerInfo(Structure):
         ("outputs", c_uint32),
         ("activation", c_int),
         ("precision", c_int),
+        ("in_height", c_uint32),
+        ("in_width", c_uint32),
+        ("in_channels", c_uint32),
         ("height", c_uint32),
         ("width", c_uint32),
         ("channels", c_uint32),
@@ -1295,6 +1298,7 @@ class LayerInfo:
     precision: Precision
     type: LayerType = LayerType.DENSE
     shape: Tuple[int, int, int] = (1, 1, 0)     # output (height, width, channels)
+    input_shape: Tuple[int, int, int] = (1, 1, 0)
     kernel: Tuple[int, int] = (0, 0)
     stride: Tuple[int, int] = (0, 0)
     padding: Tuple[int, int] = (0, 0)
@@ -1387,7 +1391,8 @@ class Model:
                                  Precision(info.precision), LayerType(info.type),
                                  (int(info.height), int(info.width), int(info.channels)),
                                  (int(info.kernel_h), int(info.kernel_w)), (int(info.stride_h), int(info.stride_w)),
-                                 (int(info.padding_h), int(info.padding_w))))
+                                 (int(info.padding_h), int(info.padding_w)),
+                                 (int(info.in_height), int(info.in_width), int(info.in_channels))))
         return out
 
     def to_bytes(self) -> bytes:

@@ -2086,11 +2086,13 @@ static void reference_conv(const uint8_t *img, Entry4 e, const float *x, float *
 }
 
 /* One convolution per window geometry and precision: the engine against the stored image (filters
-   not a multiple of four, padding, strides, rectangular and pointwise windows, a zero sample). */
+   not a multiple of four, padding, strides, rectangular and pointwise windows, windows shorter and
+   longer than SLETT_COLUMN_WINDOW, zero inputs). */
 static void model_conv_kernels(PrecisionMode p) {
     static const struct { uint32_t h, w, c, f, kh, kw, sh, sw, ph, pw; } g[] = {
         {6, 5, 4, 9, 3, 3, 2, 2, 1, 1}, {7, 7, 1, 13, 3, 3, 1, 1, 1, 1}, {5, 8, 3, 4, 2, 3, 1, 2, 0, 1},
         {4, 4, 33, 6, 1, 1, 1, 1, 0, 0}, {9, 3, 17, 5, 4, 2, 3, 1, 2, 1}, {3, 3, 70, 3, 3, 3, 1, 1, 0, 0},
+        {10, 10, 2, 40, 2, 2, 2, 2, 0, 0}, {6, 6, 3, 16, 3, 3, 1, 1, 1, 1}, {5, 5, 1, 64, 5, 5, 1, 1, 2, 2},
     };
     uint32_t inexact = 0; double worst = 0; lcg_state = 515 + p;
     for (size_t t = 0; t < sizeof g / sizeof *g; t++) {
@@ -2110,7 +2112,8 @@ static void model_conv_kernels(PrecisionMode p) {
         float *x = malloc(in * sizeof(float)), *y = malloc(out * sizeof(float)), *r = malloc(out * sizeof(float));
         double *bound = malloc(out * sizeof(double));
         for (int s = 0; s < 3; s++) {
-            for (uint32_t k = 0; k < in; k++) x[k] = s == 2 ? 0.0f : (frand() * 2 - 1) * (s ? 0.05f : 2.0f);
+            /* wide values, small ReLU-like values (half zero: skipped by short windows), all zero */
+            for (uint32_t k = 0; k < in; k++) x[k] = s == 2 ? 0.0f : s ? fmaxf(0.0f, frand() * 2 - 1) * 0.05f : (frand() * 2 - 1) * 2.0f;
             CHECK(spingalett_model_run(m, x, y, ws) == SPINGALETT_OK, "conv kernels p=%d: run failed", p);
             reference_conv(img, e, x, r, bound);
             for (uint32_t j = 0; j < out; j++) {

@@ -98,9 +98,11 @@ typedef struct {
     int8_t *xq;                                 /* [chunk x max_int_inputs] */
     float *xs;                                  /* per-sample activation scales */
     int8_t *rows;                               /* four unpacked INT4 / INT2 rows, per thread */
-    int8_t *window;                             /* a quantized convolution window, per thread */
+    int8_t *window;                             /* a quantized convolution window or one pixel's sums, per thread */
+    size_t window_stride;
     float **dequant;                            /* FP16 / BF16 layers expanded to float, per layer */
-    int8_t **unpacked;                          /* INT4 / INT2 convolution filters as bytes, per layer */
+    int8_t **unpacked;                          /* integer convolution filters as bytes, per layer:
+                                                   transposed for short windows, rows for INT4 / INT2 */
     float *conv;                                /* gathered windows of float convolutions (OpenBLAS) */
     SpingalettGemmScratch *gemm;
     int threads;
@@ -150,9 +152,11 @@ static bool predict_workspace_create(const SpingalettModel *model, uint32_t chun
         spingalett_slett_layer(image, i, &L);
         if (L.rows == 0) continue;              /* pooling */
         bool conv = L.type == LAYER_CONV2D;
+        bool columns = slett_conv_columns(&L);
         if (spingalett_precision_is_int(L.precision)) {
             if (L.inputs > int_inputs) int_inputs = L.inputs;
-            if (conv && L.row_len > int_window) int_window = L.row_len;
+            uint32_t per_thread = columns ? L.rows * 4u : L.row_len;     /* one pixel's sums, or a window */
+            if (conv && per_thread > int_window) int_window = per_thread;
             if (!conv && L.inputs > dense_int_inputs) dense_int_inputs = L.inputs;
             packed |= !conv && L.precision != PRECISION_INT8;
         } else {
@@ -174,13 +178,17 @@ static bool predict_workspace_create(const SpingalettModel *model, uint32_t chun
             }
             w->dequant[i] = d;
         }
-        if (conv && (L.precision == PRECISION_INT4 || L.precision == PRECISION_INT2)) {
+        if (conv && spingalett_precision_is_int(L.precision) && (columns || L.precision != PRECISION_INT8)) {
             int8_t *u = (int8_t *)spingalett_aligned_alloc(n);
             if (!u) return false;
-            size_t row = (size_t)spingalett_slett_row_bytes(L.precision, L.row_len);
-            for (uint32_t j = 0; j < L.rows; j++) {
-                if (L.precision == PRECISION_INT4) spingalett_unpack_int4(src + j * row, u + (size_t)j * L.row_len, L.row_len);
-                else spingalett_unpack_int2(src + j * row, u + (size_t)j * L.row_len, L.row_len);
+            if (columns) {                      /* filter-major, as the engine runs short windows */
+                spingalett_conv_transpose_filters(image, &L, u);
+            } else {
+                size_t row = (size_t)spingalett_slett_row_bytes(L.precision, L.row_len);
+                for (uint32_t j = 0; j < L.rows; j++) {
+                    if (L.precision == PRECISION_INT4) spingalett_unpack_int4(src + j * row, u + (size_t)j * L.row_len, L.row_len);
+                    else spingalett_unpack_int2(src + j * row, u + (size_t)j * L.row_len, L.row_len);
+                }
             }
             w->unpacked[i] = u;
         }
@@ -198,7 +206,8 @@ static bool predict_workspace_create(const SpingalettModel *model, uint32_t chun
             if (!w->rows) return false;
         }
         if (int_window) {
-            w->window = (int8_t *)spingalett_aligned_alloc((size_t)w->threads * int_window);
+            w->window_stride = ((size_t)int_window + 63u) & ~(size_t)63u;    /* threads on their own cache lines */
+            w->window = (int8_t *)spingalett_aligned_alloc((size_t)w->threads * w->window_stride);
             if (!w->window) return false;
         }
     }
@@ -224,8 +233,8 @@ static void activate_samples(float *y, uint32_t n, uint32_t size, ActivationFunc
 }
 
 /* An integer convolution over n samples, as spingalett_model_run computes it: each sample's input
-   quantized as a whole, each output pixel the integer dot products of the filters (unpacked: rows
-   of bytes) with its quantized window. */
+   quantized as a whole, each output pixel the integer dot products of the filters with its
+   quantized window (filters: rows of bytes, or transposed for short windows). */
 static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const int8_t *filters, const float *x, float *y,
                              uint32_t n, PredictWorkspace *w, ComputeMode mode) {
     const uint32_t in = L->inputs, out = L->outputs, OC = L->rows, K = L->row_len, C = L->in_c;
@@ -252,8 +261,15 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const in
 #endif
         uint64_t s = (uint64_t)item / pixels, p = (uint64_t)item % pixels;
         const int8_t *xq = w->xq + (size_t)s * in, *win = xq + p * C;
+        if (slett_conv_columns(L)) {
+            int32_t *acc = (int32_t *)(void *)(w->window + (size_t)t * w->window_stride);
+            float *ys = y + (size_t)s * out + p * OC;
+            spingalett_conv_columns_i8(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), filters, acc);
+            for (uint32_t j = 0; j < OC; j++) ys[j] = spingalett_int_output(bias[j], scale[j], w->xs[s], acc[j]);
+            continue;
+        }
         if (!pointwise) {
-            int8_t *window = w->window + (size_t)t * K;
+            int8_t *window = w->window + (size_t)t * w->window_stride;
             spingalett_gather_window(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), window, 1);
             win = window;
         }

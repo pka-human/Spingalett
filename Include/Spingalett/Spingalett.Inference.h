@@ -120,7 +120,7 @@ typedef struct {
     size_t image_size;              /* its size as recorded in its header */
     uint32_t max_width_;            /* private: widest hidden layer */
     uint32_t max_int_inputs_;       /* private: widest input of an integer layer */
-    uint32_t max_window_;           /* private: largest convolution window */
+    size_t conv_scratch_;           /* private: bytes of convolution scratch */
     void *owner_;                   /* private: memory released by spingalett_model_free */
 } SpingalettModel;
 
@@ -130,6 +130,7 @@ typedef struct {
     uint32_t outputs;               /* units of its output */
     ActivationFunction activation;
     PrecisionMode precision;        /* how this layer's weights are stored and computed with */
+    uint32_t in_height, in_width, in_channels;      /* the input's shape */
     uint32_t height, width, channels;               /* the output's shape (1 x 1 x outputs for dense) */
     uint32_t kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w;  /* conv and pooling, else 0 */
 } SpingalettLayerInfo;

@@ -1169,7 +1169,7 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
         }
         if (i + 2 < layers && L.outputs > info->max_width) info->max_width = L.outputs;
         if (is_int && L.inputs > info->max_int_inputs) info->max_int_inputs = L.inputs;
-        if (L.type == LAYER_CONV2D && L.row_len > info->max_window) info->max_window = L.row_len;
+        if (slett_conv_scratch(&L) > info->conv_scratch) info->conv_scratch = slett_conv_scratch(&L);
         prev_out = L.outputs;
     }
     return SPINGALETT_OK;
@@ -1195,9 +1195,9 @@ int spingalett_model_init(SpingalettModel *model, const void *image, size_t size
     SlettLayer first, last;
     spingalett_slett_layer((const uint8_t *)image, 0, &first);
     spingalett_slett_layer((const uint8_t *)image, info.layers - 2, &last);
-    /* two activation buffers, the quantized input of an integer layer, a convolution window */
+    /* two activation buffers, the quantized input of an integer layer, convolution scratch */
     uint64_t workspace = 2u * (uint64_t)workspace_float_bytes(info.max_width) + slett_align(info.max_int_inputs) +
-                         slett_align((uint64_t)info.max_window * 4u);
+                         slett_align(info.conv_scratch);
     if (workspace > SIZE_MAX)
         return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: the workspace exceeds the address space");
 
@@ -1210,7 +1210,7 @@ int spingalett_model_init(SpingalettModel *model, const void *image, size_t size
     model->image_size = (size_t)info.size;
     model->max_width_ = info.max_width;
     model->max_int_inputs_ = info.max_int_inputs;
-    model->max_window_ = info.max_window;
+    model->conv_scratch_ = (size_t)info.conv_scratch;
     return SPINGALETT_OK;
 }
 
@@ -1224,6 +1224,9 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
     info->outputs = L.outputs;
     info->activation = L.activation;
     info->precision = L.precision;
+    info->in_height = L.in_h;
+    info->in_width = L.in_w;
+    info->in_channels = L.in_c;
     info->height = L.out_h;
     info->width = L.out_w;
     info->channels = L.out_c;
@@ -1298,8 +1301,133 @@ void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, u
     }
 }
 
+void spingalett_conv_transpose_filters(const uint8_t *image, const SlettLayer *L, void *wt) {
+    const uint32_t R = L->rows, K = L->row_len;
+    const uint8_t *w = image + L->weights;
+    size_t row = (size_t)spingalett_slett_row_bytes(L->precision, K);
+    for (uint32_t j = 0; j < R; j++, w += row)
+        for (uint32_t k = 0; k < K; k++) {
+            size_t at = (size_t)k * R + j;
+            switch (L->precision) {
+                case PRECISION_FLOAT32:  { float f; memcpy(&f, w + 4u * k, 4); ((float *)wt)[at] = f; break; }
+                case PRECISION_FP16:     ((float *)wt)[at] = spingalett_fp16_to_float(slett_get16(w + 2u * k)); break;
+                case PRECISION_BFLOAT16: ((float *)wt)[at] = spingalett_bf16_to_float(slett_get16(w + 2u * k)); break;
+                case PRECISION_INT8:     ((int8_t *)wt)[at] = (int8_t)w[k]; break;
+                case PRECISION_INT4:     ((int8_t *)wt)[at] = int4_codes[w[k >> 1]][k & 1u]; break;
+                default:                 ((int8_t *)wt)[at] = int2_codes[w[k >> 2]][k & 3u]; break;
+            }
+        }
+}
+
+/* Visits the window of output pixel (oh, ow) of convolution L cell by cell inside the input: body
+   runs with `cell` the cell's offset in the input (in values) and `k0` the index of its first
+   window weight. */
+#define FOR_WINDOW_CELLS(L, oh, ow, body)                                                               \
+    do {                                                                                                \
+        int64_t ih0_ = (int64_t)(oh) * (L)->stride_h - (L)->pad_h, iw0_ = (int64_t)(ow) * (L)->stride_w - (L)->pad_w; \
+        for (uint32_t kh_ = 0; kh_ < (L)->kernel_h; kh_++) {                                            \
+            int64_t ih_ = ih0_ + kh_;                                                                   \
+            if (ih_ < 0 || ih_ >= (int64_t)(L)->in_h) continue;                                         \
+            for (uint32_t kw_ = 0; kw_ < (L)->kernel_w; kw_++) {                                        \
+                int64_t iw_ = iw0_ + kw_;                                                               \
+                if (iw_ < 0 || iw_ >= (int64_t)(L)->in_w) continue;                                     \
+                size_t cell = ((size_t)ih_ * (L)->in_w + (size_t)iw_) * (L)->in_c;                      \
+                size_t k0 = ((size_t)kh_ * (L)->kernel_w + kw_) * (L)->in_c;                            \
+                body                                                                                    \
+            }                                                                                           \
+        }                                                                                               \
+    } while (0)
+
+/* Filters are taken 32, then 16 at a time with their sums in registers (any rest in memory); the
+   window's cells (zeros skipped: ReLU outputs, image borders) each add one value times a block of
+   weights. */
+#define COLUMN_BLOCK(T, V, x, wt, acc, j0, n)                                                           \
+    do {                                                                                                \
+        T a_[n] = {0};                                                                                  \
+        FOR_WINDOW_CELLS(L, oh, ow, {                                                                   \
+            const V *w_ = (wt) + k0 * R + (j0);                                                         \
+            for (uint32_t c_ = 0; c_ < C; c_++, w_ += R) {                                              \
+                V v_ = (x)[cell + c_];                                                                  \
+                if (v_ == 0) continue;                                                                  \
+                for (uint32_t j_ = 0; j_ < (n); j_++) a_[j_] += COLUMN_PRODUCT(v_, w_[j_]);              \
+            }                                                                                           \
+        });                                                                                             \
+        memcpy((acc) + (j0), a_, sizeof a_);                                                            \
+    } while (0)
+
+#define COLUMN_REST(T, V, x, wt, acc, j0)                                                               \
+    do {                                                                                                \
+        for (uint32_t j_ = (j0); j_ < R; j_++) (acc)[j_] = 0;                                           \
+        FOR_WINDOW_CELLS(L, oh, ow, {                                                                   \
+            const V *w_ = (wt) + k0 * R;                                                                \
+            for (uint32_t c_ = 0; c_ < C; c_++, w_ += R) {                                              \
+                V v_ = (x)[cell + c_];                                                                  \
+                if (v_ == 0) continue;                                                                  \
+                for (uint32_t j_ = (j0); j_ < R; j_++) (acc)[j_] += COLUMN_PRODUCT(v_, w_[j_]);          \
+            }                                                                                           \
+        });                                                                                             \
+    } while (0)
+
+/* |v w| <= 127^2: integer products fit 16 bits */
+#define COLUMN_PRODUCT(v, w) (int16_t)((int16_t)(v) * (int16_t)(w))
+
+void spingalett_conv_columns_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
+                                int32_t *acc) {
+    const uint32_t R = L->rows, C = L->in_c;
+    uint32_t j0 = 0;
+    for (; j0 + 32u <= R; j0 += 32u) COLUMN_BLOCK(int32_t, int8_t, xq, wt, acc, j0, 32u);
+    if (j0 + 16u <= R) { COLUMN_BLOCK(int32_t, int8_t, xq, wt, acc, j0, 16u); j0 += 16u; }
+    if (j0 < R) COLUMN_REST(int32_t, int8_t, xq, wt, acc, j0);
+}
+
+#undef COLUMN_PRODUCT
+#define COLUMN_PRODUCT(v, w) ((v) * (w))
+
+static void conv_columns_f32(const float *x, const SlettLayer *L, uint32_t oh, uint32_t ow, const float *wt,
+                             float *acc) {
+    const uint32_t R = L->rows, C = L->in_c;
+    uint32_t j0 = 0;
+    for (; j0 + 32u <= R; j0 += 32u) COLUMN_BLOCK(float, float, x, wt, acc, j0, 32u);
+    if (j0 + 16u <= R) { COLUMN_BLOCK(float, float, x, wt, acc, j0, 16u); j0 += 16u; }
+    if (j0 < R) COLUMN_REST(float, float, x, wt, acc, j0);
+}
+
+/* A convolution with a short window on one sample, filter-major (scratch: the transposed filters,
+   then one pixel's sums). */
+static void conv_forward_columns(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
+                                 void *scratch) {
+    const uint32_t R = L->rows;
+    const bool is_int = spingalett_precision_is_int(L->precision);
+    const float *bias = (const float *)(const void *)(image + L->biases);
+    void *sums = (uint8_t *)scratch + slett_align((uint64_t)L->row_len * R * (is_int ? 1u : 4u));
+    spingalett_conv_transpose_filters(image, L, scratch);
+    if (is_int) {
+        const float *scale = (const float *)(const void *)(image + L->scales);
+        float x_scale = spingalett_quantize_activations(x, L->inputs, xq);
+        int32_t *acc = (int32_t *)sums;
+        for (uint32_t oh = 0; oh < L->out_h; oh++)
+            for (uint32_t ow = 0; ow < L->out_w; ow++) {
+                float *o = y + ((size_t)oh * L->out_w + ow) * R;
+                spingalett_conv_columns_i8(xq, L, oh, ow, (const int8_t *)scratch, acc);
+                for (uint32_t j = 0; j < R; j++) o[j] = spingalett_int_output(bias[j], scale[j], x_scale, acc[j]);
+            }
+    } else {
+        float *acc = (float *)sums;
+        for (uint32_t oh = 0; oh < L->out_h; oh++)
+            for (uint32_t ow = 0; ow < L->out_w; ow++) {
+                float *o = y + ((size_t)oh * L->out_w + ow) * R;
+                conv_columns_f32(x, L, oh, ow, (const float *)scratch, acc);
+                for (uint32_t j = 0; j < R; j++) o[j] = bias[j] + acc[j];
+            }
+    }
+}
+
 /* A convolution on one sample: each output pixel is its filters' dot products with its window. */
 static void conv_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq, void *window) {
+    if (slett_conv_columns(L)) {
+        conv_forward_columns(image, L, x, y, xq, window);
+        return;
+    }
     const uint32_t OC = L->rows, K = L->row_len;
     const bool is_int = spingalett_precision_is_int(L->precision), packed = is_int && L->precision != PRECISION_INT8;
     const bool pointwise = L->kernel_h == 1 && L->kernel_w == 1 && L->stride_h == 1 && L->stride_w == 1 &&

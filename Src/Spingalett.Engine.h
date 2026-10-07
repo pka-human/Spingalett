@@ -49,7 +49,7 @@ typedef struct {
     uint64_t size;              /* file size recorded in the header */
     uint32_t max_width;         /* widest hidden layer (0 without hidden layers) */
     uint32_t max_int_inputs;    /* widest input of an integer layer (0 without integer layers) */
-    uint32_t max_window;        /* largest convolution window, kernel_h x kernel_w x channels (0: none) */
+    uint64_t conv_scratch;      /* bytes of scratch the largest convolution needs (slett_conv_scratch) */
 } SlettInfo;
 
 /* Little-endian field access (format 3 is little-endian; the engine refuses big-endian hosts). */
@@ -97,6 +97,32 @@ float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q);
 int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n);
 /* acc[r] = dot of row r (rows `stride` bytes apart) with x, for r = 0..3. */
 void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n, int32_t acc[4]);
+
+/* Convolutions with windows shorter than this run filter-major: their filters are transposed into
+   the workspace (columns), and each output pixel accumulates all filters at once, reading its
+   window straight from the input; longer windows are gathered and dotted with each filter row. */
+#define SLETT_COLUMN_WINDOW 32u
+
+static inline bool slett_conv_columns(const SlettLayer *L) {
+    return L->type == LAYER_CONV2D && L->row_len < SLETT_COLUMN_WINDOW;
+}
+
+/* Bytes of engine scratch convolution L needs: its transposed filters and one pixel's sums, or a
+   gathered window (0 for other layers). */
+static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
+    if (L->type != LAYER_CONV2D) return 0;
+    if (!slett_conv_columns(L)) return (uint64_t)L->row_len * 4u;
+    uint64_t elem = spingalett_precision_is_int(L->precision) ? 1u : 4u;
+    return slett_align((uint64_t)L->row_len * L->rows * elem) + (uint64_t)L->rows * 4u;
+}
+
+/* The filters of convolution L transposed, wt[k * rows + j] = weight k of filter j: the stored
+   codes as bytes for integer precisions, floats otherwise. */
+void spingalett_conv_transpose_filters(const uint8_t *image, const SlettLayer *L, void *wt);
+/* The integer sums of output pixel (oh, ow) of convolution L with transposed filters wt, from its
+   quantized input xq (one sum per filter). */
+void spingalett_conv_columns_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
+                                int32_t *acc);
 
 /* Copies the window of output pixel (oh, ow) of convolution L from its input x, elem bytes per value
    (floats or quantized bytes): kernel_h runs of kernel_w x channels values, zeros where the window

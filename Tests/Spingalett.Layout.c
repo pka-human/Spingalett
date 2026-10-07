@@ -93,11 +93,12 @@ int main(void) {
     FIELD(SpingalettModel, input_size); FIELD(SpingalettModel, output_size); FIELD(SpingalettModel, layer_count);
     FIELD(SpingalettModel, loss); FIELD(SpingalettModel, workspace_size); FIELD(SpingalettModel, image);
     FIELD(SpingalettModel, image_size); FIELD(SpingalettModel, max_width_); FIELD(SpingalettModel, max_int_inputs_);
-    FIELD(SpingalettModel, max_window_); FIELD(SpingalettModel, owner_);
+    FIELD(SpingalettModel, conv_scratch_); FIELD(SpingalettModel, owner_);
 
     SIZE(SpingalettLayerInfo);
     FIELD(SpingalettLayerInfo, type); FIELD(SpingalettLayerInfo, inputs); FIELD(SpingalettLayerInfo, outputs);
     FIELD(SpingalettLayerInfo, activation); FIELD(SpingalettLayerInfo, precision);
+    FIELD(SpingalettLayerInfo, in_height); FIELD(SpingalettLayerInfo, in_width); FIELD(SpingalettLayerInfo, in_channels);
     FIELD(SpingalettLayerInfo, height); FIELD(SpingalettLayerInfo, width); FIELD(SpingalettLayerInfo, channels);
     FIELD(SpingalettLayerInfo, kernel_h); FIELD(SpingalettLayerInfo, kernel_w); FIELD(SpingalettLayerInfo, stride_h);
     FIELD(SpingalettLayerInfo, stride_w); FIELD(SpingalettLayerInfo, padding_h); FIELD(SpingalettLayerInfo, padding_w);
