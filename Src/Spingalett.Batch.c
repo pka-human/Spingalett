@@ -119,10 +119,14 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         bool done = false;          /* bias and activation applied */
 
         if (type == LAYER_DENSE) {
-            /* act[l] = act[l-1] * W^T, W stored [curr x prev]; the bias follows per row */
-            spingalett_gemm(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f,
-                            ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
-                            0.0f, C, curr_size);
+            /* act[l] = act[l-1] * W^T, W stored [curr x prev]; the bias and an element-wise
+               activation follow as the product's tiles complete */
+            done = act != ACT_SOFTMAX && !masked;
+            SpingalettBiasActivation epilogue = {bias, act};
+            SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
+            spingalett_gemm_ex(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f,
+                               ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
+                               0.0f, C, curr_size, done ? &hooks : NULL);
         } else if (type == LAYER_CONV2D) {
             /* the bias, and an element-wise activation, are applied as the product's tiles complete */
             done = act != ACT_SOFTMAX && !masked;

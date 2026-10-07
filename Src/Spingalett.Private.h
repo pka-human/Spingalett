@@ -169,7 +169,8 @@ double spingalett_vec_sumsq(const float *x, uint64_t n);
 float  spingalett_vec_l2norm(const float *x, uint64_t n);
 /* Native SGEMM (Spingalett.GEMM.c): C = alpha * op(A) * op(B) + beta * C, row-major. The scratch
    holds packing buffers for `threads` threads and may be reused across calls; NULL allocates a
-   temporary one. */
+   temporary one. `parallel` allows threads: the product uses them when it is large enough for its
+   kind (SPINGALETT_GEMM_PARALLEL_WORK multiply-adds; fewer for products of few columns). */
 /* A GEMM operand produced on demand instead of read from memory: fill writes rows [row, row + rows)
    x columns [col, col + cols) of the operand as stored (before op()), rows ld floats apart. */
 typedef struct {
@@ -211,8 +212,19 @@ SPINGALETT_GEMM_KERNELS(spingalett_gemm_avx512)
 #undef SPINGALETT_GEMM_KERNELS
 #endif
 
-/* Multiply-adds below which a GEMM runs on one thread. */
-#define SPINGALETT_GEMM_PARALLEL_WORK (1u << 18)
+/* An epilogue adding a bias per column and applying an element-wise activation (not softmax).
+   Rows are activated one by one: tile columns start at multiples of 8, so every element takes the
+   vector or scalar path it takes in a whole row, whatever the tiling (and the thread count). */
+typedef struct {
+    const float *bias;
+    ActivationFunction act;
+} SpingalettBiasActivation;
+void spingalett_epilogue_bias_activation(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols,
+                                         float *c, size_t ldc);
+
+/* Multiply-adds below which a GEMM runs on one thread (about 10 us of work: below it, a parallel
+   region with its barriers costs more than it saves). */
+#define SPINGALETT_GEMM_PARALLEL_WORK (1u << 20)
 
 /* GEMM on the selected backend: OpenBLAS when requested and available, the native kernels
    otherwise (multi-threaded in OpenMP mode). */
@@ -227,8 +239,23 @@ static inline void spingalett_gemm(SpingalettGemmScratch *scratch, ComputeMode m
         return;
     }
 #endif
-    bool parallel = mode == COMPUTE_OPENMP && (uint64_t)M * N * K >= SPINGALETT_GEMM_PARALLEL_WORK;
-    spingalett_gemm_native(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel);
+    spingalett_gemm_native(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                           mode == COMPUTE_OPENMP);
+}
+
+/* The same with hooks: on the native kernels as they are; with OpenBLAS (operands from memory
+   only) the epilogue runs over all of C after the product. */
+static inline void spingalett_gemm_ex(SpingalettGemmScratch *scratch, ComputeMode mode, bool trans_a, bool trans_b,
+                                      uint32_t M, uint32_t N, uint32_t K, float alpha,
+                                      const float *A, size_t lda, const float *B, size_t ldb,
+                                      float beta, float *C, size_t ldc, const SpingalettGemmHooks *hooks) {
+    if (mode == COMPUTE_OPENBLAS) {
+        spingalett_gemm(scratch, mode, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        if (hooks && hooks->epilogue && M && N) hooks->epilogue(hooks->epilogue_ctx, 0, M, 0, N, C, ldc);
+        return;
+    }
+    spingalett_gemm_hooked(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                           mode == COMPUTE_OPENMP, hooks);
 }
 
 void spingalett_vec_scale(float *data, uint64_t n, float scale);

@@ -251,45 +251,16 @@ static void fill_output_grads(const void *ctx, uint32_t row, uint32_t rows, uint
     }
 }
 
-static inline bool gemm_parallel(ComputeMode mode, uint64_t m, uint64_t n, uint64_t k) {
-    return mode == COMPUTE_OPENMP && m * n * k >= SPINGALETT_GEMM_PARALLEL_WORK;
+/* A product of gathered rows (sources and epilogues on the native kernels). */
+static inline void conv_gemm(SpingalettGemmScratch *gemm, ComputeMode mode, bool trans_a, bool trans_b, uint32_t M,
+                             uint32_t N, uint32_t K, float alpha, const float *A, size_t lda, const float *B,
+                             size_t ldb, float beta, float *C, size_t ldc, const SpingalettGemmHooks *hooks) {
+    spingalett_gemm_ex(gemm, mode, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, hooks);
 }
 
-/* A product of gathered rows: on the native kernels with the hooks (sources, epilogue); with
-   OpenBLAS from memory, the epilogue then running over all of C. */
-static void conv_gemm(SpingalettGemmScratch *gemm, ComputeMode mode, bool trans_a, bool trans_b, uint32_t M,
-                      uint32_t N, uint32_t K, float alpha, const float *A, size_t lda, const float *B, size_t ldb,
-                      float beta, float *C, size_t ldc, const SpingalettGemmHooks *hooks) {
-    if (mode == COMPUTE_OPENBLAS) {
-        spingalett_gemm(gemm, mode, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-        if (hooks && hooks->epilogue) hooks->epilogue(hooks->epilogue_ctx, 0, M, 0, N, C, ldc);
-        return;
-    }
-    spingalett_gemm_hooked(gemm, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
-                           gemm_parallel(mode, M, N, K), hooks);
-}
-
-/* Epilogues: the forward pass adds the bias and applies an element-wise activation; the data
-   gradient is multiplied by the derivative of the input layer's activation, read from its output
-   (rows from row `base` of the batch). */
-typedef struct {
-    const float *bias;
-    ActivationFunction act;
-} BiasActivation;
-
-static void add_bias_activate(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols, float *c,
-                              size_t ldc) {
-    const BiasActivation *e = (const BiasActivation *)ctx;
-    const float *bias = e->bias + col;
-    for (uint32_t r = 0; r < rows; r++) {
-        float *cr = c + (size_t)r * ldc;
-        for (uint32_t j = 0; j < cols; j++) cr[j] += bias[j];
-        if (cols != ldc) apply_activation_bulk(cr, cols, e->act);
-    }
-    if (cols == ldc) apply_activation_bulk(c, (uint64_t)rows * cols, e->act);
-    (void)row;
-}
-
+/* Epilogues: the forward pass adds the bias and applies an element-wise activation
+   (spingalett_epilogue_bias_activation); the data gradient is multiplied by the derivative of the
+   input layer's activation, read from its output (rows from row `base` of the batch). */
 typedef struct {
     const float *y;                 /* the activations of the gradient's layer */
     uint64_t base;
@@ -300,7 +271,7 @@ static void multiply_derivative(const void *ctx, uint32_t row, uint32_t rows, ui
                                 size_t ldc) {
     const Derivative *e = (const Derivative *)ctx;
     const float *y = e->y + (e->base + row) * ldc + col;
-    if (cols == ldc) { apply_derivative_batch(c, y, (uint64_t)rows * cols, e->act); return; }
+    /* row by row, as spingalett_epilogue_bias_activation, so the tiling does not change results */
     for (uint32_t r = 0; r < rows; r++) apply_derivative_batch(c + (size_t)r * ldc, y + (size_t)r * ldc, cols, e->act);
 }
 
@@ -333,8 +304,8 @@ void spingalett_conv_forward_shapes(const LayerShape *in, const LayerShape *out,
     const uint32_t OC = out->channels;
     const size_t K = (size_t)out->kernel_h * out->kernel_w * in->channels;
     const uint64_t total = (uint64_t)n * out->height * out->width;
-    BiasActivation epilogue = {bias, act == ACT_SOFTMAX ? ACT_NONE : act};
-    SpingalettGemmHooks hooks = {NULL, NULL, add_bias_activate, &epilogue};
+    SpingalettBiasActivation epilogue = {bias, act == ACT_SOFTMAX ? ACT_NONE : act};
+    SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
 
     if (pointwise(out) || implicit(mode)) {
         bool gather = !pointwise(out);

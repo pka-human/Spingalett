@@ -276,6 +276,62 @@ static void conv_api(void) {
 }
 
 /* A small CNN tells vertical from horizontal bars in noisy 8 x 8 images. */
+/* Training gives the same bits on one thread and many, in either compute mode: products split
+   their work by tiles of C (and k slots fixed by the shape), epilogues and activations run row by
+   row, reductions in fixed blocks. Odd sizes put elements into vector tails. */
+static void deterministic_threads(void) {
+    static const ComputeMode modes[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENMP, COMPUTE_OPENMP};
+    static const unsigned threads[] = {1, 1, 3, 4};
+    for (int kind = 0; kind < 2; kind++) {
+        float *ref = NULL;
+        uint64_t count = 0;
+        bool same = true;
+        for (int v = 0; v < 4; v++) {
+            spingalett_set_num_threads(threads[v]);
+            spingalett_set_compute_mode(modes[v]);
+            lcg_state = 77;
+            spingalett_seed(5);
+            NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            uint32_t n = 96, in;
+            if (kind == 0) {        /* convolutions with tanh and 70 or 5 filters (few pixels: tiles of
+                                       the product split the filters between threads), pooling, dense */
+                layer(.net = net, .height = 5, .width = 4, .channels = 16);
+                conv2d(.net = net, .filters = 70, .kernel = 3, .padding = 1, .act_func = ACT_TANH);
+                avg_pool2d(.net = net, .kernel = 2, .stride = 1);
+                conv2d(.net = net, .filters = 5, .kernel = 3, .stride = 2, .act_func = ACT_SIGMOID);
+                layer(.net = net, .neurons_amount = 13, .act_func = ACT_TANH);
+                layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            } else {                /* wide dense layers of odd sizes */
+                layer(.net = net, .neurons_amount = 300);
+                layer(.net = net, .neurons_amount = 517, .act_func = ACT_TANH);
+                layer(.net = net, .neurons_amount = 77, .act_func = ACT_SIGMOID);
+                layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            }
+            in = net->topology[0];
+            float *x = malloc((size_t)n * in * sizeof(float)), *y = calloc((size_t)n * 3, sizeof(float));
+            for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2 - 1;
+            for (uint32_t s = 0; s < n; s++) y[s * 3 + s % 3] = 1.0f;
+            train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
+                  .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32,
+                  .do_not_shuffle = true);
+            if (!ref) {
+                count = net->total_weights;
+                ref = malloc(count * sizeof(float));
+                memcpy(ref, net->weights, count * sizeof(float));
+            } else if (memcmp(ref, net->weights, count * sizeof(float)) != 0) {
+                same = false;
+            }
+            free(x); free(y); free_network(net);
+        }
+        CHECK(same, "%s training differs between thread counts or compute modes", kind ? "dense" : "convolution");
+        printf("  %s training: identical on 1, 3 and 4 threads and single-threaded%s\n", kind ? "dense" : "convolution",
+               same ? "" : " -- NO");
+        free(ref);
+    }
+    spingalett_set_num_threads(4);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 static void conv_learns(ComputeMode mode) {
     lcg_state = 31337;
     spingalett_set_compute_mode(mode);
@@ -2309,6 +2365,7 @@ int main(int argc, char **argv) {
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) conv_chunks(cm[m]);
         for (int m = 0; m < 2; m++) conv_learns(cm[m]);
+        deterministic_threads();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");

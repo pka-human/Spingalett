@@ -18,7 +18,9 @@
  * there are few blocks), with op(B) packed once per K block for all threads; small M (a mini-batch)
  * packs op(A) once for all threads and gives each thread its own column panels, which it packs and
  * multiplies itself. When all of op(B) fits the pack buffer (a convolution's filters), it is packed
- * once and each tile of C runs through all K blocks while it is in cache. A small C with a long k range (a convolution's weight gradient: filters x
+ * once and each tile of C runs through all K blocks while it is in cache. A product with at most 16
+ * columns from row-major operands (an output layer of a few units) is a set of dot products. A
+ * small C with a long k range (a convolution's weight gradient: filters x
  * window, summed over every pixel of a batch) has too few tiles for the threads; its k range is cut
  * into slots fixed by the shape alone, each slot's partial product is one thread's work, and the
  * partial products are added in slot order, so the result still does not depend on the thread
@@ -456,6 +458,110 @@ static void gemm_split(SpingalettGemmScratch *scratch, int threads, uint32_t slo
     }
 }
 
+/* Products with at most SMALL_N columns from two row-major operands (op(A) = A, op(B) = B^T: a
+   dense layer's outputs with few units) leave most of an NR-wide panel idle; each element is
+   instead a dot product of a row of A with a row of B, four rows of B per pass over A's row. The
+   lanes of each dot product are summed in a fixed order, so results do not depend on the thread
+   count. */
+#define SMALL_N 16u
+#define SMALL_N_MIN_K 64u       /* shorter dot products cost more in their reductions */
+
+/* Rows of A per dot-product block: as many as the registers hold, with four rows of B. */
+#if defined(__AVX512F__)
+#  define DOT_RA 4
+#elif defined(__AVX__)
+#  define DOT_RA 2
+#else
+#  define DOT_RA 1
+#endif
+
+/* d[i][r] = row a_i . row b_r (n floats each) for i < DOT_RA, r < 4. */
+static inline void dot_block(const float *const a[DOT_RA], const float *const b[4], uint32_t n, float d[DOT_RA][4]) {
+    uint32_t k = 0;
+#if defined(__AVX512F__)
+    __m512 acc[DOT_RA][4];
+    for (int i = 0; i < DOT_RA; i++) for (int r = 0; r < 4; r++) acc[i][r] = _mm512_setzero_ps();
+    for (; k + 16 <= n; k += 16) {
+        __m512 y0 = _mm512_loadu_ps(b[0] + k), y1 = _mm512_loadu_ps(b[1] + k);
+        __m512 y2 = _mm512_loadu_ps(b[2] + k), y3 = _mm512_loadu_ps(b[3] + k);
+        for (int i = 0; i < DOT_RA; i++) {
+            __m512 x = _mm512_loadu_ps(a[i] + k);
+            acc[i][0] = _mm512_fmadd_ps(x, y0, acc[i][0]);
+            acc[i][1] = _mm512_fmadd_ps(x, y1, acc[i][1]);
+            acc[i][2] = _mm512_fmadd_ps(x, y2, acc[i][2]);
+            acc[i][3] = _mm512_fmadd_ps(x, y3, acc[i][3]);
+        }
+    }
+    for (int i = 0; i < DOT_RA; i++) for (int r = 0; r < 4; r++) d[i][r] = _mm512_reduce_add_ps(acc[i][r]);
+#elif defined(__AVX__)
+    __m256 acc[DOT_RA][4];
+    for (int i = 0; i < DOT_RA; i++) for (int r = 0; r < 4; r++) acc[i][r] = _mm256_setzero_ps();
+    for (; k + 8 <= n; k += 8) {
+        __m256 y0 = _mm256_loadu_ps(b[0] + k), y1 = _mm256_loadu_ps(b[1] + k);
+        __m256 y2 = _mm256_loadu_ps(b[2] + k), y3 = _mm256_loadu_ps(b[3] + k);
+        for (int i = 0; i < DOT_RA; i++) {
+            __m256 x = _mm256_loadu_ps(a[i] + k);
+#if defined(__FMA__)
+            acc[i][0] = _mm256_fmadd_ps(x, y0, acc[i][0]);
+            acc[i][1] = _mm256_fmadd_ps(x, y1, acc[i][1]);
+            acc[i][2] = _mm256_fmadd_ps(x, y2, acc[i][2]);
+            acc[i][3] = _mm256_fmadd_ps(x, y3, acc[i][3]);
+#else
+            acc[i][0] = _mm256_add_ps(acc[i][0], _mm256_mul_ps(x, y0));
+            acc[i][1] = _mm256_add_ps(acc[i][1], _mm256_mul_ps(x, y1));
+            acc[i][2] = _mm256_add_ps(acc[i][2], _mm256_mul_ps(x, y2));
+            acc[i][3] = _mm256_add_ps(acc[i][3], _mm256_mul_ps(x, y3));
+#endif
+        }
+    }
+    for (int i = 0; i < DOT_RA; i++)
+        for (int r = 0; r < 4; r++) {
+            float t[8];
+            _mm256_storeu_ps(t, acc[i][r]);
+            d[i][r] = ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+        }
+#else
+    for (int i = 0; i < DOT_RA; i++) for (int r = 0; r < 4; r++) d[i][r] = 0.0f;
+#endif
+    for (; k < n; k++)
+        for (int i = 0; i < DOT_RA; i++) {
+            float x = a[i][k];
+            d[i][0] += x * b[0][k]; d[i][1] += x * b[1][k]; d[i][2] += x * b[2][k]; d[i][3] += x * b[3][k];
+        }
+}
+
+static void gemm_small_n(int threads, uint32_t M, uint32_t N, uint32_t K, float alpha, const float *A, size_t lda,
+                         const float *B, size_t ldb, float beta, float *C, size_t ldc, const SpingalettGemmHooks *hooks) {
+    const uint32_t block = 16;                          /* rows per work item and epilogue call */
+    const int64_t blocks = (int64_t)((M + block - 1) / block);
+    (void)threads;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(threads > 1 && blocks > 1)
+#endif
+    for (int64_t bi = 0; bi < blocks; bi++) {
+        uint32_t i0 = (uint32_t)bi * block, i1 = M - i0 < block ? M : i0 + block;
+        for (uint32_t i = i0; i < i1; i += DOT_RA) {
+            uint32_t ra = i1 - i < DOT_RA ? i1 - i : DOT_RA;
+            const float *a[DOT_RA];
+            for (uint32_t t = 0; t < DOT_RA; t++) a[t] = A + (size_t)(i + (t < ra ? t : 0)) * lda;  /* rows past the block repeat */
+            for (uint32_t j0 = 0; j0 < N; j0 += 4) {
+                uint32_t rows = N - j0 < 4 ? N - j0 : 4;
+                const float *b[4];
+                for (uint32_t r = 0; r < 4; r++) b[r] = B + (size_t)(j0 + (r < rows ? r : 0)) * ldb;
+                float d[DOT_RA][4];
+                dot_block(a, b, K, d);
+                for (uint32_t t = 0; t < ra; t++) {
+                    float *c = C + (size_t)(i + t) * ldc + j0;
+                    for (uint32_t r = 0; r < rows; r++)
+                        c[r] = alpha * d[t][r] + (beta == 0.0f ? 0.0f : beta * c[r]);
+                }
+            }
+        }
+        if (hooks && hooks->epilogue)
+            hooks->epilogue(hooks->epilogue_ctx, i0, i1 - i0, 0, N, C + (size_t)i0 * ldc, ldc);
+    }
+}
+
 /* The multiplication with this translation unit's kernels (scratch is not NULL, M, N, K > 0). */
 #if defined(SPINGALETT_GEMM_VARIANT)
 void SPINGALETT_GEMM_VARIANT(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
@@ -477,7 +583,14 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
     const SpingalettGemmSource *a_src = hooks ? hooks->a : NULL, *b_src = hooks ? hooks->b : NULL;
     void (*epilogue)(const void *, uint32_t, uint32_t, uint32_t, uint32_t, float *, size_t) =
         hooks ? hooks->epilogue : NULL;
-    int threads = parallel ? scratch->threads : 1;
+    const uint64_t work = (uint64_t)M * N * K;
+    if (N <= SMALL_N && K >= SMALL_N_MIN_K && !trans_a && trans_b && !a_src && !b_src) {
+        /* one parallel loop without barriers: worth threads at a quarter of the usual work */
+        gemm_small_n(parallel && work >= SPINGALETT_GEMM_PARALLEL_WORK / 4u ? scratch->threads : 1, M, N, K, alpha,
+                     A, lda, B, ldb, beta, C, ldc, hooks);
+        return;
+    }
+    int threads = parallel && work >= SPINGALETT_GEMM_PARALLEL_WORK ? scratch->threads : 1;
 
     uint32_t slots = split_slots(M, N, K);
     if (slots > 1 && split_reserve(scratch, M, N, slots, threads)) {
