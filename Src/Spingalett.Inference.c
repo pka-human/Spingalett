@@ -370,6 +370,12 @@ static inline int32_t hsum_epi32_128(__m128i s) {
     s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
     return _mm_cvtsi128_si32(s);
 }
+
+/* The sums of four accumulators: lane r of the result is the total of a_r. */
+static inline __m128i reduce_rows4(__m256i a0, __m256i a1, __m256i a2, __m256i a3) {
+    __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(a0, a1), _mm256_hadd_epi32(a2, a3));
+    return _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+}
 #endif
 
 int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
@@ -467,63 +473,233 @@ void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, ui
 #endif
 }
 
-/* INT4 row times int8 activations, the codes unpacked in registers where possible. */
-static int32_t dot_i4(const uint8_t *w, const int8_t *x, uint32_t n) {
-    uint32_t k = 0;
-    int32_t sum = 0;
+/* ---- INT4 and INT2 rows, decoded in registers.
+   The vector kernels take a row in blocks of B bytes (B = PACKED_BLOCK_BYTES, then halves of it
+   down to PACKED_MIN_BLOCK, at most one block of each smaller size) and decode a block slot by
+   slot: slot s holds code i * c + s of the block (c = 2 codes per byte for INT4, 4 for INT2) in
+   byte i. permute_activations() stores the quantized activations of such a layer in that order,
+   activation i * c + s of a block at s * B + i, so a slot meets its activations in one load. The
+   codes after the last whole block, and all codes on targets without these kernels, are taken in
+   row order. Integer sums do not depend on the order: every layout gives the same results. */
+
 #if defined(SPG_AVX2)
-    const __m128i low = _mm_set1_epi8(0x0F);
-    const __m256i eight = _mm256_set1_epi8(8);
-    __m256i acc = _mm256_setzero_si256();
-    for (; k + 32u <= n; k += 32u) {
-        __m128i b = _mm_loadu_si128((const __m128i *)(w + k / 2u));
-        __m128i lo = _mm_and_si128(b, low), hi = _mm_and_si128(_mm_srli_epi16(b, 4), low);
-        __m256i v = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_unpacklo_epi8(lo, hi)), _mm_unpackhi_epi8(lo, hi), 1);
-        v = _mm256_sub_epi8(_mm256_xor_si256(v, eight), eight);
-        __m256i vx = _mm256_loadu_si256((const __m256i *)(x + k));
-        acc = madd_i8(acc, _mm256_sign_epi8(vx, vx), v, vx);
-    }
-    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
-    sum = _mm_cvtsi128_si32(s);
+#  define PACKED_BLOCK_BYTES 32u
+#  define PACKED_MIN_BLOCK 4u
 #elif defined(SPG_NEON)
-    int32x4_t acc = vdupq_n_s32(0);
-    const int8x16_t eight = vdupq_n_s8(8);
-    for (; k + 32u <= n; k += 32u) {
-        uint8x16_t b = vld1q_u8(w + k / 2u);
-        int8x16_t lo = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vandq_u8(b, vdupq_n_u8(0x0F))), eight), eight);
-        int8x16_t hi = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), eight), eight);
-        int8x16x2_t v = vzipq_s8(lo, hi);
-        int8x16_t x0 = vld1q_s8(x + k), x1 = vld1q_s8(x + k + 16);
-#  if defined(__ARM_FEATURE_DOTPROD)
-        acc = vdotq_s32(vdotq_s32(acc, v.val[0], x0), v.val[1], x1);
-#  else
-        int16x8_t p = vmull_s8(vget_low_s8(v.val[0]), vget_low_s8(x0));
-        p = vmlal_s8(p, vget_high_s8(v.val[0]), vget_high_s8(x0));
-        acc = vpadalq_s16(acc, p);
-        p = vmull_s8(vget_low_s8(v.val[1]), vget_low_s8(x1));
-        p = vmlal_s8(p, vget_high_s8(v.val[1]), vget_high_s8(x1));
-        acc = vpadalq_s16(acc, p);
-#  endif
-    }
-#  if defined(__aarch64__)
-    sum = vaddvq_s32(acc);
-#  else
-    int32x2_t s2 = vadd_s32(vget_low_s32(acc), vget_high_s32(acc));
-    sum = vget_lane_s32(vpadd_s32(s2, s2), 0);
-#  endif
+#  define PACKED_BLOCK_BYTES 16u
+#  define PACKED_MIN_BLOCK 16u
 #endif
-    int8_t block[256];
-    while (k < n) {                               /* k is even: whole bytes */
-        uint32_t len = n - k < 256u ? n - k : 256u;
-        spingalett_unpack_int4(w + k / 2u, block, len);
-        sum += spingalett_dot_i8(block, x + k, len);
-        k += len;
+
+/* Returns the sum of the activations it moved (those of the whole blocks). */
+static int32_t permute_activations(int8_t *q, uint32_t n, uint32_t per_byte) {
+    int32_t sum = 0;
+#if defined(PACKED_BLOCK_BYTES)
+    int8_t block[4 * PACKED_BLOCK_BYTES];
+    uint32_t k = 0;
+    for (uint32_t bytes = PACKED_BLOCK_BYTES; bytes >= PACKED_MIN_BLOCK; bytes /= 2u) {
+        uint32_t codes = bytes * per_byte;
+        for (; n - k >= codes; k += codes) {
+            memcpy(block, q + k, codes);
+            for (uint32_t i = 0; i < bytes; i++)
+                for (uint32_t s = 0; s < per_byte; s++) {
+                    q[k + s * bytes + i] = block[i * per_byte + s];
+                    sum += block[i * per_byte + s];
+                }
+        }
     }
+#else
+    (void)q; (void)n; (void)per_byte;
+#endif
     return sum;
 }
 
+#if defined(PACKED_BLOCK_BYTES)
+/* Signed value of code i of a stored INT4 (per_byte 2) or INT2 (4) row. */
+static inline int32_t packed_code(const uint8_t *row, uint32_t i, uint32_t per_byte) {
+    return per_byte == 2u ? int4_codes[row[i >> 1]][i & 1u] : int2_codes[row[i >> 2]][i & 3u];
+}
+#endif
+
+#if defined(SPG_AVX2)
+/* n (16, 8 or 4) bytes into the low bytes of a vector, the others 0. */
+static inline __m128i load_bytes(const void *p, uint32_t n) {
+    if (n == 16u) return _mm_loadu_si128((const __m128i *)p);
+    if (n == 8u) return _mm_loadl_epi64((const __m128i *)p);
+    int32_t v;
+    memcpy(&v, p, 4);
+    return _mm_cvtsi32_si128(v);
+}
+
+/* acc += u * s summed in fours, u unsigned and s signed bytes; u * s pairs stay far below the
+   16-bit limit of maddubs here (u <= 15). */
+static inline __m256i madd_u8s8(__m256i acc, __m256i u, __m256i s) {
+#  if defined(SPG_VNNI)
+    return SPG_VNNI(acc, u, s);
+#  else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
+#  endif
+}
+
+static inline __m128i madd_u8s8_128(__m128i acc, __m128i u, __m128i s) {
+#  if defined(SPG_VNNI128)
+    return SPG_VNNI128(acc, u, s);
+#  else
+    return _mm_add_epi32(acc, _mm_madd_epi16(_mm_maddubs_epi16(u, s), _mm_set1_epi16(1)));
+#  endif
+}
+
+/* The codes are taken unsigned, offset by half their range: flipping the top bit of a two's
+   complement code c gives c + 8 (INT4) or c + 2 (INT2), so a block contributes
+   sum (c + offset) * x = sum c * x + offset * sum x, and the offset times the sum of the permuted
+   activations (xsum) is subtracted at the end. */
+static void dot_packed_rows4(const uint8_t *w, size_t stride, const int8_t *x, uint32_t n, uint32_t per_byte,
+                             int32_t xsum, int32_t acc[4]) {
+    const uint32_t bits = 8u / per_byte;
+    const int32_t offset = per_byte == 2u ? 8 : 2;
+    const __m128i flip128 = _mm_set1_epi8((char)(per_byte == 2u ? 0x88 : 0xAA));
+    const __m128i mask128 = _mm_set1_epi8((char)((1u << bits) - 1u));
+    const __m256i flip = _mm256_broadcastsi128_si256(flip128), mask = _mm256_broadcastsi128_si256(mask128);
+    const uint8_t *w0 = w, *w1 = w + stride, *w2 = w + 2 * stride, *w3 = w + 3 * stride;
+    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    uint32_t k = 0;         /* activations done */
+    size_t at = 0;          /* bytes of each row done */
+
+#define PK_ROWS __m256i v0 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)(w0 + at)), flip); \
+                __m256i v1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)(w1 + at)), flip); \
+                __m256i v2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)(w2 + at)), flip); \
+                __m256i v3 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)(w3 + at)), flip);
+#define PK_CODES(v, shift) _mm256_and_si256(_mm256_srli_epi16((v), (shift)), mask)
+#define PK_SLOT(s, shift, A) { \
+        __m256i vx = _mm256_loadu_si256((const __m256i *)(x + k + (s) * 32u)); \
+        A##0 = madd_u8s8(A##0, PK_CODES(v0, shift), vx); A##1 = madd_u8s8(A##1, PK_CODES(v1, shift), vx); \
+        A##2 = madd_u8s8(A##2, PK_CODES(v2, shift), vx); A##3 = madd_u8s8(A##3, PK_CODES(v3, shift), vx); }
+    if (per_byte == 2u) {
+        for (; n - k >= 64u; k += 64u, at += 32u) { PK_ROWS PK_SLOT(0, 0, a) PK_SLOT(1, 4, b) }
+    } else {
+        for (; n - k >= 128u; k += 128u, at += 32u) { PK_ROWS PK_SLOT(0, 0, a) PK_SLOT(1, 2, b) PK_SLOT(2, 4, a) PK_SLOT(3, 6, b) }
+    }
+#undef PK_ROWS
+#undef PK_CODES
+#undef PK_SLOT
+
+    __m128i t0 = _mm_setzero_si128(), t1 = t0, t2 = t0, t3 = t0;
+    for (uint32_t bytes = 16u; bytes >= PACKED_MIN_BLOCK; bytes /= 2u) {
+        if (n - k < bytes * per_byte) continue;
+        /* bytes past the block load as 0 and decode to the offset; their activations are 0 */
+        __m128i u0 = _mm_xor_si128(load_bytes(w0 + at, bytes), flip128), u1 = _mm_xor_si128(load_bytes(w1 + at, bytes), flip128);
+        __m128i u2 = _mm_xor_si128(load_bytes(w2 + at, bytes), flip128), u3 = _mm_xor_si128(load_bytes(w3 + at, bytes), flip128);
+        for (uint32_t s = 0; s < per_byte; s++) {
+            __m128i shift = _mm_cvtsi32_si128((int)(s * bits)), vx = load_bytes(x + k + s * bytes, bytes);
+#define PK_CODES128(u) _mm_and_si128(_mm_srl_epi16((u), shift), mask128)
+            t0 = madd_u8s8_128(t0, PK_CODES128(u0), vx);
+            t1 = madd_u8s8_128(t1, PK_CODES128(u1), vx);
+            t2 = madd_u8s8_128(t2, PK_CODES128(u2), vx);
+            t3 = madd_u8s8_128(t3, PK_CODES128(u3), vx);
+#undef PK_CODES128
+        }
+        k += bytes * per_byte;
+        at += bytes;
+    }
+    __m128i t = reduce_rows4(_mm256_add_epi32(a0, b0), _mm256_add_epi32(a1, b1),
+                             _mm256_add_epi32(a2, b2), _mm256_add_epi32(a3, b3));
+    t = _mm_add_epi32(t, _mm_hadd_epi32(_mm_hadd_epi32(t0, t1), _mm_hadd_epi32(t2, t3)));
+    t = _mm_sub_epi32(t, _mm_set1_epi32(offset * xsum));
+    _mm_storeu_si128((__m128i *)(void *)acc, t);
+    for (int r = 0; r < 4; r++)
+        for (uint32_t i = k; i < n; i++) acc[r] += packed_code(w + (size_t)r * stride, i, per_byte) * (int32_t)x[i];
+}
+
+#elif defined(SPG_NEON)
+
+static inline int32x4_t neon_dot_i8(int32x4_t acc, int8x16_t a, int8x16_t b) {
+#  if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(acc, a, b);
+#  else
+    int16x8_t p = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    p = vmlal_s8(p, vget_high_s8(a), vget_high_s8(b));      /* two products stay in int16 */
+    return vpadalq_s16(acc, p);
+#  endif
+}
+
+static inline int32_t neon_hsum(int32x4_t v) {
+#  if defined(__aarch64__)
+    return vaddvq_s32(v);
+#  else
+    int32x2_t s2 = vadd_s32(vget_low_s32(v), vget_high_s32(v));
+    return vget_lane_s32(vpadd_s32(s2, s2), 0);
+#  endif
+}
+
+/* Codes of 16 bytes as signed bytes: INT4 nibbles (two's complement) by xor and subtract, INT2
+   codes c as (c & 1) - (c & 2). */
+#define NEON_INT4(v) vsubq_s8(veorq_s8(vreinterpretq_s8_u8(v), eight), eight)
+#define NEON_INT2(c) vsubq_s8(vreinterpretq_s8_u8(vandq_u8((c), one)), vreinterpretq_s8_u8(vandq_u8((c), two)))
+
+static void dot_packed_rows4(const uint8_t *w, size_t stride, const int8_t *x, uint32_t n, uint32_t per_byte,
+                             int32_t xsum, int32_t acc[4]) {
+    (void)xsum;
+    const int8x16_t eight = vdupq_n_s8(8);
+    const uint8x16_t low = vdupq_n_u8(0x0F), one = vdupq_n_u8(1), two = vdupq_n_u8(2);
+    int32x4_t s[4] = {vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0)};
+    uint32_t k = 0;
+    size_t at = 0;
+    if (per_byte == 2u) {
+        for (; n - k >= 32u; k += 32u, at += 16u) {
+            int8x16_t x0 = vld1q_s8(x + k), x1 = vld1q_s8(x + k + 16);
+            for (int r = 0; r < 4; r++) {
+                uint8x16_t b = vld1q_u8(w + (size_t)r * stride + at);
+                s[r] = neon_dot_i8(s[r], NEON_INT4(vandq_u8(b, low)), x0);
+                s[r] = neon_dot_i8(s[r], NEON_INT4(vshrq_n_u8(b, 4)), x1);
+            }
+        }
+    } else {
+        for (; n - k >= 64u; k += 64u, at += 16u) {
+            int8x16_t x0 = vld1q_s8(x + k), x1 = vld1q_s8(x + k + 16), x2 = vld1q_s8(x + k + 32), x3 = vld1q_s8(x + k + 48);
+            for (int r = 0; r < 4; r++) {
+                uint8x16_t b = vld1q_u8(w + (size_t)r * stride + at);
+                s[r] = neon_dot_i8(s[r], NEON_INT2(b), x0);
+                s[r] = neon_dot_i8(s[r], NEON_INT2(vshrq_n_u8(b, 2)), x1);
+                s[r] = neon_dot_i8(s[r], NEON_INT2(vshrq_n_u8(b, 4)), x2);
+                s[r] = neon_dot_i8(s[r], NEON_INT2(vshrq_n_u8(b, 6)), x3);
+            }
+        }
+    }
+    for (int r = 0; r < 4; r++) {
+        int32_t sum = neon_hsum(s[r]);
+        for (uint32_t i = k; i < n; i++) sum += packed_code(w + (size_t)r * stride, i, per_byte) * (int32_t)x[i];
+        acc[r] = sum;
+    }
+}
+#undef NEON_INT4
+#undef NEON_INT2
+
+#else
+
+static void dot_packed_rows4(const uint8_t *w, size_t stride, const int8_t *x, uint32_t n, uint32_t per_byte,
+                             int32_t xsum, int32_t acc[4]) {
+    (void)xsum;
+    int8_t block[256];
+    for (int r = 0; r < 4; r++) {
+        const uint8_t *row = w + (size_t)r * stride;
+        int32_t sum = 0;
+        for (uint32_t k = 0; k < n; k += 256u) {         /* 256 codes: whole bytes */
+            uint32_t len = n - k < 256u ? n - k : 256u;
+            if (per_byte == 2u) spingalett_unpack_int4(row + k / 2u, block, len);
+            else spingalett_unpack_int2(row + k / 4u, block, len);
+            sum += spingalett_dot_i8(block, x + k, len);
+        }
+        acc[r] = sum;
+    }
+}
+
+#endif
+
+#if defined(SPG_F16C) && defined(SPG_AVX2)
+#  define SPG_F16_ROWS4 1       /* dot_f16_rows4 has a vector path of its own */
+#endif
+
+/* Single rows, for the targets without a four-row vector path. */
+#if !defined(SPG_AVX) || !defined(SPG_F16_ROWS4)
 static float dot_f32(const float *w, const float *x, uint32_t n) {
     uint32_t k = 0;
     float sum = 0.0f;
@@ -583,8 +759,10 @@ static float dot_f32(const float *w, const float *x, uint32_t n) {
     for (; k < n; k++) sum += w[k] * x[k];
     return sum;
 }
+#endif
 
 /* Half and bfloat16 rows: converted in blocks to float, or with conversion instructions. */
+#if !defined(SPG_F16_ROWS4)
 static float dot_f16(const uint16_t *w, const float *x, uint32_t n, bool bf16) {
     uint32_t k = 0;
     float sum = 0.0f;
@@ -670,18 +848,91 @@ static float dot_f16(const uint16_t *w, const float *x, uint32_t n, bool bf16) {
     }
     return sum;
 }
+#endif
 
-/* INT4 and INT2 rows; INT2 is unpacked in blocks of 256 (a multiple of 4, so blocks start on a byte). */
-static int32_t dot_packed(const uint8_t *w, const int8_t *x, uint32_t n, PrecisionMode precision) {
-    if (precision == PRECISION_INT4) return dot_i4(w, x, n);
-    int8_t block[256];
-    int32_t acc = 0;
-    for (uint32_t k = 0; k < n; k += 256u) {
-        uint32_t len = n - k < 256u ? n - k : 256u;
-        spingalett_unpack_int2(w + k / 4u, block, len);
-        acc += spingalett_dot_i8(block, x + k, len);
+#if defined(SPG_AVX)
+static inline float hsum256(__m256 s) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+    return _mm_cvtss_f32(h);
+}
+#endif
+
+/* out[r] = dot of row r (rows `stride` floats apart) with x, for r = 0..3. */
+static void dot_f32_rows4(const float *w, size_t stride, const float *x, uint32_t n, float out[4]) {
+#if defined(SPG_AVX)
+    const float *w0 = w, *w1 = w + stride, *w2 = w + 2 * stride, *w3 = w + 3 * stride;
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    uint32_t k = 0;
+    for (; k + 16u <= n; k += 16u) {
+        __m256 x0 = _mm256_loadu_ps(x + k), x1 = _mm256_loadu_ps(x + k + 8);
+        a0 = SPG_FMADD256(_mm256_loadu_ps(w0 + k), x0, a0);
+        a1 = SPG_FMADD256(_mm256_loadu_ps(w1 + k), x0, a1);
+        a2 = SPG_FMADD256(_mm256_loadu_ps(w2 + k), x0, a2);
+        a3 = SPG_FMADD256(_mm256_loadu_ps(w3 + k), x0, a3);
+        b0 = SPG_FMADD256(_mm256_loadu_ps(w0 + k + 8), x1, b0);
+        b1 = SPG_FMADD256(_mm256_loadu_ps(w1 + k + 8), x1, b1);
+        b2 = SPG_FMADD256(_mm256_loadu_ps(w2 + k + 8), x1, b2);
+        b3 = SPG_FMADD256(_mm256_loadu_ps(w3 + k + 8), x1, b3);
     }
-    return acc;
+    if (k + 8u <= n) {
+        __m256 x0 = _mm256_loadu_ps(x + k);
+        a0 = SPG_FMADD256(_mm256_loadu_ps(w0 + k), x0, a0);
+        a1 = SPG_FMADD256(_mm256_loadu_ps(w1 + k), x0, a1);
+        a2 = SPG_FMADD256(_mm256_loadu_ps(w2 + k), x0, a2);
+        a3 = SPG_FMADD256(_mm256_loadu_ps(w3 + k), x0, a3);
+        k += 8u;
+    }
+    out[0] = hsum256(_mm256_add_ps(a0, b0));
+    out[1] = hsum256(_mm256_add_ps(a1, b1));
+    out[2] = hsum256(_mm256_add_ps(a2, b2));
+    out[3] = hsum256(_mm256_add_ps(a3, b3));
+    for (int r = 0; r < 4; r++)
+        for (uint32_t i = k; i < n; i++) out[r] += w[(size_t)r * stride + i] * x[i];
+#else
+    for (int r = 0; r < 4; r++) out[r] = dot_f32(w + (size_t)r * stride, x, n);
+#endif
+}
+
+/* The same for half or bfloat16 rows. */
+static void dot_f16_rows4(const uint16_t *w, size_t stride, const float *x, uint32_t n, bool bf16, float out[4]) {
+#if defined(SPG_F16C) && defined(SPG_AVX2)
+    const uint16_t *w0 = w, *w1 = w + stride, *w2 = w + 2 * stride, *w3 = w + 3 * stride;
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    uint32_t k = 0;
+#define F16_HALF(p) _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p)))
+#define F16_BF16(p) _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(p))), 16))
+#define F16_ROWS4(LOAD) \
+    for (; k + 16u <= n; k += 16u) { \
+        __m256 x0 = _mm256_loadu_ps(x + k), x1 = _mm256_loadu_ps(x + k + 8); \
+        a0 = SPG_FMADD256(LOAD(w0 + k), x0, a0); a1 = SPG_FMADD256(LOAD(w1 + k), x0, a1); \
+        a2 = SPG_FMADD256(LOAD(w2 + k), x0, a2); a3 = SPG_FMADD256(LOAD(w3 + k), x0, a3); \
+        b0 = SPG_FMADD256(LOAD(w0 + k + 8), x1, b0); b1 = SPG_FMADD256(LOAD(w1 + k + 8), x1, b1); \
+        b2 = SPG_FMADD256(LOAD(w2 + k + 8), x1, b2); b3 = SPG_FMADD256(LOAD(w3 + k + 8), x1, b3); \
+    } \
+    if (k + 8u <= n) { \
+        __m256 x0 = _mm256_loadu_ps(x + k); \
+        a0 = SPG_FMADD256(LOAD(w0 + k), x0, a0); a1 = SPG_FMADD256(LOAD(w1 + k), x0, a1); \
+        a2 = SPG_FMADD256(LOAD(w2 + k), x0, a2); a3 = SPG_FMADD256(LOAD(w3 + k), x0, a3); \
+        k += 8u; \
+    }
+    if (bf16) { F16_ROWS4(F16_BF16) } else { F16_ROWS4(F16_HALF) }
+#undef F16_ROWS4
+#undef F16_HALF
+#undef F16_BF16
+    out[0] = hsum256(_mm256_add_ps(a0, b0));
+    out[1] = hsum256(_mm256_add_ps(a1, b1));
+    out[2] = hsum256(_mm256_add_ps(a2, b2));
+    out[3] = hsum256(_mm256_add_ps(a3, b3));
+    for (int r = 0; r < 4; r++)
+        for (uint32_t i = k; i < n; i++) {
+            uint16_t h = w[(size_t)r * stride + i];
+            out[r] += (bf16 ? spingalett_bf16_to_float(h) : half_to_float_fast(h)) * x[i];
+        }
+#else
+    for (int r = 0; r < 4; r++) out[r] = dot_f16(w + (size_t)r * stride, x, n, bf16);
+#endif
 }
 
 float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q) {
@@ -905,35 +1156,47 @@ static void layer_forward(const uint8_t *image, const SlettLayer *L, const float
     const uint8_t *weights = image + L->weights;
     uint32_t in = L->inputs, out = L->outputs;
 
+    /* Rows in groups of four; the last out % 4 rows one at a time, as a group of one row repeated
+       (stride 0). */
     switch (L->precision) {
         case PRECISION_FLOAT32: {
             const float *W = (const float *)(const void *)weights;
-            for (uint32_t j = 0; j < out; j++) y[j] = bias[j] + dot_f32(W + (size_t)j * in, x, in);
+            for (uint32_t j = 0, rows; j < out; j += rows) {
+                float dot[4];
+                rows = out - j >= 4u ? 4u : 1u;
+                dot_f32_rows4(W + (size_t)j * in, rows == 4u ? in : 0u, x, in, dot);
+                for (uint32_t r = 0; r < rows; r++) y[j + r] = bias[j + r] + dot[r];
+            }
             break;
         }
         case PRECISION_FP16:
         case PRECISION_BFLOAT16: {
             const uint16_t *W = (const uint16_t *)(const void *)weights;
             bool bf16 = L->precision == PRECISION_BFLOAT16;
-            for (uint32_t j = 0; j < out; j++) y[j] = bias[j] + dot_f16(W + (size_t)j * in, x, in, bf16);
+            for (uint32_t j = 0, rows; j < out; j += rows) {
+                float dot[4];
+                rows = out - j >= 4u ? 4u : 1u;
+                dot_f16_rows4(W + (size_t)j * in, rows == 4u ? in : 0u, x, in, bf16, dot);
+                for (uint32_t r = 0; r < rows; r++) y[j + r] = bias[j + r] + dot[r];
+            }
             break;
         }
         default: {
             const float *scale = (const float *)(const void *)(image + L->scales);
             float x_scale = spingalett_quantize_activations(x, in, xq);
             size_t row = (size_t)spingalett_slett_row_bytes(L->precision, in);
-            uint32_t j = 0;
-            if (L->precision == PRECISION_INT8)
-                for (; j + 4u <= out; j += 4u) {
-                    int32_t acc[4];
-                    spingalett_dot_i8_rows4((const int8_t *)(weights + (size_t)j * row), row, xq, in, acc);
-                    for (uint32_t r = 0; r < 4; r++) y[j + r] = spingalett_int_output(bias[j + r], scale[j + r], x_scale, acc[r]);
-                }
-            for (; j < out; j++) {
-                const uint8_t *w = weights + (size_t)j * row;
-                int32_t acc = L->precision == PRECISION_INT8 ? spingalett_dot_i8((const int8_t *)w, xq, in)
-                                                             : dot_packed(w, xq, in, L->precision);
-                y[j] = spingalett_int_output(bias[j], scale[j], x_scale, acc);
+            uint32_t per_byte = L->precision == PRECISION_INT4 ? 2u : 4u;
+            int32_t xsum = L->precision != PRECISION_INT8 ? permute_activations(xq, in, per_byte) : 0;
+            for (uint32_t j = 0, rows; j < out; j += rows) {
+                int32_t acc[4];
+                rows = out - j >= 4u ? 4u : 1u;
+                size_t stride = rows == 4u ? row : 0u;
+                if (L->precision == PRECISION_INT8)
+                    spingalett_dot_i8_rows4((const int8_t *)(weights + (size_t)j * row), stride, xq, in, acc);
+                else
+                    dot_packed_rows4(weights + (size_t)j * row, stride, xq, in, per_byte, xsum, acc);
+                for (uint32_t r = 0; r < rows; r++)
+                    y[j + r] = spingalett_int_output(bias[j + r], scale[j + r], x_scale, acc[r]);
             }
             break;
         }
