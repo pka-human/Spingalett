@@ -849,7 +849,7 @@ Spingalett is at version 0.8; the C API may still change between minor versions 
 change without breaking programs. Saved models are versioned and remain loadable; the inference
 engine and model format versions 3 to 5 are meant to stay stable from here on.
 
-Planned work, roughly in order:
+Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
 - 0.9: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
   backend
@@ -863,7 +863,8 @@ Bug reports and pull requests are welcome. Please make sure the test suite passe
 (`ctest --test-dir Build --output-on-failure`) for both a minimal build and a build with
 `-DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON`, and add tests for new behaviour. CI runs the
 suite with GCC and Clang, without `-march=native` (portable kernels) and under AddressSanitizer
-and UndefinedBehaviorSanitizer.
+and UndefinedBehaviorSanitizer. [AGENTS.md](AGENTS.md) summarizes the layout, the checks and the
+invariants the tests enforce, for coding agents and new contributors alike.
 
 ## License
 

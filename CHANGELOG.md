@@ -7,6 +7,10 @@ changes, which are listed under **Changed**.
 
 ## [Unreleased]
 
+### Added
+- `ROADMAP.md` (plans for 0.9, 1.0 and later) and `AGENTS.md` (layout, checks and invariants for
+  coding agents and contributors).
+
 ### Changed
 - `DigitPadTrain` prints each epoch's time and the time since training began.
 
