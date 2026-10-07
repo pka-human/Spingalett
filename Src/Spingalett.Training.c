@@ -277,9 +277,11 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
     }
 }
 
-/* grad = scale * (sum over the chunk) + beta * grad, so chunks of one step accumulate. */
+/* grad = scale * (sum over the chunk) + beta * grad, so chunks of one step accumulate. With an
+   optimizer step `o`, each layer is updated as soon as its gradient is complete, while the
+   gradient is still in cache (the gradient must then be the whole step's, unclipped). */
 static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
-                                       float scale, float beta, ComputeMode mode) {
+                                       float scale, float beta, ComputeMode mode, const OptimizerStep *o) {
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         uint32_t in_sz  = net->topology[l];
         uint32_t out_sz = net->topology[l + 1];
@@ -294,6 +296,14 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
             memset(gB, 0, out_sz * sizeof(float));
         for (uint32_t s = 0; s < N; s++)
             spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
+
+        if (o) {
+            uint64_t w = net->weight_offsets[l], b = net->bias_offsets[l];
+            optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
+                                   net->grad_weights + w, (uint64_t)out_sz * in_sz, o->decay, mode);
+            optimizer_update_array(o, net->biases + b, net->opt_m_biases + b, net->opt_v_biases + b,
+                                   net->grad_biases + b, out_sz, 0.0f, mode);
+        }
     }
 }
 
@@ -540,11 +550,16 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
             loss += batch_compute_loss(net, ws, targets, n);
             batch_output_deltas(net, ws, targets, NULL, n);
             batch_backprop_hidden(net, ws, n, t->mode);
-            batch_accumulate_gradients(net, ws, n, 1.0f / (float)count, c0 == 0 ? 0.0f : 1.0f, t->mode);
+            /* the last chunk of an unclipped step updates each layer right after its gradient */
+            bool last = c0 + n == count, fused = last && args->max_grad_norm <= 0.0f;
+            if (fused) trainer_begin_step(t);
+            batch_accumulate_gradients(net, ws, n, 1.0f / (float)count, c0 == 0 ? 0.0f : 1.0f, t->mode,
+                                       fused ? &t->opt : NULL);
+            if (last && !fused) {
+                trainer_begin_step(t);
+                apply_gradients(net, &t->opt, args->max_grad_norm, t->mode);
+            }
         }
-
-        trainer_begin_step(t);
-        apply_gradients(net, &t->opt, args->max_grad_norm, t->mode);
         return loss;
     }
 
@@ -1014,7 +1029,7 @@ static bool trainer_backward(SpingalettTrainer *tr, const float *targets, const 
     flush_denormals_begin(tr->mode);
     batch_output_deltas(net, tr->ws, targets, output_grads, n);
     batch_backprop_hidden(net, tr->ws, n, tr->mode);
-    batch_accumulate_gradients(net, tr->ws, n, 1.0f, tr->accumulated == 0 ? 0.0f : 1.0f, tr->mode);
+    batch_accumulate_gradients(net, tr->ws, n, 1.0f, tr->accumulated == 0 ? 0.0f : 1.0f, tr->mode, NULL);
     flush_denormals_end(tr->mode);
 
     tr->accumulated += n;
