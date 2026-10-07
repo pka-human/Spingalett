@@ -74,6 +74,7 @@ with sg.Network.load("xor.slett") as net:
 | `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision)` per layer; image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
+| `cpu_kernels()`, `library_version()`, `library_path()` | the matrix kernels in use (`"AVX-512"`, `"AVX2"`, ...), the loaded library |
 
 Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bindings check on import
 that the library has the same major.minor version (`library_version()`), because they mirror its

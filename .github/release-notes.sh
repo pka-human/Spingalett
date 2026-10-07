@@ -20,10 +20,10 @@ cat <<EOF
 
 | File | For |
 |---|---|
-| \`spingalett-$version-linux-x86_64.tar.gz\` | any x86-64 CPU; glibc 2.29 or newer and \`libgomp1\` |
-| \`spingalett-$version-linux-x86_64-v3.tar.gz\` | x86-64 CPUs with AVX2 and FMA (Intel Haswell, AMD Zen and newer): faster kernels |
+| \`spingalett-$version-linux-x86_64.tar.gz\` | any x86-64 CPU (AVX2 and AVX-512 matrix kernels chosen at run time); glibc 2.29 or newer and \`libgomp1\` |
+| \`spingalett-$version-linux-x86_64-v3.tar.gz\` | x86-64 CPUs with AVX2 and FMA (Intel Haswell, AMD Zen and newer): the rest of the library compiled for AVX2 too |
 | \`spingalett-$version-linux-aarch64.tar.gz\` | 64-bit ARM (Raspberry Pi 4 and 5 with a 64-bit OS, AWS Graviton, Ampere); glibc 2.29+ and \`libgomp1\` |
-| \`spingalett-$version-windows-x86_64.zip\` | 64-bit Windows; the MinGW and OpenMP runtime DLLs are included |
+| \`spingalett-$version-windows-x86_64.zip\` | 64-bit Windows (AVX2 and AVX-512 matrix kernels chosen at run time); the MinGW and OpenMP runtime DLLs are included |
 | \`spingalett-$version-windows-x86_64-v3.zip\` | the same for CPUs with AVX2 and FMA |
 | \`spingalett-$version-macos-universal.tar.gz\` | macOS 11 or newer, Apple silicon and Intel (single-threaded: no OpenMP) |
 | \`spingalett-$version-inference-engine.zip\` | the standalone inference engine for firmware: three C files, see its README |

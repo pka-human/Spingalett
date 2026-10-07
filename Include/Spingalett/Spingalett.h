@@ -310,6 +310,12 @@ SPINGALETT_API int spingalett_last_error_code(void);
 SPINGALETT_API const char *spingalett_last_error_message(void);
 SPINGALETT_API void spingalett_clear_error(void);
 
+/* Instruction set of the matrix-multiplication kernels that training and batched inference use:
+   "AVX-512", "AVX2", "AVX", "SSE2", "NEON" or "C". x86-64 libraries built without
+   SPINGALETT_NATIVE_ARCH (such as the release binaries) choose AVX-512 or AVX2 kernels at run time
+   when the processor has them. */
+SPINGALETT_API const char *spingalett_cpu_kernels(void);
+
 SPINGALETT_API ComputeMode spingalett_get_compute_mode(void);
 SPINGALETT_API void spingalett_set_compute_mode(ComputeMode mode);
 SPINGALETT_API unsigned spingalett_get_num_threads(void);

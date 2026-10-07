@@ -196,6 +196,7 @@ with tempfile.TemporaryDirectory() as d:
     except sg.SpingalettError as e:
         check("cannot open" in str(e) and e.code == sg.ErrorCode.FILE_IO, f"error: {e} code {e.code!r}")
 check(sg.library_version() == sg.__version__, f"library {sg.library_version()} vs bindings {sg.__version__}")
+check(sg.cpu_kernels() in ("AVX-512", "AVX2", "AVX", "SSE2", "NEON", "C"), f"cpu kernels {sg.cpu_kernels()!r}")
 
 # generator mode
 sg.set_compute_mode(sg.ComputeMode.OPENBLAS)

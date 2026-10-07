@@ -5,7 +5,8 @@
 
 /* White-box tests of the native GEMM against a double-precision reference: every transpose
    combination, edge sizes around the micro-kernel and block dimensions, alpha/beta handling
-   (beta = 0 must not read C), leading dimensions larger than the matrix, threading. */
+   (beta = 0 must not read C), leading dimensions larger than the matrix, threading; for every
+   kernel set of the build that the processor can run. */
 
 #include "Spingalett.Private.h"
 #include <math.h>
@@ -16,7 +17,11 @@
 #include <omp.h>
 #endif
 
+typedef void (*Gemm)(SpingalettGemmScratch *, bool, bool, uint32_t, uint32_t, uint32_t, float,
+                     const float *, size_t, const float *, size_t, float, float *, size_t, bool);
+
 static int failures = 0;
+static Gemm gemm = spingalett_gemm_native;      /* the kernel set under test */
 static unsigned state = 1;
 static float frand(void) { state = state * 1103515245u + 12345u; return (float)((state >> 8) & 0xFFFF) / 65536.0f - 0.5f; }
 
@@ -43,7 +48,7 @@ static void check_case(bool ta, bool tb, uint32_t M, uint32_t N, uint32_t K, flo
             R[(size_t)i * N + j] = alpha * s + (beta == 0.0f ? 0.0 : beta * C[(size_t)i * ldc + j]);
         }
 
-    spingalett_gemm_native(scratch, ta, tb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel);
+    gemm(scratch, ta, tb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel);
 
     double worst = 0;
     for (uint32_t i = 0; i < M; i++)
@@ -71,16 +76,33 @@ int main(void) {
         {121, 47, 300}, {150, 100, 513}, {37, 3100, 20}, {64, 1000, 64}, {300, 7, 600},
     };
     const float ab[][2] = {{1.0f, 0.0f}, {0.5f, 1.0f}, {-1.5f, 0.25f}};
+    struct { const char *name; Gemm fn; bool supported; } sets[] = {
+        {spingalett_cpu_kernels(), spingalett_gemm_native, true},
+#if defined(SPINGALETT_GEMM_DISPATCH)
+        {"baseline", spingalett_gemm_baseline, true},
+        {"AVX2", spingalett_gemm_avx2, __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")},
+        {"AVX-512", spingalett_gemm_avx512, __builtin_cpu_supports("avx512f")},
+#endif
+    };
     int cases = 0;
-    for (unsigned s = 0; s < sizeof sizes / sizeof *sizes; s++)
-        for (int t = 0; t < 4; t++)
-            for (unsigned c = 0; c < 3; c++)
-                for (int par = 0; par < 2; par++) {
-                    check_case(t & 1, t & 2, sizes[s][0], sizes[s][1], sizes[s][2], ab[c][0], ab[c][1],
-                               (s + t) % 3 == 0 ? 3 : 0, par, par ? scratch : NULL);
-                    cases++;
-                }
+    for (unsigned k = 0; k < sizeof sets / sizeof *sets; k++) {
+        if (!sets[k].supported) { printf("%s kernels: not supported by this processor\n", sets[k].name); continue; }
+        gemm = sets[k].fn;
+        int before = failures;
+        for (unsigned s = 0; s < sizeof sizes / sizeof *sizes; s++)
+            for (int t = 0; t < 4; t++)
+                for (unsigned c = 0; c < 3; c++)
+                    for (int par = 0; par < 2; par++) {
+                        /* the kernel sets themselves need a scratch; the entry point makes one */
+                        SpingalettGemmScratch *sc = par || k > 0 ? scratch : NULL;
+                        check_case(t & 1, t & 2, sizes[s][0], sizes[s][1], sizes[s][2], ab[c][0], ab[c][1],
+                                   (s + t) % 3 == 0 ? 3 : 0, par, sc);
+                        cases++;
+                    }
+        printf("%s kernels%s: %d failures\n", sets[k].name, k == 0 ? " (selected)" : "", failures - before);
+    }
     /* K = 0 / alpha = 0 reduce to C = beta * C */
+    gemm = spingalett_gemm_native;
     check_case(false, false, 9, 9, 0, 1.0f, 0.5f, 0, false, NULL);
     check_case(false, true, 9, 9, 5, 0.0f, 0.0f, 0, false, NULL);
     spingalett_gemm_scratch_free(scratch);

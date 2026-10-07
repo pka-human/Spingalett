@@ -15,8 +15,8 @@
 
 Spingalett is a neural-network library written in C23 for training and running fully connected
 networks on the CPU. It depends only on the C standard library: batch training and inference run
-as matrix-matrix products on built-in AVX-512, AVX2 or portable kernels, with OpenMP and OpenBLAS
-as optional build-time accelerators. Networks are declared with C23 designated initializers and all
+as matrix-matrix products on built-in AVX-512, AVX2, NEON or portable kernels (on x86-64, chosen
+for the processor at run time), with OpenMP and OpenBLAS as optional build-time accelerators. Networks are declared with C23 designated initializers and all
 parameters live in flat contiguous arrays. For deployment, a trained network becomes a read-only
 model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
@@ -52,8 +52,8 @@ alike. Python bindings are included.
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `forward()`, batched `predict()`, `evaluate()` (loss and accuracy) |
-| Deployment | Read-only models in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX2/VNNI, SSE2, NEON, Arm DSP); run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
-| Backends | Built-in matrix kernels (AVX-512, AVX/FMA, portable C), single-threaded or OpenMP; OpenBLAS |
+| Deployment | Read-only models in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX2/VNNI, SSE2, NEON, Arm DSP; INT4 and INT2 decoded in registers); run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
+| Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Bindings | Python (ctypes + NumPy) |
 
@@ -64,8 +64,10 @@ Prebuilt libraries for Linux (x86-64 and ARM64), Windows and macOS are attached 
 the shared library, a CMake package, `DatasetTool` and `ModelTool`. Extract one and point CMake at it with
 `-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with `-I<dir>/include -L<dir>/lib
 -lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
-`-v3` build with the AVX2/FMA kernels; the Windows DLL ships with import libraries for MinGW and
-MSVC.
+`-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
+when the processor has them, and the `-v3` build also compiles the rest of the library
+(activations, optimizers, the inference engine) for AVX2. The Windows DLL ships with import
+libraries for MinGW and MSVC.
 
 To build from source: requirements: CMake 3.21 or newer and a compiler with C23 support. GCC 13 and Clang 18 are tested
 in CI; MSVC 19.36 or newer is expected to work but is not tested. OpenMP and OpenBLAS are
@@ -90,7 +92,9 @@ cmake --install Build --prefix /usr/local
 The shared library and the example programs are written to `Bin/`, import libraries to `Lib/`.
 By default the library is compiled with `-march=native` and therefore tuned for the build
 machine; for redistributable binaries, configure with `-DSPINGALETT_NATIVE_ARCH=OFF` and choose
-a baseline through `CMAKE_C_FLAGS` (for example `-march=x86-64-v3` for AVX2).
+a baseline through `CMAKE_C_FLAGS` (for example `-march=x86-64-v3` for AVX2). On x86-64 with GCC
+or Clang, such a build also compiles the matrix kernels for AVX2 and AVX-512 and runs the best set
+the processor supports (`spingalett_cpu_kernels()` names it).
 
 | CMake option | Default | Description |
 |---|---|---|
@@ -101,6 +105,7 @@ a baseline through `CMAKE_C_FLAGS` (for example `-march=x86-64-v3` for AVX2).
 | `BUILD_APPS` | `OFF` | Build the DigitPad demo (needs SDL2) and its trainer |
 | `SPINGALETT_INFERENCE_ONLY` | `OFF` | Build only the inference engine (`Spingalett.Inference.h`) as a static library: no training, file I/O, OpenMP or heap |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
+| `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` on x86-64 (GCC, Clang): also build AVX2 and AVX-512 matrix kernels and choose at run time |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
 
@@ -109,7 +114,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.5 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.6 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -499,7 +504,9 @@ spingalett_model_free(model);
 INT8, INT4 and INT2 layers run in integer arithmetic: each layer quantizes its input to 8 bits per
 sample (the largest magnitude maps to 127), multiplies it with the weights in 32-bit integers
 (AVX2 with VNNI where available, SSE2, NEON with the dot-product extension where available, the Arm
-DSP extension, or portable C) and rescales each output by its weight row's scale. FP32, FP16 and
+DSP extension, or portable C) and rescales each output by its weight row's scale. With AVX2 and
+NEON, INT4 and INT2 codes are decoded in registers, so they run about as fast as INT8 from a half or
+a quarter of the memory. FP32, FP16 and
 BF16 layers compute in float, converting the weights as they read them. Batched prediction
 computes exactly what single runs compute, on every backend and platform.
 
@@ -515,10 +522,10 @@ INT8 and INT4 keep the accuracy of these networks; INT2 (ternary weights without
 quantization-aware training) suits small layers. One sample through the 784-512-1000-10 benchmark
 network on one thread (`Bin/Benchmark`, Intel Xeon @ 2.80 GHz):
 
-| | `forward()` | FP32 model | FP16 | INT8 | INT4 |
-|---|---:|---:|---:|---:|---:|
-| Microseconds per sample | 131 | 136 | 90 | 20 | 80 |
-| Weights | 3.7 MB | 3.7 MB | 1.9 MB | 0.9 MB | 0.5 MB |
+| | `forward()` | FP32 model | FP16 | BF16 | INT8 | INT4 | INT2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Microseconds per sample | 125 | 120 | 74 | 78 | 21 | 20 | 20 |
+| Weights | 3.7 MB | 3.7 MB | 1.9 MB | 1.9 MB | 0.9 MB | 0.5 MB | 0.2 MB |
 
 ### Running in place
 
@@ -612,24 +619,34 @@ training (batches of 64, one epoch) and batched inference. `Examples/benchmark_p
 same workload in PyTorch. Run them with `Bin/Benchmark [threads]` and
 `python Examples/benchmark_pytorch.py [threads]`.
 
-Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.10 GHz, AVX-512). Spingalett 0.3 was built
-with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build
-from PyPI (Intel MKL and oneDNN):
+Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.80 GHz, Cascade Lake, AVX-512), medians of
+three to five runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.6 is built
+with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from
+PyPI (Intel MKL and oneDNN):
 
 | | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
-| Spingalett | 1 | 24,343 | 16,094 | 58,174 |
-| PyTorch | 1 | 21,307 | 7,974 | 52,959 |
-| Spingalett (OpenMP) | 4 | 81,469 | 41,623 | 222,502 |
-| PyTorch | 4 | 68,648 | 16,425 | 177,176 |
+| Spingalett | 1 | 18,700 | 13,000 | 49,200 |
+| PyTorch | 1 | 13,900 | 5,500 | 22,900 |
+| Spingalett (OpenMP) | 4 | 59,100 | 31,700 | 168,500 |
+| PyTorch | 4 | 49,300 | 9,800 | 121,200 |
 
-The gap is largest for mini-batches, where fixed per-step costs weigh most. With
-`COMPUTE_OPENBLAS` (OpenBLAS 0.3.26) Spingalett reaches 77,469 samples/s in full-batch and 32,478
-in mini-batch training on four threads.
+Spingalett trains 1.2 to 1.3 times as fast in full batches, 2.4 to 3.2 times as fast in
+mini-batches and infers 1.4 to 2.1 times as fast. The gap is largest for mini-batches, where fixed
+per-step costs weigh most.
 
-Against 0.2 on the same machine, full-batch training without OpenBLAS is 7.2x faster on one thread
-and 7.5x faster with OpenMP. Against 0.1, per-sample training (`STRATEGY_SAMPLE`) is about 11x
-faster, mainly because denormals are flushed to zero during training.
+Against 0.5 on the same machine, mini-batch training is 36% faster on four threads (5% on one):
+the matrix products of a mini-batch pack their shared operand once for all threads and no longer
+compute padding rows, and each layer is updated as soon as its gradient is complete.
+
+The x86-64 release packages are compiled for a baseline instruction set and choose AVX2 or AVX-512
+matrix kernels at run time. On the same machine, on one thread, the baseline package trains 3.6 to
+4.9 times as fast, and infers 5 times as fast, as with kernels for its baseline (SSE2), as in 0.5:
+
+| Baseline x86-64 build, one thread | Full batch | Mini-batch 64 | Inference |
+|---|---:|---:|---:|
+| SSE2 kernels (0.5) | 3,700 | 3,200 | 9,000 |
+| AVX-512 kernels chosen at run time (0.6) | 18,200 | 11,400 | 45,000 |
 
 `Examples/MNIST.c` trains a 784-256-128-10 network with dropout (AdamW, cosine schedule,
 mini-batches of 128) on 55,000 images, keeps the epoch with the best accuracy on the other 5,000
@@ -653,18 +670,18 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.5; the C API and the in-memory `NeuralNetwork` layout may still change
+Spingalett is at version 0.6; the C API and the in-memory `NeuralNetwork` layout may still change
 between minor versions (see [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname
-carries the minor version (`libspingalett.so.0.5`). Saved models are versioned and remain
+carries the minor version (`libspingalett.so.0.6`). Saved models are versioned and remain
 loadable; the inference engine and model format version 3 are meant to stay stable from here on.
 
 Planned work, roughly in order:
 
-- 0.6: an opaque network handle and a layer abstraction; batch normalization, 2D convolution and
+- 0.7: an opaque network handle and a layer abstraction; batch normalization, 2D convolution and
   pooling layers, each with numerical gradient checks and integer inference kernels
 - 1.0: API freeze, C++ wrapper
-- Later: quantization-aware training, CUDA backend, NEON kernels for training, further language
-  bindings
+- Later: quantization-aware training, CUDA backend, NEON kernels for training, run-time choice of
+  the remaining x86 kernels (activations, optimizers, inference engine), further language bindings
 
 ## Contributing
 

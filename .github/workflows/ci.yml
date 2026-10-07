@@ -28,7 +28,8 @@ jobs:
           if [ "${{ matrix.config }}" = full ]; then
             extra="$extra -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
           elif [ "${{ matrix.config }}" = generic ]; then
-            # baseline x86-64 without AVX: exercises the portable scalar code paths
+            # baseline x86-64: the portable code paths, and GEMM kernels chosen at run time
+            # (the GEMM test runs the baseline, AVX2 and AVX-512 sets the runner supports)
             extra="$extra -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
           fi
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} $extra

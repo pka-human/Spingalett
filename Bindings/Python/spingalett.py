@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -47,7 +47,7 @@ __all__ = [
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
-    "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads",
+    "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
 ]
 
@@ -500,6 +500,7 @@ _clear_error = _bind("spingalett_clear_error", None, [])
 _get_compute_mode = _bind("spingalett_get_compute_mode", c_int, [])
 _set_compute_mode = _bind("spingalett_set_compute_mode", None, [c_int])
 _get_num_threads = _bind("spingalett_get_num_threads", ctypes.c_uint, [])
+_cpu_kernels = _bind("spingalett_cpu_kernels", c_char_p, [])
 _set_num_threads = _bind("spingalett_set_num_threads", None, [ctypes.c_uint])
 _set_log_callback = _bind("spingalett_set_log_callback", None, [_LogCallbackFn])
 _set_log_level = _bind("spingalett_set_log_level", None, [c_int])
@@ -560,6 +561,12 @@ def set_num_threads(n: int) -> None:
 
 def get_num_threads() -> int:
     return int(_get_num_threads())
+
+
+def cpu_kernels() -> str:
+    """Instruction set of the matrix-multiplication kernels in use ("AVX-512", "AVX2", "AVX",
+    "SSE2", "NEON" or "C"); x86-64 libraries not built for the build machine choose it at run time."""
+    return _cpu_kernels().decode()
 
 
 def seed(value: int) -> None:
