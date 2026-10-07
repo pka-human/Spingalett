@@ -33,9 +33,11 @@
 /* Gathered rows are taken in chunks of at most this many floats (8 MB), at least one row. */
 #define CONV_CHUNK_FLOATS (1u << 21)
 
+#if defined(_OPENMP)                    /* used in OpenMP pragmas only */
 static inline bool use_omp(ComputeMode mode, uint64_t work) {
     return spingalett_use_omp(mode, work);
 }
+#endif
 
 /* Whether rows are gathered by the native GEMM itself (implicit im2col) rather than into memory. */
 static inline bool implicit(ComputeMode mode) { return mode != COMPUTE_OPENBLAS; }
