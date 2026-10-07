@@ -3,7 +3,7 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
-/* In-memory data sets: IDX and CSV readers, shuffling and hold-out splits. */
+/* In-memory data sets: IDX, CIFAR and CSV readers, shuffling and hold-out splits. */
 
 #include "Spingalett.Private.h"
 #include <stdio.h>
@@ -28,6 +28,66 @@ static bool dataset_alloc(SpingalettDataset *d, uint32_t count, uint32_t input_s
     spingalett_dataset_free(d);
     set_error(SPINGALETT_ERR_ALLOC, "dataset allocation failed");
     return false;
+}
+
+/* ---------------------------------------------------------------- CIFAR */
+
+#define CIFAR_SIDE   32u
+#define CIFAR_PIXELS (CIFAR_SIDE * CIFAR_SIDE)
+
+bool spingalett_load_cifar(const char *const *paths, uint32_t path_count, uint32_t num_classes,
+                           SpingalettDataset *dataset) {
+    if (!dataset) { set_error(SPINGALETT_ERR_INVALID, "spingalett_load_cifar: dataset is NULL"); return false; }
+    memset(dataset, 0, sizeof *dataset);
+    if (!paths || path_count == 0 || (num_classes != 10 && num_classes != 20 && num_classes != 100)) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_load_cifar: no paths, or num_classes is not 10, 20 or 100");
+        return false;
+    }
+    /* CIFAR-10: one label; CIFAR-100: the coarse label (20 classes), then the fine one (100) */
+    const size_t labels = num_classes == 10 ? 1u : 2u, label_at = num_classes == 100 ? 1u : 0u;
+    const size_t record = labels + 3u * CIFAR_PIXELS;
+    uint8_t **data = (uint8_t **)calloc(path_count, sizeof(uint8_t *));
+    size_t *sizes = (size_t *)calloc(path_count, sizeof(size_t));
+    uint64_t count = 0;
+    bool ok = data && sizes;
+    if (!ok) set_error(SPINGALETT_ERR_ALLOC, "spingalett_load_cifar: allocation failed");
+    for (uint32_t i = 0; ok && i < path_count; i++) {
+        data[i] = (uint8_t *)spingalett_read_file(paths[i], &sizes[i]);
+        if (!data[i]) {
+            spingalett_log(LOG_ERROR, "Cannot read %s", paths[i] ? paths[i] : "(null)");
+            ok = false;
+        } else if (sizes[i] == 0 || sizes[i] % record != 0) {
+            spingalett_log(LOG_ERROR, "%s is not a CIFAR batch of %zu-byte records", paths[i], record);
+            set_error(SPINGALETT_ERR_INVALID, "not a CIFAR batch file (size is not a multiple of the record size)");
+            ok = false;
+        } else {
+            count += sizes[i] / record;
+        }
+    }
+    if (ok && count > UINT32_MAX) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_load_cifar: more than 2^32 - 1 samples");
+        ok = false;
+    }
+    ok = ok && dataset_alloc(dataset, (uint32_t)count, 3u * CIFAR_PIXELS, num_classes);
+    for (uint32_t i = 0, s = 0; ok && i < path_count; i++)
+        for (size_t r = 0; ok && r < sizes[i] / record; r++, s++) {
+            const uint8_t *rec = data[i] + r * record, *planes = rec + labels;
+            if (rec[label_at] >= num_classes) {
+                set_error(SPINGALETT_ERR_INVALID, "CIFAR label out of range");
+                ok = false;
+                break;
+            }
+            dataset->targets[(size_t)s * num_classes + rec[label_at]] = 1.0f;
+            float *x = dataset->inputs + (size_t)s * 3u * CIFAR_PIXELS;
+            for (uint32_t p = 0; p < CIFAR_PIXELS; p++)
+                for (uint32_t c = 0; c < 3; c++)       /* as spingalett_load_idx: v / 255 exactly */
+                    x[3u * p + c] = (float)((double)planes[c * CIFAR_PIXELS + p] / 255.0);
+        }
+    for (uint32_t i = 0; data && i < path_count; i++) spingalett_aligned_free(data[i]);
+    free(data);
+    free(sizes);
+    if (!ok) spingalett_dataset_free(dataset);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- IDX */

@@ -502,12 +502,17 @@ typedef struct {
     DropoutContext dropout;     /* dropout.dmask: per-sample path buffer */
     BatchWorkspace *ws;         /* batch path */
 
+    bool augment;               /* augment_shift or augment_flip */
+    uint64_t augment_seed;      /* drawn once per train() call */
+    float *augmented;           /* per-sample path: one augmented input */
+
     BatchWorkspace *val_ws;     /* validation: inference workspace and output rows */
     float *val_out;
     float *best_params;         /* restore_best_weights: weights then biases of the best epoch */
 } Trainer;
 
 static void trainer_free(Trainer *t) {
+    spingalett_aligned_free(t->augmented);
     spingalett_aligned_free(t->gen_inputs);
     spingalett_aligned_free(t->gen_targets);
     free(t->order);
@@ -554,8 +559,12 @@ static bool trainer_alloc(Trainer *t) {
 
     if (t->use_batch_path) {
         uint32_t capacity = spingalett_batch_capacity(net, t->batch_size);
-        t->ws = spingalett_batch_workspace_create(net, capacity, true, t->order != NULL, t->mode);
+        t->ws = spingalett_batch_workspace_create(net, capacity, true, t->order != NULL || t->augment, t->mode);
         return t->ws != NULL;
+    }
+    if (t->augment) {
+        t->augmented = (float *)spingalett_aligned_alloc((size_t)net->topology[0] * sizeof(float));
+        if (!t->augmented) return false;
     }
 
     t->deltas = (float **)calloc(net->layers, sizeof(float *));
@@ -578,6 +587,43 @@ static void trainer_begin_step(Trainer *t) {
     t->opt.v_factor = 1.0f / (1.0f - t->beta2_pow);
 }
 
+static inline uint64_t mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+/* dst = the image src (shape s) shifted and possibly mirrored as drawn for sample `position` of
+   step `step`: dst(y, x) = src(y + dy, x' + dx) with x' = x, or W - 1 - x when mirrored, and 0
+   where that falls outside the image. */
+static void augment_image(const Trainer *t, const float *src, float *dst, uint64_t step, uint32_t position) {
+    const LayerShape *s = &t->net->shapes[0];
+    const uint32_t H = s->height, W = s->width, C = s->channels, k = t->args->augment_shift;
+    uint64_t h = mix64(t->augment_seed ^ mix64(step * 0x9E3779B97F4A7C15ull + position));
+    int64_t dy = k ? (int64_t)(h % (2u * k + 1u)) - k : 0, dx = k ? (int64_t)((h >> 21) % (2u * k + 1u)) - k : 0;
+    bool mirror = t->args->augment_flip && ((h >> 42) & 1u);
+    for (uint32_t y = 0; y < H; y++) {
+        float *row = dst + (size_t)y * W * C;
+        int64_t sy = (int64_t)y + dy;
+        if (sy < 0 || sy >= (int64_t)H) { memset(row, 0, (size_t)W * C * sizeof(float)); continue; }
+        const float *srow = src + (size_t)sy * W * C;
+        if (!mirror) {
+            /* columns [a, b) of dst read columns [a + dx, b + dx) of src */
+            int64_t a = dx < 0 ? -dx : 0, b = dx > 0 ? (int64_t)W - dx : (int64_t)W;
+            if (b < a) b = a;
+            memset(row, 0, (size_t)a * C * sizeof(float));
+            memcpy(row + (size_t)a * C, srow + (size_t)(a + dx) * C, (size_t)(b - a) * C * sizeof(float));
+            memset(row + (size_t)b * C, 0, (size_t)((int64_t)W - b) * C * sizeof(float));
+            continue;
+        }
+        for (uint32_t x = 0; x < W; x++) {
+            int64_t sx = (int64_t)(W - 1u - x) + dx;
+            if (sx < 0 || sx >= (int64_t)W) memset(row + (size_t)x * C, 0, (size_t)C * sizeof(float));
+            else memcpy(row + (size_t)x * C, srow + (size_t)sx * C, (size_t)C * sizeof(float));
+        }
+    }
+}
+
 /* Trains on rows order[start .. start+count) of inputs/targets (rows start.. directly when order
    is NULL) and performs the optimizer step(s). Returns the summed loss. */
 static float trainer_step(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order,
@@ -598,14 +644,19 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
         for (uint32_t c0 = 0; c0 < count; c0 += ws->capacity) {
             uint32_t n = (count - c0 < ws->capacity) ? count - c0 : ws->capacity;
             const float *targets;
-            if (order) {
+            if (order || t->augment) {
                 for (uint32_t s = 0; s < n; s++) {
-                    uint32_t idx = order[start + c0 + s];
-                    memcpy(ws->inputs + (size_t)s * in_sz, inputs + (size_t)idx * in_sz, in_sz * sizeof(float));
-                    memcpy(ws->targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
+                    uint32_t idx = order ? order[start + c0 + s] : start + c0 + s;
+                    const float *src = inputs + (size_t)idx * in_sz;
+                    if (t->augment)
+                        augment_image(t, src, ws->inputs + (size_t)s * in_sz, net->time_step, c0 + s);
+                    else
+                        memcpy(ws->inputs + (size_t)s * in_sz, src, in_sz * sizeof(float));
+                    if (order)
+                        memcpy(ws->targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
                 }
                 ws->act[0] = ws->inputs;
-                targets = ws->targets;
+                targets = order ? ws->targets : targets_in + (size_t)(start + c0) * out_sz;
             } else {
                 /* Contiguous rows are read in place; act[0] is never written. */
                 ws->act[0] = (float *)(inputs + (size_t)(start + c0) * in_sz);
@@ -639,7 +690,12 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
         /* Every online step holds one sample, so its position within the step is 0. */
         t->dropout.step = net->time_step;
         t->dropout.position = 0;
-        const float *out = spingalett_forward_pass(net, inputs + (size_t)idx * in_sz, t->mode, dropout);
+        const float *x = inputs + (size_t)idx * in_sz;
+        if (t->augment) {
+            augment_image(t, x, t->augmented, net->time_step, 0);
+            x = t->augmented;
+        }
+        const float *out = spingalett_forward_pass(net, x, t->mode, dropout);
 
         loss += compute_sample_loss(out, target, out_sz, net->loss_func, out_act);
 
@@ -762,6 +818,8 @@ TrainReport train_struct_arguments(TrainArgs args) {
         args.batch_size = 32;
     if (training_strategy == STRATEGY_SMALL_BATCH && sample_count > 0 && args.batch_size > sample_count)
         args.batch_size = sample_count;
+    if ((args.augment_shift > 0 || args.augment_flip) && net->shapes[0].height * net->shapes[0].width == 1)
+        return train_failed("Augmentation needs an input layer with a height and width (an image)");
     uint32_t step_samples = training_strategy == STRATEGY_SMALL_BATCH ? args.batch_size : sample_count;
     for (uint32_t l = 1; step_samples == 1 && l < net->layers; l++)
         if (net->shapes[l].type == LAYER_BATCH_NORM && net->shapes[l].height * net->shapes[l].width == 1)
@@ -850,6 +908,9 @@ TrainReport train_struct_arguments(TrainArgs args) {
     t.use_dropout = spingalett_has_dropout(net);
     if (t.use_dropout)
         t.dropout.seed = rng_next64();
+    t.augment = args.augment_shift > 0 || args.augment_flip;
+    if (t.augment)
+        t.augment_seed = rng_next64();
 
     if (!trainer_alloc(&t)) {
         trainer_free(&t);

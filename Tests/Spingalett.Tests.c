@@ -364,6 +364,72 @@ static void deterministic_threads(void) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* Augmentation: refused without an image input; flips mirror the images (with full batches of
+   half-flipped samples, which half is bright tells almost nothing); deterministic on any backend. */
+static void augmentation(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .neurons_amount = 4);
+    layer(.net = net, .neurons_amount = 1, .act_func = ACT_NONE);
+    float x[8] = {0}, y[2] = {0};
+    TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = 2, .epochs = 1, .augment_flip = true);
+    CHECK(r.status == TRAIN_FAILED, "augmentation without an image input must be refused");
+    free_network(net);
+
+    const uint32_t N = 2000, T = 400;               /* training samples, then held-out ones */
+    float *xs = malloc((size_t)(N + T) * 64 * 4), *ys = calloc((size_t)(N + T) * 2, 4);
+    lcg_state = 4040;
+    for (uint32_t s = 0; s < N + T; s++) {          /* the bright half: left or right */
+        bool right = s % 2;
+        for (uint32_t i = 0; i < 64; i++)
+            xs[s * 64 + i] = (frand() - 0.5f) * 0.3f + (((i % 8) >= 4) == right ? 1.0f : 0.0f);
+        ys[s * 2 + right] = 1.0f;
+    }
+    for (int flip = 0; flip < 2; flip++) {
+        spingalett_seed(8);
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 8, .width = 8, .channels = 1);
+        layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_NONE);
+        train(.net = net, .inputs = xs, .targets = ys, .sample_count = N, .epochs = 30, .learning_rate = 0.05f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH, .augment_flip = flip);
+        /* flipped, the halves carry no information: the outputs stay near 1/2, the loss near ln 2 */
+        EvalMetrics m = evaluate(.net = net, .inputs = xs + (size_t)N * 64, .targets = ys + (size_t)N * 2, .sample_count = T);
+        printf("  augmentation%s: held-out loss %.3f\n", flip ? " with flips" : "", m.loss);
+        CHECK(flip ? m.loss > 0.6f : m.loss < 0.1f, "augmentation%s: held-out loss %.3f", flip ? " with flips" : "", m.loss);
+        free_network(net);
+    }
+
+    /* shifts and flips through a convolution network: identical weights on every backend */
+    float *ref = NULL;
+    uint64_t count = 0;
+    bool same = true;
+    for (int mode = 0; mode < 3; mode++) {
+        spingalett_seed(9);
+        spingalett_set_compute_mode(mode == 0 ? COMPUTE_SINGLE_THREADED : COMPUTE_OPENMP);
+        spingalett_set_num_threads(mode == 2 ? 3 : 4);
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 8, .width = 8, .channels = 1);
+        conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_RELU);
+        max_pool2d(.net = net, .kernel = 2);
+        layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX);
+        train(.net = net, .inputs = xs, .targets = ys, .sample_count = 256, .epochs = 2, .learning_rate = 0.01f,
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32,
+              .augment_shift = 2, .augment_flip = true);
+        if (!ref) {
+            count = net->total_weights;
+            ref = malloc(count * sizeof(float));
+            memcpy(ref, net->weights, count * sizeof(float));
+        } else {
+            same = same && !memcmp(ref, net->weights, count * sizeof(float));
+        }
+        free_network(net);
+    }
+    CHECK(same, "augmented training differs between compute modes or thread counts");
+    free(ref);
+    free(xs); free(ys);
+    spingalett_set_num_threads(4);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 static void conv_learns(ComputeMode mode) {
     lcg_state = 31337;
     spingalett_set_compute_mode(mode);
@@ -1364,6 +1430,51 @@ static void trainer_matches_train(ComputeMode mode) {
 static void write_be32(FILE *f, uint32_t v) {
     unsigned char b[4] = {(unsigned char)(v >> 24), (unsigned char)(v >> 16), (unsigned char)(v >> 8), (unsigned char)v};
     fwrite(b, 1, 4, f);
+}
+
+/* CIFAR-10 and CIFAR-100 records: labels, then the image plane by plane, read channels last. */
+static void cifar_files(void) {
+    const char *paths[] = {"spingalett_test_cifar_a.bin", "spingalett_test_cifar_b.bin"};
+    for (int v = 0; v < 2; v++) {               /* CIFAR-10, CIFAR-100 */
+        size_t labels = v ? 2 : 1, record = labels + 3072;
+        uint8_t *rec = malloc(record);
+        for (int file = 0; file < 2; file++) {
+            FILE *f = fopen(paths[file], "wb");
+            for (int r = 0; r < 2 + file; r++) {          /* 2 records, then 3 */
+                rec[0] = (uint8_t)(r + file * 2);         /* CIFAR-10 label, or CIFAR-100 coarse */
+                if (v) rec[1] = (uint8_t)(50 + r + file);  /* fine */
+                for (int i = 0; i < 3072; i++) rec[labels + i] = (uint8_t)((i * 7 + r * 13 + file) & 0xFF);
+                fwrite(rec, 1, record, f);
+            }
+            fclose(f);
+        }
+        SpingalettDataset d;
+        uint32_t classes = v ? 100 : 10;
+        bool ok = spingalett_load_cifar(paths, 2, classes, &d);
+        /* sample 3 is the second record of file b: pixel p channel c from plane c */
+        uint32_t p = 33, c = 2;
+        float want = (float)((((int)(c * 1024 + p) * 7 + 1 * 13 + 1) & 0xFF) / 255.0);
+        uint32_t label = v ? 50 + 1 + 1 : 1 + 2;
+        CHECK(ok && d.count == 5 && d.input_size == 3072 && d.target_size == classes &&
+              d.inputs[3 * 3072 + p * 3 + c] == want && d.targets[3 * classes + label] == 1.0f,
+              "cifar%d: records read channels last with their labels", v ? 100 : 10);
+        if (ok) spingalett_dataset_free(&d);
+        if (v) {
+            ok = spingalett_load_cifar(paths, 2, 20, &d);
+            CHECK(ok && d.target_size == 20 && d.targets[3 * 20 + 3] == 1.0f, "cifar100 coarse labels");
+            if (ok) spingalett_dataset_free(&d);
+        }
+        free(rec);
+    }
+    FILE *f = fopen(paths[0], "wb");
+    fputc(1, f);
+    fclose(f);
+    SpingalettDataset d;
+    CHECK(!spingalett_load_cifar(paths, 1, 10, &d) && d.count == 0 && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "cifar: a truncated record is refused");
+    CHECK(!spingalett_load_cifar(paths, 1, 7, &d), "cifar: num_classes must be 10, 20 or 100");
+    remove(paths[0]);
+    remove(paths[1]);
 }
 
 static void datasets(void) {
@@ -2858,6 +2969,7 @@ int main(int argc, char **argv) {
         for (int m = 0; m < 3; m++) conv_chunks(cm[m]);
         for (int m = 0; m < 2; m++) conv_learns(cm[m]);
         deterministic_threads();
+        augmentation();
     }
     if (!*only || !strcmp(only, "norm")) {
         printf("[batch normalization]\n");
@@ -2959,6 +3071,7 @@ int main(int argc, char **argv) {
     if (!*only || !strcmp(only, "data")) {
         printf("[data sets]\n");
         datasets();
+        cifar_files();
         dataset_files();
     }
     if (!*only || !strcmp(only, "io")) {

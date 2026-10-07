@@ -49,7 +49,8 @@ int main(void) {
     FIELD(TrainArgs, lr_scheduler); FIELD(TrainArgs, lr_scheduler_data);
     FIELD(TrainArgs, val_inputs); FIELD(TrainArgs, val_targets); FIELD(TrainArgs, val_count);
     FIELD(TrainArgs, monitor); FIELD(TrainArgs, early_stopping_patience); FIELD(TrainArgs, early_stopping_min_delta);
-    FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads);
+    FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads); FIELD(TrainArgs, augment_shift);
+    FIELD(TrainArgs, augment_flip);
 
     SIZE(EvalMetrics); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
 

@@ -45,7 +45,7 @@ __all__ = [
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
     "Model", "LayerInfo",
-    "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_csv",
+    "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels",
@@ -314,6 +314,8 @@ class _TrainArgs(Structure):
         ("early_stopping_min_delta", c_float),
         ("restore_best_weights", c_bool),
         ("blas_num_threads", c_int),
+        ("augment_shift", c_uint32),
+        ("augment_flip", c_bool),
     ]
 
 
@@ -518,6 +520,7 @@ _trainer_backward_grads = _bind("spingalett_trainer_backward_output_grads", c_bo
 _trainer_step = _bind("spingalett_trainer_step", c_bool, [_TrainerPtr, POINTER(_OptimizerArgs)])
 _trainer_zero_grad = _bind("spingalett_trainer_zero_grad", None, [_TrainerPtr])
 _load_idx = _bind("spingalett_load_idx", c_bool, [c_char_p, c_char_p, c_uint32, POINTER(_Dataset)])
+_load_cifar = _bind("spingalett_load_cifar", c_bool, [POINTER(c_char_p), c_uint32, c_uint32, POINTER(_Dataset)])
 _load_csv = _bind("spingalett_load_csv", c_bool, [c_char_p, c_uint32, c_uint32, POINTER(_Dataset)])
 _dataset_free = _bind("spingalett_dataset_free", None, [POINTER(_Dataset)])
 _save_dataset = _bind("spingalett_save_dataset", c_bool, [POINTER(_Dataset), c_char_p, POINTER(_DatasetSaveOptions)])
@@ -853,6 +856,8 @@ class TrainConfig:
     autosave_save_optimizer: bool = True
     autosave_precision: Precision = Precision.FLOAT32
     blas_num_threads: int = 0
+    augment_shift: int = 0              # images: random shifts by up to this many cells (zero fill)
+    augment_flip: bool = False          # images: mirror left to right half of the time
 
 
 def _as_matrix(data, width: int, name: str) -> np.ndarray:
@@ -1282,6 +1287,8 @@ class Network:
             early_stopping_min_delta=float(cfg.early_stopping_min_delta),
             restore_best_weights=bool(cfg.restore_best_weights),
             blas_num_threads=int(cfg.blas_num_threads),
+            augment_shift=int(cfg.augment_shift),
+            augment_flip=bool(cfg.augment_flip),
         )
         r = _call(_train, args)
         del keep
@@ -1590,6 +1597,19 @@ def load_idx(images_path, labels_path, num_classes: int = 0):
     Unsigned-byte images are scaled to [0, 1]; ``num_classes`` 0 = largest label + 1."""
     ds = _Dataset()
     _call(_load_idx, _encode_path(images_path), _encode_path(labels_path), int(num_classes), ctypes.byref(ds))
+    return _take_dataset(ds)
+
+
+def load_cifar(paths, num_classes: int = 10):
+    """Read CIFAR binary batches (one path or several) as ``(inputs, one_hot_targets)``: images of
+    32 x 32 x 3 values in [0, 1], channels last. ``num_classes`` 10 reads CIFAR-10, 100 the fine and
+    20 the coarse labels of CIFAR-100."""
+    if isinstance(paths, (str, bytes, os.PathLike)):
+        paths = [paths]
+    encoded = [_encode_path(p) for p in paths]
+    array = (c_char_p * len(encoded))(*encoded)
+    ds = _Dataset()
+    _call(_load_cifar, array, len(encoded), int(num_classes), ctypes.byref(ds))
     return _take_dataset(ds)
 
 

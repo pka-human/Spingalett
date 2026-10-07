@@ -283,6 +283,14 @@ typedef struct {
        each BLAS call is too small to amortize threading (per-sample training, small nets or
        mini-batches), otherwise spingalett_set_num_threads() or OpenBLAS's own default. */
     int blas_num_threads;
+
+    /* Augmentation of image samples (networks whose input layer has a height and width), drawn
+       anew for every sample of every step: a shift by up to augment_shift cells along each axis,
+       cells shifted in being 0 (random crops of an image padded by augment_shift), and, with
+       augment_flip, a mirror image left to right for half of the samples. Validation data is not
+       augmented. */
+    uint32_t augment_shift;
+    bool augment_flip;
 } TrainArgs;
 
 typedef struct {
@@ -321,7 +329,7 @@ typedef struct {
 /* Holds the activations of one batch between the calls of the low-level training API. */
 typedef struct SpingalettTrainer SpingalettTrainer;
 
-/* An in-memory data set (see spingalett_load_idx / spingalett_load_csv). */
+/* An in-memory data set (see spingalett_load_idx, spingalett_load_csv, spingalett_load_cifar). */
 typedef struct {
     uint32_t count;
     uint32_t input_size;
@@ -505,6 +513,13 @@ SPINGALETT_API bool spingalett_load_idx(const char *images_path, const char *lab
    num_classes > 0 the single target column holds class indices that are one-hot encoded. */
 SPINGALETT_API bool spingalett_load_csv(const char *path, uint32_t target_columns, uint32_t num_classes,
                                         SpingalettDataset *dataset);
+/* CIFAR binary batches, read one after the other: records of label bytes and a 32 x 32 RGB image
+   stored plane by plane, read as 32 x 32 x 3 channels-last samples scaled to [0, 1] with one-hot
+   targets. num_classes chooses the variant: 10 for CIFAR-10 (data_batch_1.bin ... test_batch.bin,
+   one label byte), 100 for CIFAR-100's fine labels or 20 for its coarse ones (train.bin, test.bin,
+   two label bytes). */
+SPINGALETT_API bool spingalett_load_cifar(const char *const *paths, uint32_t path_count, uint32_t num_classes,
+                                          SpingalettDataset *dataset);
 /* Shuffles the samples with the library's generator (see spingalett_seed). */
 SPINGALETT_API void spingalett_dataset_shuffle(SpingalettDataset *dataset);
 /* Moves the last count samples into *tail, e.g. to hold out a validation set. */
