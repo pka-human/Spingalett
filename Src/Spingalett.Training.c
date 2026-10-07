@@ -258,6 +258,10 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
         uint32_t cur_sz  = net->topology[l];
         uint32_t next_sz = net->topology[l + 1];
 
+        /* the derivative of layer l's activation is applied by the convolution and pooling
+           kernels while their output is in cache; dropout masks hold it already */
+        ActivationFunction act = net->act_func[l - 1];
+        ActivationFunction fused = ws->dmask[l] ? ACT_NONE : act;
         switch (net->shapes[l + 1].type) {
             case LAYER_DENSE:       /* delta[l] = delta[l+1] * W, W stored [next x cur] */
                 spingalett_gemm(ws->gemm, mode, false, false, N, cur_sz, next_sz, 1.0f,
@@ -265,14 +269,16 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
                                 0.0f, ws->delta[l], cur_sz);
                 break;
             case LAYER_CONV2D:
-                spingalett_conv_backward_data(net, l, ws->delta[l + 1], ws->delta[l], N, ws->conv, ws->gemm, mode);
+                spingalett_conv_backward_data(net, l, ws->delta[l + 1], ws->delta[l], N, ws->act[l], fused, ws->conv,
+                                              ws->gemm, mode);
                 break;
             default:                /* pooling has no activation: delta[l+1] is dL/d(its output) */
-                spingalett_pool_backward(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, mode);
+                spingalett_pool_backward(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, fused, mode);
                 break;
         }
+        if (net->shapes[l + 1].type != LAYER_DENSE && !ws->dmask[l])
+            continue;
 
-        ActivationFunction act = net->act_func[l - 1];
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * cur_sz))
 #endif

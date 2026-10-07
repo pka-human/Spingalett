@@ -13,11 +13,16 @@
  * compilers vectorize for SSE or NEON; the last row panel of a block runs a kernel with fewer rows
  * (8 or 4 of 12, 4 or 2 of 6) instead of computing zero rows.
  *
- * Threads split C by rows and columns only: every element is summed over k in the same order
- * whatever the thread count, so results do not depend on it. Large M splits row blocks (and
- * columns when there are few blocks), with op(B) packed once per K block for all threads; small M
- * (a mini-batch) packs op(A) once for all threads and gives each thread its own column panels,
- * which it packs and multiplies itself.
+ * Threads split C by rows and columns: every element is summed over k in the same order whatever
+ * the thread count, so results do not depend on it. Large M splits row blocks (and columns when
+ * there are few blocks), with op(B) packed once per K block for all threads; small M (a mini-batch)
+ * packs op(A) once for all threads and gives each thread its own column panels, which it packs and
+ * multiplies itself. When all of op(B) fits the pack buffer (a convolution's filters), it is packed
+ * once and each tile of C runs through all K blocks while it is in cache. A small C with a long k range (a convolution's weight gradient: filters x
+ * window, summed over every pixel of a batch) has too few tiles for the threads; its k range is cut
+ * into slots fixed by the shape alone, each slot's partial product is one thread's work, and the
+ * partial products are added in slot order, so the result still does not depend on the thread
+ * count.
  *
  * x86-64 builds that are not tuned for the build machine (SPINGALETT_GEMM_DISPATCH) compile this
  * file twice more, through Kernels/Spingalett.GEMM.AVX2.c and Kernels/Spingalett.GEMM.AVX512.c
@@ -56,10 +61,21 @@
 /* Small M: at most this many row blocks run with op(A) shared between threads. */
 #define SHARED_A_BLOCKS 2
 
+/* Products split along k: C at most SPLIT_M_MAX x SPLIT_N_MAX, at least SPLIT_K_MIN of k per slot,
+   at most SPLIT_SLOTS slots and SPLIT_PARTIAL_FLOATS floats of partial products. */
+#define SPLIT_M_MAX MC_MAX
+#define SPLIT_N_MAX 512u
+#define SPLIT_K_MIN 1024u
+#define SPLIT_SLOTS 32u
+#define SPLIT_PARTIAL_FLOATS (1u << 20)
+#define NR_MAX 32u      /* the widest NR of any kernel set */
+
 struct SpingalettGemmScratch {
     float *b_pack;      /* KC x NC */
     float *a_pack;      /* threads x (MC_MAX x KC); with a shared op(A), one M x KC block */
     int threads;
+    float *split;       /* split products: the partial products, then a column-panel pack per thread */
+    size_t split_floats;
 };
 
 #if !defined(SPINGALETT_GEMM_VARIANT)
@@ -81,9 +97,34 @@ void spingalett_gemm_scratch_free(SpingalettGemmScratch *s) {
     if (!s) return;
     spingalett_aligned_free(s->b_pack);
     spingalett_aligned_free(s->a_pack);
+    spingalett_aligned_free(s->split);
     free(s);
 }
 #endif
+
+/* The number of k slots of an M x N x K product (1: not split); it depends on the shape only. */
+static inline uint32_t split_slots(uint32_t M, uint32_t N, uint32_t K) {
+    if (M > SPLIT_M_MAX || N > SPLIT_N_MAX || K < 2 * SPLIT_K_MIN) return 1;
+    uint32_t slots = K / SPLIT_K_MIN, fit = SPLIT_PARTIAL_FLOATS / (M * N);
+    if (slots > SPLIT_SLOTS) slots = SPLIT_SLOTS;
+    if (slots > fit) slots = fit;
+    return slots < 2 ? 1 : slots;
+}
+
+/* Partial products (16-float aligned), then a KC x N column-panel pack per thread. */
+static inline size_t split_partial_floats(uint32_t M, uint32_t N, uint32_t slots) {
+    return ((size_t)slots * M * N + 15u) & ~(size_t)15u;
+}
+
+static bool split_reserve(SpingalettGemmScratch *s, uint32_t M, uint32_t N, uint32_t slots, int threads) {
+    size_t n_pad = (N + NR_MAX - 1) / NR_MAX * NR_MAX;
+    size_t need = split_partial_floats(M, N, slots) + (size_t)threads * KC * n_pad;
+    if (s->split_floats >= need) return true;
+    spingalett_aligned_free(s->split);
+    s->split = (float *)spingalett_aligned_alloc(need * sizeof(float));
+    s->split_floats = s->split ? need : 0;
+    return s->split != NULL;
+}
 
 #if defined(__AVX__)
 /* dst[k * ds + r] = src[r * ld + k] for an 8 x 8 block. */
@@ -149,9 +190,23 @@ static void pack_transposed(float *restrict dst, const float *restrict src, size
         for (uint32_t k = 0; k < kc; k++) dst[(size_t)k * width + r] = 0.0f;
 }
 
-/* Packs rows [0, rows) of an MR-row panel starting at row i of op(A), columns [k0, k0 + kc). */
+/* Packs rows [0, rows) of an MR-row panel starting at row i of op(A), columns [k0, k0 + kc). A
+   source (src) fills the operand's elements instead of A. */
 static void pack_a_panel(float *restrict dst, const float *restrict A, size_t lda, bool trans,
-                         uint32_t i, uint32_t rows, uint32_t k0, uint32_t kc) {
+                         const SpingalettGemmSource *src_op, uint32_t i, uint32_t rows, uint32_t k0, uint32_t kc) {
+    if (src_op) {
+        if (trans) {            /* A[k][i] is op(A)[i][k]: the source writes the panel itself */
+            src_op->fill(src_op->ctx, k0, kc, i, rows, dst, MR);
+            if (rows < MR)
+                for (uint32_t k = 0; k < kc; k++)
+                    for (uint32_t r = rows; r < MR; r++) dst[(size_t)k * MR + r] = 0.0f;
+        } else {
+            float tmp[MR * KC];
+            src_op->fill(src_op->ctx, i, rows, k0, kc, tmp, kc);
+            pack_transposed(dst, tmp, kc, 0, kc, rows, MR);
+        }
+        return;
+    }
     if (!trans) {
         pack_transposed(dst, A + (size_t)i * lda, lda, k0, kc, rows, MR);
         return;
@@ -163,9 +218,22 @@ static void pack_a_panel(float *restrict dst, const float *restrict A, size_t ld
     }
 }
 
-/* Packs NR-column panel (columns [j, j + cols)) of op(B), rows [k0, k0 + kc). */
+/* Packs NR-column panel (columns [j, j + cols)) of op(B), rows [k0, k0 + kc), from B or a source. */
 static void pack_b_panel(float *restrict dst, const float *restrict B, size_t ldb, bool trans,
-                         uint32_t k0, uint32_t kc, uint32_t j, uint32_t cols) {
+                         const SpingalettGemmSource *src_op, uint32_t k0, uint32_t kc, uint32_t j, uint32_t cols) {
+    if (src_op) {
+        if (!trans) {           /* B[k][j]: the source writes the panel itself */
+            src_op->fill(src_op->ctx, k0, kc, j, cols, dst, NR);
+            if (cols < NR)
+                for (uint32_t k = 0; k < kc; k++)
+                    for (uint32_t c = cols; c < NR; c++) dst[(size_t)k * NR + c] = 0.0f;
+        } else {
+            float tmp[NR * KC];
+            src_op->fill(src_op->ctx, j, cols, k0, kc, tmp, kc);
+            pack_transposed(dst, tmp, kc, 0, kc, cols, NR);
+        }
+        return;
+    }
     if (trans) {
         pack_transposed(dst, B + (size_t)j * ldb, ldb, k0, kc, cols, NR);
         return;
@@ -333,29 +401,102 @@ static void multiply_block(const float *a, const float *b_pack, uint32_t mc, uin
     }
 }
 
+/* C = alpha * op(A) * op(B) + beta * C with k cut into `slots` slots (scratch->split reserved):
+   slot s covers k [s * per, (s + 1) * per) and is multiplied by one thread into its own partial
+   product; the partial products are then summed in slot order. */
+static void gemm_split(SpingalettGemmScratch *scratch, int threads, uint32_t slots, bool trans_a, bool trans_b,
+                       uint32_t M, uint32_t N, uint32_t K, float alpha,
+                       const float *A, size_t lda, const SpingalettGemmSource *a_src,
+                       const float *B, size_t ldb, const SpingalettGemmSource *b_src,
+                       float beta, float *C, size_t ldc, const SpingalettGemmHooks *hooks) {
+    const uint32_t per = (K + slots - 1) / slots, m_panels = (M + MR - 1) / MR, n_panels = (N + NR - 1) / NR;
+    const size_t mn = (size_t)M * N, n_pad = (N + NR_MAX - 1) / NR_MAX * NR_MAX;
+    float *partial = scratch->split, *b_area = partial + split_partial_floats(M, N, slots);
+    (void)threads;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads) if(threads > 1)
+#endif
+    for (int64_t s = 0; s < (int64_t)slots; s++) {
+        int tid = 0;
+#if defined(_OPENMP)
+        tid = omp_get_thread_num();
+#endif
+        float *a_pack = scratch->a_pack + (size_t)tid * MC_MAX * KC, *b_pack = b_area + (size_t)tid * KC * n_pad;
+        float *P = partial + (size_t)s * mn;
+        uint32_t k_begin = (uint32_t)s * per, k_end = K - k_begin < per ? K : k_begin + per;
+        uint32_t len = k_end - k_begin, blocks = (len + KC - 1) / KC, step = (len + blocks - 1) / blocks;
+        for (uint32_t k0 = k_begin; k0 < k_end; k0 += step) {
+            uint32_t kc = k_end - k0 < step ? k_end - k0 : step;
+            for (uint32_t p = 0; p < m_panels; p++) {
+                uint32_t i = p * MR;
+                pack_a_panel(a_pack + (size_t)i * kc, A, lda, trans_a, a_src, i, (M - i < MR) ? M - i : MR, k0, kc);
+            }
+            for (uint32_t q = 0; q < n_panels; q++) {
+                uint32_t j = q * NR;
+                pack_b_panel(b_pack + (size_t)j * kc, B, ldb, trans_b, b_src, k0, kc, j, (N - j < NR) ? N - j : NR);
+            }
+            multiply_block(a_pack, b_pack, M, N, 0, n_panels, kc, P, N, 1.0f, k0 == k_begin ? 0.0f : 1.0f);
+        }
+    }
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(threads > 1 && mn * slots >= (1u << 16))
+#endif
+    for (int64_t i = 0; i < (int64_t)M; i++) {
+        float sum[SPLIT_N_MAX], *c = C + (size_t)i * ldc;
+        memcpy(sum, partial + (size_t)i * N, N * sizeof(float));
+        for (uint32_t s = 1; s < slots; s++) {
+            const float *P = partial + (size_t)s * mn + (size_t)i * N;
+            for (uint32_t j = 0; j < N; j++) sum[j] += P[j];
+        }
+        if (beta == 0.0f) for (uint32_t j = 0; j < N; j++) c[j] = alpha * sum[j];
+        else              for (uint32_t j = 0; j < N; j++) c[j] = alpha * sum[j] + beta * c[j];
+        if (hooks && hooks->epilogue) hooks->epilogue(hooks->epilogue_ctx, (uint32_t)i, 1, 0, N, c, ldc);
+    }
+}
+
 /* The multiplication with this translation unit's kernels (scratch is not NULL, M, N, K > 0). */
 #if defined(SPINGALETT_GEMM_VARIANT)
 void SPINGALETT_GEMM_VARIANT(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
                              uint32_t M, uint32_t N, uint32_t K, float alpha,
                              const float *A, size_t lda, const float *B, size_t ldb,
-                             float beta, float *C, size_t ldc, bool parallel) {
+                             float beta, float *C, size_t ldc, bool parallel, const SpingalettGemmHooks *hooks) {
 #elif defined(SPINGALETT_GEMM_DISPATCH)
 void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
                               uint32_t M, uint32_t N, uint32_t K, float alpha,
                               const float *A, size_t lda, const float *B, size_t ldb,
-                              float beta, float *C, size_t ldc, bool parallel) {
+                              float beta, float *C, size_t ldc, bool parallel, const SpingalettGemmHooks *hooks) {
 #else
 static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
                                      uint32_t M, uint32_t N, uint32_t K, float alpha,
                                      const float *A, size_t lda, const float *B, size_t ldb,
-                                     float beta, float *C, size_t ldc, bool parallel) {
+                                     float beta, float *C, size_t ldc, bool parallel,
+                                     const SpingalettGemmHooks *hooks) {
 #endif
+    const SpingalettGemmSource *a_src = hooks ? hooks->a : NULL, *b_src = hooks ? hooks->b : NULL;
+    void (*epilogue)(const void *, uint32_t, uint32_t, uint32_t, uint32_t, float *, size_t) =
+        hooks ? hooks->epilogue : NULL;
     int threads = parallel ? scratch->threads : 1;
 
+    uint32_t slots = split_slots(M, N, K);
+    if (slots > 1 && split_reserve(scratch, M, N, slots, threads)) {
+        gemm_split(scratch, threads, slots, trans_a, trans_b, M, N, K, alpha, A, lda, a_src, B, ldb, b_src,
+                   beta, C, ldc, hooks);
+        return;
+    }
+
+    /* K blocks of equal size (at most KC): 288 runs as 2 x 144, not 256 + 32 */
+    uint32_t k_blocks = (K + KC - 1) / KC, kc_step = (K + k_blocks - 1) / k_blocks;
     uint32_t m_panels = (M + MR - 1) / MR;
     int64_t mblocks = (int64_t)((M + MC - 1) / MC);
     bool shared_a = threads > 1 && mblocks <= SHARED_A_BLOCKS &&
                     (size_t)m_panels * MR <= (size_t)scratch->threads * MC_MAX;
+    /* All of op(B) fits the pack buffer (a convolution's filters): it is packed once, and each
+       tile then runs every K block while its part of C stays in cache, the epilogue following */
+    const int64_t n_panels = (int64_t)((N + NR - 1) / NR);
+    const size_t b_block = (size_t)kc_step * (size_t)n_panels * NR;
+    bool resident_b = !shared_a && N <= NC && (size_t)k_blocks * b_block <= (size_t)KC * NC;
 
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(threads) if(threads > 1)
@@ -366,12 +507,52 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
         tid = omp_get_thread_num();
         team = omp_get_num_threads();
 #endif
-        for (uint32_t j0 = 0; j0 < N; j0 += NC) {
+        if (resident_b) {
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+            for (int64_t w = 0; w < (int64_t)k_blocks * n_panels; w++) {
+                uint32_t kb = (uint32_t)(w / n_panels), j = (uint32_t)(w % n_panels) * NR;
+                uint32_t k0 = kb * kc_step, kc = (K - k0 < kc_step) ? K - k0 : kc_step;
+                pack_b_panel(scratch->b_pack + kb * b_block + (size_t)j * kc, B, ldb, trans_b, b_src, k0, kc, j,
+                             (N - j < NR) ? N - j : NR);
+            }
+            int64_t nsplit = 1;
+            if (team > 1 && mblocks < 2 * team) {
+                nsplit = (2 * team + mblocks - 1) / mblocks;
+                if (nsplit > n_panels) nsplit = n_panels;
+            }
+            int64_t panels_per_split = (n_panels + nsplit - 1) / nsplit;
+            float *a_pack = scratch->a_pack + (size_t)tid * MC_MAX * KC;
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic)
+#endif
+            for (int64_t t = 0; t < mblocks * nsplit; t++) {
+                uint32_t i0 = (uint32_t)(t / nsplit) * MC;
+                uint32_t mc = (M - i0 < MC) ? M - i0 : MC;
+                int64_t q_begin = (t % nsplit) * panels_per_split;
+                int64_t q_end = q_begin + panels_per_split < n_panels ? q_begin + panels_per_split : n_panels;
+                if (q_begin >= q_end) continue;
+                for (uint32_t kb = 0; kb < k_blocks; kb++) {
+                    uint32_t k0 = kb * kc_step, kc = (K - k0 < kc_step) ? K - k0 : kc_step;
+                    for (uint32_t p = 0; p < mc; p += MR)
+                        pack_a_panel(a_pack + (size_t)p * kc, A, lda, trans_a, a_src, i0 + p,
+                                     (mc - p < MR) ? mc - p : MR, k0, kc);
+                    multiply_block(a_pack, scratch->b_pack + kb * b_block, mc, N, q_begin, q_end, kc,
+                                   C + (size_t)i0 * ldc, ldc, alpha, kb == 0 ? beta : 1.0f);
+                }
+                if (epilogue) {
+                    uint32_t c0 = (uint32_t)q_begin * NR, c1 = (uint32_t)q_end * NR < N ? (uint32_t)q_end * NR : N;
+                    epilogue(hooks->epilogue_ctx, i0, mc, c0, c1 - c0, C + (size_t)i0 * ldc + c0, ldc);
+                }
+            }
+        }
+        for (uint32_t j0 = 0; !resident_b && j0 < N; j0 += NC) {
             uint32_t nc = (N - j0 < NC) ? N - j0 : NC;
             int64_t panels = (int64_t)((nc + NR - 1) / NR);
 
-            for (uint32_t k0 = 0; k0 < K; k0 += KC) {
-                uint32_t kc = (K - k0 < KC) ? K - k0 : KC;
+            for (uint32_t k0 = 0; k0 < K; k0 += kc_step) {
+                uint32_t kc = (K - k0 < kc_step) ? K - k0 : kc_step;
                 float beta_k = (k0 == 0) ? beta : 1.0f;     /* later K blocks accumulate */
 
                 if (shared_a) {
@@ -382,7 +563,7 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
 #endif
                     for (int64_t p = 0; p < (int64_t)m_panels; p++) {
                         uint32_t i = (uint32_t)p * MR;
-                        pack_a_panel(scratch->a_pack + (size_t)i * kc, A, lda, trans_a, i,
+                        pack_a_panel(scratch->a_pack + (size_t)i * kc, A, lda, trans_a, a_src, i,
                                      (M - i < MR) ? M - i : MR, k0, kc);
                     }
                     int64_t per = (panels + team - 1) / team;
@@ -390,15 +571,20 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
                     int64_t q_end = q_begin + per < panels ? q_begin + per : panels;
                     for (int64_t q = q_begin; q < q_end; q++) {
                         uint32_t j = (uint32_t)q * NR;
-                        pack_b_panel(scratch->b_pack + (size_t)j * kc, B, ldb, trans_b, k0, kc, j0 + j,
+                        pack_b_panel(scratch->b_pack + (size_t)j * kc, B, ldb, trans_b, b_src, k0, kc, j0 + j,
                                      (nc - j < NR) ? nc - j : NR);
                     }
 #if defined(_OPENMP)
 #pragma omp barrier
 #endif
-                    if (q_begin < q_end)
+                    if (q_begin < q_end) {
                         multiply_block(scratch->a_pack, scratch->b_pack, M, nc, q_begin, q_end, kc,
                                        C + j0, ldc, alpha, beta_k);
+                        if (epilogue && k0 + kc == K) {
+                            uint32_t c0 = (uint32_t)q_begin * NR, c1 = (uint32_t)q_end * NR < nc ? (uint32_t)q_end * NR : nc;
+                            epilogue(hooks->epilogue_ctx, 0, M, j0 + c0, c1 - c0, C + j0 + c0, ldc);
+                        }
+                    }
 #if defined(_OPENMP)
 #pragma omp barrier
 #endif
@@ -410,7 +596,7 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
 #endif
                 for (int64_t q = 0; q < panels; q++) {
                     uint32_t j = (uint32_t)q * NR;
-                    pack_b_panel(scratch->b_pack + (size_t)j * kc, B, ldb, trans_b, k0, kc, j0 + j,
+                    pack_b_panel(scratch->b_pack + (size_t)j * kc, B, ldb, trans_b, b_src, k0, kc, j0 + j,
                                  (nc - j < NR) ? nc - j : NR);
                 }
 
@@ -435,10 +621,14 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
                     int64_t q_end = q_begin + panels_per_split < panels ? q_begin + panels_per_split : panels;
                     if (q_begin >= q_end) continue;
                     for (uint32_t p = 0; p < mc; p += MR)
-                        pack_a_panel(a_pack + (size_t)p * kc, A, lda, trans_a, i0 + p,
+                        pack_a_panel(a_pack + (size_t)p * kc, A, lda, trans_a, a_src, i0 + p,
                                      (mc - p < MR) ? mc - p : MR, k0, kc);
                     multiply_block(a_pack, scratch->b_pack, mc, nc, q_begin, q_end, kc,
                                    C + (size_t)i0 * ldc + j0, ldc, alpha, beta_k);
+                    if (epilogue && k0 + kc == K) {
+                        uint32_t c0 = (uint32_t)q_begin * NR, c1 = (uint32_t)q_end * NR < nc ? (uint32_t)q_end * NR : nc;
+                        epilogue(hooks->epilogue_ctx, i0, mc, j0 + c0, c1 - c0, C + (size_t)i0 * ldc + j0 + c0, ldc);
+                    }
                 }
             }
         }
@@ -462,7 +652,8 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
 #endif
 
 typedef void (*GemmFunction)(SpingalettGemmScratch *, bool, bool, uint32_t, uint32_t, uint32_t, float,
-                             const float *, size_t, const float *, size_t, float, float *, size_t, bool);
+                             const float *, size_t, const float *, size_t, float, float *, size_t, bool,
+                             const SpingalettGemmHooks *);
 
 /* The kernels for this processor: the run-time choice where there is one. */
 static GemmFunction gemm_select(const char **name) {
@@ -485,6 +676,13 @@ void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool t
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             const float *A, size_t lda, const float *B, size_t ldb,
                             float beta, float *C, size_t ldc, bool parallel) {
+    spingalett_gemm_hooked(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel, NULL);
+}
+
+void spingalett_gemm_hooked(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                            uint32_t M, uint32_t N, uint32_t K, float alpha,
+                            const float *A, size_t lda, const float *B, size_t ldb,
+                            float beta, float *C, size_t ldc, bool parallel, const SpingalettGemmHooks *hooks) {
     if (M == 0 || N == 0) return;
     if (K == 0 || alpha == 0.0f) {      /* C = beta * C */
         for (uint32_t i = 0; i < M; i++) {
@@ -492,6 +690,7 @@ void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool t
             if (beta == 0.0f) memset(cr, 0, N * sizeof(float));
             else for (uint32_t j = 0; j < N; j++) cr[j] *= beta;
         }
+        if (hooks && hooks->epilogue) hooks->epilogue(hooks->epilogue_ctx, 0, M, 0, N, C, ldc);
         return;
     }
 
@@ -505,7 +704,7 @@ void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool t
         if (!scratch) { set_error(SPINGALETT_ERR_ALLOC, "GEMM scratch allocation failed"); return; }
     }
     const char *name;
-    gemm_select(&name)(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel);
+    gemm_select(&name)(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel, hooks);
     spingalett_gemm_scratch_free(own);
 }
 

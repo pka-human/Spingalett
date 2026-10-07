@@ -108,7 +108,19 @@ static void gradcheck_net(const char *name, NeuralNetwork *net, ComputeMode mode
         *p = orig;
         double gn = (lp - lm) / (2.0 * h), gn2 = (lp2 - lm2) / (2.0 * h2);
         if (fabs(gn - gn2) > 0.1 * (fabs(gn) + fabs(gn2)) + 3e-4) { kinks++; continue; } // perturbation crosses a kink
-        double rel = fabs(gn - ga[i]) / fmax(1e-2, fabs(gn) + fabs(ga[i]));
+        /* the closer of the two estimates: a max pooling switch can lie within the larger step
+           and still pass the kink test; a tiny gradient, lost in the loss's rounding at both
+           steps, gets a third, larger one */
+        double rel = fmin(fabs(gn - ga[i]) / fmax(1e-2, fabs(gn) + fabs(ga[i])),
+                          fabs(gn2 - ga[i]) / fmax(1e-2, fabs(gn2) + fabs(ga[i])));
+        if (rel > 3e-2 && fabs(ga[i]) < 1e-2) {
+            float h3 = 1e-2f;
+            *p = orig + h3; double lp3 = dataset_loss(net, x, y, N);
+            *p = orig - h3; double lm3 = dataset_loss(net, x, y, N);
+            *p = orig;
+            double gn3 = (lp3 - lm3) / (2.0 * h3);
+            rel = fmin(rel, fabs(gn3 - ga[i]) / fmax(1e-2, fabs(gn3) + fabs(ga[i])));
+        }
         if (rel > maxrel) maxrel = rel;
         if (rel > 3e-2) bad++;
     }
@@ -150,13 +162,21 @@ static NeuralNetwork *conv_net(int which) {
             max_pool2d(.net = net, .kernel = 3, .stride = 2, .padding = 1);
             conv2d(.net = net, .filters = 2, .kernel = 2, .act_func = ACT_NONE);
             return net;
-        default:    /* dropout-free deep stack: conv after dense input reshaped by a 1x1 view */
+        case 3:     /* dropout-free deep stack: conv after dense input reshaped by a 1x1 view */
             net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
             layer(.net = net, .height = 4, .width = 4, .channels = 3);
             conv2d(.net = net, .filters = 5, .kernel = 2, .act_func = ACT_RELU);
             conv2d(.net = net, .filters = 4, .kernel = 2, .padding = 1, .act_func = ACT_FOO52);
             avg_pool2d(.net = net, .kernel = 4);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_SIGMOID);
+            return net;
+        default:    /* one input channel, more filters than window weights (the weight gradient is
+                       multiplied the other way round), ReLU into max pooling */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 6, .width = 6, .channels = 1);
+            conv2d(.net = net, .filters = 12, .kernel = 3, .padding = 1, .act_func = ACT_RELU);
+            max_pool2d(.net = net, .kernel = 2);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
             return net;
     }
 }
@@ -1998,9 +2018,10 @@ int main(int argc, char **argv) {
             gradcheck("ce wide (AVX tails)", LOSS_CROSS_ENTROPY, e, 4, modes[m], strats[s]);
         }
         static const char *conv_names[] = {"conv same/maxpool/softmax", "conv stride/avgpool/1x1",
-                                           "conv rect/maxpool overlap", "conv deep relu/foo52/gap"};
+                                           "conv rect/maxpool overlap", "conv deep relu/foo52/gap",
+                                           "conv narrow window/relu/maxpool"};
         for (int m = 0; m < 3; m++) for (int s = 0; s < 3; s++)
-            for (int c = 0; c < 4; c++) {
+            for (int c = 0; c < 5; c++) {
                 lcg_state = 1000 + c;
                 gradcheck_net(conv_names[c], conv_net(c), modes[m], strats[s]);
             }

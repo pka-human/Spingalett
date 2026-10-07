@@ -77,7 +77,7 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
         if (!ws->inputs || !ws->targets) goto fail;
     }
 
-    size_t conv_floats = spingalett_conv_scratch_floats(net, capacity, training);
+    size_t conv_floats = spingalett_conv_scratch_floats(net, capacity, training, mode);
     if (conv_floats > 0) {
         ws->conv = (float *)spingalett_aligned_alloc(conv_floats * sizeof(float));
         if (!ws->conv) goto fail;
@@ -108,6 +108,7 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         float *C = ws->act[l];
         bool masked = dropout && ws->dmask[l];
         LayerType type = net->shapes[l].type;
+        bool done = false;          /* bias and activation applied */
 
         if (type == LAYER_DENSE) {
             /* act[l] = act[l-1] * W^T, W stored [curr x prev]; the bias follows per row */
@@ -115,11 +116,14 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
                             ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
                             0.0f, C, curr_size);
         } else if (type == LAYER_CONV2D) {
-            spingalett_conv_forward(net, l - 1, ws->act[l - 1], C, N, ws->conv, ws->gemm, mode);
+            /* the bias, and an element-wise activation, are applied as the product's tiles complete */
+            done = act != ACT_SOFTMAX && !masked;
+            spingalett_conv_forward(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->conv, ws->gemm, mode);
         } else {
             spingalett_pool_forward(net, l - 1, ws->act[l - 1], C, N, mode);
+            done = act == ACT_NONE && !masked;
         }
-        if (type != LAYER_DENSE && act == ACT_NONE && !masked)
+        if (done)
             continue;
 
 #if defined(_OPENMP)

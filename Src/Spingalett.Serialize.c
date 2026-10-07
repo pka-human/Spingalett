@@ -101,6 +101,10 @@ void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precisio
         set_error(SPINGALETT_ERR_INVALID, "save: network must have 2 to 65536 layers");
         return NULL;
     }
+    if (!spingalett_all_dense(net)) {     /* format version 4: next commit */
+        set_error(SPINGALETT_ERR_INVALID, "save: convolution and pooling layers cannot be saved yet");
+        return NULL;
+    }
     if ((unsigned)precision >= PRECISION_COUNT) {
         set_error(SPINGALETT_ERR_INVALID, "save: invalid precision mode");
         return NULL;

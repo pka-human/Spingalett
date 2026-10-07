@@ -78,22 +78,25 @@ void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *ou
 
 /* Convolution and pooling over batches of n channels-last samples (Spingalett.Conv.c); weight
    layer l connects layer l to l + 1. scratch holds spingalett_conv_scratch_floats() floats. */
-size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacity, bool training);
-/* y = conv(x) + bias (before the activation) */
+size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacity, bool training, ComputeMode mode);
+/* y = act(conv(x) + bias), act element-wise (ACT_SOFTMAX is left to the caller, like ACT_NONE) */
 void spingalett_conv_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
-                             float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode);
-/* dx = dL/dx from dy = dL/d(pre-activation of layer l + 1); dx is overwritten */
+                             ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode);
+/* dx = dL/dx * act'(x) from dy = dL/d(pre-activation of layer l + 1), x being layer l's output and
+   act its activation (ACT_NONE: dL/dx itself); dx is overwritten */
 void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const float *dy, float *dx, uint32_t n,
-                                   float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode);
+                                   const float *x, ActivationFunction act, float *scratch,
+                                   SpingalettGemmScratch *gemm, ComputeMode mode);
 /* weight and bias gradients: g = scale * (sum over the batch) + beta * g */
 void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
                                       float scale, float beta, float *scratch, SpingalettGemmScratch *gemm,
                                       ComputeMode mode);
 void spingalett_pool_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ComputeMode mode);
-/* dx = dL/dx from dy = dL/dy (x: the pooling layer's input); dx is overwritten */
+/* dx = dL/dx * act'(x) from dy = dL/dy (x: the pooling layer's input, the output of layer l, whose
+   activation is act); dx is overwritten */
 void spingalett_pool_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
-                              uint32_t n, ComputeMode mode);
+                              uint32_t n, ActivationFunction act, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
 bool spingalett_has_dropout(const NeuralNetwork *net);
@@ -151,27 +154,45 @@ float  spingalett_vec_l2norm(const float *x, uint64_t n);
 /* Native SGEMM (Spingalett.GEMM.c): C = alpha * op(A) * op(B) + beta * C, row-major. The scratch
    holds packing buffers for `threads` threads and may be reused across calls; NULL allocates a
    temporary one. */
+/* A GEMM operand produced on demand instead of read from memory: fill writes rows [row, row + rows)
+   x columns [col, col + cols) of the operand as stored (before op()), rows ld floats apart. */
+typedef struct {
+    void (*fill)(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols, float *dst, size_t ld);
+    const void *ctx;
+} SpingalettGemmSource;
+
+/* Additions to a product: operands given by sources (A or B is then unused), and an epilogue
+   called once on every element of C when its value is final, while the tile is still in cache:
+   with c at C[row][col] for a rows x cols block, rows ldc floats apart (concurrently on disjoint
+   blocks when the product is multi-threaded). */
+typedef struct {
+    const SpingalettGemmSource *a, *b;
+    void (*epilogue)(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols, float *c, size_t ldc);
+    const void *epilogue_ctx;
+} SpingalettGemmHooks;
+
 SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads);
 void spingalett_gemm_scratch_free(SpingalettGemmScratch *scratch);
 void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             const float *A, size_t lda, const float *B, size_t ldb,
                             float beta, float *C, size_t ldc, bool parallel);
+/* The same with hooks (NULL: none). */
+void spingalett_gemm_hooked(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                            uint32_t M, uint32_t N, uint32_t K, float alpha,
+                            const float *A, size_t lda, const float *B, size_t ldb,
+                            float beta, float *C, size_t ldc, bool parallel, const SpingalettGemmHooks *hooks);
 #if defined(SPINGALETT_GEMM_DISPATCH)
 /* The same with one kernel set: the library's baseline flags, AVX2+FMA or AVX-512 (scratch must
    not be NULL; M, N and K must be positive). */
-void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
-                              uint32_t M, uint32_t N, uint32_t K, float alpha,
-                              const float *A, size_t lda, const float *B, size_t ldb,
-                              float beta, float *C, size_t ldc, bool parallel);
-void spingalett_gemm_avx2(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
-                          uint32_t M, uint32_t N, uint32_t K, float alpha,
-                          const float *A, size_t lda, const float *B, size_t ldb,
-                          float beta, float *C, size_t ldc, bool parallel);
-void spingalett_gemm_avx512(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
-                            uint32_t M, uint32_t N, uint32_t K, float alpha,
-                            const float *A, size_t lda, const float *B, size_t ldb,
-                            float beta, float *C, size_t ldc, bool parallel);
+#define SPINGALETT_GEMM_KERNELS(name) \
+    void name(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b, uint32_t M, uint32_t N, uint32_t K, \
+              float alpha, const float *A, size_t lda, const float *B, size_t ldb, \
+              float beta, float *C, size_t ldc, bool parallel, const SpingalettGemmHooks *hooks);
+SPINGALETT_GEMM_KERNELS(spingalett_gemm_baseline)
+SPINGALETT_GEMM_KERNELS(spingalett_gemm_avx2)
+SPINGALETT_GEMM_KERNELS(spingalett_gemm_avx512)
+#undef SPINGALETT_GEMM_KERNELS
 #endif
 
 /* Multiply-adds below which a GEMM runs on one thread. */
