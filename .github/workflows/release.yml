@@ -257,9 +257,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.ref }}
-      - name: Train (2 epochs on pull requests, the full 60 for releases)
+      - name: Train (2 epochs on pull requests, the full 30 for releases)
         run: |
-          epochs=60
+          epochs=30
           [ "${{ needs.version.outputs.publish }}" = true ] || epochs=2
           sh Examples/download_mnist.sh mnist
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=ON -DBUILD_WITH_OPENMP=ON \
