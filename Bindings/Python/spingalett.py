@@ -1388,11 +1388,12 @@ class Model:
             info = _LayerInfo()
             _model_layer(self._ptr, i, ctypes.byref(info))
             out.append(LayerInfo(int(info.inputs), int(info.outputs), Activation(info.activation),
-                                 Precision(info.precision), LayerType(info.type),
-                                 (int(info.height), int(info.width), int(info.channels)),
-                                 (int(info.kernel_h), int(info.kernel_w)), (int(info.stride_h), int(info.stride_w)),
-                                 (int(info.padding_h), int(info.padding_w)),
-                                 (int(info.in_height), int(info.in_width), int(info.in_channels))))
+                                 Precision(info.precision), type=LayerType(info.type),
+                                 shape=(int(info.height), int(info.width), int(info.channels)),
+                                 input_shape=(int(info.in_height), int(info.in_width), int(info.in_channels)),
+                                 kernel=(int(info.kernel_h), int(info.kernel_w)),
+                                 stride=(int(info.stride_h), int(info.stride_w)),
+                                 padding=(int(info.padding_h), int(info.padding_w))))
         return out
 
     def to_bytes(self) -> bytes:

@@ -279,6 +279,95 @@ try:
 except sg.SpingalettError:
     pass
 
+# convolution and pooling: forward against numpy, descriptions, parameters, training, files, models
+def np_conv(x, w, b, stride, pad):           # x (H, W, C), w (F, kh, kw, C), channels last
+    H, W, C = x.shape; F, kh, kw, _ = w.shape
+    xp = np.zeros((H + 2 * pad, W + 2 * pad, C)); xp[pad:pad + H, pad:pad + W] = x
+    oh, ow = (H + 2 * pad - kh) // stride + 1, (W + 2 * pad - kw) // stride + 1
+    out = np.empty((oh, ow, F))
+    for i in range(oh):
+        for j in range(ow):
+            win = xp[i * stride:i * stride + kh, j * stride:j * stride + kw]
+            out[i, j] = np.tensordot(w, win, axes=([1, 2, 3], [0, 1, 2])) + b
+    return out
+
+def np_pool(x, k, stride, pad, op):          # windows clipped to the image: padding is not counted
+    H, W, C = x.shape
+    oh, ow = (H + 2 * pad - k) // stride + 1, (W + 2 * pad - k) // stride + 1
+    out = np.empty((oh, ow, C))
+    for i in range(oh):
+        for j in range(ow):
+            h0, w0 = max(i * stride - pad, 0), max(j * stride - pad, 0)
+            win = x[h0:min(i * stride - pad + k, H), w0:min(j * stride - pad + k, W)]
+            out[i, j] = win.max((0, 1)) if op == "max" else win.mean((0, 1))
+    return out
+
+sg.seed(5)
+cnn = sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Input(8, 7, 2), sg.Conv2D(5, 3, padding=1),
+                                         sg.MaxPool2D(2), sg.Conv2D(4, 2, stride=1, activation=sg.Activation.TANH),
+                                         sg.AvgPool2D(2, stride=1, padding=1), sg.Layer(3, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
+L = cnn.layers
+check(L[0].shape == (8, 7, 2) and L[1].type == sg.LayerType.CONV2D and L[1].shape == (8, 7, 5) and L[1].kernel == (3, 3) and
+      L[2].type == sg.LayerType.MAX_POOL2D and L[2].shape == (4, 3, 5) and L[2].weight_count == 0 and
+      L[3].shape == (3, 2, 4) and L[4].shape == (4, 3, 4) and L[4].padding == (1, 1) and cnn.topology[-1] == 3,
+      f"conv layer descriptions: {L}")
+check(cnn.get_weights(0).shape == (5, 3, 3, 2) and cnn.get_weights(1).shape == (0, 0) and cnn.get_biases(1).shape == (0,) and
+      cnn.get_weights(2).shape == (4, 2, 2, 5) and cnn.get_weights(4).shape == (3, 48), "conv weight shapes")
+w = rng.normal(size=(5, 3, 3, 2)).astype(np.float32); cnn.set_weights(0, w)
+check(np.array_equal(cnn.get_weights(0), w), "conv set/get weights")
+
+def np_cnn(net, x):
+    out = []
+    for s in x:
+        a = s.reshape(8, 7, 2).astype(np.float64)
+        a = np.maximum(np_conv(a, net.get_weights(0), net.get_biases(0), 1, 1), 0)
+        a = np_pool(a, 2, 2, 0, "max")
+        a = np.tanh(np_conv(a, net.get_weights(2), net.get_biases(2), 1, 0))
+        a = np_pool(a, 2, 1, 1, "avg")
+        out.append(ACT[sg.Activation.SOFTMAX](net.get_weights(4).astype(np.float64) @ a.reshape(-1) + net.get_biases(4)))
+    return np.array(out)
+
+xc = rng.normal(size=(6, 8 * 7 * 2)).astype(np.float32)
+for mode in (sg.ComputeMode.SINGLE_THREADED, sg.ComputeMode.OPENMP):
+    sg.set_compute_mode(mode)
+    check(np.allclose(cnn.forward(xc), np_cnn(cnn, xc), atol=1e-5), f"conv forward vs numpy ({mode.name})")
+    check(np.allclose(cnn.forward(xc[2]), np_cnn(cnn, xc[2:3])[0], atol=1e-5), f"conv single-sample forward ({mode.name})")
+sg.set_compute_mode(sg.ComputeMode.SINGLE_THREADED)
+
+# learns vertical against horizontal bars
+def bars(n):
+    xs = np.zeros((n, 8, 7, 2), np.float32); ys = np.zeros((n, 3), np.float32)
+    for i in range(n):
+        k = rng.integers(0, 3)
+        if k == 0: xs[i, rng.integers(0, 8), :, rng.integers(0, 2)] = 1
+        elif k == 1: xs[i, :, rng.integers(0, 7), rng.integers(0, 2)] = 1
+        else: xs[i, rng.integers(0, 7):, rng.integers(0, 6)] = 0.5
+        ys[i, k] = 1
+    return xs.reshape(n, -1), ys
+xb, yb = bars(240)
+cnn.train(xb, yb, epochs=30, optimizer=sg.Optimizer.ADAM, learning_rate=0.01, strategy=sg.Strategy.MINI_BATCH, batch_size=16)
+xt, yt = bars(120)
+acc = cnn.evaluate(xt, yt).accuracy
+check(acc >= 0.9, f"conv network learns bars: accuracy {acc}")
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "cnn.slett")
+    cnn.save(path)
+    data = open(path, "rb").read()
+    check(data[6] == 4, "conv networks are saved as format version 4")
+    with sg.Network.load(path) as back:
+        check(back.layers == cnn.layers and all(np.array_equal(back.get_weights(i), cnn.get_weights(i)) for i in range(5)),
+              "conv save/load round trip")
+    with cnn.to_model(sg.Precision.INT8) as m:
+        info = m.layers
+        check(info[0].type == sg.LayerType.CONV2D and info[0].shape == (8, 7, 5) and info[0].input_shape == (8, 7, 2) and
+              info[1].type == sg.LayerType.MAX_POOL2D and info[1].kernel == (2, 2) and info[4].type == sg.LayerType.DENSE,
+              f"conv model layer info: {info}")
+        p = m.predict(xt)
+        check(np.array_equal(p[5], m(xt[5])), "conv model: batched equals single")
+        check(np.abs(p - cnn.forward(xt)).max() < 0.05 and (p.argmax(1) == cnn.forward(xt).argmax(1)).mean() > 0.95,
+              "INT8 conv model close to the network")
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")
