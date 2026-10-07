@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.6.0 LANGUAGES C)
+project(Spingalett VERSION 0.7.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -394,6 +394,7 @@ if(BUILD_TESTS)
 
     add_executable(SpingalettTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Tests.c)
     target_link_libraries(SpingalettTests PRIVATE spingalett)
+    target_include_directories(SpingalettTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         # the deployment tests recompute the engine's arithmetic and compare it bit for bit
         target_compile_options(SpingalettTests PRIVATE -ffp-contract=off)
@@ -431,7 +432,7 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
-    foreach(group grad equiv cont optim sched dropout gen predict valid step data io model xor)
+    foreach(group grad conv equiv cont optim sched dropout gen predict valid step data io model xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

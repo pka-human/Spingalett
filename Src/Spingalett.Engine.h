@@ -4,9 +4,9 @@
 */
 
 /* Internals of the inference engine (Spingalett.Inference.c) shared with the rest of the library:
-   the .slett format version 3 layout (docs/ModelFormat.md), CRC-32, half and bfloat16 conversion,
-   and the kernels batched inference reuses so that it computes exactly what spingalett_model_run
-   computes. */
+   the .slett format version 3 and 4 layout (docs/ModelFormat.md), CRC-32, half and bfloat16
+   conversion, and the kernels batched inference reuses so that it computes exactly what
+   spingalett_model_run computes. */
 
 #pragma once
 
@@ -15,7 +15,9 @@
 
 #define SLETT_MAGIC              "SLETTM"
 #define SLETT_HEADER_SIZE        64u
-#define SLETT_LAYER_ENTRY_SIZE   48u
+#define SLETT_LAYER_ENTRY_SIZE   48u          /* version 3 */
+#define SLETT_LAYER_ENTRY_SIZE_4 64u          /* version 4: shapes and windows added */
+#define SLETT_MAX_EXTENT         65535u       /* largest height, width, kernel, stride or padding */
 #define SLETT_SECTION_ALIGN      16u          /* every section starts at a multiple of this */
 #define SLETT_FLAG_OPTIMIZER     0x01u
 #define SLETT_MAX_LAYERS         65536u
@@ -32,9 +34,14 @@ typedef struct {
     PrecisionMode precision;
     float dropout;
     uint64_t weights, scales, biases, optimizer;    /* section offsets; scales and optimizer may be 0 */
+    LayerType type;                                 /* LAYER_DENSE in version 3 */
+    uint32_t in_h, in_w, in_c, out_h, out_w, out_c; /* 1 x 1 x units around dense layers */
+    uint32_t kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w;
+    uint32_t rows, row_len;                         /* the weight matrix: 0 x 0 for pooling */
 } SlettLayer;
 
 typedef struct {
+    uint32_t version;           /* 3 or 4 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -42,6 +49,7 @@ typedef struct {
     uint64_t size;              /* file size recorded in the header */
     uint32_t max_width;         /* widest hidden layer (0 without hidden layers) */
     uint32_t max_int_inputs;    /* widest input of an integer layer (0 without integer layers) */
+    uint64_t conv_scratch;      /* bytes of scratch the largest convolution needs (slett_conv_scratch) */
 } SlettInfo;
 
 /* Little-endian field access (format 3 is little-endian; the engine refuses big-endian hosts). */
@@ -58,10 +66,17 @@ bool spingalett_host_is_little_endian(void);
 /* Bytes of one stored weight row of `inputs` values. */
 uint64_t spingalett_slett_row_bytes(PrecisionMode precision, uint32_t inputs);
 
-/* Validates a format 3 image (no alignment requirement: fields are read with memcpy). */
+/* Validates a format 3 or 4 image (no alignment requirement: fields are read with memcpy). */
 int spingalett_slett_validate(const uint8_t *image, size_t size, SlettInfo *info);
-/* Entry `index` (0-based) of the layer table of a validated image. */
+/* Entry `index` (0-based) of the layer table of a validated image, with its input shape. */
 void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *layer);
+
+/* A convolution or pooling layer's output extent along one axis: windows of `kernel` cells,
+   `stride` apart, over `size` cells padded by `pad` on both sides (0 when none fits). */
+static inline uint32_t slett_window_count(uint32_t size, uint32_t kernel, uint32_t stride, uint32_t pad) {
+    uint64_t padded = (uint64_t)size + 2u * pad;
+    return kernel == 0 || stride == 0 || padded < kernel ? 0u : (uint32_t)((padded - kernel) / stride + 1u);
+}
 
 /* CRC-32 (IEEE, as zlib): crc = spingalett_crc32(0, data, n), or chained over several blocks. */
 uint32_t spingalett_crc32(uint32_t crc, const void *data, size_t n);
@@ -82,6 +97,37 @@ float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q);
 int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n);
 /* acc[r] = dot of row r (rows `stride` bytes apart) with x, for r = 0..3. */
 void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n, int32_t acc[4]);
+
+/* Convolutions with windows shorter than this run filter-major: their filters are transposed into
+   the workspace (columns), and each output pixel accumulates all filters at once, reading its
+   window straight from the input; longer windows are gathered and dotted with each filter row. */
+#define SLETT_COLUMN_WINDOW 32u
+
+static inline bool slett_conv_columns(const SlettLayer *L) {
+    return L->type == LAYER_CONV2D && L->row_len < SLETT_COLUMN_WINDOW;
+}
+
+/* Bytes of engine scratch convolution L needs: its transposed filters and one pixel's sums, or a
+   gathered window (0 for other layers). */
+static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
+    if (L->type != LAYER_CONV2D) return 0;
+    if (!slett_conv_columns(L)) return (uint64_t)L->row_len * 4u;
+    uint64_t elem = spingalett_precision_is_int(L->precision) ? 1u : 4u;
+    return slett_align((uint64_t)L->row_len * L->rows * elem) + (uint64_t)L->rows * 4u;
+}
+
+/* The filters of convolution L transposed, wt[k * rows + j] = weight k of filter j: the stored
+   codes as bytes for integer precisions, floats otherwise. */
+void spingalett_conv_transpose_filters(const uint8_t *image, const SlettLayer *L, void *wt);
+/* The integer sums of output pixel (oh, ow) of convolution L with transposed filters wt, from its
+   quantized input xq (one sum per filter). */
+void spingalett_conv_columns_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
+                                int32_t *acc);
+
+/* Copies the window of output pixel (oh, ow) of convolution L from its input x, elem bytes per value
+   (floats or quantized bytes): kernel_h runs of kernel_w x channels values, zeros where the window
+   leaves the input. */
+void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, void *window, size_t elem);
 
 /* y[j] = bias[j] + scale[j] * x_scale * acc[j], the output of an integer layer before activation. */
 static inline float spingalett_int_output(float bias, float row_scale, float x_scale, int32_t acc) {

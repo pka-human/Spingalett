@@ -21,11 +21,20 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->dmask_flat);
     spingalett_aligned_free(ws->inputs);
     spingalett_aligned_free(ws->targets);
+    spingalett_aligned_free(ws->conv);
     spingalett_gemm_scratch_free(ws->gemm);
     free(ws->act);
     free(ws->delta);
     free(ws->dmask);
     free(ws);
+}
+
+uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count) {
+    uint64_t per_sample = net->total_neurons ? net->total_neurons : 1u;
+    uint64_t cap = SPINGALETT_BATCH_FLOATS / per_sample;
+    if (cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
+    if (cap < 1) cap = 1;
+    return count < cap ? count : (uint32_t)cap;
 }
 
 BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint32_t capacity,
@@ -76,6 +85,12 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
         if (!ws->inputs || !ws->targets) goto fail;
     }
 
+    size_t conv_floats = spingalett_conv_scratch_floats(net, capacity, training, mode);
+    if (conv_floats > 0) {
+        ws->conv = (float *)spingalett_aligned_alloc(conv_floats * sizeof(float));
+        if (!ws->conv) goto fail;
+    }
+
     if (mode != COMPUTE_OPENBLAS) {
         int threads = 1;
 #if defined(_OPENMP)
@@ -100,18 +115,36 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         ActivationFunction act = net->act_func[l - 1];
         float *C = ws->act[l];
         bool masked = dropout && ws->dmask[l];
+        LayerType type = net->shapes[l].type;
+        bool done = false;          /* bias and activation applied */
 
-        /* act[l] = act[l-1] * W^T, W stored [curr x prev] */
-        spingalett_gemm(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f,
-                        ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
-                        0.0f, C, curr_size);
+        if (type == LAYER_DENSE) {
+            /* act[l] = act[l-1] * W^T, W stored [curr x prev]; the bias and an element-wise
+               activation follow as the product's tiles complete */
+            done = act != ACT_SOFTMAX && !masked;
+            SpingalettBiasActivation epilogue = {bias, act};
+            SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
+            spingalett_gemm_ex(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f,
+                               ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
+                               0.0f, C, curr_size, done ? &hooks : NULL);
+        } else if (type == LAYER_CONV2D) {
+            /* the bias, and an element-wise activation, are applied as the product's tiles complete */
+            done = act != ACT_SOFTMAX && !masked;
+            spingalett_conv_forward(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->conv, ws->gemm, mode);
+        } else {
+            spingalett_pool_forward(net, l - 1, ws->act[l - 1], C, N, mode);
+            done = act == ACT_NONE && !masked;
+        }
+        if (done)
+            continue;
 
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * curr_size))
 #endif
         for (int64_t s = 0; s < (int64_t)N; s++) {
             float *row = C + (size_t)s * curr_size;
-            spingalett_vec_axpy(row, bias, curr_size, 1.0f);
+            if (type == LAYER_DENSE)
+                spingalett_vec_axpy(row, bias, curr_size, 1.0f);
             apply_activation_batch(row, curr_size, act);
             if (masked)
                 spingalett_dropout_apply(row, ws->dmask[l] + (size_t)s * curr_size, curr_size, act,
@@ -134,7 +167,7 @@ bool predict_struct_arguments(PredictArgs args) {
         return true;
 
     ComputeMode mode = resolve_compute_mode();
-    uint32_t capacity = args.sample_count < SPINGALETT_BATCH_CHUNK ? args.sample_count : SPINGALETT_BATCH_CHUNK;
+    uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
     if (!ws) {
         set_error(SPINGALETT_ERR_ALLOC, "predict: workspace allocation failed");
@@ -199,7 +232,7 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
     }
 
     ComputeMode mode = resolve_compute_mode();
-    uint32_t capacity = args.sample_count < SPINGALETT_BATCH_CHUNK ? args.sample_count : SPINGALETT_BATCH_CHUNK;
+    uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
     float *out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
     if (ws && out) {

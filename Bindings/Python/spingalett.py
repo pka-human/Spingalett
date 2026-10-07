@@ -34,15 +34,16 @@ import os
 import sys
 from ctypes import (CFUNCTYPE, POINTER, Structure, c_bool, c_char_p, c_float, c_int,
                     c_size_t, c_uint32, c_uint64, c_void_p)
-from typing import Callable, Iterable, List, Optional, Sequence, Union
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
+    "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "LayerDescription",
     "Model", "LayerInfo",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
@@ -108,6 +109,13 @@ class Precision(enum.IntEnum):
     INT2 = 5
 
 
+class LayerType(enum.IntEnum):
+    DENSE = 0
+    CONV2D = 1
+    MAX_POOL2D = 2
+    AVG_POOL2D = 3
+
+
 class AutoSave(enum.IntEnum):
     OFF = 0
     OVERWRITE = 1
@@ -163,33 +171,27 @@ _MODE_GENERATOR = 1
 # --------------------------------------------------------------------------- C structs
 # Field order and types must match Spingalett.h exactly (enums are C ints).
 
-class _NeuralNetwork(Structure):
+_NetPtr = c_void_p      # NeuralNetwork is opaque
+
+
+class _NetworkLayer(Structure):
     _fields_ = [
-        ("layers", c_uint32),
-        ("topology", POINTER(c_uint32)),
-        ("act_func", POINTER(c_int)),
-        ("weights", POINTER(c_float)),
-        ("biases", POINTER(c_float)),
-        ("neurons", POINTER(c_float)),
-        ("grad_weights", POINTER(c_float)),
-        ("grad_biases", POINTER(c_float)),
-        ("opt_m_weights", POINTER(c_float)),
-        ("opt_m_biases", POINTER(c_float)),
-        ("opt_v_weights", POINTER(c_float)),
-        ("opt_v_biases", POINTER(c_float)),
-        ("neuron_offsets", POINTER(c_uint64)),
-        ("weight_offsets", POINTER(c_uint64)),
-        ("bias_offsets", POINTER(c_uint64)),
-        ("total_neurons", c_uint64),
-        ("total_weights", c_uint64),
-        ("total_biases", c_uint64),
-        ("time_step", c_uint64),
-        ("loss_func", c_int),
-        ("dropout_rates", POINTER(c_float)),
+        ("type", c_int),
+        ("height", c_uint32),
+        ("width", c_uint32),
+        ("channels", c_uint32),
+        ("outputs", c_uint32),
+        ("activation", c_int),
+        ("dropout_rate", c_float),
+        ("kernel_h", c_uint32),
+        ("kernel_w", c_uint32),
+        ("stride_h", c_uint32),
+        ("stride_w", c_uint32),
+        ("padding_h", c_uint32),
+        ("padding_w", c_uint32),
+        ("weight_count", c_uint64),
+        ("bias_count", c_uint64),
     ]
-
-
-_NetPtr = POINTER(_NeuralNetwork)
 
 
 class _EvalMetrics(Structure):
@@ -242,6 +244,20 @@ class _LayerArgs(Structure):
         ("act_func", c_int),
         ("weight_initialization", c_int),
         ("dropout_rate", c_float),
+        ("type", c_int),
+        ("height", c_uint32),
+        ("width", c_uint32),
+        ("channels", c_uint32),
+        ("filters", c_uint32),
+        ("kernel", c_uint32),
+        ("stride", c_uint32),
+        ("padding", c_uint32),
+        ("kernel_h", c_uint32),
+        ("kernel_w", c_uint32),
+        ("stride_h", c_uint32),
+        ("stride_w", c_uint32),
+        ("padding_h", c_uint32),
+        ("padding_w", c_uint32),
     ]
 
 
@@ -370,6 +386,8 @@ class _Model(Structure):
         ("image", c_void_p),
         ("image_size", c_size_t),
         ("max_width_", c_uint32),
+        ("max_int_inputs_", c_uint32),
+        ("conv_scratch_", c_size_t),
         ("owner_", c_void_p),
     ]
 
@@ -379,10 +397,23 @@ _ModelPtr = POINTER(_Model)
 
 class _LayerInfo(Structure):
     _fields_ = [
+        ("type", c_int),
         ("inputs", c_uint32),
         ("outputs", c_uint32),
         ("activation", c_int),
         ("precision", c_int),
+        ("in_height", c_uint32),
+        ("in_width", c_uint32),
+        ("in_channels", c_uint32),
+        ("height", c_uint32),
+        ("width", c_uint32),
+        ("channels", c_uint32),
+        ("kernel_h", c_uint32),
+        ("kernel_w", c_uint32),
+        ("stride_h", c_uint32),
+        ("stride_w", c_uint32),
+        ("padding_h", c_uint32),
+        ("padding_w", c_uint32),
     ]
 
 
@@ -456,6 +487,14 @@ def _bind(name, restype, argtypes):
 
 _new = _bind("new_spingalett_struct_arguments", _NetPtr, [_NeuralNetworkArgs])
 _layer = _bind("layer_struct_arguments", None, [_LayerArgs])
+_layer_count = _bind("spingalett_layer_count", c_uint32, [_NetPtr])
+_network_layer = _bind("spingalett_network_layer", c_bool, [_NetPtr, c_uint32, POINTER(_NetworkLayer)])
+_parameter_count = _bind("spingalett_parameter_count", c_uint64, [_NetPtr])
+_network_loss = _bind("spingalett_network_loss", c_int, [_NetPtr])
+_optimizer_steps = _bind("spingalett_optimizer_steps", c_uint64, [_NetPtr])
+_get_parameters = _bind("spingalett_get_parameters", c_bool, [_NetPtr, c_uint32, c_int, POINTER(c_float), c_uint64])
+_set_parameters = _bind("spingalett_set_parameters", c_bool, [_NetPtr, c_uint32, c_int, POINTER(c_float), c_uint64])
+_PARAM_WEIGHTS, _PARAM_BIASES, _PARAM_WEIGHT_GRADIENTS, _PARAM_BIAS_GRADIENTS = 0, 1, 2, 3
 _forward = _bind("forward_struct_arguments", POINTER(c_float), [_ForwardArgs])
 _predict = _bind("predict_struct_arguments", c_bool, [_PredictArgs])
 _train = _bind("train_struct_arguments", _TrainReport, [_TrainArgs])
@@ -663,11 +702,62 @@ class _NativeGenerator:
 
 @dataclasses.dataclass
 class Layer:
-    """Layer description. Activation, init and dropout are ignored for the input layer."""
+    """Dense layer description. Activation, init and dropout are ignored for the input layer."""
     neurons: int
     activation: Activation = Activation.SIGMOID
     init: Init = Init.RANDOM
     dropout: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Input:
+    """Input layer holding samples of shape (height, width, channels), channels last."""
+    height: int
+    width: int
+    channels: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Conv2D:
+    """2D convolution with ``filters`` output channels over ``kernel`` x ``kernel`` windows."""
+    filters: int
+    kernel: int
+    stride: int = 1
+    padding: int = 0
+    activation: Activation = Activation.RELU
+    init: Init = Init.HE
+    dropout: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class MaxPool2D:
+    """Maximum over ``kernel`` x ``kernel`` windows (stride: the kernel size by default)."""
+    kernel: int
+    stride: int = 0
+    padding: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class AvgPool2D:
+    """Mean over ``kernel`` x ``kernel`` windows (padded cells not counted)."""
+    kernel: int
+    stride: int = 0
+    padding: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class LayerDescription:
+    """Layer ``index`` of a :class:`Network` (0 is the input layer)."""
+    type: LayerType
+    shape: Tuple[int, int, int]     # (height, width, channels); a dense layer is (1, 1, outputs)
+    outputs: int
+    activation: Activation
+    dropout: float
+    kernel: Tuple[int, int]
+    stride: Tuple[int, int]
+    padding: Tuple[int, int]
+    weight_count: int
+    bias_count: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -766,6 +856,15 @@ class Network:
         for spec in layers or ():
             if isinstance(spec, Layer):
                 self.add_layer(spec.neurons, spec.activation, spec.init, spec.dropout)
+            elif isinstance(spec, Input):
+                self.add_input(spec.height, spec.width, spec.channels)
+            elif isinstance(spec, Conv2D):
+                self.add_conv2d(spec.filters, spec.kernel, spec.stride, spec.padding, spec.activation, spec.init,
+                                spec.dropout)
+            elif isinstance(spec, MaxPool2D):
+                self.add_max_pool2d(spec.kernel, spec.stride, spec.padding)
+            elif isinstance(spec, AvgPool2D):
+                self.add_avg_pool2d(spec.kernel, spec.stride, spec.padding)
             else:
                 self.add_layer(int(spec))
 
@@ -803,37 +902,75 @@ class Network:
             pass
 
     @property
-    def _net(self) -> _NeuralNetwork:
+    def _net(self):
+        """The C handle; raises once the network is closed."""
         if not getattr(self, "_ptr", None):
             raise ValueError("network is closed")
-        return self._ptr.contents
+        return self._ptr
 
     # ---- structure
+    def _add(self, **fields) -> "Network":
+        _call(_layer, _LayerArgs(net=self._net, **fields))
+        return self
+
     def add_layer(self, neurons: int, activation: Activation = Activation.SIGMOID,
                   init: Init = Init.RANDOM, dropout: float = 0.0) -> "Network":
-        """Append a layer; the first layer added is the input layer."""
-        self._net  # raise if closed
-        _call(_layer, _LayerArgs(self._ptr, int(neurons), int(activation), int(init), float(dropout)))
-        return self
+        """Append a dense layer; the first layer added is the input layer."""
+        return self._add(neurons_amount=int(neurons), act_func=int(activation), weight_initialization=int(init),
+                         dropout_rate=float(dropout))
+
+    def add_input(self, height: int, width: int, channels: int = 1) -> "Network":
+        """Make the input layer take samples of shape (height, width, channels), channels last."""
+        return self._add(height=int(height), width=int(width), channels=int(channels))
+
+    def add_conv2d(self, filters: int, kernel: int, stride: int = 1, padding: int = 0,
+                   activation: Activation = Activation.RELU, init: Init = Init.HE, dropout: float = 0.0) -> "Network":
+        """Append a 2D convolution: ``filters`` output channels, ``kernel`` x ``kernel`` windows,
+        ``padding`` zeros on each side (kernel // 2 keeps the size of odd kernels at stride 1)."""
+        return self._add(type=int(LayerType.CONV2D), filters=int(filters), kernel=int(kernel), stride=int(stride),
+                         padding=int(padding), act_func=int(activation), weight_initialization=int(init),
+                         dropout_rate=float(dropout))
+
+    def add_max_pool2d(self, kernel: int, stride: int = 0, padding: int = 0) -> "Network":
+        """Append max pooling over ``kernel`` x ``kernel`` windows (stride 0 = the kernel size)."""
+        return self._add(type=int(LayerType.MAX_POOL2D), kernel=int(kernel), stride=int(stride), padding=int(padding))
+
+    def add_avg_pool2d(self, kernel: int, stride: int = 0, padding: int = 0) -> "Network":
+        """Append average pooling over ``kernel`` x ``kernel`` windows (stride 0 = the kernel size)."""
+        return self._add(type=int(LayerType.AVG_POOL2D), kernel=int(kernel), stride=int(stride), padding=int(padding))
+
+    def layer(self, index: int) -> LayerDescription:
+        """Layer ``index`` (0 is the input layer)."""
+        info = _NetworkLayer()
+        count = _layer_count(self._net)
+        if not -count <= index < count:
+            raise IndexError(f"layer index {index} out of range for {count} layers")
+        _network_layer(self._ptr, index % count, ctypes.byref(info))
+        return LayerDescription(LayerType(info.type), (info.height, info.width, info.channels), int(info.outputs),
+                                Activation(info.activation), float(info.dropout_rate), (info.kernel_h, info.kernel_w),
+                                (info.stride_h, info.stride_w), (info.padding_h, info.padding_w),
+                                int(info.weight_count), int(info.bias_count))
+
+    @property
+    def layers(self) -> List[LayerDescription]:
+        return [self.layer(i) for i in range(_layer_count(self._net))]
 
     @property
     def topology(self) -> List[int]:
-        n = self._net
-        return [n.topology[i] for i in range(n.layers)]
+        """Outputs of every layer (height x width x channels)."""
+        return [layer.outputs for layer in self.layers]
 
     @property
     def activations(self) -> List[Activation]:
-        n = self._net
-        return [Activation(n.act_func[i]) for i in range(max(n.layers - 1, 0))]
+        return [layer.activation for layer in self.layers[1:]]
 
     @property
     def dropout_rates(self) -> List[float]:
-        n = self._net
-        return [n.dropout_rates[i] for i in range(n.layers)]
+        return [layer.dropout for layer in self.layers]
 
     @property
     def loss(self) -> Loss:
-        return Loss(self._net.loss_func)
+        return Loss(_network_loss(self._net))
 
     @property
     def input_size(self) -> int:
@@ -845,48 +982,53 @@ class Network:
 
     @property
     def num_parameters(self) -> int:
-        n = self._net
-        return int(n.total_weights + n.total_biases)
+        return int(_parameter_count(self._net))
 
     @property
     def time_step(self) -> int:
         """Optimizer steps taken so far (drives Adam's bias correction)."""
-        return int(self._net.time_step)
+        return int(_optimizer_steps(self._net))
 
-    def _check_connection(self, index: int) -> int:
-        count = self._net.layers - 1
+    def _connection(self, index: int):
+        """(layer fed by weight set ``index``, its description, weight shape)."""
+        count = _layer_count(self._net) - 1
         if not -count <= index < count:
-            raise IndexError(f"connection index {index} out of range for {count} weight matrices")
-        return index % count
+            raise IndexError(f"connection index {index} out of range for {count} weight sets")
+        i = index % count + 1
+        info = self.layer(i)
+        if info.type == LayerType.CONV2D:
+            shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(i - 1).shape[2])
+        else:
+            shape = (info.bias_count, info.weight_count // info.bias_count if info.bias_count else 0)
+        return i, info, shape
+
+    def _get(self, index: int, kind: int, weights: bool) -> np.ndarray:
+        i, info, shape = self._connection(index)
+        out = np.empty(shape if weights else (info.bias_count,), dtype=np.float32)
+        if out.size:
+            _call(_get_parameters, self._ptr, i, kind, _float_ptr(out), out.size)
+        return out
+
+    def _set(self, index: int, kind: int, weights: bool, values) -> None:
+        i, info, shape = self._connection(index)
+        arr = np.ascontiguousarray(values, dtype=np.float32).reshape(shape if weights else (info.bias_count,))
+        if arr.size:
+            _call(_set_parameters, self._ptr, i, kind, _float_ptr(arr), arr.size)
 
     def get_weights(self, index: int) -> np.ndarray:
-        """Copy of weight matrix ``index`` (layer index -> index + 1), shape (out, in)."""
-        i = self._check_connection(index)
-        n = self._net
-        rows, cols = n.topology[i + 1], n.topology[i]
-        base = ctypes.addressof(n.weights.contents) + n.weight_offsets[i] * 4
-        return np.ctypeslib.as_array((c_float * (rows * cols)).from_address(base)).reshape(rows, cols).copy()
+        """Copy of the weights feeding layer ``index + 1``: shape (outputs, inputs) for a dense layer,
+        (filters, kernel_h, kernel_w, input channels) for a convolution, empty for pooling."""
+        return self._get(index, _PARAM_WEIGHTS, True)
 
     def set_weights(self, index: int, values) -> None:
-        i = self._check_connection(index)
-        n = self._net
-        rows, cols = n.topology[i + 1], n.topology[i]
-        arr = np.ascontiguousarray(values, dtype=np.float32).reshape(rows, cols)
-        ctypes.memmove(ctypes.addressof(n.weights.contents) + n.weight_offsets[i] * 4, arr.ctypes.data, arr.nbytes)
+        self._set(index, _PARAM_WEIGHTS, True, values)
 
     def get_biases(self, index: int) -> np.ndarray:
-        """Copy of the biases of layer ``index + 1``."""
-        i = self._check_connection(index)
-        n = self._net
-        size = n.topology[i + 1]
-        base = ctypes.addressof(n.biases.contents) + n.bias_offsets[i] * 4
-        return np.ctypeslib.as_array((c_float * size).from_address(base)).copy()
+        """Copy of the biases of layer ``index + 1`` (one per output or filter)."""
+        return self._get(index, _PARAM_BIASES, False)
 
     def set_biases(self, index: int, values) -> None:
-        i = self._check_connection(index)
-        n = self._net
-        arr = np.ascontiguousarray(values, dtype=np.float32).reshape(n.topology[i + 1])
-        ctypes.memmove(ctypes.addressof(n.biases.contents) + n.bias_offsets[i] * 4, arr.ctypes.data, arr.nbytes)
+        self._set(index, _PARAM_BIASES, False, values)
 
     # ---- inference
     def forward(self, inputs) -> np.ndarray:
@@ -924,18 +1066,11 @@ class Network:
         return x, y
 
     def get_weight_gradients(self, index: int) -> np.ndarray:
-        """Copy of the accumulated gradient of weight matrix ``index`` (see :class:`Trainer`)."""
-        i = self._check_connection(index)
-        n = self._net
-        rows, cols = n.topology[i + 1], n.topology[i]
-        base = ctypes.addressof(n.grad_weights.contents) + n.weight_offsets[i] * 4
-        return np.ctypeslib.as_array((c_float * (rows * cols)).from_address(base)).reshape(rows, cols).copy()
+        """Copy of the accumulated gradient of weight set ``index`` (see :class:`Trainer`)."""
+        return self._get(index, _PARAM_WEIGHT_GRADIENTS, True)
 
     def get_bias_gradients(self, index: int) -> np.ndarray:
-        i = self._check_connection(index)
-        n = self._net
-        base = ctypes.addressof(n.grad_biases.contents) + n.bias_offsets[i] * 4
-        return np.ctypeslib.as_array((c_float * n.topology[i + 1]).from_address(base)).copy()
+        return self._get(index, _PARAM_BIAS_GRADIENTS, False)
 
     # ---- training
     def train(self, inputs, targets, config: Optional[TrainConfig] = None, validation_data=None,
@@ -1156,11 +1291,17 @@ class Network:
 
 @dataclasses.dataclass(frozen=True)
 class LayerInfo:
-    """One weight layer of a :class:`Model`."""
+    """One layer of a :class:`Model` (the input layer is not counted)."""
     inputs: int
     outputs: int
     activation: Activation
     precision: Precision
+    type: LayerType = LayerType.DENSE
+    shape: Tuple[int, int, int] = (1, 1, 0)     # output (height, width, channels)
+    input_shape: Tuple[int, int, int] = (1, 1, 0)
+    kernel: Tuple[int, int] = (0, 0)
+    stride: Tuple[int, int] = (0, 0)
+    padding: Tuple[int, int] = (0, 0)
 
 
 class Model:
@@ -1246,11 +1387,17 @@ class Model:
         for i in range(self._model.layer_count):
             info = _LayerInfo()
             _model_layer(self._ptr, i, ctypes.byref(info))
-            out.append(LayerInfo(int(info.inputs), int(info.outputs), Activation(info.activation), Precision(info.precision)))
+            out.append(LayerInfo(int(info.inputs), int(info.outputs), Activation(info.activation),
+                                 Precision(info.precision), type=LayerType(info.type),
+                                 shape=(int(info.height), int(info.width), int(info.channels)),
+                                 input_shape=(int(info.in_height), int(info.in_width), int(info.in_channels)),
+                                 kernel=(int(info.kernel_h), int(info.kernel_w)),
+                                 stride=(int(info.stride_h), int(info.stride_w)),
+                                 padding=(int(info.padding_h), int(info.padding_w))))
         return out
 
     def to_bytes(self) -> bytes:
-        """The model image: a .slett file (format version 3)."""
+        """The model image: a .slett file (format version 3, or 4 with convolution or pooling layers)."""
         m = self._model
         return ctypes.string_at(m.image, m.image_size)
 

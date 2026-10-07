@@ -14,7 +14,12 @@
  * and then the network as a deployment model in every precision: the latency of one sample with
  * spingalett_model_run (against forward()) and the throughput of spingalett_model_predict.
  *
- * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workload in PyTorch.
+ * Then a convolutional network, Examples/MNIST_CNN.c's (28 x 28 x 1 -> conv 32 3x3 ReLU -> max pool
+ * -> conv 64 3x3 ReLU -> max pool -> dense 128 ReLU, dropout 0.3 -> dense 10 softmax), on 10,000
+ * synthetic images: one epoch of mini-batches of 128 with AdamW (lr 1e-3, weight decay 1e-4), and
+ * inference.
+ *
+ * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
 
 #include <Spingalett/Spingalett.h>
@@ -97,6 +102,41 @@ static double inference_throughput(const float *inputs) {
     return SAMPLES / elapsed;
 }
 
+#define CNN_SAMPLES 10000
+#define CNN_BATCH   128
+
+static NeuralNetwork *create_cnn(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 28, .width = 28, .channels = 1);
+    conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    max_pool2d(.net = net, .kernel = 2);
+    conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    max_pool2d(.net = net, .kernel = 2);
+    layer(.net = net, .neurons_amount = 128, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE,
+          .dropout_rate = 0.3f);
+    layer(.net = net, .neurons_amount = 10, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+    return net;
+}
+
+static void cnn_benchmark(const char *name, ComputeMode mode, const float *images, const float *labels) {
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *net = create_cnn();
+    double start = now();
+    train(.net = net, .inputs = images, .targets = labels, .sample_count = CNN_SAMPLES, .epochs = 1,
+          .learning_rate = 1e-3f, .weight_decay = 1e-4f, .optimizer_type = OPTIMIZER_ADAMW,
+          .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = CNN_BATCH);
+    double trained = now() - start;
+    float *outputs = (float *)malloc((size_t)CNN_SAMPLES * OUTPUT_SIZE * sizeof(float));
+    start = now();
+    predict(.net = net, .inputs = images, .sample_count = CNN_SAMPLES, .outputs = outputs);
+    double inferred = now() - start;
+    printf("%-16s %14.0f %14.0f\n", name, CNN_SAMPLES / trained, CNN_SAMPLES / inferred);
+    free(outputs);
+    free_network(net);
+}
+
 static void run_benchmark(const char *name, ComputeMode mode, const float *inputs, const float *targets) {
     spingalett_set_compute_mode(mode);
     double full = train_throughput(inputs, targets, STRATEGY_FULL_BATCH, EPOCHS);
@@ -172,7 +212,7 @@ int main(int argc, char **argv) {
     NeuralNetwork *probe = create_network();
     printf("Spingalett %s (%s kernels): %d-%d-%d-%d (%" PRIu64 " parameters), %d samples, threads: ",
            spingalett_version(), spingalett_cpu_kernels(), INPUT_SIZE, HIDDEN_1, HIDDEN_2, OUTPUT_SIZE,
-           probe->total_weights + probe->total_biases, SAMPLES);
+           spingalett_parameter_count(probe), SAMPLES);
     free_network(probe);
     if (spingalett_get_num_threads() > 0) printf("%u\n\n", spingalett_get_num_threads());
     else printf("runtime default\n\n");
@@ -187,6 +227,30 @@ int main(int argc, char **argv) {
 #endif
     deployment_benchmark(inputs);
 
+    /* the convolutional network: random images, one-hot labels */
+    float *images = (float *)malloc((size_t)CNN_SAMPLES * INPUT_SIZE * sizeof(float));
+    float *labels = (float *)calloc((size_t)CNN_SAMPLES * OUTPUT_SIZE, sizeof(float));
+    if (!images || !labels) {
+        fprintf(stderr, "Allocation failed\n");
+        return 1;
+    }
+    for (size_t i = 0; i < (size_t)CNN_SAMPLES * INPUT_SIZE; i++) images[i] = (float)rand() / (float)RAND_MAX;
+    for (size_t s = 0; s < CNN_SAMPLES; s++) labels[s * OUTPUT_SIZE + (size_t)rand() % OUTPUT_SIZE] = 1.0f;
+    NeuralNetwork *cnn = create_cnn();
+    printf("\nconvolutional network (Examples/MNIST_CNN.c), %" PRIu64 " parameters, %d images\n",
+           spingalett_parameter_count(cnn), CNN_SAMPLES);
+    free_network(cnn);
+    printf("%-16s %14s %14s\n", "samples/s", "training", "inference");
+    cnn_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, images, labels);
+#if defined(SPINGALETT_HAS_OPENMP)
+    cnn_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
+#endif
+#if defined(SPINGALETT_HAS_OPENBLAS)
+    cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, images, labels);
+#endif
+
+    free(images);
+    free(labels);
     free(inputs);
     free(targets);
     return 0;

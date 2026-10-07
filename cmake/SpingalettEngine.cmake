@@ -25,7 +25,8 @@ function(spingalett_engine_tests engine exporter)
     endif()
     if(exporter AND NOT CMAKE_CROSSCOMPILING)
         set(dir ${CMAKE_CURRENT_BINARY_DIR}/test_headers)
-        set(headers ${dir}/test_model_int8.h ${dir}/test_model_int4.h ${dir}/test_model_fp16.h ${dir}/test_model_expected.h)
+        set(headers ${dir}/test_model_int8.h ${dir}/test_model_int4.h ${dir}/test_model_fp16.h
+                    ${dir}/test_model_conv_int8.h ${dir}/test_model_conv_f32.h ${dir}/test_model_expected.h)
         add_custom_command(OUTPUT ${headers}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${dir}
             COMMAND ${exporter} export-headers ${dir}

@@ -38,9 +38,21 @@ int main(void) {
     for (uint32_t i = 0; i < model.layer_count; i++) {
         SpingalettLayerInfo layer;
         spingalett_model_layer(&model, i, &layer);
-        printf("  layer %u: %u -> %u, %s weights\n", (unsigned)i + 1, (unsigned)layer.inputs,
-               (unsigned)layer.outputs, precision_name(layer.precision));
-        macs += (unsigned long)layer.inputs * layer.outputs;
+        if (layer.type == LAYER_DENSE) {
+            printf("  layer %u: dense %u -> %u, %s weights\n", (unsigned)i + 1, (unsigned)layer.inputs,
+                   (unsigned)layer.outputs, precision_name(layer.precision));
+            macs += (unsigned long)layer.inputs * layer.outputs;
+        } else if (layer.type == LAYER_CONV2D) {
+            /* each output: a window of kernel_h x kernel_w x input channels */
+            macs += (unsigned long)layer.outputs * layer.kernel_h * layer.kernel_w * layer.in_channels;
+            printf("  layer %u: convolution %ux%u, %u filters, output %ux%u, %s weights\n", (unsigned)i + 1,
+                   (unsigned)layer.kernel_h, (unsigned)layer.kernel_w, (unsigned)layer.channels,
+                   (unsigned)layer.height, (unsigned)layer.width, precision_name(layer.precision));
+        } else {
+            printf("  layer %u: %s pooling %ux%u, output %ux%ux%u\n", (unsigned)i + 1,
+                   layer.type == LAYER_MAX_POOL2D ? "max" : "average", (unsigned)layer.kernel_h, (unsigned)layer.kernel_w,
+                   (unsigned)layer.height, (unsigned)layer.width, (unsigned)layer.channels);
+        }
     }
     printf("%lu multiply-accumulates per digit\n", macs);
 

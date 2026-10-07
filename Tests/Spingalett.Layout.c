@@ -14,21 +14,22 @@
 #define FIELD(T, f) printf("%s.%s %zu\n", #T, #f, offsetof(T, f))
 
 int main(void) {
-    SIZE(NeuralNetwork);
-    FIELD(NeuralNetwork, layers); FIELD(NeuralNetwork, topology); FIELD(NeuralNetwork, act_func);
-    FIELD(NeuralNetwork, weights); FIELD(NeuralNetwork, biases); FIELD(NeuralNetwork, neurons);
-    FIELD(NeuralNetwork, grad_weights); FIELD(NeuralNetwork, grad_biases);
-    FIELD(NeuralNetwork, opt_m_weights); FIELD(NeuralNetwork, opt_m_biases);
-    FIELD(NeuralNetwork, opt_v_weights); FIELD(NeuralNetwork, opt_v_biases);
-    FIELD(NeuralNetwork, neuron_offsets); FIELD(NeuralNetwork, weight_offsets); FIELD(NeuralNetwork, bias_offsets);
-    FIELD(NeuralNetwork, total_neurons); FIELD(NeuralNetwork, total_weights); FIELD(NeuralNetwork, total_biases);
-    FIELD(NeuralNetwork, time_step); FIELD(NeuralNetwork, loss_func); FIELD(NeuralNetwork, dropout_rates);
-
     SIZE(NeuralNetworkArgs); FIELD(NeuralNetworkArgs, loss_func);
 
     SIZE(LayerArgs);
     FIELD(LayerArgs, net); FIELD(LayerArgs, neurons_amount); FIELD(LayerArgs, act_func);
-    FIELD(LayerArgs, weight_initialization); FIELD(LayerArgs, dropout_rate);
+    FIELD(LayerArgs, weight_initialization); FIELD(LayerArgs, dropout_rate); FIELD(LayerArgs, type);
+    FIELD(LayerArgs, height); FIELD(LayerArgs, width); FIELD(LayerArgs, channels); FIELD(LayerArgs, filters);
+    FIELD(LayerArgs, kernel); FIELD(LayerArgs, stride); FIELD(LayerArgs, padding);
+    FIELD(LayerArgs, kernel_h); FIELD(LayerArgs, kernel_w); FIELD(LayerArgs, stride_h); FIELD(LayerArgs, stride_w);
+    FIELD(LayerArgs, padding_h); FIELD(LayerArgs, padding_w);
+
+    SIZE(SpingalettNetworkLayer);
+    FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
+    FIELD(SpingalettNetworkLayer, channels); FIELD(SpingalettNetworkLayer, outputs); FIELD(SpingalettNetworkLayer, activation);
+    FIELD(SpingalettNetworkLayer, dropout_rate); FIELD(SpingalettNetworkLayer, kernel_h); FIELD(SpingalettNetworkLayer, kernel_w);
+    FIELD(SpingalettNetworkLayer, stride_h); FIELD(SpingalettNetworkLayer, stride_w); FIELD(SpingalettNetworkLayer, padding_h);
+    FIELD(SpingalettNetworkLayer, padding_w); FIELD(SpingalettNetworkLayer, weight_count); FIELD(SpingalettNetworkLayer, bias_count);
 
     SIZE(ForwardArgs); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
@@ -91,11 +92,16 @@ int main(void) {
     SIZE(SpingalettModel);
     FIELD(SpingalettModel, input_size); FIELD(SpingalettModel, output_size); FIELD(SpingalettModel, layer_count);
     FIELD(SpingalettModel, loss); FIELD(SpingalettModel, workspace_size); FIELD(SpingalettModel, image);
-    FIELD(SpingalettModel, image_size); FIELD(SpingalettModel, max_width_); FIELD(SpingalettModel, owner_);
+    FIELD(SpingalettModel, image_size); FIELD(SpingalettModel, max_width_); FIELD(SpingalettModel, max_int_inputs_);
+    FIELD(SpingalettModel, conv_scratch_); FIELD(SpingalettModel, owner_);
 
     SIZE(SpingalettLayerInfo);
-    FIELD(SpingalettLayerInfo, inputs); FIELD(SpingalettLayerInfo, outputs);
+    FIELD(SpingalettLayerInfo, type); FIELD(SpingalettLayerInfo, inputs); FIELD(SpingalettLayerInfo, outputs);
     FIELD(SpingalettLayerInfo, activation); FIELD(SpingalettLayerInfo, precision);
+    FIELD(SpingalettLayerInfo, in_height); FIELD(SpingalettLayerInfo, in_width); FIELD(SpingalettLayerInfo, in_channels);
+    FIELD(SpingalettLayerInfo, height); FIELD(SpingalettLayerInfo, width); FIELD(SpingalettLayerInfo, channels);
+    FIELD(SpingalettLayerInfo, kernel_h); FIELD(SpingalettLayerInfo, kernel_w); FIELD(SpingalettLayerInfo, stride_h);
+    FIELD(SpingalettLayerInfo, stride_w); FIELD(SpingalettLayerInfo, padding_h); FIELD(SpingalettLayerInfo, padding_w);
 
     SIZE(LRScheduleParams);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);

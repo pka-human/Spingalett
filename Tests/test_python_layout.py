@@ -9,7 +9,7 @@ import sys
 import spingalett as sg
 
 MIRRORS = {
-    "NeuralNetwork": sg._NeuralNetwork, "NeuralNetworkArgs": sg._NeuralNetworkArgs,
+    "NeuralNetworkArgs": sg._NeuralNetworkArgs, "SpingalettNetworkLayer": sg._NetworkLayer,
     "LayerArgs": sg._LayerArgs, "ForwardArgs": sg._ForwardArgs, "TrainArgs": sg._TrainArgs,
     "SaveArgs": sg._SaveArgs, "LRScheduleParams": sg._LRScheduleParams, "PredictArgs": sg._PredictArgs,
     "EvalMetrics": sg._EvalMetrics, "TrainProgress": sg._TrainProgress, "TrainReport": sg._TrainReport,

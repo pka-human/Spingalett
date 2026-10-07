@@ -45,6 +45,18 @@ with sg.Network(sg.Loss.CROSS_ENTROPY, [784, sg.Layer(128, sg.Activation.RELU, s
                        early_stopping_patience=3, restore_best_weights=True)
     print(result.status.name, result.best_epoch, net.evaluate(x_train[55000:], y_train[55000:]))
 
+# a convolutional network: images as rows of height x width x channels floats (channels last)
+cnn = sg.Network(sg.Loss.CROSS_ENTROPY, [
+    sg.Input(28, 28, 1),
+    sg.Conv2D(32, 3, padding=1), sg.MaxPool2D(2),             # ReLU and He initialization by default
+    sg.Conv2D(64, 3, padding=1), sg.MaxPool2D(2),
+    sg.Layer(128, sg.Activation.RELU, sg.Init.HE, dropout=0.3),
+    sg.Layer(10, sg.Activation.SOFTMAX, sg.Init.XAVIER),
+])
+cnn.train(x_train[:55000], y_train[:55000], epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=128,
+          optimizer=sg.Optimizer.ADAMW, learning_rate=1e-3)
+print([(l.type.name, l.shape) for l in cnn.layers], cnn.get_weights(0).shape)   # filters x 3 x 3 x 1
+
 with sg.Network.load("xor.slett") as net:
     print(net.topology, net.forward([1, 0]))
     # deployment: a read-only INT8 model with integer kernels, and a C header for firmware
@@ -55,7 +67,9 @@ with sg.Network.load("xor.slett") as net:
 
 | API | Notes |
 |---|---|
-| `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer |
+| `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer; `layers` may mix `Layer`, `Input`, `Conv2D`, `MaxPool2D`, `AvgPool2D` and plain widths |
+| `add_input(h, w, c)`, `add_conv2d(filters, kernel, stride=1, padding=0, activation=RELU, init=HE, dropout=0)`, `add_max_pool2d(kernel, stride=0, padding=0)`, `add_avg_pool2d(...)` | convolution and pooling over channels-last tensors; pooling's stride defaults to the kernel size |
+| `layers`, `layer(i)`, `topology` | `LayerDescription(type, shape, outputs, activation, dropout, kernel, stride, padding, weight_count, bias_count)` per layer |
 | `forward(x)` | 1-D input -> vector, 2-D batch -> matrix (one batched `predict()` call; results are copies) |
 | `train(x, y, config=None, validation_data=None, **overrides)` | fields of `TrainConfig` (e.g. `epochs`, `strategy`, `batch_size`, `shuffle`, `early_stopping_patience`, `restore_best_weights`); returns a `TrainResult`; `callback(network, progress)` gets a `Progress`; exceptions raised in callbacks stop training and are re-raised |
 | `train_from_generator(fn, samples_per_epoch=0, validation_data=None, ...)` | `fn(inputs, targets)` fills the given arrays and returns the number of rows; 0 ends the epoch |
@@ -65,13 +79,13 @@ with sg.Network.load("xor.slett") as net:
 | `save_dataset(path, x, y, input_encoding=AUTO, target_encoding=AUTO, compress=True)`, `load_dataset(path)`, `dataset_info(path)` | `.slettd` data set files |
 | `train_from_file(path, shuffle=True, ...)` | trains on a `.slettd` file streamed by the C reader, one chunk in memory |
 | `CosineDecay`, `LinearWarmup`, `StepDecay`, `WarmupCosine` | built-in schedules; any `fn(epoch, total, initial_lr)` works too |
-| `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weight matrix `i` connects layer `i` to `i + 1`, shape `(out, in)` |
+| `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weights `i` feed layer `i + 1`: shape `(out, in)` for a dense layer, `(filters, kernel_h, kernel_w, in_channels)` for a convolution, empty for pooling |
 | `save(path, precision, save_optimizer)`, `Network.load(path)` | `.slett` files, shared with the C API |
 | `to_bytes(precision, save_optimizer=False)`, `Network.from_bytes(data)` | the same files as `bytes` |
 | `to_model(precision=INT8)` | a `Model`: read-only, computes in its precision (integer kernels for INT8, INT4, INT2) |
 | `Model.load(path)`, `Model.from_bytes(data)`, `model.to_bytes()` | models from and to `.slett` files of any version |
 | `model.predict(x)` / `model(x)`, `model.evaluate(x, y)` | 1-D input -> vector, 2-D batch -> matrix; `Metrics(loss, accuracy)` |
-| `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision)` per layer; image and C workspace bytes |
+| `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding)` per layer; image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
 | `cpu_kernels()`, `library_version()`, `library_path()` | the matrix kernels in use (`"AVX-512"`, `"AVX2"`, ...), the loaded library |
