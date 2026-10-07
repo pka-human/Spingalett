@@ -47,7 +47,8 @@ augmentation and a CIFAR-10 example.
 - `SPINGALETT_FORMAT_VERSION` is 5. `LayerArgs`, `TrainArgs`, `SpingalettNetworkLayer` and
   `SpingalettLayerInfo` gained fields, and `ParameterKind` gained two values: rebuild programs
   against the new headers.
-- DigitPad's model is a batch-normalized convolutional network.
+- DigitPad's model is a batch-normalized convolutional network: 99.58% MNIST test accuracy and
+  99.45% on randomly distorted digits (the MLP: 99.27% and 98.44%).
 
 ## [0.7.0] - 2026-10-07
 

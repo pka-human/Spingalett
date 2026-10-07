@@ -6,9 +6,12 @@ classifies it while you draw. It shows the predicted digit, the probability of e
 
 ![DigitPad recognizing a hand-drawn 3](screenshot.png)
 
-The model is a 784-1024-512-10 MLP (ReLU, dropout 0.25, softmax) trained with AdamW and a
-warm-up cosine schedule. It reaches **99.27%** accuracy on the MNIST test set and 98.44% on a
-randomly distorted copy of it.
+The model is a convolutional network with batch normalization: two stages of two 3x3
+convolutions (32, then 64 filters), each followed by batch normalization and ReLU, with 2x2 max
+pooling after each stage, then a dense layer of 128 units (batch normalization, ReLU, dropout 0.3)
+and a softmax output; 468K parameters, trained with AdamW and a warm-up cosine schedule. It
+reaches **99.58%** accuracy on the MNIST test set and 99.45% on a randomly distorted copy of it
+(the 784-1024-512-10 MLP of earlier releases: 99.27% and 98.44%).
 
 Every [release](https://github.com/pka-human/Spingalett/releases) has a ready-to-run build for
 Linux and one for Windows.
@@ -74,9 +77,9 @@ images.
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=ON -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 
-# train a model: about 2.5 minutes for 60 epochs with OpenMP on a 4-core machine
+# train a model: about 19 minutes for 30 epochs with OpenMP on a 4-core machine
 sh Examples/download_mnist.sh data/mnist
-Bin/DigitPadTrain data/mnist mnist.slett 60
+Bin/DigitPadTrain data/mnist mnist.slett 30
 
 Bin/DigitPad mnist.slett
 ```

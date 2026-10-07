@@ -627,22 +627,30 @@ dot-product instructions (AVX-512 VNNI; AVX-VNNI, as in Intel Core processors si
 generation; the Arm dot product extension, as in Apple silicon, Cortex-A76 and later, and AWS
 Graviton 2 and later): integer convolutions (with one group) and dense layers run in tiles of 12
 pixels or samples against weight rows interleaved for those instructions, every weight read once
-for the tile. The release packages carry these kernels and choose them at run time. On the
-CIFAR-10 network below, an INT8 model predicts 2.5 times as fast as the FP32 one.
+for the tile. The release packages carry these kernels and choose them at run time (see
+[Performance](#performance) for what they gain).
 
-Accuracy on the 10,000 MNIST test images (`ModelTool eval`):
+Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
+(`spingalett_model_evaluate()`):
 
 | Network | FP32 | FP16 | INT8 | INT4 | INT2 |
 |---|---:|---:|---:|---:|---:|
 | 784-256-128-10, `Examples/MNIST.c` (5 epochs) | 97.86% | 97.86% | 97.87% | 97.71% | 95.15% |
 | Model size | 941 KB | 471 KB | 238 KB | 121 KB | 62 KB |
-| 784-1024-512-10, DigitPad | 99.27% | 99.27% | 99.27% | 99.32% | 79.93% |
 | CNN of `Examples/MNIST_CNN.c` (2 epochs) | 98.89% | 98.89% | 98.89% | 98.75% | 97.74% |
 | Model size | 1.69 MB | 844 KB | 424 KB | 213 KB | 108 KB |
+| DigitPad's CNN with batch normalization (30 epochs) | 99.58% | 99.58% | 99.56% | 99.51% | 96.76% |
+| Model size | 1.88 MB | 937 KB | 471 KB | 237 KB | 120 KB |
+| CIFAR-10 network of `Examples/CIFAR10.c` (20 epochs) | 87.79% | 87.79% | 87.82% | 84.87% | 14% |
+| Model size | 2.21 MB | 1.10 MB | 555 KB | 280 KB | 143 KB |
 
-INT8 and INT4 keep the accuracy of these networks; INT2 (ternary weights without
-quantization-aware training) suits small layers. One sample through the 784-512-1000-10 benchmark
-network on one thread (`Bin/Benchmark`, Intel Xeon @ 2.80 GHz):
+INT8 keeps the accuracy of these networks and INT4 nearly so; INT2 (ternary weights without
+quantization-aware training) suits small layers. Normalizations are folded into the layer before
+them and cost nothing at inference: the deployed CIFAR-10 network has 11 layers where the trained
+one has 18.
+
+One sample through the 784-512-1000-10 benchmark network on one thread (`Bin/Benchmark`, Intel
+Xeon @ 2.80 GHz):
 
 | | `forward()` | FP32 model | FP16 | BF16 | INT8 | INT4 | INT2 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -732,8 +740,9 @@ See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
 ## DigitPad demo
 
 [Apps/DigitPad](Apps/DigitPad) is a desktop app in which you draw a digit with the mouse and a
-Spingalett network classifies it as you draw. Its 784-1024-512-10 model, trained with on-the-fly
-augmentation through a data generator, reaches 99.27% MNIST test accuracy. The directory contains
+Spingalett network classifies it as you draw. Its convolutional network with batch normalization,
+trained with on-the-fly augmentation through a data generator, reaches 99.58% MNIST test accuracy
+(99.45% on randomly distorted test digits). The directory contains
 the app, the trainer and scripts that package the app and the model as a self-contained Linux
 AppImage and as a Windows zip; every release attaches both.
 
