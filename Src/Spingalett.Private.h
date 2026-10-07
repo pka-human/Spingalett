@@ -50,7 +50,7 @@ typedef struct {
 typedef struct SpingalettGemmScratch SpingalettGemmScratch;
 
 /* Activations (and, when training, deltas and dropout masks) for up to `capacity` samples. */
-typedef struct {
+typedef struct BatchWorkspace {
     float **act;            /* act[0]: inputs of the chunk; act[l]: [capacity x topology[l]] */
     float **delta;          /* training only: delta[l] for l >= 1 */
     float **dmask;          /* training only: dropout mask * f'(a) per hidden layer with dropout */
@@ -59,6 +59,7 @@ typedef struct {
     float *inputs;          /* gather buffers for shuffled mini-batches, or NULL */
     float *targets;
     SpingalettGemmScratch *gemm;
+    float *conv;            /* convolution windows (spingalett_conv_scratch_floats), or NULL */
     uint32_t capacity;
 } BatchWorkspace;
 
@@ -74,6 +75,25 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
 void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
                                const float *inputs, const float *targets, uint32_t n, ComputeMode mode,
                                double *loss_sum, uint32_t *correct);
+
+/* Convolution and pooling over batches of n channels-last samples (Spingalett.Conv.c); weight
+   layer l connects layer l to l + 1. scratch holds spingalett_conv_scratch_floats() floats. */
+size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacity, bool training);
+/* y = conv(x) + bias (before the activation) */
+void spingalett_conv_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                             float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode);
+/* dx = dL/dx from dy = dL/d(pre-activation of layer l + 1); dx is overwritten */
+void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const float *dy, float *dx, uint32_t n,
+                                   float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode);
+/* weight and bias gradients: g = scale * (sum over the batch) + beta * g */
+void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
+                                      float scale, float beta, float *scratch, SpingalettGemmScratch *gemm,
+                                      ComputeMode mode);
+void spingalett_pool_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                             ComputeMode mode);
+/* dx = dL/dx from dy = dL/dy (x: the pooling layer's input); dx is overwritten */
+void spingalett_pool_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
+                              uint32_t n, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
 bool spingalett_has_dropout(const NeuralNetwork *net);

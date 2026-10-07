@@ -21,6 +21,7 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->dmask_flat);
     spingalett_aligned_free(ws->inputs);
     spingalett_aligned_free(ws->targets);
+    spingalett_aligned_free(ws->conv);
     spingalett_gemm_scratch_free(ws->gemm);
     free(ws->act);
     free(ws->delta);
@@ -76,6 +77,12 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
         if (!ws->inputs || !ws->targets) goto fail;
     }
 
+    size_t conv_floats = spingalett_conv_scratch_floats(net, capacity, training);
+    if (conv_floats > 0) {
+        ws->conv = (float *)spingalett_aligned_alloc(conv_floats * sizeof(float));
+        if (!ws->conv) goto fail;
+    }
+
     if (mode != COMPUTE_OPENBLAS) {
         int threads = 1;
 #if defined(_OPENMP)
@@ -100,18 +107,28 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         ActivationFunction act = net->act_func[l - 1];
         float *C = ws->act[l];
         bool masked = dropout && ws->dmask[l];
+        LayerType type = net->shapes[l].type;
 
-        /* act[l] = act[l-1] * W^T, W stored [curr x prev] */
-        spingalett_gemm(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f,
-                        ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
-                        0.0f, C, curr_size);
+        if (type == LAYER_DENSE) {
+            /* act[l] = act[l-1] * W^T, W stored [curr x prev]; the bias follows per row */
+            spingalett_gemm(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f,
+                            ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
+                            0.0f, C, curr_size);
+        } else if (type == LAYER_CONV2D) {
+            spingalett_conv_forward(net, l - 1, ws->act[l - 1], C, N, ws->conv, ws->gemm, mode);
+        } else {
+            spingalett_pool_forward(net, l - 1, ws->act[l - 1], C, N, mode);
+        }
+        if (type != LAYER_DENSE && act == ACT_NONE && !masked)
+            continue;
 
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * curr_size))
 #endif
         for (int64_t s = 0; s < (int64_t)N; s++) {
             float *row = C + (size_t)s * curr_size;
-            spingalett_vec_axpy(row, bias, curr_size, 1.0f);
+            if (type == LAYER_DENSE)
+                spingalett_vec_axpy(row, bias, curr_size, 1.0f);
             apply_activation_batch(row, curr_size, act);
             if (masked)
                 spingalett_dropout_apply(row, ws->dmask[l] + (size_t)s * curr_size, curr_size, act,

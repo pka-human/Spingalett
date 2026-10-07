@@ -128,6 +128,8 @@ bool spingalett_add_layer(LayerArgs args) {
     uint32_t neurons_amount;
     if (!layer_shape(net, &args, &shape, &neurons_amount))
         return false;
+    spingalett_batch_workspace_free(net->forward_ws);     /* made for the old layers */
+    net->forward_ws = NULL;
     bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D;
     if (pooling) act_func = ACT_NONE;
     static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d"};
@@ -454,7 +456,28 @@ float *forward_struct_arguments(ForwardArgs args) {
         return NULL;
     }
 
-    return spingalett_forward_pass(net, input, resolve_compute_mode(), NULL);
+    ComputeMode mode = resolve_compute_mode();
+    if (spingalett_all_dense(net))
+        return spingalett_forward_pass(net, input, mode, NULL);
+
+    /* one sample through the batch kernels; the output lands in the network's output slot */
+    if (net->forward_ws && net->forward_mode != mode) {
+        spingalett_batch_workspace_free(net->forward_ws);
+        net->forward_ws = NULL;
+    }
+    if (!net->forward_ws) {
+        net->forward_ws = spingalett_batch_workspace_create(net, 1, false, false, mode);
+        net->forward_mode = mode;
+        if (!net->forward_ws) {
+            set_error(SPINGALETT_ERR_ALLOC, "forward: workspace allocation failed");
+            return NULL;
+        }
+    }
+    BatchWorkspace *ws = net->forward_ws;
+    ws->act[0] = (float *)input;                                        /* read only */
+    ws->act[net->layers - 1] = SPINGALETT_LAYER_PTR(net, net->layers - 1);
+    spingalett_batch_forward(net, ws, 1, NULL, 0, mode);
+    return ws->act[net->layers - 1];
 }
 
 void print_parameters(const NeuralNetwork *net) {
@@ -485,6 +508,7 @@ void print_parameters(const NeuralNetwork *net) {
 
 void free_network(NeuralNetwork *net) {
     if (!net) return;
+    spingalett_batch_workspace_free(net->forward_ws);
     spingalett_aligned_free(net->neurons);
     spingalett_aligned_free(net->weights);
     spingalett_aligned_free(net->biases);

@@ -258,10 +258,19 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
         uint32_t cur_sz  = net->topology[l];
         uint32_t next_sz = net->topology[l + 1];
 
-        /* delta[l] = delta[l+1] * W, W stored [next x cur] */
-        spingalett_gemm(ws->gemm, mode, false, false, N, cur_sz, next_sz, 1.0f,
-                        ws->delta[l + 1], next_sz, SPINGALETT_WEIGHT_MTX_PTR(net, l), cur_sz,
-                        0.0f, ws->delta[l], cur_sz);
+        switch (net->shapes[l + 1].type) {
+            case LAYER_DENSE:       /* delta[l] = delta[l+1] * W, W stored [next x cur] */
+                spingalett_gemm(ws->gemm, mode, false, false, N, cur_sz, next_sz, 1.0f,
+                                ws->delta[l + 1], next_sz, SPINGALETT_WEIGHT_MTX_PTR(net, l), cur_sz,
+                                0.0f, ws->delta[l], cur_sz);
+                break;
+            case LAYER_CONV2D:
+                spingalett_conv_backward_data(net, l, ws->delta[l + 1], ws->delta[l], N, ws->conv, ws->gemm, mode);
+                break;
+            default:                /* pooling has no activation: delta[l+1] is dL/d(its output) */
+                spingalett_pool_backward(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, mode);
+                break;
+        }
 
         ActivationFunction act = net->act_func[l - 1];
 #if defined(_OPENMP)
@@ -285,24 +294,33 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         uint32_t in_sz  = net->topology[l];
         uint32_t out_sz = net->topology[l + 1];
+        LayerType type = net->shapes[l + 1].type;
 
-        /* gW[out x in] = delta^T[out x N] * act[N x in] */
-        spingalett_gemm(ws->gemm, mode, true, false, out_sz, in_sz, N, scale,
-                        ws->delta[l + 1], out_sz, ws->act[l], in_sz,
-                        beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
+        if (type == LAYER_DENSE) {
+            /* gW[out x in] = delta^T[out x N] * act[N x in] */
+            spingalett_gemm(ws->gemm, mode, true, false, out_sz, in_sz, N, scale,
+                            ws->delta[l + 1], out_sz, ws->act[l], in_sz,
+                            beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
 
-        float *gB = net->grad_biases + net->bias_offsets[l];
-        if (beta == 0.0f)
-            memset(gB, 0, out_sz * sizeof(float));
-        for (uint32_t s = 0; s < N; s++)
-            spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
+            float *gB = net->grad_biases + net->bias_offsets[l];
+            if (beta == 0.0f)
+                memset(gB, 0, out_sz * sizeof(float));
+            for (uint32_t s = 0; s < N; s++)
+                spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
+        } else if (type == LAYER_CONV2D) {
+            spingalett_conv_backward_weights(net, l, ws->act[l], ws->delta[l + 1], N, scale, beta, ws->conv,
+                                             ws->gemm, mode);
+        } else {
+            continue;               /* pooling has no parameters */
+        }
 
         if (o) {
             uint64_t w = net->weight_offsets[l], b = net->bias_offsets[l];
+            uint64_t rows = spingalett_weight_rows(net, l);
             optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
-                                   net->grad_weights + w, (uint64_t)out_sz * in_sz, o->decay, mode);
+                                   net->grad_weights + w, rows * spingalett_weight_row_len(net, l), o->decay, mode);
             optimizer_update_array(o, net->biases + b, net->opt_m_biases + b, net->opt_v_biases + b,
-                                   net->grad_biases + b, out_sz, 0.0f, mode);
+                                   net->grad_biases + b, rows, 0.0f, mode);
         }
     }
 }
@@ -674,6 +692,12 @@ TrainReport train_struct_arguments(TrainArgs args) {
     if (!check_trainable(net))
         return (TrainReport){.status = TRAIN_FAILED};
 
+    /* Per-sample training of networks with convolution or pooling layers runs as mini-batches of
+       one sample: the same steps, through the batch kernels. */
+    if (training_strategy == STRATEGY_SAMPLE && !spingalett_all_dense(net)) {
+        training_strategy = STRATEGY_SMALL_BATCH;
+        args.batch_size = 1;
+    }
     if (training_strategy == STRATEGY_SMALL_BATCH && args.batch_size == 0)
         args.batch_size = 32;
     if (training_strategy == STRATEGY_SMALL_BATCH && sample_count > 0 && args.batch_size > sample_count)

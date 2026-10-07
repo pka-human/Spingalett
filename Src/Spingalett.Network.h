@@ -51,6 +51,11 @@ struct NeuralNetwork {
     LossFunction loss_func;
 
     float *dropout_rates;           /* per layer, applied to its outputs while training */
+
+    /* forward() of networks with convolution or pooling layers runs the batch kernels on one
+       sample, in this workspace (made on first use, for the compute mode it was made for) */
+    struct BatchWorkspace *forward_ws;
+    ComputeMode forward_mode;
 };
 
 /* Weight layer l as a matrix: rows (dense outputs, conv filters) of row_len weights (dense inputs,

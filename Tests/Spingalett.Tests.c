@@ -78,12 +78,12 @@ static void make_data(uint32_t N, uint32_t in, uint32_t out, LossFunction loss, 
 }
 
 // One full-batch SGD step with lr=1 => analytic grad = W_before - W_after.
-static void gradcheck(const char *name, LossFunction loss, const L *ls, int nl, ComputeMode mode, TrainingStrategy strat) {
-    uint32_t N = strat == STRATEGY_SAMPLE ? 1 : 6; lcg_state = 777;
+static void gradcheck_net(const char *name, NeuralNetwork *net, ComputeMode mode, TrainingStrategy strat) {
+    uint32_t N = strat == STRATEGY_SAMPLE ? 1 : 6;
+    uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
     float *x, *y;
-    make_data(N, ls[0].n, ls[nl - 1].n, loss, ls[nl - 1].act, &x, &y);
+    make_data(N, in, out, net->loss_func, net->act_func[net->layers - 2], &x, &y);
     spingalett_set_compute_mode(mode);
-    NeuralNetwork *net = build(loss, ls, nl, NULL, NULL);
     for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = frand() * 1.2f - 0.6f;
     for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() * 0.2f - 0.1f;
     uint64_t nw = net->total_weights, nb = net->total_biases;
@@ -118,8 +118,170 @@ static void gradcheck(const char *name, LossFunction loss, const L *ls, int nl, 
     free_network(net);
 }
 
+static void gradcheck(const char *name, LossFunction loss, const L *ls, int nl, ComputeMode mode, TrainingStrategy strat) {
+    lcg_state = 777;
+    gradcheck_net(name, build(loss, ls, nl, NULL, NULL), mode, strat);
+}
+
+/* Convolutional networks for the gradient checks: every window option of conv2d and pooling. */
+static NeuralNetwork *conv_net(int which) {
+    NeuralNetwork *net;
+    switch (which) {
+        case 0:     /* same-size 3x3 conv, max pool, dense softmax (cross-entropy) */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 6, .width = 6, .channels = 2);
+            conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_TANH);
+            max_pool2d(.net = net, .kernel = 2);
+            layer(.net = net, .neurons_amount = 4, .act_func = ACT_SOFTMAX);
+            return net;
+        case 1:     /* strided conv, overlapping padded average pool, pointwise conv, dense (MSE) */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 7, .width = 5, .channels = 3);
+            conv2d(.net = net, .filters = 4, .kernel = 3, .stride = 2, .act_func = ACT_TANH);
+            avg_pool2d(.net = net, .kernel = 2, .stride = 1, .padding = 1);
+            conv2d(.net = net, .filters = 2, .kernel = 1, .act_func = ACT_SIGMOID);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_NONE);
+            return net;
+        case 2:     /* rectangular windows and strides, overlapping max pool, conv output layer */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 5, .width = 8, .channels = 2);
+            conv2d(.net = net, .filters = 3, .kernel_h = 2, .kernel_w = 3, .stride_w = 2, .padding_w = 1,
+                   .act_func = ACT_LEAKY_RELU);
+            max_pool2d(.net = net, .kernel = 3, .stride = 2, .padding = 1);
+            conv2d(.net = net, .filters = 2, .kernel = 2, .act_func = ACT_NONE);
+            return net;
+        default:    /* dropout-free deep stack: conv after dense input reshaped by a 1x1 view */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 4, .width = 4, .channels = 3);
+            conv2d(.net = net, .filters = 5, .kernel = 2, .act_func = ACT_RELU);
+            conv2d(.net = net, .filters = 4, .kernel = 2, .padding = 1, .act_func = ACT_FOO52);
+            avg_pool2d(.net = net, .kernel = 4);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SIGMOID);
+            return net;
+    }
+}
+
 static float max_abs_diff(const float *a, const float *b, uint64_t n) {
     float m = 0; for (uint64_t i = 0; i < n; i++) { float d = fabsf(a[i] - b[i]); if (d > m) m = d; } return m;
+}
+
+/* Batches whose gathered windows exceed one chunk (2^21 floats) must compute what single samples
+   compute: outputs, and gradients summed over the batch. */
+static void conv_chunks(ComputeMode mode) {
+    lcg_state = 4711;
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 48, .width = 48, .channels = 8);
+    conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    conv2d(.net = net, .filters = 16, .kernel = 3, .stride = 2, .act_func = ACT_TANH, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    max_pool2d(.net = net, .kernel = 2);
+    layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+    const uint32_t N = 16, in = net->topology[0], out = 5;
+    float *x, *y;
+    make_data(N, in, out, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    float *batch = malloc((size_t)N * out * 4), *single = malloc((size_t)N * out * 4);
+    predict(.net = net, .inputs = x, .sample_count = N, .outputs = batch);
+    for (uint32_t s = 0; s < N; s++) memcpy(single + s * out, forward(.net = net, .input = x + (size_t)s * in), out * 4);
+    float dout = max_abs_diff(batch, single, (size_t)N * out);
+
+    uint64_t nw = net->total_weights, nb = net->total_biases;
+    float *g_batch = malloc((nw + nb) * 4);
+    SpingalettTrainer *t = spingalett_trainer_new(net, N);
+    spingalett_trainer_forward(t, x, N);
+    spingalett_trainer_backward(t, y);
+    memcpy(g_batch, net->grad_weights, nw * 4); memcpy(g_batch + nw, net->grad_biases, nb * 4);
+    spingalett_trainer_free(t);
+    t = spingalett_trainer_new(net, 1);
+    for (uint32_t s = 0; s < N; s++) {
+        spingalett_trainer_forward(t, x + (size_t)s * in, 1);
+        spingalett_trainer_backward(t, y + (size_t)s * out);
+    }
+    double worst = 0, scale = 0;
+    for (uint64_t i = 0; i < nw + nb; i++) {
+        float g = i < nw ? net->grad_weights[i] : net->grad_biases[i - nw];
+        if (fabs(g_batch[i]) > scale) scale = fabs(g_batch[i]);
+        if (fabs(g - g_batch[i]) > worst) worst = fabs(g - g_batch[i]);
+    }
+    spingalett_trainer_free(t);
+    printf("  conv chunks mode=%d: |batch - single| outputs %.2e, gradients %.2e (largest %.2e)\n", mode, dout, worst, scale);
+    CHECK(dout < 1e-5f && worst < 1e-4 * scale, "conv chunks mode %d: outputs %.2e gradients %.2e", mode, dout, worst);
+    free(batch); free(single); free(g_batch); free(x); free(y);
+    free_network(net);
+}
+
+/* Layer arguments that cannot be built are refused, leaving the network as it was. */
+static void conv_api(void) {
+    spingalett_set_verbose(false);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    conv2d(.net = net, .filters = 2, .kernel = 3);
+    CHECK(spingalett_layer_count(net) == 0 && spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "conv input layer must be refused");
+    layer(.net = net, .height = 5, .width = 4, .channels = 3, .neurons_amount = 61);
+    CHECK(spingalett_layer_count(net) == 0, "input size disagreeing with the shape must be refused");
+    layer(.net = net, .height = 5, .width = 4, .channels = 3);
+    CHECK(spingalett_layer_count(net) == 1 && spingalett_input_size(net) == 60, "image input layer");
+    struct { LayerArgs a; const char *what; } bad[] = {
+        {{.type = LAYER_CONV2D, .filters = 2}, "conv without kernel"},
+        {{.type = LAYER_CONV2D, .kernel = 3}, "conv without filters"},
+        {{.type = LAYER_CONV2D, .filters = 2, .kernel = 3, .padding = 3}, "padding >= kernel"},
+        {{.type = LAYER_CONV2D, .filters = 2, .kernel = 6}, "kernel larger than the input"},
+        {{.type = LAYER_MAX_POOL2D, .kernel = 5, .padding = 5}, "pool padding >= kernel"},
+        {{.type = (LayerType)9, .neurons_amount = 3}, "unknown layer type"},
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        bad[i].a.net = net;
+        layer_struct_arguments(bad[i].a);
+        CHECK(spingalett_layer_count(net) == 1 && spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "%s must be refused", bad[i].what);
+    }
+    conv2d(.net = net, .filters = 7, .kernel_h = 3, .kernel_w = 2, .stride_w = 2, .padding = 1, .act_func = ACT_RELU);
+    max_pool2d(.net = net, .kernel = 2, .act_func = ACT_TANH);          /* pooling has no activation */
+    layer(.net = net, .neurons_amount = 4, .act_func = ACT_NONE);
+    SpingalettNetworkLayer c, p, d;
+    bool ok = spingalett_network_layer(net, 1, &c) && spingalett_network_layer(net, 2, &p) && spingalett_network_layer(net, 3, &d);
+    /* conv: (5 + 2 - 3) / 1 + 1 = 5 rows, (4 + 2 - 2) / 2 + 1 = 3 columns; pool: 2 x 1 */
+    CHECK(ok && c.type == LAYER_CONV2D && c.height == 5 && c.width == 3 && c.channels == 7 && c.outputs == 105 &&
+          c.kernel_h == 3 && c.kernel_w == 2 && c.stride_h == 1 && c.stride_w == 2 && c.padding_h == 1 && c.padding_w == 1 &&
+          c.weight_count == 7 * 3 * 2 * 3 && c.bias_count == 7 && c.activation == ACT_RELU, "conv layer description");
+    CHECK(ok && p.type == LAYER_MAX_POOL2D && p.height == 2 && p.width == 1 && p.channels == 7 && p.stride_h == 2 &&
+          p.activation == ACT_NONE && p.weight_count == 0 && p.bias_count == 0, "pool layer description");
+    CHECK(ok && d.type == LAYER_DENSE && d.weight_count == 4 * 14 && d.bias_count == 4, "dense after pooling flattens");
+    CHECK(spingalett_parameter_count(net) == 7 * 18 + 7 + 4 * 14 + 4, "parameter count");
+    float w[126], back[126];
+    for (int i = 0; i < 126; i++) w[i] = (float)i * 0.01f;
+    CHECK(spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, 126) && spingalett_get_parameters(net, 1, PARAM_WEIGHTS, back, 126) &&
+          !memcmp(w, back, sizeof w), "conv weights round-trip");
+    CHECK(!spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, 125) && !spingalett_get_parameters(net, 2, PARAM_BIASES, back, 1) &&
+          spingalett_get_parameters(net, 2, PARAM_BIASES, back, 0) && !spingalett_get_parameters(net, 0, PARAM_WEIGHTS, back, 0),
+          "parameter counts and layer indices are checked");
+    free_network(net);
+}
+
+/* A small CNN tells vertical from horizontal bars in noisy 8 x 8 images. */
+static void conv_learns(ComputeMode mode) {
+    lcg_state = 31337;
+    spingalett_set_compute_mode(mode);
+    const uint32_t N = 400;
+    float *x = malloc((size_t)N * 64 * 4), *y = calloc((size_t)N * 2, 4);
+    for (uint32_t s = 0; s < N; s++) {
+        bool vertical = s % 2;
+        uint32_t pos = (uint32_t)(frand() * 6) + 1;
+        for (uint32_t i = 0; i < 64; i++) {
+            uint32_t r = i / 8, c = i % 8;
+            x[s * 64 + i] = (frand() - 0.5f) * 0.6f + ((vertical ? c : r) == pos ? 1.0f : 0.0f);
+        }
+        y[s * 2 + vertical] = 1.0f;
+    }
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 8, .width = 8, .channels = 1);
+    conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    max_pool2d(.net = net, .kernel = 2);
+    layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+    train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 15, .learning_rate = 0.01f,
+          .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32);
+    EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y, .sample_count = N);
+    printf("  conv learns bars mode=%d: accuracy %.1f%%, loss %.4f\n", mode, 100.0 * m.accuracy, m.loss);
+    CHECK(m.accuracy > 0.95f, "conv net must learn vertical vs horizontal bars (mode %d): %.3f", mode, m.accuracy);
+    free(x); free(y);
+    free_network(net);
 }
 
 /* RMSProp divides every gradient by its own running magnitude (sqrt(v) + eps with eps = 1e-8, as
@@ -1835,6 +1997,20 @@ int main(int argc, char **argv) {
             gradcheck("mse relu/leaky/foo52", LOSS_MSE, d, 5, modes[m], strats[s]);
             gradcheck("ce wide (AVX tails)", LOSS_CROSS_ENTROPY, e, 4, modes[m], strats[s]);
         }
+        static const char *conv_names[] = {"conv same/maxpool/softmax", "conv stride/avgpool/1x1",
+                                           "conv rect/maxpool overlap", "conv deep relu/foo52/gap"};
+        for (int m = 0; m < 3; m++) for (int s = 0; s < 3; s++)
+            for (int c = 0; c < 4; c++) {
+                lcg_state = 1000 + c;
+                gradcheck_net(conv_names[c], conv_net(c), modes[m], strats[s]);
+            }
+    }
+    if (!*only || !strcmp(only, "conv")) {
+        printf("[convolution and pooling]\n");
+        conv_api();
+        ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+        for (int m = 0; m < 3; m++) conv_chunks(cm[m]);
+        for (int m = 0; m < 2; m++) conv_learns(cm[m]);
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");
