@@ -74,18 +74,7 @@ typedef enum {
    spingalett_get_parameters() / spingalett_set_parameters(). */
 typedef struct NeuralNetwork NeuralNetwork;
 
-/*
- * Kinds of layers. Data flows through a network as one tensor per sample, height x width x channels
- * in channels-last order (element (y, x, c) at (y * width + x) * channels + c); a dense layer reads
- * it as a flat vector, so a dense layer after convolutions needs no flattening.
- */
-typedef enum {
-    LAYER_DENSE,                    /* fully connected: neurons_amount outputs */
-    LAYER_CONV2D,                   /* 2D convolution: `filters` output channels, kernel windows */
-    LAYER_MAX_POOL2D,               /* maximum over each window, per channel */
-    LAYER_AVG_POOL2D,               /* mean over each window (padded cells not counted), per channel */
-    LAYER_TYPE_COUNT
-} LayerType;
+/* Kinds of layers: LayerType, in Spingalett.Inference.h (the inference engine runs them all). */
 
 /* Layer `index` of a network (0 is the input layer), see spingalett_network_layer(). */
 typedef struct {

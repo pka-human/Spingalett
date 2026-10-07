@@ -85,13 +85,23 @@ static int info(const char *path) {
     NeuralNetwork *net;
     PrecisionMode stored;
     if (!open_model(path, &m, &net, &stored)) return fail(path);
-    printf("%s\n  %u inputs, %u outputs, %u weight layers, %llu parameters\n  image %zu bytes, workspace %zu bytes\n",
+    printf("%s\n  %u inputs, %u outputs, %u layers, %llu parameters\n  image %zu bytes, workspace %zu bytes\n",
            path, m->input_size, m->output_size, m->layer_count,
            (unsigned long long)spingalett_parameter_count(net), m->image_size, m->workspace_size);
+    SpingalettNetworkLayer input;
+    spingalett_network_layer(net, 0, &input);
+    if (input.height > 1 || input.width > 1)
+        printf("  input: %u x %u x %u\n", input.height, input.width, input.channels);
+    static const char *const kinds[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d"};
     for (uint32_t i = 0; i < m->layer_count; i++) {
         SpingalettLayerInfo l;
         spingalett_model_layer(m, i, &l);
-        printf("  layer %u: %5u -> %-5u %-10s %s\n", i + 1, l.inputs, l.outputs, activation_name(l.activation), precision_name(l.precision));
+        char shape[96] = "";
+        if (l.type != LAYER_DENSE)
+            snprintf(shape, sizeof shape, "  %u x %u x %u, window %u x %u, stride %u x %u, padding %u x %u", l.height, l.width,
+                     l.channels, l.kernel_h, l.kernel_w, l.stride_h, l.stride_w, l.padding_h, l.padding_w);
+        printf("  layer %u: %-10s %7u -> %-7u %-10s %s%s\n", i + 1, kinds[l.type], l.inputs, l.outputs,
+               activation_name(l.activation), l.type >= LAYER_MAX_POOL2D ? "-" : precision_name(l.precision), shape);
     }
     spingalett_model_free(m);
     free_network(net);

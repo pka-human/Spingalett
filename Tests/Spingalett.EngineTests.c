@@ -217,24 +217,34 @@ static void hand_made_model(void) {
 #include "test_model_int8.h"
 #include "test_model_int4.h"
 #include "test_model_fp16.h"
+#include "test_model_conv_int8.h"
+#include "test_model_conv_f32.h"
 #include "test_model_expected.h"
 
 static void exported_headers(void) {
-    struct { const uint8_t *image; size_t size; uint32_t in, out; size_t ws; const float *expected; const char *name; } m[] = {
-        {test_model_int8, TEST_MODEL_INT8_SIZE, TEST_MODEL_INT8_INPUTS, TEST_MODEL_INT8_OUTPUTS, TEST_MODEL_INT8_WORKSPACE, expected_int8, "INT8"},
-        {test_model_int4, TEST_MODEL_INT4_SIZE, TEST_MODEL_INT4_INPUTS, TEST_MODEL_INT4_OUTPUTS, TEST_MODEL_INT4_WORKSPACE, expected_int4, "INT4"},
-        {test_model_fp16, TEST_MODEL_FP16_SIZE, TEST_MODEL_FP16_INPUTS, TEST_MODEL_FP16_OUTPUTS, TEST_MODEL_FP16_WORKSPACE, expected_fp16, "FP16"},
+    struct { const uint8_t *image; size_t size; uint32_t in, out; size_t ws; const float *inputs, *expected; const char *name; } m[] = {
+        {test_model_int8, TEST_MODEL_INT8_SIZE, TEST_MODEL_INT8_INPUTS, TEST_MODEL_INT8_OUTPUTS, TEST_MODEL_INT8_WORKSPACE,
+         test_inputs[0], expected_int8, "INT8"},
+        {test_model_int4, TEST_MODEL_INT4_SIZE, TEST_MODEL_INT4_INPUTS, TEST_MODEL_INT4_OUTPUTS, TEST_MODEL_INT4_WORKSPACE,
+         test_inputs[0], expected_int4, "INT4"},
+        {test_model_fp16, TEST_MODEL_FP16_SIZE, TEST_MODEL_FP16_INPUTS, TEST_MODEL_FP16_OUTPUTS, TEST_MODEL_FP16_WORKSPACE,
+         test_inputs[0], expected_fp16, "FP16"},
+        {test_model_conv_int8, TEST_MODEL_CONV_INT8_SIZE, TEST_MODEL_CONV_INT8_INPUTS, TEST_MODEL_CONV_INT8_OUTPUTS,
+         TEST_MODEL_CONV_INT8_WORKSPACE, test_conv_inputs[0], expected_conv_int8, "convolution INT8"},
+        {test_model_conv_f32, TEST_MODEL_CONV_F32_SIZE, TEST_MODEL_CONV_F32_INPUTS, TEST_MODEL_CONV_F32_OUTPUTS,
+         TEST_MODEL_CONV_F32_WORKSPACE, test_conv_inputs[0], expected_conv_f32, "convolution FLOAT32"},
     };
-    static float workspace[TEST_MODEL_INT8_WORKSPACE / sizeof(float) + TEST_MODEL_FP16_WORKSPACE / sizeof(float)];
-    for (int i = 0; i < 3; i++) {
+    static float workspace[(TEST_MODEL_INT8_WORKSPACE + TEST_MODEL_FP16_WORKSPACE + TEST_MODEL_CONV_INT8_WORKSPACE +
+                            TEST_MODEL_CONV_F32_WORKSPACE) / sizeof(float)];
+    for (int i = 0; i < (int)(sizeof m / sizeof *m); i++) {
         SpingalettModel model;
         int rc = spingalett_model_init(&model, m[i].image, m[i].size);
         CHECK(rc == SPINGALETT_OK && model.input_size == m[i].in && model.output_size == m[i].out &&
               model.workspace_size == m[i].ws && model.workspace_size <= sizeof workspace, "%s header model", m[i].name);
         if (rc != SPINGALETT_OK) continue;
-        float worst = 0, out[TEST_MODEL_INT8_OUTPUTS];
+        float worst = 0, out[16];
         for (int s = 0; s < TEST_SAMPLES; s++) {
-            spingalett_model_run(&model, test_inputs[s], out, workspace);
+            spingalett_model_run(&model, m[i].inputs + (size_t)s * m[i].in, out, workspace);
             for (uint32_t k = 0; k < model.output_size; k++) {
                 float d = fabsf(out[k] - m[i].expected[s * model.output_size + k]);
                 if (d > worst) worst = d;

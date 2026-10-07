@@ -493,7 +493,7 @@ static bool trainer_alloc(Trainer *t) {
     }
 
     if (t->args->val_count > 0) {
-        uint32_t capacity = t->args->val_count < SPINGALETT_BATCH_CHUNK ? t->args->val_count : SPINGALETT_BATCH_CHUNK;
+        uint32_t capacity = spingalett_batch_capacity(net, t->args->val_count);
         t->val_ws = spingalett_batch_workspace_create(net, capacity, false, false, t->mode);
         t->val_out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
         if (!t->val_ws || !t->val_out) return false;
@@ -511,7 +511,7 @@ static bool trainer_alloc(Trainer *t) {
     }
 
     if (t->use_batch_path) {
-        uint32_t capacity = t->batch_size < SPINGALETT_BATCH_CHUNK ? t->batch_size : SPINGALETT_BATCH_CHUNK;
+        uint32_t capacity = spingalett_batch_capacity(net, t->batch_size);
         t->ws = spingalett_batch_workspace_create(net, capacity, true, t->order != NULL, t->mode);
         return t->ws != NULL;
     }

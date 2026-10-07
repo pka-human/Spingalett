@@ -6,8 +6,8 @@
 /*
  * Spingalett inference engine.
  *
- * Runs a network stored as a .slett image (format version 3) in place, in the precision its
- * parameters were saved in. The image can be a file read into memory, a const array compiled into
+ * Runs a network stored as a .slett image (format version 3, or 4 for networks with convolution
+ * and pooling layers) in place, in the precision its parameters were saved in. The image can be a file read into memory, a const array compiled into
  * the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing,
  * does no I/O and keeps no global state: apart from the image it only needs a workspace from the
  * caller, so it runs on microcontrollers as well as on desktops, and any number of threads can share
@@ -21,7 +21,8 @@
  * Layers whose weights are stored as INT8, INT4 or INT2 run in integer arithmetic: the layer's input
  * is quantized to 8 bits with a scale chosen per sample (its largest magnitude maps to 127), the dot
  * products with the weights accumulate in 32-bit integers, and each output is rescaled by its weight
- * row's scale. FLOAT32, FP16 and BFLOAT16 layers run in float.
+ * row's scale. FLOAT32, FP16 and BFLOAT16 layers run in float. Convolutions compute each output
+ * pixel as such dot products of the filters with the window it reads; pooling runs in float.
  */
 #pragma once
 
@@ -47,8 +48,10 @@ extern "C" {
 #  endif
 #endif
 
-/* Version of the .slett model format that save_spingalett writes; versions 1 and 2 still load. */
-#define SPINGALETT_FORMAT_VERSION 3
+/* Newest version of the .slett model format. save_spingalett writes version 4 for networks with
+   convolution or pooling layers and version 3 for the others, so that engines of earlier releases
+   still run them; versions 1 and 2 still load. */
+#define SPINGALETT_FORMAT_VERSION 4
 
 /* File name extensions: models (save_spingalett appends it when the name has none) and data sets. */
 #define SPINGALETT_MODEL_EXTENSION   ".slett"
@@ -77,6 +80,19 @@ typedef enum {
     LOSS_COUNT
 } LossFunction;
 
+/*
+ * Kinds of layers. Data flows through a network as one tensor per sample, height x width x channels
+ * in channels-last order (element (y, x, c) at (y * width + x) * channels + c); a dense layer reads
+ * it as a flat vector, so a dense layer after convolutions needs no flattening.
+ */
+typedef enum {
+    LAYER_DENSE,                    /* fully connected: neurons_amount outputs */
+    LAYER_CONV2D,                   /* 2D convolution: `filters` output channels, kernel windows */
+    LAYER_MAX_POOL2D,               /* maximum over each window, per channel */
+    LAYER_AVG_POOL2D,               /* mean over each window (padded cells not counted), per channel */
+    LAYER_TYPE_COUNT
+} LayerType;
+
 /* How parameters are stored: in .slett files, and as the weights a model computes with. The
    integer precisions keep one scale per weight row (output unit). */
 typedef enum {
@@ -103,19 +119,24 @@ typedef struct {
     const void *image;              /* the .slett image */
     size_t image_size;              /* its size as recorded in its header */
     uint32_t max_width_;            /* private: widest hidden layer */
+    uint32_t max_int_inputs_;       /* private: widest input of an integer layer */
+    uint32_t max_window_;           /* private: largest convolution window */
     void *owner_;                   /* private: memory released by spingalett_model_free */
 } SpingalettModel;
 
 typedef struct {
-    uint32_t inputs;
-    uint32_t outputs;
+    LayerType type;
+    uint32_t inputs;                /* units of the layer's input: height x width x channels */
+    uint32_t outputs;               /* units of its output */
     ActivationFunction activation;
     PrecisionMode precision;        /* how this layer's weights are stored and computed with */
+    uint32_t height, width, channels;               /* the output's shape (1 x 1 x outputs for dense) */
+    uint32_t kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w;  /* conv and pooling, else 0 */
 } SpingalettLayerInfo;
 
 /*
- * Checks a .slett image (format version 3: header, layer table, bounds and CRC-32 checksums) and
- * fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in
+ * Checks a .slett image (format version 3 or 4: header, layer table, shapes, bounds and CRC-32
+ * checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in
  * use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region).
  * Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format
  * versions, which the full library's spingalett_model_load converts).

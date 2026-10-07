@@ -315,12 +315,25 @@ static bool pointwise(const LayerShape *out) {
 
 void spingalett_conv_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode) {
-    const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
+    spingalett_conv_forward_shapes(&net->shapes[l], &net->shapes[l + 1], SPINGALETT_WEIGHT_MTX_PTR(net, l),
+                                   net->biases + net->bias_offsets[l], x, y, n, act, scratch, gemm, mode);
+}
+
+size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *out, uint32_t capacity,
+                                       ComputeMode mode) {
+    if (implicit(mode) || pointwise(out)) return 0;
+    size_t fwd = (size_t)out->kernel_h * out->kernel_w * in->channels;
+    size_t total = fwd * out->height * out->width * capacity;
+    return total < CONV_CHUNK_FLOATS ? total : (fwd > CONV_CHUNK_FLOATS ? fwd : CONV_CHUNK_FLOATS);
+}
+
+void spingalett_conv_forward_shapes(const LayerShape *in, const LayerShape *out, const float *Wt, const float *bias,
+                                    const float *x, float *y, uint32_t n, ActivationFunction act, float *scratch,
+                                    SpingalettGemmScratch *gemm, ComputeMode mode) {
     const uint32_t OC = out->channels;
     const size_t K = (size_t)out->kernel_h * out->kernel_w * in->channels;
     const uint64_t total = (uint64_t)n * out->height * out->width;
-    const float *Wt = SPINGALETT_WEIGHT_MTX_PTR(net, l);
-    BiasActivation epilogue = {net->biases + net->bias_offsets[l], act == ACT_SOFTMAX ? ACT_NONE : act};
+    BiasActivation epilogue = {bias, act == ACT_SOFTMAX ? ACT_NONE : act};
     SpingalettGemmHooks hooks = {NULL, NULL, add_bias_activate, &epilogue};
 
     if (pointwise(out) || implicit(mode)) {
@@ -525,9 +538,13 @@ static inline void pool_block_forward(const float *restrict xs, float *restrict 
 
 void spingalett_pool_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ComputeMode mode) {
-    const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
+    spingalett_pool_forward_shapes(&net->shapes[l], &net->shapes[l + 1], x, y, n, mode);
+}
+
+void spingalett_pool_forward_shapes(const LayerShape *in, const LayerShape *out, const float *x, float *y, uint32_t n,
+                                    ComputeMode mode) {
     const uint32_t C = in->channels, W = in->width;
-    const size_t in_size = net->topology[l], out_size = net->topology[l + 1];
+    const size_t in_size = (size_t)in->height * W * C, out_size = (size_t)out->height * out->width * C;
     const bool max = out->type == LAYER_MAX_POOL2D;
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(use_omp(mode, (uint64_t)n * out_size * out->kernel_h * out->kernel_w))

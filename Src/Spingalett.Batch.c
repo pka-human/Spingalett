@@ -29,6 +29,14 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     free(ws);
 }
 
+uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count) {
+    uint64_t per_sample = net->total_neurons ? net->total_neurons : 1u;
+    uint64_t cap = SPINGALETT_BATCH_FLOATS / per_sample;
+    if (cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
+    if (cap < 1) cap = 1;
+    return count < cap ? count : (uint32_t)cap;
+}
+
 BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint32_t capacity,
                                                   bool training, bool gather, ComputeMode mode) {
     BatchWorkspace *ws = (BatchWorkspace *)calloc(1, sizeof(BatchWorkspace));
@@ -155,7 +163,7 @@ bool predict_struct_arguments(PredictArgs args) {
         return true;
 
     ComputeMode mode = resolve_compute_mode();
-    uint32_t capacity = args.sample_count < SPINGALETT_BATCH_CHUNK ? args.sample_count : SPINGALETT_BATCH_CHUNK;
+    uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
     if (!ws) {
         set_error(SPINGALETT_ERR_ALLOC, "predict: workspace allocation failed");
@@ -220,7 +228,7 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
     }
 
     ComputeMode mode = resolve_compute_mode();
-    uint32_t capacity = args.sample_count < SPINGALETT_BATCH_CHUNK ? args.sample_count : SPINGALETT_BATCH_CHUNK;
+    uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
     float *out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
     if (ws && out) {

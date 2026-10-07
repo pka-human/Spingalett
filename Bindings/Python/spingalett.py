@@ -386,6 +386,8 @@ class _Model(Structure):
         ("image", c_void_p),
         ("image_size", c_size_t),
         ("max_width_", c_uint32),
+        ("max_int_inputs_", c_uint32),
+        ("max_window_", c_uint32),
         ("owner_", c_void_p),
     ]
 
@@ -395,10 +397,20 @@ _ModelPtr = POINTER(_Model)
 
 class _LayerInfo(Structure):
     _fields_ = [
+        ("type", c_int),
         ("inputs", c_uint32),
         ("outputs", c_uint32),
         ("activation", c_int),
         ("precision", c_int),
+        ("height", c_uint32),
+        ("width", c_uint32),
+        ("channels", c_uint32),
+        ("kernel_h", c_uint32),
+        ("kernel_w", c_uint32),
+        ("stride_h", c_uint32),
+        ("stride_w", c_uint32),
+        ("padding_h", c_uint32),
+        ("padding_w", c_uint32),
     ]
 
 
@@ -1276,11 +1288,16 @@ class Network:
 
 @dataclasses.dataclass(frozen=True)
 class LayerInfo:
-    """One weight layer of a :class:`Model`."""
+    """One layer of a :class:`Model` (the input layer is not counted)."""
     inputs: int
     outputs: int
     activation: Activation
     precision: Precision
+    type: LayerType = LayerType.DENSE
+    shape: Tuple[int, int, int] = (1, 1, 0)     # output (height, width, channels)
+    kernel: Tuple[int, int] = (0, 0)
+    stride: Tuple[int, int] = (0, 0)
+    padding: Tuple[int, int] = (0, 0)
 
 
 class Model:
@@ -1366,11 +1383,15 @@ class Model:
         for i in range(self._model.layer_count):
             info = _LayerInfo()
             _model_layer(self._ptr, i, ctypes.byref(info))
-            out.append(LayerInfo(int(info.inputs), int(info.outputs), Activation(info.activation), Precision(info.precision)))
+            out.append(LayerInfo(int(info.inputs), int(info.outputs), Activation(info.activation),
+                                 Precision(info.precision), LayerType(info.type),
+                                 (int(info.height), int(info.width), int(info.channels)),
+                                 (int(info.kernel_h), int(info.kernel_w)), (int(info.stride_h), int(info.stride_w)),
+                                 (int(info.padding_h), int(info.padding_w))))
         return out
 
     def to_bytes(self) -> bytes:
-        """The model image: a .slett file (format version 3)."""
+        """The model image: a .slett file (format version 3, or 4 with convolution or pooling layers)."""
         m = self._model
         return ctypes.string_at(m.image, m.image_size)
 

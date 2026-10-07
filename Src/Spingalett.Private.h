@@ -44,8 +44,11 @@ typedef struct {
 } DropoutContext;
 
 /* Samples per batch-path chunk: bounds workspace memory (full-batch training over a large dataset
-   runs in chunks whose gradients are accumulated) while keeping the GEMMs large. */
+   runs in chunks whose gradients are accumulated) while keeping the GEMMs large. Networks with more
+   than SPINGALETT_BATCH_FLOATS / SPINGALETT_BATCH_CHUNK activations per sample (convolutions) take
+   fewer samples per chunk, so that one chunk's activations stay near SPINGALETT_BATCH_FLOATS. */
 #define SPINGALETT_BATCH_CHUNK 2048u
+#define SPINGALETT_BATCH_FLOATS (1u << 24)
 
 typedef struct SpingalettGemmScratch SpingalettGemmScratch;
 
@@ -68,6 +71,9 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
 void spingalett_batch_workspace_free(BatchWorkspace *ws);
 /* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
    layers; samples are numbered position_offset + s for the dropout hash. */
+/* Samples per chunk for `count` samples: at most count, SPINGALETT_BATCH_CHUNK and what fits
+   SPINGALETT_BATCH_FLOATS activations, at least 1. */
+uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
 /* Summed loss and number of correctly classified samples (see EvalMetrics) over n samples, in
@@ -93,6 +99,16 @@ void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const floa
                                       ComputeMode mode);
 void spingalett_pool_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ComputeMode mode);
+/* The forward passes from shapes and parameters alone (batched inference of models): W holds
+   out->channels filters of kernel_h x kernel_w x in->channels weights; scratch holds
+   spingalett_conv_forward_scratch() floats. */
+size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *out, uint32_t capacity,
+                                       ComputeMode mode);
+void spingalett_conv_forward_shapes(const LayerShape *in, const LayerShape *out, const float *W, const float *bias,
+                                    const float *x, float *y, uint32_t n, ActivationFunction act, float *scratch,
+                                    SpingalettGemmScratch *gemm, ComputeMode mode);
+void spingalett_pool_forward_shapes(const LayerShape *in, const LayerShape *out, const float *x, float *y, uint32_t n,
+                                    ComputeMode mode);
 /* dx = dL/dx * act'(x) from dy = dL/dy (x: the pooling layer's input, the output of layer l, whose
    activation is act); dx is overwritten */
 void spingalett_pool_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,

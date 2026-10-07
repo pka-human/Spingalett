@@ -1843,7 +1843,7 @@ static void model_validation(void) {
     }
 
     memcpy(buf, img, size);
-    buf[6] = 4;                                                  /* a future format version */
+    buf[6] = 5;                                                  /* a future format version */
     reseal(buf, size);
     CHECK(spingalett_model_init(&m, buf, size) == SPINGALETT_ERR_FORMAT_VERSION, "validation: future version");
     CHECK(spingalett_model_init(NULL, img, size) == SPINGALETT_ERR_INVALID && spingalett_model_init(&m, NULL, size) == SPINGALETT_ERR_INVALID,
@@ -1955,8 +1955,11 @@ static void model_files(void) {
 }
 
 
-/* SpingalettTests export-headers DIR: the deploy_net model as C headers in three precisions and
-   the outputs the library computes for a few inputs, for Spingalett.EngineTests.c. */
+static NeuralNetwork *conv_deploy_net(void);
+
+/* SpingalettTests export-headers DIR: the deploy_net model as C headers in three precisions, the
+   conv_deploy_net model in two, and the outputs the library computes for a few inputs, for
+   Spingalett.EngineTests.c. */
 static int export_test_headers(const char *dir) {
     NeuralNetwork *net = deploy_net();
     const PrecisionMode precisions[] = {PRECISION_INT8, PRECISION_INT4, PRECISION_FP16};
@@ -1985,9 +1988,280 @@ static int export_test_headers(const char *dir) {
         if (!m) rc = 1;
         spingalett_model_free(m);
     }
+    /* a convolution network, as INT8 and FLOAT32 */
+    NeuralNetwork *conv = conv_deploy_net();
+    const uint32_t cin = conv->topology[0], cout = conv->topology[conv->layers - 1];
+    float *cx = malloc((size_t)SAMPLES * cin * sizeof(float)), *cy = malloc((size_t)SAMPLES * cout * sizeof(float));
+    for (uint32_t i = 0; i < SAMPLES * cin; i++) cx[i] = frand() * 2 - 1;
+    fprintf(f, "#define TEST_CONV_INPUTS %u\nstatic const float test_conv_inputs[%d][%u] = {\n", cin, SAMPLES, cin);
+    for (uint32_t i = 0; i < SAMPLES * cin; i++)
+        fprintf(f, "%s%.9g,%s", i % cin ? "" : "    {", (double)cx[i], i % cin == cin - 1 ? "},\n" : " ");
+    fprintf(f, "};\n");
+    const PrecisionMode conv_precisions[] = {PRECISION_INT8, PRECISION_FLOAT32};
+    const char *conv_names[] = {"test_model_conv_int8", "test_model_conv_f32"}, *conv_suffix[] = {"conv_int8", "conv_f32"};
+    for (int p = 0; p < 2; p++) {
+        snprintf(path, sizeof path, "%s/%s.h", dir, conv_names[p]);
+        if (!spingalett_export_c_header(conv, path, conv_names[p], conv_precisions[p])) rc = 1;
+        SpingalettModel *m = spingalett_model_from_network(conv, conv_precisions[p]);
+        for (int s = 0; s < SAMPLES && m; s++) spingalett_model_run(m, cx + (size_t)s * cin, cy + (size_t)s * cout, NULL);
+        fprintf(f, "static const float expected_%s[%u] = {\n", conv_suffix[p], SAMPLES * cout);
+        for (uint32_t i = 0; i < SAMPLES * cout; i++)
+            fprintf(f, "%s%.9g,%s", i % cout ? "" : "    ", (double)cy[i], i % cout == cout - 1 ? "\n" : " ");
+        fprintf(f, "};\n");
+        if (!m) rc = 1;
+        spingalett_model_free(m);
+    }
+    free(cx); free(cy);
+    free_network(conv);
     fclose(f);
     free_network(net);
     return rc;
+}
+
+/* ---------------------------------------------------------------- convolution models (format 4) */
+
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+
+/* A version 4 layer table entry with its input shape (header or previous entry). */
+typedef struct { uint32_t in, out; int act, prec, type; uint64_t w, s, b, o;
+                 uint32_t ih, iw, ic, oh, ow, oc, kh, kw, sh, sw, ph, pw; } Entry4;
+static Entry4 image_layer4(const uint8_t *img, uint32_t i) {
+    const uint8_t *e = img + 64 + 64 * (size_t)i;
+    Entry4 r = {rd32(e), rd32(e + 4), e[8], e[9], e[10], rd64(e + 16), rd64(e + 24), rd64(e + 32), rd64(e + 40),
+                0, 0, 0, rd16(e + 48), rd16(e + 50), 0, rd16(e + 52), rd16(e + 54), rd16(e + 56), rd16(e + 58),
+                rd16(e + 60), rd16(e + 62)};
+    r.ih = i ? rd16(e - 64 + 48) : rd32(img + 32);
+    r.iw = i ? rd16(e - 64 + 50) : rd32(img + 36);
+    r.ic = r.in / (r.ih * r.iw);
+    r.oc = r.out / (r.oh * r.ow);
+    return r;
+}
+
+/* Weight k of filter j of a stored convolution, decoded as docs/ModelFormat.md describes. */
+static double conv_weight(const uint8_t *img, Entry4 e, uint32_t j, uint32_t k) {
+    Entry as_dense = {e.kh * e.kw * e.ic, e.oc, e.act, e.prec, e.w, e.s, e.b, e.o};
+    return stored_weight(img, as_dense, j, k);
+}
+
+/* What the engine computes for a convolution without activation, from the stored image (as
+   reference_layer: integer layers bit for bit, float ones within `bound`). */
+static void reference_conv(const uint8_t *img, Entry4 e, const float *x, float *y, double *bound) {
+    bool integer = e.prec >= PRECISION_INT8;
+    int8_t *q = malloc(e.in);
+    float a = 0;
+    if (integer) {
+        float amax = 0;
+        for (uint32_t k = 0; k < e.in; k++) if (fabsf(x[k]) > amax) amax = fabsf(x[k]);
+        a = amax / 127.0f;
+        float inv = amax > 0 ? 127.0f / amax : 0;
+        for (uint32_t k = 0; k < e.in; k++) q[k] = (int8_t)lrintf(x[k] * inv);
+    }
+    Entry as_dense = {e.kh * e.kw * e.ic, e.oc, e.act, e.prec, e.w, e.s, e.b, e.o};
+    for (uint32_t oh = 0; oh < e.oh; oh++)
+        for (uint32_t ow = 0; ow < e.ow; ow++)
+            for (uint32_t j = 0; j < e.oc; j++) {
+                int64_t acc = 0;
+                double facc = rdf(img + e.b + 4 * (uint64_t)j), mag = fabs(facc);
+                for (uint32_t kh = 0; kh < e.kh; kh++)
+                    for (uint32_t kw = 0; kw < e.kw; kw++) {
+                        int64_t ih = (int64_t)oh * e.sh - e.ph + kh, iw = (int64_t)ow * e.sw - e.pw + kw;
+                        if (ih < 0 || iw < 0 || ih >= e.ih || iw >= e.iw) continue;
+                        for (uint32_t c = 0; c < e.ic; c++) {
+                            uint32_t k = (kh * e.kw + kw) * e.ic + c;
+                            size_t xi = ((size_t)ih * e.iw + (size_t)iw) * e.ic + c;
+                            if (integer) acc += (int64_t)stored_code(img, as_dense, j, k) * q[xi];
+                            else { double t = conv_weight(img, e, j, k) * x[xi]; facc += t; mag += fabs(t); }
+                        }
+                    }
+                size_t o = ((size_t)oh * e.ow + ow) * e.oc + j;
+                if (integer) {
+                    y[o] = rdf(img + e.b + 4 * (uint64_t)j) + (rdf(img + e.s + 4 * (uint64_t)j) * a) * (float)acc;
+                    bound[o] = 0;
+                } else {
+                    y[o] = (float)facc;
+                    bound[o] = 1e-6 * mag + 1e-30;
+                }
+            }
+    free(q);
+}
+
+/* One convolution per window geometry and precision: the engine against the stored image (filters
+   not a multiple of four, padding, strides, rectangular and pointwise windows, a zero sample). */
+static void model_conv_kernels(PrecisionMode p) {
+    static const struct { uint32_t h, w, c, f, kh, kw, sh, sw, ph, pw; } g[] = {
+        {6, 5, 4, 9, 3, 3, 2, 2, 1, 1}, {7, 7, 1, 13, 3, 3, 1, 1, 1, 1}, {5, 8, 3, 4, 2, 3, 1, 2, 0, 1},
+        {4, 4, 33, 6, 1, 1, 1, 1, 0, 0}, {9, 3, 17, 5, 4, 2, 3, 1, 2, 1}, {3, 3, 70, 3, 3, 3, 1, 1, 0, 0},
+    };
+    uint32_t inexact = 0; double worst = 0; lcg_state = 515 + p;
+    for (size_t t = 0; t < sizeof g / sizeof *g; t++) {
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = net, .height = g[t].h, .width = g[t].w, .channels = g[t].c);
+        conv2d(.net = net, .filters = g[t].f, .kernel_h = g[t].kh, .kernel_w = g[t].kw, .stride_h = g[t].sh,
+               .stride_w = g[t].sw, .padding_h = g[t].ph, .padding_w = g[t].pw, .act_func = ACT_NONE);
+        for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * (i % 7 == 0 ? 2.0f : 0.3f);
+        for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() - 0.5f;
+        SpingalettModel *m = spingalett_model_from_network(net, p);
+        CHECK(m != NULL, "conv kernels p=%d geometry %zu: no model", p, t);
+        if (!m) { free_network(net); continue; }
+        const uint8_t *img = m->image;
+        Entry4 e = image_layer4(img, 0);
+        uint32_t in = net->topology[0], out = net->topology[1];
+        void *ws = malloc(m->workspace_size);
+        float *x = malloc(in * sizeof(float)), *y = malloc(out * sizeof(float)), *r = malloc(out * sizeof(float));
+        double *bound = malloc(out * sizeof(double));
+        for (int s = 0; s < 3; s++) {
+            for (uint32_t k = 0; k < in; k++) x[k] = s == 2 ? 0.0f : (frand() * 2 - 1) * (s ? 0.05f : 2.0f);
+            CHECK(spingalett_model_run(m, x, y, ws) == SPINGALETT_OK, "conv kernels p=%d: run failed", p);
+            reference_conv(img, e, x, r, bound);
+            for (uint32_t j = 0; j < out; j++) {
+                double d = fabs((double)y[j] - r[j]);
+                if (bound[j] == 0) { if (d != 0) inexact++; }
+                else if (d / bound[j] > worst) worst = d / bound[j];
+            }
+        }
+        free(ws); free(x); free(y); free(r); free(bound);
+        spingalett_model_free(m); free_network(net);
+    }
+    printf("  conv kernels precision=%d: %s\n", p, p >= PRECISION_INT8 ? (inexact ? "MISMATCH" : "bit-exact") : (worst <= 1 ? "within rounding" : "OFF"));
+    CHECK(inexact == 0 && worst <= 1.0, "conv kernels precision %d: %u inexact integer outputs, float error %.2f x bound", p, inexact, worst);
+}
+
+/* Every layer kind: same and strided convolutions, rectangular windows, overlapping padded average
+   pooling, a pointwise convolution and a dense head. */
+static NeuralNetwork *conv_deploy_net(void) {
+    lcg_state = 4242;
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 9, .width = 7, .channels = 3);
+    conv2d(.net = net, .filters = 6, .kernel = 3, .padding = 1, .act_func = ACT_RELU);
+    max_pool2d(.net = net, .kernel = 2);
+    conv2d(.net = net, .filters = 5, .kernel_h = 2, .kernel_w = 3, .stride_w = 2, .padding_w = 1, .act_func = ACT_TANH,
+           .dropout_rate = 0.25f);
+    avg_pool2d(.net = net, .kernel = 2, .stride = 1, .padding = 1);
+    conv2d(.net = net, .filters = 7, .kernel = 1, .act_func = ACT_LEAKY_RELU);
+    layer(.net = net, .neurons_amount = 4, .act_func = ACT_SOFTMAX);
+    for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.5f;
+    for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() * 0.2f - 0.1f;
+    return net;
+}
+
+/* Saving and loading convolution networks; models in every precision against the network, batched
+   prediction against single runs; damaged version 4 images. */
+static void model_conv(void) {
+    NeuralNetwork *net = conv_deploy_net();
+    uint32_t N = 40, in = net->topology[0], out = 4;
+
+    /* the layer table, and the version: 4 here, 3 for dense networks */
+    size_t size = 0, dense_size = 0;
+    for (uint64_t i = 0; i < net->total_weights; i++) { net->opt_m_weights[i] = frand(); net->opt_v_weights[i] = frand(); }
+    net->time_step = 17;
+    uint8_t *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &size);
+    NeuralNetwork *dense = deploy_net();
+    uint8_t *dimg = spingalett_save_to_memory(dense, PRECISION_FLOAT32, false, &dense_size);
+    CHECK(img && dimg && rd16(img + 6) == 4 && rd16(dimg + 6) == 3, "conv model: format versions");
+    if (!img || !dimg) { free_network(net); free_network(dense); spingalett_free(img); spingalett_free(dimg); return; }
+    Entry4 e1 = image_layer4(img, 0), e2 = image_layer4(img, 1), e3 = image_layer4(img, 2), e6 = image_layer4(img, 5);
+    CHECK(rd32(img + 32) == 9 && rd32(img + 36) == 7 && e1.type == LAYER_CONV2D && e1.oh == 9 && e1.ow == 7 && e1.oc == 6 &&
+          e1.kh == 3 && e1.ph == 1 && e1.sh == 1 && e2.type == LAYER_MAX_POOL2D && e2.oh == 4 && e2.ow == 3 && e2.w == 0 &&
+          e2.b == 0 && e2.act == ACT_NONE && e3.kh == 2 && e3.kw == 3 && e3.sw == 2 && e3.pw == 1 && e3.oh == 3 && e3.ow == 2 &&
+          e6.type == LAYER_DENSE && e6.oh == 1 && e6.kh == 0, "conv model: layer table");
+
+    /* round trip: shapes, parameters, optimizer state */
+    NeuralNetwork *back = load_spingalett_from_memory(img, size);
+    bool same = back && back->layers == net->layers && back->total_weights == net->total_weights && back->time_step == 17;
+    for (uint32_t l = 0; same && l < net->layers; l++) {
+        SpingalettNetworkLayer a, b;
+        same = spingalett_network_layer(net, l, &a) && spingalett_network_layer(back, l, &b) && !memcmp(&a, &b, sizeof a);
+    }
+    if (same)
+        same = !memcmp(back->weights, net->weights, net->total_weights * 4) && !memcmp(back->biases, net->biases, net->total_biases * 4) &&
+               !memcmp(back->opt_m_weights, net->opt_m_weights, net->total_weights * 4) &&
+               !memcmp(back->opt_v_weights, net->opt_v_weights, net->total_weights * 4);
+    CHECK(same, "conv model: save and load round trip");
+    if (back) free_network(back);
+
+    /* every precision: the engine against the network (dequantized as stored), batched prediction
+       against single runs */
+    float *x = malloc((size_t)N * in * sizeof(float)), *ref = malloc((size_t)N * out * sizeof(float));
+    float *one = malloc((size_t)N * out * sizeof(float)), *batch = malloc((size_t)N * out * sizeof(float));
+    for (size_t i = 0; i < (size_t)N * in; i++) x[i] = frand() * 2 - 1;
+    for (int p = 0; p < PRECISION_COUNT; p++) {
+        SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+        CHECK(m && m->input_size == in && m->output_size == out && m->layer_count == 6, "conv model p=%d: fields", p);
+        if (!m) continue;
+        SpingalettLayerInfo li;
+        CHECK(spingalett_model_layer(m, 2, &li) && li.type == LAYER_CONV2D && li.height == 3 && li.width == 2 &&
+              li.channels == 5 && li.kernel_h == 2 && li.kernel_w == 3 && li.stride_w == 2 && li.padding_w == 1 &&
+              li.activation == ACT_TANH && spingalett_model_layer(m, 1, &li) && li.type == LAYER_MAX_POOL2D,
+              "conv model p=%d: layer info", p);
+        size_t isize = 0;
+        uint8_t *pimg = spingalett_save_to_memory(net, (PrecisionMode)p, false, &isize);
+        NeuralNetwork *stored = load_spingalett_from_memory(pimg, isize);    /* the weights as stored */
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        predict(.net = stored, .inputs = x, .sample_count = N, .outputs = ref);
+        void *ws = malloc(m->workspace_size);
+        for (uint32_t s = 0; s < N; s++) spingalett_model_run(m, x + (size_t)s * in, one + (size_t)s * out, ws);
+        free(ws);
+        float err = max_abs_diff(ref, one, (size_t)N * out), worst = 0;
+        ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+        for (int c = 0; c < 3; c++) {
+            spingalett_set_compute_mode(cm[c]);
+            memset(batch, 0, (size_t)N * out * sizeof(float));
+            CHECK(spingalett_model_predict(m, x, N, batch), "conv model p=%d: predict failed", p);
+            float d = max_abs_diff(one, batch, (size_t)N * out);
+            if (d > worst) worst = d;
+        }
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        bool integer = p >= PRECISION_INT8;
+        printf("  conv model precision=%d: |run - network| = %.1e, |predict - run| = %.1e\n", p, err, worst);
+        /* float layers: the stored weights in float; integer layers also quantize activations */
+        float tol = integer ? (p == PRECISION_INT8 ? 0.05f : 0.5f) : 1e-5f;
+        CHECK(err <= tol, "conv model p=%d: engine differs from the network by %.3e", p, err);
+        CHECK(integer ? worst == 0.0f : worst < 1e-5f, "conv model p=%d: predict differs from run by %.3e", p, worst);
+        spingalett_free(pimg);
+        if (stored) free_network(stored);
+        spingalett_model_free(m);
+    }
+
+    /* damaged version 4 tables with valid checksums */
+    uint8_t *buf = malloc(size);
+    SpingalettModel m;
+    struct { size_t at; int bytes; uint32_t value; const char *what; } bad[] = {
+        {64 + 10, 1, LAYER_TYPE_COUNT, "unknown layer type"},
+        {64 + 48, 2, 8, "output height that the window does not give"},
+        {64 + 52, 2, 0, "kernel height 0"},
+        {64 + 56, 2, 0, "stride 0"},
+        {64 + 60, 2, 3, "padding as large as the kernel"},
+        {64 + 64 + 8, 1, ACT_RELU, "pooling with an activation"},
+        {64 + 64 + 16, 4, 64, "pooling with weights"},
+        {64 + 64 + 10, 1, LAYER_CONV2D, "pooling read as a convolution"},
+        {64 + 5 * 64 + 48, 2, 2, "dense layer with a height"},
+        {64 + 5 * 64 + 52, 2, 1, "dense layer with a kernel"},
+        {32, 4, 3, "input height that does not divide the inputs"},
+        {36, 4, 0, "input width 0"},
+    };
+    for (size_t t = 0; t < sizeof bad / sizeof *bad; t++) {
+        memcpy(buf, img, size);
+        for (int k = 0; k < bad[t].bytes; k++) buf[bad[t].at + k] = (uint8_t)(bad[t].value >> (8 * k));
+        reseal(buf, size);
+        CHECK(spingalett_model_init(&m, buf, size) != SPINGALETT_OK && load_spingalett_from_memory(buf, size) == NULL,
+              "conv model validation: %s accepted", bad[t].what);
+    }
+    for (size_t i = 0; i < size; i++) {                         /* every truncation */
+        if (spingalett_model_init(&m, img, i) == SPINGALETT_OK) { CHECK(0, "conv model: truncation to %zu accepted", i); break; }
+    }
+
+    /* a header for compiling the model in */
+    CHECK(spingalett_export_c_header(net, "spingalett_test_conv.h", "conv_model", PRECISION_INT8), "conv model: export");
+    FILE *fp = fopen("spingalett_test_conv.h", "r");
+    char line[256]; bool v4 = false;
+    while (fp && fgets(line, sizeof line, fp)) if (strstr(line, "format version 4")) v4 = true;
+    if (fp) fclose(fp);
+    CHECK(v4, "conv model: exported header names format version 4");
+    remove("spingalett_test_conv.h");
+
+    free(buf); free(x); free(ref); free(one); free(batch);
+    spingalett_free(img); spingalett_free(dimg);
+    free_network(net); free_network(dense);
 }
 
 int main(int argc, char **argv) {
@@ -2143,6 +2417,8 @@ int main(int argc, char **argv) {
         model_inference(PRECISION_INT2, 0.5f);
         model_validation();
         model_files();
+        for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);
+        model_conv();
     }
     if (!*only || !strcmp(only, "xor")) {
         printf("[xor convergence]\n");
