@@ -89,8 +89,8 @@ with sg.Network.load("xor.slett") as net:
 | `evaluate(x, y)` | `Metrics(loss, accuracy)` |
 | `Trainer(net, max_batch)` | `forward(x)`, `backward(y)`, `backward_output_grads(dl_dout)` for custom losses, `step(optimizer=..., learning_rate=...)`, `zero_grad()`, `train_on_batch(x, y, ...)`; gradients via `net.get_weight_gradients(i)` / `get_bias_gradients(i)` |
 | `load_idx(images, labels, num_classes=0)`, `load_cifar(paths, num_classes=10)`, `load_csv(path, target_columns=1, num_classes=0)` | return `(inputs, targets)` float32 arrays; CIFAR images as 32 x 32 x 3, channels last |
-| `save_dataset(path, x, y, input_encoding=AUTO, target_encoding=AUTO, compress=True)`, `load_dataset(path)`, `dataset_info(path)` | `.slettd` data set files |
-| `train_from_file(path, shuffle=True, ...)` | trains on a `.slettd` file streamed by the C reader, one chunk in memory |
+| `save_dataset(path, x, y, input_encoding=AUTO, target_encoding=AUTO, compress=True, shape=None, class_names=None, target_name=None, extra_targets=None)`, `load_dataset(path, target_set=0)`, `dataset_info(path)` | `.slettd` data set files, optionally with the input shape, class names and further sets of targets (`extra_targets`: dicts with `"targets"` and optionally `"name"`, `"class_names"`, `"encoding"`); `dataset_info` returns the counts, encodings, `shape` and `target_sets` |
+| `train_from_file(path, shuffle=True, in_memory=False, prefetch=True, target_set=0, ...)` | trains on a `.slettd` file through the C reader: streamed with a few chunks in memory, or with `in_memory=True` decoded once and kept in its compact form (a byte per 8-bit value); `prefetch=False` keeps decoding off a background thread |
 | `CosineDecay`, `LinearWarmup`, `StepDecay`, `WarmupCosine` | built-in schedules; any `fn(epoch, total, initial_lr)` works too |
 | `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weights `i` feed layer `i + 1`: shape `(out, in)` for a dense layer, `(filters, kernel_h, kernel_w, in_channels / groups)` for a convolution, gamma `(channels,)` for batch normalization (beta are its biases), empty for pooling |
 | `save(path, precision, save_optimizer)`, `Network.load(path)` | `.slett` files, shared with the C API |
@@ -102,6 +102,11 @@ with sg.Network.load("xor.slett") as net:
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
 | `cpu_kernels()`, `library_version()`, `library_path()` | the matrix kernels in use (`"AVX-512"`, `"AVX2"`, ...), the loaded library |
+
+`uint8` arrays stand for 8-bit images: value q means q / 255 in `train()`, `forward()`,
+`predict()`, `evaluate()` and `save_dataset()`. `train()` keeps such inputs as bytes, a quarter of
+the memory of float32, and converts them a batch at a time, with the same result as training on
+`x / 255` in float32.
 
 Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bindings check on import
 that the library has the same major.minor version (`library_version()`), because they mirror its

@@ -175,6 +175,37 @@ with tempfile.TemporaryDirectory() as d:
     except sg.SpingalettError as e:
         check(e.code == sg.ErrorCode.FILE_IO, "missing data set error code")
 
+    # shape, class names and a second set of targets; uint8 images; in-memory and u8 training
+    imgs = rng.integers(0, 256, size=(300, 4, 4, 3), dtype=np.uint8)
+    labels = rng.integers(0, 3, 300)
+    yd = np.eye(3, dtype=np.float32)[labels]
+    yp = np.eye(2, dtype=np.float32)[labels % 2]
+    meta = os.path.join(d, "meta.slettd")
+    sg.save_dataset(meta, imgs, yd, class_names=["cat", "dog", "fox"], target_name="animal",
+                    extra_targets=[{"targets": yp, "name": "parity", "class_names": ["even", "odd"]}])
+    info = sg.dataset_info(meta)
+    check(info["shape"] == (4, 4, 3) and info["format_version"] == 2 and info["input_encoding"] == sg.DatasetEncoding.U8_UNIT
+          and info["target_sets"] == [{"name": "animal", "size": 3, "class_names": ["cat", "dog", "fox"]},
+                                      {"name": "parity", "size": 2, "class_names": ["even", "odd"]}], f"slettd metadata {info}")
+    mx, my = sg.load_dataset(meta)
+    check(np.array_equal(mx, imgs.reshape(300, -1).astype(np.float64).__truediv__(255.0).astype(np.float32))
+          and np.array_equal(my, yd), "uint8 images round trip as q / 255")
+    _, mp = sg.load_dataset(meta, target_set=1)
+    check(np.array_equal(mp, yp), "second set of targets")
+    def image_net():
+        sg.seed(48)
+        return sg.Network(sg.Loss.CROSS_ENTROPY, [48, sg.Layer(8, sg.Activation.RELU, sg.Init.HE),
+                                                  sg.Layer(3, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
+    with image_net() as a, image_net() as b, image_net() as c:
+        a.train(mx, yd, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=32, shuffle=False, optimizer=sg.Optimizer.ADAM)
+        b.train(imgs.reshape(300, -1), yd, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=32, shuffle=False,
+                optimizer=sg.Optimizer.ADAM)
+        c.train_from_file(meta, in_memory=True, shuffle=False, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=32,
+                          optimizer=sg.Optimizer.ADAM)
+        check(np.array_equal(a.get_weights(0), b.get_weights(0)) and np.array_equal(a.get_weights(0), c.get_weights(0)),
+              "training on uint8 arrays and in memory == training on floats")
+        check(np.array_equal(a.forward(imgs.reshape(300, -1)[:5]), a.forward(mx[:5])), "forward reads uint8 as q / 255")
+
 # dropout + save/load + precision
 with tempfile.TemporaryDirectory() as d:
     sg.seed(3)
