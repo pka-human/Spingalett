@@ -18,6 +18,11 @@
  * columns when there are few blocks), with op(B) packed once per K block for all threads; small M
  * (a mini-batch) packs op(A) once for all threads and gives each thread its own column panels,
  * which it packs and multiplies itself.
+ *
+ * x86-64 builds that are not tuned for the build machine (SPINGALETT_GEMM_DISPATCH) compile this
+ * file twice more, through Kernels/Spingalett.GEMM.AVX2.c and Kernels/Spingalett.GEMM.AVX512.c
+ * with those instruction sets enabled; spingalett_gemm_native() then runs the best kernels the
+ * processor supports.
  */
 
 #include "Spingalett.Private.h"
@@ -46,23 +51,25 @@
 
 #define KC 256
 #define NC 3072
+#define MC_MAX 144      /* the largest MC of any kernel set: one scratch serves them all */
 
 /* Small M: at most this many row blocks run with op(A) shared between threads. */
 #define SHARED_A_BLOCKS 2
 
 struct SpingalettGemmScratch {
     float *b_pack;      /* KC x NC */
-    float *a_pack;      /* threads x (MC x KC); with a shared op(A), one M x KC block */
+    float *a_pack;      /* threads x (MC_MAX x KC); with a shared op(A), one M x KC block */
     int threads;
 };
 
+#if !defined(SPINGALETT_GEMM_VARIANT)
 SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads) {
     if (threads < 1) threads = 1;
     SpingalettGemmScratch *s = (SpingalettGemmScratch *)calloc(1, sizeof(SpingalettGemmScratch));
     if (!s) return NULL;
     s->threads = threads;
     s->b_pack = (float *)spingalett_aligned_alloc((size_t)KC * NC * sizeof(float));
-    s->a_pack = (float *)spingalett_aligned_alloc((size_t)threads * MC * KC * sizeof(float));
+    s->a_pack = (float *)spingalett_aligned_alloc((size_t)threads * MC_MAX * KC * sizeof(float));
     if (!s->b_pack || !s->a_pack) {
         spingalett_gemm_scratch_free(s);
         return NULL;
@@ -76,6 +83,7 @@ void spingalett_gemm_scratch_free(SpingalettGemmScratch *s) {
     spingalett_aligned_free(s->a_pack);
     free(s);
 }
+#endif
 
 #if defined(__AVX__)
 /* dst[k * ds + r] = src[r * ld + k] for an 8 x 8 block. */
@@ -325,35 +333,29 @@ static void multiply_block(const float *a, const float *b_pack, uint32_t mc, uin
     }
 }
 
-void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
-                            uint32_t M, uint32_t N, uint32_t K, float alpha,
-                            const float *A, size_t lda, const float *B, size_t ldb,
-                            float beta, float *C, size_t ldc, bool parallel) {
-    if (M == 0 || N == 0) return;
-    if (K == 0 || alpha == 0.0f) {      /* C = beta * C */
-        for (uint32_t i = 0; i < M; i++) {
-            float *cr = C + (size_t)i * ldc;
-            if (beta == 0.0f) memset(cr, 0, N * sizeof(float));
-            else for (uint32_t j = 0; j < N; j++) cr[j] *= beta;
-        }
-        return;
-    }
-
-    SpingalettGemmScratch *own = NULL;
-    if (!scratch) {
-        int threads = 1;
-#if defined(_OPENMP)
-        if (parallel) threads = omp_get_max_threads();
+/* The multiplication with this translation unit's kernels (scratch is not NULL, M, N, K > 0). */
+#if defined(SPINGALETT_GEMM_VARIANT)
+void SPINGALETT_GEMM_VARIANT(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                             uint32_t M, uint32_t N, uint32_t K, float alpha,
+                             const float *A, size_t lda, const float *B, size_t ldb,
+                             float beta, float *C, size_t ldc, bool parallel) {
+#elif defined(SPINGALETT_GEMM_DISPATCH)
+void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                              uint32_t M, uint32_t N, uint32_t K, float alpha,
+                              const float *A, size_t lda, const float *B, size_t ldb,
+                              float beta, float *C, size_t ldc, bool parallel) {
+#else
+static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                                     uint32_t M, uint32_t N, uint32_t K, float alpha,
+                                     const float *A, size_t lda, const float *B, size_t ldb,
+                                     float beta, float *C, size_t ldc, bool parallel) {
 #endif
-        scratch = own = spingalett_gemm_scratch_create(threads);
-        if (!scratch) { set_error(SPINGALETT_ERR_ALLOC, "GEMM scratch allocation failed"); return; }
-    }
     int threads = parallel ? scratch->threads : 1;
 
     uint32_t m_panels = (M + MR - 1) / MR;
     int64_t mblocks = (int64_t)((M + MC - 1) / MC);
     bool shared_a = threads > 1 && mblocks <= SHARED_A_BLOCKS &&
-                    (size_t)m_panels * MR <= (size_t)scratch->threads * MC;
+                    (size_t)m_panels * MR <= (size_t)scratch->threads * MC_MAX;
 
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(threads) if(threads > 1)
@@ -421,7 +423,7 @@ void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool t
                 }
                 int64_t panels_per_split = (panels + nsplit - 1) / nsplit;
                 int64_t tiles = mblocks * nsplit;
-                float *a_pack = scratch->a_pack + (size_t)tid * MC * KC;
+                float *a_pack = scratch->a_pack + (size_t)tid * MC_MAX * KC;
 
 #if defined(_OPENMP)
 #pragma omp for schedule(dynamic)
@@ -441,6 +443,70 @@ void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool t
             }
         }
     }
+}
 
+#if !defined(SPINGALETT_GEMM_VARIANT)
+
+#if defined(__AVX512F__)
+#  define GEMM_KERNELS "AVX-512"
+#elif defined(__AVX2__) && defined(__FMA__)
+#  define GEMM_KERNELS "AVX2"
+#elif defined(__AVX__)
+#  define GEMM_KERNELS "AVX"
+#elif defined(__SSE2__) || defined(_M_X64)
+#  define GEMM_KERNELS "SSE2"
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+#  define GEMM_KERNELS "NEON"
+#else
+#  define GEMM_KERNELS "C"
+#endif
+
+typedef void (*GemmFunction)(SpingalettGemmScratch *, bool, bool, uint32_t, uint32_t, uint32_t, float,
+                             const float *, size_t, const float *, size_t, float, float *, size_t, bool);
+
+/* The kernels for this processor: the run-time choice where there is one. */
+static GemmFunction gemm_select(const char **name) {
+#if defined(SPINGALETT_GEMM_DISPATCH)
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx512f")) { *name = "AVX-512"; return spingalett_gemm_avx512; }
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) { *name = "AVX2"; return spingalett_gemm_avx2; }
+#endif
+    *name = GEMM_KERNELS;
+    return spingalett_gemm_baseline;
+}
+
+const char *spingalett_cpu_kernels(void) {
+    const char *name;
+    gemm_select(&name);
+    return name;
+}
+
+void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                            uint32_t M, uint32_t N, uint32_t K, float alpha,
+                            const float *A, size_t lda, const float *B, size_t ldb,
+                            float beta, float *C, size_t ldc, bool parallel) {
+    if (M == 0 || N == 0) return;
+    if (K == 0 || alpha == 0.0f) {      /* C = beta * C */
+        for (uint32_t i = 0; i < M; i++) {
+            float *cr = C + (size_t)i * ldc;
+            if (beta == 0.0f) memset(cr, 0, N * sizeof(float));
+            else for (uint32_t j = 0; j < N; j++) cr[j] *= beta;
+        }
+        return;
+    }
+
+    SpingalettGemmScratch *own = NULL;
+    if (!scratch) {
+        int threads = 1;
+#if defined(_OPENMP)
+        if (parallel) threads = omp_get_max_threads();
+#endif
+        scratch = own = spingalett_gemm_scratch_create(threads);
+        if (!scratch) { set_error(SPINGALETT_ERR_ALLOC, "GEMM scratch allocation failed"); return; }
+    }
+    const char *name;
+    gemm_select(&name)(scratch, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, parallel);
     spingalett_gemm_scratch_free(own);
 }
+
+#endif

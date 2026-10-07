@@ -258,6 +258,28 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(spingalett PRIVATE m)
 endif()
 
+# x86-64 binaries that are not tuned for the build machine (release packages, MinGW) also carry
+# GEMM kernels for AVX2 and AVX-512 and pick them at run time (Src/Spingalett.GEMM.c).
+option(SPINGALETT_CPU_DISPATCH "Choose AVX2 or AVX-512 GEMM kernels at run time on x86-64 builds without -march=native" ON)
+set(_spg_native_flags OFF)
+if(SPINGALETT_NATIVE_ARCH AND NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(_spg_native_flags ON)
+endif()
+if(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    set(SPINGALETT_GEMM_VARIANTS
+        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX2.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX512.c)
+    target_sources(spingalett PRIVATE ${SPINGALETT_GEMM_VARIANTS})
+    target_compile_definitions(spingalett PRIVATE SPINGALETT_GEMM_DISPATCH)
+    # -fno-lto: link-time optimization must not move code between instruction sets
+    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX2.c
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-fno-lto")
+    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX512.c
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mfma;-fno-lto")
+    message(STATUS "Spingalett: GEMM kernels for AVX2 and AVX-512 chosen at run time")
+endif()
+
 # The inference engine and batched model inference compute in IEEE order (no reassociation,
 # reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -391,6 +413,10 @@ if(BUILD_TESTS)
     target_include_directories(SpingalettGemmTests PRIVATE Src ${CMAKE_CURRENT_SOURCE_DIR}/Include
                                ${CMAKE_CURRENT_BINARY_DIR}/Spingalett)
     target_compile_definitions(SpingalettGemmTests PRIVATE SPINGALETT_STATIC)
+    if(SPINGALETT_GEMM_VARIANTS)              # every kernel set the processor supports
+        target_sources(SpingalettGemmTests PRIVATE ${SPINGALETT_GEMM_VARIANTS})
+        target_compile_definitions(SpingalettGemmTests PRIVATE SPINGALETT_GEMM_DISPATCH)
+    endif()
     if(SPINGALETT_NATIVE_ARCH AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
         target_compile_options(SpingalettGemmTests PRIVATE -O2 -march=native)
     endif()

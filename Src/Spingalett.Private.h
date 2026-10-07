@@ -138,6 +138,22 @@ void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool t
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             const float *A, size_t lda, const float *B, size_t ldb,
                             float beta, float *C, size_t ldc, bool parallel);
+#if defined(SPINGALETT_GEMM_DISPATCH)
+/* The same with one kernel set: the library's baseline flags, AVX2+FMA or AVX-512 (scratch must
+   not be NULL; M, N and K must be positive). */
+void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                              uint32_t M, uint32_t N, uint32_t K, float alpha,
+                              const float *A, size_t lda, const float *B, size_t ldb,
+                              float beta, float *C, size_t ldc, bool parallel);
+void spingalett_gemm_avx2(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                          uint32_t M, uint32_t N, uint32_t K, float alpha,
+                          const float *A, size_t lda, const float *B, size_t ldb,
+                          float beta, float *C, size_t ldc, bool parallel);
+void spingalett_gemm_avx512(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
+                            uint32_t M, uint32_t N, uint32_t K, float alpha,
+                            const float *A, size_t lda, const float *B, size_t ldb,
+                            float beta, float *C, size_t ldc, bool parallel);
+#endif
 
 /* Multiply-adds below which a GEMM runs on one thread. */
 #define SPINGALETT_GEMM_PARALLEL_WORK (1u << 18)
