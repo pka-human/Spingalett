@@ -72,6 +72,17 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerSh
     } else if (args->type == LAYER_DENSE) {
         units = args->neurons_amount;
         shape->channels = args->neurons_amount;
+    } else if (args->type == LAYER_BATCH_NORM) {
+        /* the previous layer's shape, normalized per channel */
+        const LayerShape *in = &net->shapes[net->layers - 1];
+        if (!(args->epsilon >= 0.0f && args->epsilon < 1.0f) || !(args->momentum >= 0.0f && args->momentum <= 1.0f))
+            return layer_error("Batch normalization needs epsilon in [0, 1) and momentum in [0, 1]");
+        shape->height = in->height;
+        shape->width = in->width;
+        shape->channels = in->channels;
+        shape->eps = args->epsilon > 0.0f ? args->epsilon : 1e-5f;
+        shape->momentum = args->momentum > 0.0f ? args->momentum : 0.1f;
+        units = net->topology[net->layers - 1];
     } else {
         const LayerShape *in = &net->shapes[net->layers - 1];
         bool conv = args->type == LAYER_CONV2D;
@@ -91,6 +102,11 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerSh
             return layer_error("The kernel is larger than the (padded) input");
         if (conv && args->filters == 0)
             return layer_error("A convolution layer needs filters > 0");
+        uint32_t groups = conv && args->groups ? args->groups : 1u;
+        if (conv && (in->channels % groups != 0 || args->filters % groups != 0))
+            return layer_error("Convolution groups must divide the input channels and the filters");
+        shape->groups = groups;
+        if (groups > 1) return layer_error("Grouped convolutions are not supported yet");
         shape->kernel_h = kh; shape->kernel_w = kw;
         shape->stride_h = sh; shape->stride_w = sw;
         shape->pad_h = ph; shape->pad_w = pw;
@@ -98,7 +114,7 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerSh
         shape->width = (uint32_t)(((uint64_t)in->width + 2u * pw - kw) / sw + 1u);
         shape->channels = conv ? args->filters : in->channels;
         units = (uint64_t)shape->height * shape->width * shape->channels;
-        if (conv && (uint64_t)kh * kw * in->channels > UINT32_MAX)
+        if (conv && (uint64_t)kh * kw * (in->channels / groups) > UINT32_MAX)
             return layer_error("Convolution windows are limited to 2^32 - 1 inputs");
     }
     if (units == 0)
@@ -132,7 +148,7 @@ bool spingalett_add_layer(LayerArgs args) {
     net->forward_ws = NULL;
     bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D;
     if (pooling) act_func = ACT_NONE;
-    static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d"};
+    static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm"};
 
     uint32_t nl = net->layers + 1;
 
@@ -158,8 +174,9 @@ bool spingalett_add_layer(LayerArgs args) {
     if (nl > 1 && shape.type == LAYER_DENSE) { rows = neurons_amount; row_len = prev_neurons; }
     if (nl > 1 && shape.type == LAYER_CONV2D) {
         rows = shape.channels;
-        row_len = shape.kernel_h * shape.kernel_w * net->shapes[net->layers - 1].channels;
+        row_len = shape.kernel_h * shape.kernel_w * (net->shapes[net->layers - 1].channels / shape.groups);
     }
+    if (nl > 1 && shape.type == LAYER_BATCH_NORM) { rows = shape.channels; row_len = 1; }
     uint64_t add_w = (uint64_t)rows * row_len;
     uint64_t add_b = rows;
 
@@ -180,6 +197,7 @@ bool spingalett_add_layer(LayerArgs args) {
     float *t_gw = NULL, *t_gb = NULL;
     float *t_mw = NULL, *t_mb = NULL;
     float *t_vw = NULL, *t_vb = NULL;
+    float *t_rm = NULL, *t_rv = NULL;
 
     /* sizes of at least 1: pooling layers add no parameters, and a network of pooling layers has none */
     size_t nw = new_tw ? new_tw : 1, nb = new_tb ? new_tb : 1;
@@ -193,11 +211,13 @@ bool spingalett_add_layer(LayerArgs args) {
         t_mb  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
         t_vw  = (float *)spingalett_aligned_calloc(nw, sizeof(float));
         t_vb  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
+        t_rm  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
+        t_rv  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
     }
 
     bool ok = t_topo && t_shapes && t_noff && t_woff && t_boff && t_neurons && t_drop;
     if (nl > 1)
-        ok = ok && t_act && t_w && t_b && t_gw && t_gb && t_mw && t_mb && t_vw && t_vb;
+        ok = ok && t_act && t_w && t_b && t_gw && t_gb && t_mw && t_mb && t_vw && t_vb && t_rm && t_rv;
 
     if (!ok) {
         free(t_topo); free(t_shapes); free(t_noff); free(t_woff); free(t_boff); free(t_drop);
@@ -208,6 +228,7 @@ bool spingalett_add_layer(LayerArgs args) {
             spingalett_aligned_free(t_gw); spingalett_aligned_free(t_gb);
             spingalett_aligned_free(t_mw); spingalett_aligned_free(t_mb);
             spingalett_aligned_free(t_vw); spingalett_aligned_free(t_vb);
+            spingalett_aligned_free(t_rm); spingalett_aligned_free(t_rv);
         }
         set_error(SPINGALETT_ERR_ALLOC, "Layer allocation failed");
         return false;
@@ -243,6 +264,8 @@ bool spingalett_add_layer(LayerArgs args) {
             memcpy(t_gb, net->grad_biases,   net->total_biases * sizeof(float));
             memcpy(t_mb, net->opt_m_biases,  net->total_biases * sizeof(float));
             memcpy(t_vb, net->opt_v_biases,  net->total_biases * sizeof(float));
+            memcpy(t_rm, net->running_mean,  net->total_biases * sizeof(float));
+            memcpy(t_rv, net->running_var,   net->total_biases * sizeof(float));
         }
 
         /* Standard deviations: Glorot sqrt(2 / (fan_in + fan_out)), He sqrt(2 / fan_in),
@@ -260,11 +283,16 @@ bool spingalett_add_layer(LayerArgs args) {
 
         for (uint64_t idx = 0; idx < add_w; idx++) {
             uint64_t pos = net->total_weights + idx;
-            if (wi == WEIGHT_INITIALIZATION_RANDOM)
+            if (shape.type == LAYER_BATCH_NORM)
+                t_w[pos] = 1.0f;                        /* gamma; beta starts at 0 */
+            else if (wi == WEIGHT_INITIALIZATION_RANDOM)
                 t_w[pos] = random_uniform_weight();
             else if (wi != WEIGHT_INITIALIZATION_NONE)
                 t_w[pos] = random_normal_weight() * scale;
         }
+        if (shape.type == LAYER_BATCH_NORM)
+            for (uint64_t idx = 0; idx < add_b; idx++)
+                t_rv[net->total_biases + idx] = 1.0f;   /* running variance; the mean starts at 0 */
     }
 
     free(net->topology);
@@ -283,6 +311,8 @@ bool spingalett_add_layer(LayerArgs args) {
     spingalett_aligned_free(net->opt_m_biases);
     spingalett_aligned_free(net->opt_v_weights);
     spingalett_aligned_free(net->opt_v_biases);
+    spingalett_aligned_free(net->running_mean);
+    spingalett_aligned_free(net->running_var);
 
     net->layers         = nl;
     net->topology       = t_topo;
@@ -301,6 +331,8 @@ bool spingalett_add_layer(LayerArgs args) {
     net->opt_m_biases    = t_mb;
     net->opt_v_weights   = t_vw;
     net->opt_v_biases    = t_vb;
+    net->running_mean    = t_rm;
+    net->running_var     = t_rv;
     net->total_neurons   = new_tn;
     net->total_weights   = new_tw;
     net->total_biases    = new_tb;
@@ -311,6 +343,40 @@ bool spingalett_add_layer(LayerArgs args) {
 
 void layer_struct_arguments(LayerArgs args) {
     (void)spingalett_add_layer(args);
+}
+
+LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
+    const LayerShape *s = &net->shapes[l];
+    LayerArgs a = {0};
+    a.net = net;
+    a.weight_initialization = WEIGHT_INITIALIZATION_NONE;
+    a.dropout_rate = net->dropout_rates[l];
+    if (l == 0) {
+        a.neurons_amount = net->topology[0];
+        a.height = s->height;
+        a.width = s->width;
+        a.channels = s->channels;
+        return a;
+    }
+    a.type = s->type;
+    a.act_func = net->act_func[l - 1];
+    switch (s->type) {
+        case LAYER_DENSE:
+            a.neurons_amount = net->topology[l];
+            break;
+        case LAYER_BATCH_NORM:
+            a.epsilon = s->eps;
+            a.momentum = s->momentum;
+            break;
+        default:
+            a.filters = s->type == LAYER_CONV2D ? s->channels : 0u;
+            a.groups = s->type == LAYER_CONV2D ? s->groups : 0u;
+            a.kernel_h = s->kernel_h; a.kernel_w = s->kernel_w;
+            a.stride_h = s->stride_h; a.stride_w = s->stride_w;
+            a.padding_h = s->pad_h; a.padding_w = s->pad_w;
+            break;
+    }
+    return a;
 }
 
 uint32_t spingalett_layer_count(const NeuralNetwork *net) {
@@ -337,6 +403,9 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->stride_w = s->stride_w;
     layer->padding_h = s->pad_h;
     layer->padding_w = s->pad_w;
+    layer->groups = s->type == LAYER_CONV2D ? s->groups : 0u;
+    layer->epsilon = s->eps;
+    layer->momentum = s->momentum;
     if (index > 0) {
         layer->bias_count = spingalett_weight_rows(net, index - 1);
         layer->weight_count = layer->bias_count * spingalett_weight_row_len(net, index - 1);
@@ -373,16 +442,20 @@ static float *parameter_block(const NeuralNetwork *net, uint32_t index, Paramete
     }
     uint64_t rows = spingalett_weight_rows(net, index - 1);
     bool weights = kind == PARAM_WEIGHTS || kind == PARAM_WEIGHT_GRADIENTS;
+    bool statistics = kind == PARAM_RUNNING_MEAN || kind == PARAM_RUNNING_VARIANCE;
     uint64_t expected = weights ? rows * spingalett_weight_row_len(net, index - 1) : rows;
-    if (count != expected) {
+    if (count != expected || (statistics && net->shapes[index].type != LAYER_BATCH_NORM)) {
         set_error(SPINGALETT_ERR_INVALID, who);
         return NULL;
     }
+    uint64_t b = net->bias_offsets[index - 1];
     switch (kind) {
         case PARAM_WEIGHTS:          return net->weights + net->weight_offsets[index - 1];
-        case PARAM_BIASES:           return net->biases + net->bias_offsets[index - 1];
+        case PARAM_BIASES:           return net->biases + b;
         case PARAM_WEIGHT_GRADIENTS: return net->grad_weights + net->weight_offsets[index - 1];
-        default:                     return net->grad_biases + net->bias_offsets[index - 1];
+        case PARAM_BIAS_GRADIENTS:   return net->grad_biases + b;
+        case PARAM_RUNNING_MEAN:     return net->running_mean + b;
+        default:                     return net->running_var + b;
     }
 }
 
@@ -525,6 +598,8 @@ void free_network(NeuralNetwork *net) {
     spingalett_aligned_free(net->opt_m_biases);
     spingalett_aligned_free(net->opt_v_weights);
     spingalett_aligned_free(net->opt_v_biases);
+    spingalett_aligned_free(net->running_mean);
+    spingalett_aligned_free(net->running_var);
     free(net->neuron_offsets);
     free(net->weight_offsets);
     free(net->bias_offsets);

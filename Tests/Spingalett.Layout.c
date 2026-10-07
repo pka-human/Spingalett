@@ -22,7 +22,8 @@ int main(void) {
     FIELD(LayerArgs, height); FIELD(LayerArgs, width); FIELD(LayerArgs, channels); FIELD(LayerArgs, filters);
     FIELD(LayerArgs, kernel); FIELD(LayerArgs, stride); FIELD(LayerArgs, padding);
     FIELD(LayerArgs, kernel_h); FIELD(LayerArgs, kernel_w); FIELD(LayerArgs, stride_h); FIELD(LayerArgs, stride_w);
-    FIELD(LayerArgs, padding_h); FIELD(LayerArgs, padding_w);
+    FIELD(LayerArgs, padding_h); FIELD(LayerArgs, padding_w); FIELD(LayerArgs, groups); FIELD(LayerArgs, epsilon);
+    FIELD(LayerArgs, momentum);
 
     SIZE(SpingalettNetworkLayer);
     FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
@@ -30,6 +31,7 @@ int main(void) {
     FIELD(SpingalettNetworkLayer, dropout_rate); FIELD(SpingalettNetworkLayer, kernel_h); FIELD(SpingalettNetworkLayer, kernel_w);
     FIELD(SpingalettNetworkLayer, stride_h); FIELD(SpingalettNetworkLayer, stride_w); FIELD(SpingalettNetworkLayer, padding_h);
     FIELD(SpingalettNetworkLayer, padding_w); FIELD(SpingalettNetworkLayer, weight_count); FIELD(SpingalettNetworkLayer, bias_count);
+    FIELD(SpingalettNetworkLayer, groups); FIELD(SpingalettNetworkLayer, epsilon); FIELD(SpingalettNetworkLayer, momentum);
 
     SIZE(ForwardArgs); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
@@ -102,6 +104,7 @@ int main(void) {
     FIELD(SpingalettLayerInfo, height); FIELD(SpingalettLayerInfo, width); FIELD(SpingalettLayerInfo, channels);
     FIELD(SpingalettLayerInfo, kernel_h); FIELD(SpingalettLayerInfo, kernel_w); FIELD(SpingalettLayerInfo, stride_h);
     FIELD(SpingalettLayerInfo, stride_w); FIELD(SpingalettLayerInfo, padding_h); FIELD(SpingalettLayerInfo, padding_w);
+    FIELD(SpingalettLayerInfo, groups); FIELD(SpingalettLayerInfo, epsilon);
 
     SIZE(LRScheduleParams);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);

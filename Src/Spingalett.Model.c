@@ -41,7 +41,7 @@ static SpingalettModel *adopt_image(void *image, size_t size) {
 
 SpingalettModel *spingalett_model_from_network(const NeuralNetwork *net, PrecisionMode precision) {
     size_t size = 0;
-    void *image = spingalett_save_to_memory(net, precision, false, &size);
+    void *image = spingalett_save_deployment(net, precision, &size);
     return image ? adopt_image(image, size) : NULL;
 }
 
@@ -104,6 +104,7 @@ typedef struct {
     int8_t **unpacked;                          /* integer convolution filters as bytes, per layer:
                                                    transposed for short windows, rows for INT4 / INT2 */
     float *conv;                                /* gathered windows of float convolutions (OpenBLAS) */
+    float *norm;                                /* batch normalization coefficients */
     SpingalettGemmScratch *gemm;
     int threads;
 } PredictWorkspace;
@@ -116,6 +117,7 @@ static void predict_workspace_free(PredictWorkspace *w, uint32_t layers) {
     spingalett_aligned_free(w->rows);
     spingalett_aligned_free(w->window);
     spingalett_aligned_free(w->conv);
+    spingalett_aligned_free(w->norm);
     for (uint32_t i = 0; i < layers; i++) {
         if (w->dequant) spingalett_aligned_free(w->dequant[i]);
         if (w->unpacked) spingalett_aligned_free(w->unpacked[i]);
@@ -131,7 +133,7 @@ static LayerShape input_shape(const SlettLayer *L) {
 
 static LayerShape output_shape(const SlettLayer *L) {
     return (LayerShape){L->type, L->out_h, L->out_w, L->out_c, L->kernel_h, L->kernel_w,
-                        L->stride_h, L->stride_w, L->pad_h, L->pad_w};
+                        L->stride_h, L->stride_w, L->pad_h, L->pad_w, L->groups, L->eps, L->momentum};
 }
 
 static bool predict_workspace_create(const SpingalettModel *model, uint32_t chunk, ComputeMode mode, PredictWorkspace *w) {
@@ -147,10 +149,12 @@ static bool predict_workspace_create(const SpingalettModel *model, uint32_t chun
     w->dequant = (float **)calloc(model->layer_count, sizeof(float *));
     w->unpacked = (int8_t **)calloc(model->layer_count, sizeof(int8_t *));
     if (!w->dequant || !w->unpacked) return false;
+    uint32_t norm_channels = 0;
     for (uint32_t i = 0; i < model->layer_count; i++) {
         SlettLayer L;
         spingalett_slett_layer(image, i, &L);
-        if (L.rows == 0) continue;              /* pooling */
+        if (L.type == LAYER_BATCH_NORM && L.out_c > norm_channels) norm_channels = L.out_c;
+        if (L.rows == 0 || L.type == LAYER_BATCH_NORM) continue;      /* pooling, normalization */
         bool conv = L.type == LAYER_CONV2D;
         bool columns = slett_conv_columns(&L);
         if (spingalett_precision_is_int(L.precision)) {
@@ -214,6 +218,10 @@ static bool predict_workspace_create(const SpingalettModel *model, uint32_t chun
     if (conv_floats) {
         w->conv = (float *)spingalett_aligned_alloc(conv_floats * sizeof(float));
         if (!w->conv) return false;
+    }
+    if (norm_channels) {
+        w->norm = (float *)spingalett_aligned_alloc(2u * (size_t)norm_channels * sizeof(float));
+        if (!w->norm) return false;
     }
     if (has_float && mode != COMPUTE_OPENBLAS) {
         w->gemm = spingalett_gemm_scratch_create(w->threads);
@@ -293,6 +301,25 @@ static void predict_layer(const uint8_t *image, const SlettLayer *L, const float
     uint32_t in = L->inputs, out = L->outputs;
     const float *bias = (const float *)(const void *)(image + L->biases);
 
+    if (L->type == LAYER_BATCH_NORM) {
+        /* as the engine computes it: y = x a + b per channel, then the activation */
+        const uint32_t C = L->out_c;
+        const float *stats = (const float *)(const void *)(image + L->scales);
+        float *a = w->norm, *b = w->norm + C;
+        spingalett_bn_coefficients((const float *)(const void *)(image + L->weights), bias, stats, stats + C, L->eps, C,
+                                   a, b);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)n * out))
+#endif
+        for (int64_t s = 0; s < (int64_t)n; s++) {
+            const float *xs = x + (size_t)s * out;
+            float *ys = y + (size_t)s * out;
+            for (uint32_t i = 0; i < out; i += C)
+                for (uint32_t c = 0; c < C; c++) ys[i + c] = xs[i + c] * a[c] + b[c];
+            spingalett_engine_activate(ys, out, L->activation);
+        }
+        return;
+    }
     if (L->type != LAYER_DENSE) {
         LayerShape is = input_shape(L), os = output_shape(L);
         if (L->type != LAYER_CONV2D) {

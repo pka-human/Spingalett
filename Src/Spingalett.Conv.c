@@ -301,10 +301,16 @@ size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *o
 void spingalett_conv_forward_shapes(const LayerShape *in, const LayerShape *out, const float *Wt, const float *bias,
                                     const float *x, float *y, uint32_t n, ActivationFunction act, float *scratch,
                                     SpingalettGemmScratch *gemm, ComputeMode mode) {
+    spingalett_conv_forward_scaled(in, out, Wt, NULL, bias, x, y, n, act, scratch, gemm, mode);
+}
+
+void spingalett_conv_forward_scaled(const LayerShape *in, const LayerShape *out, const float *Wt, const float *scale,
+                                    const float *bias, const float *x, float *y, uint32_t n, ActivationFunction act,
+                                    float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode) {
     const uint32_t OC = out->channels;
     const size_t K = (size_t)out->kernel_h * out->kernel_w * in->channels;
     const uint64_t total = (uint64_t)n * out->height * out->width;
-    SpingalettBiasActivation epilogue = {bias, act == ACT_SOFTMAX ? ACT_NONE : act};
+    SpingalettBiasActivation epilogue = {bias, act == ACT_SOFTMAX ? ACT_NONE : act, scale};
     SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
 
     if (pointwise(out) || implicit(mode)) {

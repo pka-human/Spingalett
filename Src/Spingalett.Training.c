@@ -67,13 +67,34 @@ static void optimizer_update_array(const OptimizerStep *o, float *W, float *mW, 
     (void)mode;
 }
 
+static bool has_batch_norm(const NeuralNetwork *net) {
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_BATCH_NORM) return true;
+    return false;
+}
+
+/* Weight decay of weight layer l: none for batch normalization's gamma (nor for any bias). */
+static inline float layer_decay(const NeuralNetwork *net, uint32_t l, float decay) {
+    return net->shapes[l + 1].type == LAYER_BATCH_NORM ? 0.0f : decay;
+}
+
 /* Apply the accumulated (already averaged) gradients of all layers. */
 static void apply_gradients(NeuralNetwork *net, const OptimizerStep *o, float max_grad_norm, ComputeMode mode) {
     if (max_grad_norm > 0.0f)
         spingalett_clip_grad_norm(net, max_grad_norm);
 
-    optimizer_update_array(o, net->weights, net->opt_m_weights, net->opt_v_weights,
-                           net->grad_weights, net->total_weights, o->decay, mode);
+    if (o->decay != 0.0f && has_batch_norm(net)) {
+        for (uint32_t l = 0; l + 1 < net->layers; l++) {
+            uint64_t w = net->weight_offsets[l];
+            optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
+                                   net->grad_weights + w,
+                                   (uint64_t)spingalett_weight_rows(net, l) * spingalett_weight_row_len(net, l),
+                                   layer_decay(net, l, o->decay), mode);
+        }
+    } else {
+        optimizer_update_array(o, net->weights, net->opt_m_weights, net->opt_v_weights,
+                               net->grad_weights, net->total_weights, o->decay, mode);
+    }
     optimizer_update_array(o, net->biases, net->opt_m_biases, net->opt_v_biases,
                            net->grad_biases, net->total_biases, 0.0f, mode);
 }
@@ -272,6 +293,12 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
                 spingalett_conv_backward_data(net, l, ws->delta[l + 1], ws->delta[l], N, ws->act[l], fused, ws->conv,
                                               ws->gemm, mode);
                 break;
+            case LAYER_BATCH_NORM:  /* the sums are also the parameters' gradients */
+                spingalett_bn_backward_sums(net, l, ws->act[l], ws->delta[l + 1], N, ws->bn_stats[l + 1],
+                                            ws->bn_sums[l + 1], ws->bn_scratch, mode);
+                spingalett_bn_backward_data(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, ws->bn_stats[l + 1],
+                                            ws->bn_sums[l + 1], fused, ws->bn_coef, mode);
+                break;
             default:                /* pooling has no activation: delta[l+1] is dL/d(its output) */
                 spingalett_pool_backward(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, fused, mode);
                 break;
@@ -316,6 +343,19 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
         } else if (type == LAYER_CONV2D) {
             spingalett_conv_backward_weights(net, l, ws->act[l], ws->delta[l + 1], N, scale, beta, ws->conv,
                                              ws->gemm, mode);
+        } else if (type == LAYER_BATCH_NORM) {
+            /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass, except after the input) */
+            if (l == 0)
+                spingalett_bn_backward_sums(net, l, ws->act[0], ws->delta[1], N, ws->bn_stats[1], ws->bn_sums[1],
+                                            ws->bn_scratch, mode);
+            const double *sums = ws->bn_sums[l + 1];
+            const uint32_t C = net->shapes[l + 1].channels;
+            float *gW = net->grad_weights + net->weight_offsets[l], *gB = net->grad_biases + net->bias_offsets[l];
+            for (uint32_t c = 0; c < C; c++) {
+                float dg = (float)sums[C + c] * scale, db = (float)sums[c] * scale;
+                gW[c] = beta == 0.0f ? dg : dg + beta * gW[c];
+                gB[c] = beta == 0.0f ? db : db + beta * gB[c];
+            }
         } else {
             continue;               /* pooling has no parameters */
         }
@@ -324,7 +364,8 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
             uint64_t w = net->weight_offsets[l], b = net->bias_offsets[l];
             uint64_t rows = spingalett_weight_rows(net, l);
             optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
-                                   net->grad_weights + w, rows * spingalett_weight_row_len(net, l), o->decay, mode);
+                                   net->grad_weights + w, rows * spingalett_weight_row_len(net, l),
+                                   layer_decay(net, l, o->decay), mode);
             optimizer_update_array(o, net->biases + b, net->opt_m_biases + b, net->opt_v_biases + b,
                                    net->grad_biases + b, rows, 0.0f, mode);
         }
@@ -500,7 +541,8 @@ static bool trainer_alloc(Trainer *t) {
     }
 
     if (t->args->restore_best_weights) {
-        t->best_params = (float *)malloc((size_t)(net->total_weights + net->total_biases) * sizeof(float));
+        /* weights, biases and the running statistics of batch normalization */
+        t->best_params = (float *)malloc((size_t)(net->total_weights + 3u * net->total_biases) * sizeof(float));
         if (!t->best_params) return false;
     }
 
@@ -643,9 +685,21 @@ static TrainReport train_failed(const char *message) {
     return (TrainReport){.status = TRAIN_FAILED};
 }
 
-static void copy_params(float *dst_w, float *dst_b, const float *src_w, const float *src_b, const NeuralNetwork *net) {
-    memcpy(dst_w, src_w, net->total_weights * sizeof(float));
-    memcpy(dst_b, src_b, net->total_biases * sizeof(float));
+/* The parameters to restore: weights, biases, running statistics, back to back. */
+static void save_params(float *dst, const NeuralNetwork *net) {
+    uint64_t w = net->total_weights, b = net->total_biases;
+    memcpy(dst, net->weights, w * sizeof(float));
+    memcpy(dst + w, net->biases, b * sizeof(float));
+    memcpy(dst + w + b, net->running_mean, b * sizeof(float));
+    memcpy(dst + w + 2u * b, net->running_var, b * sizeof(float));
+}
+
+static void restore_params(NeuralNetwork *net, const float *src) {
+    uint64_t w = net->total_weights, b = net->total_biases;
+    memcpy(net->weights, src, w * sizeof(float));
+    memcpy(net->biases, src + w, b * sizeof(float));
+    memcpy(net->running_mean, src + w + b, b * sizeof(float));
+    memcpy(net->running_var, src + w + 2u * b, b * sizeof(float));
 }
 
 TrainReport train_struct_arguments(TrainArgs args) {
@@ -708,6 +762,10 @@ TrainReport train_struct_arguments(TrainArgs args) {
         args.batch_size = 32;
     if (training_strategy == STRATEGY_SMALL_BATCH && sample_count > 0 && args.batch_size > sample_count)
         args.batch_size = sample_count;
+    uint32_t step_samples = training_strategy == STRATEGY_SMALL_BATCH ? args.batch_size : sample_count;
+    for (uint32_t l = 1; step_samples == 1 && l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_BATCH_NORM && net->shapes[l].height * net->shapes[l].width == 1)
+            return train_failed("Batch normalization of a dense layer needs batches of at least 2 samples");
 
     ComputeMode effective_mode = resolve_compute_mode();
 
@@ -921,7 +979,7 @@ TrainReport train_struct_arguments(TrainArgs args) {
                 report.best_value = value;
                 epochs_without_improvement = 0;
                 if (t.best_params)
-                    copy_params(t.best_params, t.best_params + net->total_weights, net->weights, net->biases, net);
+                    save_params(t.best_params, net);
             } else {
                 epochs_without_improvement++;
             }
@@ -963,7 +1021,7 @@ TrainReport train_struct_arguments(TrainArgs args) {
     }
 
     if (t.best_params && report.best_epoch > 0 && report.best_epoch != report.epochs_run) {
-        copy_params(net->weights, net->biases, t.best_params, t.best_params + net->total_weights, net);
+        restore_params(net, t.best_params);
         report.restored_best = true;
         spingalett_log(LOG_INFO, "Restored the weights of epoch %zu", report.best_epoch);
     }

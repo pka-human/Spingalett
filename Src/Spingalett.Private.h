@@ -63,6 +63,16 @@ typedef struct BatchWorkspace {
     float *targets;
     SpingalettGemmScratch *gemm;
     float *conv;            /* convolution windows (spingalett_conv_scratch_floats), or NULL */
+    /* batch normalization: per normalizing layer l, training only: bn_stats[l] (4 x channels, see
+       spingalett_bn_forward_train) and bn_sums[l] (2 x channels: the parameter gradients' sums);
+       and scratch for any of them */
+    float **bn_stats;
+    double **bn_sums;
+    double *bn_scratch;
+    float *bn_coef;         /* 3 x the most channels */
+    float *bn_flat;
+    double *bn_sums_flat;
+    bool training;          /* normalize with batch statistics */
     uint32_t capacity;
 } BatchWorkspace;
 
@@ -107,6 +117,11 @@ size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *o
 void spingalett_conv_forward_shapes(const LayerShape *in, const LayerShape *out, const float *W, const float *bias,
                                     const float *x, float *y, uint32_t n, ActivationFunction act, float *scratch,
                                     SpingalettGemmScratch *gemm, ComputeMode mode);
+/* The same with the outputs scaled per filter before the bias (inference with a batch
+   normalization folded in). */
+void spingalett_conv_forward_scaled(const LayerShape *in, const LayerShape *out, const float *W, const float *scale,
+                                    const float *bias, const float *x, float *y, uint32_t n, ActivationFunction act,
+                                    float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode);
 void spingalett_pool_forward_shapes(const LayerShape *in, const LayerShape *out, const float *x, float *y, uint32_t n,
                                     ComputeMode mode);
 /* dx = dL/dx * act'(x) from dy = dL/dy (x: the pooling layer's input, the output of layer l, whose
@@ -114,7 +129,34 @@ void spingalett_pool_forward_shapes(const LayerShape *in, const LayerShape *out,
 void spingalett_pool_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
                               uint32_t n, ActivationFunction act, ComputeMode mode);
 
+/* Batch normalization of layer l + 1 over n samples of layer l's output x (Spingalett.Norm.c);
+   gamma and beta are weight layer l's weights and biases. scratch holds
+   spingalett_bn_scratch_doubles() doubles. */
+size_t spingalett_bn_scratch_doubles(const NeuralNetwork *net, uint32_t capacity);
+/* Training: y = act(gamma * xhat + beta) with the batch's statistics, kept in stats [4 x channels:
+   mean, 1 / standard deviation, and the coefficients y = act(a x + b)] for the backward pass; the
+   running statistics move towards them. */
+void spingalett_bn_forward_train(NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                                 ActivationFunction act, float *stats, double *scratch, ComputeMode mode);
+/* Inference, with the running statistics (coef: 2 x channels floats of scratch). */
+void spingalett_bn_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                           ActivationFunction act, float *coef, ComputeMode mode);
+/* Per channel, from dy = dL/d(pre-activation of layer l + 1): sums [0, C) of dy (beta's gradient)
+   and [C, 2C) of dy * xhat (gamma's) */
+void spingalett_bn_backward_sums(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
+                                 const float *stats, double *sums, double *scratch, ComputeMode mode);
+/* dx = dL/dx * act'(x), act being layer l's activation (ACT_NONE: dL/dx itself); coef: 3 x channels
+   floats of scratch */
+void spingalett_bn_backward_data(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
+                                 uint32_t n, const float *stats, const double *sums, ActivationFunction act,
+                                 float *coef, ComputeMode mode);
+
 bool spingalett_add_layer(LayerArgs args);
+/* The arguments that add layer l of net again (to another network: set .net), parameters aside. */
+LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l);
+/* The image of a deployment model: net with every batch normalization that directly follows a dense
+   or convolution layer without activation folded into that layer, without optimizer state. */
+void *spingalett_save_deployment(const NeuralNetwork *net, PrecisionMode precision, size_t *size);
 bool spingalett_has_dropout(const NeuralNetwork *net);
 /* dropout == NULL: inference. Otherwise hidden layers with a dropout rate are masked. */
 float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,
@@ -212,12 +254,14 @@ SPINGALETT_GEMM_KERNELS(spingalett_gemm_avx512)
 #undef SPINGALETT_GEMM_KERNELS
 #endif
 
-/* An epilogue adding a bias per column and applying an element-wise activation (not softmax).
-   Rows are activated one by one: tile columns start at multiples of 8, so every element takes the
-   vector or scalar path it takes in a whole row, whatever the tiling (and the thread count). */
+/* An epilogue adding a bias per column, after multiplying by a scale per column when scale is set,
+   and applying an element-wise activation (not softmax). Rows are activated one by one: tile
+   columns start at multiples of 8, so every element takes the vector or scalar path it takes in a
+   whole row, whatever the tiling (and the thread count). */
 typedef struct {
     const float *bias;
     ActivationFunction act;
+    const float *scale;
 } SpingalettBiasActivation;
 void spingalett_epilogue_bias_activation(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols,
                                          float *c, size_t ldc);

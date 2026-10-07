@@ -87,9 +87,14 @@ typedef struct {
     uint32_t stride_h, stride_w;
     uint32_t padding_h, padding_w;  /* zeros (conv) or ignored cells (pooling) on each side */
     uint64_t weight_count;          /* parameters feeding the layer: dense outputs x inputs, conv */
-    uint64_t bias_count;            /* filters x kernel_h x kernel_w x input channels; one bias per
-                                       output (dense) or filter (conv); none for the input and
-                                       pooling layers */
+    uint64_t bias_count;            /* filters x kernel_h x kernel_w x input channels / groups; one
+                                       bias per output (dense) or filter (conv); batch normalization:
+                                       gamma (weights) and beta (biases), one per channel; none for
+                                       the input and pooling layers */
+    uint32_t groups;                /* conv: channel groups (1 unless set) */
+    float epsilon;                  /* batch normalization: added to the variance */
+    float momentum;                 /* batch normalization: weight of each batch in the running
+                                       statistics */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -98,6 +103,8 @@ typedef enum {
     PARAM_BIASES,
     PARAM_WEIGHT_GRADIENTS,         /* the gradient left by the last training step or backward pass */
     PARAM_BIAS_GRADIENTS,
+    PARAM_RUNNING_MEAN,             /* batch normalization: the statistics inference uses, one per */
+    PARAM_RUNNING_VARIANCE,         /* channel (count: the layer's bias_count) */
     PARAM_KIND_COUNT
 } ParameterKind;
 
@@ -188,11 +195,13 @@ typedef struct {
 typedef struct {
     NeuralNetwork *net;
     uint32_t neurons_amount;        /* dense: outputs; input layer: its size (or give its shape) */
-    ActivationFunction act_func;    /* dense and conv layers (pooling layers have none) */
+    ActivationFunction act_func;    /* dense, conv and batch normalization layers (pooling layers
+                                       have none) */
     WeightInitialization weight_initialization;
     float dropout_rate;             /* [0, 1): inverted dropout on this layer's outputs during
                                        training; ignored on the input and output layers */
-    LayerType type;                 /* LAYER_DENSE unless set; see conv2d(), max_pool2d(), avg_pool2d() */
+    LayerType type;                 /* LAYER_DENSE unless set; see conv2d(), max_pool2d(),
+                                       avg_pool2d(), batch_norm() */
     uint32_t height, width, channels;   /* input layer: the shape of a sample (channels-last), e.g.
                                        28 x 28 x 1 for MNIST; omitted: 1 x 1 x neurons_amount */
     uint32_t filters;               /* conv: output channels */
@@ -203,6 +212,12 @@ typedef struct {
     uint32_t kernel_h, kernel_w;    /* per-axis overrides of kernel, stride and padding (0 = unset) */
     uint32_t stride_h, stride_w;
     uint32_t padding_h, padding_w;
+    uint32_t groups;                /* conv: split input and output channels into this many groups,
+                                       each filter seeing the input channels of its group (0 = 1;
+                                       the input channels give depthwise convolution) */
+    float epsilon;                  /* batch normalization: added to the variance; 0 = 1e-5 */
+    float momentum;                 /* batch normalization: running statistics move this far towards
+                                       each training batch's; 0 = 0.1 */
 } LayerArgs;
 
 typedef struct {
@@ -351,6 +366,7 @@ SPINGALETT_API NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs 
 #define conv2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONV2D, __VA_ARGS__})
 #define max_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_MAX_POOL2D, __VA_ARGS__})
 #define avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_AVG_POOL2D, __VA_ARGS__})
+#define batch_norm(...) layer_struct_arguments((LayerArgs){.type = LAYER_BATCH_NORM, __VA_ARGS__})
 SPINGALETT_API void layer_struct_arguments(LayerArgs args);
 
 /* Describing a network. */
@@ -363,8 +379,10 @@ SPINGALETT_API LossFunction spingalett_network_loss(const NeuralNetwork *net);
 SPINGALETT_API uint64_t spingalett_optimizer_steps(const NeuralNetwork *net);   /* steps taken (Adam's t) */
 
 /* Copies the parameters feeding layer `index` (1 to layers - 1) out of or into the network: count
-   must be the layer's weight_count or bias_count. Dense weights are [outputs][inputs], conv weights
-   [filters][kernel_h][kernel_w][input channels]. Return false (with the error set) otherwise. */
+   must be the layer's weight_count, or its bias_count for biases and the running statistics of
+   batch normalization layers. Dense weights are [outputs][inputs], conv weights
+   [filters][kernel_h][kernel_w][input channels / groups], batch normalization's weights and biases
+   its gamma and beta. Return false (with the error set) otherwise. */
 SPINGALETT_API bool spingalett_get_parameters(const NeuralNetwork *net, uint32_t index, ParameterKind kind,
                                               float *values, uint64_t count);
 SPINGALETT_API bool spingalett_set_parameters(NeuralNetwork *net, uint32_t index, ParameterKind kind,

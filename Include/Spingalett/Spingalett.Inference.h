@@ -6,9 +6,10 @@
 /*
  * Spingalett inference engine.
  *
- * Runs a network stored as a .slett image (format version 3, or 4 for networks with convolution
- * and pooling layers) in place, in the precision its parameters were saved in. The image can be a file read into memory, a const array compiled into
- * the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing,
+ * Runs a network stored as a .slett image (format version 3; 4 for networks with convolution and
+ * pooling layers; 5 for networks with batch normalization or grouped convolutions) in place, in the
+ * precision its parameters were saved in. The image can be a file read into memory, a const array
+ * compiled into the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing,
  * does no I/O and keeps no global state: apart from the image it only needs a workspace from the
  * caller, so it runs on microcontrollers as well as on desktops, and any number of threads can share
  * one model.
@@ -22,7 +23,8 @@
  * is quantized to 8 bits with a scale chosen per sample (its largest magnitude maps to 127), the dot
  * products with the weights accumulate in 32-bit integers, and each output is rescaled by its weight
  * row's scale. FLOAT32, FP16 and BFLOAT16 layers run in float. Convolutions compute each output
- * pixel as such dot products of the filters with the window it reads; pooling runs in float.
+ * pixel as such dot products of the filters with the window it reads; pooling and batch
+ * normalization run in float.
  */
 #pragma once
 
@@ -48,10 +50,11 @@ extern "C" {
 #  endif
 #endif
 
-/* Newest version of the .slett model format. save_spingalett writes version 4 for networks with
-   convolution or pooling layers and version 3 for the others, so that engines of earlier releases
-   still run them; versions 1 and 2 still load. */
-#define SPINGALETT_FORMAT_VERSION 4
+/* Newest version of the .slett model format. save_spingalett writes the oldest version that holds
+   the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch
+   normalization or grouped convolutions, so that engines of earlier releases still run what they
+   can; versions 1 and 2 still load. */
+#define SPINGALETT_FORMAT_VERSION 5
 
 /* File name extensions: models (save_spingalett appends it when the name has none) and data sets. */
 #define SPINGALETT_MODEL_EXTENSION   ".slett"
@@ -90,6 +93,9 @@ typedef enum {
     LAYER_CONV2D,                   /* 2D convolution: `filters` output channels, kernel windows */
     LAYER_MAX_POOL2D,               /* maximum over each window, per channel */
     LAYER_AVG_POOL2D,               /* mean over each window (padded cells not counted), per channel */
+    LAYER_BATCH_NORM,               /* per channel: gamma (x - mean) / sqrt(variance + epsilon) + beta,
+                                       with the batch's statistics while training and running
+                                       averages of them otherwise */
     LAYER_TYPE_COUNT
 } LayerType;
 
@@ -133,10 +139,12 @@ typedef struct {
     uint32_t in_height, in_width, in_channels;      /* the input's shape */
     uint32_t height, width, channels;               /* the output's shape (1 x 1 x outputs for dense) */
     uint32_t kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w;  /* conv and pooling, else 0 */
+    uint32_t groups;                /* conv: channel groups (1: every filter sees every input channel) */
+    float epsilon;                  /* batch normalization: added to the variance */
 } SpingalettLayerInfo;
 
 /*
- * Checks a .slett image (format version 3 or 4: header, layer table, shapes, bounds and CRC-32
+ * Checks a .slett image (format version 3, 4 or 5: header, layer table, shapes, bounds and CRC-32
  * checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in
  * use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region).
  * Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format

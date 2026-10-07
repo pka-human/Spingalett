@@ -368,6 +368,56 @@ with tempfile.TemporaryDirectory() as d:
         check(np.abs(p - cnn.forward(xt)).max() < 0.05 and (p.argmax(1) == cnn.forward(xt).argmax(1)).mean() > 0.95,
               "INT8 conv model close to the network")
 
+# batch normalization: descriptions, statistics, inference against numpy, training, files, folded models
+sg.seed(7)
+bn = sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Input(8, 7, 2), sg.Conv2D(5, 3, padding=1, activation=sg.Activation.NONE),
+                                        sg.BatchNorm(sg.Activation.RELU), sg.MaxPool2D(2),
+                                        sg.BatchNorm(sg.Activation.TANH, epsilon=1e-3, momentum=0.2),
+                                        sg.Layer(3, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
+L = bn.layers
+check(L[2].type == sg.LayerType.BATCH_NORM and L[2].shape == (8, 7, 5) and L[2].weight_count == 5 and L[2].bias_count == 5 and
+      abs(L[4].epsilon - 1e-3) < 1e-9 and abs(L[4].momentum - 0.2) < 1e-7 and L[1].groups == 1,
+      f"batch norm layer descriptions: {L}")
+mean, var = bn.get_running_statistics(1)
+check(bn.get_weights(1).shape == (5,) and np.all(bn.get_weights(1) == 1) and np.all(mean == 0) and np.all(var == 1),
+      "batch norm initial gamma and statistics")
+bn.set_running_statistics(1, rng.normal(size=5), 0.5 + rng.random(5))
+bn.set_running_statistics(3, rng.normal(size=5), 0.5 + rng.random(5))
+bn.set_weights(1, 0.5 + rng.random(5)); bn.set_biases(1, rng.normal(size=5) * 0.1)
+
+def np_bn(a, net, i, eps):
+    m, v = net.get_running_statistics(i)
+    return (a - m) / np.sqrt(v + eps) * net.get_weights(i) + net.get_biases(i)
+
+def np_bn_cnn(net, x):
+    out = []
+    for s in x:
+        a = np_conv(s.reshape(8, 7, 2).astype(np.float64), net.get_weights(0), net.get_biases(0), 1, 1)
+        a = np.maximum(np_bn(a, net, 1, 1e-5), 0)
+        a = np.tanh(np_bn(np_pool(a, 2, 2, 0, "max"), net, 3, 1e-3))
+        out.append(ACT[sg.Activation.SOFTMAX](net.get_weights(4).astype(np.float64) @ a.reshape(-1) + net.get_biases(4)))
+    return np.array(out)
+
+check(np.allclose(bn.forward(xc), np_bn_cnn(bn, xc), atol=1e-5), "batch norm inference vs numpy")
+r = bn.train(xb, yb, epochs=20, optimizer=sg.Optimizer.ADAM, learning_rate=0.02, strategy=sg.Strategy.MINI_BATCH,
+             batch_size=16)
+acc = bn.evaluate(xt, yt).accuracy
+check(acc >= 0.9 and not np.allclose(bn.get_running_statistics(1)[0], mean), f"batch-normalized network learns bars: {acc}")
+check(np.allclose(bn.forward(xc), np_bn_cnn(bn, xc), atol=1e-5), "batch norm inference vs numpy after training")
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "bn.slett")
+    bn.save(path)
+    check(open(path, "rb").read()[6] == 5, "batch-normalized networks are saved as format version 5")
+    with sg.Network.load(path) as back:
+        check(back.layers == bn.layers and np.array_equal(back.get_running_statistics(3)[1], bn.get_running_statistics(3)[1]),
+              "batch norm save/load round trip")
+    with bn.to_model(sg.Precision.FLOAT32) as m:
+        kinds = [l.type for l in m.layers]
+        check(kinds == [sg.LayerType.CONV2D, sg.LayerType.MAX_POOL2D, sg.LayerType.BATCH_NORM, sg.LayerType.DENSE] and
+              m.layers[0].activation == sg.Activation.RELU and abs(m.layers[2].epsilon - 1e-3) < 1e-9,
+              f"folded model layers: {m.layers}")
+        check(np.abs(m.predict(xt) - bn.forward(xt)).max() < 1e-4, "folded model matches the network")
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")

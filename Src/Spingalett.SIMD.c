@@ -177,10 +177,13 @@ void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act) 
 void spingalett_epilogue_bias_activation(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols,
                                          float *c, size_t ldc) {
     const SpingalettBiasActivation *e = (const SpingalettBiasActivation *)ctx;
-    const float *bias = e->bias + col;
+    const float *bias = e->bias + col, *scale = e->scale ? e->scale + col : NULL;
     for (uint32_t r = 0; r < rows; r++) {
         float *cr = c + (size_t)r * ldc;
-        for (uint32_t j = 0; j < cols; j++) cr[j] += bias[j];
+        if (scale)
+            for (uint32_t j = 0; j < cols; j++) cr[j] = cr[j] * scale[j] + bias[j];
+        else
+            for (uint32_t j = 0; j < cols; j++) cr[j] += bias[j];
         apply_activation_bulk(cr, cols, e->act);
     }
     (void)row;

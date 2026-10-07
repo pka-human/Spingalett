@@ -43,11 +43,13 @@ int main(void) {
                    (unsigned)layer.outputs, precision_name(layer.precision));
             macs += (unsigned long)layer.inputs * layer.outputs;
         } else if (layer.type == LAYER_CONV2D) {
-            /* each output: a window of kernel_h x kernel_w x input channels */
-            macs += (unsigned long)layer.outputs * layer.kernel_h * layer.kernel_w * layer.in_channels;
+            /* each output: a window of kernel_h x kernel_w x the input channels of its group */
+            macs += (unsigned long)layer.outputs * layer.kernel_h * layer.kernel_w * (layer.in_channels / layer.groups);
             printf("  layer %u: convolution %ux%u, %u filters, output %ux%u, %s weights\n", (unsigned)i + 1,
                    (unsigned)layer.kernel_h, (unsigned)layer.kernel_w, (unsigned)layer.channels,
                    (unsigned)layer.height, (unsigned)layer.width, precision_name(layer.precision));
+        } else if (layer.type == LAYER_BATCH_NORM) {
+            printf("  layer %u: batch normalization of %u channels\n", (unsigned)i + 1, (unsigned)layer.channels);
         } else {
             printf("  layer %u: %s pooling %ux%u, output %ux%ux%u\n", (unsigned)i + 1,
                    layer.type == LAYER_MAX_POOL2D ? "max" : "average", (unsigned)layer.kernel_h, (unsigned)layer.kernel_w,
