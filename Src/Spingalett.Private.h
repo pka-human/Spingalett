@@ -7,6 +7,7 @@
 
 #include "Spingalett/Spingalett.h"
 #include "Spingalett.Engine.h"
+#include "Spingalett.Network.h"
 #include <stdint.h>
 
 #if defined(SPINGALETT_HAS_OPENBLAS)
@@ -26,8 +27,6 @@ static inline bool spingalett_use_omp(ComputeMode mode, uint64_t work) {
 #define SPINGALETT_NEURON(net, l, j)        ((net)->neurons[(net)->neuron_offsets[l] + (uint64_t)(j)])
 #define SPINGALETT_LAYER_PTR(net, l)        ((net)->neurons + (net)->neuron_offsets[l])
 
-#define SPINGALETT_WEIGHT(net, l, j, k)     ((net)->weights[(net)->weight_offsets[l] + (uint64_t)(j) * (uint64_t)(net)->topology[l] + (uint64_t)(k)])
-#define SPINGALETT_BIAS(net, l, j)          ((net)->biases[(net)->bias_offsets[l] + (uint64_t)(j)])
 
 #define SPINGALETT_WEIGHT_MTX_PTR(net, l)   ((net)->weights + (net)->weight_offsets[l])
 #define SPINGALETT_GRAD_W_MTX_PTR(net, l)   ((net)->grad_weights + (net)->weight_offsets[l])

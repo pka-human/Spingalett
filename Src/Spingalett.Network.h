@@ -1,0 +1,74 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* The network's representation, private to the library (and its white-box tests). */
+
+#pragma once
+
+#include "Spingalett/Spingalett.h"
+
+/* Layer l's output shape and, for conv and pooling layers, its window over layer l - 1. */
+typedef struct {
+    LayerType type;
+    uint32_t height, width, channels;
+    uint32_t kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w;
+} LayerShape;
+
+/*
+ * All parameters live in flat arrays shared by every layer kind: weight layer l (the parameters
+ * feeding layer l + 1) owns weights [weight_offsets[l], +weight_count) and biases
+ * [bias_offsets[l], +bias_count), with the gradients and optimizer moments laid out alike.
+ */
+struct NeuralNetwork {
+    uint32_t layers;
+    uint32_t *topology;             /* outputs of each layer: height * width * channels */
+    ActivationFunction *act_func;   /* [layers - 1]: the activation of layer l + 1 */
+    LayerShape *shapes;             /* [layers] */
+
+    float *weights;
+    float *biases;
+    float *neurons;                 /* one sample's activations, laid out by neuron_offsets */
+
+    float *grad_weights;
+    float *grad_biases;
+
+    float *opt_m_weights;
+    float *opt_m_biases;
+    float *opt_v_weights;
+    float *opt_v_biases;
+
+    uint64_t *neuron_offsets;
+    uint64_t *weight_offsets;
+    uint64_t *bias_offsets;
+
+    uint64_t total_neurons;
+    uint64_t total_weights;
+    uint64_t total_biases;
+
+    uint64_t time_step;
+    LossFunction loss_func;
+
+    float *dropout_rates;           /* per layer, applied to its outputs while training */
+};
+
+/* Weight layer l as a matrix: rows (dense outputs, conv filters) of row_len weights (dense inputs,
+   conv kernel_h x kernel_w x input channels), one bias per row; pooling layers have none. */
+static inline uint32_t spingalett_weight_rows(const NeuralNetwork *net, uint32_t l) {
+    const LayerShape *s = &net->shapes[l + 1];
+    return s->type == LAYER_DENSE ? net->topology[l + 1] : s->type == LAYER_CONV2D ? s->channels : 0u;
+}
+
+static inline uint32_t spingalett_weight_row_len(const NeuralNetwork *net, uint32_t l) {
+    const LayerShape *s = &net->shapes[l + 1];
+    return s->type == LAYER_DENSE ? net->topology[l]
+         : s->type == LAYER_CONV2D ? s->kernel_h * s->kernel_w * net->shapes[l].channels : 0u;
+}
+
+/* Whether every weight layer is dense (the network of earlier versions). */
+static inline bool spingalett_all_dense(const NeuralNetwork *net) {
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type != LAYER_DENSE) return false;
+    return true;
+}

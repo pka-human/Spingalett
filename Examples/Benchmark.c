@@ -172,7 +172,7 @@ int main(int argc, char **argv) {
     NeuralNetwork *probe = create_network();
     printf("Spingalett %s (%s kernels): %d-%d-%d-%d (%" PRIu64 " parameters), %d samples, threads: ",
            spingalett_version(), spingalett_cpu_kernels(), INPUT_SIZE, HIDDEN_1, HIDDEN_2, OUTPUT_SIZE,
-           probe->total_weights + probe->total_biases, SAMPLES);
+           spingalett_parameter_count(probe), SAMPLES);
     free_network(probe);
     if (spingalett_get_num_threads() > 0) printf("%u\n\n", spingalett_get_num_threads());
     else printf("runtime default\n\n");

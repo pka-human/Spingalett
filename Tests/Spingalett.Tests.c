@@ -17,6 +17,7 @@
  */
 
 #include <Spingalett/Spingalett.h>
+#include "Spingalett.Network.h"      /* white-box: the network's arrays */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

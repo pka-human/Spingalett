@@ -87,7 +87,7 @@ static int info(const char *path) {
     if (!open_model(path, &m, &net, &stored)) return fail(path);
     printf("%s\n  %u inputs, %u outputs, %u weight layers, %llu parameters\n  image %zu bytes, workspace %zu bytes\n",
            path, m->input_size, m->output_size, m->layer_count,
-           (unsigned long long)(net->total_weights + net->total_biases), m->image_size, m->workspace_size);
+           (unsigned long long)spingalett_parameter_count(net), m->image_size, m->workspace_size);
     for (uint32_t i = 0; i < m->layer_count; i++) {
         SpingalettLayerInfo l;
         spingalett_model_layer(m, i, &l);
@@ -106,7 +106,7 @@ static int convert(const char *in, const char *out, bool have_precision, Precisi
     spingalett_model_free(m);
     /* files saved without optimizer state record no optimizer steps */
     save_spingalett(.net = net, .filename = out, .precision = have_precision ? precision : stored,
-                    .do_not_save_optimizer = !optimizer || net->time_step == 0);
+                    .do_not_save_optimizer = !optimizer || spingalett_optimizer_steps(net) == 0);
     free_network(net);
     if (spingalett_last_error_code() != SPINGALETT_OK) return fail(out);
     printf("wrote %s (%s)\n", out, precision_name(have_precision ? precision : stored));
@@ -136,14 +136,14 @@ static int eval(const char *path, const char *data, const char *labels, bool hav
     if (!open_model(path, &m, &net, &stored)) return fail(path);
     spingalett_model_free(m);
     SpingalettDataset d;
-    bool loaded = labels ? spingalett_load_idx(data, labels, net->topology[net->layers - 1], &d) : spingalett_load_dataset(data, &d);
+    bool loaded = labels ? spingalett_load_idx(data, labels, spingalett_output_size(net), &d) : spingalett_load_dataset(data, &d);
     if (!loaded) {
         free_network(net);
         return fail(data);
     }
-    if (d.input_size != net->topology[0] || d.target_size != net->topology[net->layers - 1]) {
+    if (d.input_size != spingalett_input_size(net) || d.target_size != spingalett_output_size(net)) {
         fprintf(stderr, "%s: %u inputs and %u targets per sample; the model has %u and %u\n", data, d.input_size,
-                d.target_size, net->topology[0], net->topology[net->layers - 1]);
+                d.target_size, spingalett_input_size(net), spingalett_output_size(net));
         spingalett_dataset_free(&d);
         free_network(net);
         return 1;
@@ -170,7 +170,7 @@ static int bench(const char *path, bool have_precision, PrecisionMode precision)
     PrecisionMode stored;
     if (!open_model(path, &m, &net, &stored)) return fail(path);
     spingalett_model_free(m);
-    uint32_t n = 4096, in = net->topology[0], out = net->topology[net->layers - 1];
+    uint32_t n = 4096, in = spingalett_input_size(net), out = spingalett_output_size(net);
     float *x = malloc((size_t)n * in * sizeof(float)), *y = malloc((size_t)n * out * sizeof(float));
     for (size_t i = 0; i < (size_t)n * in; i++) x[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
     printf("  precision     bytes   one sample     batched\n");
