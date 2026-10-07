@@ -7,7 +7,8 @@
 synthetic samples: full batch (5 epochs), mini-batches of 64 (1 epoch) and inference. Then the
 convolutional network of Examples/MNIST_CNN.c (channels first, as PyTorch prefers) on 10,000
 synthetic 28 x 28 images: one epoch of mini-batches of 128 with AdamW, and inference in batches of
-1,000. Each measurement runs on a fresh model after one untimed warm-up step, so lazy
+1,000; and the same network with batch normalization after each convolution and the hidden dense
+layer. Each measurement runs on a fresh model after one untimed warm-up step, so lazy
 initialization inside PyTorch is not counted.
 """
 import sys
@@ -53,14 +54,16 @@ def inference_throughput(x):
         return SAMPLES / (time.perf_counter() - start)
 
 
-def make_cnn():
-    return nn.Sequential(nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-                         nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2), nn.Flatten(),
-                         nn.Linear(3136, 128), nn.ReLU(), nn.Dropout(0.3), nn.Linear(128, 10))
+def make_cnn(normalized=False):
+    def norm(n, two_d=True):
+        return [nn.BatchNorm2d(n) if two_d else nn.BatchNorm1d(n)] if normalized else []
+    return nn.Sequential(nn.Conv2d(1, 32, 3, padding=1), *norm(32), nn.ReLU(), nn.MaxPool2d(2),
+                         nn.Conv2d(32, 64, 3, padding=1), *norm(64), nn.ReLU(), nn.MaxPool2d(2), nn.Flatten(),
+                         nn.Linear(3136, 128), *norm(128, False), nn.ReLU(), nn.Dropout(0.3), nn.Linear(128, 10))
 
 
-def cnn_throughput(x, y):
-    model = make_cnn()
+def cnn_throughput(x, y, normalized=False):
+    model = make_cnn(normalized)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     loss_fn = nn.CrossEntropyLoss()
 
@@ -103,10 +106,12 @@ def main():
 
     images = torch.rand(CNN_SAMPLES, 1, 28, 28)
     labels = torch.randint(0, 10, (CNN_SAMPLES,))
-    print(f"\nconvolutional network (Examples/MNIST_CNN.c), {CNN_SAMPLES} images")
-    print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
-    train, infer = cnn_throughput(images, labels)
-    print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
+    for normalized in (False, True):
+        print(f"\nconvolutional network (Examples/MNIST_CNN.c){' with batch normalization' if normalized else ''}, "
+              f"{CNN_SAMPLES} images")
+        print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
+        train, infer = cnn_throughput(images, labels, normalized)
+        print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
 
 
 if __name__ == "__main__":
