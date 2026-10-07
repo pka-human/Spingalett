@@ -394,6 +394,27 @@ static inline void depthwise_tap(float *restrict o, const float *restrict x, con
         for (uint32_t j = 0; j < m; j++) o[c * m + j] += x[c] * w[c * m + j];
 }
 
+/* One output pixel of a depthwise convolution with one filter per channel: the taps add up in
+   registers, in the order depthwise_tap adds them to o (from 0), so the sums are the same. CW is
+   a constant at the call sites (16, 32 or 64 channels). */
+static inline __attribute__((always_inline)) void
+depthwise_pixel(float *restrict o, const float *restrict xs, const float *restrict wt, uint32_t H, uint32_t W,
+                uint32_t KH, uint32_t KW, int64_t ih0, int64_t iw0, const uint32_t CW) {
+    float acc[64];
+    for (uint32_t c = 0; c < CW; c++) acc[c] = 0.0f;
+    for (uint32_t kh = 0; kh < KH; kh++) {
+        int64_t ih = ih0 + kh;
+        if (ih < 0 || ih >= (int64_t)H) continue;
+        for (uint32_t kw = 0; kw < KW; kw++) {
+            int64_t iw = iw0 + kw;
+            if (iw < 0 || iw >= (int64_t)W) continue;
+            const float *xp = xs + ((size_t)ih * W + (size_t)iw) * CW, *wp = wt + ((size_t)kh * KW + kw) * CW;
+            for (uint32_t c = 0; c < CW; c++) acc[c] += xp[c] * wp[c];
+        }
+    }
+    for (uint32_t c = 0; c < CW; c++) o[c] = acc[c];
+}
+
 static void depthwise_forward(const LayerShape *in, const LayerShape *out, const float *Wt, const float *scale,
                               const float *bias, const float *x, float *y, uint32_t n, ActivationFunction act,
                               float *wt, ComputeMode mode) {
@@ -413,14 +434,20 @@ static void depthwise_forward(const LayerShape *in, const LayerShape *out, const
         for (uint32_t ow = 0; ow < OW; ow++) {
             float *o = y + s * out_size + ((size_t)oh * OW + ow) * OC;
             int64_t iw0 = (int64_t)ow * out->stride_w - out->pad_w;
-            memset(o, 0, OC * sizeof(float));
-            for (uint32_t kh = 0; kh < KH; kh++) {
-                int64_t ih = ih0 + kh;
-                if (ih < 0 || ih >= (int64_t)H) continue;
-                for (uint32_t kw = 0; kw < KW; kw++) {
-                    int64_t iw = iw0 + kw;
-                    if (iw < 0 || iw >= (int64_t)W) continue;
-                    depthwise_tap(o, xs + ((size_t)ih * W + (size_t)iw) * C, wt + ((size_t)kh * KW + kw) * OC, C, m);
+            if (m == 1 && (C == 16 || C == 32 || C == 64)) {
+                if (C == 16) depthwise_pixel(o, xs, wt, H, W, KH, KW, ih0, iw0, 16);
+                else if (C == 32) depthwise_pixel(o, xs, wt, H, W, KH, KW, ih0, iw0, 32);
+                else depthwise_pixel(o, xs, wt, H, W, KH, KW, ih0, iw0, 64);
+            } else {
+                memset(o, 0, OC * sizeof(float));
+                for (uint32_t kh = 0; kh < KH; kh++) {
+                    int64_t ih = ih0 + kh;
+                    if (ih < 0 || ih >= (int64_t)H) continue;
+                    for (uint32_t kw = 0; kw < KW; kw++) {
+                        int64_t iw = iw0 + kw;
+                        if (iw < 0 || iw >= (int64_t)W) continue;
+                        depthwise_tap(o, xs + ((size_t)ih * W + (size_t)iw) * C, wt + ((size_t)kh * KW + kw) * OC, C, m);
+                    }
                 }
             }
             if (scale) for (uint32_t oc = 0; oc < OC; oc++) o[oc] = o[oc] * scale[oc] + bias[oc];
@@ -433,6 +460,31 @@ static void depthwise_forward(const LayerShape *in, const LayerShape *out, const
 
 /* dx, sample by sample: each output pixel adds its gradient times the filters to its window's
    cells, then the derivative of the input layer's activation */
+/* dx of one input cell of a depthwise convolution with one filter per channel, gathered from the
+   output pixels whose windows hold it. They are visited in raster order, the order in which
+   depthwise_backward_data adds them to the cell otherwise, and summed in registers from 0, so the
+   sums are the same. CW is a constant at the call sites (16, 32 or 64 channels). */
+static inline __attribute__((always_inline)) void
+depthwise_cell_grad(float *restrict d, const float *restrict gs, const float *restrict wt, const LayerShape *out,
+                    uint32_t ih, uint32_t iw, const uint32_t CW) {
+    const uint32_t KH = out->kernel_h, KW = out->kernel_w, sh = out->stride_h, sw = out->stride_w;
+    const int64_t th = (int64_t)ih + out->pad_h, tw = (int64_t)iw + out->pad_w;
+    /* output rows oh with 0 <= th - oh sh < KH, and columns alike */
+    int64_t oh0 = th - (int64_t)KH + 1 <= 0 ? 0 : (th - (int64_t)KH + sh) / sh, oh1 = th / sh;
+    int64_t ow0 = tw - (int64_t)KW + 1 <= 0 ? 0 : (tw - (int64_t)KW + sw) / sw, ow1 = tw / sw;
+    if (oh1 > (int64_t)out->height - 1) oh1 = (int64_t)out->height - 1;
+    if (ow1 > (int64_t)out->width - 1) ow1 = (int64_t)out->width - 1;
+    float acc[64];
+    for (uint32_t c = 0; c < CW; c++) acc[c] = 0.0f;
+    for (int64_t oh = oh0; oh <= oh1; oh++)
+        for (int64_t ow = ow0; ow <= ow1; ow++) {
+            const float *g = gs + ((size_t)oh * out->width + (size_t)ow) * CW;
+            const float *w = wt + ((size_t)(th - oh * sh) * KW + (size_t)(tw - ow * sw)) * CW;
+            for (uint32_t c = 0; c < CW; c++) acc[c] += g[c] * w[c];
+        }
+    for (uint32_t c = 0; c < CW; c++) d[c] = acc[c];
+}
+
 static void depthwise_backward_data(const LayerShape *in, const LayerShape *out, const float *Wt, const float *dy,
                                     float *dx, uint32_t n, const float *x, ActivationFunction act, float *wt,
                                     ComputeMode mode) {
@@ -445,6 +497,18 @@ static void depthwise_backward_data(const LayerShape *in, const LayerShape *out,
 #endif
     for (int64_t s = 0; s < (int64_t)n; s++) {
         float *dxs = dx + (uint64_t)s * in_size;
+        if (m == 1 && (C == 16 || C == 32 || C == 64)) {
+            const float *gs = dy + (uint64_t)s * out_size;
+            for (uint32_t ih = 0; ih < H; ih++)
+                for (uint32_t iw = 0; iw < W; iw++) {
+                    float *d = dxs + ((size_t)ih * W + iw) * C;
+                    if (C == 16) depthwise_cell_grad(d, gs, wt, out, ih, iw, 16);
+                    else if (C == 32) depthwise_cell_grad(d, gs, wt, out, ih, iw, 32);
+                    else depthwise_cell_grad(d, gs, wt, out, ih, iw, 64);
+                }
+            if (act != ACT_NONE) apply_derivative_batch(dxs, x + (uint64_t)s * in_size, in_size, act);
+            continue;
+        }
         memset(dxs, 0, in_size * sizeof(float));
         for (uint32_t oh = 0; oh < OH; oh++)
             for (uint32_t ow = 0; ow < OW; ow++) {
@@ -870,9 +934,10 @@ void spingalett_pool_forward_shapes(const LayerShape *in, const LayerShape *out,
 /* The gradient of one channel block of one window: max pooling routes g to the first maximum
    (recomputed from the input), average pooling spreads it evenly. With tiling windows each input
    cell is written once (no clearing needed); otherwise contributions are added. */
-static inline void pool_block_backward(const float *restrict xs, float *restrict dxs, const float *restrict g,
-                                       uint32_t W, uint32_t C, uint32_t h0, uint32_t h1, uint32_t w0, uint32_t w1,
-                                       uint32_t c0, uint32_t len, bool max, bool tiles) {
+static inline __attribute__((always_inline)) void
+pool_block_backward_len(const float *restrict xs, float *restrict dxs, const float *restrict g, uint32_t W, uint32_t C,
+                        uint32_t h0, uint32_t h1, uint32_t w0, uint32_t w1, uint32_t c0, uint32_t len, bool max,
+                        bool tiles) {
     if (max) {
         float best[POOL_BLOCK];
         uint32_t at[POOL_BLOCK];
@@ -906,6 +971,14 @@ static inline void pool_block_backward(const float *restrict xs, float *restrict
                 else       { for (uint32_t c = 0; c < POOL_BLOCK; c++) if (c < len) d[c] += share[c]; }
             }
     }
+}
+
+/* A whole block runs with len a constant, so that its tests fold away and the block vectorizes. */
+static inline void pool_block_backward(const float *restrict xs, float *restrict dxs, const float *restrict g,
+                                       uint32_t W, uint32_t C, uint32_t h0, uint32_t h1, uint32_t w0, uint32_t w1,
+                                       uint32_t c0, uint32_t len, bool max, bool tiles) {
+    if (len == POOL_BLOCK) pool_block_backward_len(xs, dxs, g, W, C, h0, h1, w0, w1, c0, POOL_BLOCK, max, tiles);
+    else pool_block_backward_len(xs, dxs, g, W, C, h0, h1, w0, w1, c0, len, max, tiles);
 }
 
 void spingalett_pool_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
