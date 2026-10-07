@@ -563,6 +563,18 @@ static void encode_values(DatasetEncoding e, const float *src, uint32_t rows, ui
                           const float *params, uint8_t *planes) {
     uint32_t w = stream_width(e, size);
     size_t n = (size_t)rows * w;
+    if (e == DATASET_ENCODING_FP16) {
+        uint16_t h[256];
+        for (size_t i0 = 0; i0 < n; i0 += 256) {
+            size_t len = n - i0 < 256 ? n - i0 : 256;
+            spingalett_fp16_encode(src + i0, len, h);
+            for (size_t i = 0; i < len; i++) {
+                planes[i0 + i] = (uint8_t)h[i];
+                planes[n + i0 + i] = (uint8_t)(h[i] >> 8);
+            }
+        }
+        return;
+    }
     for (size_t i = 0; i < n; i++) {
         switch (e) {
             case DATASET_ENCODING_FLOAT32: {

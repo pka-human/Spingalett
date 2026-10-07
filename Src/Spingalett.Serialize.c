@@ -46,9 +46,15 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
         case PRECISION_FLOAT32:
             memcpy(dst, w, (size_t)n * 4u);
             return 0.0f;
-        case PRECISION_FP16:
-            for (uint32_t i = 0; i < n; i++) slett_put16(dst + 2u * i, spingalett_float_to_fp16(w[i]));
+        case PRECISION_FP16: {
+            uint16_t h[256];
+            for (uint32_t i0 = 0; i0 < n; i0 += 256) {
+                uint32_t len = n - i0 < 256 ? n - i0 : 256;
+                spingalett_fp16_encode(w + i0, len, h);
+                for (uint32_t i = 0; i < len; i++) slett_put16(dst + 2u * (i0 + i), h[i]);
+            }
             return 0.0f;
+        }
         case PRECISION_BFLOAT16:
             for (uint32_t i = 0; i < n; i++) slett_put16(dst + 2u * i, spingalett_float_to_bf16(w[i]));
             return 0.0f;
@@ -461,6 +467,16 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
         input.width = first.in_w;
         input.channels = first.in_c;
     }
+    /* room for every layer's neurons and parameters at once (adding layers then moves nothing) */
+    uint64_t neurons = first.inputs, weights = 0, biases = 0;
+    for (uint32_t l = 0; l + 1 < info->layers; l++) {
+        SlettLayer e;
+        spingalett_slett_layer(p, l, &e);
+        neurons += e.outputs;
+        weights += (uint64_t)e.rows * e.row_len;
+        biases += e.rows;
+    }
+    (void)spingalett_network_reserve(net, neurons, weights, biases);
     bool ok = spingalett_add_layer(input);
     for (uint32_t l = 0; ok && l + 1 < info->layers; l++) {
         SlettLayer e;
