@@ -14,6 +14,8 @@ typedef struct {
     LayerType type;
     uint32_t height, width, channels;
     uint32_t kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w;
+    uint32_t groups;                /* conv: channel groups (1 otherwise) */
+    float eps, momentum;            /* batch normalization (0 otherwise) */
 } LayerShape;
 
 /*
@@ -52,23 +54,31 @@ struct NeuralNetwork {
 
     float *dropout_rates;           /* per layer, applied to its outputs while training */
 
+    /* batch normalization layers: the statistics inference uses, laid out like the biases (zeros
+       elsewhere) */
+    float *running_mean;
+    float *running_var;
+
     /* forward() of networks with convolution or pooling layers runs the batch kernels on one
        sample, in this workspace (made on first use, for the compute mode it was made for) */
     struct BatchWorkspace *forward_ws;
     ComputeMode forward_mode;
 };
 
-/* Weight layer l as a matrix: rows (dense outputs, conv filters) of row_len weights (dense inputs,
-   conv kernel_h x kernel_w x input channels), one bias per row; pooling layers have none. */
+/* Weight layer l as a matrix: rows (dense outputs, conv filters, batch normalization channels) of
+   row_len weights (dense inputs, conv kernel_h x kernel_w x input channels of the filter's group,
+   batch normalization's gamma), one bias per row; pooling layers have none. */
 static inline uint32_t spingalett_weight_rows(const NeuralNetwork *net, uint32_t l) {
     const LayerShape *s = &net->shapes[l + 1];
-    return s->type == LAYER_DENSE ? net->topology[l + 1] : s->type == LAYER_CONV2D ? s->channels : 0u;
+    return s->type == LAYER_DENSE ? net->topology[l + 1]
+         : s->type == LAYER_CONV2D || s->type == LAYER_BATCH_NORM ? s->channels : 0u;
 }
 
 static inline uint32_t spingalett_weight_row_len(const NeuralNetwork *net, uint32_t l) {
     const LayerShape *s = &net->shapes[l + 1];
     return s->type == LAYER_DENSE ? net->topology[l]
-         : s->type == LAYER_CONV2D ? s->kernel_h * s->kernel_w * net->shapes[l].channels : 0u;
+         : s->type == LAYER_CONV2D ? s->kernel_h * s->kernel_w * (net->shapes[l].channels / s->groups)
+         : s->type == LAYER_BATCH_NORM ? 1u : 0u;
 }
 
 /* Whether every weight layer is dense (the network of earlier versions). */

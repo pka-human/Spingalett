@@ -4,8 +4,9 @@
 */
 
 /*
- * .slett model files. Writing produces format version 3, or version 4 for networks with convolution
- * or pooling layers (docs/ModelFormat.md): a header, a layer table and 16-byte aligned sections,
+ * .slett model files. Writing produces format version 3, version 4 for networks with convolution or
+ * pooling layers, or version 5 for networks with batch normalization or grouped convolutions
+ * (docs/ModelFormat.md): a header, a layer table and 16-byte aligned sections,
  * little-endian, with per-row scales for the integer precisions and CRC-32 checksums, so that a
  * file image doubles as an in-place inference model. Reading also accepts versions 1 and 2 (native
  * byte order, one scale per tensor).
@@ -18,7 +19,7 @@
 #include <math.h>
 #include <float.h>
 
-/* ------------------------------------------------------------------------- writing (formats 3 and 4) */
+/* ------------------------------------------------------------------------- writing (formats 3 to 5) */
 
 static float row_abs_max(const float *w, uint32_t n, bool *finite) {
     float amax = 0.0f;
@@ -92,12 +93,24 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
     }
 }
 
-void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precision, bool save_optimizer, size_t *size) {
-    if (size) *size = 0;
-    if (!net || !size) {
-        set_error(SPINGALETT_ERR_INVALID, "save: net or size is NULL");
-        return NULL;
+/* The oldest format version that holds the network: 3 for dense layers only, 4 with convolution or
+   pooling layers, 5 with batch normalization or grouped convolutions. */
+static uint16_t format_version(const NeuralNetwork *net) {
+    uint16_t version = 3u;
+    for (uint32_t l = 1; l < net->layers; l++) {
+        const LayerShape *s = &net->shapes[l];
+        if (s->type == LAYER_BATCH_NORM || (s->type == LAYER_CONV2D && s->groups > 1)) return 5u;
+        if (s->type != LAYER_DENSE) version = 4u;
     }
+    return version;
+}
+
+/* Batch normalization keeps its parameters and statistics in FLOAT32 whatever the file's precision. */
+static inline PrecisionMode layer_precision(const NeuralNetwork *net, uint32_t l, PrecisionMode precision) {
+    return net->shapes[l + 1].type == LAYER_BATCH_NORM ? PRECISION_FLOAT32 : precision;
+}
+
+static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool save_optimizer, size_t *size) {
     if (net->layers < 2 || net->layers > SLETT_MAX_LAYERS) {
         set_error(SPINGALETT_ERR_INVALID, "save: network must have 2 to 65536 layers");
         return NULL;
@@ -110,16 +123,16 @@ void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precisio
         set_error(SPINGALETT_ERR_INVALID, "save: the .slett format needs a little-endian host");
         return NULL;
     }
-    /* version 3 keeps dense networks readable by the engines of earlier releases */
-    const uint16_t version = spingalett_all_dense(net) ? 3u : 4u;
-    const size_t entry_size = version == 3u ? SLETT_LAYER_ENTRY_SIZE : SLETT_LAYER_ENTRY_SIZE_4;
+    const uint16_t version = format_version(net);
+    const size_t entry_size = version == 3u ? SLETT_LAYER_ENTRY_SIZE
+                            : version == 4u ? SLETT_LAYER_ENTRY_SIZE_4 : SLETT_LAYER_ENTRY_SIZE_5;
     uint32_t L = net->layers - 1;              /* weight layers */
-    if (spingalett_precision_is_int(precision))
-        for (uint32_t l = 0; l < L; l++)
-            if (spingalett_weight_row_len(net, l) > SLETT_MAX_INT_INPUTS) {
-                set_error(SPINGALETT_ERR_INVALID, "save: integer precisions allow at most 131072 weights per output");
-                return NULL;
-            }
+    for (uint32_t l = 0; l < L; l++)
+        if (spingalett_precision_is_int(layer_precision(net, l, precision)) &&
+            spingalett_weight_row_len(net, l) > SLETT_MAX_INT_INPUTS) {
+            set_error(SPINGALETT_ERR_INVALID, "save: integer precisions allow at most 131072 weights per output");
+            return NULL;
+        }
 
     uint64_t *off = (uint64_t *)calloc((size_t)L * 4u, sizeof(uint64_t));   /* weights, scales, biases, optimizer */
     if (!off) {
@@ -129,12 +142,14 @@ void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precisio
     uint64_t pos = slett_align(SLETT_HEADER_SIZE + (uint64_t)L * entry_size);
     for (uint32_t l = 0; l < L; l++) {
         uint32_t rows = spingalett_weight_rows(net, l), row_len = spingalett_weight_row_len(net, l);
+        PrecisionMode p = layer_precision(net, l, precision);
         if (rows == 0) continue;                /* pooling: no sections */
         off[4 * l] = pos;
-        pos = slett_align(pos + spingalett_slett_row_bytes(precision, row_len) * rows);
-        if (spingalett_precision_is_int(precision)) {
+        pos = slett_align(pos + spingalett_slett_row_bytes(p, row_len) * rows);
+        if (spingalett_precision_is_int(p) || net->shapes[l + 1].type == LAYER_BATCH_NORM) {
+            /* row scales; batch normalization: its running mean and variance */
             off[4 * l + 1] = pos;
-            pos = slett_align(pos + (uint64_t)rows * 4u);
+            pos = slett_align(pos + (uint64_t)rows * (spingalett_precision_is_int(p) ? 4u : 8u));
         }
         off[4 * l + 2] = pos;
         pos = slett_align(pos + (uint64_t)rows * 4u);
@@ -170,14 +185,15 @@ void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precisio
     for (uint32_t l = 0; l < L; l++) {
         uint32_t rows = spingalett_weight_rows(net, l), row_len = spingalett_weight_row_len(net, l);
         const LayerShape *shape = &net->shapes[l + 1];
+        PrecisionMode p = layer_precision(net, l, precision);
         uint8_t *e = img + SLETT_HEADER_SIZE + (size_t)l * entry_size;
         slett_put32(e, net->topology[l]);
         slett_put32(e + 4, net->topology[l + 1]);
         e[8] = (uint8_t)net->act_func[l];
-        e[9] = (uint8_t)precision;
-        uint32_t dropout;
-        memcpy(&dropout, &net->dropout_rates[l + 1], 4);
-        slett_put32(e + 12, dropout);
+        e[9] = (uint8_t)p;
+        uint32_t bits;
+        memcpy(&bits, &net->dropout_rates[l + 1], 4);
+        slett_put32(e + 12, bits);
         for (int k = 0; k < 4; k++) slett_put64(e + 16 + 8 * k, off[4 * l + k]);
         if (version >= 4u) {
             e[10] = (uint8_t)shape->type;
@@ -185,13 +201,24 @@ void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precisio
                                         shape->stride_h, shape->stride_w, shape->pad_h, shape->pad_w};
             for (int k = 0; k < 8; k++) slett_put16(e + 48 + 2 * k, (uint16_t)fields[k]);
         }
+        if (version >= 5u) {
+            slett_put32(e + 64, shape->type == LAYER_CONV2D ? shape->groups : 0u);
+            memcpy(&bits, &shape->eps, 4);
+            slett_put32(e + 68, bits);
+            memcpy(&bits, &shape->momentum, 4);
+            slett_put32(e + 72, bits);
+        }
         if (rows == 0) continue;
 
         const float *W = net->weights + net->weight_offsets[l];
-        size_t row = (size_t)spingalett_slett_row_bytes(precision, row_len);
+        size_t row = (size_t)spingalett_slett_row_bytes(p, row_len);
         for (uint32_t j = 0; j < rows; j++) {
-            float scale = quantize_row(W + (size_t)j * row_len, row_len, precision, img + off[4 * l] + (size_t)j * row);
-            if (off[4 * l + 1]) memcpy(img + off[4 * l + 1] + 4u * (size_t)j, &scale, 4);
+            float scale = quantize_row(W + (size_t)j * row_len, row_len, p, img + off[4 * l] + (size_t)j * row);
+            if (spingalett_precision_is_int(p)) memcpy(img + off[4 * l + 1] + 4u * (size_t)j, &scale, 4);
+        }
+        if (shape->type == LAYER_BATCH_NORM) {
+            memcpy(img + off[4 * l + 1], net->running_mean + net->bias_offsets[l], (size_t)rows * 4u);
+            memcpy(img + off[4 * l + 1] + (size_t)rows * 4u, net->running_var + net->bias_offsets[l], (size_t)rows * 4u);
         }
         memcpy(img + off[4 * l + 2], net->biases + net->bias_offsets[l], (size_t)rows * 4u);
         if (save_optimizer) {
@@ -209,6 +236,100 @@ void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precisio
     slett_put32(img + 60, spingalett_crc32(0, img, 60));
     *size = (size_t)pos;
     return img;
+}
+
+/* Whether layer l is a batch normalization that folds into layer l - 1: a dense or convolution
+   layer without activation. */
+static bool foldable(const NeuralNetwork *net, uint32_t l) {
+    if (l < 2 || net->shapes[l].type != LAYER_BATCH_NORM) return false;
+    LayerType prev = net->shapes[l - 1].type;
+    return (prev == LAYER_DENSE || prev == LAYER_CONV2D) && net->act_func[l - 2] == ACT_NONE;
+}
+
+/* A copy of net with its foldable batch normalizations folded into the layers before them: those
+   layers' weight rows scaled by gamma / sqrt(var + eps) and their biases shifted alike, taking the
+   normalization's activation and dropout rate. NULL with *failed false when there is nothing to fold;
+   the optimizer state is not copied. */
+static NeuralNetwork *fold_batch_norm(const NeuralNetwork *net, bool *failed) {
+    *failed = false;
+    bool any = false;
+    for (uint32_t l = 2; l < net->layers; l++) any |= foldable(net, l);
+    if (!any) return NULL;
+
+    NeuralNetwork *src = (NeuralNetwork *)net;      /* only read */
+    NeuralNetwork *f = new_spingalett_struct_arguments((NeuralNetworkArgs){ .loss_func = net->loss_func });
+    bool ok = f != NULL;
+    for (uint32_t l = 0; ok && l < net->layers; l++) {
+        if (foldable(net, l)) continue;
+        LayerArgs a = spingalett_layer_args(src, l);
+        a.net = f;
+        if (l + 1 < net->layers && foldable(net, l + 1)) {
+            a.act_func = net->act_func[l];
+            a.dropout_rate = net->dropout_rates[l + 1];
+        }
+        ok = spingalett_add_layer(a);
+    }
+    float *coef = ok ? (float *)malloc(2u * (size_t)net->total_biases * sizeof(float) + sizeof(float)) : NULL;
+    if (!ok || !coef) {
+        free(coef);
+        free_network(f);
+        if (ok) set_error(SPINGALETT_ERR_ALLOC, "save: allocation failed");
+        *failed = true;
+        return NULL;
+    }
+
+    for (uint32_t l = 0, k = 0; l + 1 < net->layers; l++) {
+        if (foldable(net, l + 1)) continue;     /* folded into weight layer k - 1 below */
+        uint64_t rows = spingalett_weight_rows(net, l), len = spingalett_weight_row_len(net, l);
+        uint64_t sw = net->weight_offsets[l], sb = net->bias_offsets[l];
+        uint64_t dw = f->weight_offsets[k], db = f->bias_offsets[k];
+        memcpy(f->weights + dw, net->weights + sw, (size_t)(rows * len) * sizeof(float));
+        memcpy(f->biases + db, net->biases + sb, (size_t)rows * sizeof(float));
+        memcpy(f->running_mean + db, net->running_mean + sb, (size_t)rows * sizeof(float));
+        memcpy(f->running_var + db, net->running_var + sb, (size_t)rows * sizeof(float));
+        if (l + 2 < net->layers && foldable(net, l + 2)) {
+            /* weight layer l + 1 is the normalization of this layer's rows (one channel each) */
+            uint64_t nw = net->weight_offsets[l + 1], nb = net->bias_offsets[l + 1];
+            float *a = coef, *b = coef + rows;
+            spingalett_bn_coefficients(net->weights + nw, net->biases + nb, net->running_mean + nb, net->running_var + nb,
+                                       net->shapes[l + 2].eps, (uint32_t)rows, a, b);
+            for (uint64_t j = 0; j < rows; j++) {
+                float *row = f->weights + dw + j * len;
+                for (uint64_t i = 0; i < len; i++) row[i] *= a[j];
+                f->biases[db + j] = f->biases[db + j] * a[j] + b[j];
+            }
+        }
+        k++;
+    }
+    free(coef);
+    f->time_step = net->time_step;
+    return f;
+}
+
+void *spingalett_save_deployment(const NeuralNetwork *net, PrecisionMode precision, size_t *size) {
+    if (size) *size = 0;
+    if (!net || !size) {
+        set_error(SPINGALETT_ERR_INVALID, "save: net or size is NULL");
+        return NULL;
+    }
+    bool failed;
+    NeuralNetwork *folded = fold_batch_norm(net, &failed);
+    if (failed) return NULL;
+    void *img = save_image(folded ? folded : net, precision, false, size);
+    free_network(folded);
+    return img;
+}
+
+void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precision, bool save_optimizer, size_t *size) {
+    if (size) *size = 0;
+    if (!net || !size) {
+        set_error(SPINGALETT_ERR_INVALID, "save: net or size is NULL");
+        return NULL;
+    }
+    /* quantized files without optimizer state are for deployment: normalizations are folded */
+    if (precision != PRECISION_FLOAT32 && !save_optimizer)
+        return spingalett_save_deployment(net, precision, size);
+    return save_image(net, precision, save_optimizer, size);
 }
 
 void spingalett_free(void *ptr) {
@@ -264,7 +385,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
         } else {
             spingalett_log(LOG_INFO, "Network saved to %s", target_filename);
             spingalett_log(LOG_INFO, "Save info: format=v%u, layers=%u, weights=%llu, biases=%llu, precision=%s, optimizer=%s, bytes=%zu",
-                spingalett_all_dense(args.net) ? 3u : 4u, args.net->layers,
+                (unsigned)slett_get16((const uint8_t *)img + 6), slett_get32((const uint8_t *)img + 8),
                 (unsigned long long)args.net->total_weights, (unsigned long long)args.net->total_biases,
                 precision_names[args.precision], args.do_not_save_optimizer ? "OFF" : "ON", size);
         }
@@ -326,7 +447,7 @@ static NeuralNetwork *make_network(LossFunction loss, uint32_t layers, const uin
     return net;
 }
 
-/* The network a format 3 or 4 image describes, its parameters 0. */
+/* The network a format 3, 4 or 5 image describes, its parameters 0. */
 static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) {
     NeuralNetwork *net = new_spingalett_struct_arguments((NeuralNetworkArgs){ .loss_func = info->loss });
     if (!net) return NULL;
@@ -352,8 +473,12 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
         a.weight_initialization = WEIGHT_INITIALIZATION_NONE;
         if (e.type == LAYER_DENSE) {
             a.neurons_amount = e.outputs;
+        } else if (e.type == LAYER_BATCH_NORM) {
+            a.epsilon = e.eps;
+            a.momentum = e.momentum;
         } else {
             a.filters = e.type == LAYER_CONV2D ? e.out_c : 0;
+            a.groups = e.type == LAYER_CONV2D ? e.groups : 0;
             a.kernel_h = e.kernel_h; a.kernel_w = e.kernel_w;
             a.stride_h = e.stride_h; a.stride_w = e.stride_w;
             a.padding_h = e.pad_h; a.padding_w = e.pad_w;
@@ -377,10 +502,12 @@ static NeuralNetwork *load_image(const uint8_t *p, size_t size, PrecisionMode *p
     uint32_t L = info.layers - 1;
     int8_t *codes = NULL;
     bool first = true;
+    /* the file's precision: that of the first dense or convolution layer (normalizations are FLOAT32) */
+    *precision = PRECISION_FLOAT32;
     for (uint32_t l = 0; l < L; l++) {
         SlettLayer e;
         spingalett_slett_layer(p, l, &e);
-        if (first) { *precision = e.precision; first = false; }
+        if (first && (e.type == LAYER_DENSE || e.type == LAYER_CONV2D)) { *precision = e.precision; first = false; }
         if (e.rows == 0) continue;
         if (e.rows != spingalett_weight_rows(net, l) || e.row_len != spingalett_weight_row_len(net, l)) {
             free(codes);
@@ -427,6 +554,10 @@ static NeuralNetwork *load_image(const uint8_t *p, size_t size, PrecisionMode *p
             }
         }
         memcpy(net->biases + net->bias_offsets[l], p + e.biases, (size_t)e.rows * 4u);
+        if (e.type == LAYER_BATCH_NORM) {
+            memcpy(net->running_mean + net->bias_offsets[l], p + e.scales, (size_t)e.rows * 4u);
+            memcpy(net->running_var + net->bias_offsets[l], p + e.scales + (size_t)e.rows * 4u, (size_t)e.rows * 4u);
+        }
         if (info.flags & SLETT_FLAG_OPTIMIZER) {
             const uint8_t *o = p + e.optimizer;
             size_t wbytes = (size_t)e.rows * e.row_len * 4u, bbytes = (size_t)e.rows * 4u;

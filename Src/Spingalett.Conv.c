@@ -33,18 +33,31 @@
 /* Gathered rows are taken in chunks of at most this many floats (8 MB), at least one row. */
 #define CONV_CHUNK_FLOATS (1u << 21)
 
+#if defined(_OPENMP)                    /* used in OpenMP pragmas only */
 static inline bool use_omp(ComputeMode mode, uint64_t work) {
     return spingalett_use_omp(mode, work);
 }
+#endif
 
 /* Whether rows are gathered by the native GEMM itself (implicit im2col) rather than into memory. */
 static inline bool implicit(ComputeMode mode) { return mode != COMPUTE_OPENBLAS; }
+
+/* Channel groups of a convolution; depthwise when each group holds one input channel. */
+static inline uint32_t groups_of(const LayerShape *out) { return out->groups ? out->groups : 1u; }
+static inline bool depthwise(const LayerShape *in, const LayerShape *out) {
+    return groups_of(out) > 1 && in->channels == groups_of(out);
+}
 
 size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacity, bool training, ComputeMode mode) {
     size_t need = 0;
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
         if (out->type != LAYER_CONV2D) continue;
+        if (depthwise(in, out)) {           /* the filters transposed, tap-major */
+            size_t t = (size_t)out->kernel_h * out->kernel_w * out->channels;
+            if (t > need) need = t;
+            continue;
+        }
         size_t fwd = (size_t)out->kernel_h * out->kernel_w * in->channels;     /* per output pixel */
         if (implicit(mode)) {
             /* implicit im2col: the regrouped weights (data gradient) or a transposed weight
@@ -170,12 +183,47 @@ typedef struct {
     const LayerShape *in, *out;
     uint64_t base;                  /* global row of the source's row 0 */
     bool ones;                      /* windows: a column of ones follows the window (column K) */
+    uint32_t c0, cg;                /* channels [c0, c0 + cg) of each cell: a group's input channels
+                                       (windows) or output channels (gradients); cg 0: all */
 } RowSource;
+
+/* Window rows of a group's input channels: per cell, cg channels from c0 (as fill_windows). */
+static void fill_group_windows(const RowSource *src, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols,
+                               float *dst, size_t ld) {
+    const LayerShape *in = src->in, *out = src->out;
+    const uint32_t H = in->height, W = in->width, C = in->channels, OH = out->height, OW = out->width;
+    const uint32_t KW = out->kernel_w, CG = src->cg, K = out->kernel_h * KW * CG;
+    const bool one = src->ones && col + cols > K;
+    const uint32_t end = one ? K : col + cols, tap0 = col / CG, ch0 = col - tap0 * CG;
+    const uint64_t pixels = (uint64_t)OH * OW, sample = (uint64_t)H * W * C, p = src->base + row;
+    uint64_t n = p / pixels;
+    uint32_t pix = (uint32_t)(p % pixels), oh = pix / OW, ow = pix % OW;
+    for (uint32_t r = 0; r < rows; r++, dst += ld) {
+        const float *xs = src->data + n * sample + src->c0;
+        int64_t ih0 = (int64_t)oh * out->stride_h - out->pad_h, iw0 = (int64_t)ow * out->stride_w - out->pad_w;
+        float *d = dst;
+        uint32_t tap = tap0, ch = ch0;
+        for (uint32_t k = col; k < end; tap++, ch = 0) {
+            uint32_t take = CG - ch < end - k ? CG - ch : end - k, kh = tap / KW, kw = tap - kh * KW;
+            int64_t ih = ih0 + kh, iw = iw0 + kw;
+            if (ih < 0 || ih >= (int64_t)H || iw < 0 || iw >= (int64_t)W) zero_run(d, take);
+            else copy_run(d, xs + ((size_t)ih * W + (size_t)iw) * C + ch, take);
+            d += take;
+            k += take;
+        }
+        if (one) *d = 1.0f;
+        if (++ow == OW) { ow = 0; if (++oh == OH) { oh = 0; n++; } }
+    }
+}
 
 /* Elements [col, col + cols) of window rows [row, row + rows) (output pixels). Positions advance
    from row to row and segments from run to run, so the loops divide only once per call. */
 static void fill_windows(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols, float *dst, size_t ld) {
     const RowSource *src = (const RowSource *)ctx;
+    if (src->cg && src->cg != src->in->channels) {
+        fill_group_windows(src, row, rows, col, cols, dst, ld);
+        return;
+    }
     const LayerShape *in = src->in, *out = src->out;
     const uint32_t H = in->height, W = in->width, C = in->channels, OH = out->height, OW = out->width;
     const uint32_t KW = out->kernel_w, run = KW * C, K = out->kernel_h * run;
@@ -220,19 +268,20 @@ static void fill_output_grads(const void *ctx, uint32_t row, uint32_t rows, uint
     const RowSource *src = (const RowSource *)ctx;
     const LayerShape *in = src->in, *out = src->out;
     const uint32_t H = in->height, W = in->width, OH = out->height, OW = out->width, OC = out->channels;
+    const uint32_t OG = src->cg ? src->cg : OC;     /* the group's filters: OG of them from c0 */
     const uint32_t KW = out->kernel_w, SH = out->stride_h, SW = out->stride_w, end = col + cols;
-    const uint32_t kpos0 = col / OC, oc0 = col - kpos0 * OC, kh0 = kpos0 / KW, kw0 = kpos0 - kh0 * KW;
+    const uint32_t kpos0 = col / OG, oc0 = col - kpos0 * OG, kh0 = kpos0 / KW, kw0 = kpos0 - kh0 * KW;
     const uint64_t pixels = (uint64_t)H * W, sample = (uint64_t)OH * OW * OC, q = src->base + row;
     uint64_t n = q / pixels;
     uint32_t pix = (uint32_t)(q % pixels), ih = pix / W, iw = pix % W;
     for (uint32_t r = 0; r < rows; r++, dst += ld) {
-        const float *ds = src->data + n * sample;
+        const float *ds = src->data + n * sample + src->c0;
         float *d = dst;
         uint32_t kh = kh0, kw = kw0, oc = oc0;
         int64_t th = (int64_t)ih + out->pad_h - kh;     /* = oh * SH when an output row covers it */
         bool row_ok = th >= 0 && th % SH == 0 && th / SH < OH;
         for (uint32_t k = col; k < end; oc = 0) {
-            uint32_t take = OC - oc < end - k ? OC - oc : end - k;
+            uint32_t take = OG - oc < end - k ? OG - oc : end - k;
             int64_t tw = (int64_t)iw + out->pad_w - kw;
             if (row_ok && tw >= 0 && tw % SW == 0 && tw / SW < OW)
                 copy_run(d, ds + ((size_t)(th / SH) * OW + (size_t)(tw / SW)) * OC + oc, take);
@@ -249,6 +298,47 @@ static void fill_output_grads(const void *ctx, uint32_t row, uint32_t rows, uint
         }
         if (++iw == W) { iw = 0; if (++ih == H) { ih = 0; n++; } }
     }
+}
+
+/* Gathered rows for OpenBLAS: group g's windows (all of them with one group), or the gradients of
+   its filters, through the operand sources in blocks of rows. */
+#define GATHER_BLOCK 256u
+
+static void gather_group_windows(const float *x, const LayerShape *in, const LayerShape *out, uint64_t p0, uint64_t rows,
+                                 uint32_t g, float *col, ComputeMode mode) {
+    const uint32_t G = groups_of(out), CG = in->channels / G;
+    if (G == 1) { gather_windows(x, in, out, p0, rows, col, mode); return; }
+    const uint32_t K = out->kernel_h * out->kernel_w * CG;
+    const int64_t blocks = (int64_t)((rows + GATHER_BLOCK - 1) / GATHER_BLOCK);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(use_omp(mode, rows * K))
+#endif
+    for (int64_t b = 0; b < blocks; b++) {
+        uint64_t r0 = (uint64_t)b * GATHER_BLOCK, nr = rows - r0 < GATHER_BLOCK ? rows - r0 : GATHER_BLOCK;
+        RowSource src = {x, in, out, p0, false, g * CG, CG};
+        fill_group_windows(&src, (uint32_t)r0, (uint32_t)nr, 0, K, col + r0 * K, K);
+    }
+    (void)mode;
+}
+
+static void fill_output_grads(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols, float *dst,
+                              size_t ld);
+
+static void gather_group_output_grads(const float *dy, const LayerShape *in, const LayerShape *out, uint64_t q0,
+                                      uint64_t rows, uint32_t g, float *col, ComputeMode mode) {
+    const uint32_t G = groups_of(out), OG = out->channels / G;
+    if (G == 1) { gather_output_grads(dy, in, out, q0, rows, col, mode); return; }
+    const uint32_t K = out->kernel_h * out->kernel_w * OG;
+    const int64_t blocks = (int64_t)((rows + GATHER_BLOCK - 1) / GATHER_BLOCK);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(use_omp(mode, rows * K))
+#endif
+    for (int64_t b = 0; b < blocks; b++) {
+        uint64_t r0 = (uint64_t)b * GATHER_BLOCK, nr = rows - r0 < GATHER_BLOCK ? rows - r0 : GATHER_BLOCK;
+        RowSource src = {dy, in, out, q0, false, g * OG, OG};
+        fill_output_grads(&src, (uint32_t)r0, (uint32_t)nr, 0, K, col + r0 * K, K);
+    }
+    (void)mode;
 }
 
 /* A product of gathered rows (sources and epilogues on the native kernels). */
@@ -284,6 +374,168 @@ static bool pointwise(const LayerShape *out) {
            out->pad_h == 0 && out->pad_w == 0;
 }
 
+/* ---- depthwise convolutions: one input channel per group (times a multiplier of filters each),
+   computed directly, every output pixel's channels at once; filters transposed tap-major,
+   wt[t * OC + oc] = W[oc][t]. Output channel oc reads input channel oc / m. */
+
+static void transpose_taps(const float *W, uint32_t OC, uint32_t taps, float *wt) {
+    for (uint32_t oc = 0; oc < OC; oc++)
+        for (uint32_t t = 0; t < taps; t++) wt[(size_t)t * OC + oc] = W[(size_t)oc * taps + t];
+}
+
+/* o[oc] += x[oc / m] * w[oc] for C input channels */
+static inline void depthwise_tap(float *restrict o, const float *restrict x, const float *restrict w, uint32_t C,
+                                 uint32_t m) {
+    if (m == 1) {
+        for (uint32_t c = 0; c < C; c++) o[c] += x[c] * w[c];
+        return;
+    }
+    for (uint32_t c = 0; c < C; c++)
+        for (uint32_t j = 0; j < m; j++) o[c * m + j] += x[c] * w[c * m + j];
+}
+
+static void depthwise_forward(const LayerShape *in, const LayerShape *out, const float *Wt, const float *scale,
+                              const float *bias, const float *x, float *y, uint32_t n, ActivationFunction act,
+                              float *wt, ComputeMode mode) {
+    const uint32_t H = in->height, W = in->width, C = in->channels, OH = out->height, OW = out->width;
+    const uint32_t OC = out->channels, m = OC / C, KH = out->kernel_h, KW = out->kernel_w;
+    const uint64_t in_size = (uint64_t)H * W * C, out_size = (uint64_t)OH * OW * OC, rows = (uint64_t)n * OH;
+    transpose_taps(Wt, OC, KH * KW, wt);
+    if (act == ACT_SOFTMAX) act = ACT_NONE;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(use_omp(mode, (uint64_t)n * out_size * KH * KW))
+#endif
+    for (int64_t r = 0; r < (int64_t)rows; r++) {
+        uint64_t s = (uint64_t)r / OH;
+        uint32_t oh = (uint32_t)((uint64_t)r % OH);
+        const float *xs = x + s * in_size;
+        int64_t ih0 = (int64_t)oh * out->stride_h - out->pad_h;
+        for (uint32_t ow = 0; ow < OW; ow++) {
+            float *o = y + s * out_size + ((size_t)oh * OW + ow) * OC;
+            int64_t iw0 = (int64_t)ow * out->stride_w - out->pad_w;
+            memset(o, 0, OC * sizeof(float));
+            for (uint32_t kh = 0; kh < KH; kh++) {
+                int64_t ih = ih0 + kh;
+                if (ih < 0 || ih >= (int64_t)H) continue;
+                for (uint32_t kw = 0; kw < KW; kw++) {
+                    int64_t iw = iw0 + kw;
+                    if (iw < 0 || iw >= (int64_t)W) continue;
+                    depthwise_tap(o, xs + ((size_t)ih * W + (size_t)iw) * C, wt + ((size_t)kh * KW + kw) * OC, C, m);
+                }
+            }
+            if (scale) for (uint32_t oc = 0; oc < OC; oc++) o[oc] = o[oc] * scale[oc] + bias[oc];
+            else       for (uint32_t oc = 0; oc < OC; oc++) o[oc] += bias[oc];
+            apply_activation_bulk(o, OC, act);
+        }
+    }
+    (void)mode;
+}
+
+/* dx, sample by sample: each output pixel adds its gradient times the filters to its window's
+   cells, then the derivative of the input layer's activation */
+static void depthwise_backward_data(const LayerShape *in, const LayerShape *out, const float *Wt, const float *dy,
+                                    float *dx, uint32_t n, const float *x, ActivationFunction act, float *wt,
+                                    ComputeMode mode) {
+    const uint32_t H = in->height, W = in->width, C = in->channels, OH = out->height, OW = out->width;
+    const uint32_t OC = out->channels, m = OC / C, KH = out->kernel_h, KW = out->kernel_w;
+    const uint64_t in_size = (uint64_t)H * W * C, out_size = (uint64_t)OH * OW * OC;
+    transpose_taps(Wt, OC, KH * KW, wt);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(use_omp(mode, (uint64_t)n * out_size * KH * KW))
+#endif
+    for (int64_t s = 0; s < (int64_t)n; s++) {
+        float *dxs = dx + (uint64_t)s * in_size;
+        memset(dxs, 0, in_size * sizeof(float));
+        for (uint32_t oh = 0; oh < OH; oh++)
+            for (uint32_t ow = 0; ow < OW; ow++) {
+                const float *g = dy + (uint64_t)s * out_size + ((size_t)oh * OW + ow) * OC;
+                int64_t ih0 = (int64_t)oh * out->stride_h - out->pad_h, iw0 = (int64_t)ow * out->stride_w - out->pad_w;
+                for (uint32_t kh = 0; kh < KH; kh++) {
+                    int64_t ih = ih0 + kh;
+                    if (ih < 0 || ih >= (int64_t)H) continue;
+                    for (uint32_t kw = 0; kw < KW; kw++) {
+                        int64_t iw = iw0 + kw;
+                        if (iw < 0 || iw >= (int64_t)W) continue;
+                        float *d = dxs + ((size_t)ih * W + (size_t)iw) * C;
+                        const float *w = wt + ((size_t)kh * KW + kw) * OC;
+                        if (m == 1) {
+                            for (uint32_t c = 0; c < C; c++) d[c] += g[c] * w[c];
+                        } else {
+                            for (uint32_t c = 0; c < C; c++) {
+                                float sum = 0.0f;
+                                for (uint32_t j = 0; j < m; j++) sum += g[c * m + j] * w[c * m + j];
+                                d[c] += sum;
+                            }
+                        }
+                    }
+                }
+            }
+        if (act != ACT_NONE) apply_derivative_batch(dxs, x + (uint64_t)s * in_size, in_size, act);
+    }
+    (void)mode;
+}
+
+/* Weight and bias gradients over fixed ranges of samples (each summed in float sample by sample,
+   then in double), added in order: the result does not depend on the thread count. */
+#define DEPTHWISE_CHUNKS 32u
+
+static void depthwise_backward_weights(const LayerShape *in, const LayerShape *out, const float *x, const float *dy,
+                                       uint32_t n, float scale, float beta, float *gW, float *gB, ComputeMode mode) {
+    const uint32_t H = in->height, W = in->width, C = in->channels, OH = out->height, OW = out->width;
+    const uint32_t OC = out->channels, m = OC / C, KH = out->kernel_h, KW = out->kernel_w, T = KH * KW;
+    const uint64_t in_size = (uint64_t)H * W * C, out_size = (uint64_t)OH * OW * OC;
+    const uint32_t chunks = n < DEPTHWISE_CHUNKS ? n : DEPTHWISE_CHUNKS, per = (n + chunks - 1) / chunks;
+    const size_t width = (size_t)(T + 1) * OC;         /* tap-major weights, then the biases */
+    double *part = (double *)malloc((size_t)chunks * width * sizeof(double));
+    float *acc = (float *)malloc((size_t)chunks * width * sizeof(float));
+    if (!part || !acc) {
+        free(part); free(acc);
+        set_error(SPINGALETT_ERR_ALLOC, "conv: depthwise gradient allocation failed");
+        return;
+    }
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(use_omp(mode, (uint64_t)n * out_size * T) && chunks > 1)
+#endif
+    for (int64_t ch = 0; ch < (int64_t)chunks; ch++) {
+        double *pd = part + (size_t)ch * width;
+        float *a = acc + (size_t)ch * width;
+        for (size_t i = 0; i < width; i++) pd[i] = 0.0;
+        uint64_t s0 = (uint64_t)ch * per, s1 = s0 + per < n ? s0 + per : n;
+        for (uint64_t s = s0; s < s1; s++) {
+            memset(a, 0, width * sizeof(float));
+            const float *xs = x + s * in_size;
+            for (uint32_t oh = 0; oh < OH; oh++)
+                for (uint32_t ow = 0; ow < OW; ow++) {
+                    const float *g = dy + s * out_size + ((size_t)oh * OW + ow) * OC;
+                    int64_t ih0 = (int64_t)oh * out->stride_h - out->pad_h, iw0 = (int64_t)ow * out->stride_w - out->pad_w;
+                    for (uint32_t kh = 0; kh < KH; kh++) {
+                        int64_t ih = ih0 + kh;
+                        if (ih < 0 || ih >= (int64_t)H) continue;
+                        for (uint32_t kw = 0; kw < KW; kw++) {
+                            int64_t iw = iw0 + kw;
+                            if (iw < 0 || iw >= (int64_t)W) continue;
+                            depthwise_tap(a + ((size_t)kh * KW + kw) * OC, xs + ((size_t)ih * W + (size_t)iw) * C, g, C, m);
+                        }
+                    }
+                    float *ab = a + (size_t)T * OC;
+                    for (uint32_t oc = 0; oc < OC; oc++) ab[oc] += g[oc];
+                }
+            for (size_t i = 0; i < width; i++) pd[i] += a[i];
+        }
+    }
+    (void)mode;
+    for (uint32_t oc = 0; oc < OC; oc++) {
+        for (uint32_t t = 0; t <= T; t++) {
+            double sum = 0.0;
+            for (uint32_t ch = 0; ch < chunks; ch++) sum += part[(size_t)ch * width + (size_t)t * OC + oc];
+            float *dst = t < T ? gW + (size_t)oc * T + t : gB + oc;
+            *dst = (float)(scale * sum) + (beta == 0.0f ? 0.0f : beta * *dst);
+        }
+    }
+    free(part);
+    free(acc);
+}
+
 void spingalett_conv_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode) {
     spingalett_conv_forward_shapes(&net->shapes[l], &net->shapes[l + 1], SPINGALETT_WEIGHT_MTX_PTR(net, l),
@@ -292,6 +544,7 @@ void spingalett_conv_forward(const NeuralNetwork *net, uint32_t l, const float *
 
 size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *out, uint32_t capacity,
                                        ComputeMode mode) {
+    if (depthwise(in, out)) return (size_t)out->kernel_h * out->kernel_w * out->channels;
     if (implicit(mode) || pointwise(out)) return 0;
     size_t fwd = (size_t)out->kernel_h * out->kernel_w * in->channels;
     size_t total = fwd * out->height * out->width * capacity;
@@ -301,30 +554,45 @@ size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *o
 void spingalett_conv_forward_shapes(const LayerShape *in, const LayerShape *out, const float *Wt, const float *bias,
                                     const float *x, float *y, uint32_t n, ActivationFunction act, float *scratch,
                                     SpingalettGemmScratch *gemm, ComputeMode mode) {
-    const uint32_t OC = out->channels;
-    const size_t K = (size_t)out->kernel_h * out->kernel_w * in->channels;
-    const uint64_t total = (uint64_t)n * out->height * out->width;
-    SpingalettBiasActivation epilogue = {bias, act == ACT_SOFTMAX ? ACT_NONE : act};
-    SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
+    spingalett_conv_forward_scaled(in, out, Wt, NULL, bias, x, y, n, act, scratch, gemm, mode);
+}
 
-    if (pointwise(out) || implicit(mode)) {
-        bool gather = !pointwise(out);
-        for (uint64_t p0 = 0; p0 < total; p0 += POINTWISE_ROWS) {
-            uint64_t rows = total - p0 < POINTWISE_ROWS ? total - p0 : POINTWISE_ROWS;
-            RowSource src = {x, in, out, p0, false};
-            SpingalettGemmSource windows = {fill_windows, &src};
-            hooks.a = gather ? &windows : NULL;
-            conv_gemm(gemm, mode, false, true, (uint32_t)rows, OC, (uint32_t)K, 1.0f, gather ? NULL : x + p0 * K, K,
-                      Wt, K, 0.0f, y + p0 * OC, OC, &hooks);
-        }
+void spingalett_conv_forward_scaled(const LayerShape *in, const LayerShape *out, const float *Wt, const float *scale,
+                                    const float *bias, const float *x, float *y, uint32_t n, ActivationFunction act,
+                                    float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode) {
+    if (depthwise(in, out)) {
+        depthwise_forward(in, out, Wt, scale, bias, x, y, n, act, scratch, mode);
         return;
     }
-    uint64_t step = chunk_rows(total, K);
-    for (uint64_t p0 = 0; p0 < total; p0 += step) {
-        uint64_t rows = total - p0 < step ? total - p0 : step;
-        gather_windows(x, in, out, p0, rows, scratch, mode);
-        conv_gemm(gemm, mode, false, true, (uint32_t)rows, OC, (uint32_t)K, 1.0f, scratch, K, Wt, K, 0.0f,
-                  y + p0 * OC, OC, &hooks);
+    /* groups: one product per group, over its input channels and into its filters' columns */
+    const uint32_t G = groups_of(out), C = in->channels, CG = C / G, OC = out->channels, OG = OC / G;
+    const size_t K = (size_t)out->kernel_h * out->kernel_w * CG;
+    const uint64_t total = (uint64_t)n * out->height * out->width;
+    for (uint32_t g = 0; g < G; g++) {
+        const float *Wg = Wt + (size_t)g * OG * K;
+        SpingalettBiasActivation epilogue = {bias + (size_t)g * OG, act == ACT_SOFTMAX ? ACT_NONE : act,
+                                             scale ? scale + (size_t)g * OG : NULL};
+        SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
+        if (pointwise(out) || implicit(mode)) {
+            bool gather = !pointwise(out);
+            for (uint64_t p0 = 0; p0 < total; p0 += POINTWISE_ROWS) {
+                uint64_t rows = total - p0 < POINTWISE_ROWS ? total - p0 : POINTWISE_ROWS;
+                RowSource src = {x, in, out, p0, false, g * CG, G > 1 ? CG : 0u};
+                SpingalettGemmSource windows = {fill_windows, &src};
+                hooks.a = gather ? &windows : NULL;
+                conv_gemm(gemm, mode, false, true, (uint32_t)rows, OG, (uint32_t)K, 1.0f,
+                          gather ? NULL : x + p0 * C + (size_t)g * CG, C, Wg, K, 0.0f, y + p0 * OC + (size_t)g * OG, OC,
+                          &hooks);
+            }
+            continue;
+        }
+        uint64_t step = chunk_rows(total, K);
+        for (uint64_t p0 = 0; p0 < total; p0 += step) {
+            uint64_t rows = total - p0 < step ? total - p0 : step;
+            gather_group_windows(x, in, out, p0, rows, g, scratch, mode);
+            conv_gemm(gemm, mode, false, true, (uint32_t)rows, OG, (uint32_t)K, 1.0f, scratch, K, Wg, K, 0.0f,
+                      y + p0 * OC + (size_t)g * OG, OC, &hooks);
+        }
     }
 }
 
@@ -332,51 +600,61 @@ void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const f
                                    const float *x, ActivationFunction act, float *scratch,
                                    SpingalettGemmScratch *gemm, ComputeMode mode) {
     const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
-    const uint32_t C = in->channels, OC = out->channels, KH = out->kernel_h, KW = out->kernel_w;
-    const size_t K = (size_t)KH * KW * C;
-    const uint64_t total = (uint64_t)n * in->height * in->width;
     const float *Wt = SPINGALETT_WEIGHT_MTX_PTR(net, l);
-    Derivative epilogue = {x, 0, act};
-    SpingalettGemmHooks hooks = {NULL, NULL, act == ACT_NONE ? NULL : multiply_derivative, &epilogue};
-
-    if (pointwise(out)) {           /* dx = dy * W */
-        for (uint64_t q0 = 0; q0 < total; q0 += POINTWISE_ROWS) {
-            uint64_t rows = total - q0 < POINTWISE_ROWS ? total - q0 : POINTWISE_ROWS;
-            epilogue.base = q0;
-            conv_gemm(gemm, mode, false, false, (uint32_t)rows, C, OC, 1.0f, dy + q0 * OC, OC, Wt, K, 0.0f,
-                      dx + q0 * C, C, &hooks);
-        }
+    if (depthwise(in, out)) {
+        depthwise_backward_data(in, out, Wt, dy, dx, n, x, act, scratch, mode);
         return;
     }
-    /* The weights regrouped per input channel, Wr[c][(kh, kw, oc)] = W[oc][(kh, kw, c)], at the
-       start of the scratch buffer; gathered rows (OpenBLAS) use the rest. */
-    const size_t Kr = (size_t)KH * KW * OC, wsize = (size_t)C * Kr;
-    float *Wr = scratch;
-    float *col = scratch + ((wsize + 15u) & ~(size_t)15u);
-    for (uint32_t oc = 0; oc < OC; oc++)
-        for (size_t s = 0; s < (size_t)KH * KW; s++)
-            for (uint32_t c = 0; c < C; c++)
-                Wr[(size_t)c * Kr + s * OC + oc] = Wt[(size_t)oc * K + s * C + c];
+    /* groups: group g's input channels get the gradients of its filters */
+    const uint32_t G = groups_of(out), C = in->channels, CG = C / G, OC = out->channels, OG = OC / G;
+    const uint32_t KH = out->kernel_h, KW = out->kernel_w;
+    const size_t K = (size_t)KH * KW * CG;
+    const uint64_t total = (uint64_t)n * in->height * in->width;
+    for (uint32_t g = 0; g < G; g++) {
+        const float *Wg = Wt + (size_t)g * OG * K;
+        float *dxg = dx + (size_t)g * CG;
+        Derivative epilogue = {x + (size_t)g * CG, 0, act};
+        SpingalettGemmHooks hooks = {NULL, NULL, act == ACT_NONE ? NULL : multiply_derivative, &epilogue};
 
-    if (implicit(mode)) {
-        for (uint64_t q0 = 0; q0 < total; q0 += POINTWISE_ROWS) {
-            uint64_t rows = total - q0 < POINTWISE_ROWS ? total - q0 : POINTWISE_ROWS;
-            RowSource src = {dy, in, out, q0, false};
-            SpingalettGemmSource grads = {fill_output_grads, &src};
-            hooks.a = &grads;
-            epilogue.base = q0;
-            conv_gemm(gemm, mode, false, true, (uint32_t)rows, C, (uint32_t)Kr, 1.0f, NULL, Kr, Wr, Kr, 0.0f,
-                      dx + q0 * C, C, &hooks);
+        if (pointwise(out)) {       /* dx = dy * W */
+            for (uint64_t q0 = 0; q0 < total; q0 += POINTWISE_ROWS) {
+                uint64_t rows = total - q0 < POINTWISE_ROWS ? total - q0 : POINTWISE_ROWS;
+                epilogue.base = q0;
+                conv_gemm(gemm, mode, false, false, (uint32_t)rows, CG, OG, 1.0f, dy + q0 * OC + (size_t)g * OG, OC, Wg,
+                          K, 0.0f, dxg + q0 * C, C, &hooks);
+            }
+            continue;
         }
-        return;
-    }
-    uint64_t step = chunk_rows(total, Kr);
-    for (uint64_t q0 = 0; q0 < total; q0 += step) {
-        uint64_t rows = total - q0 < step ? total - q0 : step;
-        gather_output_grads(dy, in, out, q0, rows, col, mode);
-        epilogue.base = q0;
-        conv_gemm(gemm, mode, false, true, (uint32_t)rows, C, (uint32_t)Kr, 1.0f, col, Kr, Wr, Kr, 0.0f,
-                  dx + q0 * C, C, &hooks);
+        /* The group's weights regrouped per input channel, Wr[c][(kh, kw, oc)] = W[oc][(kh, kw, c)],
+           at the start of the scratch buffer; gathered rows (OpenBLAS) use the rest. */
+        const size_t Kr = (size_t)KH * KW * OG, wsize = (size_t)CG * Kr;
+        float *Wr = scratch;
+        float *col = scratch + ((wsize + 15u) & ~(size_t)15u);
+        for (uint32_t oc = 0; oc < OG; oc++)
+            for (size_t t = 0; t < (size_t)KH * KW; t++)
+                for (uint32_t c = 0; c < CG; c++)
+                    Wr[(size_t)c * Kr + t * OG + oc] = Wg[(size_t)oc * K + t * CG + c];
+
+        if (implicit(mode)) {
+            for (uint64_t q0 = 0; q0 < total; q0 += POINTWISE_ROWS) {
+                uint64_t rows = total - q0 < POINTWISE_ROWS ? total - q0 : POINTWISE_ROWS;
+                RowSource src = {dy, in, out, q0, false, g * OG, G > 1 ? OG : 0u};
+                SpingalettGemmSource grads = {fill_output_grads, &src};
+                hooks.a = &grads;
+                epilogue.base = q0;
+                conv_gemm(gemm, mode, false, true, (uint32_t)rows, CG, (uint32_t)Kr, 1.0f, NULL, Kr, Wr, Kr, 0.0f,
+                          dxg + q0 * C, C, &hooks);
+            }
+            continue;
+        }
+        uint64_t step = chunk_rows(total, Kr);
+        for (uint64_t q0 = 0; q0 < total; q0 += step) {
+            uint64_t rows = total - q0 < step ? total - q0 : step;
+            gather_group_output_grads(dy, in, out, q0, rows, g, col, mode);
+            epilogue.base = q0;
+            conv_gemm(gemm, mode, false, true, (uint32_t)rows, CG, (uint32_t)Kr, 1.0f, col, Kr, Wr, Kr, 0.0f,
+                      dxg + q0 * C, C, &hooks);
+        }
     }
 }
 
@@ -389,12 +667,53 @@ void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const floa
     const uint64_t total = (uint64_t)n * out->height * out->width;
     float *gW = SPINGALETT_GRAD_W_MTX_PTR(net, l), *gB = net->grad_biases + net->bias_offsets[l];
 
+    if (depthwise(in, out)) {
+        depthwise_backward_weights(in, out, x, dy, n, scale, beta, gW, gB, mode);
+        return;
+    }
+    const uint32_t G = groups_of(out);
+    if (G > 1) {
+        /* per group: gW_g[filters of g x window of g] = scale * dy_g^T * windows_g (+ beta * gW_g) */
+        const uint32_t C = in->channels, CG = C / G, OG = OC / G;
+        const size_t KG = (size_t)out->kernel_h * out->kernel_w * CG;
+        for (uint32_t g = 0; g < G; g++) {
+            float *gWg = gW + (size_t)g * OG * KG;
+            const float *dyg = dy + (size_t)g * OG;
+            if (pointwise(out)) {
+                for (uint64_t p0 = 0; p0 < total; p0 += POINTWISE_ROWS) {
+                    uint64_t rows = total - p0 < POINTWISE_ROWS ? total - p0 : POINTWISE_ROWS;
+                    spingalett_gemm(gemm, mode, true, false, OG, (uint32_t)KG, (uint32_t)rows, scale, dyg + p0 * OC, OC,
+                                    x + p0 * C + (size_t)g * CG, C, p0 == 0 ? beta : 1.0f, gWg, KG);
+                }
+            } else if (implicit(mode)) {
+                for (uint64_t p0 = 0; p0 < total; p0 += POINTWISE_ROWS) {
+                    uint64_t rows = total - p0 < POINTWISE_ROWS ? total - p0 : POINTWISE_ROWS;
+                    RowSource src = {x, in, out, p0, false, g * CG, CG};
+                    SpingalettGemmSource windows = {fill_windows, &src};
+                    SpingalettGemmHooks hooks = {NULL, &windows, NULL, NULL};
+                    conv_gemm(gemm, mode, true, false, OG, (uint32_t)KG, (uint32_t)rows, scale, dyg + p0 * OC, OC, NULL,
+                              KG, p0 == 0 ? beta : 1.0f, gWg, KG, &hooks);
+                }
+            } else {
+                uint64_t step = chunk_rows(total, KG);
+                for (uint64_t p0 = 0; p0 < total; p0 += step) {
+                    uint64_t rows = total - p0 < step ? total - p0 : step;
+                    gather_group_windows(x, in, out, p0, rows, g, scratch, mode);
+                    spingalett_gemm(gemm, mode, true, false, OG, (uint32_t)KG, (uint32_t)rows, scale, dyg + p0 * OC, OC,
+                                    scratch, KG, p0 == 0 ? beta : 1.0f, gWg, KG);
+                }
+            }
+        }
+    }
+
     /* gW[oc x window] = scale * dy^T * windows (+ beta * gW). Windows narrower than a GEMM panel
        (a first layer over one channel has 9 weights per filter) are multiplied the other way
        round, T[window x oc] = windows^T * dy, which fills the panels, and T is transposed into gW.
        Gathered by the GEMM, the windows then end in a column of ones, whose row of T is the bias
        gradient: dy is read once. */
-    if (K < 32 && OC > K && !pointwise(out)) {
+    if (G > 1) {
+        /* the bias gradient below */
+    } else if (K < 32 && OC > K && !pointwise(out)) {
         float *T = scratch, *col = scratch + ((K * OC + 15u) & ~(size_t)15u);
         if (implicit(mode)) {
             for (uint64_t p0 = 0; p0 < total; p0 += POINTWISE_ROWS) {

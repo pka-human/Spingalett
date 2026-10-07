@@ -42,18 +42,18 @@ alike. Python bindings are included.
 
 | Area | Supported |
 |---|---|
-| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows), max and average pooling; channels-last tensors; optional dropout per layer |
+| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), max and average pooling, batch normalization; channels-last tensors; optional dropout per layer |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs) |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
-| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; validation with early stopping and best-weight restore |
+| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
-| Data | `.slettd` data set files (compact, lossless by default, streamable into training), IDX (MNIST) and CSV readers, shuffling, hold-out splits |
+| Data | `.slettd` data set files (compact, lossless by default, streamable into training), IDX (MNIST), CIFAR-10/100 and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `forward()`, batched `predict()`, `evaluate()` (loss and accuracy) |
-| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX2/VNNI, SSE2, NEON, Arm DSP; INT4 and INT2 decoded in registers); run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
+| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
@@ -69,7 +69,9 @@ the shared library, a CMake package, `DatasetTool` and `ModelTool`. Extract one 
 `-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
 when the processor has them, and the `-v3` build also compiles the rest of the library
 (activations, optimizers, the inference engine) for AVX2. The Windows DLL ships with import
-libraries for MinGW and MSVC.
+libraries for MinGW and MSVC. Every package is built with OpenMP; the macOS one (a universal
+library for Apple silicon and Intel, macOS 11 or newer) carries LLVM's OpenMP runtime,
+`libomp.dylib`, next to the library, since Apple's compilers come without one.
 
 To build from source: requirements: CMake 3.21 or newer and a compiler with C23 support. GCC 13 and Clang 18 are tested
 in CI; MSVC 19.36 or newer is expected to work but is not tested. OpenMP and OpenBLAS are
@@ -107,7 +109,7 @@ the processor supports (`spingalett_cpu_kernels()` names it).
 | `BUILD_APPS` | `OFF` | Build the DigitPad demo (needs SDL2) and its trainer |
 | `SPINGALETT_INFERENCE_ONLY` | `OFF` | Build only the inference engine (`Spingalett.Inference.h`) as a static library: no training, file I/O, OpenMP or heap |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
-| `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` on x86-64 (GCC, Clang): also build AVX2 and AVX-512 matrix kernels and choose at run time |
+| `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` (GCC, Clang): on x86-64 also build AVX2 and AVX-512 matrix kernels and AVX-512 VNNI and AVX-VNNI integer kernels, on AArch64 Linux integer kernels for the dot product instructions, and choose at run time |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
 
@@ -116,7 +118,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.7 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.8 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -170,8 +172,9 @@ Fields that are not mentioned are zero, which selects the documented default.
 
 The `Examples/` directory contains this XOR program, an MNIST classifier
 (`Examples/download_mnist.sh data/mnist && Bin/MNIST data/mnist`), a convolutional one
-(`Bin/MNIST_CNN data/mnist`, about 99% after two epochs) and the benchmark described under
-[Performance](#performance).
+(`Bin/MNIST_CNN data/mnist`, about 99% after two epochs), a CIFAR-10 classifier with batch
+normalization and augmentation (`Examples/download_cifar10.sh data/cifar10 && Bin/CIFAR10
+data/cifar10`) and the benchmark described under [Performance](#performance).
 
 ## Usage
 
@@ -222,10 +225,11 @@ layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
 | `kernel`, `kernel_h`, `kernel_w` | Window size; `kernel` sets both, `kernel_h` / `kernel_w` override one axis |
 | `stride`, `stride_h`, `stride_w` | Window step: 1 for convolutions and the kernel size for pooling unless set |
 | `padding`, `padding_h`, `padding_w` | Zero cells added on both sides of each axis; smaller than the kernel |
+| `groups` | Convolutions: split the input channels and the filters into this many groups; each filter sees the input channels of its own group. As many groups as input channels make a depthwise convolution (with any number of filters per channel) |
 
 An output axis has `(size + 2 padding - kernel) / stride + 1` cells. A convolution's filters are
-`kernel_h x kernel_w x input channels` weights each, plus one bias, and take an activation, a weight
-initialization (fan-in is the window size) and dropout like dense layers. Pooling has no parameters
+`kernel_h x kernel_w x (input channels / groups)` weights each, plus one bias, and take an
+activation, a weight initialization (fan-in is the window size) and dropout like dense layers. Pooling has no parameters
 and no activation; windows are clipped to the input, so padding cells never count (average pooling
 divides by the cells inside), and max pooling passes the gradient to the first maximum. Every
 training strategy, optimizer, schedule, the custom training loop and `predict()` work with these
@@ -234,8 +238,33 @@ layers as with dense ones.
 Convolutions run as matrix products whose input windows are gathered by the matrix kernels
 themselves (implicit im2col: no window matrix is stored), with the bias and activation applied to
 each tile of the result while it is in cache; weight gradients split their long summation over all
-pixels into fixed slots that the threads share. On a single core, `Examples/MNIST_CNN.c` trains 1.5
-times as fast as PyTorch and infers 4 times as fast (see [Performance](#performance)).
+pixels into fixed slots that the threads share. Depthwise convolutions are computed directly, all
+of a pixel's channels at once, and other grouped ones as one product per group. The network of
+`Examples/MNIST_CNN.c` trains 1.3 to 1.7 times as fast as in PyTorch and infers 3.4 to 4.1 times as
+fast (see [Performance](#performance)).
+
+### Batch normalization
+
+`batch_norm()` normalizes the previous layer per channel (per unit after a dense layer):
+`y = act(gamma (x - mean) / sqrt(var + epsilon) + beta)`. While training, mean and variance are
+those of the batch (of each chunk of up to 2,048 samples in full-batch training), and running
+averages of them move `momentum` of the way towards each batch's; `predict()`, `forward()`,
+`evaluate()` and deployment models use the running averages. Gamma starts at 1 and beta at 0; they
+are the layer's weights and biases for every optimizer, but weight decay leaves them alone. The
+convolution or dense layer before a normalization usually takes no activation:
+
+```c
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+       .weight_initialization = WEIGHT_INITIALIZATION_HE);
+batch_norm(.net = net, .act_func = ACT_RELU);            /* .epsilon = 1e-5, .momentum = 0.1 */
+```
+
+Such a pair costs no more than the convolution alone at inference: `predict()` and `forward()`
+apply the normalization while the convolution's tiles are in cache, and deployment models (and
+files saved in other precisions than FP32 without optimizer state) fold it into the convolution's
+weights and biases. A normalization of a dense layer needs batches of at least 2 samples.
+`PARAM_RUNNING_MEAN` and `PARAM_RUNNING_VARIANCE` read and write the statistics, and
+`restore_best_weights` restores them with the weights.
 
 ### Inspecting a network
 
@@ -251,9 +280,11 @@ spingalett_get_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count); /* weights 
 spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count);
 ```
 
-Parameters come as `PARAM_WEIGHTS`, `PARAM_BIASES`, `PARAM_WEIGHT_GRADIENTS` and
-`PARAM_BIAS_GRADIENTS`. Dense weights are `outputs x inputs` (row `j` holds the weights into unit
-`j`); convolution weights are `filters x kernel_h x kernel_w x input channels`. Also available:
+Parameters come as `PARAM_WEIGHTS`, `PARAM_BIASES`, `PARAM_WEIGHT_GRADIENTS`,
+`PARAM_BIAS_GRADIENTS` and, for batch normalization, `PARAM_RUNNING_MEAN` and
+`PARAM_RUNNING_VARIANCE`. Dense weights are `outputs x inputs` (row `j` holds the weights into unit
+`j`); convolution weights are `filters x kernel_h x kernel_w x (input channels / groups)`; batch
+normalization has gamma as weights and beta as biases, one per channel. Also available:
 `spingalett_input_size()`, `spingalett_output_size()`, `spingalett_parameter_count()`,
 `spingalett_network_loss()` and `spingalett_optimizer_steps()`.
 
@@ -286,6 +317,7 @@ Parameters come as `PARAM_WEIGHTS`, `PARAM_BIASES`, `PARAM_WEIGHT_GRADIENTS` and
 | `autosave_mode`, `autosave_interval`, `autosave_path` | off | Periodic checkpoints (`AUTOSAVE_OVERWRITE` or `AUTOSAVE_NEW_FILES`, which appends `_epoch_N`) |
 | `autosave_precision`, `autosave_do_not_save_optimizer` | FP32, false | Checkpoint format |
 | `blas_num_threads` | 0 (auto) | OpenBLAS threads during training, see [Backends](#backends-and-threading) |
+| `augment_shift`, `augment_flip` | 0, false | Image augmentation (the input layer has a height and width): each training sample is shifted by up to `augment_shift` cells along each axis, zeros shifted in, and with `augment_flip` mirrored left to right half of the time; drawn anew for every sample of every step, the same on any number of threads |
 
 The reported loss is averaged over the samples of an epoch: the sum of squared errors per sample
 for MSE, and categorical (softmax) or binary (sigmoid) cross-entropy otherwise. Cross-entropy
@@ -409,6 +441,9 @@ are flattened and scaled to [0, 1] (float and double files are read unchanged), 
 one-hot encoded. `spingalett_load_csv(path, target_columns, num_classes, &d)` reads numeric,
 comma-separated files; a non-numeric first line is skipped as a header, the last `target_columns`
 columns are the targets, and with `num_classes > 0` a single label column is one-hot encoded.
+`spingalett_load_cifar(paths, count, num_classes, &d)` reads CIFAR binary batches one after the
+other as 32 x 32 x 3 channels-last images in [0, 1]: `num_classes` 10 for CIFAR-10, 100 or 20 for
+the fine or coarse labels of CIFAR-100.
 
 ### Data set files
 
@@ -587,23 +622,40 @@ layer over one or three channels, accumulate all filters at once); pooling runs 
 prediction of integer models computes exactly what single runs compute, on every backend and
 platform.
 
-Accuracy on the 10,000 MNIST test images (`ModelTool eval`):
+`spingalett_model_predict()` and `spingalett_model_evaluate()` go further on processors with byte
+dot-product instructions (AVX-512 VNNI; AVX-VNNI, as in Intel Core processors since the 12th
+generation; the Arm dot product extension, as in Apple silicon, Cortex-A76 and later, and AWS
+Graviton 2 and later): integer convolutions (with one group) and dense layers run in tiles of 12
+pixels or samples against weight rows interleaved for those instructions, every weight read once
+for the tile. The release packages carry these kernels and choose them at run time (see
+[Performance](#performance) for what they gain).
+
+Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
+(`spingalett_model_evaluate()`):
 
 | Network | FP32 | FP16 | INT8 | INT4 | INT2 |
 |---|---:|---:|---:|---:|---:|
 | 784-256-128-10, `Examples/MNIST.c` (5 epochs) | 97.86% | 97.86% | 97.87% | 97.71% | 95.15% |
 | Model size | 941 KB | 471 KB | 238 KB | 121 KB | 62 KB |
-| 784-1024-512-10, DigitPad | 99.27% | 99.27% | 99.27% | 99.32% | 79.93% |
 | CNN of `Examples/MNIST_CNN.c` (2 epochs) | 98.89% | 98.89% | 98.89% | 98.75% | 97.74% |
 | Model size | 1.69 MB | 844 KB | 424 KB | 213 KB | 108 KB |
+| DigitPad's CNN with batch normalization (30 epochs) | 99.58% | 99.58% | 99.56% | 99.51% | 96.76% |
+| Model size | 1.88 MB | 937 KB | 471 KB | 237 KB | 120 KB |
+| CIFAR-10 network of `Examples/CIFAR10.c` (20 epochs) | 87.79% | 87.79% | 87.82% | 84.87% | 14% |
+| Model size | 2.21 MB | 1.10 MB | 555 KB | 280 KB | 143 KB |
 
-INT8 and INT4 keep the accuracy of these networks; INT2 (ternary weights without
-quantization-aware training) suits small layers. One sample through the 784-512-1000-10 benchmark
-network on one thread (`Bin/Benchmark`, Intel Xeon @ 2.80 GHz):
+INT8 keeps the accuracy of these networks and INT4 nearly so; INT2 (ternary weights without
+quantization-aware training) suits small layers. Normalizations are folded into the layer before
+them and cost nothing at inference: the deployed CIFAR-10 network has 11 layers where the trained
+one has 18.
+
+The 784-512-1000-10 benchmark network on one thread (`Bin/Benchmark`, Intel Xeon @ 2.10 GHz,
+Sapphire Rapids), one sample at a time and batched:
 
 | | `forward()` | FP32 model | FP16 | BF16 | INT8 | INT4 | INT2 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Microseconds per sample | 125 | 120 | 74 | 78 | 21 | 20 | 20 |
+| Microseconds per sample | 161 | 150 | 86 | 85 | 28 | 31 | 20 |
+| Batched samples per second | | 50,600 | 48,500 | 57,400 | 184,600 | 172,200 | 195,900 |
 | Weights | 3.7 MB | 3.7 MB | 1.9 MB | 1.9 MB | 0.9 MB | 0.5 MB | 0.2 MB |
 
 ### Running in place
@@ -689,8 +741,9 @@ See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
 ## DigitPad demo
 
 [Apps/DigitPad](Apps/DigitPad) is a desktop app in which you draw a digit with the mouse and a
-Spingalett network classifies it as you draw. Its 784-1024-512-10 model, trained with on-the-fly
-augmentation through a data generator, reaches 99.27% MNIST test accuracy. The directory contains
+Spingalett network classifies it as you draw. Its convolutional network with batch normalization,
+trained with on-the-fly augmentation through a data generator, reaches 99.58% MNIST test accuracy
+(99.45% on randomly distorted test digits). The directory contains
 the app, the trainer and scripts that package the app and the model as a self-contained Linux
 AppImage and as a Windows zip; every release attaches both.
 
@@ -702,42 +755,63 @@ AppImage and as a Windows zip; every release attaches both.
 cross-entropy, Adam) on 20,000 synthetic samples: full-batch training (5 epochs), mini-batch
 training (batches of 64, one epoch) and batched inference; then the convolutional network of
 `Examples/MNIST_CNN.c` (422K parameters) on 10,000 synthetic images: one epoch of mini-batches of
-128 with AdamW, and inference. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch.
+128 with AdamW, and inference, without and with batch normalization after each convolution and the
+hidden dense layer. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch.
 Run them with `Bin/Benchmark [threads]` and `python Examples/benchmark_pytorch.py [threads]`.
 
-Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.80 GHz, Cascade Lake, AVX-512), medians of
-three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.7 is
-built with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build
-from PyPI (Intel MKL and oneDNN):
+Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.10 GHz, Sapphire Rapids, AVX-512), medians
+of three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.8 is
+built with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the build from
+PyPI, run on the CPU (Intel MKL and oneDNN):
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
-| Spingalett | 1 | 18,100 | 11,600 | 52,700 |
-| PyTorch | 1 | 14,700 | 5,200 | 40,100 |
-| Spingalett (OpenMP) | 4 | 56,700 | 29,300 | 172,700 |
-| PyTorch | 4 | 57,300 | 9,200 | 146,900 |
+| Spingalett | 1 | 18,000 | 15,300 | 50,300 |
+| PyTorch | 1 | 15,500 | 6,060 | 40,000 |
+| Spingalett (OpenMP) | 4 | 61,800 | 33,400 | 170,000 |
+| PyTorch | 4 | 47,800 | 10,400 | 106,200 |
 
 | Convolutional network | Threads | Training | Inference |
 |---|---:|---:|---:|
-| Spingalett | 1 | 1,720 | 5,550 |
-| PyTorch | 1 | 1,100 | 1,390 |
-| Spingalett (OpenMP) | 4 | 5,500 | 17,900 |
-| PyTorch | 4 | 3,060 | 4,440 |
+| Spingalett | 1 | 1,530 | 4,960 |
+| PyTorch | 1 | 1,190 | 1,460 |
+| Spingalett (OpenMP) | 4 | 5,450 | 18,300 |
+| PyTorch | 4 | 3,220 | 4,480 |
+| **With batch normalization** | | | |
+| Spingalett | 1 | 1,230 | 4,940 |
+| PyTorch | 1 | 850 | 1,100 |
+| Spingalett (OpenMP) | 4 | 4,910 | 19,800 |
+| PyTorch | 4 | 2,400 | 3,500 |
 
-Spingalett trains the convolutional network 1.6 to 1.8 times as fast and runs it 4 times as fast.
-For the fully connected network it trains mini-batches 2.3 to 3.2 times as fast, infers 1.2 to 1.3
-times as fast and trains full batches 1.2 times as fast on one thread and as fast on four. The gap
-is largest for mini-batches, where fixed per-step costs weigh most.
+Spingalett trains the convolutional network 1.3 to 1.7 times as fast as PyTorch and runs it 3.4 to
+4.1 times as fast. With batch normalization the gap widens to 1.5 to 2 times and 4.5 to 5.6 times:
+normalization slows Spingalett's training by 10 to 20% (PyTorch's by 26 to 29%) and its inference
+not at all, since it runs in the convolution's epilogue. For the fully connected network
+Spingalett trains mini-batches 2.5 to 3.2 times as fast, infers 1.3 to 1.6 times as fast and trains
+full batches 1.2 to 1.3 times as fast. The gap is largest for mini-batches, where fixed per-step
+costs weigh most.
 
-Against 0.6, the benchmark network runs at the same speed. Output layers of up to 16 units now run
-as blocks of dot products instead of mostly idle matrix panels, and products too small to gain from
-threads run on one: a 32-64-64-1 regression network trains 7% faster on one thread and 65% faster
-on four, and infers 10% and 40% faster.
+Deployment models of the CIFAR-10 network of `Examples/CIFAR10.c` (551K parameters, six
+convolutions with batch normalization folded in), `spingalett_model_predict()` on 4,000 test
+images, images per second; 0.7's integer kernels against 0.8's (float layers are unchanged):
+
+| CIFAR-10 network | Threads | FP32 | FP16 | INT8 | INT4 |
+|---|---:|---:|---:|---:|---:|
+| 0.7 integer kernels | 1 | 1,020 | 950 | 810 | 830 |
+| 0.8 | 1 | 1,010 | 970 | 2,520 | 2,960 |
+| 0.7 integer kernels | 4 | 3,420 | 3,550 | 2,710 | 2,500 |
+| 0.8 | 4 | 3,530 | 3,710 | 7,380 | 7,950 |
+
+With the AVX-512 VNNI tiles an INT8 model predicts 3.1 times as fast as before on one thread and
+2.7 times on four, and 2.5 and 2.1 times as fast as the FP32 model. One image at a time
+(`spingalett_model_run()`), the INT8 network runs 1.7 to 1.8 times as fast as in 0.7 (1,580
+against 860 images per second), its convolutions now taking four pixels against four filters at a
+time.
 
 The x86-64 release packages are compiled for a baseline instruction set and choose AVX2 or AVX-512
-matrix kernels at run time (since 0.6). On the same machine, on one thread, the baseline package
-trains 3.6 to 4.9 times as fast, and infers 5 times as fast, as with kernels for its baseline
-(SSE2), as in 0.5:
+matrix kernels at run time (since 0.6), and AVX-512 VNNI or AVX-VNNI integer kernels (since 0.8).
+On the Cascade Lake VM where 0.6 was measured, on one thread, the baseline package trains 3.6 to
+4.9 times as fast, and infers 5 times as fast, as with kernels for its baseline (SSE2), as in 0.5:
 
 | Baseline x86-64 build, one thread | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|
@@ -748,6 +822,8 @@ trains 3.6 to 4.9 times as fast, and infers 5 times as fast, as with kernels for
 mini-batches of 128) on 55,000 images, keeps the epoch with the best accuracy on the other 5,000
 and reaches 98.2% test accuracy after 10 epochs, which take a few seconds with OpenMP on the same
 VM. `Examples/MNIST_CNN.c` reaches 98.9% after two epochs of about 9 seconds each on four threads.
+`Examples/CIFAR10.c` reaches 87.8% test accuracy after 20 epochs, 20 minutes on four threads of the
+Sapphire Rapids VM (760 images per second with augmentation); its INT8 model keeps 87.8%.
 
 ## Project layout
 
@@ -767,16 +843,14 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.7; the C API may still change between minor versions (see
+Spingalett is at version 0.8; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.7`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.8`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
-engine and model format versions 3 and 4 are meant to stay stable from here on.
+engine and model format versions 3 to 5 are meant to stay stable from here on.
 
 Planned work, roughly in order:
 
-- 0.8: batch normalization, depthwise and grouped convolutions, a CIFAR-10 example, faster integer
-  convolutions on more targets
 - 0.9: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
   backend
 - 1.0: API freeze, C++ wrapper

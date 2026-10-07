@@ -4,9 +4,10 @@
 */
 
 /*
- * The inference engine (Spingalett.Inference.h) and the parts of the .slett format versions 3 and
- * 4 the rest of the library shares with it (Spingalett.Engine.h). With -DSPINGALETT_INFERENCE_ONLY this
- * file builds on its own and calls nothing beyond memcpy, memset, memcmp, expf, tanhf and lrintf.
+ * The inference engine (Spingalett.Inference.h) and the parts of the .slett format versions 3, 4
+ * and 5 the rest of the library shares with it (Spingalett.Engine.h). With -DSPINGALETT_INFERENCE_ONLY
+ * this file builds on its own and calls nothing beyond memcpy, memset, memcmp, expf, tanhf, sqrtf
+ * and lrintf.
  *
  * Kernels: AVX2 (with VNNI where the compiler targets it), AVX, SSE2, NEON (with the dot-product
  * extension where available), the Arm DSP extension (Cortex-M4, M7, M33) and portable C. Defining
@@ -40,6 +41,9 @@ static int engine_fail(int code, const char *msg) { set_error(code, msg); return
 #    if defined(__AVX__) && defined(__F16C__)
 #      define SPG_F16C 1
 #    endif
+#    if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#      define SPG_AVX512_VNNI 1
+#    endif
 #    if defined(__AVX2__) && defined(__AVXVNNI__)
 #      define SPG_VNNI(acc, u, s) _mm256_dpbusd_avx_epi32((acc), (u), (s))
 #      define SPG_VNNI128(acc, u, s) _mm_dpbusd_avx_epi32((acc), (u), (s))
@@ -54,6 +58,15 @@ static int engine_fail(int code, const char *msg) { set_error(code, msg); return
 #    include <arm_acle.h>
 #    define SPG_ARM_DSP 1
 #  endif
+#endif
+
+/* Kernels whose loops carry many sums in registers: GCC's partial redundancy elimination has it
+   copy them between registers, or through memory, on every step (dpbusd adds into its first
+   operand), so it is off for these. Arrays of sums end up in memory too: kernels name them. */
+#if defined(__GNUC__) && !defined(__clang__)
+#  define SPG_REGISTER_SUMS __attribute__((optimize("no-tree-pre")))
+#else
+#  define SPG_REGISTER_SUMS
 #endif
 
 #if defined(SPG_AVX) && defined(__FMA__)
@@ -344,6 +357,28 @@ uint64_t spingalett_slett_row_bytes(PrecisionMode precision, uint32_t inputs) {
 
 /* ------------------------------------------------------------------------- kernels */
 
+#if defined(SPG_NEON)
+static inline int32x4_t neon_dot_i8(int32x4_t acc, int8x16_t a, int8x16_t b) {
+#  if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(acc, a, b);
+#  else
+    int16x8_t p = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    p = vmlal_s8(p, vget_high_s8(a), vget_high_s8(b));      /* two products stay in int16 */
+    return vpadalq_s16(acc, p);
+#  endif
+}
+
+static inline int32_t neon_hsum(int32x4_t v) {
+#  if defined(__aarch64__)
+    return vaddvq_s32(v);
+#  else
+    int32x2_t s2 = vadd_s32(vget_low_s32(v), vget_high_s32(v));
+    return vget_lane_s32(vpadd_s32(s2, s2), 0);
+#  endif
+}
+
+#endif
+
 #if defined(SPG_AVX2)
 /* acc += |x| * (w with the sign of x): maddubs multiplies unsigned by signed bytes, and pairs of
    products stay below 2 * 127 * 127, so its 16-bit sums cannot saturate. */
@@ -378,7 +413,7 @@ static inline __m128i reduce_rows4(__m256i a0, __m256i a1, __m256i a2, __m256i a
 }
 #endif
 
-int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
+SPG_REGISTER_SUMS int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
     uint32_t k = 0;
     int32_t sum = 0;
 #if defined(SPG_AVX2)
@@ -443,7 +478,8 @@ int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
     return sum;
 }
 
-void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n, int32_t acc[4]) {
+SPG_REGISTER_SUMS void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n,
+                                               int32_t acc[4]) {
 #if defined(SPG_AVX2)
     __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
     uint32_t k = 0;
@@ -470,6 +506,158 @@ void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, ui
         for (uint32_t i = k; i < n; i++) acc[r] += (int32_t)w[(size_t)r * stride + i] * (int32_t)x[i];
 #else
     for (int r = 0; r < 4; r++) acc[r] = spingalett_dot_i8(w + (size_t)r * stride, x, n);
+#endif
+}
+
+/* ---- four rows against four activation vectors: acc[4 r + p] = row r . x_p, each row and each
+   vector loaded once per block. With VNNI the activations are offset to unsigned bytes, x + 128,
+   and 128 times each row's sum is taken off: products need no sign handling, and the sums, exact
+   modulo 2^32 like the result, give it exactly. */
+
+#if defined(SPG_AVX512_VNNI)
+/* The lane sums of 16 vectors as one vector, lane i the total of v[i]: pairs of 32-bit, then 64-bit
+   unpacks add within 128-bit lanes, and two rounds of 128-bit shuffles add across them. */
+static inline __m512i reduce16_epi32(const __m512i v[16]) {
+    __m512i s[8], t[4];
+    for (int i = 0; i < 8; i++)
+        s[i] = _mm512_add_epi32(_mm512_unpacklo_epi32(v[2 * i], v[2 * i + 1]), _mm512_unpackhi_epi32(v[2 * i], v[2 * i + 1]));
+    for (int j = 0; j < 4; j++)
+        t[j] = _mm512_add_epi32(_mm512_unpacklo_epi64(s[2 * j], s[2 * j + 1]), _mm512_unpackhi_epi64(s[2 * j], s[2 * j + 1]));
+    __m512i u01 = _mm512_add_epi32(_mm512_shuffle_i32x4(t[0], t[1], 0x44), _mm512_shuffle_i32x4(t[0], t[1], 0xEE));
+    __m512i u23 = _mm512_add_epi32(_mm512_shuffle_i32x4(t[2], t[3], 0x44), _mm512_shuffle_i32x4(t[2], t[3], 0xEE));
+    return _mm512_add_epi32(_mm512_shuffle_i32x4(u01, u23, 0x88), _mm512_shuffle_i32x4(u01, u23, 0xDD));
+}
+#endif
+
+#if defined(SPG_AVX512_VNNI)
+const bool spingalett_dot_i8_4x4_sums = true;
+#else
+const bool spingalett_dot_i8_4x4_sums = false;
+#endif
+
+int32_t spingalett_sum_i8(const int8_t *w, uint32_t n) {
+    uint32_t k = 0;
+    int32_t sum = 0;
+#if defined(SPG_AVX512_VNNI)
+    const __m512i ones = _mm512_set1_epi8(1);
+    __m512i a = _mm512_setzero_si512();
+    for (; k < n; k += 64u) {
+        __mmask64 m = n - k >= 64u ? ~(__mmask64)0 : (((__mmask64)1 << (n - k)) - 1u);
+        a = _mm512_dpbusd_epi32(a, ones, _mm512_maskz_loadu_epi8(m, w + k));
+    }
+    sum = _mm512_reduce_add_epi32(a);
+#endif
+    for (; k < n; k++) sum += w[k];
+    return sum;
+}
+
+#if defined(SPG_AVX512_VNNI)
+#define Q4_EACH(M) M(0) M(1) M(2) M(3)
+#define Q4_ZERO(r) __m512i a##r##0 = _mm512_setzero_si512(), a##r##1 = a##r##0, a##r##2 = a##r##0, a##r##3 = a##r##0;
+#define Q4_X(p) __m512i x##p = _mm512_xor_si512(_mm512_maskz_loadu_epi8(m, x + (size_t)(p) * x_stride + k), bias);
+#define Q4_ROW(r) \
+    { \
+        __m512i wr = _mm512_maskz_loadu_epi8(m, w + (size_t)(r) * w_stride + k); \
+        a##r##0 = _mm512_dpbusd_epi32(a##r##0, x0, wr); \
+        a##r##1 = _mm512_dpbusd_epi32(a##r##1, x1, wr); \
+        a##r##2 = _mm512_dpbusd_epi32(a##r##2, x2, wr); \
+        a##r##3 = _mm512_dpbusd_epi32(a##r##3, x3, wr); \
+    }
+
+SPG_REGISTER_SUMS static void dot_i8_4x4_vnni(const int8_t *w, size_t w_stride, const int8_t *x, size_t x_stride,
+                                              uint32_t n, const int32_t wsum[4], int32_t acc[16]) {
+    const __m512i bias = _mm512_set1_epi8((char)0x80);
+    Q4_EACH(Q4_ZERO)
+    /* whole blocks of 64 bytes, then the rest as one block of masked loads (zeros add nothing:
+       their offset activations meet zero weights) */
+    for (uint32_t k = 0; k < n; k += 64u) {
+        __mmask64 m = n - k >= 64u ? ~(__mmask64)0 : (((__mmask64)1 << (n - k)) - 1u);
+        Q4_EACH(Q4_X)
+        Q4_EACH(Q4_ROW)
+    }
+    const __m512i a[16] = {a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33};
+    /* lane 4 r + p: the sum of row r and vector p, less 128 times the sum of row r */
+    __m512i corr = _mm512_slli_epi32(_mm512_set_epi32(wsum[3], wsum[3], wsum[3], wsum[3], wsum[2], wsum[2], wsum[2],
+                                                      wsum[2], wsum[1], wsum[1], wsum[1], wsum[1], wsum[0], wsum[0],
+                                                      wsum[0], wsum[0]), 7);
+    _mm512_storeu_si512((void *)acc, _mm512_sub_epi32(reduce16_epi32(a), corr));
+}
+
+#undef Q4_EACH
+#undef Q4_ZERO
+#undef Q4_X
+#undef Q4_ROW
+#endif
+
+void spingalett_dot_i8_4x4(const int8_t *w, size_t w_stride, const int8_t *x, size_t x_stride, uint32_t n,
+                           const int32_t wsum[4], int32_t acc[16]) {
+#if defined(SPG_AVX512_VNNI)
+    dot_i8_4x4_vnni(w, w_stride, x, x_stride, n, wsum, acc);
+#else
+    uint32_t k = 0;
+    (void)wsum;
+#  if defined(SPG_AVX2)
+    /* two activation vectors at a time: four rows by two keep the registers of AVX2 */
+    uint32_t kk = 0;
+    for (int half = 0; half < 2; half++) {
+        const int8_t *x0 = x + (size_t)(2 * half) * x_stride, *x1 = x0 + x_stride;
+        __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+        kk = 0;
+        for (; kk + 32u <= n; kk += 32u) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(x0 + kk)), v1 = _mm256_loadu_si256((const __m256i *)(x1 + kk));
+            __m256i u0 = _mm256_sign_epi8(v0, v0), u1 = _mm256_sign_epi8(v1, v1);
+            __m256i w0 = _mm256_loadu_si256((const __m256i *)(w + kk));
+            __m256i w1 = _mm256_loadu_si256((const __m256i *)(w + w_stride + kk));
+            __m256i w2 = _mm256_loadu_si256((const __m256i *)(w + 2 * w_stride + kk));
+            __m256i w3 = _mm256_loadu_si256((const __m256i *)(w + 3 * w_stride + kk));
+            a0 = madd_i8(a0, u0, w0, v0); b0 = madd_i8(b0, u1, w0, v1);
+            a1 = madd_i8(a1, u0, w1, v0); b1 = madd_i8(b1, u1, w1, v1);
+            a2 = madd_i8(a2, u0, w2, v0); b2 = madd_i8(b2, u1, w2, v1);
+            a3 = madd_i8(a3, u0, w3, v0); b3 = madd_i8(b3, u1, w3, v1);
+        }
+        __m128i ta = reduce_rows4(a0, a1, a2, a3), tb = reduce_rows4(b0, b1, b2, b3);
+        if (kk + 16u <= n) {
+            __m128i v0 = _mm_loadu_si128((const __m128i *)(x0 + kk)), v1 = _mm_loadu_si128((const __m128i *)(x1 + kk));
+            __m128i z = _mm_setzero_si128(), c[4], d[4];
+            for (int r = 0; r < 4; r++) {
+                __m128i wr = _mm_loadu_si128((const __m128i *)(w + (size_t)r * w_stride + kk));
+                c[r] = madd_i8_128(z, wr, v0);
+                d[r] = madd_i8_128(z, wr, v1);
+            }
+            ta = _mm_add_epi32(ta, _mm_hadd_epi32(_mm_hadd_epi32(c[0], c[1]), _mm_hadd_epi32(c[2], c[3])));
+            tb = _mm_add_epi32(tb, _mm_hadd_epi32(_mm_hadd_epi32(d[0], d[1]), _mm_hadd_epi32(d[2], d[3])));
+            kk += 16u;
+        }
+        int32_t sa[4], sb[4];
+        _mm_storeu_si128((__m128i *)(void *)sa, ta);
+        _mm_storeu_si128((__m128i *)(void *)sb, tb);
+        for (int r = 0; r < 4; r++) { acc[4 * r + 2 * half] = sa[r]; acc[4 * r + 2 * half + 1] = sb[r]; }
+    }
+    k = kk;
+#  elif defined(SPG_NEON)
+    int32x4_t a[16];
+    for (int i = 0; i < 16; i++) a[i] = vdupq_n_s32(0);
+    for (; k + 16u <= n; k += 16u) {
+        int8x16_t xv[4];
+        for (int p = 0; p < 4; p++) xv[p] = vld1q_s8(x + (size_t)p * x_stride + k);
+        for (int r = 0; r < 4; r++) {
+            int8x16_t wr = vld1q_s8(w + (size_t)r * w_stride + k);
+            for (int p = 0; p < 4; p++) a[4 * r + p] = neon_dot_i8(a[4 * r + p], wr, xv[p]);
+        }
+    }
+    for (int i = 0; i < 16; i++) acc[i] = neon_hsum(a[i]);
+#  else
+    for (int p = 0; p < 4; p++) {
+        int32_t r4[4];
+        spingalett_dot_i8_rows4(w, w_stride, x + (size_t)p * x_stride, n, r4);
+        for (int r = 0; r < 4; r++) acc[4 * r + p] = r4[r];
+    }
+    k = n;
+#  endif
+    for (; k < n; k++)
+        for (int r = 0; r < 4; r++)
+            for (int p = 0; p < 4; p++)
+                acc[4 * r + p] += (int32_t)w[(size_t)r * w_stride + k] * (int32_t)x[(size_t)p * x_stride + k];
 #endif
 }
 
@@ -610,25 +798,6 @@ static void dot_packed_rows4(const uint8_t *w, size_t stride, const int8_t *x, u
 }
 
 #elif defined(SPG_NEON)
-
-static inline int32x4_t neon_dot_i8(int32x4_t acc, int8x16_t a, int8x16_t b) {
-#  if defined(__ARM_FEATURE_DOTPROD)
-    return vdotq_s32(acc, a, b);
-#  else
-    int16x8_t p = vmull_s8(vget_low_s8(a), vget_low_s8(b));
-    p = vmlal_s8(p, vget_high_s8(a), vget_high_s8(b));      /* two products stay in int16 */
-    return vpadalq_s16(acc, p);
-#  endif
-}
-
-static inline int32_t neon_hsum(int32x4_t v) {
-#  if defined(__aarch64__)
-    return vaddvq_s32(v);
-#  else
-    int32x2_t s2 = vadd_s32(vget_low_s32(v), vget_high_s32(v));
-    return vget_lane_s32(vpadd_s32(s2, s2), 0);
-#  endif
-}
 
 /* Codes of 16 bytes as signed bytes: INT4 nibbles (two's complement) by xor and subtract, INT2
    codes c as (c & 1) - (c & 2). */
@@ -1023,10 +1192,10 @@ void spingalett_engine_activate(float *y, uint32_t n, ActivationFunction act) {
 #endif
 }
 
-/* ------------------------------------------------------------------------- formats 3 and 4 */
+/* ------------------------------------------------------------------------- formats 3 to 5 */
 
 static inline size_t entry_size(uint16_t version) {
-    return version >= 4u ? SLETT_LAYER_ENTRY_SIZE_4 : SLETT_LAYER_ENTRY_SIZE;
+    return version >= 5u ? SLETT_LAYER_ENTRY_SIZE_5 : version == 4u ? SLETT_LAYER_ENTRY_SIZE_4 : SLETT_LAYER_ENTRY_SIZE;
 }
 
 static inline const uint8_t *entry_at(const uint8_t *image, uint32_t index) {
@@ -1048,7 +1217,8 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
     layer->optimizer = slett_get64(e + 40);
     layer->type = LAYER_DENSE;
     layer->in_h = layer->in_w = layer->out_h = layer->out_w = 1;
-    if (slett_get16(image + 6) >= 4u) {
+    uint16_t version = slett_get16(image + 6);
+    if (version >= 4u) {
         layer->type = (LayerType)e[10];
         layer->out_h = slett_get16(e + 48);
         layer->out_w = slett_get16(e + 50);
@@ -1066,6 +1236,14 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
             layer->in_h = slett_get16(prev + 48);
             layer->in_w = slett_get16(prev + 50);
         }
+        if (layer->type == LAYER_CONV2D) layer->groups = 1;
+    }
+    if (version >= 5u) {
+        layer->groups = slett_get32(e + 64);
+        uint32_t f = slett_get32(e + 68);
+        memcpy(&layer->eps, &f, 4);
+        f = slett_get32(e + 72);
+        memcpy(&layer->momentum, &f, 4);
     }
     uint64_t in_cells = (uint64_t)layer->in_h * layer->in_w, out_cells = (uint64_t)layer->out_h * layer->out_w;
     layer->in_c = in_cells ? (uint32_t)(layer->inputs / in_cells) : 0u;
@@ -1074,9 +1252,12 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         layer->rows = layer->outputs;
         layer->row_len = layer->inputs;
     } else if (layer->type == LAYER_CONV2D) {
-        uint64_t len = (uint64_t)layer->kernel_h * layer->kernel_w * layer->in_c;
+        uint64_t len = layer->groups ? (uint64_t)layer->kernel_h * layer->kernel_w * (layer->in_c / layer->groups) : 0u;
         layer->rows = layer->out_c;
         layer->row_len = len > UINT32_MAX ? 0u : (uint32_t)len;
+    } else if (layer->type == LAYER_BATCH_NORM) {
+        layer->rows = layer->out_c;
+        layer->row_len = 1;
     }
 }
 
@@ -1085,23 +1266,33 @@ static bool section_ok(uint64_t offset, uint64_t bytes, uint64_t size, uint64_t 
     return offset >= SLETT_HEADER_SIZE && offset % align == 0 && offset <= size && bytes <= size - offset;
 }
 
-/* The shape fields of a version 4 entry agree with its kind and its input. */
-static bool shape_ok(const SlettLayer *L) {
+/* The shape fields of a version 4 or 5 entry agree with its kind and its input. */
+static bool shape_ok(const SlettLayer *L, uint16_t version) {
     uint64_t in_cells = (uint64_t)L->in_h * L->in_w, out_cells = (uint64_t)L->out_h * L->out_w;
     if ((unsigned)L->type >= LAYER_TYPE_COUNT || in_cells == 0 || out_cells == 0 || L->in_c == 0 || L->out_c == 0 ||
         in_cells * L->in_c != L->inputs || out_cells * L->out_c != L->outputs ||
         L->in_h > SLETT_MAX_EXTENT || L->in_w > SLETT_MAX_EXTENT)
         return false;
+    if (L->type == LAYER_BATCH_NORM && version < 5u)
+        return false;
+    bool windowless = L->kernel_h == 0 && L->kernel_w == 0 && L->stride_h == 0 && L->stride_w == 0 &&
+                      L->pad_h == 0 && L->pad_w == 0;
+    /* version 5: groups for convolutions only, epsilon and momentum for batch normalization only */
+    if (L->type != LAYER_CONV2D && L->groups != 0) return false;
+    if (L->type != LAYER_BATCH_NORM && (L->eps != 0.0f || L->momentum != 0.0f)) return false;
     if (L->type == LAYER_DENSE)
-        return L->out_h == 1 && L->out_w == 1 && L->kernel_h == 0 && L->kernel_w == 0 && L->stride_h == 0 &&
-               L->stride_w == 0 && L->pad_h == 0 && L->pad_w == 0;
+        return L->out_h == 1 && L->out_w == 1 && windowless;
+    if (L->type == LAYER_BATCH_NORM)
+        return windowless && L->out_h == L->in_h && L->out_w == L->in_w && L->out_c == L->in_c &&
+               L->precision == PRECISION_FLOAT32 && L->eps > 0.0f && L->eps < 1.0f &&
+               L->momentum >= 0.0f && L->momentum <= 1.0f;
     if (L->kernel_h == 0 || L->kernel_w == 0 || L->stride_h == 0 || L->stride_w == 0 ||
         L->pad_h >= L->kernel_h || L->pad_w >= L->kernel_w ||
         L->out_h != slett_window_count(L->in_h, L->kernel_h, L->stride_h, L->pad_h) ||
         L->out_w != slett_window_count(L->in_w, L->kernel_w, L->stride_w, L->pad_w))
         return false;
     if (L->type == LAYER_CONV2D)
-        return L->row_len != 0;
+        return L->groups != 0 && L->in_c % L->groups == 0 && L->out_c % L->groups == 0 && L->row_len != 0;
     /* pooling: per channel, no activation, no parameters */
     return L->out_c == L->in_c && L->activation == ACT_NONE && L->weights == 0 && L->scales == 0 &&
            L->biases == 0 && L->optimizer == 0;
@@ -1112,9 +1303,9 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
     if (!spingalett_host_is_little_endian())
         return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: the .slett format needs a little-endian host");
     if (size < 8 || memcmp(p, SLETT_MAGIC, 6) != 0)
-        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3 or 4 image");
+        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3, 4 or 5 image");
     uint16_t version = slett_get16(p + 6);
-    if (version != 3 && version != 4)
+    if (version < 3 || version > 5)
         return ENGINE_FAIL(SPINGALETT_ERR_FORMAT_VERSION, "model: unsupported format version");
     if (size < SLETT_HEADER_SIZE)
         return ENGINE_FAIL(SPINGALETT_ERR_FILE_IO, "model: image is truncated");
@@ -1146,19 +1337,22 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
         spingalett_slett_layer(p, i, &L);
         if (L.inputs == 0 || L.outputs == 0 || (i > 0 && L.inputs != prev_out) ||
             (unsigned)L.activation >= ACT_COUNT || (unsigned)L.precision >= PRECISION_COUNT ||
-            !(L.dropout >= 0.0f && L.dropout < 1.0f) || (version >= 4 && !shape_ok(&L)))
+            !(L.dropout >= 0.0f && L.dropout < 1.0f) || (version >= 4 && !shape_ok(&L, version)))
             return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
-        bool weighted = L.type == LAYER_DENSE || L.type == LAYER_CONV2D;
-        bool is_int = weighted && spingalett_precision_is_int(L.precision);
+        bool norm = L.type == LAYER_BATCH_NORM;
+        bool weighted = L.type == LAYER_DENSE || L.type == LAYER_CONV2D || norm;
+        bool is_int = weighted && !norm && spingalett_precision_is_int(L.precision);
         if (is_int && L.row_len > SLETT_MAX_INT_INPUTS)
             return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: integer layer has too many inputs per output");
         if (weighted) {
             uint64_t row = spingalett_slett_row_bytes(L.precision, L.row_len);
             uint64_t elem = L.precision == PRECISION_FLOAT32 ? 4u : (L.precision <= PRECISION_BFLOAT16 ? 2u : 1u);
+            /* batch normalization: gamma as the weights, the running mean and variance as the scales */
             bool ok = L.rows <= (file_size - SLETT_HEADER_SIZE) / row &&
                       section_ok(L.weights, row * L.rows, file_size, elem) &&
                       section_ok(L.biases, (uint64_t)L.rows * 4u, file_size, 4) &&
-                      (!is_int || section_ok(L.scales, (uint64_t)L.rows * 4u, file_size, 4));
+                      (!is_int || section_ok(L.scales, (uint64_t)L.rows * 4u, file_size, 4)) &&
+                      (!norm || section_ok(L.scales, (uint64_t)L.rows * 8u, file_size, 4));
             if (ok && (info->flags & SLETT_FLAG_OPTIMIZER)) {
                 uint64_t weights = (uint64_t)L.rows * L.row_len;
                 ok = weights <= file_size / 8u &&
@@ -1227,6 +1421,8 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
     info->in_height = L.in_h;
     info->in_width = L.in_w;
     info->in_channels = L.in_c;
+    info->groups = L.groups;
+    info->epsilon = L.eps;
     info->height = L.out_h;
     info->width = L.out_w;
     info->channels = L.out_c;
@@ -1242,8 +1438,8 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
 /* Outputs j0 .. j0 + count - 1 of a weight layer: bias + the dot products of those weight rows with
    x (row_len values), in float; integer rows take x quantized instead (xq, with x_scale, and
    permuted with sum xsum for packed rows), the sums rescaled. */
-static void weight_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count, const float *x,
-                        const int8_t *xq, float x_scale, int32_t xsum, float *y) {
+SPG_REGISTER_SUMS static void weight_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count,
+                                           const float *x, const int8_t *xq, float x_scale, int32_t xsum, float *y) {
     const float *bias = (const float *)(const void *)(image + L->biases);
     const uint8_t *weights = image + L->weights;
     uint32_t n = L->row_len;
@@ -1422,10 +1618,113 @@ static void conv_forward_columns(const uint8_t *image, const SlettLayer *L, cons
     }
 }
 
+void spingalett_gather_group_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, uint32_t g,
+                                    void *window, size_t elem) {
+    const uint32_t C = L->in_c, CG = C / L->groups;
+    const size_t run = (size_t)CG * elem;
+    uint8_t *d = (uint8_t *)window;
+    int64_t ih0 = (int64_t)oh * L->stride_h - L->pad_h, iw0 = (int64_t)ow * L->stride_w - L->pad_w;
+    for (uint32_t kh = 0; kh < L->kernel_h; kh++)
+        for (uint32_t kw = 0; kw < L->kernel_w; kw++, d += run) {
+            int64_t ih = ih0 + kh, iw = iw0 + kw;
+            if (ih < 0 || ih >= (int64_t)L->in_h || iw < 0 || iw >= (int64_t)L->in_w) { memset(d, 0, run); continue; }
+            memcpy(d, (const uint8_t *)x + (((size_t)ih * L->in_w + (size_t)iw) * C + (size_t)g * CG) * elem, run);
+        }
+}
+
+/* Each filter of a depthwise convolution reads channel j / m (m filters per channel). */
+#define DEPTHWISE_SUMS(T, x, wt, acc)                                                                \
+    do {                                                                                            \
+        const uint32_t R = L->rows, C = L->in_c, m = R / C;                                         \
+        for (uint32_t j = 0; j < R; j++) (acc)[j] = 0;                                              \
+        int64_t ih0 = (int64_t)oh * L->stride_h - L->pad_h, iw0 = (int64_t)ow * L->stride_w - L->pad_w; \
+        for (uint32_t kh = 0; kh < L->kernel_h; kh++) {                                             \
+            int64_t ih = ih0 + kh;                                                                  \
+            if (ih < 0 || ih >= (int64_t)L->in_h) continue;                                         \
+            for (uint32_t kw = 0; kw < L->kernel_w; kw++) {                                         \
+                int64_t iw = iw0 + kw;                                                              \
+                if (iw < 0 || iw >= (int64_t)L->in_w) continue;                                     \
+                const T *v = (x) + ((size_t)ih * L->in_w + (size_t)iw) * C;                         \
+                const T *w = (wt) + ((size_t)kh * L->kernel_w + kw) * R;                            \
+                if (m == 1) for (uint32_t c = 0; c < C; c++) (acc)[c] += DEPTHWISE_PRODUCT(v[c], w[c]); \
+                else for (uint32_t c = 0; c < C; c++)                                               \
+                    for (uint32_t i = 0; i < m; i++) (acc)[c * m + i] += DEPTHWISE_PRODUCT(v[c], w[c * m + i]); \
+            }                                                                                       \
+        }                                                                                           \
+    } while (0)
+
+#define DEPTHWISE_PRODUCT(v, w) (int32_t)((int16_t)(v) * (int16_t)(w))
+
+void spingalett_conv_depthwise_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
+                                  int32_t *acc) {
+    DEPTHWISE_SUMS(int8_t, xq, wt, acc);
+}
+
+#undef DEPTHWISE_PRODUCT
+#define DEPTHWISE_PRODUCT(v, w) ((v) * (w))
+
+static void conv_depthwise_f32(const float *x, const SlettLayer *L, uint32_t oh, uint32_t ow, const float *wt,
+                               float *acc) {
+    DEPTHWISE_SUMS(float, x, wt, acc);
+}
+
+/* A depthwise convolution on one sample (scratch: the transposed filters, then one pixel's sums). */
+static void conv_forward_depthwise(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
+                                   void *scratch) {
+    const uint32_t R = L->rows;
+    const bool is_int = spingalett_precision_is_int(L->precision);
+    const float *bias = (const float *)(const void *)(image + L->biases);
+    void *sums = (uint8_t *)scratch + slett_align((uint64_t)L->row_len * R * (is_int ? 1u : 4u));
+    spingalett_conv_transpose_filters(image, L, scratch);
+    const float *scale = is_int ? (const float *)(const void *)(image + L->scales) : NULL;
+    float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    for (uint32_t oh = 0; oh < L->out_h; oh++)
+        for (uint32_t ow = 0; ow < L->out_w; ow++) {
+            float *o = y + ((size_t)oh * L->out_w + ow) * R;
+            if (is_int) {
+                int32_t *acc = (int32_t *)sums;
+                spingalett_conv_depthwise_i8(xq, L, oh, ow, (const int8_t *)scratch, acc);
+                for (uint32_t j = 0; j < R; j++) o[j] = spingalett_int_output(bias[j], scale[j], x_scale, acc[j]);
+            } else {
+                float *acc = (float *)sums;
+                conv_depthwise_f32(x, L, oh, ow, (const float *)scratch, acc);
+                for (uint32_t j = 0; j < R; j++) o[j] = bias[j] + acc[j];
+            }
+        }
+}
+
+/* A grouped convolution on one sample: each group's filters dotted with the window of its channels. */
+static void conv_forward_grouped(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
+                                 void *window) {
+    const uint32_t G = L->groups, OG = L->rows / G, K = L->row_len;
+    const bool is_int = spingalett_precision_is_int(L->precision), packed = is_int && L->precision != PRECISION_INT8;
+    const uint32_t per_byte = L->precision == PRECISION_INT4 ? 2u : 4u;
+    float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    for (uint32_t oh = 0; oh < L->out_h; oh++)
+        for (uint32_t ow = 0; ow < L->out_w; ow++) {
+            float *o = y + ((size_t)oh * L->out_w + ow) * L->rows;
+            for (uint32_t g = 0; g < G; g++) {
+                spingalett_gather_group_window(is_int ? (const void *)xq : (const void *)x, L, oh, ow, g, window,
+                                               is_int ? 1u : 4u);
+                int32_t xsum = packed ? permute_activations((int8_t *)window, K, per_byte) : 0;
+                weight_rows(image, L, g * OG, OG, (const float *)window, (const int8_t *)window, x_scale, xsum,
+                            o + (size_t)g * OG);
+            }
+        }
+}
+
 /* A convolution on one sample: each output pixel is its filters' dot products with its window. */
 static void conv_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq, void *window) {
     if (slett_conv_columns(L)) {
         conv_forward_columns(image, L, x, y, xq, window);
+        return;
+    }
+    if (slett_conv_depthwise(L)) {
+        conv_forward_depthwise(image, L, x, y, xq, window);
+        return;
+    }
+    if (L->groups > 1) {
+        conv_forward_grouped(image, L, x, y, xq, window);
         return;
     }
     const uint32_t OC = L->rows, K = L->row_len;
@@ -1434,6 +1733,42 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
                            L->pad_h == 0 && L->pad_w == 0;
     const uint32_t per_byte = L->precision == PRECISION_INT4 ? 2u : 4u;
     float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    if (L->precision == PRECISION_INT8) {
+        /* four pixels at a time (their windows fill the scratch of one float window), each filter
+           read once for the four; the integer sums are those of one pixel at a time */
+        const float *bias = (const float *)(const void *)(image + L->biases);
+        const float *scale = (const float *)(const void *)(image + L->scales);
+        const int8_t *weights = (const int8_t *)(image + L->weights);
+        const uint32_t pixels = L->out_h * L->out_w;
+        int8_t *windows = (int8_t *)window;
+        int32_t *wsum = (int32_t *)(void *)((uint8_t *)window + slett_align((uint64_t)K * 4u));
+        if (spingalett_dot_i8_4x4_sums && pixels >= 4u)
+            for (uint32_t j = 0; j < OC; j++) wsum[j] = spingalett_sum_i8(weights + (size_t)j * K, K);
+        for (uint32_t p0 = 0; p0 < pixels; p0 += 4u) {
+            uint32_t count = pixels - p0 < 4u ? pixels - p0 : 4u;
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t p = p0 + i;
+                if (pointwise) memcpy(windows + (size_t)i * K, xq + (size_t)p * L->in_c, K);
+                else spingalett_gather_window(xq, L, p / L->out_w, p % L->out_w, windows + (size_t)i * K, 1);
+            }
+            for (uint32_t j = 0; j < OC; j += 4u) {
+                uint32_t rows = OC - j < 4u ? OC - j : 4u;
+                const int8_t *block = weights + (size_t)j * K;
+                int32_t acc[16];
+                if (rows == 4u && count == 4u) {
+                    spingalett_dot_i8_4x4(block, K, windows, K, K, wsum + j, acc);
+                } else {
+                    for (uint32_t i = 0; i < count; i++)
+                        for (uint32_t r = 0; r < rows; r++)
+                            acc[4u * r + i] = spingalett_dot_i8(block + (size_t)r * K, windows + (size_t)i * K, K);
+                }
+                for (uint32_t i = 0; i < count; i++)
+                    for (uint32_t r = 0; r < rows; r++)
+                        y[(size_t)(p0 + i) * OC + j + r] = spingalett_int_output(bias[j + r], scale[j + r], x_scale, acc[4u * r + i]);
+            }
+        }
+        return;
+    }
     for (uint32_t oh = 0; oh < L->out_h; oh++)
         for (uint32_t ow = 0; ow < L->out_w; ow++) {
             size_t p = (size_t)oh * L->out_w + ow;
@@ -1476,12 +1811,26 @@ static void pool_forward(const SlettLayer *L, const float *x, float *y) {
         }
 }
 
+/* Batch normalization on one sample with the stored running statistics (coef: 2 x channels). */
+static void norm_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, float *coef) {
+    const uint32_t C = L->out_c;
+    const float *stats = (const float *)(const void *)(image + L->scales);
+    spingalett_bn_coefficients((const float *)(const void *)(image + L->weights),
+                               (const float *)(const void *)(image + L->biases), stats, stats + C, L->eps, C,
+                               coef, coef + C);
+    for (uint32_t i = 0; i < L->outputs; i += C)
+        for (uint32_t c = 0; c < C; c++) y[i + c] = x[i + c] * coef[c] + coef[C + c];
+}
+
 /* One layer on one sample: x [inputs] -> y [outputs], activation included. */
 static void layer_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
                           void *window) {
     switch (L->type) {
         case LAYER_CONV2D:
             conv_forward(image, L, x, y, xq, window);
+            break;
+        case LAYER_BATCH_NORM:
+            norm_forward(image, L, x, y, (float *)window);
             break;
         case LAYER_MAX_POOL2D:
         case LAYER_AVG_POOL2D:

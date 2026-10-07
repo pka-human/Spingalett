@@ -54,7 +54,7 @@ need a larger workspace, and the window of the first convolution is short, so it
 filters at once per pixel:
 
 ```
-model in flash: 423744 bytes, workspace in RAM: 208128 bytes
+model in flash: 423744 bytes, workspace in RAM: 208384 bytes
   layer 1: convolution 3x3, 32 filters, output 28x28, INT8 weights
   layer 2: max pooling 2x2, output 14x14x32
   layer 3: convolution 3x3, 64 filters, output 14x14, INT8 weights

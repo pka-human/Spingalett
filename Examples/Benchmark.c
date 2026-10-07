@@ -17,7 +17,8 @@
  * Then a convolutional network, Examples/MNIST_CNN.c's (28 x 28 x 1 -> conv 32 3x3 ReLU -> max pool
  * -> conv 64 3x3 ReLU -> max pool -> dense 128 ReLU, dropout 0.3 -> dense 10 softmax), on 10,000
  * synthetic images: one epoch of mini-batches of 128 with AdamW (lr 1e-3, weight decay 1e-4), and
- * inference.
+ * inference; and the same network with batch normalization after each convolution and the hidden
+ * dense layer (which then take no activation, the normalizations ReLU).
  *
  * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
@@ -105,24 +106,29 @@ static double inference_throughput(const float *inputs) {
 #define CNN_SAMPLES 10000
 #define CNN_BATCH   128
 
-static NeuralNetwork *create_cnn(void) {
+static NeuralNetwork *create_cnn(bool normalized) {
+    ActivationFunction act = normalized ? ACT_NONE : ACT_RELU;
     NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
     layer(.net = net, .height = 28, .width = 28, .channels = 1);
-    conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
+    conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1, .act_func = act,
            .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    if (normalized) batch_norm(.net = net, .act_func = ACT_RELU);
     max_pool2d(.net = net, .kernel = 2);
-    conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
+    conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1, .act_func = act,
            .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    if (normalized) batch_norm(.net = net, .act_func = ACT_RELU);
     max_pool2d(.net = net, .kernel = 2);
-    layer(.net = net, .neurons_amount = 128, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE,
-          .dropout_rate = 0.3f);
+    layer(.net = net, .neurons_amount = 128, .act_func = act, .weight_initialization = WEIGHT_INITIALIZATION_HE,
+          .dropout_rate = normalized ? 0.0f : 0.3f);
+    if (normalized) batch_norm(.net = net, .act_func = ACT_RELU, .dropout_rate = 0.3f);
     layer(.net = net, .neurons_amount = 10, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
     return net;
 }
 
-static void cnn_benchmark(const char *name, ComputeMode mode, const float *images, const float *labels) {
+static void cnn_benchmark(const char *name, ComputeMode mode, bool normalized, const float *images,
+                          const float *labels) {
     spingalett_set_compute_mode(mode);
-    NeuralNetwork *net = create_cnn();
+    NeuralNetwork *net = create_cnn(normalized);
     double start = now();
     train(.net = net, .inputs = images, .targets = labels, .sample_count = CNN_SAMPLES, .epochs = 1,
           .learning_rate = 1e-3f, .weight_decay = 1e-4f, .optimizer_type = OPTIMIZER_ADAMW,
@@ -236,18 +242,20 @@ int main(int argc, char **argv) {
     }
     for (size_t i = 0; i < (size_t)CNN_SAMPLES * INPUT_SIZE; i++) images[i] = (float)rand() / (float)RAND_MAX;
     for (size_t s = 0; s < CNN_SAMPLES; s++) labels[s * OUTPUT_SIZE + (size_t)rand() % OUTPUT_SIZE] = 1.0f;
-    NeuralNetwork *cnn = create_cnn();
-    printf("\nconvolutional network (Examples/MNIST_CNN.c), %" PRIu64 " parameters, %d images\n",
-           spingalett_parameter_count(cnn), CNN_SAMPLES);
-    free_network(cnn);
-    printf("%-16s %14s %14s\n", "samples/s", "training", "inference");
-    cnn_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, images, labels);
+    for (int normalized = 0; normalized < 2; normalized++) {
+        NeuralNetwork *cnn = create_cnn(normalized);
+        printf("\nconvolutional network (Examples/MNIST_CNN.c)%s, %" PRIu64 " parameters, %d images\n",
+               normalized ? " with batch normalization" : "", spingalett_parameter_count(cnn), CNN_SAMPLES);
+        free_network(cnn);
+        printf("%-16s %14s %14s\n", "samples/s", "training", "inference");
+        cnn_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, normalized, images, labels);
 #if defined(SPINGALETT_HAS_OPENMP)
-    cnn_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
+        cnn_benchmark("OpenMP", COMPUTE_OPENMP, normalized, images, labels);
 #endif
 #if defined(SPINGALETT_HAS_OPENBLAS)
-    cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, images, labels);
+        cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, normalized, images, labels);
 #endif
+    }
 
     free(images);
     free(labels);

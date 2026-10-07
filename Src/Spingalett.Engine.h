@@ -4,19 +4,21 @@
 */
 
 /* Internals of the inference engine (Spingalett.Inference.c) shared with the rest of the library:
-   the .slett format version 3 and 4 layout (docs/ModelFormat.md), CRC-32, half and bfloat16
+   the .slett format version 3, 4 and 5 layout (docs/ModelFormat.md), CRC-32, half and bfloat16
    conversion, and the kernels batched inference reuses so that it computes exactly what
    spingalett_model_run computes. */
 
 #pragma once
 
 #include <Spingalett/Spingalett.Inference.h>
+#include <math.h>
 #include <string.h>
 
 #define SLETT_MAGIC              "SLETTM"
 #define SLETT_HEADER_SIZE        64u
 #define SLETT_LAYER_ENTRY_SIZE   48u          /* version 3 */
 #define SLETT_LAYER_ENTRY_SIZE_4 64u          /* version 4: shapes and windows added */
+#define SLETT_LAYER_ENTRY_SIZE_5 80u          /* version 5: groups and batch normalization added */
 #define SLETT_MAX_EXTENT         65535u       /* largest height, width, kernel, stride or padding */
 #define SLETT_SECTION_ALIGN      16u          /* every section starts at a multiple of this */
 #define SLETT_FLAG_OPTIMIZER     0x01u
@@ -37,11 +39,14 @@ typedef struct {
     LayerType type;                                 /* LAYER_DENSE in version 3 */
     uint32_t in_h, in_w, in_c, out_h, out_w, out_c; /* 1 x 1 x units around dense layers */
     uint32_t kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w;
-    uint32_t rows, row_len;                         /* the weight matrix: 0 x 0 for pooling */
+    uint32_t groups;                                /* conv: channel groups (1 before version 5) */
+    float eps, momentum;                            /* batch normalization */
+    uint32_t rows, row_len;                         /* the weight matrix: 0 x 0 for pooling, channels
+                                                       x 1 (gamma) for batch normalization */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3 or 4 */
+    uint32_t version;           /* 3, 4 or 5 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -66,7 +71,7 @@ bool spingalett_host_is_little_endian(void);
 /* Bytes of one stored weight row of `inputs` values. */
 uint64_t spingalett_slett_row_bytes(PrecisionMode precision, uint32_t inputs);
 
-/* Validates a format 3 or 4 image (no alignment requirement: fields are read with memcpy). */
+/* Validates a format 3, 4 or 5 image (no alignment requirement: fields are read with memcpy). */
 int spingalett_slett_validate(const uint8_t *image, size_t size, SlettInfo *info);
 /* Entry `index` (0-based) of the layer table of a validated image, with its input shape. */
 void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *layer);
@@ -97,6 +102,15 @@ float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q);
 int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n);
 /* acc[r] = dot of row r (rows `stride` bytes apart) with x, for r = 0..3. */
 void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n, int32_t acc[4]);
+/* acc[4 r + p] = dot of row r of w with vector p of x (rows and vectors their strides apart), for r
+   and p in 0..3: each row is read once for four vectors (twice, for two each, with AVX2 alone,
+   whose 16 registers hold fewer sums). wsum holds the rows' sums
+   (spingalett_sum_i8) when spingalett_dot_i8_4x4_sums is true; the kernel does not read it
+   otherwise, and callers may skip the sums. */
+void spingalett_dot_i8_4x4(const int8_t *w, size_t w_stride, const int8_t *x, size_t x_stride, uint32_t n,
+                           const int32_t wsum[4], int32_t acc[16]);
+extern const bool spingalett_dot_i8_4x4_sums;
+int32_t spingalett_sum_i8(const int8_t *w, uint32_t n);
 
 /* Convolutions with windows shorter than this run filter-major: their filters are transposed into
    the workspace (columns), and each output pixel accumulates all filters at once, reading its
@@ -104,14 +118,26 @@ void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, ui
 #define SLETT_COLUMN_WINDOW 32u
 
 static inline bool slett_conv_columns(const SlettLayer *L) {
-    return L->type == LAYER_CONV2D && L->row_len < SLETT_COLUMN_WINDOW;
+    return L->type == LAYER_CONV2D && L->groups == 1 && L->row_len < SLETT_COLUMN_WINDOW;
 }
 
-/* Bytes of engine scratch convolution L needs: its transposed filters and one pixel's sums, or a
-   gathered window (0 for other layers). */
+/* Depthwise convolutions (one input channel per group) run channel-major: their filters are
+   transposed tap by tap, wt[t * rows + j], and each output pixel accumulates all filters at once. */
+static inline bool slett_conv_depthwise(const SlettLayer *L) {
+    return L->type == LAYER_CONV2D && L->groups > 1 && L->in_c == L->groups;
+}
+
+/* Bytes of engine scratch layer L needs: a convolution its transposed filters and one pixel's sums,
+   or a gathered window (of its group's channels; an INT8 convolution with one group four windows
+   and the sums of its filters); batch normalization its coefficients (0 for other layers). */
 static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
+    if (L->type == LAYER_BATCH_NORM) return (uint64_t)L->out_c * 8u;
     if (L->type != LAYER_CONV2D) return 0;
-    if (!slett_conv_columns(L)) return (uint64_t)L->row_len * 4u;
+    if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) {
+        uint64_t window = (uint64_t)L->row_len * 4u;
+        if (L->precision == PRECISION_INT8 && L->groups <= 1) return slett_align(window) + (uint64_t)L->rows * 4u;
+        return window;
+    }
     uint64_t elem = spingalett_precision_is_int(L->precision) ? 1u : 4u;
     return slett_align((uint64_t)L->row_len * L->rows * elem) + (uint64_t)L->rows * 4u;
 }
@@ -119,6 +145,14 @@ static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
 /* The filters of convolution L transposed, wt[k * rows + j] = weight k of filter j: the stored
    codes as bytes for integer precisions, floats otherwise. */
 void spingalett_conv_transpose_filters(const uint8_t *image, const SlettLayer *L, void *wt);
+/* The integer sums of output pixel (oh, ow) of depthwise convolution L with transposed filters wt,
+   from its quantized input xq (one sum per filter). */
+void spingalett_conv_depthwise_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
+                                  int32_t *acc);
+/* The window of output pixel (oh, ow) over the channels of group g of convolution L (as
+   spingalett_gather_window, kernel_h x kernel_w x in_c / groups values). */
+void spingalett_gather_group_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, uint32_t g,
+                                    void *window, size_t elem);
 /* The integer sums of output pixel (oh, ow) of convolution L with transposed filters wt, from its
    quantized input xq (one sum per filter). */
 void spingalett_conv_columns_i8(const int8_t *xq, const SlettLayer *L, uint32_t oh, uint32_t ow, const int8_t *wt,
@@ -132,6 +166,16 @@ void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, u
 /* y[j] = bias[j] + scale[j] * x_scale * acc[j], the output of an integer layer before activation. */
 static inline float spingalett_int_output(float bias, float row_scale, float x_scale, int32_t acc) {
     return bias + (row_scale * x_scale) * (float)acc;
+}
+
+/* Batch normalization at inference as y = a x + b per channel: a = gamma / sqrt(var + eps),
+   b = beta - mean a (every implementation computes these alike, so their results agree). */
+static inline void spingalett_bn_coefficients(const float *gamma, const float *beta, const float *mean,
+                                              const float *var, float eps, uint32_t channels, float *a, float *b) {
+    for (uint32_t c = 0; c < channels; c++) {
+        a[c] = gamma[c] / sqrtf(var[c] + eps);
+        b[c] = beta[c] - mean[c] * a[c];
+    }
 }
 
 /* The layer's activation on one sample's outputs, in place. */

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.7.0 LANGUAGES C)
+project(Spingalett VERSION 0.8.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -259,8 +259,10 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # x86-64 binaries that are not tuned for the build machine (release packages, MinGW) also carry
-# GEMM kernels for AVX2 and AVX-512 and pick them at run time (Src/Spingalett.GEMM.c).
-option(SPINGALETT_CPU_DISPATCH "Choose AVX2 or AVX-512 GEMM kernels at run time on x86-64 builds without -march=native" ON)
+# GEMM kernels for AVX2 and AVX-512 (Src/Spingalett.GEMM.c) and batched INT8 kernels for AVX-512
+# VNNI and AVX-VNNI (Src/Spingalett.Int8Tiles.c), and pick them at run time; AArch64 Linux ones
+# carry INT8 kernels for the dot product instructions.
+option(SPINGALETT_CPU_DISPATCH "Choose AVX2, AVX-512, VNNI and ARM dot product kernels at run time on builds without -march=native" ON)
 set(_spg_native_flags OFF)
 if(SPINGALETT_NATIVE_ARCH AND NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(_spg_native_flags ON)
@@ -270,14 +272,28 @@ if(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MAT
     set(SPINGALETT_GEMM_VARIANTS
         ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX2.c
         ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX512.c)
-    target_sources(spingalett PRIVATE ${SPINGALETT_GEMM_VARIANTS})
-    target_compile_definitions(spingalett PRIVATE SPINGALETT_GEMM_DISPATCH)
+    target_sources(spingalett PRIVATE ${SPINGALETT_GEMM_VARIANTS}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVX512.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c)
+    target_compile_definitions(spingalett PRIVATE SPINGALETT_GEMM_DISPATCH SPINGALETT_INT8_DISPATCH)
     # -fno-lto: link-time optimization must not move code between instruction sets
     set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX2.c
         PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-fno-lto")
     set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX512.c
         PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mfma;-fno-lto")
-    message(STATUS "Spingalett: GEMM kernels for AVX2 and AVX-512 chosen at run time")
+    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVX512.c
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vnni;-mavx2;-mfma;-fno-lto")
+    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavxvnni;-fno-lto")
+    message(STATUS "Spingalett: GEMM kernels for AVX2 and AVX-512, INT8 kernels for AVX-512 VNNI and AVX-VNNI, chosen at run time")
+elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+       AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # AArch64 Linux: batched INT8 kernels for the dot product instructions (ARMv8.2), where present
+    target_sources(spingalett PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.DotProd.c)
+    target_compile_definitions(spingalett PRIVATE SPINGALETT_INT8_DISPATCH)
+    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.DotProd.c
+        PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod;-fno-lto")
+    message(STATUS "Spingalett: INT8 kernels for the ARM dot product instructions chosen at run time")
 endif()
 
 # The inference engine and batched model inference compute in IEEE order (no reassociation,
@@ -309,6 +325,10 @@ set_target_properties(spingalett PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${SPINGALETT_SOVERSION}
 )
+# macOS packages carry their OpenMP runtime (@rpath/libomp.dylib) next to the library
+if(APPLE)
+    set_target_properties(spingalett PROPERTIES INSTALL_RPATH "@loader_path")
+endif()
 
 # ------------------------------------------------------------------------------
 # Examples
@@ -432,7 +452,7 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
-    foreach(group grad conv equiv cont optim sched dropout gen predict valid step data io model xor)
+    foreach(group grad conv norm equiv cont optim sched dropout gen predict valid step data io model xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

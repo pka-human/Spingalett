@@ -1,17 +1,26 @@
-# The .slett model format, versions 3 and 4
+# The .slett model format, versions 3 to 5
 
 `.slett` files store a network: its shape, its parameters in a chosen precision and, optionally,
 the optimizer state for resuming training. `save_spingalett()` and `spingalett_save_to_memory()`
-write version 4 for networks with convolution or pooling layers and version 3 for networks of
-dense layers only, which engines from Spingalett 0.5 and 0.6 can run as well;
-`load_spingalett()` and `load_spingalett_from_memory()` read versions 1 to 4.
+write the oldest version that can hold the network: version 3 for networks of dense layers only
+(which engines from Spingalett 0.5 on can run), version 4 for networks with convolution or pooling
+layers (0.7 on), version 5 for networks with batch normalization or grouped convolutions (0.8 on).
+`load_spingalett()` and `load_spingalett_from_memory()` read versions 1 to 5.
 
-Versions 3 and 4 are laid out so that a file image can be used as it is: the inference engine
+Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
 (`spingalett_model_init()` in `Spingalett.Inference.h`) checks the image and computes directly from
 it, so a model can be read into memory, compiled into a program as a byte array, or executed from
 flash. This document describes the layout precisely enough to write an independent reader.
-Version 4 is version 3 with a larger layer table entry that adds the layer's kind and shape; the
-differences are marked below.
+Version 4 is version 3 with a larger layer table entry that adds the layer's kind and shape;
+version 5 extends the entry again with convolution groups and the constants of batch
+normalization. The differences are marked below.
+
+Batch normalization is folded when a network is saved for deployment: files written in a precision
+other than FLOAT32 without optimizer state, and the models of `spingalett_model_from_network()`,
+merge every batch normalization that directly follows a dense or convolution layer without
+activation into that layer (its weight rows scaled by `gamma / sqrt(var + eps)` and its biases
+shifted alike; the layer takes the normalization's activation). Other normalizations remain
+layers of their own, so such files can still be version 3 or 4.
 
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 CRC-32 is the IEEE polynomial (0xEDB88320, reflected, initial value and final XOR 0xFFFFFFFF), as
@@ -20,13 +29,14 @@ in zlib and PNG.
 ## Overview
 
 ```
-header (64 bytes) | layer table (48 bytes per entry in version 3, 64 in version 4) | sections ...
+header (64 bytes) | layer table (48 bytes per entry in version 3, 64 in version 4, 80 in version 5) | sections ...
 ```
 
 A network of `L` layers (the input layer included) has `L - 1` table entries; entry `i` (counted
 from 0) describes layer `i + 1` and the connection from layer `i`. Each dense or convolution layer
 owns up to four sections: its weights, the per-row scales of integer weights, its biases and its
-optimizer state; pooling layers own none. Every section starts at an offset that is a multiple of
+optimizer state; a batch normalization owns the same four, its scales section holding its running
+statistics; pooling layers own none. Every section starts at an offset that is a multiple of
 16; the bytes between sections are 0. A writer places the sections in table order, but a reader
 must only rely on the offsets.
 
@@ -39,15 +49,15 @@ its input as a flat vector; its output has shape `1 x 1 x out`. In version 3 eve
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 6 | magic `SLETTM` |
-| 6 | 2 | format version, 3 or 4 |
+| 6 | 2 | format version, 3, 4 or 5 |
 | 8 | 4 | `L`: number of layers, input layer included (2 to 65536) |
 | 12 | 1 | loss function: 0 mean squared error, 1 cross-entropy |
 | 13 | 1 | flags: bit 0 set when the file holds optimizer state; other bits 0 |
 | 14 | 2 | reserved, 0 |
 | 16 | 8 | optimizer time step (number of steps taken; 0 without optimizer state) |
 | 24 | 8 | file size in bytes |
-| 32 | 4 | version 4: height of the input layer (1 to 65535); version 3: reserved, 0 |
-| 36 | 4 | version 4: width of the input layer (1 to 65535); version 3: reserved, 0 |
+| 32 | 4 | versions 4 and 5: height of the input layer (1 to 65535); version 3: reserved, 0 |
+| 36 | 4 | versions 4 and 5: width of the input layer (1 to 65535); version 3: reserved, 0 |
 | 40 | 16 | reserved, 0 |
 | 56 | 4 | CRC-32 of bytes 64 to file size - 1 (the layer table and all sections) |
 | 60 | 4 | CRC-32 of bytes 0 to 59 |
@@ -59,7 +69,8 @@ The input layer's channels are its units (`in` of the first entry) divided by he
 
 ## Layer table
 
-`L - 1` entries start at offset 64, 48 bytes each in version 3 and 64 bytes in version 4:
+`L - 1` entries start at offset 64, 48 bytes each in version 3, 64 bytes in version 4 and 80 bytes
+in version 5:
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -67,21 +78,25 @@ The input layer's channels are its units (`in` of the first entry) divided by he
 | 4 | 4 | `out`: units of layer `i + 1`; equals `in` of the next entry |
 | 8 | 1 | activation of layer `i + 1` (codes below) |
 | 9 | 1 | weight precision (codes below) |
-| 10 | 1 | version 4: kind of layer `i + 1`: 0 dense, 1 convolution, 2 max pooling, 3 average pooling; version 3: reserved, 0 |
+| 10 | 1 | versions 4 and 5: kind of layer `i + 1`: 0 dense, 1 convolution, 2 max pooling, 3 average pooling, 4 batch normalization (version 5 only); version 3: reserved, 0 |
 | 11 | 1 | reserved, 0 |
 | 12 | 4 | dropout rate of layer `i + 1`, a float in [0, 1) (used only when training) |
 | 16 | 8 | offset of the weights; 0 for pooling |
-| 24 | 8 | offset of the row scales; 0 for FLOAT32, FP16 and BFLOAT16, and for pooling |
+| 24 | 8 | offset of the row scales (batch normalization: of its running statistics); 0 for FLOAT32, FP16 and BFLOAT16 dense and convolution layers, and for pooling |
 | 32 | 8 | offset of the biases; 0 for pooling |
 | 40 | 8 | offset of the optimizer state; 0 when the file has none, and for pooling |
-| 48 | 2 | version 4: output height of layer `i + 1` |
-| 50 | 2 | version 4: output width of layer `i + 1` |
-| 52 | 2 | version 4: kernel height (window rows) |
-| 54 | 2 | version 4: kernel width (window columns) |
-| 56 | 2 | version 4: vertical stride |
-| 58 | 2 | version 4: horizontal stride |
-| 60 | 2 | version 4: padding at the top and at the bottom |
-| 62 | 2 | version 4: padding on the left and on the right |
+| 48 | 2 | versions 4 and 5: output height of layer `i + 1` |
+| 50 | 2 | versions 4 and 5: output width of layer `i + 1` |
+| 52 | 2 | versions 4 and 5: kernel height (window rows) |
+| 54 | 2 | versions 4 and 5: kernel width (window columns) |
+| 56 | 2 | versions 4 and 5: vertical stride |
+| 58 | 2 | versions 4 and 5: horizontal stride |
+| 60 | 2 | versions 4 and 5: padding at the top and at the bottom |
+| 62 | 2 | versions 4 and 5: padding on the left and on the right |
+| 64 | 4 | version 5: convolution groups `g` (at least 1, dividing `in_c` and `out_c`); 0 for other kinds |
+| 68 | 4 | version 5: batch normalization's epsilon, a float in (0, 1); 0 for other kinds |
+| 72 | 4 | version 5: batch normalization's momentum, a float in [0, 1] (used only when training); 0 for other kinds |
+| 76 | 4 | version 5: reserved, 0 |
 
 The input shape of entry `i` is the output shape of entry `i - 1` (for the first entry, the input
 layer's shape from the header): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output
@@ -92,9 +107,16 @@ channels are `out_c = out / (out_h * out_w)`. Both divisions must be exact.
   the kernel along each axis; the output has `out_h = (in_h + 2 pad_h - kernel_h) / stride_h + 1`
   rows (integer division; at least 1) and likewise `out_w` columns. Window `(oh, ow)` covers input
   rows `oh * stride_h - pad_h` to that plus `kernel_h - 1`, and columns likewise.
-- Convolution: `out_c` filters of `kernel_h x kernel_w x in_c` weights.
+- Convolution: `out_c` filters of `kernel_h x kernel_w x (in_c / g)` weights (`g` is 1 in version
+  4). The channels split into `g` groups: filter `j` belongs to group `j / (out_c / g)` and reads
+  only the input channels of its group, `in_c / g` of them starting at that group times `in_c / g`.
+  With `g = in_c` every filter sees a single channel (depthwise convolution).
 - Pooling: `out_c = in_c`, activation 6 (none); the precision byte is the file's precision, which
   pooling does not use.
+- Batch normalization (version 5): the output shape equals the input shape, kernel, stride and
+  padding 0, precision 0 (FLOAT32) whatever the file's precision; `out_c` channels, each with its
+  gamma (the weights: `rows = out_c`, `n = 1`), its beta (the biases) and its running mean and
+  variance (the scales section).
 
 Activation codes: 0 sigmoid, 1 ReLU, 2 tanh, 3 leaky ReLU (slope 0.01), 4 FOO52, 5 softmax,
 6 none.
@@ -106,8 +128,9 @@ Activation codes: 0 sigmoid, 1 ReLU, 2 tanh, 3 leaky ReLU (slope 0.01), 4 FOO52,
 `rows` rows of `n` weights each: for a dense layer, `rows = out` (one per output unit) and
 `n = in`, row `j` holding the weights into unit `j` (row `j` of the `out x in` matrix `W`, so that
 `y = activation(W x + b)`); for a convolution, `rows = out_c` (one per filter) and
-`n = kernel_h x kernel_w x in_c`, row `j` holding filter `j` in window order: weight
-`(kh * kernel_w + kw) * in_c + c` multiplies input channel `c` at window row `kh`, column `kw`. Rows
+`n = kernel_h x kernel_w x (in_c / g)`, row `j` holding filter `j` in window order: weight
+`(kh * kernel_w + kw) * (in_c / g) + c` multiplies channel `c` of the filter's group at window row
+`kh`, column `kw`; for a batch normalization, `rows = out_c` and `n = 1`: gamma per channel. Rows
 are stored back to back without padding; what a row looks like depends on the precision:
 
 | Code | Precision | Row size in bytes | Weight `k` of row `j` |
@@ -136,6 +159,10 @@ A row of zeros gets scale 0. A row with a NaN or infinite weight gets scale NaN.
 
 `rows` floats, one per weight row, for INT8, INT4 and INT2 weights.
 
+### Running statistics (batch normalization)
+
+`2 x out_c` floats: the running mean of each channel, then its running variance.
+
 ### Biases
 
 `rows` floats (one per output unit or filter), whatever the weight precision.
@@ -145,15 +172,16 @@ A row of zeros gets scale 0. A row with a NaN or infinite weight gets scale NaN.
 Present when flag bit 0 is set: the first and second moment estimates of the optimizer, as floats,
 in this order: `m` of the weights (`rows x n`, in row order), `v` of the weights, `m` of the
 biases (`rows`), `v` of the biases. SGD leaves them 0, Momentum uses `m`, RMSProp uses `v`, Adam
-and AdamW use both.
+and AdamW use both. For a batch normalization the weights are gamma and the biases beta.
 
 ## Validation
 
 A reader should reject an image when the magic, the version or either checksum does not match;
 when the recorded file size exceeds the data; when `L` is outside 2..65536 or the loss, an
 activation, a precision or a layer kind code is unknown; when `in` or `out` is 0, an entry's `in`
-differs from the previous entry's `out` or a dropout rate lies outside [0, 1); in version 4, when
-the shapes, windows or section offsets disagree with the layer kind as described above; when a
+differs from the previous entry's `out` or a dropout rate lies outside [0, 1); in versions 4 and 5,
+when the shapes, windows, groups, normalization constants or section offsets disagree with the
+layer kind as described above (a batch normalization in a version 4 file is invalid); when a
 section offset is below 64, misaligned for its type or extends past the file size; and, for
 integer layers, when `n` exceeds 131072 (so that `127 * 127 * n` fits a 32-bit accumulator).
 
@@ -168,7 +196,10 @@ The engine evaluates the layers in order; the output of the last one is the netw
   then `y[j] = b[j] + (scale[j] * s) * sum_k q[j][k] * xq[k]` with the sum in 32-bit integers.
 - A convolution computes, for each output pixel `(oh, ow)`, its `out_c` outputs as above with `x`
   the pixel's window: `kernel_h x kernel_w x in_c` values in the order of the filter rows, 0 where
-  the window lies in the padding (for integer layers, the window of the quantized input).
+  the window lies in the padding (for integer layers, the window of the quantized input); with
+  groups, each filter takes the part of the window that holds its group's channels.
+- Batch normalization computes, per channel `c`, `a = gamma / sqrt(var + eps)` and
+  `b = beta - mean * a` in float, then `y = a x + b` for every cell of the channel.
 - Pooling takes, per channel, the maximum or the mean of the window's cells inside the input;
   padding cells are not counted (a window of 2 x 2 cells over one row of padding averages 2 cells).
 
@@ -187,4 +218,4 @@ precision; INT8, INT4 and INT2 arrays are preceded by one float `max |value|` fo
 and decode as `q / 127`, `q / 7` and `q` times it. Reading such a file and saving it again gives a
 version 3 file (`ModelTool convert`).
 
-Spingalett 0.5 and 0.6 read versions 1 to 3; version 4 appeared in 0.7.
+Spingalett 0.5 and 0.6 read versions 1 to 3; version 4 appeared in 0.7 and version 5 in 0.8.

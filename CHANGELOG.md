@@ -5,6 +5,71 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.8.0] - Unreleased
+
+Deeper convolutional networks: batch normalization, grouped and depthwise convolutions, image
+augmentation and a CIFAR-10 example.
+
+### Added
+- `batch_norm()` (`LAYER_BATCH_NORM`): per-channel normalization of the previous layer with the
+  batch's statistics while training and running averages of them (`.momentum`, default 0.1;
+  `.epsilon`, default 1e-5) in `predict()`, `forward()`, `evaluate()` and models; an activation
+  and dropout of its own. Gamma and beta are the layer's weights and biases for every optimizer,
+  clipping, the step API and `spingalett_get_parameters()`; weight decay leaves them alone.
+  `PARAM_RUNNING_MEAN` and `PARAM_RUNNING_VARIANCE` read and write the statistics, which
+  `restore_best_weights` restores with the weights. Training stays bit-identical on any number of
+  threads; gradients are checked numerically after convolutions, dense layers, the input and
+  pooling.
+- Inference with a normalization after a dense or convolution layer costs no more than the layer
+  alone: `predict()` and `forward()` apply it in the layer's matrix-product epilogue, and deployment
+  models (`spingalett_model_from_network()`, and files saved in other precisions than FP32 without
+  optimizer state) fold it into the layer's weights and biases. Other normalizations remain layers
+  that the inference engine runs in every precision.
+- Grouped convolutions: `conv2d(.groups = g)` splits input channels and filters into `g` groups;
+  as many groups as input channels make a depthwise convolution, with any number of filters per
+  channel. Depthwise convolutions run directly (all of a pixel's channels at once), other groups as
+  one matrix product per group, in training and in the engine (integer results bit-exact against a
+  reference, batched identical to single runs).
+- `.slett` format version 5 (written only for networks that need it): layer table entries of 80
+  bytes adding convolution groups and the normalization's epsilon and momentum; normalizations
+  store gamma, beta and the running statistics in FLOAT32 (docs/ModelFormat.md).
+- Image augmentation in `train()`: `.augment_shift` (random shifts by up to that many cells, zeros
+  shifted in) and `.augment_flip` (mirror images for half of the samples), drawn per sample and
+  step from a seed, so results do not depend on the thread count.
+- `spingalett_load_cifar()` reads CIFAR-10 and CIFAR-100 binary batches as 32 x 32 x 3
+  channels-last images.
+- `Examples/CIFAR10.c` and `Examples/download_cifar10.sh`: a batch-normalized network with
+  augmentation, optionally depthwise-separable, evaluated as FP16 and INT8 models.
+- Python: `BatchNorm`, `add_batch_norm()`, `get_running_statistics()` / `set_running_statistics()`,
+  `Conv2D(groups=...)`, `load_cifar()`, `TrainConfig.augment_shift` / `augment_flip`.
+- Batched integer inference on processors with byte dot-product instructions:
+  `spingalett_model_predict()` and `spingalett_model_evaluate()` run integer convolutions (with one
+  group) and dense layers (from 12 samples) in tiles of 12 pixels or samples against weight rows
+  interleaved four bytes at a time, with kernels for AVX-512 VNNI, AVX-VNNI and the Arm dot
+  product extension (Src/Spingalett.Int8Tiles.c). Builds without `-march=native` carry them and
+  choose at run time: the x86-64 packages, and on AArch64 Linux. The INT8 CIFAR-10 network
+  predicts 3.1 times as fast as in 0.7 on one thread (2,520 images/s) and 2.7 times on four, 2.5
+  and 2.1 times as fast as its FP32 model. Results are unchanged (integer sums are exact), and
+  still identical to single runs.
+- The macOS package is built with OpenMP and carries LLVM's OpenMP runtime (`libomp.dylib`, with
+  its license) next to the library, which finds it through `@loader_path`.
+- `Bin/Benchmark` and `Examples/benchmark_pytorch.py` also measure the convolutional network with
+  batch normalization: Spingalett trains it 1.5 to 2 times as fast as PyTorch and infers it 4.5 to
+  5.6 times as fast.
+
+### Changed
+- `SPINGALETT_FORMAT_VERSION` is 5. `LayerArgs`, `TrainArgs`, `SpingalettNetworkLayer` and
+  `SpingalettLayerInfo` gained fields, and `ParameterKind` gained two values: rebuild programs
+  against the new headers.
+- DigitPad's model is a batch-normalized convolutional network: 99.58% MNIST test accuracy and
+  99.45% on randomly distorted digits (the MLP: 99.27% and 98.44%).
+- The inference engine's INT8 convolutions take four pixels against four filters at a time, with
+  the filters' sums computed once per layer on AVX-512 VNNI: one CIFAR-10 image through
+  `spingalett_model_run()` takes 1.7 to 1.8 times less time. GCC's partial redundancy elimination
+  is off for the integer dot-product kernels, where it copied the sums through memory on every
+  step. The engine's scratch for an INT8 convolution grows by 4 bytes per filter.
+- The shared library's soname is `libspingalett.so.0.8`.
+
 ## [0.7.0] - 2026-10-07
 
 Convolutional networks: training, saving, and deployment down to microcontrollers, with the

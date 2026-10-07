@@ -219,6 +219,7 @@ static void hand_made_model(void) {
 #include "test_model_fp16.h"
 #include "test_model_conv_int8.h"
 #include "test_model_conv_f32.h"
+#include "test_model_norm_int8.h"
 #include "test_model_expected.h"
 
 static void exported_headers(void) {
@@ -233,9 +234,11 @@ static void exported_headers(void) {
          TEST_MODEL_CONV_INT8_WORKSPACE, test_conv_inputs[0], expected_conv_int8, "convolution INT8"},
         {test_model_conv_f32, TEST_MODEL_CONV_F32_SIZE, TEST_MODEL_CONV_F32_INPUTS, TEST_MODEL_CONV_F32_OUTPUTS,
          TEST_MODEL_CONV_F32_WORKSPACE, test_conv_inputs[0], expected_conv_f32, "convolution FLOAT32"},
+        {test_model_norm_int8, TEST_MODEL_NORM_INT8_SIZE, TEST_MODEL_NORM_INT8_INPUTS, TEST_MODEL_NORM_INT8_OUTPUTS,
+         TEST_MODEL_NORM_INT8_WORKSPACE, test_conv_inputs[0], expected_norm_int8, "batch-normalized INT8"},
     };
     static float workspace[(TEST_MODEL_INT8_WORKSPACE + TEST_MODEL_FP16_WORKSPACE + TEST_MODEL_CONV_INT8_WORKSPACE +
-                            TEST_MODEL_CONV_F32_WORKSPACE) / sizeof(float)];
+                            TEST_MODEL_CONV_F32_WORKSPACE + TEST_MODEL_NORM_INT8_WORKSPACE) / sizeof(float)];
     for (int i = 0; i < (int)(sizeof m / sizeof *m); i++) {
         SpingalettModel model;
         int rc = spingalett_model_init(&model, m[i].image, m[i].size);

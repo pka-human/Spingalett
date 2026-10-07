@@ -22,10 +22,16 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->inputs);
     spingalett_aligned_free(ws->targets);
     spingalett_aligned_free(ws->conv);
+    spingalett_aligned_free(ws->bn_flat);
+    spingalett_aligned_free(ws->bn_sums_flat);
+    spingalett_aligned_free(ws->bn_scratch);
+    spingalett_aligned_free(ws->bn_coef);
     spingalett_gemm_scratch_free(ws->gemm);
     free(ws->act);
     free(ws->delta);
     free(ws->dmask);
+    free(ws->bn_stats);
+    free(ws->bn_sums);
     free(ws);
 }
 
@@ -42,10 +48,13 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
     BatchWorkspace *ws = (BatchWorkspace *)calloc(1, sizeof(BatchWorkspace));
     if (!ws) return NULL;
     ws->capacity = capacity;
+    ws->training = training;
     ws->act   = (float **)calloc(net->layers, sizeof(float *));
     ws->delta = (float **)calloc(net->layers, sizeof(float *));
     ws->dmask = (float **)calloc(net->layers, sizeof(float *));
-    if (!ws->act || !ws->delta || !ws->dmask) goto fail;
+    ws->bn_stats = (float **)calloc(net->layers, sizeof(float *));
+    ws->bn_sums = (double **)calloc(net->layers, sizeof(double *));
+    if (!ws->act || !ws->delta || !ws->dmask || !ws->bn_stats || !ws->bn_sums) goto fail;
 
     /* Inference writes the last layer straight into the caller's output buffer. */
     uint32_t act_layers = training ? net->layers : net->layers - 1;
@@ -91,6 +100,30 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
         if (!ws->conv) goto fail;
     }
 
+    size_t bn_channels = 0, widest = 0;
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_BATCH_NORM) {
+            bn_channels += net->shapes[l].channels;
+            if (net->shapes[l].channels > widest) widest = net->shapes[l].channels;
+        }
+    if (bn_channels > 0) {
+        ws->bn_coef = (float *)spingalett_aligned_alloc(3u * widest * sizeof(float));
+        if (!ws->bn_coef) goto fail;
+        if (training) {
+            ws->bn_flat = (float *)spingalett_aligned_alloc(4u * bn_channels * sizeof(float));
+            ws->bn_sums_flat = (double *)spingalett_aligned_alloc(2u * bn_channels * sizeof(double));
+            ws->bn_scratch = (double *)spingalett_aligned_alloc((2u * widest + spingalett_bn_scratch_doubles(net, capacity)) *
+                                                                sizeof(double));
+            if (!ws->bn_flat || !ws->bn_sums_flat || !ws->bn_scratch) goto fail;
+            for (uint32_t l = 1, off = 0; l < net->layers; l++)
+                if (net->shapes[l].type == LAYER_BATCH_NORM) {
+                    ws->bn_stats[l] = ws->bn_flat + 4u * off;
+                    ws->bn_sums[l] = ws->bn_sums_flat + 2u * off;
+                    off += net->shapes[l].channels;
+                }
+        }
+    }
+
     if (mode != COMPUTE_OPENBLAS) {
         int threads = 1;
 #if defined(_OPENMP)
@@ -118,6 +151,31 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         LayerType type = net->shapes[l].type;
         bool done = false;          /* bias and activation applied */
 
+        /* inference: a batch normalization after a dense or convolution layer without activation
+           scales its outputs per channel in the product's epilogue, straight into its own output */
+        if (!ws->training && (type == LAYER_DENSE || type == LAYER_CONV2D) && act == ACT_NONE && l + 1 < net->layers &&
+            net->shapes[l + 1].type == LAYER_BATCH_NORM && net->act_func[l] != ACT_SOFTMAX) {
+            const uint64_t b0 = net->bias_offsets[l];
+            uint32_t channels = net->shapes[l].channels;
+            float *scale = ws->bn_coef, *shift = ws->bn_coef + channels;
+            spingalett_bn_coefficients(net->weights + net->weight_offsets[l], net->biases + b0, net->running_mean + b0,
+                                       net->running_var + b0, net->shapes[l + 1].eps, channels, scale, shift);
+            for (uint32_t c = 0; c < channels; c++) shift[c] += bias[c] * scale[c];
+            if (type == LAYER_DENSE) {
+                SpingalettBiasActivation epilogue = {shift, net->act_func[l], scale};
+                SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
+                spingalett_gemm_ex(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f, ws->act[l - 1], prev_size,
+                                   SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size, 0.0f, ws->act[l + 1], curr_size,
+                                   &hooks);
+            } else {
+                spingalett_conv_forward_scaled(&net->shapes[l - 1], &net->shapes[l], SPINGALETT_WEIGHT_MTX_PTR(net, l - 1),
+                                               scale, shift, ws->act[l - 1], ws->act[l + 1], N, net->act_func[l], ws->conv,
+                                               ws->gemm, mode);
+            }
+            l++;
+            continue;
+        }
+
         if (type == LAYER_DENSE) {
             /* act[l] = act[l-1] * W^T, W stored [curr x prev]; the bias and an element-wise
                activation follow as the product's tiles complete */
@@ -131,6 +189,13 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
             /* the bias, and an element-wise activation, are applied as the product's tiles complete */
             done = act != ACT_SOFTMAX && !masked;
             spingalett_conv_forward(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->conv, ws->gemm, mode);
+        } else if (type == LAYER_BATCH_NORM) {
+            done = act != ACT_SOFTMAX && !masked;
+            if (ws->training)
+                spingalett_bn_forward_train(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->bn_stats[l],
+                                            ws->bn_scratch, mode);
+            else
+                spingalett_bn_forward(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->bn_coef, mode);
         } else {
             spingalett_pool_forward(net, l - 1, ws->act[l - 1], C, N, mode);
             done = act == ACT_NONE && !masked;

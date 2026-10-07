@@ -4,11 +4,16 @@
 */
 
 /*
- * Trains the DigitPad model: a 784-1024-512-10 MLP on MNIST with on-the-fly augmentation (random
- * rotation, scale, aspect, shear, shift and stroke thickness) fed through a data generator, so
- * the network copes with digits drawn by hand rather than only with scanned MNIST digits.
- * 5,000 training images are held out to select the best epoch, whose weights train() restores;
- * the test set is evaluated once.
+ * Trains the DigitPad model: a convolutional network with batch normalization on MNIST,
+ *
+ *   28 x 28 x 1 -> [conv 3x3 -> batch norm, ReLU] x 2, 32 filters -> max pool 2
+ *               -> [conv 3x3 -> batch norm, ReLU] x 2, 64 filters -> max pool 2
+ *               -> dense 128, batch norm, ReLU, dropout -> dense 10, softmax
+ *
+ * with on-the-fly augmentation (random rotation, scale, aspect, shear, shift and stroke thickness)
+ * fed through a data generator, so the network copes with digits drawn by hand rather than only
+ * with scanned MNIST digits. 5,000 training images are held out to select the best epoch, whose
+ * weights train() restores; the test set is evaluated once.
  *
  *   DigitPadTrain <mnist-dir> <output.slett> [epochs]
  */
@@ -85,7 +90,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <mnist-dir> <output.slett> [epochs]\n", argv[0]);
         return 1;
     }
-    size_t epochs = argc > 3 ? (size_t)strtoul(argv[3], NULL, 10) : 40;
+    size_t epochs = argc > 3 ? (size_t)strtoul(argv[3], NULL, 10) : 30;
     const char *output = argv[2];
 
     SpingalettDataset train_set, val_set, test_set;
@@ -108,13 +113,23 @@ int main(int argc, char **argv) {
     spingalett_seed(2026);
 
     NeuralNetwork *net = new_spingalett(LOSS_CROSS_ENTROPY);
-    layer(net, DIGIT_PIXELS);
-    layer(net, 1024, ACT_RELU, WEIGHT_INITIALIZATION_HE, .dropout_rate = 0.25f);
-    layer(net, 512, ACT_RELU, WEIGHT_INITIALIZATION_HE, .dropout_rate = 0.25f);
+    layer(.net = net, .height = DIGIT_SIDE, .width = DIGIT_SIDE, .channels = 1);
+    const uint32_t widths[2] = {32, 64};
+    for (int stage = 0; stage < 2; stage++) {
+        for (int k = 0; k < 2; k++) {
+            conv2d(.net = net, .filters = widths[stage], .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+                   .weight_initialization = WEIGHT_INITIALIZATION_HE);
+            batch_norm(.net = net, .act_func = ACT_RELU);
+        }
+        max_pool2d(.net = net, .kernel = 2);
+    }
+    layer(net, 128, ACT_NONE, WEIGHT_INITIALIZATION_HE);
+    batch_norm(.net = net, .act_func = ACT_RELU, .dropout_rate = 0.3f);
     layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
 
-    LRScheduleParams schedule = {.warmup_epochs = 2, .min_lr = 1e-5f};
-    printf("training 784-1024-512-10 on %u augmented samples per epoch, %u held out\n", train_set.count, val_set.count);
+    LRScheduleParams schedule = {.warmup_epochs = 1, .min_lr = 1e-5f};
+    printf("training a convolutional network (%llu parameters) on %u augmented samples per epoch, %u held out\n",
+           (unsigned long long)spingalett_parameter_count(net), train_set.count, val_set.count);
     double started = now();
     TrainReport report = train(
         .net = net,
@@ -126,8 +141,8 @@ int main(int argc, char **argv) {
         .training_strategy = STRATEGY_SMALL_BATCH,
         .batch_size = 128,
         .optimizer_type = OPTIMIZER_ADAMW,
-        .learning_rate = 1e-3f,
-        .weight_decay = 1e-2f,
+        .learning_rate = 2e-3f,
+        .weight_decay = 5e-4f,
         .max_grad_norm = 5.0f,
         .lr_scheduler = spingalett_lr_warmup_cosine,
         .lr_scheduler_data = &schedule,
@@ -167,7 +182,8 @@ int main(int argc, char **argv) {
     snprintf(info, sizeof info, "%s.info", output);
     FILE *f = fopen(info, "w");
     if (f) {
-        fprintf(f, "784-1024-512-10 MLP, MNIST test accuracy %.2f%%\n", 100.0 * (double)test.accuracy);
+        fprintf(f, "convolutional network with batch normalization, MNIST test accuracy %.2f%%\n",
+                100.0 * (double)test.accuracy);
         fclose(f);
     }
     free_network(net);

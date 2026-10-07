@@ -38,14 +38,14 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
-    "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "LayerDescription",
+    "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
     "Model", "LayerInfo",
-    "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_csv",
+    "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels",
@@ -114,6 +114,7 @@ class LayerType(enum.IntEnum):
     CONV2D = 1
     MAX_POOL2D = 2
     AVG_POOL2D = 3
+    BATCH_NORM = 4
 
 
 class AutoSave(enum.IntEnum):
@@ -191,6 +192,9 @@ class _NetworkLayer(Structure):
         ("padding_w", c_uint32),
         ("weight_count", c_uint64),
         ("bias_count", c_uint64),
+        ("groups", c_uint32),
+        ("epsilon", c_float),
+        ("momentum", c_float),
     ]
 
 
@@ -258,6 +262,9 @@ class _LayerArgs(Structure):
         ("stride_w", c_uint32),
         ("padding_h", c_uint32),
         ("padding_w", c_uint32),
+        ("groups", c_uint32),
+        ("epsilon", c_float),
+        ("momentum", c_float),
     ]
 
 
@@ -307,6 +314,8 @@ class _TrainArgs(Structure):
         ("early_stopping_min_delta", c_float),
         ("restore_best_weights", c_bool),
         ("blas_num_threads", c_int),
+        ("augment_shift", c_uint32),
+        ("augment_flip", c_bool),
     ]
 
 
@@ -414,6 +423,8 @@ class _LayerInfo(Structure):
         ("stride_w", c_uint32),
         ("padding_h", c_uint32),
         ("padding_w", c_uint32),
+        ("groups", c_uint32),
+        ("epsilon", c_float),
     ]
 
 
@@ -495,6 +506,7 @@ _optimizer_steps = _bind("spingalett_optimizer_steps", c_uint64, [_NetPtr])
 _get_parameters = _bind("spingalett_get_parameters", c_bool, [_NetPtr, c_uint32, c_int, POINTER(c_float), c_uint64])
 _set_parameters = _bind("spingalett_set_parameters", c_bool, [_NetPtr, c_uint32, c_int, POINTER(c_float), c_uint64])
 _PARAM_WEIGHTS, _PARAM_BIASES, _PARAM_WEIGHT_GRADIENTS, _PARAM_BIAS_GRADIENTS = 0, 1, 2, 3
+_PARAM_RUNNING_MEAN, _PARAM_RUNNING_VARIANCE = 4, 5
 _forward = _bind("forward_struct_arguments", POINTER(c_float), [_ForwardArgs])
 _predict = _bind("predict_struct_arguments", c_bool, [_PredictArgs])
 _train = _bind("train_struct_arguments", _TrainReport, [_TrainArgs])
@@ -508,6 +520,7 @@ _trainer_backward_grads = _bind("spingalett_trainer_backward_output_grads", c_bo
 _trainer_step = _bind("spingalett_trainer_step", c_bool, [_TrainerPtr, POINTER(_OptimizerArgs)])
 _trainer_zero_grad = _bind("spingalett_trainer_zero_grad", None, [_TrainerPtr])
 _load_idx = _bind("spingalett_load_idx", c_bool, [c_char_p, c_char_p, c_uint32, POINTER(_Dataset)])
+_load_cifar = _bind("spingalett_load_cifar", c_bool, [POINTER(c_char_p), c_uint32, c_uint32, POINTER(_Dataset)])
 _load_csv = _bind("spingalett_load_csv", c_bool, [c_char_p, c_uint32, c_uint32, POINTER(_Dataset)])
 _dataset_free = _bind("spingalett_dataset_free", None, [POINTER(_Dataset)])
 _save_dataset = _bind("spingalett_save_dataset", c_bool, [POINTER(_Dataset), c_char_p, POINTER(_DatasetSaveOptions)])
@@ -719,13 +732,24 @@ class Input:
 
 @dataclasses.dataclass(frozen=True)
 class Conv2D:
-    """2D convolution with ``filters`` output channels over ``kernel`` x ``kernel`` windows."""
+    """2D convolution with ``filters`` output channels over ``kernel`` x ``kernel`` windows; with
+    ``groups``, each filter sees the input channels of its group only (input channels: depthwise)."""
     filters: int
     kernel: int
     stride: int = 1
     padding: int = 0
     activation: Activation = Activation.RELU
     init: Init = Init.HE
+    dropout: float = 0.0
+    groups: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchNorm:
+    """Batch normalization of the previous layer, per channel, followed by ``activation``."""
+    activation: Activation = Activation.NONE
+    epsilon: float = 1e-5
+    momentum: float = 0.1
     dropout: float = 0.0
 
 
@@ -758,6 +782,9 @@ class LayerDescription:
     padding: Tuple[int, int]
     weight_count: int
     bias_count: int
+    groups: int = 0                 # convolutions: channel groups
+    epsilon: float = 0.0            # batch normalization
+    momentum: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -829,6 +856,8 @@ class TrainConfig:
     autosave_save_optimizer: bool = True
     autosave_precision: Precision = Precision.FLOAT32
     blas_num_threads: int = 0
+    augment_shift: int = 0              # images: random shifts by up to this many cells (zero fill)
+    augment_flip: bool = False          # images: mirror left to right half of the time
 
 
 def _as_matrix(data, width: int, name: str) -> np.ndarray:
@@ -860,7 +889,9 @@ class Network:
                 self.add_input(spec.height, spec.width, spec.channels)
             elif isinstance(spec, Conv2D):
                 self.add_conv2d(spec.filters, spec.kernel, spec.stride, spec.padding, spec.activation, spec.init,
-                                spec.dropout)
+                                spec.dropout, spec.groups)
+            elif isinstance(spec, BatchNorm):
+                self.add_batch_norm(spec.activation, spec.epsilon, spec.momentum, spec.dropout)
             elif isinstance(spec, MaxPool2D):
                 self.add_max_pool2d(spec.kernel, spec.stride, spec.padding)
             elif isinstance(spec, AvgPool2D):
@@ -924,12 +955,23 @@ class Network:
         return self._add(height=int(height), width=int(width), channels=int(channels))
 
     def add_conv2d(self, filters: int, kernel: int, stride: int = 1, padding: int = 0,
-                   activation: Activation = Activation.RELU, init: Init = Init.HE, dropout: float = 0.0) -> "Network":
+                   activation: Activation = Activation.RELU, init: Init = Init.HE, dropout: float = 0.0,
+                   groups: int = 1) -> "Network":
         """Append a 2D convolution: ``filters`` output channels, ``kernel`` x ``kernel`` windows,
-        ``padding`` zeros on each side (kernel // 2 keeps the size of odd kernels at stride 1)."""
+        ``padding`` zeros on each side (kernel // 2 keeps the size of odd kernels at stride 1). With
+        ``groups``, input channels and filters split into that many groups and each filter sees the
+        input channels of its own (groups = input channels: a depthwise convolution)."""
         return self._add(type=int(LayerType.CONV2D), filters=int(filters), kernel=int(kernel), stride=int(stride),
                          padding=int(padding), act_func=int(activation), weight_initialization=int(init),
-                         dropout_rate=float(dropout))
+                         dropout_rate=float(dropout), groups=int(groups))
+
+    def add_batch_norm(self, activation: Activation = Activation.NONE, epsilon: float = 1e-5, momentum: float = 0.1,
+                       dropout: float = 0.0) -> "Network":
+        """Append batch normalization of the previous layer, per channel, then ``activation``: while
+        training with the batch's mean and variance, otherwise with running averages of them (each
+        batch moves them ``momentum`` of the way)."""
+        return self._add(type=int(LayerType.BATCH_NORM), act_func=int(activation), epsilon=float(epsilon),
+                         momentum=float(momentum), dropout_rate=float(dropout))
 
     def add_max_pool2d(self, kernel: int, stride: int = 0, padding: int = 0) -> "Network":
         """Append max pooling over ``kernel`` x ``kernel`` windows (stride 0 = the kernel size)."""
@@ -949,7 +991,8 @@ class Network:
         return LayerDescription(LayerType(info.type), (info.height, info.width, info.channels), int(info.outputs),
                                 Activation(info.activation), float(info.dropout_rate), (info.kernel_h, info.kernel_w),
                                 (info.stride_h, info.stride_w), (info.padding_h, info.padding_w),
-                                int(info.weight_count), int(info.bias_count))
+                                int(info.weight_count), int(info.bias_count), int(info.groups), float(info.epsilon),
+                                float(info.momentum))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -997,7 +1040,9 @@ class Network:
         i = index % count + 1
         info = self.layer(i)
         if info.type == LayerType.CONV2D:
-            shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(i - 1).shape[2])
+            shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(i - 1).shape[2] // info.groups)
+        elif info.type == LayerType.BATCH_NORM:
+            shape = (info.bias_count,)
         else:
             shape = (info.bias_count, info.weight_count // info.bias_count if info.bias_count else 0)
         return i, info, shape
@@ -1017,7 +1062,8 @@ class Network:
 
     def get_weights(self, index: int) -> np.ndarray:
         """Copy of the weights feeding layer ``index + 1``: shape (outputs, inputs) for a dense layer,
-        (filters, kernel_h, kernel_w, input channels) for a convolution, empty for pooling."""
+        (filters, kernel_h, kernel_w, input channels / groups) for a convolution, gamma (channels,)
+        for batch normalization, empty for pooling."""
         return self._get(index, _PARAM_WEIGHTS, True)
 
     def set_weights(self, index: int, values) -> None:
@@ -1029,6 +1075,15 @@ class Network:
 
     def set_biases(self, index: int, values) -> None:
         self._set(index, _PARAM_BIASES, False, values)
+
+    def get_running_statistics(self, index: int) -> Tuple[np.ndarray, np.ndarray]:
+        """(mean, variance) per channel that batch normalization layer ``index + 1`` uses outside
+        training."""
+        return self._get(index, _PARAM_RUNNING_MEAN, False), self._get(index, _PARAM_RUNNING_VARIANCE, False)
+
+    def set_running_statistics(self, index: int, mean, variance) -> None:
+        self._set(index, _PARAM_RUNNING_MEAN, False, mean)
+        self._set(index, _PARAM_RUNNING_VARIANCE, False, variance)
 
     # ---- inference
     def forward(self, inputs) -> np.ndarray:
@@ -1232,6 +1287,8 @@ class Network:
             early_stopping_min_delta=float(cfg.early_stopping_min_delta),
             restore_best_weights=bool(cfg.restore_best_weights),
             blas_num_threads=int(cfg.blas_num_threads),
+            augment_shift=int(cfg.augment_shift),
+            augment_flip=bool(cfg.augment_flip),
         )
         r = _call(_train, args)
         del keep
@@ -1302,6 +1359,8 @@ class LayerInfo:
     kernel: Tuple[int, int] = (0, 0)
     stride: Tuple[int, int] = (0, 0)
     padding: Tuple[int, int] = (0, 0)
+    groups: int = 0
+    epsilon: float = 0.0
 
 
 class Model:
@@ -1393,11 +1452,13 @@ class Model:
                                  input_shape=(int(info.in_height), int(info.in_width), int(info.in_channels)),
                                  kernel=(int(info.kernel_h), int(info.kernel_w)),
                                  stride=(int(info.stride_h), int(info.stride_w)),
-                                 padding=(int(info.padding_h), int(info.padding_w))))
+                                 padding=(int(info.padding_h), int(info.padding_w)),
+                                 groups=int(info.groups), epsilon=float(info.epsilon)))
         return out
 
     def to_bytes(self) -> bytes:
-        """The model image: a .slett file (format version 3, or 4 with convolution or pooling layers)."""
+        """The model image: a .slett file (format version 3; 4 with convolution or pooling layers; 5 with
+        batch normalization that could not be folded, or grouped convolutions)."""
         m = self._model
         return ctypes.string_at(m.image, m.image_size)
 
@@ -1536,6 +1597,19 @@ def load_idx(images_path, labels_path, num_classes: int = 0):
     Unsigned-byte images are scaled to [0, 1]; ``num_classes`` 0 = largest label + 1."""
     ds = _Dataset()
     _call(_load_idx, _encode_path(images_path), _encode_path(labels_path), int(num_classes), ctypes.byref(ds))
+    return _take_dataset(ds)
+
+
+def load_cifar(paths, num_classes: int = 10):
+    """Read CIFAR binary batches (one path or several) as ``(inputs, one_hot_targets)``: images of
+    32 x 32 x 3 values in [0, 1], channels last. ``num_classes`` 10 reads CIFAR-10, 100 the fine and
+    20 the coarse labels of CIFAR-100."""
+    if isinstance(paths, (str, bytes, os.PathLike)):
+        paths = [paths]
+    encoded = [_encode_path(p) for p in paths]
+    array = (c_char_p * len(encoded))(*encoded)
+    ds = _Dataset()
+    _call(_load_cifar, array, len(encoded), int(num_classes), ctypes.byref(ds))
     return _take_dataset(ds)
 
 

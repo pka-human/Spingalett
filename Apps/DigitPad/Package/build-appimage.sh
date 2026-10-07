@@ -8,7 +8,7 @@
 #   Apps/DigitPad/Package/build-appimage.sh [--model FILE.slett] [--epochs N] [--work DIR]
 #
 #   --model FILE.slett  package this model (and FILE.slett.info, if present) instead of training one
-#   --epochs N       epochs for the model trained when --model is not given (default 60)
+#   --epochs N       epochs for the model trained when --model is not given (default 30)
 #   --work DIR       build directory (default build/appimage)
 #
 # Without --model, MNIST is downloaded and DigitPadTrain trains a model first (OpenMP build,
@@ -22,7 +22,7 @@ SDL_SHA256=5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 work="$root/build/appimage"
 model=""
-epochs=60
+epochs=30
 while [ $# -gt 0 ]; do
     case "$1" in
         --model) model=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2 ;;
