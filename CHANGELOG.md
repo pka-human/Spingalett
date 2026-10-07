@@ -5,7 +5,11 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
-## [Unreleased]
+## [0.9.0] - Unreleased
+
+"Bottlenecks": every part of the library profiled and its slow paths removed, from data set files
+through training and inference to model files and the Python bindings. Measurements on a 4-vCPU
+Xeon @ 2.1 GHz with AVX-512, 4 threads unless noted.
 
 ### Added
 - `ROADMAP.md` (plans for the next releases, 1.0 and later) and `AGENTS.md` (layout, checks and
@@ -39,6 +43,46 @@ changes, which are listed under **Changed**.
   `train_from_file(..., in_memory, prefetch, target_set)`.
 
 ### Changed
+- Deployment models made by the library (`spingalett_model_from_network()`, `_load()`,
+  `_from_memory()`) prepare what batched prediction runs on once, on the first call that needs it:
+  FP16 and BF16 weights expanded to float, INT4 and INT2 rows unpacked, integer rows interleaved
+  for the tile kernels, transposed filters and row sums. Before, `spingalett_model_predict()` built
+  them, and all of its buffers, on every call; it now also keeps the last call's workspace for the
+  next one. Models stay safe to share between threads (the preparation takes a lock, the workspace
+  an atomic exchange); models filled in by `spingalett_model_init()` own nothing and prepare on
+  every call as before. The prepared forms take memory next to the image: up to the float size of
+  FP16 layers and four times the packed size of INT2 layers. `predict()` of one sample of a
+  784-256-128-10 MLP: FP32 63 -> 12 us, FP16 403 -> 8 us, INT8 10.5 -> 4.4 us, INT4 27 -> 4.2 us;
+  batches of 1024: FP16 2.04 -> 0.92 us, INT8 0.54 -> 0.31 us per sample.
+- Matrix products of at most 8 rows (4 with AVX2, 2 without AVX) from row-major operands, such as
+  a dense layer on one sample or a few, take dot products instead of packing all of the weights:
+  the FP32 MLP above predicts 8 samples in 2.2 us each instead of 7.9, and training it with batches
+  of 2, 4 and 8 takes 0.33, 0.175 and 0.076 s per 4096 samples instead of 0.57, 0.28 and 0.093.
+  Float outputs of one sample or a few may now differ in the last bits from those of the same
+  samples in a larger batch; integer models still compute exactly what single runs compute, and
+  results still do not depend on the thread count.
+- Loops that would run on one thread no longer enter an OpenMP parallel region (whose false `if`
+  clause still cost about 0.2 us), and integer layers start threads from 2^19 multiply-adds instead
+  of 2^15: `predict()` of one sample of a 4-8-8-2 INT8 model takes 0.21 us instead of 2.19.
+- Pooling (forward and backward) runs a whole block of 16 channels without a test per channel, so
+  that it vectorizes; depthwise convolutions with one filter per channel and 16, 32 or 64 channels
+  sum their taps in registers, forward and for the data gradient; the tile kernels' epilogue, window
+  gathering and the activation maximum of integer layers lost their overheads. Results are the same
+  bits as before. Batched INT8 prediction of a small CIFAR-sized CNN: 36.6 -> 33.3 us per sample;
+  training a depthwise-separable block on 32 x 32 x 3 images: 3017 -> 3514 samples/s, a small CNN
+  with batch normalization 7188 -> 7529.
+- A mini-batch step gathers and augments its samples on the OpenMP threads.
+- Model files load and save three to ten times as fast: CRC-32 eight bytes at a time in the library
+  (the engine alone keeps its byte-wise loop and 1 KB table), FP16 conversion eight values at a
+  time with F16C (the same halves as the portable conversion for every value but NaN, which keeps
+  the portable path), and networks built without reallocating every parameter array for each layer
+  (adding a layer copied and zeroed all of them; loaders now reserve the final sizes). Files are
+  byte for byte the same. A 924,930-parameter MLP: FP32 save 10.8 -> 2.5 ms, load 26 -> 8.3 ms, as
+  a model 9.5 -> 2.4 ms; FP16 save 15.2 -> 1.4 ms; INT8 load 13 -> 1.3 ms.
+- Python: `Network.input_size` / `output_size` read the sizes instead of describing every layer,
+  and per-batch calls pass arrays by address: `forward()` of a 4-8-2 network 42.6 -> 7.8 us, of the
+  MLP above on one sample 69 -> 22 us, `Model.predict()` of one sample 9.1 -> 5.4 us,
+  `Network.from_bytes()` of that MLP 6.2 -> 0.75 ms.
 - Streaming readers decode the next chunks on a background thread when a processor is free for it
   (fewer OpenMP threads than processors), and otherwise several chunks at a time on the OpenMP
   threads when they are needed: a thread competing with the OpenMP threads for the processors

@@ -20,12 +20,13 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Private.h`, `Src/Spingalett.Network.h` | Internal declarations; the network is opaque to users |
 | `Src/Spingalett.Engine.h` | Internals shared by the engine and the desktop library (layer table, kernels, scratch rules) |
 | `Src/Spingalett.Inference.c` | The standalone engine: `.slett` parsing, per-sample kernels for every precision. Must stay free of heap, stdio, files and OpenMP (`model.engine_symbols` checks) and compile as C99 |
-| `Src/Spingalett.Model.c` | Batched deployment models (`spingalett_model_predict`) |
+| `Src/Spingalett.Model.c` | Batched deployment models (`spingalett_model_predict`): weights prepared once per owned model, a workspace kept between calls |
 | `Src/Spingalett.Int8Tiles.c` | Batched INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product) |
 | `Src/Spingalett.GEMM.c` | Float matrix kernels, including implicit im2col and epilogues |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
 | `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward, convolution and normalization layers |
-| `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` |
+| `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
+| `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
 | `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, Python tests, `Layout.c` |
 | `Examples/`, `Apps/DigitPad/`, `Bindings/Python/` | Examples and tools, the demo app, the bindings |
 
@@ -71,6 +72,14 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   ctypes structures match the C ones; a new field in a public struct needs both sides.
 - **Engine scratch.** The engine's workspace size comes from `slett_conv_scratch()`; kernels may
   only use what it reserves.
+- **Data set readers.** A reader's sample order is a function of its seed (drawn when it opens)
+  and the pass or chunk number, never of how far ahead chunks are decoded or on how many threads;
+  the `data` group compares a background thread, chunks decoded on the OpenMP threads and one chunk
+  at a time. Decoding on a worker thread sets errors without logging and hands them to the caller.
+- **Shared models.** A `SpingalettModel` may be used from several threads at once: what
+  `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
+  read afterwards (`model_shared` in the `model` group runs four threads; run it under
+  ThreadSanitizer when changing that code).
 
 ## Performance work
 
@@ -84,6 +93,13 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - New instruction-set paths need a dispatch story for builds without `-march=native`: compile the
   kernel again through `Src/Kernels/` with the right flags and choose at run time, as the GEMM and
   INT8 tile kernels do.
+- A parallel region whose `if` clause is false still costs about 0.2 us: loops that are often too
+  small for threads use `SPINGALETT_PARALLEL_FOR(cond, for ...)` (`Spingalett.Private.h`), which runs
+  them as plain code then. Integer kernels need far more work than float ones before threads pay.
+- A change to a kernel that must keep its results (most of them) is checked by hashing the weights
+  after an epoch, or the saved files, against a build of the previous commit, and with a profile
+  (`gprofng collect app` works with AVX-512, Valgrind does not; Release builds are stripped, so
+  profile a `RelWithDebInfo` build).
 - Numbers quoted in README and CHANGELOG are measured, with the machine named.
 
 ## Style

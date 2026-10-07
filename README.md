@@ -118,7 +118,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.8 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.9 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -675,6 +675,19 @@ pixels or samples against weight rows interleaved for those instructions, every 
 for the tile. The release packages carry these kernels and choose them at run time (see
 [Performance](#performance) for what they gain).
 
+A model made by the library (`spingalett_model_from_network()`, `spingalett_model_load()`,
+`spingalett_model_from_memory()`) prepares what batched prediction runs on once, on the first call
+that needs it: FP16 and BF16 weights expanded to float, INT4 and INT2 rows unpacked to bytes,
+integer rows interleaved for the tiles. It keeps them, and the last call's buffers, until
+`spingalett_model_free()`, so a call on a single sample costs about what `spingalett_model_run()`
+does (4 to 12 us for a 784-256-128-10 MLP in any precision, 0.2 us for a tiny one). The prepared
+forms take memory next to the image: up to the float size of FP16 layers and four times the packed
+size of INT2 layers. A model stays safe to use from several threads at once. Models filled in by
+`spingalett_model_init()` over an image of your own prepare on every call. Float layers on one
+sample or a few compute through dot products rather than the batched kernels, so their outputs can
+differ in the last bits from those of the same samples in a larger batch; integer layers compute
+exactly what `spingalett_model_run()` computes, in batches of any size.
+
 Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
 (`spingalett_model_evaluate()`):
 
@@ -888,15 +901,15 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.8; the C API may still change between minor versions (see
+Spingalett is at version 0.9; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.8`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.9`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
 engine and model format versions 3 to 5 are meant to stay stable from here on.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.9: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
+- 0.10: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
   backend
 - 1.0: API freeze, C++ wrapper
 - Later: CUDA/cuDNN backend, quantization-aware training, NEON kernels for training, further

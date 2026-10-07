@@ -1,6 +1,6 @@
 # Roadmap
 
-Where Spingalett is going after 0.8, roughly in order. Plans change as the work shows what is
+Where Spingalett is going after 0.9, roughly in order. Plans change as the work shows what is
 worth doing; the [CHANGELOG](CHANGELOG.md) records what was actually done. Every release keeps the
 project's rule: nothing gets slower, and new kernels are measured against the previous release and
 against PyTorch on the same machine.
@@ -14,10 +14,11 @@ against PyTorch on the same machine.
 | 0.6 | Faster matrix kernels, run-time choice of AVX2 / AVX-512 kernels |
 | 0.7 | Convolutions and pooling, opaque network handle, model format 4 |
 | 0.8 | Batch normalization (folded at inference), grouped and depthwise convolutions, augmentation, CIFAR-10, INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product), macOS packages with OpenMP |
+| 0.9 | "Bottlenecks": `.slettd` format 2 (rANS coder, input shape, class names, several sets of targets), streaming readers that decode ahead or on the OpenMP threads, 8-bit data sets in memory, `DatasetTool cifar` and image folders; models that prepare their weights once, dot-product kernels for products of a few rows, faster pooling and depthwise convolutions, model files three to ten times as fast, lighter Python calls |
 
-## 0.9: networks as graphs, interoperability, GPU groundwork
+## 0.10: networks as graphs, interoperability, GPU groundwork
 
-**Residual connections and graphs.** Today a network is a chain of layers. 0.9 turns it into a
+**Residual connections and graphs.** Today a network is a chain of layers. 0.10 turns it into a
 directed acyclic graph of layers, so that a layer can take the outputs of several earlier ones:
 
 - `add` (residual connections, ResNet blocks) and `concat` along channels (Inception-style and
@@ -49,7 +50,7 @@ parameters resident on the device during training. The candidates are Vulkan com
 works on AMD, Intel, NVIDIA and Apple through MoltenVK) and CUDA; the first one decides the
 internal interface that later backends implement. Deterministic reductions stay the default.
 
-**Smaller items considered for 0.9:**
+**Smaller items considered for 0.10:**
 
 - per-sample INT8 kernels on AVX-512 VNNI for dense layers in the engine (512-bit rows), and tile
   kernels for depthwise and grouped integer convolutions in batched prediction;
@@ -58,7 +59,13 @@ internal interface that later backends implement. Deterministic reductions stay 
   as an option for models where it helps accuracy;
 - layer normalization (needed later for attention), label smoothing, and a
   reduce-on-plateau learning-rate schedule;
-- `DatasetTool` support for CIFAR and image folders.
+- what the 0.9 profiles left: packing for convolution weight gradients (a tenth of a small CNN's
+  training step), the weight gradient of depthwise convolutions, and threads idling in the
+  barriers of mini-batch steps on dense networks (a quarter of the time on four threads);
+- gradients and optimizer state allocated on the first training step, so that networks loaded
+  only for inference take a quarter of the memory;
+- a faster data set decoder (the rANS coder decodes 30 to 40 MB/s per thread; streaming CIFAR-10
+  costs about a fifth of an epoch of a small CNN).
 
 ## 1.0: stability
 
