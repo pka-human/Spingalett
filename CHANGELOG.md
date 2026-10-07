@@ -8,10 +8,57 @@ changes, which are listed under **Changed**.
 ## [Unreleased]
 
 ### Added
-- `ROADMAP.md` (plans for 0.9, 1.0 and later) and `AGENTS.md` (layout, checks and invariants for
-  coding agents and contributors).
+- `ROADMAP.md` (plans for the next releases, 1.0 and later) and `AGENTS.md` (layout, checks and
+  invariants for coding agents and contributors).
+- `.slettd` format version 2 (see `docs/DatasetFormat.md`): metadata records for the input shape,
+  names of sets of targets, class names, and further sets of targets for the same samples (such as
+  CIFAR-100's fine and coarse labels); and an rANS coder of half-bytes that decodes dense data such
+  as photographs two to three times as fast as the binary range coder at about the same size.
+  The writer chooses the coder per stream, and still writes version 1 for data sets that need
+  neither. CIFAR-10's training set takes 112.1 MB (`xz -9` of the original batches: 116.3 MB).
+- `SpingalettDataset.height`, `.width`, `.channels` and `.class_names`, filled by
+  `spingalett_load_idx()`, `spingalett_load_cifar()` (class names from `batches.meta.txt`,
+  `fine_label_names.txt` or `coarse_label_names.txt` next to the batches) and `.slettd` files, kept
+  by `spingalett_dataset_split()`; `spingalett_dataset_set_class_names()`.
+- `DatasetSaveOptions.target_name`, `.extra_targets` and `.extra_target_count`
+  (`SpingalettTargetSet`), `spingalett_load_dataset_targets()` and
+  `spingalett_load_dataset_from_memory_targets()`; `SpingalettDatasetInfo.format_version`,
+  `.height`, `.width`, `.channels`, `.target_set_count` and `.target_set`;
+  `spingalett_dataset_target_set_name()`, `spingalett_dataset_class_name()` and
+  `spingalett_dataset_target_set_size()`.
+- `spingalett_dataset_open_ex()` with `DatasetReaderOptions`: `in_memory` decodes the file once and
+  keeps its values in their compact form (a byte per 8-bit value, a quarter of float32) with
+  every pass shuffling all samples; `target_set` serves another set of targets; `no_prefetch`
+  keeps decoding off a background thread. `spingalett_dataset_open_u8()` trains from 8-bit data in
+  memory without a float copy.
+- `DatasetTool cifar` (CIFAR-10, and CIFAR-100 with both sets of labels), `DatasetTool images`
+  (one subfolder per class; PNG, JPEG, BMP and other formats through stb_image, optional resizing)
+  and `DatasetTool verify`; `DatasetTool info` prints the shape, sets of targets and class names.
+- Python: `save_dataset(..., shape, class_names, target_name, extra_targets)`,
+  `load_dataset(path, target_set)`, the shape and sets of targets in `dataset_info()`, and
+  `train_from_file(..., in_memory, prefetch, target_set)`.
 
 ### Changed
+- Streaming readers decode the next chunks on a background thread when a processor is free for it
+  (fewer OpenMP threads than processors), and otherwise several chunks at a time on the OpenMP
+  threads when they are needed: a thread competing with the OpenMP threads for the processors
+  stalls their barriers. Chunks stay in their compact form until a batch is read, and batches
+  convert to float on the OpenMP threads. One epoch of a small CNN on CIFAR-10 (4 threads, Xeon @
+  2.1 GHz, 4 vCPUs) streamed from a `.slettd` file: 10.3 s before, 6.4 s now (5.4 s from float
+  arrays, 5.1 s from the file in memory).
+- A reader's shuffled order is drawn from a seed taken when it opens and from the number of the
+  pass or chunk, so it is the same with or without a background thread and on any number of
+  threads; it differs from 0.8's order for the same `spingalett_seed()`.
+- `spingalett_save_dataset()` compresses chunks in parallel (CIFAR-10's training set: 12.4 s
+  before, 2.2 s on 4 threads; MNIST: 1.11 s before, 0.47 s).
+- `SpingalettDataset` has new fields: a data set built by hand must be zero-initialized
+  (`SpingalettDataset d = {0};`), because `spingalett_save_dataset()` reads them and
+  `spingalett_dataset_free()` frees `class_names`. The loaders initialize every field.
+- `SpingalettDatasetInfo` and `DatasetSaveOptions` have new fields; zero-initialized options keep
+  the previous behavior.
+- Python: `uint8` inputs are 8-bit images, value q read as q / 255, in `train()`, `forward()`,
+  `predict()`, `evaluate()` and `save_dataset()` (before, they were converted to floats 0 to 255).
+  `train()` keeps them as bytes and converts a batch at a time. Targets keep their values.
 - `DigitPadTrain` prints each epoch's time and the time since training began.
 
 ## [0.8.0] - Unreleased
