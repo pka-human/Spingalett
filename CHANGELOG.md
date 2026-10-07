@@ -5,6 +5,70 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.7.0] - 2026-10-07
+
+Convolutional networks: training, saving, and deployment down to microcontrollers, with the
+network becoming an opaque handle.
+
+### Added
+- Layer types (`LayerType`): `conv2d()` (2D convolution with any kernel, stride and padding, also
+  rectangular), `max_pool2d()` and `avg_pool2d()` next to dense layers. Tensors are channels-last
+  (`height x width x channels` per sample); the input layer takes a shape (`.height`, `.width`,
+  `.channels`), and a dense layer reads what precedes it as a flat vector. Every training strategy,
+  optimizer, schedule, dropout, the step API, `predict()` and `evaluate()` work with them. Gradients
+  are checked numerically for every layer kind, activation and compute mode.
+- Convolutions run as matrix products whose input windows the matrix kernels gather themselves
+  (implicit im2col), with the bias and activation applied while each tile of the result is in
+  cache; weight gradients are split over threads in slots fixed by the shape. On one core the
+  convolutional network of `Examples/MNIST_CNN.c` trains 1.6 times and infers 4 times as fast as
+  PyTorch (1.8 and 4 times on four cores).
+- Accessors for the opaque network: `spingalett_layer_count()`, `spingalett_network_layer()`
+  (`SpingalettNetworkLayer`: type, shape, outputs, activation, dropout, window, parameter counts),
+  `spingalett_input_size()`, `spingalett_output_size()`, `spingalett_parameter_count()`,
+  `spingalett_network_loss()`, `spingalett_optimizer_steps()`, and `spingalett_get_parameters()` /
+  `spingalett_set_parameters()` for the weights, biases and gradients of a layer (`ParameterKind`).
+- `.slett` format version 4 for networks with convolution or pooling layers: 64-byte layer table
+  entries with the layer's kind, shape, window, stride and padding, the input shape in the header
+  (docs/ModelFormat.md). Networks of dense layers are still written as version 3.
+- The inference engine and deployment models run convolutions and pooling in every precision:
+  integer convolutions quantize each sample's input once and take integer dot products of the
+  filters with each window; windows shorter than 32 values (a first layer over one or three
+  channels) accumulate all filters at once. Batched prediction of integer models remains
+  identical to single runs. The MNIST CNN keeps 98.9% test accuracy in INT8 (424 KB) and 98.75% in
+  INT4, and runs on the Cortex-M4 example with 208 KB of RAM. `SpingalettLayerInfo` describes
+  kinds, input and output shapes and windows; `ModelTool info` prints them.
+- Python: `Input`, `Conv2D`, `MaxPool2D`, `AvgPool2D` layer specs, `add_input()`, `add_conv2d()`,
+  `add_max_pool2d()`, `add_avg_pool2d()`, `Network.layers` / `layer(i)` (`LayerDescription`),
+  convolution weights as `(filters, kernel_h, kernel_w, channels)` arrays, `LayerType`, and model
+  layer shapes in `LayerInfo`.
+- `Examples/MNIST_CNN.c`: a two-convolution MNIST network (about 99% test accuracy after two
+  epochs), evaluated as FP16, INT8 and INT4 models. `Bin/Benchmark` and
+  `Examples/benchmark_pytorch.py` measure it too.
+- A test that trains a convolutional and a dense network on 1, 3 and 4 threads and single-threaded
+  and requires identical weights.
+
+### Changed
+- **Breaking:** `NeuralNetwork` is an opaque type; read networks through the accessors above
+  (`net->topology`, `net->weights` and the other fields are gone from the public header).
+  `LayerArgs` gained the fields of convolution and pooling layers, `SpingalettLayerInfo` and
+  `SpingalettModel` gained fields, and `LayerType` moved to `Spingalett.Inference.h` (included by
+  `Spingalett.h`): rebuild programs against the new headers. `SPINGALETT_FORMAT_VERSION` is 4.
+- Products with at most 16 columns from row-major operands (output layers of a few units) run as
+  blocks of dot products instead of mostly idle matrix panels: a 64 x 10 x 1000 product takes 23
+  instead of 49 us on one thread and 9 instead of 58 us on four.
+- The matrix kernels decide whether to use threads from the size and kind of each product
+  (products below about 10 us of work run on one thread). A 32-64-64-1 regression network trains
+  65% faster with OpenMP (7% faster on one thread) and infers 40% faster (10%).
+- A dense layer's bias and activation run in its matrix product's epilogue. Epilogues apply
+  activations row by row, so results do not depend on how threads split a product: with the
+  built-in kernels, training gives the same bits on any number of threads and single-threaded.
+- K blocks of the matrix kernels have equal sizes (288 runs as 2 x 144 rather than 256 + 32), and
+  when the whole right operand fits the pack buffer, each tile of the result runs through all K
+  blocks while it is in cache. The 784-512-1000-10 benchmark network runs as fast as in 0.6.
+- Batch training and `predict()` take fewer samples per chunk when a sample's activations are
+  large, so that convolutional networks need tens rather than hundreds of megabytes.
+- The shared library's soname is `libspingalett.so.0.7`.
+
 ## [0.6.0] - 2026-10-07
 
 A performance release: the same API and file formats, faster kernels.
@@ -249,6 +313,7 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[0.7.0]: https://github.com/pka-human/Spingalett/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pka-human/Spingalett/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/pka-human/Spingalett/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/pka-human/Spingalett/compare/v0.4.0...v0.4.1

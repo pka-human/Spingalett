@@ -7,9 +7,9 @@ AN386 board, so it can be tried without hardware:
 
 ```
 model in flash: 238128 bytes, workspace in RAM: 2832 bytes
-  layer 1: 784 -> 256, INT8 weights
-  layer 2: 256 -> 128, INT8 weights
-  layer 3: 128 -> 10, INT8 weights
+  layer 1: dense 784 -> 256, INT8 weights
+  layer 2: dense 256 -> 128, INT8 weights
+  layer 3: dense 128 -> 10, INT8 weights
 234752 multiply-accumulates per digit
   digit 7: recognised as 7 (99.9%)
   digit 2: recognised as 2 (99.7%)
@@ -48,13 +48,33 @@ scores the same in FP32, FP16 and INT8 and 0.1 to 0.2% lower in INT4; INT2 costs
 networks lose more in INT2 without quantization-aware training (DigitPad's 784-1024-512-10 model
 keeps 99.3% in INT8 and INT4 and drops to 80% in INT2), so INT2 suits small models.
 
+The convolutional network of `Examples/MNIST_CNN.c` runs the same way
+(`Bin/MNIST_CNN data/mnist 2`, then `run-qemu.sh mnist_cnn.slett data/mnist`). Its activations
+need a larger workspace, and the window of the first convolution is short, so it accumulates all 32
+filters at once per pixel:
+
+```
+model in flash: 423744 bytes, workspace in RAM: 208128 bytes
+  layer 1: convolution 3x3, 32 filters, output 28x28, INT8 weights
+  layer 2: max pooling 2x2, output 14x14x32
+  layer 3: convolution 3x3, 64 filters, output 14x14, INT8 weights
+  layer 4: max pooling 2x2, output 7x7x64
+  layer 5: dense 3136 -> 128, INT8 weights
+  layer 6: dense 128 -> 10, INT8 weights
+4241152 multiply-accumulates per digit
+  ...
+accuracy: 99 of 100 test digits (99.0%)
+```
+
+On the 10,000 test images it scores 98.9% in FP32, FP16 and INT8 and 98.75% in INT4.
+
 ## Using the engine in your firmware
 
 1. Copy `Include/Spingalett/Spingalett.Inference.h` and `Src/Spingalett.Inference.c` (and
    `Src/Spingalett.Engine.h`, which it includes) into the project, put the `Include` directory on
    the include path and compile with `-DSPINGALETT_INFERENCE_ONLY`. The engine calls only
-   `memcpy`, `memset`, `memcmp`, `expf`, `tanhf` and `lrintf`; it takes about 6 KB of flash on a
-   Cortex-M4 at `-O2`.
+   `memcpy`, `memset`, `memcmp`, `expf`, `tanhf` and `lrintf`; it takes about 12 KB of flash on a
+   Cortex-M4 at `-O2`, convolution and pooling included.
 2. Export the trained model: `ModelTool header model.slett model.h my_model --precision int8`
    (or `spingalett_export_c_header()` from your own program). The header holds a 16-byte aligned
    `static const uint8_t my_model[]` and the macros `MY_MODEL_SIZE`, `MY_MODEL_INPUTS`,

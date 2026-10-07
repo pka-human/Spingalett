@@ -117,15 +117,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi qemu-system-arm
 
-      - name: Library, ModelTool and an MNIST model
+      - name: Library, ModelTool and MNIST models (dense and convolutional)
         run: |
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON -DBUILD_TESTS=OFF
-          cmake --build Build --parallel --target MNIST ModelTool
+          cmake --build Build --parallel --target MNIST MNIST_CNN ModelTool
           sh Examples/download_mnist.sh data/mnist
           Bin/MNIST data/mnist 3
           Bin/ModelTool eval mnist.slett data/mnist/t10k-images-idx3-ubyte data/mnist/t10k-labels-idx1-ubyte
+          Bin/MNIST_CNN data/mnist 1
+          Bin/ModelTool eval mnist_cnn.slett data/mnist/t10k-images-idx3-ubyte data/mnist/t10k-labels-idx1-ubyte
 
-      - name: Run on the Cortex-M4 (INT8, INT4)
+      - name: Run on the Cortex-M4 (INT8, INT4; the CNN in INT8)
         run: |
           Examples/Embedded/run-qemu.sh mnist.slett data/mnist --precision int8 --work build/embedded-int8
           Examples/Embedded/run-qemu.sh mnist.slett data/mnist --precision int4 --work build/embedded-int4
+          Examples/Embedded/run-qemu.sh mnist_cnn.slett data/mnist --precision int8 --work build/embedded-cnn
