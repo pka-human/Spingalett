@@ -239,9 +239,9 @@ Convolutions run as matrix products whose input windows are gathered by the matr
 themselves (implicit im2col: no window matrix is stored), with the bias and activation applied to
 each tile of the result while it is in cache; weight gradients split their long summation over all
 pixels into fixed slots that the threads share. Depthwise convolutions are computed directly, all
-of a pixel's channels at once, and other grouped ones as one product per group. On a single core,
-`Examples/MNIST_CNN.c` trains 1.6 times as fast as PyTorch and infers 4 times as fast (see
-[Performance](#performance)).
+of a pixel's channels at once, and other grouped ones as one product per group. The network of
+`Examples/MNIST_CNN.c` trains 1.3 to 1.7 times as fast as in PyTorch and infers 3.4 to 4.1 times as
+fast (see [Performance](#performance)).
 
 ### Batch normalization
 
@@ -649,12 +649,13 @@ quantization-aware training) suits small layers. Normalizations are folded into 
 them and cost nothing at inference: the deployed CIFAR-10 network has 11 layers where the trained
 one has 18.
 
-One sample through the 784-512-1000-10 benchmark network on one thread (`Bin/Benchmark`, Intel
-Xeon @ 2.80 GHz):
+The 784-512-1000-10 benchmark network on one thread (`Bin/Benchmark`, Intel Xeon @ 2.10 GHz,
+Sapphire Rapids), one sample at a time and batched:
 
 | | `forward()` | FP32 model | FP16 | BF16 | INT8 | INT4 | INT2 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Microseconds per sample | 125 | 120 | 74 | 78 | 21 | 20 | 20 |
+| Microseconds per sample | 161 | 150 | 86 | 85 | 28 | 31 | 20 |
+| Batched samples per second | | 50,600 | 48,500 | 57,400 | 184,600 | 172,200 | 195,900 |
 | Weights | 3.7 MB | 3.7 MB | 1.9 MB | 1.9 MB | 0.9 MB | 0.5 MB | 0.2 MB |
 
 ### Running in place
@@ -754,42 +755,63 @@ AppImage and as a Windows zip; every release attaches both.
 cross-entropy, Adam) on 20,000 synthetic samples: full-batch training (5 epochs), mini-batch
 training (batches of 64, one epoch) and batched inference; then the convolutional network of
 `Examples/MNIST_CNN.c` (422K parameters) on 10,000 synthetic images: one epoch of mini-batches of
-128 with AdamW, and inference. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch.
+128 with AdamW, and inference, without and with batch normalization after each convolution and the
+hidden dense layer. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch.
 Run them with `Bin/Benchmark [threads]` and `python Examples/benchmark_pytorch.py [threads]`.
 
-Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.80 GHz, Cascade Lake, AVX-512), medians of
-three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.7 is
-built with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build
-from PyPI (Intel MKL and oneDNN):
+Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.10 GHz, Sapphire Rapids, AVX-512), medians
+of three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.8 is
+built with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the build from
+PyPI, run on the CPU (Intel MKL and oneDNN):
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
-| Spingalett | 1 | 18,100 | 11,600 | 52,700 |
-| PyTorch | 1 | 14,700 | 5,200 | 40,100 |
-| Spingalett (OpenMP) | 4 | 56,700 | 29,300 | 172,700 |
-| PyTorch | 4 | 57,300 | 9,200 | 146,900 |
+| Spingalett | 1 | 18,000 | 15,300 | 50,300 |
+| PyTorch | 1 | 15,500 | 6,060 | 40,000 |
+| Spingalett (OpenMP) | 4 | 61,800 | 33,400 | 170,000 |
+| PyTorch | 4 | 47,800 | 10,400 | 106,200 |
 
 | Convolutional network | Threads | Training | Inference |
 |---|---:|---:|---:|
-| Spingalett | 1 | 1,720 | 5,550 |
-| PyTorch | 1 | 1,100 | 1,390 |
-| Spingalett (OpenMP) | 4 | 5,500 | 17,900 |
-| PyTorch | 4 | 3,060 | 4,440 |
+| Spingalett | 1 | 1,530 | 4,960 |
+| PyTorch | 1 | 1,190 | 1,460 |
+| Spingalett (OpenMP) | 4 | 5,450 | 18,300 |
+| PyTorch | 4 | 3,220 | 4,480 |
+| **With batch normalization** | | | |
+| Spingalett | 1 | 1,230 | 4,940 |
+| PyTorch | 1 | 850 | 1,100 |
+| Spingalett (OpenMP) | 4 | 4,910 | 19,800 |
+| PyTorch | 4 | 2,400 | 3,500 |
 
-Spingalett trains the convolutional network 1.6 to 1.8 times as fast and runs it 4 times as fast.
-For the fully connected network it trains mini-batches 2.3 to 3.2 times as fast, infers 1.2 to 1.3
-times as fast and trains full batches 1.2 times as fast on one thread and as fast on four. The gap
-is largest for mini-batches, where fixed per-step costs weigh most.
+Spingalett trains the convolutional network 1.3 to 1.7 times as fast as PyTorch and runs it 3.4 to
+4.1 times as fast. With batch normalization the gap widens to 1.5 to 2 times and 4.5 to 5.6 times:
+normalization slows Spingalett's training by 10 to 20% (PyTorch's by 26 to 29%) and its inference
+not at all, since it runs in the convolution's epilogue. For the fully connected network
+Spingalett trains mini-batches 2.5 to 3.2 times as fast, infers 1.3 to 1.6 times as fast and trains
+full batches 1.2 to 1.3 times as fast. The gap is largest for mini-batches, where fixed per-step
+costs weigh most.
 
-Against 0.6, the benchmark network runs at the same speed. Output layers of up to 16 units now run
-as blocks of dot products instead of mostly idle matrix panels, and products too small to gain from
-threads run on one: a 32-64-64-1 regression network trains 7% faster on one thread and 65% faster
-on four, and infers 10% and 40% faster.
+Deployment models of the CIFAR-10 network of `Examples/CIFAR10.c` (551K parameters, six
+convolutions with batch normalization folded in), `spingalett_model_predict()` on 4,000 test
+images, images per second; 0.7's integer kernels against 0.8's (float layers are unchanged):
+
+| CIFAR-10 network | Threads | FP32 | FP16 | INT8 | INT4 |
+|---|---:|---:|---:|---:|---:|
+| 0.7 integer kernels | 1 | 1,020 | 950 | 810 | 830 |
+| 0.8 | 1 | 1,010 | 970 | 2,520 | 2,960 |
+| 0.7 integer kernels | 4 | 3,420 | 3,550 | 2,710 | 2,500 |
+| 0.8 | 4 | 3,530 | 3,710 | 7,380 | 7,950 |
+
+With the AVX-512 VNNI tiles an INT8 model predicts 3.1 times as fast as before on one thread and
+2.7 times on four, and 2.5 and 2.1 times as fast as the FP32 model. One image at a time
+(`spingalett_model_run()`), the INT8 network runs 1.7 to 1.8 times as fast as in 0.7 (1,580
+against 860 images per second), its convolutions now taking four pixels against four filters at a
+time.
 
 The x86-64 release packages are compiled for a baseline instruction set and choose AVX2 or AVX-512
-matrix kernels at run time (since 0.6). On the same machine, on one thread, the baseline package
-trains 3.6 to 4.9 times as fast, and infers 5 times as fast, as with kernels for its baseline
-(SSE2), as in 0.5:
+matrix kernels at run time (since 0.6), and AVX-512 VNNI or AVX-VNNI integer kernels (since 0.8).
+On the Cascade Lake VM where 0.6 was measured, on one thread, the baseline package trains 3.6 to
+4.9 times as fast, and infers 5 times as fast, as with kernels for its baseline (SSE2), as in 0.5:
 
 | Baseline x86-64 build, one thread | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|
@@ -800,6 +822,8 @@ trains 3.6 to 4.9 times as fast, and infers 5 times as fast, as with kernels for
 mini-batches of 128) on 55,000 images, keeps the epoch with the best accuracy on the other 5,000
 and reaches 98.2% test accuracy after 10 epochs, which take a few seconds with OpenMP on the same
 VM. `Examples/MNIST_CNN.c` reaches 98.9% after two epochs of about 9 seconds each on four threads.
+`Examples/CIFAR10.c` reaches 87.8% test accuracy after 20 epochs, 20 minutes on four threads of the
+Sapphire Rapids VM (760 images per second with augmentation); its INT8 model keeps 87.8%.
 
 ## Project layout
 

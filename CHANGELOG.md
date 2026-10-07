@@ -42,6 +42,20 @@ augmentation and a CIFAR-10 example.
   augmentation, optionally depthwise-separable, evaluated as FP16 and INT8 models.
 - Python: `BatchNorm`, `add_batch_norm()`, `get_running_statistics()` / `set_running_statistics()`,
   `Conv2D(groups=...)`, `load_cifar()`, `TrainConfig.augment_shift` / `augment_flip`.
+- Batched integer inference on processors with byte dot-product instructions:
+  `spingalett_model_predict()` and `spingalett_model_evaluate()` run integer convolutions (with one
+  group) and dense layers (from 12 samples) in tiles of 12 pixels or samples against weight rows
+  interleaved four bytes at a time, with kernels for AVX-512 VNNI, AVX-VNNI and the Arm dot
+  product extension (Src/Spingalett.Int8Tiles.c). Builds without `-march=native` carry them and
+  choose at run time: the x86-64 packages, and on AArch64 Linux. The INT8 CIFAR-10 network
+  predicts 3.1 times as fast as in 0.7 on one thread (2,520 images/s) and 2.7 times on four, 2.5
+  and 2.1 times as fast as its FP32 model. Results are unchanged (integer sums are exact), and
+  still identical to single runs.
+- The macOS package is built with OpenMP and carries LLVM's OpenMP runtime (`libomp.dylib`, with
+  its license) next to the library, which finds it through `@loader_path`.
+- `Bin/Benchmark` and `Examples/benchmark_pytorch.py` also measure the convolutional network with
+  batch normalization: Spingalett trains it 1.5 to 2 times as fast as PyTorch and infers it 4.5 to
+  5.6 times as fast.
 
 ### Changed
 - `SPINGALETT_FORMAT_VERSION` is 5. `LayerArgs`, `TrainArgs`, `SpingalettNetworkLayer` and
@@ -49,6 +63,12 @@ augmentation and a CIFAR-10 example.
   against the new headers.
 - DigitPad's model is a batch-normalized convolutional network: 99.58% MNIST test accuracy and
   99.45% on randomly distorted digits (the MLP: 99.27% and 98.44%).
+- The inference engine's INT8 convolutions take four pixels against four filters at a time, with
+  the filters' sums computed once per layer on AVX-512 VNNI: one CIFAR-10 image through
+  `spingalett_model_run()` takes 1.7 to 1.8 times less time. GCC's partial redundancy elimination
+  is off for the integer dot-product kernels, where it copied the sums through memory on every
+  step. The engine's scratch for an INT8 convolution grows by 4 bytes per filter.
+- The shared library's soname is `libspingalett.so.0.8`.
 
 ## [0.7.0] - 2026-10-07
 
