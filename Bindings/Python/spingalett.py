@@ -268,8 +268,13 @@ class _LayerArgs(Structure):
     ]
 
 
+# Arrays passed in and out of the calls made per batch go by address (c_void_p, from
+# ndarray.ctypes.data): building a ctypes float pointer costs about a microsecond more per array.
+_FloatArray = c_void_p
+
+
 class _ForwardArgs(Structure):
-    _fields_ = [("net", _NetPtr), ("input", POINTER(c_float))]
+    _fields_ = [("net", _NetPtr), ("input", _FloatArray)]
 
 
 class _TrainArgs(Structure):
@@ -322,17 +327,17 @@ class _TrainArgs(Structure):
 class _PredictArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
-        ("inputs", POINTER(c_float)),
+        ("inputs", _FloatArray),
         ("sample_count", c_uint32),
-        ("outputs", POINTER(c_float)),
+        ("outputs", _FloatArray),
     ]
 
 
 class _EvaluateArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
-        ("inputs", POINTER(c_float)),
-        ("targets", POINTER(c_float)),
+        ("inputs", _FloatArray),
+        ("targets", _FloatArray),
         ("sample_count", c_uint32),
     ]
 
@@ -530,6 +535,8 @@ def _bind(name, restype, argtypes):
 _new = _bind("new_spingalett_struct_arguments", _NetPtr, [_NeuralNetworkArgs])
 _layer = _bind("layer_struct_arguments", None, [_LayerArgs])
 _layer_count = _bind("spingalett_layer_count", c_uint32, [_NetPtr])
+_input_size = _bind("spingalett_input_size", c_uint32, [_NetPtr])
+_output_size = _bind("spingalett_output_size", c_uint32, [_NetPtr])
 _network_layer = _bind("spingalett_network_layer", c_bool, [_NetPtr, c_uint32, POINTER(_NetworkLayer)])
 _parameter_count = _bind("spingalett_parameter_count", c_uint64, [_NetPtr])
 _network_loss = _bind("spingalett_network_loss", c_int, [_NetPtr])
@@ -538,16 +545,16 @@ _get_parameters = _bind("spingalett_get_parameters", c_bool, [_NetPtr, c_uint32,
 _set_parameters = _bind("spingalett_set_parameters", c_bool, [_NetPtr, c_uint32, c_int, POINTER(c_float), c_uint64])
 _PARAM_WEIGHTS, _PARAM_BIASES, _PARAM_WEIGHT_GRADIENTS, _PARAM_BIAS_GRADIENTS = 0, 1, 2, 3
 _PARAM_RUNNING_MEAN, _PARAM_RUNNING_VARIANCE = 4, 5
-_forward = _bind("forward_struct_arguments", POINTER(c_float), [_ForwardArgs])
+_forward = _bind("forward_struct_arguments", c_void_p, [_ForwardArgs])
 _predict = _bind("predict_struct_arguments", c_bool, [_PredictArgs])
 _train = _bind("train_struct_arguments", _TrainReport, [_TrainArgs])
 _evaluate = _bind("evaluate_struct_arguments", _EvalMetrics, [_EvaluateArgs])
 _TrainerPtr = c_void_p
 _trainer_new = _bind("spingalett_trainer_new", _TrainerPtr, [_NetPtr, c_uint32])
 _trainer_free = _bind("spingalett_trainer_free", None, [_TrainerPtr])
-_trainer_forward = _bind("spingalett_trainer_forward", POINTER(c_float), [_TrainerPtr, POINTER(c_float), c_uint32])
-_trainer_backward = _bind("spingalett_trainer_backward", c_float, [_TrainerPtr, POINTER(c_float)])
-_trainer_backward_grads = _bind("spingalett_trainer_backward_output_grads", c_bool, [_TrainerPtr, POINTER(c_float)])
+_trainer_forward = _bind("spingalett_trainer_forward", c_void_p, [_TrainerPtr, _FloatArray, c_uint32])
+_trainer_backward = _bind("spingalett_trainer_backward", c_float, [_TrainerPtr, _FloatArray])
+_trainer_backward_grads = _bind("spingalett_trainer_backward_output_grads", c_bool, [_TrainerPtr, _FloatArray])
 _trainer_step = _bind("spingalett_trainer_step", c_bool, [_TrainerPtr, POINTER(_OptimizerArgs)])
 _trainer_zero_grad = _bind("spingalett_trainer_zero_grad", None, [_TrainerPtr])
 _load_idx = _bind("spingalett_load_idx", c_bool, [c_char_p, c_char_p, c_uint32, POINTER(_Dataset)])
@@ -576,8 +583,8 @@ _model_load = _bind("spingalett_model_load", _ModelPtr, [c_char_p])
 _model_from_memory = _bind("spingalett_model_from_memory", _ModelPtr, [c_char_p, c_size_t])
 _model_free = _bind("spingalett_model_free", None, [_ModelPtr])
 _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
-_model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, POINTER(c_float), c_uint32, POINTER(c_float)])
-_model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, POINTER(c_float), POINTER(c_float), c_uint32])
+_model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, _FloatArray, c_uint32, _FloatArray])
+_model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _FloatArray, _FloatArray, c_uint32])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
 _free = _bind("free_network", None, [_NetPtr])
 _print_parameters = _bind("print_parameters", None, [_NetPtr])
@@ -1065,11 +1072,11 @@ class Network:
 
     @property
     def input_size(self) -> int:
-        return self.topology[0]
+        return int(_input_size(self._net))
 
     @property
     def output_size(self) -> int:
-        return self.topology[-1]
+        return int(_output_size(self._net))
 
     @property
     def num_parameters(self) -> int:
@@ -1143,12 +1150,12 @@ class Network:
         batch = _as_matrix(arr, n_in, "inputs")
         out = np.empty((batch.shape[0], n_out), dtype=np.float32)
         if single:
-            ptr = _call(_forward, _ForwardArgs(self._ptr, _float_ptr(batch[0])))
+            ptr = _call(_forward, _ForwardArgs(self._ptr, batch.ctypes.data))
             ctypes.memmove(out.ctypes.data, ptr, n_out * 4)
             return out[0]
         if batch.shape[0]:
             self._net  # raise if closed
-            _call(_predict, _PredictArgs(self._ptr, _float_ptr(batch), batch.shape[0], _float_ptr(out)))
+            _call(_predict, _PredictArgs(self._ptr, batch.ctypes.data, batch.shape[0], out.ctypes.data))
         return out
 
     __call__ = forward
@@ -1157,7 +1164,7 @@ class Network:
         """Mean loss (as reported by training) and accuracy over a data set. Accuracy compares
         the argmax of outputs and targets; with a single output, their side of 0.5."""
         x, y = self._pair(inputs, targets, "")
-        return _metrics(_call(_evaluate, _EvaluateArgs(self._ptr, _float_ptr(x), _float_ptr(y), x.shape[0])))
+        return _metrics(_call(_evaluate, _EvaluateArgs(self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0])))
 
     def _pair(self, inputs, targets, what: str):
         x = _as_matrix(inputs, self.input_size, what + "inputs")
@@ -1448,6 +1455,7 @@ class Model:
             raise SpingalettError(-1, "could not create the model")
         model = cls.__new__(cls)
         model._ptr = ptr
+        model._sizes = (int(ptr.contents.input_size), int(ptr.contents.output_size))   # read-only
         return model
 
     @classmethod
@@ -1534,13 +1542,14 @@ class Model:
     # ---- inference
     def predict(self, inputs) -> np.ndarray:
         """Outputs for one sample (1-D input) or a batch (one row per sample)."""
-        n_in = self.input_size
+        self._model  # raise if closed
+        n_in, n_out = self._sizes
         arr = _as_float(inputs)
         single = arr.ndim == 1 and arr.size == n_in
         batch = _as_matrix(arr, n_in, "inputs")
-        out = np.empty((batch.shape[0], self.output_size), dtype=np.float32)
+        out = np.empty((batch.shape[0], n_out), dtype=np.float32)
         if batch.shape[0]:
-            _call(_model_predict, self._ptr, _float_ptr(batch), batch.shape[0], _float_ptr(out))
+            _call(_model_predict, self._ptr, batch.ctypes.data, batch.shape[0], out.ctypes.data)
         return out[0] if single else out
 
     __call__ = predict
@@ -1551,7 +1560,7 @@ class Model:
         y = _as_matrix(targets, self.output_size, "targets", images=False)
         if x.shape[0] != y.shape[0] or x.shape[0] == 0:
             raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
-        return _metrics(_call(_model_evaluate, self._ptr, _float_ptr(x), _float_ptr(y), x.shape[0]))
+        return _metrics(_call(_model_evaluate, self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0]))
 
     def __repr__(self) -> str:
         if not getattr(self, "_ptr", None):
@@ -1612,7 +1621,7 @@ class Trainer:
         """Training-mode forward pass (dropout active); returns a copy of the outputs."""
         net = self._network
         x = _as_matrix(inputs, net.input_size, "inputs")
-        ptr = _call(_trainer_forward, self._handle(), _float_ptr(x), x.shape[0])
+        ptr = _call(_trainer_forward, self._handle(), x.ctypes.data, x.shape[0])
         self._rows = x.shape[0]
         out = np.empty((x.shape[0], net.output_size), dtype=np.float32)
         ctypes.memmove(out.ctypes.data, ptr, out.nbytes)
@@ -1623,14 +1632,14 @@ class Trainer:
         y = _as_matrix(targets, self._network.output_size, "targets", images=False)
         if y.shape[0] != self._rows:
             raise ValueError(f"targets have {y.shape[0]} rows, the last forward pass had {self._rows}")
-        return float(_call(_trainer_backward, self._handle(), _float_ptr(y)))
+        return float(_call(_trainer_backward, self._handle(), y.ctypes.data))
 
     def backward_output_grads(self, output_grads) -> None:
         """Back-propagates a custom loss given dL/d(output) for every sample of the last forward pass."""
         g = _as_matrix(output_grads, self._network.output_size, "output_grads", images=False)
         if g.shape[0] != self._rows:
             raise ValueError(f"output_grads have {g.shape[0]} rows, the last forward pass had {self._rows}")
-        _call(_trainer_backward_grads, self._handle(), _float_ptr(g))
+        _call(_trainer_backward_grads, self._handle(), g.ctypes.data)
 
     def step(self, optimizer: Optimizer = Optimizer.ADAM, learning_rate: float = 0.01, weight_decay: float = 0.0,
              momentum: float = 0.0, beta1: float = 0.0, beta2: float = 0.0, epsilon: float = 0.0,
