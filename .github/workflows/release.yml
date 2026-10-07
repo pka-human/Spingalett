@@ -96,19 +96,53 @@ jobs:
           pacman -Ss gomp || true
           ls /ucrt64/bin/libgomp* /ucrt64/lib/libgomp* /ucrt64/lib/gcc/x86_64-w64-mingw32/*/libgomp* 2>/dev/null || true
 
+      # Apple's compilers come without an OpenMP runtime, and Homebrew's is built for the runner's
+      # macOS: build LLVM's for both architectures and macOS 11, and ship it in the package
+      - name: OpenMP runtime (macOS)
+        if: runner.os == 'macOS'
+        id: libomp
+        uses: actions/cache@v4
+        with:
+          path: libomp
+          key: libomp-19.1.7-universal-macos11
+
+      - name: Build the OpenMP runtime (macOS)
+        if: runner.os == 'macOS' && steps.libomp.outputs.cache-hit != 'true'
+        run: |
+          v=19.1.7
+          base=https://github.com/llvm/llvm-project/releases/download/llvmorg-$v
+          mkdir -p omp-src
+          curl -fsSL "$base/openmp-$v.src.tar.xz" | tar -xJ -C omp-src
+          curl -fsSL "$base/cmake-$v.src.tar.xz" | tar -xJ -C omp-src
+          mv "omp-src/cmake-$v.src" omp-src/cmake
+          cmake -S "omp-src/openmp-$v.src" -B omp-build -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DOPENMP_STANDALONE_BUILD=ON -DLIBOMP_INSTALL_ALIASES=OFF -DLIBOMP_OMPD_SUPPORT=OFF \
+            -DOPENMP_ENABLE_LIBOMPTARGET=OFF -DOPENMP_ENABLE_OMPT_TOOLS=OFF -DLIBOMP_OMPT_SUPPORT=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/libomp"
+          cmake --build omp-build --parallel
+          cmake --install omp-build
+          cp "omp-src/openmp-$v.src/LICENSE.TXT" libomp/LICENSE-libomp.txt
+          install_name_tool -id @rpath/libomp.dylib libomp/lib/libomp.dylib
+          lipo -info libomp/lib/libomp.dylib
+          otool -l libomp/lib/libomp.dylib | grep -A4 LC_BUILD_VERSION | head -8
+
       - name: Configure
         run: |
           root=$PWD; [ "$RUNNER_OS" = Windows ] && root=$(cygpath -m "$PWD")    # native CMake, MSYS shell
           args=(-DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF "-DCMAKE_C_FLAGS=${{ matrix.flags }}"
                 -DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE")
           case "${{ matrix.name }}" in
-            macos-*)   args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0) ;;
+            macos-*)   omp="$PWD/libomp"
+                       args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+                              -DBUILD_WITH_OPENMP=ON "-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$omp/include"
+                              -DOpenMP_C_LIB_NAMES=omp "-DOpenMP_omp_LIBRARY=$omp/lib/libomp.dylib") ;;
             windows-*) args+=(-G Ninja -DBUILD_WITH_OPENMP=ON) ;;
             *)         args+=(-DBUILD_WITH_OPENMP=ON) ;;
           esac
           cmake -S . -B Build "${args[@]}"
-          # OpenMP is requested everywhere but macOS: a build without it must not be published
-          if [ "$RUNNER_OS" != macOS ] && ! grep -q "define SPINGALETT_HAS_OPENMP" Build/Spingalett/Spingalett.Config.h; then
+          # OpenMP is requested everywhere: a build without it must not be published
+          if ! grep -q "define SPINGALETT_HAS_OPENMP" Build/Spingalett/Spingalett.Config.h; then
             grep -n -i -B2 -A25 "openmp" Build/CMakeFiles/CMakeConfigureLog.yaml | tail -120 || true
             echo "::error::OpenMP was requested but not found"
             exit 1
@@ -130,6 +164,19 @@ jobs:
               awk '$3 ~ /^\/ucrt64\// { print $3 }' | sort -u | xargs -r cp -t "$ARCHIVE/bin/"
             ls "$ARCHIVE/bin"
             (cd "$ARCHIVE/lib" && gendef ../bin/libspingalett.dll && mv libspingalett.def spingalett.def)
+          fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            # the OpenMP runtime next to the library, which finds it through @loader_path
+            cp libomp/lib/libomp.dylib "$ARCHIVE/lib/"
+            cp libomp/LICENSE-libomp.txt "$ARCHIVE/"
+            otool -L "$ARCHIVE"/lib/libspingalett.*.dylib
+            otool -l "$ARCHIVE"/lib/libspingalett.*.dylib | grep -A2 LC_RPATH
+            out=$("$ARCHIVE/bin/ModelTool" 2>&1 || true)            # usage: the tool and its libraries load
+            echo "$out" | head -3
+            if echo "$out" | grep -q "Library not loaded"; then
+              echo "::error::the installed tools cannot load their libraries"
+              exit 1
+            fi
           fi
 
       - name: MSVC import library

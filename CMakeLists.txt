@@ -325,6 +325,10 @@ set_target_properties(spingalett PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${SPINGALETT_SOVERSION}
 )
+# macOS packages carry their OpenMP runtime (@rpath/libomp.dylib) next to the library
+if(APPLE)
+    set_target_properties(spingalett PROPERTIES INSTALL_RPATH "@loader_path")
+endif()
 
 # ------------------------------------------------------------------------------
 # Examples

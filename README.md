@@ -69,7 +69,9 @@ the shared library, a CMake package, `DatasetTool` and `ModelTool`. Extract one 
 `-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
 when the processor has them, and the `-v3` build also compiles the rest of the library
 (activations, optimizers, the inference engine) for AVX2. The Windows DLL ships with import
-libraries for MinGW and MSVC.
+libraries for MinGW and MSVC. Every package is built with OpenMP; the macOS one (a universal
+library for Apple silicon and Intel, macOS 11 or newer) carries LLVM's OpenMP runtime,
+`libomp.dylib`, next to the library, since Apple's compilers come without one.
 
 To build from source: requirements: CMake 3.21 or newer and a compiler with C23 support. GCC 13 and Clang 18 are tested
 in CI; MSVC 19.36 or newer is expected to work but is not tested. OpenMP and OpenBLAS are
