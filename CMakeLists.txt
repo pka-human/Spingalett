@@ -52,6 +52,13 @@ target_include_directories(spingalett
 
 target_compile_definitions(spingalett PRIVATE SPINGALETT_EXPORTS)
 
+# Background threads (the data set reader decodes ahead): POSIX threads, or Win32 on Windows
+if(NOT WIN32)
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+    target_link_libraries(spingalett PRIVATE Threads::Threads)
+endif()
+
 # ------------------------------------------------------------------------------
 # OpenMP
 # ------------------------------------------------------------------------------
@@ -342,6 +349,9 @@ if(BUILD_EXAMPLE)
 
         add_executable(${EXAMPLE_NAME} ${EXAMPLE_SOURCE})
         target_link_libraries(${EXAMPLE_NAME} PRIVATE spingalett)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(${EXAMPLE_NAME} PRIVATE m)       # stb_image in DatasetTool
+        endif()
 
         if(UNIX AND NOT APPLE)
             set_target_properties(${EXAMPLE_NAME} PROPERTIES

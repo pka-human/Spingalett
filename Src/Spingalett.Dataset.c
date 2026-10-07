@@ -15,7 +15,41 @@ void spingalett_dataset_free(SpingalettDataset *d) {
     if (!d) return;
     free(d->inputs);
     free(d->targets);
+    free(d->class_names);
     memset(d, 0, sizeof *d);
+}
+
+char **spingalett_copy_names(const char *const *names, uint32_t count) {
+    /* one block: count + 1 pointers, then the strings */
+    size_t bytes = ((size_t)count + 1) * sizeof(char *);
+    for (uint32_t i = 0; i < count; i++) bytes += strlen(names[i] ? names[i] : "") + 1;
+    char **out = (char **)malloc(bytes);
+    if (!out) return NULL;
+    char *p = (char *)(out + count + 1);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *n = names[i] ? names[i] : "";
+        size_t len = strlen(n) + 1;
+        memcpy(p, n, len);
+        out[i] = p;
+        p += len;
+    }
+    out[count] = NULL;
+    return out;
+}
+
+bool spingalett_dataset_set_class_names(SpingalettDataset *d, const char *const *names, uint32_t count) {
+    if (!d || (names && count != d->target_size)) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_dataset_set_class_names: need one name per target");
+        return false;
+    }
+    char **copy = NULL;
+    if (names && !(copy = spingalett_copy_names(names, count))) {
+        set_error(SPINGALETT_ERR_ALLOC, "spingalett_dataset_set_class_names: allocation failed");
+        return false;
+    }
+    free(d->class_names);
+    d->class_names = copy;
+    return true;
 }
 
 static bool dataset_alloc(SpingalettDataset *d, uint32_t count, uint32_t input_size, uint32_t target_size) {
@@ -34,6 +68,41 @@ static bool dataset_alloc(SpingalettDataset *d, uint32_t count, uint32_t input_s
 
 #define CIFAR_SIDE   32u
 #define CIFAR_PIXELS (CIFAR_SIDE * CIFAR_SIDE)
+
+/* Class names from the text file the archives carry next to the batches (batches.meta.txt for
+   CIFAR-10, fine_label_names.txt or coarse_label_names.txt for CIFAR-100), when it is there. */
+static void cifar_class_names(const char *batch_path, uint32_t num_classes, SpingalettDataset *d) {
+    const char *file = num_classes == 10 ? "batches.meta.txt" : num_classes == 100 ? "fine_label_names.txt"
+                                                                                  : "coarse_label_names.txt";
+    const char *slash = strrchr(batch_path, '/'), *backslash = strrchr(batch_path, '\\');
+    const char *sep = slash > backslash ? slash : backslash;
+    size_t dir = sep ? (size_t)(sep - batch_path) + 1 : 0;
+    char *path = (char *)malloc(dir + strlen(file) + 1);
+    if (!path) return;
+    memcpy(path, batch_path, dir);
+    strcpy(path + dir, file);
+    FILE *f = fopen(path, "rb");
+    free(path);
+    if (!f) return;
+    char text[8192];
+    size_t len = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[len] = '\0';
+    const char *names[100];
+    uint32_t n = 0;
+    for (char *line = text; line && *line && n < num_classes;) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        size_t l = strlen(line);
+        while (l > 0 && (line[l - 1] == '\r' || line[l - 1] == ' ')) line[--l] = '\0';
+        if (l > 0) names[n++] = line;
+        line = next;
+    }
+    if (n == num_classes) {
+        free(d->class_names);
+        d->class_names = spingalett_copy_names(names, n);
+    }
+}
 
 bool spingalett_load_cifar(const char *const *paths, uint32_t path_count, uint32_t num_classes,
                            SpingalettDataset *dataset) {
@@ -86,6 +155,11 @@ bool spingalett_load_cifar(const char *const *paths, uint32_t path_count, uint32
     for (uint32_t i = 0; data && i < path_count; i++) spingalett_aligned_free(data[i]);
     free(data);
     free(sizes);
+    if (ok) {
+        dataset->height = dataset->width = CIFAR_SIDE;
+        dataset->channels = 3;
+        cifar_class_names(paths[0], num_classes, dataset);
+    }
     if (!ok) spingalett_dataset_free(dataset);
     return ok;
 }
@@ -96,6 +170,7 @@ typedef struct {
     uint8_t type;           /* 0x08 ubyte, 0x09 byte, 0x0B short, 0x0C int, 0x0D float, 0x0E double */
     uint32_t count;         /* first dimension */
     uint64_t sample_size;   /* product of the other dimensions */
+    uint32_t dims, dim[4];  /* the first four dimensions */
 } IdxHeader;
 
 static bool read_be(FILE *f, unsigned char *b, size_t n) {
@@ -111,6 +186,7 @@ static bool idx_header(FILE *f, const char *path, IdxHeader *h) {
     }
     h->type = b[2];
     h->sample_size = 1;
+    h->dims = b[3];
     for (unsigned d = 0; d < b[3]; d++) {
         unsigned char v[4];
         if (!read_be(f, v, 4)) {
@@ -118,6 +194,7 @@ static bool idx_header(FILE *f, const char *path, IdxHeader *h) {
             return false;
         }
         uint32_t dim = (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 | (uint32_t)v[2] << 8 | v[3];
+        if (d < 4) h->dim[d] = dim;
         if (d == 0) h->count = dim;
         else h->sample_size *= dim;
         if (h->sample_size > UINT32_MAX) {
@@ -202,6 +279,11 @@ bool spingalett_load_idx(const char *images_path, const char *labels_path, uint3
         }
         for (uint32_t i = 0; i < hi.count; i++)
             dataset->targets[(size_t)i * dataset->target_size + labels[i]] = 1.0f;
+        if (hi.dims == 3 || hi.dims == 4) {     /* count x height x width (x channels) */
+            dataset->height = hi.dim[1];
+            dataset->width = hi.dim[2];
+            dataset->channels = hi.dims == 4 ? hi.dim[3] : 1;
+        }
     }
 
     free(raw);
@@ -360,7 +442,15 @@ bool spingalett_dataset_split(SpingalettDataset *d, uint32_t count, SpingalettDa
         set_error(SPINGALETT_ERR_INVALID, "spingalett_dataset_split: need 0 < count < dataset size");
         return false;
     }
+    memset(tail, 0, sizeof *tail);
     if (!dataset_alloc(tail, count, d->input_size, d->target_size)) return false;
+    tail->height = d->height;
+    tail->width = d->width;
+    tail->channels = d->channels;
+    if (d->class_names && !spingalett_dataset_set_class_names(tail, (const char *const *)d->class_names, d->target_size)) {
+        spingalett_dataset_free(tail);
+        return false;
+    }
     uint32_t keep = d->count - count;
     memcpy(tail->inputs, d->inputs + (size_t)keep * d->input_size, (size_t)count * d->input_size * sizeof(float));
     memcpy(tail->targets, d->targets + (size_t)keep * d->target_size, (size_t)count * d->target_size * sizeof(float));

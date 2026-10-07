@@ -171,6 +171,8 @@ void spingalett_log(LogLevel level, const char *fmt, ...);
 /* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
    spingalett_aligned_free). NULL on error, with the error set. */
 void *spingalett_read_file(const char *path, size_t *size);
+/* count strings copied into one allocation (a NULL-terminated array of pointers; free() releases it). */
+char **spingalett_copy_names(const char *const *names, uint32_t count);
 /* load_spingalett_from_memory that also reports the precision of the first weight layer. */
 NeuralNetwork *spingalett_load_from_memory_ex(const void *data, size_t size, PrecisionMode *precision);
 /* Whether a sample counts as correctly classified (see EvalMetrics). */
