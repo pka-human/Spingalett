@@ -2229,7 +2229,12 @@ static void model_conv(void) {
     bool same = back && back->layers == net->layers && back->total_weights == net->total_weights && back->time_step == 17;
     for (uint32_t l = 0; same && l < net->layers; l++) {
         SpingalettNetworkLayer a, b;
-        same = spingalett_network_layer(net, l, &a) && spingalett_network_layer(back, l, &b) && !memcmp(&a, &b, sizeof a);
+        same = spingalett_network_layer(net, l, &a) && spingalett_network_layer(back, l, &b) &&
+               a.type == b.type && a.height == b.height && a.width == b.width && a.channels == b.channels &&
+               a.outputs == b.outputs && a.activation == b.activation && a.dropout_rate == b.dropout_rate &&
+               a.kernel_h == b.kernel_h && a.kernel_w == b.kernel_w && a.stride_h == b.stride_h &&
+               a.stride_w == b.stride_w && a.padding_h == b.padding_h && a.padding_w == b.padding_w &&
+               a.weight_count == b.weight_count && a.bias_count == b.bias_count;
     }
     if (same)
         same = !memcmp(back->weights, net->weights, net->total_weights * 4) && !memcmp(back->biases, net->biases, net->total_biases * 4) &&

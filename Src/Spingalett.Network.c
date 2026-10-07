@@ -323,13 +323,20 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
         return false;
     }
     const LayerShape *s = &net->shapes[index];
-    *layer = (SpingalettNetworkLayer){
-        .type = s->type, .height = s->height, .width = s->width, .channels = s->channels,
-        .outputs = net->topology[index], .activation = index > 0 ? net->act_func[index - 1] : ACT_NONE,
-        .dropout_rate = net->dropout_rates[index],
-        .kernel_h = s->kernel_h, .kernel_w = s->kernel_w, .stride_h = s->stride_h, .stride_w = s->stride_w,
-        .padding_h = s->pad_h, .padding_w = s->pad_w,
-    };
+    memset(layer, 0, sizeof *layer);        /* padding bytes too, so equal layers compare equal */
+    layer->type = s->type;
+    layer->height = s->height;
+    layer->width = s->width;
+    layer->channels = s->channels;
+    layer->outputs = net->topology[index];
+    layer->activation = index > 0 ? net->act_func[index - 1] : ACT_NONE;
+    layer->dropout_rate = net->dropout_rates[index];
+    layer->kernel_h = s->kernel_h;
+    layer->kernel_w = s->kernel_w;
+    layer->stride_h = s->stride_h;
+    layer->stride_w = s->stride_w;
+    layer->padding_h = s->pad_h;
+    layer->padding_w = s->pad_w;
     if (index > 0) {
         layer->bias_count = spingalett_weight_rows(net, index - 1);
         layer->weight_count = layer->bias_count * spingalett_weight_row_len(net, index - 1);
