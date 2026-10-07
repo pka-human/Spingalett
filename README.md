@@ -42,18 +42,18 @@ alike. Python bindings are included.
 
 | Area | Supported |
 |---|---|
-| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows), max and average pooling; channels-last tensors; optional dropout per layer |
+| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), max and average pooling, batch normalization; channels-last tensors; optional dropout per layer |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs) |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
-| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; validation with early stopping and best-weight restore |
+| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
-| Data | `.slettd` data set files (compact, lossless by default, streamable into training), IDX (MNIST) and CSV readers, shuffling, hold-out splits |
+| Data | `.slettd` data set files (compact, lossless by default, streamable into training), IDX (MNIST), CIFAR-10/100 and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `forward()`, batched `predict()`, `evaluate()` (loss and accuracy) |
-| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX2/VNNI, SSE2, NEON, Arm DSP; INT4 and INT2 decoded in registers); run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
+| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
@@ -118,7 +118,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.7 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.8 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -172,8 +172,9 @@ Fields that are not mentioned are zero, which selects the documented default.
 
 The `Examples/` directory contains this XOR program, an MNIST classifier
 (`Examples/download_mnist.sh data/mnist && Bin/MNIST data/mnist`), a convolutional one
-(`Bin/MNIST_CNN data/mnist`, about 99% after two epochs) and the benchmark described under
-[Performance](#performance).
+(`Bin/MNIST_CNN data/mnist`, about 99% after two epochs), a CIFAR-10 classifier with batch
+normalization and augmentation (`Examples/download_cifar10.sh data/cifar10 && Bin/CIFAR10
+data/cifar10`) and the benchmark described under [Performance](#performance).
 
 ## Usage
 
@@ -224,10 +225,11 @@ layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
 | `kernel`, `kernel_h`, `kernel_w` | Window size; `kernel` sets both, `kernel_h` / `kernel_w` override one axis |
 | `stride`, `stride_h`, `stride_w` | Window step: 1 for convolutions and the kernel size for pooling unless set |
 | `padding`, `padding_h`, `padding_w` | Zero cells added on both sides of each axis; smaller than the kernel |
+| `groups` | Convolutions: split the input channels and the filters into this many groups; each filter sees the input channels of its own group. As many groups as input channels make a depthwise convolution (with any number of filters per channel) |
 
 An output axis has `(size + 2 padding - kernel) / stride + 1` cells. A convolution's filters are
-`kernel_h x kernel_w x input channels` weights each, plus one bias, and take an activation, a weight
-initialization (fan-in is the window size) and dropout like dense layers. Pooling has no parameters
+`kernel_h x kernel_w x (input channels / groups)` weights each, plus one bias, and take an
+activation, a weight initialization (fan-in is the window size) and dropout like dense layers. Pooling has no parameters
 and no activation; windows are clipped to the input, so padding cells never count (average pooling
 divides by the cells inside), and max pooling passes the gradient to the first maximum. Every
 training strategy, optimizer, schedule, the custom training loop and `predict()` work with these
@@ -236,8 +238,33 @@ layers as with dense ones.
 Convolutions run as matrix products whose input windows are gathered by the matrix kernels
 themselves (implicit im2col: no window matrix is stored), with the bias and activation applied to
 each tile of the result while it is in cache; weight gradients split their long summation over all
-pixels into fixed slots that the threads share. On a single core, `Examples/MNIST_CNN.c` trains 1.5
-times as fast as PyTorch and infers 4 times as fast (see [Performance](#performance)).
+pixels into fixed slots that the threads share. Depthwise convolutions are computed directly, all
+of a pixel's channels at once, and other grouped ones as one product per group. On a single core,
+`Examples/MNIST_CNN.c` trains 1.6 times as fast as PyTorch and infers 4 times as fast (see
+[Performance](#performance)).
+
+### Batch normalization
+
+`batch_norm()` normalizes the previous layer per channel (per unit after a dense layer):
+`y = act(gamma (x - mean) / sqrt(var + epsilon) + beta)`. While training, mean and variance are
+those of the batch (of each chunk of up to 2,048 samples in full-batch training), and running
+averages of them move `momentum` of the way towards each batch's; `predict()`, `forward()`,
+`evaluate()` and deployment models use the running averages. Gamma starts at 1 and beta at 0; they
+are the layer's weights and biases for every optimizer, but weight decay leaves them alone. The
+convolution or dense layer before a normalization usually takes no activation:
+
+```c
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+       .weight_initialization = WEIGHT_INITIALIZATION_HE);
+batch_norm(.net = net, .act_func = ACT_RELU);            /* .epsilon = 1e-5, .momentum = 0.1 */
+```
+
+Such a pair costs no more than the convolution alone at inference: `predict()` and `forward()`
+apply the normalization while the convolution's tiles are in cache, and deployment models (and
+files saved in other precisions than FP32 without optimizer state) fold it into the convolution's
+weights and biases. A normalization of a dense layer needs batches of at least 2 samples.
+`PARAM_RUNNING_MEAN` and `PARAM_RUNNING_VARIANCE` read and write the statistics, and
+`restore_best_weights` restores them with the weights.
 
 ### Inspecting a network
 
@@ -253,9 +280,11 @@ spingalett_get_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count); /* weights 
 spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count);
 ```
 
-Parameters come as `PARAM_WEIGHTS`, `PARAM_BIASES`, `PARAM_WEIGHT_GRADIENTS` and
-`PARAM_BIAS_GRADIENTS`. Dense weights are `outputs x inputs` (row `j` holds the weights into unit
-`j`); convolution weights are `filters x kernel_h x kernel_w x input channels`. Also available:
+Parameters come as `PARAM_WEIGHTS`, `PARAM_BIASES`, `PARAM_WEIGHT_GRADIENTS`,
+`PARAM_BIAS_GRADIENTS` and, for batch normalization, `PARAM_RUNNING_MEAN` and
+`PARAM_RUNNING_VARIANCE`. Dense weights are `outputs x inputs` (row `j` holds the weights into unit
+`j`); convolution weights are `filters x kernel_h x kernel_w x (input channels / groups)`; batch
+normalization has gamma as weights and beta as biases, one per channel. Also available:
 `spingalett_input_size()`, `spingalett_output_size()`, `spingalett_parameter_count()`,
 `spingalett_network_loss()` and `spingalett_optimizer_steps()`.
 
@@ -288,6 +317,7 @@ Parameters come as `PARAM_WEIGHTS`, `PARAM_BIASES`, `PARAM_WEIGHT_GRADIENTS` and
 | `autosave_mode`, `autosave_interval`, `autosave_path` | off | Periodic checkpoints (`AUTOSAVE_OVERWRITE` or `AUTOSAVE_NEW_FILES`, which appends `_epoch_N`) |
 | `autosave_precision`, `autosave_do_not_save_optimizer` | FP32, false | Checkpoint format |
 | `blas_num_threads` | 0 (auto) | OpenBLAS threads during training, see [Backends](#backends-and-threading) |
+| `augment_shift`, `augment_flip` | 0, false | Image augmentation (the input layer has a height and width): each training sample is shifted by up to `augment_shift` cells along each axis, zeros shifted in, and with `augment_flip` mirrored left to right half of the time; drawn anew for every sample of every step, the same on any number of threads |
 
 The reported loss is averaged over the samples of an epoch: the sum of squared errors per sample
 for MSE, and categorical (softmax) or binary (sigmoid) cross-entropy otherwise. Cross-entropy
@@ -411,6 +441,9 @@ are flattened and scaled to [0, 1] (float and double files are read unchanged), 
 one-hot encoded. `spingalett_load_csv(path, target_columns, num_classes, &d)` reads numeric,
 comma-separated files; a non-numeric first line is skipped as a header, the last `target_columns`
 columns are the targets, and with `num_classes > 0` a single label column is one-hot encoded.
+`spingalett_load_cifar(paths, count, num_classes, &d)` reads CIFAR binary batches one after the
+other as 32 x 32 x 3 channels-last images in [0, 1]: `num_classes` 10 for CIFAR-10, 100 or 20 for
+the fine or coarse labels of CIFAR-100.
 
 ### Data set files
 
@@ -588,6 +621,14 @@ output pixel as its filters' dot products with the window it reads (short window
 layer over one or three channels, accumulate all filters at once); pooling runs in float. Batched
 prediction of integer models computes exactly what single runs compute, on every backend and
 platform.
+
+`spingalett_model_predict()` and `spingalett_model_evaluate()` go further on processors with byte
+dot-product instructions (AVX-512 VNNI; AVX-VNNI, as in Intel Core processors since the 12th
+generation; the Arm dot product extension, as in Apple silicon, Cortex-A76 and later, and AWS
+Graviton 2 and later): integer convolutions (with one group) and dense layers run in tiles of 12
+pixels or samples against weight rows interleaved for those instructions, every weight read once
+for the tile. The release packages carry these kernels and choose them at run time. On the
+CIFAR-10 network below, an INT8 model predicts 2.5 times as fast as the FP32 one.
 
 Accuracy on the 10,000 MNIST test images (`ModelTool eval`):
 
@@ -769,16 +810,14 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.7; the C API may still change between minor versions (see
+Spingalett is at version 0.8; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.7`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.8`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
-engine and model format versions 3 and 4 are meant to stay stable from here on.
+engine and model format versions 3 to 5 are meant to stay stable from here on.
 
 Planned work, roughly in order:
 
-- 0.8: batch normalization, depthwise and grouped convolutions, a CIFAR-10 example, faster integer
-  convolutions on more targets
 - 0.9: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
   backend
 - 1.0: API freeze, C++ wrapper
