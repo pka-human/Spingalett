@@ -241,6 +241,33 @@ void spingalett_gemm_hooked(SpingalettGemmScratch *scratch, bool trans_a, bool t
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             const float *A, size_t lda, const float *B, size_t ldb,
                             float beta, float *C, size_t ldc, bool parallel, const SpingalettGemmHooks *hooks);
+/* Integer weight rows interleaved for batches (Spingalett.Int8Tiles.c). spingalett_i8_interleaved()
+   tells whether this processor runs the tile kernel (x86-64 with AVX-512 VNNI or AVX-VNNI, ARM with
+   the dot product instructions); elsewhere the tile function does nothing. spingalett_i8_interleave stores `rows` rows of n bytes (stride bytes apart)
+   in spingalett_i8_interleaved_rows(rows) * spingalett_i8_interleaved_len(n) bytes, zeros after the
+   last row and byte, and their sums in spingalett_i8_interleaved_rows(rows) entries.
+   spingalett_i8_interleaved_tile computes acc[p * acc_stride + j] = row j . vector p of x for the
+   SPINGALETT_I8_TILE vectors of x (x_stride bytes apart, spingalett_i8_interleaved_len(n) bytes
+   each, any initialized values after the first n; it changes all of them) and every j below
+   spingalett_i8_interleaved_rows(rows). */
+#define SPINGALETT_I8_TILE 12u
+bool spingalett_i8_interleaved(void);
+static inline uint32_t spingalett_i8_interleaved_rows(uint32_t rows) { return (rows + 15u) & ~15u; }
+static inline uint32_t spingalett_i8_interleaved_len(uint32_t n) { return (n + 3u) & ~3u; }
+void spingalett_i8_interleave(const int8_t *w, size_t stride, uint32_t rows, uint32_t n, int8_t *out, int32_t *sums);
+void spingalett_i8_interleaved_tile(const int8_t *weights, const int32_t *sums, uint32_t rows, uint32_t n, int8_t *x,
+                                    size_t x_stride, int32_t *acc, size_t acc_stride);
+#if defined(SPINGALETT_INT8_DISPATCH)
+/* The kernel compiled for AVX-512 VNNI, for AVX-VNNI, and for the ARM dot product instructions */
+#define SPINGALETT_I8_TILE_KERNEL(name) \
+    void name(const int8_t *weights, const int32_t *sums, uint32_t rows, uint32_t n, int8_t *x, size_t x_stride, \
+              int32_t *acc, size_t acc_stride);
+SPINGALETT_I8_TILE_KERNEL(spingalett_i8_tile_avx512)
+SPINGALETT_I8_TILE_KERNEL(spingalett_i8_tile_avxvnni)
+SPINGALETT_I8_TILE_KERNEL(spingalett_i8_tile_dotprod)
+#undef SPINGALETT_I8_TILE_KERNEL
+#endif
+
 #if defined(SPINGALETT_GEMM_DISPATCH)
 /* The same with one kernel set: the library's baseline flags, AVX2+FMA or AVX-512 (scratch must
    not be NULL; M, N and K must be positive). */

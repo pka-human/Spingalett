@@ -102,6 +102,15 @@ float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q);
 int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n);
 /* acc[r] = dot of row r (rows `stride` bytes apart) with x, for r = 0..3. */
 void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n, int32_t acc[4]);
+/* acc[4 r + p] = dot of row r of w with vector p of x (rows and vectors their strides apart), for r
+   and p in 0..3: each row is read once for four vectors (twice, for two each, with AVX2 alone,
+   whose 16 registers hold fewer sums). wsum holds the rows' sums
+   (spingalett_sum_i8) when spingalett_dot_i8_4x4_sums is true; the kernel does not read it
+   otherwise, and callers may skip the sums. */
+void spingalett_dot_i8_4x4(const int8_t *w, size_t w_stride, const int8_t *x, size_t x_stride, uint32_t n,
+                           const int32_t wsum[4], int32_t acc[16]);
+extern const bool spingalett_dot_i8_4x4_sums;
+int32_t spingalett_sum_i8(const int8_t *w, uint32_t n);
 
 /* Convolutions with windows shorter than this run filter-major: their filters are transposed into
    the workspace (columns), and each output pixel accumulates all filters at once, reading its
@@ -119,12 +128,16 @@ static inline bool slett_conv_depthwise(const SlettLayer *L) {
 }
 
 /* Bytes of engine scratch layer L needs: a convolution its transposed filters and one pixel's sums,
-   or a gathered window (of its group's channels); batch normalization its coefficients (0 for
-   other layers). */
+   or a gathered window (of its group's channels; an INT8 convolution with one group four windows
+   and the sums of its filters); batch normalization its coefficients (0 for other layers). */
 static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
     if (L->type == LAYER_BATCH_NORM) return (uint64_t)L->out_c * 8u;
     if (L->type != LAYER_CONV2D) return 0;
-    if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) return (uint64_t)L->row_len * 4u;
+    if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) {
+        uint64_t window = (uint64_t)L->row_len * 4u;
+        if (L->precision == PRECISION_INT8 && L->groups <= 1) return slett_align(window) + (uint64_t)L->rows * 4u;
+        return window;
+    }
     uint64_t elem = spingalett_precision_is_int(L->precision) ? 1u : 4u;
     return slett_align((uint64_t)L->row_len * L->rows * elem) + (uint64_t)L->rows * 4u;
 }

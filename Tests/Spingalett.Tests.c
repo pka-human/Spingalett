@@ -1972,6 +1972,14 @@ static void model_inference(PrecisionMode p, float tol) {
         CHECK(spingalett_model_predict(m, x, N, batch), "inference p=%d: predict failed", p);
         float d = max_abs_diff(one, batch, (size_t)N * out);
         if (d > worst) worst = d;
+        /* a few samples at a time: one, fewer than four, fewer than a tile of the batched kernels,
+           one past a tile */
+        static const uint32_t few[] = {1, 3, 5, 11, 13};
+        for (size_t f = 0; f < sizeof few / sizeof *few; f++) {
+            CHECK(spingalett_model_predict(m, x + (size_t)7 * in, few[f], batch), "inference p=%d: predict failed", p);
+            d = max_abs_diff(one + (size_t)7 * out, batch, (size_t)few[f] * out);
+            if (d > worst) worst = d;
+        }
     }
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     bool integer = p >= PRECISION_INT8;

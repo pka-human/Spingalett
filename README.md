@@ -107,7 +107,7 @@ the processor supports (`spingalett_cpu_kernels()` names it).
 | `BUILD_APPS` | `OFF` | Build the DigitPad demo (needs SDL2) and its trainer |
 | `SPINGALETT_INFERENCE_ONLY` | `OFF` | Build only the inference engine (`Spingalett.Inference.h`) as a static library: no training, file I/O, OpenMP or heap |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
-| `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` on x86-64 (GCC, Clang): also build AVX2 and AVX-512 matrix kernels and choose at run time |
+| `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` (GCC, Clang): on x86-64 also build AVX2 and AVX-512 matrix kernels and AVX-512 VNNI and AVX-VNNI integer kernels, on AArch64 Linux integer kernels for the dot product instructions, and choose at run time |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
 

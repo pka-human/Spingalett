@@ -41,6 +41,9 @@ static int engine_fail(int code, const char *msg) { set_error(code, msg); return
 #    if defined(__AVX__) && defined(__F16C__)
 #      define SPG_F16C 1
 #    endif
+#    if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#      define SPG_AVX512_VNNI 1
+#    endif
 #    if defined(__AVX2__) && defined(__AVXVNNI__)
 #      define SPG_VNNI(acc, u, s) _mm256_dpbusd_avx_epi32((acc), (u), (s))
 #      define SPG_VNNI128(acc, u, s) _mm_dpbusd_avx_epi32((acc), (u), (s))
@@ -55,6 +58,15 @@ static int engine_fail(int code, const char *msg) { set_error(code, msg); return
 #    include <arm_acle.h>
 #    define SPG_ARM_DSP 1
 #  endif
+#endif
+
+/* Kernels whose loops carry many sums in registers: GCC's partial redundancy elimination has it
+   copy them between registers, or through memory, on every step (dpbusd adds into its first
+   operand), so it is off for these. Arrays of sums end up in memory too: kernels name them. */
+#if defined(__GNUC__) && !defined(__clang__)
+#  define SPG_REGISTER_SUMS __attribute__((optimize("no-tree-pre")))
+#else
+#  define SPG_REGISTER_SUMS
 #endif
 
 #if defined(SPG_AVX) && defined(__FMA__)
@@ -345,6 +357,28 @@ uint64_t spingalett_slett_row_bytes(PrecisionMode precision, uint32_t inputs) {
 
 /* ------------------------------------------------------------------------- kernels */
 
+#if defined(SPG_NEON)
+static inline int32x4_t neon_dot_i8(int32x4_t acc, int8x16_t a, int8x16_t b) {
+#  if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(acc, a, b);
+#  else
+    int16x8_t p = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    p = vmlal_s8(p, vget_high_s8(a), vget_high_s8(b));      /* two products stay in int16 */
+    return vpadalq_s16(acc, p);
+#  endif
+}
+
+static inline int32_t neon_hsum(int32x4_t v) {
+#  if defined(__aarch64__)
+    return vaddvq_s32(v);
+#  else
+    int32x2_t s2 = vadd_s32(vget_low_s32(v), vget_high_s32(v));
+    return vget_lane_s32(vpadd_s32(s2, s2), 0);
+#  endif
+}
+
+#endif
+
 #if defined(SPG_AVX2)
 /* acc += |x| * (w with the sign of x): maddubs multiplies unsigned by signed bytes, and pairs of
    products stay below 2 * 127 * 127, so its 16-bit sums cannot saturate. */
@@ -379,7 +413,7 @@ static inline __m128i reduce_rows4(__m256i a0, __m256i a1, __m256i a2, __m256i a
 }
 #endif
 
-int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
+SPG_REGISTER_SUMS int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
     uint32_t k = 0;
     int32_t sum = 0;
 #if defined(SPG_AVX2)
@@ -444,7 +478,8 @@ int32_t spingalett_dot_i8(const int8_t *a, const int8_t *b, uint32_t n) {
     return sum;
 }
 
-void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n, int32_t acc[4]) {
+SPG_REGISTER_SUMS void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, uint32_t n,
+                                               int32_t acc[4]) {
 #if defined(SPG_AVX2)
     __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
     uint32_t k = 0;
@@ -471,6 +506,158 @@ void spingalett_dot_i8_rows4(const int8_t *w, size_t stride, const int8_t *x, ui
         for (uint32_t i = k; i < n; i++) acc[r] += (int32_t)w[(size_t)r * stride + i] * (int32_t)x[i];
 #else
     for (int r = 0; r < 4; r++) acc[r] = spingalett_dot_i8(w + (size_t)r * stride, x, n);
+#endif
+}
+
+/* ---- four rows against four activation vectors: acc[4 r + p] = row r . x_p, each row and each
+   vector loaded once per block. With VNNI the activations are offset to unsigned bytes, x + 128,
+   and 128 times each row's sum is taken off: products need no sign handling, and the sums, exact
+   modulo 2^32 like the result, give it exactly. */
+
+#if defined(SPG_AVX512_VNNI)
+/* The lane sums of 16 vectors as one vector, lane i the total of v[i]: pairs of 32-bit, then 64-bit
+   unpacks add within 128-bit lanes, and two rounds of 128-bit shuffles add across them. */
+static inline __m512i reduce16_epi32(const __m512i v[16]) {
+    __m512i s[8], t[4];
+    for (int i = 0; i < 8; i++)
+        s[i] = _mm512_add_epi32(_mm512_unpacklo_epi32(v[2 * i], v[2 * i + 1]), _mm512_unpackhi_epi32(v[2 * i], v[2 * i + 1]));
+    for (int j = 0; j < 4; j++)
+        t[j] = _mm512_add_epi32(_mm512_unpacklo_epi64(s[2 * j], s[2 * j + 1]), _mm512_unpackhi_epi64(s[2 * j], s[2 * j + 1]));
+    __m512i u01 = _mm512_add_epi32(_mm512_shuffle_i32x4(t[0], t[1], 0x44), _mm512_shuffle_i32x4(t[0], t[1], 0xEE));
+    __m512i u23 = _mm512_add_epi32(_mm512_shuffle_i32x4(t[2], t[3], 0x44), _mm512_shuffle_i32x4(t[2], t[3], 0xEE));
+    return _mm512_add_epi32(_mm512_shuffle_i32x4(u01, u23, 0x88), _mm512_shuffle_i32x4(u01, u23, 0xDD));
+}
+#endif
+
+#if defined(SPG_AVX512_VNNI)
+const bool spingalett_dot_i8_4x4_sums = true;
+#else
+const bool spingalett_dot_i8_4x4_sums = false;
+#endif
+
+int32_t spingalett_sum_i8(const int8_t *w, uint32_t n) {
+    uint32_t k = 0;
+    int32_t sum = 0;
+#if defined(SPG_AVX512_VNNI)
+    const __m512i ones = _mm512_set1_epi8(1);
+    __m512i a = _mm512_setzero_si512();
+    for (; k < n; k += 64u) {
+        __mmask64 m = n - k >= 64u ? ~(__mmask64)0 : (((__mmask64)1 << (n - k)) - 1u);
+        a = _mm512_dpbusd_epi32(a, ones, _mm512_maskz_loadu_epi8(m, w + k));
+    }
+    sum = _mm512_reduce_add_epi32(a);
+#endif
+    for (; k < n; k++) sum += w[k];
+    return sum;
+}
+
+#if defined(SPG_AVX512_VNNI)
+#define Q4_EACH(M) M(0) M(1) M(2) M(3)
+#define Q4_ZERO(r) __m512i a##r##0 = _mm512_setzero_si512(), a##r##1 = a##r##0, a##r##2 = a##r##0, a##r##3 = a##r##0;
+#define Q4_X(p) __m512i x##p = _mm512_xor_si512(_mm512_maskz_loadu_epi8(m, x + (size_t)(p) * x_stride + k), bias);
+#define Q4_ROW(r) \
+    { \
+        __m512i wr = _mm512_maskz_loadu_epi8(m, w + (size_t)(r) * w_stride + k); \
+        a##r##0 = _mm512_dpbusd_epi32(a##r##0, x0, wr); \
+        a##r##1 = _mm512_dpbusd_epi32(a##r##1, x1, wr); \
+        a##r##2 = _mm512_dpbusd_epi32(a##r##2, x2, wr); \
+        a##r##3 = _mm512_dpbusd_epi32(a##r##3, x3, wr); \
+    }
+
+SPG_REGISTER_SUMS static void dot_i8_4x4_vnni(const int8_t *w, size_t w_stride, const int8_t *x, size_t x_stride,
+                                              uint32_t n, const int32_t wsum[4], int32_t acc[16]) {
+    const __m512i bias = _mm512_set1_epi8((char)0x80);
+    Q4_EACH(Q4_ZERO)
+    /* whole blocks of 64 bytes, then the rest as one block of masked loads (zeros add nothing:
+       their offset activations meet zero weights) */
+    for (uint32_t k = 0; k < n; k += 64u) {
+        __mmask64 m = n - k >= 64u ? ~(__mmask64)0 : (((__mmask64)1 << (n - k)) - 1u);
+        Q4_EACH(Q4_X)
+        Q4_EACH(Q4_ROW)
+    }
+    const __m512i a[16] = {a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33};
+    /* lane 4 r + p: the sum of row r and vector p, less 128 times the sum of row r */
+    __m512i corr = _mm512_slli_epi32(_mm512_set_epi32(wsum[3], wsum[3], wsum[3], wsum[3], wsum[2], wsum[2], wsum[2],
+                                                      wsum[2], wsum[1], wsum[1], wsum[1], wsum[1], wsum[0], wsum[0],
+                                                      wsum[0], wsum[0]), 7);
+    _mm512_storeu_si512((void *)acc, _mm512_sub_epi32(reduce16_epi32(a), corr));
+}
+
+#undef Q4_EACH
+#undef Q4_ZERO
+#undef Q4_X
+#undef Q4_ROW
+#endif
+
+void spingalett_dot_i8_4x4(const int8_t *w, size_t w_stride, const int8_t *x, size_t x_stride, uint32_t n,
+                           const int32_t wsum[4], int32_t acc[16]) {
+#if defined(SPG_AVX512_VNNI)
+    dot_i8_4x4_vnni(w, w_stride, x, x_stride, n, wsum, acc);
+#else
+    uint32_t k = 0;
+    (void)wsum;
+#  if defined(SPG_AVX2)
+    /* two activation vectors at a time: four rows by two keep the registers of AVX2 */
+    uint32_t kk = 0;
+    for (int half = 0; half < 2; half++) {
+        const int8_t *x0 = x + (size_t)(2 * half) * x_stride, *x1 = x0 + x_stride;
+        __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+        kk = 0;
+        for (; kk + 32u <= n; kk += 32u) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(x0 + kk)), v1 = _mm256_loadu_si256((const __m256i *)(x1 + kk));
+            __m256i u0 = _mm256_sign_epi8(v0, v0), u1 = _mm256_sign_epi8(v1, v1);
+            __m256i w0 = _mm256_loadu_si256((const __m256i *)(w + kk));
+            __m256i w1 = _mm256_loadu_si256((const __m256i *)(w + w_stride + kk));
+            __m256i w2 = _mm256_loadu_si256((const __m256i *)(w + 2 * w_stride + kk));
+            __m256i w3 = _mm256_loadu_si256((const __m256i *)(w + 3 * w_stride + kk));
+            a0 = madd_i8(a0, u0, w0, v0); b0 = madd_i8(b0, u1, w0, v1);
+            a1 = madd_i8(a1, u0, w1, v0); b1 = madd_i8(b1, u1, w1, v1);
+            a2 = madd_i8(a2, u0, w2, v0); b2 = madd_i8(b2, u1, w2, v1);
+            a3 = madd_i8(a3, u0, w3, v0); b3 = madd_i8(b3, u1, w3, v1);
+        }
+        __m128i ta = reduce_rows4(a0, a1, a2, a3), tb = reduce_rows4(b0, b1, b2, b3);
+        if (kk + 16u <= n) {
+            __m128i v0 = _mm_loadu_si128((const __m128i *)(x0 + kk)), v1 = _mm_loadu_si128((const __m128i *)(x1 + kk));
+            __m128i z = _mm_setzero_si128(), c[4], d[4];
+            for (int r = 0; r < 4; r++) {
+                __m128i wr = _mm_loadu_si128((const __m128i *)(w + (size_t)r * w_stride + kk));
+                c[r] = madd_i8_128(z, wr, v0);
+                d[r] = madd_i8_128(z, wr, v1);
+            }
+            ta = _mm_add_epi32(ta, _mm_hadd_epi32(_mm_hadd_epi32(c[0], c[1]), _mm_hadd_epi32(c[2], c[3])));
+            tb = _mm_add_epi32(tb, _mm_hadd_epi32(_mm_hadd_epi32(d[0], d[1]), _mm_hadd_epi32(d[2], d[3])));
+            kk += 16u;
+        }
+        int32_t sa[4], sb[4];
+        _mm_storeu_si128((__m128i *)(void *)sa, ta);
+        _mm_storeu_si128((__m128i *)(void *)sb, tb);
+        for (int r = 0; r < 4; r++) { acc[4 * r + 2 * half] = sa[r]; acc[4 * r + 2 * half + 1] = sb[r]; }
+    }
+    k = kk;
+#  elif defined(SPG_NEON)
+    int32x4_t a[16];
+    for (int i = 0; i < 16; i++) a[i] = vdupq_n_s32(0);
+    for (; k + 16u <= n; k += 16u) {
+        int8x16_t xv[4];
+        for (int p = 0; p < 4; p++) xv[p] = vld1q_s8(x + (size_t)p * x_stride + k);
+        for (int r = 0; r < 4; r++) {
+            int8x16_t wr = vld1q_s8(w + (size_t)r * w_stride + k);
+            for (int p = 0; p < 4; p++) a[4 * r + p] = neon_dot_i8(a[4 * r + p], wr, xv[p]);
+        }
+    }
+    for (int i = 0; i < 16; i++) acc[i] = neon_hsum(a[i]);
+#  else
+    for (int p = 0; p < 4; p++) {
+        int32_t r4[4];
+        spingalett_dot_i8_rows4(w, w_stride, x + (size_t)p * x_stride, n, r4);
+        for (int r = 0; r < 4; r++) acc[4 * r + p] = r4[r];
+    }
+    k = n;
+#  endif
+    for (; k < n; k++)
+        for (int r = 0; r < 4; r++)
+            for (int p = 0; p < 4; p++)
+                acc[4 * r + p] += (int32_t)w[(size_t)r * w_stride + k] * (int32_t)x[(size_t)p * x_stride + k];
 #endif
 }
 
@@ -611,25 +798,6 @@ static void dot_packed_rows4(const uint8_t *w, size_t stride, const int8_t *x, u
 }
 
 #elif defined(SPG_NEON)
-
-static inline int32x4_t neon_dot_i8(int32x4_t acc, int8x16_t a, int8x16_t b) {
-#  if defined(__ARM_FEATURE_DOTPROD)
-    return vdotq_s32(acc, a, b);
-#  else
-    int16x8_t p = vmull_s8(vget_low_s8(a), vget_low_s8(b));
-    p = vmlal_s8(p, vget_high_s8(a), vget_high_s8(b));      /* two products stay in int16 */
-    return vpadalq_s16(acc, p);
-#  endif
-}
-
-static inline int32_t neon_hsum(int32x4_t v) {
-#  if defined(__aarch64__)
-    return vaddvq_s32(v);
-#  else
-    int32x2_t s2 = vadd_s32(vget_low_s32(v), vget_high_s32(v));
-    return vget_lane_s32(vpadd_s32(s2, s2), 0);
-#  endif
-}
 
 /* Codes of 16 bytes as signed bytes: INT4 nibbles (two's complement) by xor and subtract, INT2
    codes c as (c & 1) - (c & 2). */
@@ -1270,8 +1438,8 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
 /* Outputs j0 .. j0 + count - 1 of a weight layer: bias + the dot products of those weight rows with
    x (row_len values), in float; integer rows take x quantized instead (xq, with x_scale, and
    permuted with sum xsum for packed rows), the sums rescaled. */
-static void weight_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count, const float *x,
-                        const int8_t *xq, float x_scale, int32_t xsum, float *y) {
+SPG_REGISTER_SUMS static void weight_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count,
+                                           const float *x, const int8_t *xq, float x_scale, int32_t xsum, float *y) {
     const float *bias = (const float *)(const void *)(image + L->biases);
     const uint8_t *weights = image + L->weights;
     uint32_t n = L->row_len;
@@ -1565,6 +1733,42 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
                            L->pad_h == 0 && L->pad_w == 0;
     const uint32_t per_byte = L->precision == PRECISION_INT4 ? 2u : 4u;
     float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    if (L->precision == PRECISION_INT8) {
+        /* four pixels at a time (their windows fill the scratch of one float window), each filter
+           read once for the four; the integer sums are those of one pixel at a time */
+        const float *bias = (const float *)(const void *)(image + L->biases);
+        const float *scale = (const float *)(const void *)(image + L->scales);
+        const int8_t *weights = (const int8_t *)(image + L->weights);
+        const uint32_t pixels = L->out_h * L->out_w;
+        int8_t *windows = (int8_t *)window;
+        int32_t *wsum = (int32_t *)(void *)((uint8_t *)window + slett_align((uint64_t)K * 4u));
+        if (spingalett_dot_i8_4x4_sums && pixels >= 4u)
+            for (uint32_t j = 0; j < OC; j++) wsum[j] = spingalett_sum_i8(weights + (size_t)j * K, K);
+        for (uint32_t p0 = 0; p0 < pixels; p0 += 4u) {
+            uint32_t count = pixels - p0 < 4u ? pixels - p0 : 4u;
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t p = p0 + i;
+                if (pointwise) memcpy(windows + (size_t)i * K, xq + (size_t)p * L->in_c, K);
+                else spingalett_gather_window(xq, L, p / L->out_w, p % L->out_w, windows + (size_t)i * K, 1);
+            }
+            for (uint32_t j = 0; j < OC; j += 4u) {
+                uint32_t rows = OC - j < 4u ? OC - j : 4u;
+                const int8_t *block = weights + (size_t)j * K;
+                int32_t acc[16];
+                if (rows == 4u && count == 4u) {
+                    spingalett_dot_i8_4x4(block, K, windows, K, K, wsum + j, acc);
+                } else {
+                    for (uint32_t i = 0; i < count; i++)
+                        for (uint32_t r = 0; r < rows; r++)
+                            acc[4u * r + i] = spingalett_dot_i8(block + (size_t)r * K, windows + (size_t)i * K, K);
+                }
+                for (uint32_t i = 0; i < count; i++)
+                    for (uint32_t r = 0; r < rows; r++)
+                        y[(size_t)(p0 + i) * OC + j + r] = spingalett_int_output(bias[j + r], scale[j + r], x_scale, acc[4u * r + i]);
+            }
+        }
+        return;
+    }
     for (uint32_t oh = 0; oh < L->out_h; oh++)
         for (uint32_t ow = 0; ow < L->out_w; ow++) {
             size_t p = (size_t)oh * L->out_w + ow;
