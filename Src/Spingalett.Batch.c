@@ -360,7 +360,7 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
     while (want < count && want < SPINGALETT_BATCH_CHUNK) want *= 2;
     uint32_t capacity = spingalett_gpu_capacity(net, want, false);
     SpgGpuNet *gpu = atomic_exchange(&net->gpu_predict, NULL);
-    if (gpu && spingalett_gpu_net_capacity(gpu) >= capacity) {
+    if (gpu && spingalett_gpu_net_capacity(gpu) >= capacity && spingalett_gpu_net_current(gpu)) {
         if (spingalett_gpu_upload(gpu)) return gpu;     /* the parameters as they are now */
     }
     spingalett_gpu_net_free(gpu);

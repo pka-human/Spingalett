@@ -235,6 +235,9 @@ with tempfile.TemporaryDirectory() as d:
 check(sg.library_version() == sg.__version__, f"library {sg.library_version()} vs bindings {sg.__version__}")
 check(sg.cpu_kernels() in ("AVX-512", "AVX2", "AVX", "SSE2", "NEON", "C"), f"cpu kernels {sg.cpu_kernels()!r}")
 check(sg.gpu_device() is None or isinstance(sg.gpu_device(), str), f"gpu device {sg.gpu_device()!r}")
+sg.set_gpu_precision(sg.Precision.BFLOAT16)
+check(sg.get_gpu_precision() == sg.Precision.BFLOAT16, "gpu precision bfloat16")
+sg.set_gpu_precision(sg.Precision.FLOAT32)
 
 # the GPU (or, without one, the CPU it falls back to) trains and predicts as the CPU does
 gx = np.random.default_rng(3).normal(size=(64, 6)).astype(np.float32)

@@ -4327,6 +4327,51 @@ static void gpu_threads(void) {
 #endif
 }
 
+/* Products in bfloat16 on the matrix units (where the device has them): predictions within a few
+   per cent of single precision (8 bits of mantissa in the operands), training as far along (its
+   loss), and repeating bit for bit. */
+static void gpu_bf16(void) {
+    for (int which = 0; which <= 2; which++) {
+        NeuralNetwork *probe = gpu_net(which);
+        SpingalettNetworkLayer first, last;
+        spingalett_network_layer(probe, 0, &first);
+        spingalett_network_layer(probe, spingalett_layer_count(probe) - 1, &last);
+        const uint32_t n = 256, in_sz = first.outputs, out_sz = last.outputs;
+        float *x = (float *)malloc((size_t)n * in_sz * sizeof(float)), *t = (float *)calloc((size_t)n * out_sz, sizeof(float));
+        lcg_state = 31u + (unsigned)which;
+        for (size_t i = 0; i < (size_t)n * in_sz; i++) x[i] = frand() * 2.0f - 1.0f;
+        for (uint32_t s = 0; s < n; s++) t[s * out_sz + (uint32_t)(frand() * out_sz) % out_sz] = 1.0f;
+        float *p[2] = {(float *)malloc((size_t)n * out_sz * sizeof(float)), (float *)malloc((size_t)n * out_sz * sizeof(float))};
+        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        for (int k = 0; k < 2; k++) {
+            spingalett_set_gpu_precision(k ? PRECISION_BFLOAT16 : PRECISION_FLOAT32);
+            predict(.net = probe, .inputs = x, .outputs = p[k], .sample_count = n);
+        }
+        free_network(probe);
+        double predicted = 0.0;          /* the largest difference of a probability */
+        for (size_t i = 0; i < (size_t)n * out_sz; i++) predicted = fmax(predicted, fabs((double)p[0][i] - p[1][i]));
+        float *o[3], *w[3];
+        size_t count;
+        TrainReport r[3];
+        for (int k = 0; k < 3; k++) {
+            spingalett_set_gpu_precision(k == 0 ? PRECISION_FLOAT32 : PRECISION_BFLOAT16);
+            o[k] = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, OPTIMIZER_MOMENTUM, STRATEGY_SMALL_BATCH, 0.0f,
+                               &w[k], &count, &r[k]);
+        }
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        bool same = !memcmp(w[1], w[2], count * sizeof(float));
+        double loss = fabs((double)r[1].train_loss - r[0].train_loss) / fabs((double)r[0].train_loss);
+        CHECK(same, "gpu bf16 net %d: two runs differ", which);
+        CHECK(predicted < 0.05, "gpu bf16 net %d: predictions %.2e from single precision", which, predicted);
+        CHECK(loss < 0.05 && r[1].status == TRAIN_COMPLETED, "gpu bf16 net %d: training loss %g, single precision %g",
+              which, (double)r[1].train_loss, (double)r[0].train_loss);
+        printf("  gpu bf16 net %d: predictions %.1e from single precision, training loss %.1e, deterministic %s\n",
+               which, predicted, loss, same ? "yes" : "no");
+        for (int k = 0; k < 3; k++) { free(o[k]); free(w[k]); }
+        free(p[0]); free(p[1]); free(x); free(t);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "export-headers")) {
         spingalett_set_verbose(false);
@@ -4531,6 +4576,7 @@ int main(int argc, char **argv) {
             for (int k = 0; k < 6; k++) gpu_equivalence(k);
             gpu_training_options();
             gpu_threads();
+            gpu_bf16();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }

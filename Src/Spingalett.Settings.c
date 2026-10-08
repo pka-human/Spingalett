@@ -19,6 +19,7 @@
 #endif
 
 static _Atomic ComputeMode s_compute_mode = COMPUTE_SINGLE_THREADED;
+static _Atomic PrecisionMode s_gpu_precision = PRECISION_FLOAT32;
 static _Atomic unsigned s_num_threads = 0;
 
 static _Atomic LogLevel s_log_level = LOG_INFO;
@@ -175,4 +176,13 @@ bool spingalett_use_gpu(void) {
 
 const char *spingalett_gpu_device(void) {
     return spingalett_gpu_name();
+}
+
+void spingalett_set_gpu_precision(PrecisionMode precision) {
+    if (precision == PRECISION_FLOAT32 || precision == PRECISION_BFLOAT16)
+        atomic_store(&s_gpu_precision, precision);
+}
+
+PrecisionMode spingalett_get_gpu_precision(void) {
+    return atomic_load(&s_gpu_precision);
 }

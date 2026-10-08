@@ -390,6 +390,14 @@ SPINGALETT_API void spingalett_set_compute_mode(ComputeMode mode);
    addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
    SPINGALETT_GPU_DEVICE picks one by its index in the Vulkan device list. */
 SPINGALETT_API const char *spingalett_gpu_device(void);
+/* Precision of the GPU's matrix products: PRECISION_FLOAT32 (the default: single precision, as on
+   the CPU) or PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
+   multiplied on the GPU's matrix units with the products added in single precision: faster; the
+   rest of training, the parameters among it, stays in single precision). Devices without bfloat16
+   cooperative matrices keep single precision. Applies from the next train(), predict() or
+   evaluate() call; results stay deterministic. Other values are ignored. */
+SPINGALETT_API void spingalett_set_gpu_precision(PrecisionMode precision);
+SPINGALETT_API PrecisionMode spingalett_get_gpu_precision(void);
 SPINGALETT_API unsigned spingalett_get_num_threads(void);
 SPINGALETT_API void spingalett_set_num_threads(unsigned n);
 

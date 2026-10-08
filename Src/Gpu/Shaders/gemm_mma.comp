@@ -1,0 +1,122 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * C = A B on the GPU's matrix units (VK_KHR_cooperative_matrix): the operands of gemm.comp, read
+ * the same way, rounded to bfloat16 as they go to shared memory, multiplied 16 x 16 x 16 at a time
+ * with the products added in single precision. Each subgroup holds WM x WN accumulators of 16 x 16;
+ * the workgroup's subgroups tile its BM x BN outputs, and its results go through the epilogues of
+ * gemm.comp (gemm_common.glsl).
+ *
+ * An output's products are added 16 values of k at a time, in the order of k, whatever the tile:
+ * tiles change the speed only, as in gemm.comp.
+ */
+
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_bfloat16 : require
+#include "common.glsl"
+
+layout(constant_id = 0) const uint BM = 64;
+layout(constant_id = 1) const uint BN = 64;
+layout(constant_id = 2) const uint BK = 32;
+layout(constant_id = 3) const uint WM = 2;            /* accumulators of a subgroup, in m */
+layout(constant_id = 4) const uint WN = 2;            /* and in n */
+layout(constant_id = 5) const uint AMODE = 0;
+layout(constant_id = 6) const uint BMODE = 0;
+layout(constant_id = 7) const uint EPI = 0;
+layout(constant_id = 8) const uint ACT = 6;
+layout(constant_id = 9) const uint THREADS = 128;     /* subgroups x SG */
+layout(constant_id = 10) const uint PHASED = 0;
+layout(constant_id = 11) const uint VEC = 0;
+layout(constant_id = 12) const uint SG = 32;          /* the subgroup size */
+layout(local_size_x_id = 9) in;
+
+#include "gemm_common.glsl"
+
+const uint SGM = BM / (16u * WM);                     /* subgroups in m, in n */
+
+/* Shared tiles laid out along the axis the operand is read along, so that the values a thread
+   loads together go to consecutive addresses: A as rows of k (row-major) when it is read along k,
+   as rows of m (column-major) otherwise; B as rows of k (row-major) when read along n, as rows of n
+   (column-major) along k. Rows are padded by 8 values. */
+const uint SA = A_KFAST ? BK + 8u : BM + 8u, SB = B_KFAST ? BK + 8u : BN + 8u;
+const int LAYOUT_A = A_KFAST ? gl_CooperativeMatrixLayoutRowMajor : gl_CooperativeMatrixLayoutColumnMajor;
+const int LAYOUT_B = B_KFAST ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor;
+
+/* four values to an element: a vector load is converted and stored at once */
+shared bf16vec4 As[(A_KFAST ? BM : BK) * SA / 4u];
+shared bf16vec4 Bs[(B_KFAST ? BN : BK) * SB / 4u];
+shared float Cs[THREADS / SG * 256u];                 /* a subgroup's 16 x 16 results, for the epilogue */
+
+/* the index of value (k, m) of A, (k, n) of B */
+uint at_a(uint k, uint m) { return A_KFAST ? m * SA + k : k * SA + m; }
+uint at_b(uint k, uint n) { return B_KFAST ? n * SB + k : k * SB + n; }
+void put_a(uint k, uint m, float v) { uint i = at_a(k, m); As[i >> 2][i & 3u] = bfloat16_t(v); }
+void put_b(uint k, uint n, float v) { uint i = at_b(k, n); Bs[i >> 2][i & 3u] = bfloat16_t(v); }
+
+void store_tiles() {
+    /* a vector load runs along the shared rows, at an index that is a multiple of four */
+    for (uint i = 0; i < LA; i++) {
+        if (!a_live(i)) continue;
+        if (VA) As[at_a(a_k(i), a_row(i)) >> 2] = bf16vec4(fa[i]);
+        else put_a(a_k(i), a_row(i), fa[i].x);
+    }
+    for (uint i = 0; i < LB; i++) {
+        if (!b_live(i)) continue;
+        if (VB) Bs[at_b(b_k(i), b_col(i)) >> 2] = bf16vec4(fb[i]);
+        else put_b(b_k(i), b_col(i), fb[i].x);
+    }
+}
+
+void main() {
+    tid = gl_LocalInvocationID.x;
+    const uint z = gl_WorkGroupID.z, g = z / p.slices, s = z % p.slices;
+    m0 = gl_WorkGroupID.x * BM;
+    n0 = gl_WorkGroupID.y * BN;
+    const uint kbeg = s * p.slice_k;
+    kend = min(p.K, kbeg + p.slice_k);
+    aoff = g * p.a_group;
+    boff = g * p.b_group;
+    prepare(kbeg);
+
+    /* subgroup (sm, sn) computes rows sm 16 WM .. + 16 WM and columns sn 16 WN .. + 16 WN */
+    const uint sg = tid / SG, lane = tid % SG, sm = sg % SGM, sn = sg / SGM;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[WM * WN];
+    for (uint i = 0; i < WM * WN; i++) acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    if (kbeg < kend) fetch(kbeg);
+    for (uint k0 = kbeg; k0 < kend; k0 += BK) {
+        store_tiles();
+        barrier();
+        if (k0 + BK < kend) fetch(k0 + BK);
+        for (uint kk = 0; kk < BK; kk += 16u) {
+            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[WM];
+            coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[WN];
+            for (uint i = 0; i < WM; i++) coopMatLoad(a[i], As, at_a(kk, (sm * WM + i) * 16u) >> 2, SA / 4u, LAYOUT_A);
+            for (uint j = 0; j < WN; j++) coopMatLoad(b[j], Bs, at_b(kk, (sn * WN + j) * 16u) >> 2, SB / 4u, LAYOUT_B);
+            for (uint i = 0; i < WM; i++)
+                for (uint j = 0; j < WN; j++) acc[i * WN + j] = coopMatMulAdd(a[i], b[j], acc[i * WN + j]);
+        }
+        barrier();
+    }
+
+    /* each 16 x 16 accumulator through the subgroup's shared block to the epilogue */
+    const uint coff = g * p.c_group, block = sg * 256u;
+    for (uint i = 0; i < WM; i++)
+        for (uint j = 0; j < WN; j++) {
+            coopMatStore(acc[i * WN + j], Cs, block, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint e = lane; e < 256u; e += SG) {
+                uint m = m0 + (sm * WM + i) * 16u + e / 16u, n = n0 + (sn * WN + j) * 16u + e % 16u;
+                if (m < p.M && n < p.N) store_c(z, coff, m, c_row(m), n, Cs[block + e]);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+}

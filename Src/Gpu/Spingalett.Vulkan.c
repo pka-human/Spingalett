@@ -62,6 +62,7 @@ static PFN_vkVoidFunction loader_symbol(void *lib, const char *name) {
 #define VK_GLOBAL_FUNCTIONS(X) X(vkCreateInstance) X(vkEnumerateInstanceVersion)
 #define VK_INSTANCE_FUNCTIONS(X) \
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures2) \
+    X(vkGetPhysicalDeviceProperties2) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkEnumerateDeviceExtensionProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkDestroyInstance)
 #define VK_DEVICE_FUNCTIONS(X) \
@@ -73,6 +74,33 @@ static PFN_vkVoidFunction loader_symbol(void *lib, const char *name) {
     X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkResetFences) \
     X(vkWaitForFences) X(vkQueueSubmit) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) \
     X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+
+/* VK_KHR_cooperative_matrix and VK_KHR_shader_bfloat16, declared here for headers that predate them */
+typedef struct {
+    VkStructureType sType;
+    void *pNext;
+    VkBool32 cooperativeMatrix, cooperativeMatrixRobustBufferAccess;
+} CoopFeatures;
+typedef struct {
+    VkStructureType sType;
+    void *pNext;
+    VkBool32 type, dot_product, cooperative_matrix;
+} Bf16Features;
+typedef struct {
+    VkStructureType sType;
+    void *pNext;
+    uint32_t M, N, K;
+    int32_t a, b, c, result;
+    VkBool32 saturating;
+    int32_t scope;
+} CoopProperties;
+typedef VkResult (VKAPI_PTR *CoopPropertiesFn)(VkPhysicalDevice, uint32_t *, CoopProperties *);
+#define COOP_FEATURES_TYPE   ((VkStructureType)1000506000)
+#define COOP_PROPERTIES_TYPE ((VkStructureType)1000506001)
+#define BF16_FEATURES_TYPE   ((VkStructureType)1000141000)
+#define COMPONENT_FLOAT32    1
+#define COMPONENT_BFLOAT16   1000141000
+#define SCOPE_SUBGROUP       3
 
 #define DECLARE(name) static PFN_##name name;
 VK_GLOBAL_FUNCTIONS(DECLARE)
@@ -100,6 +128,8 @@ static struct {
     VkPhysicalDeviceMemoryProperties memory;
     uint64_t heap;
     uint32_t shared;
+    uint32_t subgroup;              /* the subgroup size */
+    bool mma_bf16;                  /* cooperative matrices of bfloat16, 16 x 16 x 16, sums in float */
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     VkPipelineLayout layout;
     VkShaderModule modules[SPG_KERNEL_COUNT];
@@ -230,16 +260,51 @@ static bool open_device(void) {
         if (!extensions || vkEnumerateDeviceExtensionProperties(gpu.physical, NULL, &extension_count, extensions) < 0)
             extension_count = 0;
     }
-    const char *device_extensions[1];
+    const char *device_extensions[3];
     uint32_t enabled = 0;
     if (has_extension(extensions, extension_count, "VK_KHR_portability_subset"))
         device_extensions[enabled++] = "VK_KHR_portability_subset";
+    /* the matrix units: bfloat16 cooperative matrices of 16 x 16 x 16 that add in float, in subgroups */
+    CoopFeatures coop = {.sType = COOP_FEATURES_TYPE};
+    Bf16Features bf16 = {.sType = BF16_FEATURES_TYPE};
+    if (has_extension(extensions, extension_count, "VK_KHR_cooperative_matrix") &&
+        has_extension(extensions, extension_count, "VK_KHR_shader_bfloat16")) {
+        coop.pNext = &bf16;
+        VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &coop};
+        vkGetPhysicalDeviceFeatures2(gpu.physical, &f);
+        CoopPropertiesFn properties = (CoopPropertiesFn)vkGetInstanceProcAddr(gpu.instance,
+                                                                              "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        uint32_t count = 0;
+        if (coop.cooperativeMatrix && bf16.type && bf16.cooperative_matrix && properties &&
+            properties(gpu.physical, &count, NULL) == VK_SUCCESS && count > 0) {
+            CoopProperties *list = (CoopProperties *)calloc(count, sizeof *list);
+            for (uint32_t k = 0; list && k < count; k++) list[k].sType = COOP_PROPERTIES_TYPE;
+            if (list && properties(gpu.physical, &count, list) >= 0)
+                for (uint32_t k = 0; k < count; k++)
+                    if (list[k].M == 16 && list[k].N == 16 && list[k].K == 16 && list[k].a == COMPONENT_BFLOAT16 &&
+                        list[k].b == COMPONENT_BFLOAT16 && list[k].c == COMPONENT_FLOAT32 &&
+                        list[k].result == COMPONENT_FLOAT32 && list[k].scope == SCOPE_SUBGROUP)
+                        gpu.mma_bf16 = true;
+            free(list);
+        }
+    }
+    if (gpu.mma_bf16) {
+        device_extensions[enabled++] = "VK_KHR_cooperative_matrix";
+        device_extensions[enabled++] = "VK_KHR_shader_bfloat16";
+        coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+        bf16.dot_product = VK_FALSE;
+    }
     free(extensions);
+    VkPhysicalDeviceSubgroupProperties subgroup = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroup};
+    vkGetPhysicalDeviceProperties2(gpu.physical, &props2);
+    gpu.subgroup = subgroup.subgroupSize ? subgroup.subgroupSize : 32u;
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gpu.family, 1, &priority};
     VkPhysicalDeviceVulkan12Features enable12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                                                 .bufferDeviceAddress = VK_TRUE};
+                                                 .bufferDeviceAddress = VK_TRUE,
+                                                 .pNext = gpu.mma_bf16 ? (void *)&coop : NULL};
     VkPhysicalDeviceFeatures2 enable = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &enable12};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable, 0, 1, &qci, 0, NULL, enabled,
                               device_extensions, NULL};
@@ -284,6 +349,14 @@ uint64_t spg_gpu_memory(void) {
 
 uint32_t spg_gpu_shared_memory(void) {
     return spg_gpu_open() ? gpu.shared : 0;
+}
+
+uint32_t spg_gpu_subgroup_size(void) {
+    return spg_gpu_open() ? gpu.subgroup : 32u;
+}
+
+bool spg_gpu_mma_bf16(void) {
+    return spg_gpu_open() && gpu.mma_bf16;
 }
 
 /* The pipeline of a kernel with these specialization constants, made on first use. */
@@ -463,7 +536,7 @@ void spg_gpu_dispatch(SpgGpuCommands *c, SpgKernel kernel, const uint32_t *spec,
         /* the kernel and its modes: for gemm the operand modes and tile, for the others the first constants */
         char *label = c->labels[c->timed];
         int len = snprintf(label, 48, "%s", spg_kernel_names[kernel]);
-        if (kernel == SPG_KERNEL_gemm && spec_count >= 8)
+        if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 8)
             snprintf(label + len, 48u - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7], spec[0], spec[1]);
         else
             for (uint32_t k = 0; k < spec_count && k < 2 && len < 40; k++)

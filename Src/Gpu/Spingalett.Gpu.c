@@ -48,6 +48,7 @@ struct SpgGpuNet {
     NeuralNetwork *net;
     uint32_t capacity, layers;
     bool training;
+    bool bf16;                      /* matrix products in bfloat16 on the matrix units */
     SpgGpuTraining cfg;
 
     /* parameters: weight layer l's weights at woff[l] of the Wp weight floats, its biases (and
@@ -145,6 +146,10 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
 
 uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) {
     return g->capacity;
+}
+
+bool spingalett_gpu_net_current(const SpgGpuNet *g) {
+    return g->bf16 == (spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16());
 }
 
 /* ------------------------------------------------------------------------- transfers */
@@ -330,6 +335,7 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
     g->capacity = capacity;
     g->layers = L;
     g->training = training != NULL;
+    g->bf16 = spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16();
     if (training) g->cfg = *training;
     g->act = (SpgGpuBuffer *)calloc(L, sizeof(SpgGpuBuffer));
     g->delta = (SpgGpuBuffer *)calloc(L, sizeof(SpgGpuBuffer));
@@ -545,7 +551,7 @@ static void conv_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint
         .a_group = CG, .b_group = OG * K, .c_group = OG, .alpha = 1.0f, .flags = SPG_GEMM_BIAS,
     };
     SpgGemmMode m = {SPG_A_CONV, SPG_B_COL, SPG_EPI_BIAS_ACT, act, G, false, CG % 4u == 0 && in->channels % 4u == 0,
-                     true, 0, (uint64_t)n * net->topology[l]};
+                     true, 0, (uint64_t)n * net->topology[l], g->bf16};
     Access a = {0};
     reads(&a, whole(&g->act[src]));
     reads(&a, weights_of(g, l - 1));
@@ -562,7 +568,7 @@ static void dense_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uin
         .a = g->act[src].address, .b = weights_at(g, l - 1), .c = g->act[l].address, .e0 = biases_at(g, l - 1),
         .M = n, .N = N, .K = K, .lda = K, .ldb = K, .ldc = N, .alpha = 1.0f, .flags = SPG_GEMM_BIAS,
     };
-    SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, act, 1, false, true, true, 0, (uint64_t)n * N};
+    SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, act, 1, false, true, true, 0, (uint64_t)n * N, g->bf16};
     Access a = {0};
     reads(&a, whole(&g->act[src]));
     reads(&a, weights_of(g, l - 1));
@@ -759,7 +765,7 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
                 .beta = accumulate ? 1.0f : 0.0f,
             };
             SpgGemmMode m = {SPG_A_ROW, SPG_B_ROW, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused, 1, false, true, true, 0,
-                             (uint64_t)n * cur};
+                             (uint64_t)n * cur, g->bf16};
             reads(&a, weights_of(g, cl - 1));
             product(r, &a, &p, &m);
             return derive;
@@ -790,7 +796,7 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
                 };
                 SpgGemmMode m = {SPG_A_CONV, SPG_B_ROW, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused, G,
                                  info->phases > 1, OG % 4u == 0 && s->channels % 4u == 0, true, 0,
-                                 (uint64_t)n * net->topology[i]};
+                                 (uint64_t)n * net->topology[i], g->bf16};
                 product(r, &a, &p, &m);
             }
             return derive;
@@ -876,7 +882,7 @@ static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, f
     const uint32_t src = spingalett_source(net, l + 1), out_sz = net->topology[l + 1];
     const LayerShape *s = &net->shapes[l + 1], *in = &net->shapes[src];
     SpgGemmPush p = {.c = grad_weights_at(g, l), .alpha = scale, .beta = beta};
-    SpgGemmMode m = {SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, 1, false, true, true, 0, 0};
+    SpgGemmMode m = {SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, 1, false, true, true, 0, 0, g->bf16};
     uint32_t rows, M, N, K;
     Access a = {0};
     reads(&a, whole(&g->delta[l + 1]));

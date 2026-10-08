@@ -34,6 +34,8 @@ typedef struct {
     uint32_t tile;                  /* 1 + an index of the tile table to use it (tests), 0: chosen */
     uint64_t c_floats;              /* floats from c that the product may write: with them, the tile
                                        is chosen by timing the candidates on a scratch copy of C */
+    bool bf16;                      /* operands rounded to bfloat16 on the matrix units (when the device
+                                       has them; single precision otherwise) */
 } SpgGemmMode;
 
 /* Records C = A B (gemm.comp) with the tile that suits M, N and the workgroups in z (no barrier). */
@@ -45,9 +47,10 @@ uint64_t spg_gemm_workgroups(uint32_t M, uint32_t N, uint32_t z);
    SPG_SPLIT_FLOATS. */
 #define SPG_SPLIT_FLOATS (1u << 22)
 uint32_t spg_gemm_split(uint32_t M, uint32_t N, uint32_t K, uint32_t G, uint32_t *slice_k);
-/* The tiles: their number, and rows x columns x k-step and rows x columns per thread of one. */
-uint32_t spg_gemm_tiles(void);
-void spg_gemm_tile(uint32_t index, uint32_t *bm, uint32_t *bn, uint32_t *bk, uint32_t *tm, uint32_t *tn);
+/* The tiles of gemm.comp, or of gemm_mma.comp with mma: their number, and rows x columns x k-step
+   and rows x columns per thread (gemm_mma.comp: accumulators per subgroup) of one. */
+uint32_t spg_gemm_tiles(bool mma);
+void spg_gemm_tile(bool mma, uint32_t index, uint32_t *bm, uint32_t *bn, uint32_t *bk, uint32_t *tm, uint32_t *tn);
 
 /* A monotonic clock, in seconds. */
 double spg_seconds(void);

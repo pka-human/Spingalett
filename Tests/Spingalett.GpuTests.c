@@ -9,9 +9,11 @@
  * weight gradients, with every tile and with and without vector loads. Without a usable Vulkan device
  * the tests are skipped (exit code 77).
  *
- *   SpingalettGpuTests            the tests, with the tile chosen and a third of the others
+ *   SpingalettGpuTests            the tests, with the tile chosen and a third of the others, in single
+ *                                 precision and (with matrix units) in bfloat16 on them
  *   SpingalettGpuTests all        with every tile
  *   SpingalettGpuTests bench      times every tile on the products of ResNet-20 at 128 samples
+ *   SpingalettGpuTests bench bf16 the same on the matrix units
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -22,6 +24,23 @@
 
 static int failures;
 static uint32_t tile_step = 3;      /* every tile_step-th tile is tried */
+static bool mma;                    /* the products in bfloat16 on the matrix units (gemm_mma.comp) */
+
+/* x rounded to bfloat16, to the nearest (ties to even), as the matrix kernel converts its operands */
+static float bf16(float x) {
+    uint32_t u;
+    memcpy(&u, &x, 4);
+    if ((u & 0x7F800000u) != 0x7F800000u) u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+    memcpy(&x, &u, 4);
+    return x;
+}
+
+/* The operands as the kernel sees them: rounded to bfloat16 on the matrix units. */
+static float *operands(const float *x, size_t n) {
+    float *r = (float *)malloc(n * sizeof(float));
+    for (size_t i = 0; i < n; i++) r[i] = mma ? bf16(x[i]) : x[i];
+    return r;
+}
 
 static double seconds(void) {
     return spg_seconds();
@@ -158,7 +177,7 @@ static uint32_t conv_push(const Conv *v, const ConvBuffers *b, int pass, uint32_
                              .M = v->n * OH * OW, .N = OG, .K = K, .ldb = K, .ldc = v->out, .a_group = CG,
                              .b_group = OG * K, .c_group = OG, .alpha = 1.0f};
         m[0] = (SpgGemmMode){SPG_A_CONV, SPG_B_COL, SPG_EPI_STORE, 6, G, false, vec && CG % 4 == 0 && v->c % 4 == 0,
-                             vec, 0, timed ? ny : 0};
+                             vec, 0, timed ? ny : 0, mma};
         return 1;
     }
     if (pass == 1) {
@@ -169,7 +188,7 @@ static uint32_t conv_push(const Conv *v, const ConvBuffers *b, int pass, uint32_
                                   .K = b->info.phase[ph].taps * OG, .ldb = CG, .ldc = v->c, .a_group = OG,
                                   .b_group = taps * OG * CG, .c_group = CG, .alpha = 1.0f};
             m[ph] = (SpgGemmMode){SPG_A_CONV, SPG_B_ROW, SPG_EPI_STORE, 6, G, b->info.phases > 1,
-                                  vec && OG % 4 == 0 && v->out % 4 == 0, vec, 0, timed ? nx : 0};
+                                  vec && OG % 4 == 0 && v->out % 4 == 0, vec, 0, timed ? nx : 0, mma};
         }
         return b->info.phases;
     }
@@ -179,7 +198,7 @@ static uint32_t conv_push(const Conv *v, const ConvBuffers *b, int pass, uint32_
                          .a_group = OG, .b_group = CG, .c_group = OG * K, .alpha = 1.0f,
                          .slices = (pixels + slice_k - 1) / slice_k, .slice_k = slice_k};
     m[0] = (SpgGemmMode){SPG_A_COL, SPG_B_CONV, p[0].slices > 1 ? SPG_EPI_PARTIAL : SPG_EPI_STORE, 6, G, false, vec,
-                         vec && CG % 4 == 0 && v->c % 4 == 0, 0, timed ? (uint64_t)v->out * K : 0};
+                         vec && CG % 4 == 0 && v->c % 4 == 0, 0, timed ? (uint64_t)v->out * K : 0, mma};
     return 1;
 }
 
@@ -227,7 +246,9 @@ static void test_conv(const Conv *v) {
     for (size_t i = 0; i < nx; i++) x[i] = uniform();
     for (size_t i = 0; i < nw; i++) w[i] = uniform();
     for (size_t i = 0; i < ny; i++) dy[i] = uniform();
-    reference(v, x, w, dy, y, dx, dw);
+    float *rx = operands(x, nx), *rw = operands(w, nw), *rdy = operands(dy, ny);
+    reference(v, rx, rw, rdy, y, dx, dw);
+    free(rx); free(rw); free(rdy);
     ConvBuffers b = {0};
     if (!conv_setup(v, &b, x, w, dy)) {
         printf("  conv setup failed\n");
@@ -238,7 +259,7 @@ static void test_conv(const Conv *v) {
     float *first[4] = {malloc(ny * 4), malloc(nx * 4), malloc(nw * 4), malloc(nw * 4)};
     bool seen[4] = {false, false, false, false}, same = true;
     double worst[3] = {0, 0, 0};
-    for (uint32_t tile = 0; tile <= spg_gemm_tiles(); tile += tile ? tile_step : 1)
+    for (uint32_t tile = 0; tile <= spg_gemm_tiles(mma); tile += tile ? tile_step : 1)
         for (int vec = 0; vec < 2; vec++)
             for (int pass = 0; pass < 3; pass++) {
                 uint32_t slices = pass == 2 ? (tile % 3 == 0 ? 1u : 3u) : 1u;
@@ -272,8 +293,8 @@ static void test_conv(const Conv *v) {
     bool ok = worst[0] < 1e-5 && worst[1] < 1e-5 && worst[2] < 1e-5 && same;
     if (!same) printf("  tiles differ in their results\n");
     failures += !ok;
-    printf("  conv %ux%ux%u -> %u, %ux%u window, stride %ux%u, padding %ux%u, %u groups: forward %.1e, data %.1e, "
-           "weights %.1e  %s\n", v->h, v->w, v->c, v->out, v->kh, v->kw, v->sh, v->sw, v->ph, v->pw, v->groups, worst[0],
+    printf("  %sconv %ux%ux%u -> %u, %ux%u window, stride %ux%u, padding %ux%u, %u groups: forward %.1e, data %.1e, "
+           "weights %.1e  %s\n", mma ? "bf16 " : "", v->h, v->w, v->c, v->out, v->kh, v->kw, v->sh, v->sw, v->ph, v->pw, v->groups, worst[0],
            worst[1], worst[2], ok ? "ok" : "FAILED");
     conv_free(&b);
     free(x); free(w); free(dy); free(got); free(y); free(dx); free(dw);
@@ -288,53 +309,55 @@ static void test_dense(uint32_t n, uint32_t in, uint32_t out) {
     for (size_t i = 0; i < (size_t)n * in; i++) x[i] = uniform();
     for (size_t i = 0; i < (size_t)out * in; i++) w[i] = uniform();
     for (size_t i = 0; i < (size_t)n * out; i++) d[i] = uniform();
+    float *xr = operands(x, (size_t)n * in), *wr = operands(w, (size_t)out * in), *dr = operands(d, (size_t)n * out);
     for (uint32_t s = 0; s < n; s++)
         for (uint32_t j = 0; j < out; j++) {
             double acc = 0;
-            for (uint32_t i = 0; i < in; i++) acc += (double)x[(size_t)s * in + i] * w[(size_t)j * in + i];
+            for (uint32_t i = 0; i < in; i++) acc += (double)xr[(size_t)s * in + i] * wr[(size_t)j * in + i];
             y[(size_t)s * out + j] = acc;
         }
     for (uint32_t s = 0; s < n; s++)
         for (uint32_t i = 0; i < in; i++) {
             double acc = 0;
-            for (uint32_t j = 0; j < out; j++) acc += (double)d[(size_t)s * out + j] * w[(size_t)j * in + i];
+            for (uint32_t j = 0; j < out; j++) acc += (double)dr[(size_t)s * out + j] * wr[(size_t)j * in + i];
             dx[(size_t)s * in + i] = acc;
         }
     for (uint32_t j = 0; j < out; j++)
         for (uint32_t i = 0; i < in; i++) {
             double acc = 0;
-            for (uint32_t s = 0; s < n; s++) acc += (double)d[(size_t)s * out + j] * x[(size_t)s * in + i];
+            for (uint32_t s = 0; s < n; s++) acc += (double)dr[(size_t)s * out + j] * xr[(size_t)s * in + i];
             dw[(size_t)j * in + i] = acc;
         }
+    free(xr); free(wr); free(dr);
     SpgGpuBuffer bx, bw, bd, by, bdx, bdw;
     bool ok = upload(&bx, x, (size_t)n * in * 4) && upload(&bw, w, (size_t)out * in * 4) &&
               upload(&bd, d, (size_t)n * out * 4) && spg_gpu_buffer_create(&by, (size_t)n * out * 4, false) &&
               spg_gpu_buffer_create(&bdx, (size_t)n * in * 4, false) && spg_gpu_buffer_create(&bdw, (size_t)out * in * 4, false);
     double worst[3] = {0, 0, 0};
-    for (uint32_t tile = 0; ok && tile <= spg_gemm_tiles(); tile += tile ? tile_step : 1)
+    for (uint32_t tile = 0; ok && tile <= spg_gemm_tiles(mma); tile += tile ? tile_step : 1)
         for (int vec = 0; vec < 2; vec++) {
             SpgGemmPush p = {.a = bx.address, .b = bw.address, .c = by.address, .M = n, .N = out, .K = in, .lda = in,
                              .ldb = in, .ldc = out, .alpha = 1.0f};
-            SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0};
+            SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0, mma};
             run(&p, &m, 1);
             download(got, &by, (size_t)n * out * 4);
             worst[0] = fmax(worst[0], compare(got, y, (size_t)n * out));
             p = (SpgGemmPush){.a = bd.address, .b = bw.address, .c = bdx.address, .M = n, .N = in, .K = out,
                               .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
-            m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0};
+            m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0, mma};
             run(&p, &m, 1);
             download(got, &bdx, (size_t)n * in * 4);
             worst[1] = fmax(worst[1], compare(got, dx, (size_t)n * in));
             p = (SpgGemmPush){.a = bd.address, .b = bx.address, .c = bdw.address, .M = out, .N = in, .K = n,
                               .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
-            m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0};
+            m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0, mma};
             run(&p, &m, 1);
             download(got, &bdw, (size_t)out * in * 4);
             worst[2] = fmax(worst[2], compare(got, dw, (size_t)out * in));
         }
     bool good = ok && worst[0] < 1e-5 && worst[1] < 1e-5 && worst[2] < 1e-5;
     failures += !good;
-    printf("  dense %u x %u -> %u: forward %.1e, data %.1e, weights %.1e  %s\n", n, in, out, worst[0], worst[1],
+    printf("  %sdense %u x %u -> %u: forward %.1e, data %.1e, weights %.1e  %s\n", mma ? "bf16 " : "", n, in, out, worst[0], worst[1],
            worst[2], good ? "ok" : "FAILED");
     SpgGpuBuffer *all[] = {&bx, &bw, &bd, &by, &bdx, &bdw};
     for (size_t k = 0; k < 6; k++) spg_gpu_buffer_free(all[k]);
@@ -367,7 +390,7 @@ static void bench(void) {
         for (int pass = 0; pass < 3; pass++) {
             double best = 1e9, chosen = 0;
             uint32_t best_tile = 0;
-            for (uint32_t tile = 0; tile <= spg_gemm_tiles(); tile++) {
+            for (uint32_t tile = 0; tile <= spg_gemm_tiles(mma); tile++) {
                 SpgGemmPush p[SPG_MAX_PHASES];
                 SpgGemmMode m[SPG_MAX_PHASES];
                 uint32_t slices = 1, slice_k;
@@ -382,7 +405,7 @@ static void bench(void) {
                 else if (t > 0 && t < best) { best = t; best_tile = tile; }
             }
             uint32_t bm, bn, bk, tm, tn;
-            spg_gemm_tile(best_tile - 1, &bm, &bn, &bk, &tm, &tn);
+            spg_gemm_tile(mma, best_tile - 1, &bm, &bn, &bk, &tm, &tn);
             printf("  %-8s chosen %7.1f us %5.2f TFLOPS   best %7.1f us %5.2f TFLOPS (%ux%u k%u, %ux%u a thread)\n",
                    names[pass], chosen * 1e6, flops / chosen * 1e-12, best * 1e6, flops / best * 1e-12, bm, bn, bk, tm,
                    tn);
@@ -407,24 +430,24 @@ static void bench(void) {
         for (int pass = 0; pass < 3; pass++) {
             double best = 1e9, chosen = 0;
             uint32_t best_tile = 0;
-            for (uint32_t tile = 0; tile <= spg_gemm_tiles(); tile++) {
+            for (uint32_t tile = 0; tile <= spg_gemm_tiles(mma); tile++) {
                 SpgGemmPush p;
                 SpgGemmMode m;
                 if (pass == 0) {
                     p = (SpgGemmPush){.a = bx.address, .b = bw.address, .c = by.address, .M = n, .N = out, .K = in,
                                       .lda = in, .ldb = in, .ldc = out, .alpha = 1.0f};
                     m = (SpgGemmMode){SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, 6, 1, false, true, true, tile,
-                                      (uint64_t)n * out};
+                                      (uint64_t)n * out, mma};
                 } else if (pass == 1) {
                     p = (SpgGemmPush){.a = bd.address, .b = bw.address, .c = by.address, .M = n, .N = in, .K = out,
                                       .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
                     m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, true, true, tile,
-                                      (uint64_t)n * in};
+                                      (uint64_t)n * in, mma};
                 } else {
                     p = (SpgGemmPush){.a = bd.address, .b = bx.address, .c = by.address, .M = out, .N = in, .K = n,
                                       .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
                     m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, true, true, tile,
-                                      (uint64_t)out * in};
+                                      (uint64_t)out * in, mma};
                 }
                 run(&p, &m, 2);
                 double t = run(&p, &m, 20);
@@ -432,7 +455,7 @@ static void bench(void) {
                 else if (t > 0 && t < best) { best = t; best_tile = tile; }
             }
             uint32_t bm, bn, bk, tm, tn;
-            spg_gemm_tile(best_tile - 1, &bm, &bn, &bk, &tm, &tn);
+            spg_gemm_tile(mma, best_tile - 1, &bm, &bn, &bk, &tm, &tn);
             printf("  %-8s chosen %7.1f us %5.2f TFLOPS   best %7.1f us %5.2f TFLOPS (%ux%u k%u, %ux%u a thread)\n",
                    names[pass], chosen * 1e6, flops / chosen * 1e-12, best * 1e6, flops / best * 1e-12, bm, bn, bk, tm,
                    tn);
@@ -449,7 +472,9 @@ int main(int argc, char **argv) {
         return 77;
     }
     printf("device: %s\n", spg_gpu_device_name());
+    printf("matrix units: %s\n", spg_gpu_mma_bf16() ? "bfloat16 cooperative matrices" : "none");
     if (argc > 1 && !strcmp(argv[1], "bench")) {
+        mma = argc > 2 && !strcmp(argv[2], "bf16") && spg_gpu_mma_bf16();
         bench();
         return 0;
     }
@@ -460,10 +485,13 @@ int main(int argc, char **argv) {
         {2, 7, 7, 6, 6, 3, 3, 1, 1, 1, 1, 6}, {1, 10, 9, 32, 16, 1, 1, 2, 2, 0, 0, 1},
         {4, 6, 6, 16, 24, 5, 5, 1, 1, 2, 2, 4}, {2, 12, 12, 12, 8, 3, 3, 3, 2, 1, 0, 1},
     };
-    for (size_t k = 0; k < sizeof convs / sizeof convs[0]; k++) test_conv(&convs[k]);
-    test_dense(37, 50, 21);
-    test_dense(64, 784, 128);
-    test_dense(5, 3, 7);
+    for (int pass = 0; pass < (spg_gpu_mma_bf16() ? 2 : 1); pass++) {
+        mma = pass == 1;
+        for (size_t k = 0; k < sizeof convs / sizeof convs[0]; k++) test_conv(&convs[k]);
+        test_dense(37, 50, 21);
+        test_dense(64, 784, 128);
+        test_dense(5, 3, 7);
+    }
     printf(failures ? "%d FAILED\n" : "ALL PASSED\n", failures);
     return failures != 0;
 }
