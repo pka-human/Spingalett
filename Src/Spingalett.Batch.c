@@ -8,6 +8,7 @@
    Layers run in index order, which puts every layer after the layers it reads. */
 
 #include "Spingalett.Private.h"
+#include "Spingalett.Gpu.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -286,6 +287,20 @@ bool predict_struct_arguments(PredictArgs args) {
     if (args.sample_count == 0)
         return true;
 
+    SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
+    if (gpu) {
+        const uint32_t cap = spingalett_gpu_net_capacity(gpu), in_sz = net->topology[0];
+        const uint32_t out_sz = net->topology[net->layers - 1];
+        bool ok = true;
+        for (uint32_t start = 0; ok && start < args.sample_count; start += cap) {
+            uint32_t n = args.sample_count - start < cap ? args.sample_count - start : cap;
+            ok = spingalett_gpu_predict(gpu, args.inputs + (size_t)start * in_sz, args.outputs + (size_t)start * out_sz, n);
+        }
+        spingalett_gpu_net_free(gpu);
+        if (ok) return true;
+        spingalett_log(LOG_WARNING, "predict: the GPU failed; predicting on the CPU");
+    }
+
     ComputeMode mode = resolve_compute_mode();
     uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
@@ -339,6 +354,40 @@ void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *ou
     *correct = hits;
 }
 
+SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
+    const char *why = NULL;
+    if (!spingalett_use_gpu()) return NULL;
+    if (!spingalett_gpu_supports(net, &why)) {
+        spingalett_log(LOG_WARNING, "The GPU cannot run this network (%s); running it on the CPU", why);
+        return NULL;
+    }
+    uint32_t capacity = spingalett_gpu_capacity(net, count, false);
+    SpgGpuNet *gpu = capacity ? spingalett_gpu_net_create(net, capacity, NULL) : NULL;
+    if (!gpu) spingalett_log(LOG_WARNING, "Not enough GPU memory for the network; running it on the CPU");
+    return gpu;
+}
+
+bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, float *out_buf, const float *inputs,
+                             const float *targets, uint32_t n, double *loss_sum, uint32_t *correct) {
+    const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
+    const uint32_t cap = spingalett_gpu_net_capacity(gpu);
+    const ActivationFunction out_act = net->act_func[net->layers - 2];
+    double loss = 0.0;
+    uint32_t hits = 0;
+    for (uint32_t start = 0; start < n; start += cap) {
+        uint32_t count = n - start < cap ? n - start : cap;
+        if (!spingalett_gpu_predict(gpu, inputs + (size_t)start * in_sz, out_buf, count)) return false;
+        for (uint32_t s = 0; s < count; s++) {
+            const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * out_sz;
+            loss += compute_sample_loss(o, t, out_sz, net->loss_func, out_act);
+            hits += spingalett_sample_correct(o, t, out_sz);
+        }
+    }
+    *loss_sum = loss;
+    *correct = hits;
+    return true;
+}
+
 EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
     EvalMetrics m = {NAN, NAN};
     NeuralNetwork *net = args.net;
@@ -352,6 +401,24 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
     }
     if (!spingalett_check_graph(net, "evaluate"))
         return m;
+
+    SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
+    if (gpu) {
+        float *buf = (float *)spingalett_aligned_alloc((size_t)spingalett_gpu_net_capacity(gpu) *
+                                                       net->topology[net->layers - 1] * sizeof(float));
+        double loss;
+        uint32_t correct;
+        bool ok = buf && spingalett_gpu_evaluate(gpu, net, buf, args.inputs, args.targets, args.sample_count, &loss,
+                                                 &correct);
+        spingalett_aligned_free(buf);
+        spingalett_gpu_net_free(gpu);
+        if (ok) {
+            m.loss = (float)(loss / args.sample_count);
+            m.accuracy = (float)correct / (float)args.sample_count;
+            return m;
+        }
+        spingalett_log(LOG_WARNING, "evaluate: the GPU failed; evaluating on the CPU");
+    }
 
     ComputeMode mode = resolve_compute_mode();
     uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);

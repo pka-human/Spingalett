@@ -20,11 +20,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopenblas-dev libomp-dev python3-numpy libsdl2-dev
+          # glslc and the Vulkan headers build the GPU backend; Mesa's lavapipe (a Vulkan device on
+          # the CPU) runs its tests
+          sudo apt-get install -y libopenblas-dev libomp-dev python3-numpy libsdl2-dev \
+            glslc libvulkan-dev mesa-vulkan-drivers
 
       - name: Configure
         run: |
-          extra="-DBUILD_APPS=ON"
+          extra="-DBUILD_APPS=ON -DSPINGALETT_VULKAN=ON"
           if [ "${{ matrix.config }}" = full ]; then
             extra="$extra -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
           elif [ "${{ matrix.config }}" = generic ]; then

@@ -59,7 +59,9 @@ typedef enum {
     COMPUTE_SINGLE_THREADED,
     COMPUTE_OPENMP,
     COMPUTE_OPENBLAS,
-    COMPUTE_CUDA,
+    COMPUTE_CUDA,                   /* reserved: falls back to the CPU */
+    COMPUTE_VULKAN,                 /* the GPU through Vulkan compute (spingalett_gpu_device()); the CPU
+                                       parts of training run as with COMPUTE_OPENMP */
     COMPUTE_COUNT
 } ComputeMode;
 
@@ -383,6 +385,11 @@ SPINGALETT_API const char *spingalett_cpu_kernels(void);
 
 SPINGALETT_API ComputeMode spingalett_get_compute_mode(void);
 SPINGALETT_API void spingalett_set_compute_mode(ComputeMode mode);
+/* The name of the GPU that COMPUTE_VULKAN uses (opening the device on first call), or NULL when the
+   library was built without the Vulkan backend or no device is usable: Vulkan 1.2 with buffer device
+   addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
+   SPINGALETT_GPU_DEVICE picks one by its index in the Vulkan device list. */
+SPINGALETT_API const char *spingalett_gpu_device(void);
 SPINGALETT_API unsigned spingalett_get_num_threads(void);
 SPINGALETT_API void spingalett_set_num_threads(unsigned n);
 

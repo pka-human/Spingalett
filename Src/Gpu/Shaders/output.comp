@@ -1,0 +1,77 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * The output layer, one thread per sample (rows of n outputs):
+ *
+ *   SOFTMAX   y = softmax(y), as apply_softmax() computes it
+ *   LOSS      loss[s] = the sample's loss (compute_sample_loss()) and delta = dL/dz of the output
+ *             layer (output_delta() in Spingalett.Training.c), from targets t
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint ACT = 6;     /* the output layer's activation */
+layout(constant_id = 2) const uint LOSS = 0;    /* LossFunction */
+layout(local_size_x = 64) in;
+
+#define SOFTMAX 0u
+#define LOSS_OP 1u
+
+#define LOSS_MSE 0u
+#define LOSS_CROSS_ENTROPY 1u
+
+layout(push_constant) uniform Push {
+    F32 y, t, delta, loss;
+    uint rows, n;
+} p;
+
+void main() {
+    const uint s = gl_GlobalInvocationID.x;
+    if (s >= p.rows) return;
+    const uint base = s * p.n, n = p.n;
+    if (OP == SOFTMAX) {
+        float top = -3.402823466e38;
+        for (uint k = 0; k < n; k++) top = max(top, p.y.v[base + k]);
+        float sum = 0.0;
+        for (uint k = 0; k < n; k++) {
+            float e = exp(p.y.v[base + k] - top);
+            p.y.v[base + k] = e;
+            sum += e;
+        }
+        if (sum > 0.0) {
+            float inv = 1.0 / sum;
+            for (uint k = 0; k < n; k++) p.y.v[base + k] *= inv;
+        }
+        return;
+    }
+
+    const float eps = 1e-9;
+    float loss = 0.0, dot = 0.0;
+    for (uint k = 0; k < n; k++) {
+        float o = p.y.v[base + k], t = p.t.v[base + k];
+        if (LOSS == LOSS_MSE) {
+            float d = o - t;
+            loss += d * d;
+            dot += d * o;
+        } else if (ACT == ACT_SIGMOID) {
+            float c = clamp(o, eps, 1.0 - eps);
+            loss -= t * log(c) + (1.0 - t) * log(1.0 - c);
+        } else {
+            loss -= t * log(max(o, eps));
+        }
+    }
+    p.loss.v[s] = loss;
+    for (uint k = 0; k < n; k++) {
+        float o = p.y.v[base + k], d = o - p.t.v[base + k];
+        if (LOSS == LOSS_MSE && ACT == ACT_SOFTMAX)
+            d = o * (d - dot);
+        else if (LOSS == LOSS_MSE || (ACT != ACT_SOFTMAX && ACT != ACT_SIGMOID))
+            d *= derivative(o, ACT);    /* cross-entropy cancels the derivative of a softmax or sigmoid */
+        p.delta.v[base + k] = d;
+    }
+}

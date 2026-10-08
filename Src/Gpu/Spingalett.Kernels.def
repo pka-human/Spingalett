@@ -1,0 +1,19 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* The GPU kernels: SPG_KERNEL(name) is Shaders/name.comp, compiled to SPIR-V and embedded by
+   cmake/Vulkan.cmake. */
+
+SPG_KERNEL(gemm)
+SPG_KERNEL(colsum)
+SPG_KERNEL(reduce)
+SPG_KERNEL(bn)
+SPG_KERNEL(eltwise)
+SPG_KERNEL(output)
+SPG_KERNEL(pool)
+SPG_KERNEL(combine)
+SPG_KERNEL(wtrans)
+SPG_KERNEL(optim)
+SPG_KERNEL(sumsq)

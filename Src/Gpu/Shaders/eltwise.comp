@@ -1,0 +1,117 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Element-wise passes over `total` floats, rows of n (a sample's outputs, or a pixel's channels):
+ *
+ *   BIAS_ACT  y = act(y + a[column])            (a: optional, FLAG_A)
+ *   DERIV     y = y act'(x)                     (x: the activation's outputs)
+ *   MUL       y = y x
+ *   ADD       y = y + x
+ *   DROPOUT   rows of n units of one sample each: x = mask act'(y), then y = mask y, with the mask of
+ *             spingalett_dropout_apply() (Spingalett.SIMD.c), drawn from the step header
+ *   AFFINE    y = act(x a[c] + b[c])            (batch normalization)
+ *   BDATA     y = (a[c] x + (a[C + c] b + a[2C + c])) act'(b)    (its data gradient; x = dy, b = input)
+ *   SCALE     y = y a[0]                        (gradient clipping)
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint ACT = 6;
+layout(local_size_x = 256) in;
+
+#define BIAS_ACT 0u
+#define DERIV    1u
+#define MUL      2u
+#define ADD      3u
+#define DROPOUT  4u
+#define AFFINE   5u
+#define BDATA    6u
+#define SCALE    7u
+
+#define FLAG_A   1u
+
+layout(push_constant) uniform Push {
+    F32 y, x, a, b;
+    U32 header;
+    uint total, n;
+    uint layer, threshold;
+    float keep_scale;
+    uint flags;
+} p;
+
+/* 64-bit arithmetic on (low, high) pairs, for the dropout hash */
+uvec2 mul64(uvec2 a, uvec2 b) {
+    uint hi, lo;
+    umulExtended(a.x, b.x, hi, lo);
+    return uvec2(lo, hi + a.x * b.y + a.y * b.x);
+}
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+uvec2 shr64(uvec2 a, uint k) {          /* 0 < k < 32 */
+    return uvec2((a.x >> k) | (a.y << (32u - k)), a.y >> k);
+}
+uvec2 mix64(uvec2 z) {
+    z ^= shr64(z, 30u);
+    z = mul64(z, uvec2(0x1CE4E5B9u, 0xBF58476Du));
+    z ^= shr64(z, 27u);
+    z = mul64(z, uvec2(0x133111EBu, 0x94D049BBu));
+    return z ^ shr64(z, 31u);
+}
+uint hash32(uint x) {
+    x ^= x >> 16; x *= 0x7FEB352Du;
+    x ^= x >> 15; x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+/* the mask's base for the sample at `position` of the step: the high word of
+   mix64(seed ^ mix64(step * golden + (position << 20) + layer)) */
+uint dropout_base(uint position) {
+    uvec2 seed = uvec2(p.header.v[STEP_SEED_LO], p.header.v[STEP_SEED_HI]);
+    uvec2 step = uvec2(p.header.v[STEP_STEP_LO], p.header.v[STEP_STEP_HI]);
+    uvec2 v = add64(mul64(step, uvec2(0x7F4A7C15u, 0x9E3779B9u)), uvec2(position << 20, position >> 12));
+    v = add64(v, uvec2(p.layer, 0u));
+    return mix64(seed ^ mix64(v)).y;
+}
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        if (OP == BIAS_ACT) {
+            float v = p.y.v[i];
+            if ((p.flags & FLAG_A) != 0u) v += p.a.v[i % p.n];
+            p.y.v[i] = activate(v, ACT);
+        } else if (OP == DERIV) {
+            p.y.v[i] *= derivative(p.x.v[i], ACT);
+        } else if (OP == MUL) {
+            p.y.v[i] *= p.x.v[i];
+        } else if (OP == ADD) {
+            p.y.v[i] += p.x.v[i];
+        } else if (OP == DROPOUT) {
+            uint s = i / p.n, j = i % p.n;
+            uint base = dropout_base(p.header.v[STEP_POSITION] + s);
+            float m = hash32(base + j * 0x9E3779B9u) >= p.threshold ? p.keep_scale : 0.0;
+            float y = p.y.v[i];
+            p.x.v[i] = m * derivative(y, ACT);
+            p.y.v[i] = y * m;
+        } else if (OP == AFFINE) {
+            uint c = i % p.n;
+            p.y.v[i] = activate(p.x.v[i] * p.a.v[c] + p.b.v[c], ACT);
+        } else if (OP == BDATA) {
+            uint c = i % p.n;
+            float xin = p.b.v[i];
+            float v = p.a.v[c] * p.x.v[i] + (p.a.v[p.n + c] * xin + p.a.v[2u * p.n + c]);
+            p.y.v[i] = ACT == ACT_NONE ? v : v * derivative(xin, ACT);
+        } else if (OP == SCALE) {
+            p.y.v[i] *= p.a.v[0];
+        }
+    }
+}

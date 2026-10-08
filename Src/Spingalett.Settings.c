@@ -4,6 +4,7 @@
 */
 
 #include "Spingalett.Private.h"
+#include "Spingalett.Gpu.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -146,7 +147,32 @@ ComputeMode resolve_compute_mode(void) {
 #else
             return mode;
 #endif
+        case COMPUTE_VULKAN:
+            /* what runs on the CPU uses its threads */
+#if defined(_OPENMP)
+            return COMPUTE_OPENMP;
+#else
+            return COMPUTE_SINGLE_THREADED;
+#endif
         default:
             return mode;
     }
+}
+
+bool spingalett_use_gpu(void) {
+    if (spingalett_get_compute_mode() != COMPUTE_VULKAN) return false;
+    if (spingalett_gpu_available()) return true;
+    if (!atomic_exchange(&s_fallback_warned[COMPUTE_VULKAN], true))
+        spingalett_log(LOG_WARNING, "Vulkan requested but %s. Falling back to the CPU.",
+#if defined(SPINGALETT_HAS_VULKAN)
+                       "no usable device was found (Vulkan 1.2 with buffer device addresses)"
+#else
+                       "the library was built without it"
+#endif
+        );
+    return false;
+}
+
+const char *spingalett_gpu_device(void) {
+    return spingalett_gpu_name();
 }

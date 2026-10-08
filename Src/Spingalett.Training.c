@@ -4,6 +4,7 @@
 */
 
 #include "Spingalett.Private.h"
+#include "Spingalett.Gpu.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -561,9 +562,13 @@ typedef struct {
     BatchWorkspace *val_ws;     /* validation: inference workspace and output rows */
     float *val_out;
     float *best_params;         /* restore_best_weights: weights then biases of the best epoch */
+
+    SpgGpuNet *gpu;             /* COMPUTE_VULKAN: the network on the GPU (no CPU workspaces then) */
+    bool gpu_failed;
 } Trainer;
 
 static void trainer_free(Trainer *t) {
+    spingalett_gpu_net_free(t->gpu);
     spingalett_aligned_free(t->augmented);
     spingalett_aligned_free(t->smoothed);
     spingalett_aligned_free(t->gen_inputs);
@@ -591,7 +596,11 @@ static bool trainer_alloc(Trainer *t) {
             t->order[i] = i;
     }
 
-    if (t->args->val_count > 0) {
+    if (t->args->val_count > 0 && t->gpu) {
+        t->val_out = (float *)spingalett_aligned_alloc((size_t)spingalett_gpu_net_capacity(t->gpu) *
+                                                      net->topology[net->layers - 1] * sizeof(float));
+        if (!t->val_out) return false;
+    } else if (t->args->val_count > 0) {
         uint32_t capacity = spingalett_batch_capacity(net, t->args->val_count);
         t->val_ws = spingalett_batch_workspace_create(net, capacity, false, false, t->mode);
         t->val_out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
@@ -611,6 +620,8 @@ static bool trainer_alloc(Trainer *t) {
     }
 
     uint32_t out_sz = net->topology[net->layers - 1];
+    if (t->gpu)
+        return true;
     if (t->use_batch_path) {
         uint32_t capacity = spingalett_batch_capacity(net, t->batch_size);
         t->ws = spingalett_batch_workspace_create(net, capacity, true, t->order != NULL || t->augment, t->mode);
@@ -696,6 +707,36 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
     uint32_t out_sz = net->topology[net->layers - 1];
     ActivationFunction out_act = net->act_func[net->layers - 2];
     float loss = 0.0f;
+
+    if (t->gpu) {
+        /* chunks filled straight into the memory the device reads, trained there; the losses come
+           back at the end of the epoch */
+        const uint32_t cap = spingalett_gpu_net_capacity(t->gpu);
+        const uint64_t step = net->time_step;
+        for (uint32_t c0 = 0; c0 < count && !t->gpu_failed; c0 += cap) {
+            uint32_t n = (count - c0 < cap) ? count - c0 : cap;
+            float *targets, *x = spingalett_gpu_chunk_inputs(t->gpu, &targets);
+            SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, (uint64_t)n * in_sz * (t->augment ? 4u : 1u)) && n > 1,
+                for (int64_t s = 0; s < (int64_t)n; s++) {
+                    uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
+                    const float *src = inputs + (size_t)idx * in_sz;
+                    if (t->augment)
+                        augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
+                    else
+                        memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
+                    memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
+                }
+            );
+            if (args->label_smoothing > 0.0f)
+                smooth_targets(targets, targets, n, out_sz, out_act, args->label_smoothing, t->mode);
+            bool last = c0 + n == count;
+            if (last) trainer_begin_step(t);
+            SpgGpuStep st = {t->opt.lr, t->opt.m_factor, t->opt.v_factor, step};
+            if (!spingalett_gpu_train_chunk(t->gpu, n, count, c0, c0 == 0, last, &st))
+                t->gpu_failed = true;
+        }
+        return 0.0f;
+    }
 
     if (t->use_batch_path) {
         BatchWorkspace *ws = t->ws;
@@ -935,13 +976,30 @@ TrainReport train_struct_arguments(TrainArgs args) {
     }
 #endif
 
+    /* COMPUTE_VULKAN: mini-batch and full-batch training on the GPU (per-sample training of dense
+       networks stays on the CPU) */
+    bool use_gpu = false;
+    if (spingalett_use_gpu()) {
+        const char *why = NULL;
+        if (training_strategy == STRATEGY_SAMPLE)
+            spingalett_log(LOG_INFO, "Per-sample training runs on the CPU");
+        else if (!spingalett_gpu_supports(net, &why))
+            spingalett_log(LOG_WARNING, "The GPU cannot train this network (%s); training on the CPU", why);
+        else
+            use_gpu = true;
+    }
+    char compute_name[160];
+    snprintf(compute_name, sizeof compute_name, "%s", compute_mode_names[effective_mode < COMPUTE_COUNT ? effective_mode : 0]);
+    if (use_gpu)
+        snprintf(compute_name, sizeof compute_name, "VULKAN (%s)", spingalett_gpu_name());
+
     if (training_strategy == STRATEGY_SMALL_BATCH) {
         spingalett_log(LOG_INFO, "Starting training: loss=%s, strategy=%s, mode=%s, optimizer=%s, compute=%s, batch_size=%u",
             loss_func_names[net->loss_func],
             training_strategy_names[training_strategy],
             training_mode_names[training_mode],
             optimizer_names[args.optimizer_type],
-            compute_mode_names[effective_mode < COMPUTE_COUNT ? effective_mode : 0],
+            compute_name,
             args.batch_size);
     } else {
         spingalett_log(LOG_INFO, "Starting training: loss=%s, strategy=%s, mode=%s, optimizer=%s, compute=%s",
@@ -949,7 +1007,7 @@ TrainReport train_struct_arguments(TrainArgs args) {
             training_strategy_names[training_strategy],
             training_mode_names[training_mode],
             optimizer_names[args.optimizer_type],
-            compute_mode_names[effective_mode < COMPUTE_COUNT ? effective_mode : 0]);
+            compute_name);
     }
 
     Trainer t = {0};
@@ -989,6 +1047,18 @@ TrainReport train_struct_arguments(TrainArgs args) {
     t.augment = args.augment_shift > 0 || args.augment_flip;
     if (t.augment)
         t.augment_seed = rng_next64();
+
+    if (use_gpu) {
+        SpgGpuTraining cfg = {
+            .optimizer = args.optimizer_type, .decay = args.weight_decay, .momentum = args.momentum,
+            .beta1 = args.beta1, .beta2 = args.beta2, .epsilon = args.epsilon, .max_grad_norm = args.max_grad_norm,
+            .dropout_seed = t.dropout.seed,
+        };
+        uint32_t capacity = spingalett_gpu_capacity(net, t.batch_size, true);
+        t.gpu = capacity ? spingalett_gpu_net_create(net, capacity, &cfg) : NULL;
+        if (!t.gpu)
+            spingalett_log(LOG_WARNING, "Not enough GPU memory to train the network; training on the CPU");
+    }
 
     if (!trainer_alloc(&t)) {
         trainer_free(&t);
@@ -1089,6 +1159,13 @@ TrainReport train_struct_arguments(TrainArgs args) {
             epoch_samples = sample_count;
         }
 
+        if (t.gpu && (t.gpu_failed || !spingalett_gpu_take_loss(t.gpu, &total_error) || !spingalett_gpu_download(t.gpu))) {
+            set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
+            spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+            report.status = TRAIN_FAILED;
+            break;
+        }
+
         report.epochs_run = epoch;
         report.train_loss = total_error / (float)epoch_samples;
 
@@ -1101,8 +1178,18 @@ TrainReport train_struct_arguments(TrainArgs args) {
         if (has_validation) {
             double loss;
             uint32_t correct;
-            spingalett_batch_evaluate(net, t.val_ws, t.val_out, args.val_inputs, args.val_targets, args.val_count,
-                                      effective_mode, &loss, &correct);
+            if (t.gpu) {
+                if (!spingalett_gpu_evaluate(t.gpu, net, t.val_out, args.val_inputs, args.val_targets, args.val_count,
+                                             &loss, &correct)) {
+                    set_error(SPINGALETT_ERR_INVALID, "The GPU failed during validation");
+                    spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                    report.status = TRAIN_FAILED;
+                    break;
+                }
+            } else {
+                spingalett_batch_evaluate(net, t.val_ws, t.val_out, args.val_inputs, args.val_targets, args.val_count,
+                                          effective_mode, &loss, &correct);
+            }
             report.validation.loss = (float)(loss / args.val_count);
             report.validation.accuracy = (float)correct / (float)args.val_count;
         }

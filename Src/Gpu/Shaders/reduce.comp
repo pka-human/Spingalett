@@ -1,0 +1,37 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Adds partial results in a fixed order: out[o] = scale * (sum over s of part[g][s][r]) + beta out[o]
+ * for o = g * width + r, with compensated (Kahan) sums so that many slices lose little. With
+ * beta = 0, out is not read.
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    F32 part, out_;
+    uint total, width, slices;
+    float scale, beta;
+} p;
+
+void main() {
+    const uint o = gl_GlobalInvocationID.x;
+    if (o >= p.total) return;
+    const uint g = o / p.width, r = o % p.width;
+    precise float sum = 0.0, comp = 0.0;     /* precise: the compensation must not be simplified away */
+    for (uint s = 0; s < p.slices; s++) {
+        precise float y = p.part.v[(g * p.slices + s) * p.width + r] - comp;
+        precise float t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    float v = p.scale * sum;
+    if (p.beta != 0.0) v += p.beta * p.out_.v[o];
+    p.out_.v[o] = v;
+}

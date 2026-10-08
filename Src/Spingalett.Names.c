@@ -34,5 +34,5 @@ const char * const precision_names[] = {
 };
 
 const char * const compute_mode_names[] = {
-    "SINGLE_THREADED", "OPENMP", "OPENBLAS", "CUDA"
+    "SINGLE_THREADED", "OPENMP", "OPENBLAS", "CUDA", "VULKAN"
 };

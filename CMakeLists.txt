@@ -148,6 +148,11 @@ if(BUILD_WITH_OPENBLAS)
     endif()
 endif()
 
+# ------------------------------------------------------------------------------
+# GPU backend (Vulkan compute)
+# ------------------------------------------------------------------------------
+include(cmake/Vulkan.cmake)
+
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Config.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/Spingalett/Spingalett.Config.h
@@ -468,10 +473,27 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
-    foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model xor)
+    foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model gpu xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()
+
+    # The GPU kernels against references in double precision (skipped without a Vulkan device).
+    if(SPINGALETT_HAS_VULKAN)
+        add_executable(SpingalettGpuTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.GpuTests.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Vulkan.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuKernels.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c)
+        target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_BINARY_DIR}/Gpu
+                                   ${SPINGALETT_VULKAN_INCLUDE})
+        add_dependencies(SpingalettGpuTests spingalett_shaders)
+        target_link_libraries(SpingalettGpuTests PRIVATE ${CMAKE_DL_LIBS})
+        if(NOT WIN32)
+            target_link_libraries(SpingalettGpuTests PRIVATE Threads::Threads m)
+        endif()
+        add_test(NAME gpu.kernels COMMAND SpingalettGpuTests)
+        set_tests_properties(gpu.kernels PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     # The inference engine on its own, also running models exported as C headers.
     include(cmake/SpingalettEngine.cmake)

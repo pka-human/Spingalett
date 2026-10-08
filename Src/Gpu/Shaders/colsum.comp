@@ -1,0 +1,73 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Per-column sums of R rows of C floats over slices of `slice_rows` rows: workgroup (x, y) sums
+ * columns [x * COLS, +COLS) of slice y. Each thread adds every (256 / COLS)-th row of the slice, and
+ * the threads' sums are added in a fixed tree, so the partial sums do not depend on scheduling;
+ * reduce.comp (or the batch normalization kernels) adds the slices in order.
+ *
+ *   SUM       part[y][c] = sum of x
+ *   SHIFTED   part[y][c] = sum of (x - k[c]), part[y][C + c] = sum of (x - k[c])^2
+ *   DY        part[y][c] = sum of dy,         part[y][C + c] = sum of dy * (x - k[c])
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint COLS = 16;
+layout(constant_id = 1) const uint MODE = 0;
+layout(local_size_x = 256) in;
+
+#define SUM     0u
+#define SHIFTED 1u
+#define DY      2u
+
+layout(push_constant) uniform Push {
+    F32 x, dy, k, part;
+    uint R, C, slice_rows;
+} p;
+
+const uint ROWS = 256u / COLS;
+shared float s1[256], s2[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lc = tid % COLS, lr = tid / COLS;
+    const uint c = gl_WorkGroupID.x * COLS + lc, slice = gl_WorkGroupID.y;
+    const uint r0 = slice * p.slice_rows, r1 = min(p.R, r0 + p.slice_rows);
+    float t1 = 0.0, t2 = 0.0;
+    if (c < p.C) {
+        float shift = MODE == SUM ? 0.0 : p.k.v[c];
+        for (uint r = r0 + lr; r < r1; r += ROWS) {
+            float v = p.x.v[r * p.C + c];
+            if (MODE == SUM) {
+                t1 += v;
+            } else if (MODE == SHIFTED) {
+                float d = v - shift;
+                t1 += d;
+                t2 = fma(d, d, t2);
+            } else {
+                float g = p.dy.v[r * p.C + c];
+                t1 += g;
+                t2 = fma(g, v - shift, t2);
+            }
+        }
+    }
+    s1[tid] = t1;
+    s2[tid] = t2;
+    barrier();
+    for (uint half_rows = ROWS / 2u; half_rows > 0u; half_rows /= 2u) {
+        if (lr < half_rows) {
+            s1[tid] += s1[tid + half_rows * COLS];
+            s2[tid] += s2[tid + half_rows * COLS];
+        }
+        barrier();
+    }
+    if (lr == 0u && c < p.C) {
+        uint width = MODE == SUM ? p.C : 2u * p.C;
+        p.part.v[slice * width + c] = s1[tid];
+        if (MODE != SUM) p.part.v[slice * width + p.C + c] = s2[tid];
+    }
+}

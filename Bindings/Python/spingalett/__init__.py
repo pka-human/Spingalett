@@ -48,7 +48,7 @@ __all__ = [
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
-    "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels",
+    "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
 ]
 
@@ -97,7 +97,8 @@ class ComputeMode(enum.IntEnum):
     SINGLE_THREADED = 0
     OPENMP = 1
     OPENBLAS = 2
-    CUDA = 3
+    CUDA = 3        # reserved: falls back to the CPU
+    VULKAN = 4      # the GPU (gpu_device()); training's CPU parts run as with OPENMP
 
 
 class Precision(enum.IntEnum):
@@ -621,6 +622,7 @@ _get_compute_mode = _bind("spingalett_get_compute_mode", c_int, [])
 _set_compute_mode = _bind("spingalett_set_compute_mode", None, [c_int])
 _get_num_threads = _bind("spingalett_get_num_threads", ctypes.c_uint, [])
 _cpu_kernels = _bind("spingalett_cpu_kernels", c_char_p, [])
+_gpu_device = _bind("spingalett_gpu_device", c_char_p, [])
 _set_num_threads = _bind("spingalett_set_num_threads", None, [ctypes.c_uint])
 _set_log_callback = _bind("spingalett_set_log_callback", None, [_LogCallbackFn])
 _set_log_level = _bind("spingalett_set_log_level", None, [c_int])
@@ -681,6 +683,13 @@ def set_num_threads(n: int) -> None:
 
 def get_num_threads() -> int:
     return int(_get_num_threads())
+
+
+def gpu_device() -> Optional[str]:
+    """Name of the GPU that ComputeMode.VULKAN uses, or None without a usable Vulkan device (or a
+    library built without the Vulkan backend). SPINGALETT_GPU_DEVICE picks a device by its index."""
+    name = _gpu_device()
+    return name.decode() if name else None
 
 
 def cpu_kernels() -> str:

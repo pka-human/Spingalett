@@ -4004,6 +4004,271 @@ static void pytorch_weights(void) {
     free(data);
 }
 
+/* ---- the GPU (COMPUTE_VULKAN) against the CPU ---- */
+
+/* Networks covering every kind of layer the GPU runs: dense layers, convolutions (strided, grouped,
+   depthwise), pooling, batch normalization (of convolutions and of dense layers), residual additions,
+   concatenations, global pooling, dropout, layers feeding several others. */
+static NeuralNetwork *gpu_net(int which) {
+    spingalett_seed(1234 + (uint64_t)which);
+    NeuralNetwork *net = NULL;
+    switch (which) {
+    case 0:
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = 37);
+        layer(.net = net, .neurons_amount = 50, .act_func = ACT_RELU);
+        layer(.net = net, .neurons_amount = 20, .act_func = ACT_TANH);
+        layer(.net = net, .neurons_amount = 10, .act_func = ACT_SOFTMAX);
+        break;
+    case 1:
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 12, .width = 12, .channels = 3);
+        conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+        batch_norm(.net = net, .act_func = ACT_RELU);
+        max_pool2d(.net = net, .kernel = 2);
+        conv2d(.net = net, .filters = 16, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_LEAKY_RELU);
+        avg_pool2d(.net = net, .kernel = 3, .stride = 1, .padding = 1);
+        layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX);
+        break;
+    case 2: {
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 8, .width = 8, .channels = 4);
+        conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+        uint32_t b = batch_norm(.net = net, .act_func = ACT_RELU);
+        conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+        uint32_t d = batch_norm(.net = net, .act_func = ACT_NONE);
+        add_layers(.net = net, .inputs = {b, d}, .act_func = ACT_RELU);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 7, .act_func = ACT_SOFTMAX);
+        break;
+    }
+    case 3: {
+        net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = net, .height = 9, .width = 7, .channels = 6);
+        uint32_t a = conv2d(.net = net, .filters = 6, .kernel = 3, .padding = 1, .groups = 6, .act_func = ACT_TANH);
+        uint32_t b = conv2d(.net = net, .inputs = {0}, .filters = 4, .kernel = 3, .padding = 1, .groups = 2,
+                            .act_func = ACT_FOO52);
+        uint32_t c = conv2d(.net = net, .inputs = {a}, .filters = 8, .kernel = 1, .act_func = ACT_RELU, .dropout_rate = 0.25f);
+        uint32_t d = conv2d(.net = net, .inputs = {0}, .filters = 3, .kernel = 1, .act_func = ACT_SIGMOID);
+        uint32_t e = concat_layers(.net = net, .inputs = {c, d, b}, .act_func = ACT_NONE);
+        max_pool2d(.net = net, .inputs = {e}, .kernel_h = 2, .kernel_w = 3, .stride_w = 2, .padding_w = 1);
+        layer(.net = net, .neurons_amount = 3, .act_func = ACT_SIGMOID);
+        break;
+    }
+    case 4: {
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = 24);
+        uint32_t a = layer(.net = net, .neurons_amount = 32, .act_func = ACT_RELU);
+        uint32_t b = layer(.net = net, .neurons_amount = 32, .act_func = ACT_TANH);
+        layer(.net = net, .inputs = {a}, .neurons_amount = 32, .act_func = ACT_NONE);
+        uint32_t d = batch_norm(.net = net, .act_func = ACT_SIGMOID);
+        add_layers(.net = net, .inputs = {a, b, d}, .act_func = ACT_LEAKY_RELU);
+        layer(.net = net, .neurons_amount = 4, .act_func = ACT_SOFTMAX);
+        break;
+    }
+    default:
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 16, .width = 16, .channels = 3);
+        conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+        batch_norm(.net = net, .act_func = ACT_RELU);
+        conv2d(.net = net, .filters = 32, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_NONE);
+        batch_norm(.net = net, .act_func = ACT_RELU);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 10, .act_func = ACT_SOFTMAX);
+        break;
+    }
+    return net;
+}
+
+static double gpu_max_rel(const float *a, const float *b, size_t n) {
+    double worst = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double d = fabs((double)a[i] - b[i]), s = fabs((double)a[i]) + fabs((double)b[i]) + 1e-3;
+        if (d / s > worst) worst = d / s;
+    }
+    return worst;
+}
+
+/* Trains network `which` and returns its outputs on x, predicted on the CPU, and its parameters. */
+static float *gpu_trained(int which, ComputeMode mode, const float *x, const float *t, uint32_t n, uint32_t out_sz,
+                          OptimizerType opt, TrainingStrategy strategy, float clip, float **params, size_t *count,
+                          TrainReport *report) {
+    NeuralNetwork *net = gpu_net(which);
+    spingalett_set_compute_mode(mode);
+    spingalett_seed(99);
+    *report = train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 3, .training_strategy = strategy,
+                    .batch_size = 32, .optimizer_type = opt,
+                    .learning_rate = opt == OPTIMIZER_SGD || opt == OPTIMIZER_MOMENTUM ? 0.05f : 0.002f,
+                    .weight_decay = 1e-3f, .max_grad_norm = clip, .label_smoothing = 0.05f, .report_interval = 0);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    float *y = (float *)malloc((size_t)n * out_sz * sizeof(float));
+    predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
+    *count = 0;
+    for (uint32_t l = 0; l < spingalett_layer_count(net); l++) {
+        SpingalettNetworkLayer info;
+        spingalett_network_layer(net, l, &info);
+        *count += info.weight_count + info.bias_count;
+    }
+    *params = (float *)calloc(*count + 1, sizeof(float));
+    size_t off = 0;
+    for (uint32_t l = 0; l < spingalett_layer_count(net); l++) {
+        SpingalettNetworkLayer info;
+        spingalett_network_layer(net, l, &info);
+        if (info.weight_count) spingalett_get_parameters(net, l, PARAM_WEIGHTS, *params + off, info.weight_count);
+        off += info.weight_count;
+        if (info.bias_count) spingalett_get_parameters(net, l, PARAM_BIASES, *params + off, info.bias_count);
+        off += info.bias_count;
+    }
+    free_network(net);
+    return y;
+}
+
+/* Predictions, mini-batch and full-batch training on the GPU against the CPU (through the outputs of
+   the trained networks: a bias before batch normalization has no gradient but rounding noise, which
+   Adam turns into steps; momentum keeps it still), and the same bits from two GPU runs. */
+static void gpu_equivalence(int which) {
+    static const OptimizerType opts[] = {OPTIMIZER_SGD, OPTIMIZER_MOMENTUM, OPTIMIZER_MOMENTUM, OPTIMIZER_ADAMW,
+                                         OPTIMIZER_RMSPROP, OPTIMIZER_MOMENTUM};
+    NeuralNetwork *probe = gpu_net(which);
+    SpingalettNetworkLayer first, last;
+    spingalett_network_layer(probe, 0, &first);
+    spingalett_network_layer(probe, spingalett_layer_count(probe) - 1, &last);
+    const uint32_t n = 300, in_sz = first.outputs, out_sz = last.outputs;
+    float *x = (float *)malloc((size_t)n * in_sz * sizeof(float)), *t = (float *)calloc((size_t)n * out_sz, sizeof(float));
+    lcg_state = 7u + (unsigned)which;
+    for (size_t i = 0; i < (size_t)n * in_sz; i++) x[i] = frand() * 2.0f - 1.0f;
+    for (uint32_t s = 0; s < n; s++) {
+        if (last.activation == ACT_SIGMOID) for (uint32_t k = 0; k < out_sz; k++) t[s * out_sz + k] = frand();
+        else t[s * out_sz + (uint32_t)(frand() * out_sz) % out_sz] = 1.0f;
+    }
+    float *pc = (float *)malloc((size_t)n * out_sz * sizeof(float)), *pg = (float *)malloc((size_t)n * out_sz * sizeof(float));
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    predict(.net = probe, .inputs = x, .outputs = pc, .sample_count = n);
+    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    predict(.net = probe, .inputs = x, .outputs = pg, .sample_count = n);
+    free_network(probe);
+    double predicted = gpu_max_rel(pc, pg, (size_t)n * out_sz);
+
+    float *wc, *wg, *wg2;
+    size_t count;
+    TrainReport rc, rg, rg2;
+    const float clip = which == 1 ? 0.5f : 0.0f;
+    float *oc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], STRATEGY_SMALL_BATCH, clip, &wc, &count, &rc);
+    float *og = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], STRATEGY_SMALL_BATCH, clip, &wg, &count, &rg);
+    float *og2 = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], STRATEGY_SMALL_BATCH, clip, &wg2, &count, &rg2);
+    double trained = gpu_max_rel(oc, og, (size_t)n * out_sz);
+    bool same = !memcmp(wg, wg2, count * sizeof(float)) && !memcmp(og, og2, (size_t)n * out_sz * sizeof(float));
+    /* full batch: the CPU normalizes over chunks of a bounded size, so only networks without batch
+       normalization compare */
+    float *fc, *fg;
+    TrainReport fr1, fr2;
+    float *ofc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], STRATEGY_FULL_BATCH, 0.0f, &fc, &count, &fr1);
+    float *ofg = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], STRATEGY_FULL_BATCH, 0.0f, &fg, &count, &fr2);
+    double full = which == 5 ? 0.0 : gpu_max_rel(ofc, ofg, (size_t)n * out_sz);
+    CHECK(predicted < 1e-4, "gpu net %d: predictions differ by %.2e", which, predicted);
+    CHECK(rg.status == TRAIN_COMPLETED && fr2.status == TRAIN_COMPLETED, "gpu net %d: training failed", which);
+    CHECK(trained < 1e-3, "gpu net %d: trained outputs differ by %.2e (loss %g / %g)", which, trained,
+          (double)rc.train_loss, (double)rg.train_loss);
+    CHECK(fabsf(rc.train_loss - rg.train_loss) <= 1e-4f * fabsf(rc.train_loss), "gpu net %d: losses %g / %g", which,
+          (double)rc.train_loss, (double)rg.train_loss);
+    CHECK(full < 1e-3, "gpu net %d: full-batch outputs differ by %.2e", which, full);
+    CHECK(same, "gpu net %d: two GPU runs differ", which);
+    printf("  gpu net %d: predict %.1e, trained outputs %.1e, full batch %.1e, deterministic %s\n", which, predicted,
+           trained, full, same ? "yes" : "no");
+    free(oc); free(og); free(og2); free(ofc); free(ofg); free(wc); free(wg); free(wg2); free(fc); free(fg);
+    free(pc); free(pg); free(x); free(t);
+}
+
+typedef struct { const float *x, *t; uint32_t n, in, out, at; } GpuServe;
+
+static uint32_t gpu_serve(float *inputs, float *targets, uint32_t count, void *data) {
+    GpuServe *g = (GpuServe *)data;
+    uint32_t k = 0;
+    for (; k < count && g->at < g->n; k++, g->at++) {
+        memcpy(inputs + (size_t)k * g->in, g->x + (size_t)g->at * g->in, g->in * sizeof(float));
+        memcpy(targets + (size_t)k * g->out, g->t + (size_t)g->at * g->out, g->out * sizeof(float));
+    }
+    if (k == 0) g->at = 0;
+    return k;
+}
+
+/* Validation, evaluate(), the best weights restored, a generator, and per-sample training (which
+   stays on the CPU), against the CPU. */
+static void gpu_training_options(void) {
+    const uint32_t n = 256, in_sz = 37, out_sz = 10;
+    float *x = (float *)malloc((size_t)n * in_sz * sizeof(float)), *t = (float *)calloc((size_t)n * out_sz, sizeof(float));
+    lcg_state = 77;
+    for (size_t i = 0; i < (size_t)n * in_sz; i++) x[i] = frand() * 2.0f - 1.0f;
+    for (uint32_t s = 0; s < n; s++) t[s * out_sz + (uint32_t)(frand() * out_sz) % out_sz] = 1.0f;
+    TrainReport r[2];
+    EvalMetrics e[2];
+    float *w[2];
+    size_t count = 0;
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = gpu_net(0);
+        spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+        spingalett_seed(5);
+        r[k] = train(.net = net, .inputs = x, .targets = t, .sample_count = 192, .val_inputs = x + 192 * in_sz,
+                     .val_targets = t + 192 * out_sz, .val_count = 64, .epochs = 6, .batch_size = 16,
+                     .training_strategy = STRATEGY_SMALL_BATCH, .optimizer_type = OPTIMIZER_MOMENTUM,
+                     .learning_rate = 0.05f, .restore_best_weights = true, .report_interval = 0);
+        e[k] = evaluate(.net = net, .inputs = x, .targets = t, .sample_count = n);
+        count = spingalett_parameter_count(net);
+        w[k] = (float *)malloc(count * sizeof(float));
+        SpingalettNetworkLayer info;
+        size_t off = 0;
+        for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+            spingalett_network_layer(net, l, &info);
+            spingalett_get_parameters(net, l, PARAM_WEIGHTS, w[k] + off, info.weight_count);
+            off += info.weight_count;
+            spingalett_get_parameters(net, l, PARAM_BIASES, w[k] + off, info.bias_count);
+            off += info.bias_count;
+        }
+        free_network(net);
+    }
+    CHECK(r[0].best_epoch == r[1].best_epoch && r[0].restored_best == r[1].restored_best,
+          "gpu: best epochs %zu / %zu", r[0].best_epoch, r[1].best_epoch);
+    CHECK(fabsf(r[0].validation.loss - r[1].validation.loss) < 1e-4f * fabsf(r[0].validation.loss),
+          "gpu: validation losses %g / %g", (double)r[0].validation.loss, (double)r[1].validation.loss);
+    CHECK(fabsf(e[0].loss - e[1].loss) < 1e-4f * fabsf(e[0].loss) && e[0].accuracy == e[1].accuracy,
+          "gpu: evaluate() %g %g / %g %g", (double)e[0].loss, (double)e[0].accuracy, (double)e[1].loss,
+          (double)e[1].accuracy);
+    CHECK(gpu_max_rel(w[0], w[1], count) < 1e-3, "gpu: restored weights differ by %.2e", gpu_max_rel(w[0], w[1], count));
+    free(w[0]); free(w[1]);
+
+    /* a generator gives the same steps as the arrays */
+    TrainReport g[2];
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = gpu_net(0);
+        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        GpuServe serve = {x, t, n, in_sz, out_sz, 0};
+        g[k] = k ? train(.net = net, .training_mode = MODE_GENERATOR_FUNCTION, .generator = gpu_serve,
+                         .generator_data = &serve, .sample_count = n, .epochs = 2, .batch_size = 32,
+                         .training_strategy = STRATEGY_SMALL_BATCH, .report_interval = 0)
+                 : train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .batch_size = 32,
+                         .training_strategy = STRATEGY_SMALL_BATCH, .do_not_shuffle = true, .report_interval = 0);
+        free_network(net);
+    }
+    CHECK(g[0].train_loss == g[1].train_loss, "gpu: generator loss %g, arrays %g", (double)g[1].train_loss,
+          (double)g[0].train_loss);
+
+    /* per-sample training of a dense network runs on the CPU, the same as COMPUTE_OPENMP */
+    TrainReport s[2];
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = gpu_net(0);
+        spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+        spingalett_seed(3);
+        s[k] = train(.net = net, .inputs = x, .targets = t, .sample_count = 64, .epochs = 1,
+                     .training_strategy = STRATEGY_SAMPLE, .report_interval = 0);
+        free_network(net);
+    }
+    CHECK(s[0].train_loss == s[1].train_loss, "gpu: per-sample losses %g / %g", (double)s[0].train_loss,
+          (double)s[1].train_loss);
+    printf("  gpu: validation, evaluate(), restored weights, generator, per-sample training\n");
+    free(x);
+    free(t);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "export-headers")) {
         spingalett_set_verbose(false);
@@ -4198,6 +4463,17 @@ int main(int argc, char **argv) {
         model_files();
         for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);
         model_conv();
+    }
+    if (!*only || !strcmp(only, "gpu")) {
+        printf("[GPU]\n");
+        if (!spingalett_gpu_device()) {
+            printf("  skipped: no usable Vulkan device\n");
+        } else {
+            printf("  device: %s\n", spingalett_gpu_device());
+            for (int k = 0; k < 6; k++) gpu_equivalence(k);
+            gpu_training_options();
+        }
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }
     if (!*only || !strcmp(only, "xor")) {
         printf("[xor convergence]\n");

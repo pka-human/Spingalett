@@ -24,6 +24,10 @@
  * synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with SGD and momentum, and
  * inference.
  *
+ * With a usable GPU (spingalett_gpu_device()), every workload also runs with COMPUTE_VULKAN, after a
+ * first run that is not timed (it makes the GPU's pipelines and times the matrix products' tiles,
+ * once per process).
+ *
  * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
 
@@ -132,6 +136,7 @@ static NeuralNetwork *create_cnn(bool normalized) {
 static void cnn_benchmark(const char *name, ComputeMode mode, bool normalized, const float *images,
                           const float *labels) {
     spingalett_set_compute_mode(mode);
+    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) {   /* the GPU's first run */
     NeuralNetwork *net = create_cnn(normalized);
     double start = now();
     train(.net = net, .inputs = images, .targets = labels, .sample_count = CNN_SAMPLES, .epochs = 1,
@@ -142,9 +147,10 @@ static void cnn_benchmark(const char *name, ComputeMode mode, bool normalized, c
     start = now();
     predict(.net = net, .inputs = images, .sample_count = CNN_SAMPLES, .outputs = outputs);
     double inferred = now() - start;
-    printf("%-16s %14.0f %14.0f\n", name, CNN_SAMPLES / trained, CNN_SAMPLES / inferred);
+    if (!untimed) printf("%-16s %14.0f %14.0f\n", name, CNN_SAMPLES / trained, CNN_SAMPLES / inferred);
     free(outputs);
     free_network(net);
+    }
 }
 
 #define RESNET_SAMPLES 4096
@@ -183,6 +189,7 @@ static NeuralNetwork *create_resnet20(void) {
 
 static void resnet_benchmark(const char *name, ComputeMode mode, const float *images, const float *labels) {
     spingalett_set_compute_mode(mode);
+    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) {   /* the GPU's first run */
     NeuralNetwork *net = create_resnet20();
     double start = now();
     train(.net = net, .inputs = images, .targets = labels, .sample_count = RESNET_SAMPLES, .epochs = 1,
@@ -193,13 +200,19 @@ static void resnet_benchmark(const char *name, ComputeMode mode, const float *im
     start = now();
     predict(.net = net, .inputs = images, .sample_count = RESNET_SAMPLES, .outputs = outputs);
     double inferred = now() - start;
-    printf("%-16s %14.0f %14.0f\n", name, RESNET_SAMPLES / trained, RESNET_SAMPLES / inferred);
+    if (!untimed) printf("%-16s %14.0f %14.0f\n", name, RESNET_SAMPLES / trained, RESNET_SAMPLES / inferred);
     free(outputs);
     free_network(net);
+    }
 }
 
 static void run_benchmark(const char *name, ComputeMode mode, const float *inputs, const float *targets) {
     spingalett_set_compute_mode(mode);
+    if (mode == COMPUTE_VULKAN) {           /* the GPU's first use, not timed */
+        train_throughput(inputs, targets, STRATEGY_FULL_BATCH, 1);
+        train_throughput(inputs, targets, STRATEGY_SMALL_BATCH, 1);
+        inference_throughput(inputs);
+    }
     double full = train_throughput(inputs, targets, STRATEGY_FULL_BATCH, EPOCHS);
     double mini = train_throughput(inputs, targets, STRATEGY_SMALL_BATCH, 1);
     double infer = inference_throughput(inputs);
@@ -275,8 +288,9 @@ int main(int argc, char **argv) {
            spingalett_version(), spingalett_cpu_kernels(), INPUT_SIZE, HIDDEN_1, HIDDEN_2, OUTPUT_SIZE,
            spingalett_parameter_count(probe), SAMPLES);
     free_network(probe);
-    if (spingalett_get_num_threads() > 0) printf("%u\n\n", spingalett_get_num_threads());
-    else printf("runtime default\n\n");
+    if (spingalett_get_num_threads() > 0) printf("%u", spingalett_get_num_threads());
+    else printf("runtime default");
+    printf(spingalett_gpu_device() ? ", GPU: %s\n\n" : "\n\n", spingalett_gpu_device());
 
     printf("%-16s %14s %14s %14s\n", "samples/s", "full batch", "mini-batch 64", "inference");
     run_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, inputs, targets);
@@ -286,6 +300,8 @@ int main(int argc, char **argv) {
 #if defined(SPINGALETT_HAS_OPENBLAS)
     run_benchmark("OpenBLAS", COMPUTE_OPENBLAS, inputs, targets);
 #endif
+    const char *gpu = spingalett_gpu_device();
+    if (gpu) run_benchmark("Vulkan GPU", COMPUTE_VULKAN, inputs, targets);
     deployment_benchmark(inputs);
 
     /* the convolutional network: random images, one-hot labels */
@@ -310,6 +326,7 @@ int main(int argc, char **argv) {
 #if defined(SPINGALETT_HAS_OPENBLAS)
         cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, normalized, images, labels);
 #endif
+        if (gpu) cnn_benchmark("Vulkan GPU", COMPUTE_VULKAN, normalized, images, labels);
     }
 
     free(images);
@@ -333,6 +350,7 @@ int main(int argc, char **argv) {
 #if defined(SPINGALETT_HAS_OPENMP)
     resnet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
 #endif
+    if (gpu) resnet_benchmark("Vulkan GPU", COMPUTE_VULKAN, images, labels);
     free(images);
     free(labels);
     free(inputs);
