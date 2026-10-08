@@ -29,13 +29,15 @@
  * once per process), and again with the products in bfloat16 when the GPU has matrix units for them
  * (spingalett_set_gpu_precision()).
  *
- * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
+ * Usage: Benchmark [threads] [gpu] ("gpu": the GPU's rows only, as Examples/benchmark_pytorch.py --cuda
+ * runs them). Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
 
 #include <Spingalett/Spingalett.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #if !defined(TIME_UTC) && defined(_WIN32)
 #include <windows.h>
@@ -281,8 +283,11 @@ int main(int argc, char **argv) {
     generate_synthetic_data(&inputs, &targets);
 
     /* More threads than cores oversubscribes the CPU and slows training down. */
-    if (argc > 1)
-        spingalett_set_num_threads((unsigned)strtoul(argv[1], NULL, 10));
+    bool cpu = true;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "gpu")) cpu = false;
+        else spingalett_set_num_threads((unsigned)strtoul(argv[i], NULL, 10));
+    }
 
     NeuralNetwork *probe = create_network();
     printf("Spingalett %s (%s kernels): %d-%d-%d-%d (%" PRIu64 " parameters), %d samples, threads: ",
@@ -294,13 +299,15 @@ int main(int argc, char **argv) {
     printf(spingalett_gpu_device() ? ", GPU: %s\n\n" : "\n\n", spingalett_gpu_device());
 
     printf("%-16s %14s %14s %14s\n", "samples/s", "full batch", "mini-batch 64", "inference");
-    run_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, inputs, targets);
+    if (cpu) {
+        run_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, inputs, targets);
 #if defined(SPINGALETT_HAS_OPENMP)
-    run_benchmark("OpenMP", COMPUTE_OPENMP, inputs, targets);
+        run_benchmark("OpenMP", COMPUTE_OPENMP, inputs, targets);
 #endif
 #if defined(SPINGALETT_HAS_OPENBLAS)
-    run_benchmark("OpenBLAS", COMPUTE_OPENBLAS, inputs, targets);
+        run_benchmark("OpenBLAS", COMPUTE_OPENBLAS, inputs, targets);
 #endif
+    }
     const char *gpu = spingalett_gpu_device();
     /* and with the matrix products in bfloat16 on its matrix units, where it has them */
     const bool bf16 = gpu && spingalett_set_gpu_precision(PRECISION_BFLOAT16);
@@ -311,7 +318,7 @@ int main(int argc, char **argv) {
         run_benchmark("Vulkan GPU bf16", COMPUTE_VULKAN, inputs, targets);
         spingalett_set_gpu_precision(PRECISION_FLOAT32);
     }
-    deployment_benchmark(inputs);
+    if (cpu) deployment_benchmark(inputs);
 
     /* the convolutional network: random images, one-hot labels */
     float *images = (float *)malloc((size_t)CNN_SAMPLES * INPUT_SIZE * sizeof(float));
@@ -328,13 +335,15 @@ int main(int argc, char **argv) {
                normalized ? " with batch normalization" : "", spingalett_parameter_count(cnn), CNN_SAMPLES);
         free_network(cnn);
         printf("%-16s %14s %14s\n", "samples/s", "training", "inference");
-        cnn_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, normalized, images, labels);
+        if (cpu) {
+            cnn_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, normalized, images, labels);
 #if defined(SPINGALETT_HAS_OPENMP)
-        cnn_benchmark("OpenMP", COMPUTE_OPENMP, normalized, images, labels);
+            cnn_benchmark("OpenMP", COMPUTE_OPENMP, normalized, images, labels);
 #endif
 #if defined(SPINGALETT_HAS_OPENBLAS)
-        cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, normalized, images, labels);
+            cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, normalized, images, labels);
 #endif
+        }
         if (gpu) cnn_benchmark("Vulkan GPU", COMPUTE_VULKAN, normalized, images, labels);
         if (bf16) {
             spingalett_set_gpu_precision(PRECISION_BFLOAT16);
@@ -360,10 +369,12 @@ int main(int argc, char **argv) {
            spingalett_layer_count(resnet), spingalett_parameter_count(resnet), RESNET_SAMPLES);
     free_network(resnet);
     printf("%-16s %14s %14s\n", "samples/s", "training", "inference");
-    resnet_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, images, labels);
+    if (cpu) {
+        resnet_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, images, labels);
 #if defined(SPINGALETT_HAS_OPENMP)
-    resnet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
+        resnet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
 #endif
+    }
     if (gpu) resnet_benchmark("Vulkan GPU", COMPUTE_VULKAN, images, labels);
     if (bf16) {
         spingalett_set_gpu_precision(PRECISION_BFLOAT16);
