@@ -95,6 +95,10 @@ SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads) {
     return s;
 }
 
+int spingalett_gemm_scratch_threads(const SpingalettGemmScratch *s) {
+    return s ? s->threads : 1;
+}
+
 size_t spingalett_gemm_scratch_bytes(int threads) {
     if (threads < 1) threads = 1;
     return ((size_t)KC * NC + (size_t)threads * MC_MAX * KC) * sizeof(float);

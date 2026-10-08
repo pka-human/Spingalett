@@ -48,12 +48,25 @@ static inline bool depthwise(const LayerShape *in, const LayerShape *out) {
     return groups_of(out) > 1 && in->channels == groups_of(out);
 }
 
+/* Threads the native kernels of a pass may use (those its GEMM scratch was made for). */
+static inline int scratch_threads(const SpingalettGemmScratch *gemm) {
+    return spingalett_gemm_scratch_threads(gemm);
+}
+
 size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacity, bool training, ComputeMode mode) {
     size_t need = 0;
+    int threads = 1;
+#if defined(_OPENMP)
+    if (mode == COMPUTE_OPENMP) threads = omp_get_max_threads();
+#endif
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         const uint32_t src = spingalett_source(net, l + 1);
         const LayerShape *in = &net->shapes[src], *out = &net->shapes[l + 1];
         if (out->type != LAYER_CONV2D) continue;
+        if (spingalett_conv_direct(in, out, mode)) {        /* the indirect kernels (Spingalett.ConvGEMM.c) */
+            size_t d = spingalett_conv_direct_scratch(in, out, capacity, training, threads);
+            if (d > need) need = d;
+        }
         if (depthwise(in, out)) {           /* the filters transposed, tap-major */
             size_t t = (size_t)out->kernel_h * out->kernel_w * out->channels;
             if (t > need) need = t;
@@ -611,6 +624,7 @@ void spingalett_conv_forward(const NeuralNetwork *net, uint32_t l, const float *
 size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *out, uint32_t capacity,
                                        ComputeMode mode) {
     if (depthwise(in, out)) return (size_t)out->kernel_h * out->kernel_w * out->channels;
+    if (spingalett_conv_direct(in, out, mode)) return spingalett_conv_direct_scratch(in, out, capacity, false, 1);
     if (implicit(mode) || pointwise(out)) return 0;
     size_t fwd = (size_t)out->kernel_h * out->kernel_w * in->channels;
     size_t total = fwd * out->height * out->width * capacity;
@@ -632,6 +646,18 @@ void spingalett_conv_forward_scaled(const LayerShape *in, const LayerShape *out,
     }
     /* groups: one product per group, over its input channels and into its filters' columns */
     const uint32_t G = groups_of(out), C = in->channels, CG = C / G, OC = out->channels, OG = OC / G;
+    if (spingalett_conv_direct(in, out, mode)) {
+        const uint64_t work = (uint64_t)n * out->height * out->width * out->kernel_h * out->kernel_w * CG * OG;
+        for (uint32_t g = 0; g < G; g++) {
+            SpingalettBiasActivation epilogue = {bias + (size_t)g * OG, act == ACT_SOFTMAX ? ACT_NONE : act,
+                                                 scale ? scale + (size_t)g * OG : NULL};
+            SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
+            spingalett_conv_direct_forward(in, out, g, Wt, x, y, n, scratch, &hooks,
+                                           mode == COMPUTE_OPENMP && work >= SPINGALETT_GEMM_PARALLEL_WORK,
+                                           scratch_threads(gemm));
+        }
+        return;
+    }
     const size_t K = (size_t)out->kernel_h * out->kernel_w * CG;
     const uint64_t total = (uint64_t)n * out->height * out->width;
     for (uint32_t g = 0; g < G; g++) {
@@ -674,6 +700,17 @@ void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const f
     /* groups: group g's input channels get the gradients of its filters */
     const uint32_t G = groups_of(out), C = in->channels, CG = C / G, OC = out->channels, OG = OC / G;
     const uint32_t KH = out->kernel_h, KW = out->kernel_w;
+    if (spingalett_conv_direct(in, out, mode)) {
+        const uint64_t work = (uint64_t)n * in->height * in->width * KH * KW * CG * OG;
+        for (uint32_t g = 0; g < G; g++) {
+            Derivative epilogue = {x + (size_t)g * CG, 0, act};
+            SpingalettGemmHooks hooks = {NULL, NULL, act == ACT_NONE ? NULL : multiply_derivative, &epilogue};
+            spingalett_conv_direct_backward_data(in, out, g, Wt, dy, dx, n, scratch, &hooks,
+                                                 mode == COMPUTE_OPENMP && work >= SPINGALETT_GEMM_PARALLEL_WORK,
+                                                 scratch_threads(gemm));
+        }
+        return;
+    }
     const size_t K = (size_t)KH * KW * CG;
     const uint64_t total = (uint64_t)n * in->height * in->width;
     for (uint32_t g = 0; g < G; g++) {
@@ -738,7 +775,14 @@ void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const floa
         return;
     }
     const uint32_t G = groups_of(out);
-    if (G > 1) {
+    const bool direct = spingalett_conv_direct_wgrad(in, out, mode);
+    if (direct) {
+        const uint64_t work = total * K * OC / G;
+        for (uint32_t g = 0; g < G; g++)
+            spingalett_conv_direct_backward_weights(in, out, g, x, dy, n, scale, beta, gW, scratch,
+                                                    mode == COMPUTE_OPENMP && work >= SPINGALETT_GEMM_PARALLEL_WORK,
+                                                    scratch_threads(gemm));
+    } else if (G > 1) {
         /* per group: gW_g[filters of g x window of g] = scale * dy_g^T * windows_g (+ beta * gW_g) */
         const uint32_t C = in->channels, CG = C / G, OG = OC / G;
         const size_t KG = (size_t)out->kernel_h * out->kernel_w * CG;
@@ -777,7 +821,7 @@ void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const floa
        round, T[window x oc] = windows^T * dy, which fills the panels, and T is transposed into gW.
        Gathered by the GEMM, the windows then end in a column of ones, whose row of T is the bias
        gradient: dy is read once. */
-    if (G > 1) {
+    if (G > 1 || direct) {
         /* the bias gradient below */
     } else if (K < 32 && OC > K && !pointwise(out)) {
         float *T = scratch, *col = scratch + ((K * OC + 15u) & ~(size_t)15u);

@@ -266,7 +266,8 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # x86-64 binaries that are not tuned for the build machine (release packages, MinGW) also carry
-# GEMM kernels for AVX2 and AVX-512 (Src/Spingalett.GEMM.c) and batched INT8 kernels for AVX-512
+# GEMM and convolution kernels for AVX2 and AVX-512 (Src/Spingalett.GEMM.c, Src/Spingalett.ConvGEMM.c)
+# and batched INT8 kernels for AVX-512
 # VNNI and AVX-VNNI (Src/Spingalett.Int8Tiles.c), and pick them at run time; AArch64 Linux ones
 # carry INT8 kernels for the dot product instructions.
 option(SPINGALETT_CPU_DISPATCH "Choose AVX2, AVX-512, VNNI and ARM dot product kernels at run time on builds without -march=native" ON)
@@ -280,13 +281,15 @@ if(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MAT
         ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX2.c
         ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX512.c)
     target_sources(spingalett PRIVATE ${SPINGALETT_GEMM_VARIANTS}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.ConvGEMM.AVX2.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.ConvGEMM.AVX512.c
                    ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVX512.c
                    ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c)
     target_compile_definitions(spingalett PRIVATE SPINGALETT_GEMM_DISPATCH SPINGALETT_INT8_DISPATCH)
     # -fno-lto: link-time optimization must not move code between instruction sets
-    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX2.c
+    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX2.c Src/Kernels/Spingalett.ConvGEMM.AVX2.c
         PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-fno-lto")
-    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX512.c
+    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX512.c Src/Kernels/Spingalett.ConvGEMM.AVX512.c
         PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mfma;-fno-lto")
     set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVX512.c
         PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vnni;-mavx2;-mfma;-fno-lto")

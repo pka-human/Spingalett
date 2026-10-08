@@ -365,6 +365,90 @@ SPINGALETT_GEMM_KERNELS(spingalett_gemm_avx512)
 #undef SPINGALETT_GEMM_KERNELS
 #endif
 
+/* Convolutions as indirect matrix products (Spingalett.ConvGEMM.c): windows read straight from the
+   image through per-tap pointers. They run where spingalett_conv_direct() holds (native kernels,
+   not depthwise, at most SPINGALETT_CONV_DIRECT_TAPS taps), the weight gradient where
+   spingalett_conv_direct_wgrad() does too, a group at a time; the scratch they take is sized by the
+   functions below, from the widest panels and tiles of any kernel set. The epilogue (or NULL) runs
+   on every tile of rows of the group's columns. */
+#define SPINGALETT_CONV_DIRECT_TAPS 64u
+#define SPINGALETT_CONV_NR_MAX 32u
+#define SPINGALETT_CONV_MR_MAX 12u
+#define SPINGALETT_CONV_WGRAD_MIN 1024u     /* pixels per slot of the weight gradient, at least */
+#define SPINGALETT_CONV_WGRAD_SLOTS 32u     /* slots at most */
+#define SPINGALETT_CONV_WGRAD_BLOCK 128u    /* pixels whose tap pointers are made at once */
+
+static inline bool spingalett_conv_direct(const LayerShape *in, const LayerShape *out, ComputeMode mode) {
+#if defined(SPINGALETT_NO_DIRECT_CONV)      /* for comparisons with the products of gathered windows */
+    (void)in; (void)out; (void)mode;
+    return false;
+#endif
+    uint32_t G = out->groups ? out->groups : 1u;
+    return mode != COMPUTE_OPENBLAS && !(G > 1 && in->channels == G) &&
+           (uint64_t)out->kernel_h * out->kernel_w <= SPINGALETT_CONV_DIRECT_TAPS;
+}
+
+static inline bool spingalett_conv_direct_wgrad(const LayerShape *in, const LayerShape *out, ComputeMode mode) {
+    uint32_t G = out->groups ? out->groups : 1u;
+    return spingalett_conv_direct(in, out, mode) && (in->channels / G) % 16u == 0 &&
+           out->channels / G >= SPINGALETT_CONV_MR_MAX;
+}
+
+static inline size_t spingalett_conv_direct_packed_floats(uint32_t cols, uint32_t K) {
+    return ((((size_t)cols + SPINGALETT_CONV_NR_MAX - 1) / SPINGALETT_CONV_NR_MAX * SPINGALETT_CONV_NR_MAX * K) + 15u) &
+           ~(size_t)15u;
+}
+
+static inline uint32_t spingalett_conv_wgrad_slots(uint64_t pixels) {
+    uint64_t slots = pixels / SPINGALETT_CONV_WGRAD_MIN;
+    if (slots > SPINGALETT_CONV_WGRAD_SLOTS) slots = SPINGALETT_CONV_WGRAD_SLOTS;
+    return slots < 1 ? 1u : (uint32_t)slots;
+}
+
+static inline size_t spingalett_conv_wgrad_partial_floats(uint32_t OG, uint32_t K, uint32_t slots) {
+    return (((size_t)OG + SPINGALETT_CONV_MR_MAX - 1) * ((size_t)K + SPINGALETT_CONV_NR_MAX - 1) * slots + 15u) &
+           ~(size_t)15u;
+}
+
+static inline size_t spingalett_conv_wgrad_zero_floats(uint32_t CG) {
+    return ((size_t)CG + SPINGALETT_CONV_NR_MAX + 15u) & ~(size_t)15u;
+}
+
+/* Floats of scratch the direct passes of a convolution need: the forward pass and data gradient
+   their packed weights and zeros, the weight gradient its partial sums, zeros and tap pointers. */
+static inline size_t spingalett_conv_direct_scratch(const LayerShape *in, const LayerShape *out, uint32_t n,
+                                                    bool training, int threads) {
+    const uint32_t G = out->groups ? out->groups : 1u, CG = in->channels / G, OG = out->channels / G;
+    const uint32_t taps = out->kernel_h * out->kernel_w, wide = (CG > OG ? CG : OG) + 32u;
+    size_t need = spingalett_conv_direct_packed_floats(OG, taps * CG) + wide;
+    if (training) {
+        size_t data = spingalett_conv_direct_packed_floats(CG, taps * OG) + wide;
+        if (data > need) need = data;
+        if (spingalett_conv_direct_wgrad(in, out, COMPUTE_SINGLE_THREADED)) {
+            uint64_t pixels = (uint64_t)n * out->height * out->width;
+            size_t w = spingalett_conv_wgrad_partial_floats(OG, taps * CG, spingalett_conv_wgrad_slots(pixels)) +
+                       spingalett_conv_wgrad_zero_floats(CG) +
+                       (size_t)(threads > 0 ? threads : 1) * 2u * SPINGALETT_CONV_WGRAD_BLOCK * 2u + 16u;
+            if (w > need) need = w;
+        }
+    }
+    return need;
+}
+
+void spingalett_conv_direct_forward(const LayerShape *in, const LayerShape *out, uint32_t g, const float *W,
+                                    const float *x, float *y, uint32_t n, float *scratch,
+                                    const SpingalettGemmHooks *epilogue, bool parallel, int threads);
+void spingalett_conv_direct_backward_data(const LayerShape *in, const LayerShape *out, uint32_t g, const float *W,
+                                          const float *dy, float *dx, uint32_t n, float *scratch,
+                                          const SpingalettGemmHooks *epilogue, bool parallel, int threads);
+/* gW = scale * (sum over the batch) + beta * gW for group g's filters (the bias gradient is the
+   caller's) */
+void spingalett_conv_direct_backward_weights(const LayerShape *in, const LayerShape *out, uint32_t g, const float *x,
+                                             const float *dy, uint32_t n, float scale, float beta, float *gW,
+                                             float *scratch, bool parallel, int threads);
+/* Threads a GEMM scratch was made for. */
+int spingalett_gemm_scratch_threads(const SpingalettGemmScratch *scratch);
+
 /* An epilogue adding a bias per column, after multiplying by a scale per column when scale is set,
    and applying an element-wise activation (not softmax). Rows are activated one by one: tile
    columns start at multiples of 8, so every element takes the vector or scalar path it takes in a

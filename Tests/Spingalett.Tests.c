@@ -78,6 +78,10 @@ static void make_data(uint32_t N, uint32_t in, uint32_t out, LossFunction loss, 
     }
 }
 
+/* Weight rows longer than this (when set) are scaled by sqrt(limit / length), so that wide windows do
+   not saturate their activations at the check's weights. */
+static uint32_t gradcheck_fan_in_limit = 0;
+
 // One full-batch SGD step with lr=1 => analytic grad = W_before - W_after.
 static void gradcheck_net(const char *name, NeuralNetwork *net, ComputeMode mode, TrainingStrategy strat) {
     uint32_t N = strat == STRATEGY_SAMPLE ? 1 : 6;
@@ -87,6 +91,14 @@ static void gradcheck_net(const char *name, NeuralNetwork *net, ComputeMode mode
     spingalett_set_compute_mode(mode);
     for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = frand() * 1.2f - 0.6f;
     for (uint64_t i = 0; i < net->total_biases; i++) net->biases[i] = frand() * 0.2f - 0.1f;
+    for (uint32_t l = 1; gradcheck_fan_in_limit && l < net->layers; l++) {
+        SpingalettNetworkLayer d;
+        spingalett_network_layer(net, l, &d);
+        uint64_t len = d.bias_count ? d.weight_count / d.bias_count : 0;
+        if (len > gradcheck_fan_in_limit)
+            for (uint64_t i = 0; i < d.weight_count; i++)
+                net->weights[net->weight_offsets[l - 1] + i] *= sqrtf((float)gradcheck_fan_in_limit / (float)len);
+    }
     uint64_t nw = net->total_weights, nb = net->total_biases;
     float *w0 = malloc(nw * 4), *b0 = malloc(nb * 4);
     memcpy(w0, net->weights, nw * 4); memcpy(b0, net->biases, nb * 4);
@@ -195,6 +207,22 @@ static NeuralNetwork *conv_net(int which) {
             max_pool2d(.net = net, .kernel = 2);
             conv2d(.net = net, .filters = 5, .kernel = 1, .groups = 5, .act_func = ACT_FOO52);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_SIGMOID);
+            return net;
+        case 8:     /* 16 input channels per group and at least 12 filters: the indirect weight
+                       gradient, grouped and strided, then a pointwise one */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 4, .width = 4, .channels = 32);
+            conv2d(.net = net, .filters = 24, .kernel = 3, .stride = 2, .padding = 1, .groups = 2, .act_func = ACT_TANH);
+            conv2d(.net = net, .filters = 12, .kernel = 1, .groups = 1, .act_func = ACT_NONE);
+            avg_pool2d(.net = net, .kernel = 2);
+            layer(.net = net, .neurons_amount = 2, .act_func = ACT_SIGMOID);
+            return net;
+        case 9:     /* the same in a 3 x 3 convolution of stride 1 over 16 channels, padded */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 5, .width = 4, .channels = 16);
+            conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_SIGMOID);
+            conv2d(.net = net, .filters = 13, .kernel = 2, .act_func = ACT_TANH);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
             return net;
         default:    /* one input channel, more filters than window weights (the weight gradient is
                        multiplied the other way round), ReLU into max pooling */
@@ -426,6 +454,84 @@ static void augmentation(void) {
     CHECK(same, "augmented training differs between compute modes or thread counts");
     free(ref);
     free(xs); free(ys);
+    spingalett_set_num_threads(4);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* The weight and bias gradients of a convolution output layer for given output gradients (over
+   40 samples of 8 x 8 cells: several slots of pixels), against sums in double, and the same bits on
+   1, 3 and 4 threads. */
+static void conv_weight_gradient(void) {
+    static const struct { uint32_t c, f, k, stride, pad, groups; } cases[] = {
+        {32, 24, 3, 1, 1, 2}, {16, 16, 3, 2, 1, 1}, {16, 12, 1, 1, 0, 1}, {48, 18, 2, 1, 0, 1},
+    };
+    for (size_t t = 0; t < sizeof cases / sizeof cases[0]; t++) {
+        const uint32_t n = 40, C = cases[t].c, F = cases[t].f, K = cases[t].k, G = cases[t].groups;
+        float *ref = NULL;
+        bool same = true;
+        double worst = 0.0;
+        for (int v = 0; v < 4; v++) {
+            static const unsigned threads[] = {1, 1, 3, 4};
+            spingalett_set_num_threads(threads[v]);
+            spingalett_set_compute_mode(v ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+            lcg_state = 90 + (unsigned)t;
+            NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 8, .width = 8, .channels = C);
+            conv2d(.net = net, .filters = F, .kernel = K, .stride = cases[t].stride, .padding = cases[t].pad, .groups = G,
+                   .act_func = ACT_NONE);
+            SpingalettNetworkLayer o;
+            spingalett_network_layer(net, 1, &o);
+            const uint32_t in = 64 * C, out = o.outputs;
+            float *x = malloc((size_t)n * in * 4), *dy = malloc((size_t)n * out * 4);
+            for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2 - 1;
+            for (size_t i = 0; i < (size_t)n * out; i++) dy[i] = frand() * 2 - 1;
+            for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = frand() - 0.5f;
+            SpingalettTrainer *tr = spingalett_trainer_new(net, n);
+            spingalett_trainer_forward(tr, x, n);
+            spingalett_trainer_backward_output_grads(tr, dy);
+            float *gw = malloc(o.weight_count * 4), gb[64];
+            spingalett_get_parameters(net, 1, PARAM_WEIGHT_GRADIENTS, gw, o.weight_count);
+            spingalett_get_parameters(net, 1, PARAM_BIAS_GRADIENTS, gb, o.bias_count);
+            if (v == 0) {
+                /* gW[f][kh][kw][c] = sum over samples and output cells of dy * the input cell it covers */
+                const uint32_t CG = C / G, FG = F / G;
+                for (uint32_t f = 0; f < F; f++) {
+                    double db = 0.0;
+                    for (uint32_t s = 0; s < n; s++)
+                        for (uint32_t p = 0; p < o.height * o.width; p++) db += dy[((size_t)s * o.height * o.width + p) * F + f];
+                    worst = fmax(worst, fabs(db - gb[f]) / (1.0 + fabs(db)));
+                    for (uint32_t kh = 0; kh < K; kh++)
+                        for (uint32_t kw = 0; kw < K; kw++)
+                            for (uint32_t c = 0; c < CG; c++) {
+                                double sum = 0.0;
+                                for (uint32_t s = 0; s < n; s++)
+                                    for (uint32_t oh = 0; oh < o.height; oh++)
+                                        for (uint32_t ow = 0; ow < o.width; ow++) {
+                                            int ih = (int)(oh * cases[t].stride + kh) - (int)cases[t].pad;
+                                            int iw = (int)(ow * cases[t].stride + kw) - (int)cases[t].pad;
+                                            if (ih < 0 || iw < 0 || ih >= 8 || iw >= 8) continue;
+                                            sum += (double)dy[(((size_t)s * o.height + oh) * o.width + ow) * F + f] *
+                                                   x[(((size_t)s * 8 + ih) * 8 + iw) * C + (f / FG) * CG + c];
+                                        }
+                                float got = gw[(((size_t)f * K + kh) * K + kw) * CG + c];
+                                worst = fmax(worst, fabs(sum - got) / (1.0 + fabs(sum)));
+                            }
+                }
+                ref = malloc(o.weight_count * 4);
+                memcpy(ref, gw, o.weight_count * 4);
+            } else {
+                same = same && !memcmp(ref, gw, o.weight_count * 4);
+            }
+            free(gw); free(x); free(dy);
+            spingalett_trainer_free(tr);
+            free_network(net);
+        }
+        CHECK(worst < 1e-4 && same, "conv weight gradient %zu: relative error %.2e%s", t, worst,
+              same ? "" : ", differs between thread counts");
+        printf("  conv weight gradient %ux%u, %u -> %u channels, %u groups: error %.1e, identical on 1, 3, 4 threads%s\n",
+               K, K, C, F, G, worst, same ? "" : " -- NO");
+        free(ref);
+    }
     spingalett_set_num_threads(4);
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
@@ -3894,10 +4000,12 @@ int main(int argc, char **argv) {
         static const char *conv_names[] = {"conv same/maxpool/softmax", "conv stride/avgpool/1x1",
                                            "conv rect/maxpool overlap", "conv deep relu/foo52/gap",
                                            "conv narrow window/relu/maxpool", "depthwise x2/pointwise",
-                                           "groups 2/rect/grouped 1x1", "depthwise strided/maxpool"};
+                                           "groups 2/rect/grouped 1x1", "depthwise strided/maxpool",
+                                           "16 channels a group, strided", "16 channels, padded 3x3"};
         for (int m = 0; m < 3; m++) for (int s = 0; s < 3; s++)
-            for (int c = 0; c < 8; c++) {
+            for (int c = 0; c < 10; c++) {
                 lcg_state = 1000 + c;
+                gradcheck_fan_in_limit = c >= 8 ? 32u : 0u;
                 gradcheck_net(conv_names[c], conv_net(c), modes[m], strats[s]);
             }
     }
@@ -3906,6 +4014,7 @@ int main(int argc, char **argv) {
         conv_api();
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) conv_chunks(cm[m]);
+        conv_weight_gradient();
         for (int m = 0; m < 2; m++) conv_learns(cm[m]);
         deterministic_threads();
         augmentation();
