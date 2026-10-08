@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
-## [0.10.0] - Unreleased
+## [0.10.0] - 2026-10-08
 
 "Graphs": networks become directed acyclic graphs of layers (residual connections, concatenated
 branches), models come in from ONNX and PyTorch, the Python package goes to PyPI with the library
@@ -89,7 +89,7 @@ inside, and convolutions read their windows straight from the image.
   16.1 dropped the stack realignment of a function that inlined the thread-local error state and
   still read its arguments through it. `set_error()` now stays out of line.
 
-## [0.9.0] - Unreleased
+## [0.9.0] - 2026-10-08
 
 "Bottlenecks": every part of the library profiled and its slow paths removed, from data set files
 through training and inference to model files and the Python bindings. Measurements on a 4-vCPU
@@ -200,7 +200,7 @@ Xeon @ 2.1 GHz with AVX-512, 4 threads unless noted.
 - Threads opening data sets at the same time no longer race to build the table of 8-bit values.
 - Builds with `SPINGALETT_PORTABLE_KERNELS` and without `-march=native` link again (broken in 0.8).
 
-## [0.8.0] - Unreleased
+## [0.8.0] - 2026-10-08
 
 Deeper convolutional networks: batch normalization, grouped and depthwise convolutions, image
 augmentation and a CIFAR-10 example.
@@ -573,6 +573,9 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[0.10.0]: https://github.com/pka-human/Spingalett/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/pka-human/Spingalett/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/pka-human/Spingalett/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pka-human/Spingalett/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pka-human/Spingalett/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/pka-human/Spingalett/compare/v0.4.1...v0.5.0
