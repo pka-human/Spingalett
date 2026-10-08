@@ -4113,17 +4113,21 @@ static double gpu_max_rel(const float *a, const float *b, size_t n) {
     return worst;
 }
 
-/* Trains network `which` and returns its outputs on x, predicted on the CPU, and its parameters. */
+/* Trains network `which` (images augmented with `augment`) and returns its outputs on x, predicted on
+   the CPU, and its parameters. */
 static float *gpu_trained(int which, ComputeMode mode, const float *x, const float *t, uint32_t n, uint32_t out_sz,
-                          OptimizerType opt, TrainingStrategy strategy, float clip, float **params, size_t *count,
-                          TrainReport *report) {
+                          OptimizerType opt, TrainingStrategy strategy, float clip, bool augment, float **params,
+                          size_t *count, TrainReport *report) {
     NeuralNetwork *net = gpu_net(which);
     spingalett_set_compute_mode(mode);
     spingalett_seed(99);
+    /* images are augmented (on the GPU, where the training set is kept, the CPU's shifts and mirrors) */
+    const bool image = augment && net->shapes[0].height > 1;
     *report = train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 3, .training_strategy = strategy,
                     .batch_size = 32, .optimizer_type = opt,
                     .learning_rate = opt == OPTIMIZER_SGD || opt == OPTIMIZER_MOMENTUM ? 0.05f : 0.002f,
-                    .weight_decay = 1e-3f, .max_grad_norm = clip, .label_smoothing = 0.05f, .report_interval = 0);
+                    .weight_decay = 1e-3f, .max_grad_norm = clip, .label_smoothing = 0.05f, .report_interval = 0,
+                    .augment_shift = image ? 2u : 0u, .augment_flip = image);
     spingalett_set_compute_mode(COMPUTE_OPENMP);
     float *y = (float *)malloc((size_t)n * out_sz * sizeof(float));
     predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
@@ -4177,17 +4181,18 @@ static void gpu_equivalence(int which) {
     size_t count;
     TrainReport rc, rg, rg2;
     const float clip = which == 1 ? 0.5f : 0.0f;
-    float *oc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], STRATEGY_SMALL_BATCH, clip, &wc, &count, &rc);
-    float *og = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], STRATEGY_SMALL_BATCH, clip, &wg, &count, &rg);
-    float *og2 = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], STRATEGY_SMALL_BATCH, clip, &wg2, &count, &rg2);
+    const TrainingStrategy mini = STRATEGY_SMALL_BATCH, whole = STRATEGY_FULL_BATCH;
+    float *oc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], mini, clip, true, &wc, &count, &rc);
+    float *og = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], mini, clip, true, &wg, &count, &rg);
+    float *og2 = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], mini, clip, true, &wg2, &count, &rg2);
     double trained = gpu_max_rel(oc, og, (size_t)n * out_sz);
     bool same = !memcmp(wg, wg2, count * sizeof(float)) && !memcmp(og, og2, (size_t)n * out_sz * sizeof(float));
     /* full batch: the CPU normalizes over chunks of a bounded size, so only networks without batch
        normalization compare */
     float *fc, *fg;
     TrainReport fr1, fr2;
-    float *ofc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], STRATEGY_FULL_BATCH, 0.0f, &fc, &count, &fr1);
-    float *ofg = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], STRATEGY_FULL_BATCH, 0.0f, &fg, &count, &fr2);
+    float *ofc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], whole, 0.0f, true, &fc, &count, &fr1);
+    float *ofg = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], whole, 0.0f, true, &fg, &count, &fr2);
     double full = which == 5 ? 0.0 : gpu_max_rel(ofc, ofg, (size_t)n * out_sz);
     CHECK(predicted < 1e-4, "gpu net %d: predictions differ by %.2e", which, predicted);
     CHECK(rg.status == TRAIN_COMPLETED && fr2.status == TRAIN_COMPLETED, "gpu net %d: training failed", which);
@@ -4492,7 +4497,7 @@ static void gpu_bf16(void) {
         for (int k = 0; k < 3; k++) {
             spingalett_set_gpu_precision(k == 0 ? PRECISION_FLOAT32 : PRECISION_BFLOAT16);
             o[k] = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, OPTIMIZER_MOMENTUM, STRATEGY_SMALL_BATCH, 0.0f,
-                               &w[k], &count, &r[k]);
+                               false, &w[k], &count, &r[k]);
         }
         spingalett_set_gpu_precision(PRECISION_FLOAT32);
         bool same = !memcmp(w[1], w[2], count * sizeof(float));

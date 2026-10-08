@@ -71,3 +71,4 @@ float derivative(float y, uint act) {
 #define STEP_STEP_HI    6u
 #define STEP_POSITION   7u      /* uint: position of the chunk's first sample in its step */
 #define STEP_CLIP       8u      /* float: gradient scale of norm clipping (1: none) */
+#define STEP_GRAD_SCALE 9u      /* float: the step API's gradient scale (one over its samples) */
