@@ -1,10 +1,13 @@
 name: Release
 
-# Builds, tests and packages the library on every supported platform, and DigitPad as a Linux
-# AppImage and a Windows zip around one trained model. On a pull request this only checks that
-# everything builds and packages; pushing a tag vX.Y.Z publishes a GitHub release with the files.
-# workflow_dispatch (re)publishes an existing tag, optionally without binaries for versions that
-# predate this workflow. Only the highest version is marked as the latest release.
+# Builds, tests and packages the library on every supported platform, Python wheels with the library
+# inside, and DigitPad as a Linux AppImage and a Windows zip around one trained model. On a pull
+# request this only checks that everything builds and packages; pushing a tag vX.Y.Z publishes a
+# GitHub release with the files, and the wheels on PyPI when the repository variable PYPI_PUBLISH is
+# "true" (trusted publishing: PyPI must list this repository, release.yml and the environment "pypi"
+# as a publisher of the project). workflow_dispatch (re)publishes an existing tag, optionally without
+# binaries for versions that predate this workflow. Only the highest version is marked as the
+# latest release.
 
 on:
   push:
@@ -221,6 +224,94 @@ jobs:
           path: ${{ env.ARCHIVE }}.*
           if-no-files-found: error
 
+      # Python wheels from the baseline macOS and Windows builds (Linux wheels: the wheels job)
+      - uses: actions/setup-python@v5
+        if: matrix.name == 'macos-universal' || matrix.name == 'windows-x86_64'
+        with:
+          python-version: '3.12'
+      - name: Wheel
+        if: matrix.name == 'macos-universal' || matrix.name == 'windows-x86_64'
+        shell: bash
+        run: |
+          python -m pip install --quiet build wheel numpy
+          rm -f Bindings/Python/spingalett/*.so* Bindings/Python/spingalett/*.dylib Bindings/Python/spingalett/*.dll
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "$ARCHIVE"/bin/*.dll Bindings/Python/spingalett/           # the library and its MinGW runtime
+            platform=win_amd64
+          else
+            cp "$ARCHIVE"/lib/libspingalett.*.dylib "$ARCHIVE"/lib/libomp.dylib Bindings/Python/spingalett/
+            platform=macosx_11_0_universal2
+          fi
+          python -m build --wheel --outdir wheelhouse Bindings/Python
+          python -m wheel tags --remove --platform-tag "$platform" wheelhouse/*.whl
+          python -m pip install wheelhouse/*.whl
+          cd Tests && env -u SPINGALETT_LIBRARY python test_python_bindings.py
+      - uses: actions/upload-artifact@v4
+        if: matrix.name == 'macos-universal' || matrix.name == 'windows-x86_64'
+        with:
+          name: wheel-${{ matrix.name }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # manylinux wheels: the library built in the manylinux 2.28 images (glibc 2.28, any Linux of 2018
+  # on), libgomp vendored by auditwheel; x86-64 builds choose AVX2 or AVX-512 kernels at run time
+  wheels:
+    needs: version
+    if: needs.version.outputs.binaries == 'true'
+    name: wheel-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  os: ubuntu-24.04 }
+          - { arch: aarch64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Build the library
+        run: |
+          python3.12 -m pip install --quiet cmake ninja build wheel numpy
+          export PATH="/opt/python/cp312-cp312/bin:$PATH"
+          gcc --version | head -1
+          cmake -S . -B Build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON \
+                -DBUILD_EXAMPLE=OFF
+          cmake --build Build --parallel
+          ctest --test-dir Build --output-on-failure -R core
+      - name: Wheel
+        run: |
+          export PATH="/opt/python/cp312-cp312/bin:$PATH"
+          cp Bin/libspingalett.so.* Bindings/Python/spingalett/
+          python -m build --wheel --outdir dist Bindings/Python
+          auditwheel repair --plat manylinux_2_28_${{ matrix.arch }} -w wheelhouse dist/*.whl
+          for py in cp310-cp310 cp312-cp312 cp313-cp313; do
+            "/opt/python/$py/bin/python" -m pip install --quiet numpy wheelhouse/*.whl
+            (cd Tests && env -u SPINGALETT_LIBRARY "/opt/python/$py/bin/python" test_python_bindings.py | tail -1)
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - run: |
+          python3 -m pip install --quiet build
+          python3 -m build --sdist --outdir dist Bindings/Python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   # the inference engine's three source files, for firmware projects
   engine:
     needs: version
@@ -344,11 +435,28 @@ jobs:
           path: build/windows/DigitPad-*-windows-x86_64.zip
           if-no-files-found: error
 
+  pypi:
+    needs: [version, package, wheels, sdist]
+    if: needs.version.outputs.publish == 'true' && vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
   publish:
-    needs: [version, package, engine, model, appimage, digitpad-windows]
+    needs: [version, package, wheels, sdist, engine, model, appimage, digitpad-windows]
     if: >-
       always() && needs.version.outputs.publish == 'true' &&
       (needs.package.result == 'success' || needs.package.result == 'skipped') &&
+      (needs.wheels.result == 'success' || needs.wheels.result == 'skipped') &&
       (needs.engine.result == 'success' || needs.engine.result == 'skipped') &&
       (needs.model.result == 'success' || needs.model.result == 'skipped') &&
       (needs.appimage.result == 'success' || needs.appimage.result == 'skipped') &&
@@ -372,6 +480,12 @@ jobs:
         with:
           path: dist
           pattern: release-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4       # the Python wheels, also attached to the release
+        if: needs.version.outputs.binaries == 'true'
+        with:
+          path: dist
+          pattern: wheel-*
           merge-multiple: true
       - name: Notes and checksums
         run: |

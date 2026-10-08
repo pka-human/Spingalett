@@ -119,7 +119,7 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 ## Releases
 
 The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`
-and `Bindings/Python/spingalett.py`. `.github/workflows/release.yml` builds packages for Linux
+and `Bindings/Python/spingalett/__init__.py`. `.github/workflows/release.yml` builds packages for Linux
 (x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), trains the DigitPad model
 (2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip. The
 maintainer merges pull requests and pushes tags.

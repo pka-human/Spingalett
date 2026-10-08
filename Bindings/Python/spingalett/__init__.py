@@ -2,11 +2,11 @@
 # Copyright (c) 2026 pka_human (pka_human@proton.me)
 """Python bindings for the Spingalett C23 deep learning engine.
 
-Pure ``ctypes`` over the shared library: nothing is compiled at install time.
-The library is located in this order:
+Pure ``ctypes`` over the shared library: nothing is compiled at install time, and the wheels on
+PyPI carry the library inside the package. The library is located in this order:
 
 1. the ``SPINGALETT_LIBRARY`` environment variable (full path to the library),
-2. next to this module, then the repository's ``Bin/`` directory,
+2. inside this package (wheels), then the repository's ``Bin/`` directory,
 3. the system loader (``LD_LIBRARY_PATH``, ``DYLD_LIBRARY_PATH``, ``PATH``).
 
 Example::
@@ -504,8 +504,10 @@ def _load_library() -> ctypes.CDLL:
         return ctypes.CDLL(env)
 
     here = os.path.dirname(os.path.abspath(__file__))
+    if sys.platform.startswith("win") and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(here)              # the runtime DLLs a wheel carries next to the library
     candidates = [os.path.join(here, n) for n in _library_names()]
-    candidates += [os.path.join(here, "..", "..", "Bin", n) for n in _library_names()]
+    candidates += [os.path.join(here, "..", "..", "..", "Bin", n) for n in _library_names()]   # a checkout
     for path in candidates:
         if os.path.exists(path):
             return ctypes.CDLL(os.path.normpath(path))
