@@ -29,10 +29,8 @@
 
 typedef struct { const char *s; size_t n; } Name;
 
-static bool name_is(Name a, const char *b) { return a.n == strlen(b) && memcmp(a.s, b, a.n) == 0; }
-static bool name_eq(Name a, Name b) { return a.n == b.n && memcmp(a.s, b.s, a.n) == 0; }
-
-enum { DT_F32, DT_F16, DT_BF16, DT_F64, DT_I64, DT_OTHER };
+static bool name_is(Name a, const char *b) { return a.n == strlen(b) && (a.n == 0 || memcmp(a.s, b, a.n) == 0); }
+static bool name_eq(Name a, Name b) { return a.n == b.n && (a.n == 0 || memcmp(a.s, b.s, a.n) == 0); }
 
 /* A tensor of the file: its name, type, shape and strides (in elements), and its bytes. */
 typedef struct {
@@ -69,10 +67,6 @@ static Weight *new_weight(Weights *w) {
     return t;
 }
 
-static size_t dtype_size(int dtype) {
-    return dtype == DT_F32 ? 4u : dtype == DT_F16 || dtype == DT_BF16 ? 2u : dtype == DT_F64 || dtype == DT_I64 ? 8u : 0u;
-}
-
 /* Elements of the shape; UINT64_MAX when the product overflows. */
 static uint64_t elements(const Weight *t) {
     uint64_t n = 1;
@@ -92,16 +86,9 @@ static bool element(const Weight *t, uint64_t i, float *v) {
         at += (i % extent) * (uint64_t)t->strides[d];
         i /= extent;
     }
-    size_t size = dtype_size(t->dtype);
+    size_t size = spingalett_dtype_size(t->dtype);
     if (size == 0 || at >= t->bytes / size) return false;
-    const uint8_t *p = t->data + at * size;
-    switch (t->dtype) {
-        case DT_F32: memcpy(v, p, 4); break;
-        case DT_F16: *v = spingalett_fp16_to_float(slett_get16(p)); break;
-        case DT_BF16: *v = spingalett_bf16_to_float(slett_get16(p)); break;
-        case DT_F64: { double x; memcpy(&x, p, 8); *v = (float)x; break; }
-        default: { int64_t x; memcpy(&x, p, 8); *v = (float)x; break; }
-    }
+    spingalett_decode(v, t->data + at * size, t->dtype, 1);
     return true;
 }
 
@@ -194,7 +181,7 @@ static bool read_safetensors(const uint8_t *data, size_t size, Weights *w) {
         Weight *t = new_weight(w);
         if (!t) return werr(w, "out of memory");
         t->name = name;
-        t->dtype = DT_OTHER;
+        t->dtype = SPG_DTYPE_OTHER;
         uint64_t begin = 0, end = 0;
         bool have_offsets = false;
         if (!json_char(&j, '{')) { j.ok = false; break; }
@@ -203,8 +190,9 @@ static bool read_safetensors(const uint8_t *data, size_t size, Weights *w) {
             if (!j.ok || !json_char(&j, ':')) { j.ok = false; break; }
             if (name_is(key, "dtype")) {
                 Name v = json_string(&j);
-                t->dtype = name_is(v, "F32") ? DT_F32 : name_is(v, "F16") ? DT_F16 : name_is(v, "BF16") ? DT_BF16
-                         : name_is(v, "F64") ? DT_F64 : name_is(v, "I64") ? DT_I64 : DT_OTHER;
+                t->dtype = name_is(v, "F32") ? SPG_DTYPE_F32 : name_is(v, "F16") ? SPG_DTYPE_F16
+                         : name_is(v, "BF16") ? SPG_DTYPE_BF16 : name_is(v, "F64") ? SPG_DTYPE_F64
+                         : name_is(v, "I32") ? SPG_DTYPE_I32 : name_is(v, "I64") ? SPG_DTYPE_I64 : SPG_DTYPE_OTHER;
             } else if (name_is(key, "shape")) {
                 if (!json_char(&j, '[')) { j.ok = false; break; }
                 if (!json_char(&j, ']')) {
@@ -232,7 +220,7 @@ static bool read_safetensors(const uint8_t *data, size_t size, Weights *w) {
         t->data = body + begin;
         t->bytes = end - begin;
         contiguous_strides(t);
-        if (dtype_size(t->dtype) && elements(t) * dtype_size(t->dtype) != t->bytes)
+        if (spingalett_dtype_size(t->dtype) && elements(t) * spingalett_dtype_size(t->dtype) != t->bytes)
             return werr(w, "a tensor's size does not match its shape");
     } while (j.ok && json_char(&j, ','));
     if (!j.ok || !json_char(&j, '}')) return werr(w, "the safetensors header cannot be read");
@@ -414,12 +402,12 @@ static bool global_is(const Ob *o, const char *module, const char *name) {
 
 static int storage_dtype(const Ob *type) {
     static const struct { const char *name; int dtype; } types[] = {
-        {"FloatStorage", DT_F32}, {"HalfStorage", DT_F16}, {"BFloat16Storage", DT_BF16},
-        {"DoubleStorage", DT_F64}, {"LongStorage", DT_I64},
+        {"FloatStorage", SPG_DTYPE_F32}, {"HalfStorage", SPG_DTYPE_F16}, {"BFloat16Storage", SPG_DTYPE_BF16},
+        {"DoubleStorage", SPG_DTYPE_F64}, {"IntStorage", SPG_DTYPE_I32}, {"LongStorage", SPG_DTYPE_I64},
     };
     for (size_t k = 0; k < sizeof types / sizeof types[0]; k++)
         if (global_is(type, "torch", types[k].name)) return types[k].dtype;
-    return DT_OTHER;
+    return SPG_DTYPE_OTHER;
 }
 
 /* A tuple of integers as a shape or strides. */
@@ -753,13 +741,14 @@ static const Weight *tensor_of(const Weights *w, Name module, const char *suffix
     return NULL;
 }
 
-/* Copies tensor t (of `count` elements in the shape given) into dst through map(i) (NULL: in order). */
-static bool copy_tensor(Weights *w, const Weight *t, const int64_t *shape, int ndims, float *dst, Name module,
-                        const char *what, const uint32_t *map) {
+/* Whether tensor t has the shape given, a type that converts to float and every element within its
+   storage; sets the error naming module.what otherwise. *at: its bytes from the first element when it
+   is stored in row-major order of the shape, NULL when its strides differ. */
+static bool check_tensor(Weights *w, const Weight *t, const int64_t *shape, int ndims, Name module, const char *what,
+                         const uint8_t **at) {
     bool fits = t->ndims == ndims;
     for (int d = 0; fits && d < ndims; d++) fits = t->dims[d] == shape[d];
-    uint64_t n = elements(t);
-    if (!fits || dtype_size(t->dtype) == 0 || t->offset == UINT64_MAX) {
+    if (!fits || spingalett_dtype_size(t->dtype) == 0 || t->offset == UINT64_MAX) {
         char msg[200], dims[64] = "";
         for (int d = 0, used = 0; d < t->ndims && used < 56; d++)
             used += snprintf(dims + used, sizeof dims - used, "%s%lld", d ? ", " : "", (long long)t->dims[d]);
@@ -767,12 +756,119 @@ static bool copy_tensor(Weights *w, const Weight *t, const int64_t *shape, int n
                  ndims == 4 ? "convolution filters" : ndims == 2 ? "dense weights" : "per-channel size");
         return werr(w, msg);
     }
-    for (uint64_t i = 0; i < n; i++) {
-        float v;
-        if (!element(t, i, &v)) return werr(w, "a tensor's data exceeds its storage");
-        dst[map ? map[i] : i] = v;
+    /* the last element: within the storage */
+    const uint64_t size = spingalett_dtype_size(t->dtype);
+    uint64_t last = t->offset, expect = 1;
+    bool rows = true;
+    for (int d = t->ndims - 1; d >= 0; d--) {
+        uint64_t extent = (uint64_t)t->dims[d];
+        if (extent == 0) { *at = NULL; return true; }
+        if (t->strides[d] < 0 || (extent > 1 && (uint64_t)t->strides[d] > (UINT64_MAX - last) / (extent - 1)))
+            return werr(w, "a tensor's data exceeds its storage");
+        last += (extent - 1) * (uint64_t)t->strides[d];
+        rows &= extent == 1 || (uint64_t)t->strides[d] == expect;
+        expect *= extent;
     }
+    if (last >= t->bytes / size) return werr(w, "a tensor's data exceeds its storage");
+    *at = rows ? t->data + t->offset * size : NULL;
     return true;
+}
+
+/* The elements of t in row-major order into dst, through its strides. */
+static void gather(const Weight *t, float *dst) {
+    uint64_t n = elements(t);
+    for (uint64_t i = 0; i < n; i++) (void)element(t, i, &dst[i]);
+}
+
+/* What one module's tensors become: in the first pass every tensor is checked and the scratch counted,
+   in the second (write) they are copied, which cannot fail then. */
+typedef struct {
+    bool write;
+    float *scratch;
+    size_t scratch_need;
+} Pass;
+
+static void need(Pass *p, size_t floats) { if (floats > p->scratch_need) p->scratch_need = floats; }
+
+static bool put_vector(Weights *w, Pass *p, const Weight *t, uint32_t n, float *dst, Name module, const char *what) {
+    const int64_t shape[1] = {n};
+    const uint8_t *at;
+    if (!check_tensor(w, t, shape, 1, module, what, &at)) return false;
+    if (!p->write) return true;
+    if (at) spingalett_decode(dst, at, t->dtype, n);
+    else gather(t, dst);
+    return true;
+}
+
+static bool put_filters(Weights *w, Pass *p, const Weight *t, uint32_t OC, uint32_t CG, uint32_t KH, uint32_t KW,
+                        float *dst, Name module) {
+    const int64_t shape[4] = {OC, CG, KH, KW};
+    const uint8_t *at;
+    if (!check_tensor(w, t, shape, 4, module, "weight", &at)) return false;
+    const size_t count = (size_t)OC * CG * KH * KW, filters = spingalett_filters_scratch(CG, KH, KW);
+    if (!p->write) { need(p, at ? filters : count + filters); return true; }
+    int dtype = t->dtype;
+    if (!at) {                              /* strided: gathered first */
+        gather(t, p->scratch + filters);
+        at = (const uint8_t *)(p->scratch + filters);
+        dtype = SPG_DTYPE_F32;
+    }
+    spingalett_import_filters(dst, at, dtype, OC, CG, KH, KW, p->scratch);
+    return true;
+}
+
+static bool put_dense(Weights *w, Pass *p, const Weight *t, uint32_t rows, uint32_t cols, uint32_t C, uint32_t HW,
+                      float *dst, Name module) {
+    const int64_t shape[2] = {rows, cols};
+    const uint8_t *at;
+    if (!check_tensor(w, t, shape, 2, module, "weight", &at)) return false;
+    /* a transposed view ([cols][rows] in memory, as x @ W saves it) reads as a transposed product */
+    const bool transposed = !at && t->strides[0] == 1 && t->strides[1] == (int64_t)rows;
+    const size_t count = (size_t)rows * cols, scratch = spingalett_dense_scratch(rows, cols, transposed);
+    if (!p->write) { need(p, at || transposed ? scratch : count + scratch); return true; }
+    int dtype = t->dtype;
+    if (transposed) {
+        at = t->data + t->offset * spingalett_dtype_size(dtype);
+    } else if (!at) {
+        gather(t, p->scratch + scratch);
+        at = (const uint8_t *)(p->scratch + scratch);
+        dtype = SPG_DTYPE_F32;
+    }
+    spingalett_import_dense(dst, at, dtype, rows, cols, C, HW, transposed, 1.0f, p->scratch);
+    return true;
+}
+
+/* Copies module `mod` into layer l (a dense, convolution or batch normalization layer). */
+static bool put_module(NeuralNetwork *net, Weights *w, Pass *p, uint32_t l, Name mod) {
+    char msg[200];
+    const LayerShape *s = &net->shapes[l];
+    const uint32_t src = spingalett_source(net, l), rows = spingalett_weight_rows(net, l - 1);
+    float *W = net->weights + net->weight_offsets[l - 1], *b = net->biases + net->bias_offsets[l - 1];
+    const Weight *tw = tensor_of(w, mod, "weight"), *tb = tensor_of(w, mod, "bias");
+    if (s->type == LAYER_BATCH_NORM) {
+        const Weight *mean = tensor_of(w, mod, "running_mean"), *var = tensor_of(w, mod, "running_var");
+        if (!mean || !var) {
+            snprintf(msg, sizeof msg, "module '%.*s' is no batch normalization, which layer %u is", (int)mod.n, mod.s, l);
+            return werr(w, msg);
+        }
+        uint64_t o = net->bias_offsets[l - 1];
+        if (p->write)
+            for (uint32_t c = 0; c < rows; c++) { W[c] = 1.0f; b[c] = 0.0f; }     /* without affine parameters */
+        return (!tw || put_vector(w, p, tw, rows, W, mod, "weight")) && (!tb || put_vector(w, p, tb, rows, b, mod, "bias")) &&
+               put_vector(w, p, mean, rows, net->running_mean + o, mod, "running_mean") &&
+               put_vector(w, p, var, rows, net->running_var + o, mod, "running_var");
+    }
+    if (!tw) {
+        snprintf(msg, sizeof msg, "module '%.*s' has no weight for layer %u", (int)mod.n, mod.s, l);
+        return werr(w, msg);
+    }
+    if (p->write)
+        for (uint32_t r = 0; r < rows; r++) b[r] = 0.0f;
+    const LayerShape *in = &net->shapes[src];
+    bool ok = s->type == LAYER_CONV2D
+            ? put_filters(w, p, tw, rows, in->channels / s->groups, s->kernel_h, s->kernel_w, W, mod)
+            : put_dense(w, p, tw, rows, net->topology[src], in->channels, in->height * in->width, W, mod);
+    return ok && (!tb || put_vector(w, p, tb, rows, b, mod, "bias"));
 }
 
 static bool assign(NeuralNetwork *net, Weights *w, const char *const *names, uint32_t name_count, bool sort) {
@@ -796,79 +892,36 @@ static bool assign(NeuralNetwork *net, Weights *w, const char *const *names, uin
                     Name t = modules[j]; modules[j] = modules[j - 1]; modules[j - 1] = t;
                 }
     }
-    size_t next = 0;
+    /* every module checked before any parameter changes, so that an error leaves the network as it was */
+    Pass pass = {0};
     bool ok = true;
-    uint32_t *map = NULL;
-    for (uint32_t l = 1; ok && l < net->layers; l++) {
-        const LayerShape *s = &net->shapes[l];
-        if (s->type != LAYER_DENSE && s->type != LAYER_CONV2D && s->type != LAYER_BATCH_NORM) continue;
-        char msg[200];
-        if (next == m) {
-            snprintf(msg, sizeof msg, "the file has weights for %zu layers; the network has more (layer %u is the first "
-                     "without)", m, l);
-            ok = werr(w, msg);
-            break;
+    for (int write = 0; ok && write < 2; write++) {
+        pass.write = write;
+        if (write && pass.scratch_need) {
+            pass.scratch = (float *)malloc(pass.scratch_need * sizeof(float));
+            if (!pass.scratch) { ok = werr(w, "out of memory"); break; }
         }
-        Name mod = modules[next++];
-        const uint32_t src = spingalett_source(net, l), rows = spingalett_weight_rows(net, l - 1);
-        float *W = net->weights + net->weight_offsets[l - 1], *b = net->biases + net->bias_offsets[l - 1];
-        const Weight *tw = tensor_of(w, mod, "weight"), *tb = tensor_of(w, mod, "bias");
-        if (s->type == LAYER_BATCH_NORM) {
-            const Weight *mean = tensor_of(w, mod, "running_mean"), *var = tensor_of(w, mod, "running_var");
-            if (!mean || !var) {
-                snprintf(msg, sizeof msg, "module '%.*s' is no batch normalization, which layer %u is", (int)mod.n, mod.s, l);
+        size_t next = 0;
+        for (uint32_t l = 1; ok && l < net->layers; l++) {
+            const LayerType type = net->shapes[l].type;
+            if (type != LAYER_DENSE && type != LAYER_CONV2D && type != LAYER_BATCH_NORM) continue;
+            if (next == m) {
+                char msg[200];
+                snprintf(msg, sizeof msg, "the file has weights for %zu layers; the network has more (layer %u is the "
+                         "first without)", m, l);
                 ok = werr(w, msg);
                 break;
             }
-            const int64_t shape[1] = {rows};
-            uint64_t o = net->bias_offsets[l - 1];
-            for (uint32_t c = 0; c < rows; c++) { W[c] = 1.0f; b[c] = 0.0f; }     /* without affine parameters */
-            ok = (!tw || copy_tensor(w, tw, shape, 1, W, mod, "weight", NULL)) &&
-                 (!tb || copy_tensor(w, tb, shape, 1, b, mod, "bias", NULL)) &&
-                 copy_tensor(w, mean, shape, 1, net->running_mean + o, mod, "running_mean", NULL) &&
-                 copy_tensor(w, var, shape, 1, net->running_var + o, mod, "running_var", NULL);
-            continue;
+            ok = put_module(net, w, &pass, l, modules[next++]);
         }
-        if (!tw) {
-            snprintf(msg, sizeof msg, "module '%.*s' has no weight for layer %u", (int)mod.n, mod.s, l);
+        if (ok && next < m) {
+            char msg[200];
+            snprintf(msg, sizeof msg, "the file has weights for %zu layers, the network %zu ('%.*s' is left)", m, next,
+                     (int)modules[next].n, modules[next].s);
             ok = werr(w, msg);
-            break;
         }
-        const int64_t bshape[1] = {rows};
-        for (uint32_t r = 0; r < rows; r++) b[r] = 0.0f;
-        const LayerShape *in = &net->shapes[src];
-        if (s->type == LAYER_CONV2D) {
-            /* [OC][IC/g][KH][KW] -> [OC][KH][KW][IC/g] */
-            const uint32_t CG = in->channels / s->groups, KH = s->kernel_h, KW = s->kernel_w;
-            const int64_t shape[4] = {rows, CG, KH, KW};
-            free(map);
-            map = (uint32_t *)malloc((size_t)rows * CG * KH * KW * sizeof(uint32_t));
-            if (!map) { ok = werr(w, "out of memory"); break; }
-            for (uint32_t o = 0, i = 0; o < rows; o++)
-                for (uint32_t c = 0; c < CG; c++)
-                    for (uint32_t y = 0; y < KH; y++)
-                        for (uint32_t x = 0; x < KW; x++, i++) map[i] = ((o * KH + y) * KW + x) * CG + c;
-            ok = copy_tensor(w, tw, shape, 4, W, mod, "weight", map);
-        } else {
-            /* a map read flat: columns from (c, h, w) to (h, w, c) */
-            const uint32_t cols = net->topology[src], C = in->channels, HW = in->height * in->width;
-            const int64_t shape[2] = {rows, cols};
-            free(map);
-            map = (uint32_t *)malloc((size_t)rows * cols * sizeof(uint32_t));
-            if (!map) { ok = werr(w, "out of memory"); break; }
-            for (uint32_t o = 0, i = 0; o < rows; o++)
-                for (uint32_t k = 0; k < cols; k++, i++) map[i] = o * cols + (HW > 1 ? (k % HW) * C + k / HW : k);
-            ok = copy_tensor(w, tw, shape, 2, W, mod, "weight", map);
-        }
-        ok = ok && (!tb || copy_tensor(w, tb, bshape, 1, b, mod, "bias", NULL));
     }
-    if (ok && next < m) {
-        char msg[200];
-        snprintf(msg, sizeof msg, "the file has weights for %zu layers, the network %zu ('%.*s' is left)", m, next,
-                 (int)modules[next].n, modules[next].s);
-        ok = werr(w, msg);
-    }
-    free(map);
+    free(pass.scratch);
     free(modules);
     return ok;
 }
@@ -884,27 +937,7 @@ bool spingalett_load_pytorch_from_memory(NeuralNetwork *net, const void *data, s
     const uint8_t *p = (const uint8_t *)data;
     bool zip = size >= 4 && slett_get32(p) == 0x04034b50u;
     bool ok = zip ? read_torch_zip(p, size, &w, &u) : read_safetensors(p, size, &w);
-    /* the parameters change only when every tensor fits: a copy takes them first */
-    float *saved = NULL;
-    if (ok) {
-        size_t nw = (size_t)net->total_weights, nb = (size_t)net->total_biases;
-        saved = (float *)malloc((nw + 3 * nb + 1) * sizeof(float));
-        if (!saved) ok = werr(&w, "out of memory");
-        else {
-            memcpy(saved, net->weights, nw * sizeof(float));
-            memcpy(saved + nw, net->biases, nb * sizeof(float));
-            memcpy(saved + nw + nb, net->running_mean, nb * sizeof(float));
-            memcpy(saved + nw + 2 * nb, net->running_var, nb * sizeof(float));
-            ok = assign(net, &w, modules, module_count, !zip);
-            if (!ok) {
-                memcpy(net->weights, saved, nw * sizeof(float));
-                memcpy(net->biases, saved + nw, nb * sizeof(float));
-                memcpy(net->running_mean, saved + nw + nb, nb * sizeof(float));
-                memcpy(net->running_var, saved + nw + 2 * nb, nb * sizeof(float));
-            }
-        }
-    }
-    free(saved);
+    ok = ok && assign(net, &w, modules, module_count, !zip);
     for (uint32_t k = 0; k < u.count; k++) free(u.obs[k].items);
     free(u.obs);
     free(u.stack);
@@ -923,10 +956,9 @@ bool spingalett_load_pytorch(NeuralNetwork *net, const char *path, const char *c
         set_error(SPINGALETT_ERR_INVALID, "PyTorch weights: path is NULL");
         return false;
     }
-    size_t size = 0;
-    void *data = spingalett_read_file(path, &size);
-    if (!data) return false;
-    bool ok = spingalett_load_pytorch_from_memory(net, data, size, modules, module_count);
-    spingalett_aligned_free(data);
+    SpgFileView file;
+    if (!spingalett_file_open(&file, path)) return false;
+    bool ok = spingalett_load_pytorch_from_memory(net, file.data, file.size, modules, module_count);
+    spingalett_file_close(&file);
     return ok;
 }

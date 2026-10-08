@@ -89,8 +89,8 @@ static Str pb_str(Pb *r) {
     return (Str){(const char *)b.p, (size_t)(b.end - b.p)};
 }
 
-static bool str_is(Str a, const char *b) { return a.n == strlen(b) && memcmp(a.s, b, a.n) == 0; }
-static bool str_eq(Str a, Str b) { return a.n == b.n && memcmp(a.s, b.s, a.n) == 0; }
+static bool str_is(Str a, const char *b) { return a.n == strlen(b) && (a.n == 0 || memcmp(a.s, b, a.n) == 0); }
+static bool str_eq(Str a, Str b) { return a.n == b.n && (a.n == 0 || memcmp(a.s, b.s, a.n) == 0); }
 
 /* ------------------------------------------------------------------------- tensors and attributes */
 
@@ -105,11 +105,25 @@ typedef struct {
     int64_t dims[MAX_DIMS];
     int ndims;
     int32_t type;
-    Pb raw;                     /* raw_data, or the packed typed data */
-    bool has_raw, packed_floats, packed_ints, external;
+    Pb raw;                     /* raw_data, or the bytes of the external file */
+    bool has_raw, external;
     Pb typed;                   /* float_data / int32_data / int64_data / double_data */
     uint32_t typed_wire;
+    Str location;               /* external data: the file (relative to the model's), offset and length */
+    uint64_t offset, length;
+    bool has_length;
 } TensorRef;
+
+/* A decimal string as a number; false when it is not one. */
+static bool str_u64(Str s, uint64_t *v) {
+    *v = 0;
+    if (s.n == 0 || s.n > 19) return false;
+    for (size_t k = 0; k < s.n; k++) {
+        if (s.s[k] < '0' || s.s[k] > '9') return false;
+        *v = *v * 10u + (uint64_t)(s.s[k] - '0');
+    }
+    return true;
+}
 
 static void read_tensor(Pb r, TensorRef *t) {
     memset(t, 0, sizeof *t);
@@ -144,6 +158,19 @@ static void read_tensor(Pb r, TensorRef *t) {
             pb_skip(&r, w);
         } else if (f == 14 && w == WIRE_VARINT) {
             t->external = pb_varint(&r) == 1;
+        } else if (f == 13 && w == WIRE_BYTES) {
+            /* external_data: key-value pairs */
+            Pb e = pb_bytes(&r);
+            Str key = {0}, value = {0};
+            uint32_t ef, ew;
+            while (pb_next(&e, &ef, &ew)) {
+                if (ef == 1 && ew == WIRE_BYTES) key = pb_str(&e);
+                else if (ef == 2 && ew == WIRE_BYTES) value = pb_str(&e);
+                else pb_skip(&e, ew);
+            }
+            if (str_is(key, "location")) t->location = value;
+            else if (str_is(key, "offset") && !str_u64(value, &t->offset)) t->offset = UINT64_MAX;
+            else if (str_is(key, "length")) t->has_length = str_u64(value, &t->length) || (t->length = UINT64_MAX, true);
         } else {
             pb_skip(&r, w);
         }
@@ -161,15 +188,24 @@ static uint64_t tensor_count(const TensorRef *t) {
     return n;
 }
 
-static float half_to_float(uint16_t h) { return spingalett_fp16_to_float(h); }
+/* The element type of an ONNX tensor type (SPG_DTYPE_OTHER: not numeric). */
+static int onnx_dtype(int32_t type) {
+    switch (type) {
+        case ONNX_FLOAT: return SPG_DTYPE_F32;
+        case ONNX_INT32: return SPG_DTYPE_I32;
+        case ONNX_INT64: return SPG_DTYPE_I64;
+        case ONNX_FLOAT16: return SPG_DTYPE_F16;
+        case ONNX_DOUBLE: return SPG_DTYPE_F64;
+        case ONNX_BFLOAT16: return SPG_DTYPE_BF16;
+        default: return SPG_DTYPE_OTHER;
+    }
+}
 
 /* Elements the tensor's data can hold at most (raw: its bytes over the element size; typed fields:
    one byte each at least), so that a shape larger than the file is rejected before allocating. */
 static uint64_t tensor_capacity(const TensorRef *t) {
     if (t->has_raw) {
-        uint64_t size = t->type == ONNX_FLOAT || t->type == ONNX_INT32 ? 4u
-                      : t->type == ONNX_INT64 || t->type == ONNX_DOUBLE ? 8u
-                      : t->type == ONNX_FLOAT16 || t->type == ONNX_BFLOAT16 ? 2u : 0u;
+        uint64_t size = spingalett_dtype_size(onnx_dtype(t->type));
         return size ? (uint64_t)(t->raw.end - t->raw.p) / size : 0u;
     }
     return t->typed.ok ? (uint64_t)(t->typed.end - t->typed.p) : 0u;
@@ -180,21 +216,9 @@ static uint64_t tensor_capacity(const TensorRef *t) {
 static bool tensor_floats(const TensorRef *t, float *out, uint64_t count) {
     if (t->external) return false;
     if (t->has_raw) {
-        uint64_t size = t->type == ONNX_FLOAT || t->type == ONNX_INT32 ? 4u
-                      : t->type == ONNX_INT64 || t->type == ONNX_DOUBLE ? 8u
-                      : t->type == ONNX_FLOAT16 || t->type == ONNX_BFLOAT16 ? 2u : 0u;
+        uint64_t size = spingalett_dtype_size(onnx_dtype(t->type));
         if (size == 0 || (uint64_t)(t->raw.end - t->raw.p) < count * size) return false;
-        const uint8_t *p = t->raw.p;
-        for (uint64_t i = 0; i < count; i++, p += size) {
-            switch (t->type) {
-                case ONNX_FLOAT: memcpy(&out[i], p, 4); break;
-                case ONNX_INT32: { int32_t v; memcpy(&v, p, 4); out[i] = (float)v; break; }
-                case ONNX_INT64: { int64_t v; memcpy(&v, p, 8); out[i] = (float)v; break; }
-                case ONNX_DOUBLE: { double v; memcpy(&v, p, 8); out[i] = (float)v; break; }
-                case ONNX_FLOAT16: out[i] = half_to_float(slett_get16(p)); break;
-                default: out[i] = spingalett_bf16_to_float(slett_get16(p)); break;
-            }
-        }
+        spingalett_decode(out, t->raw.p, onnx_dtype(t->type), (size_t)count);
         return true;
     }
     if (count == 0) return true;
@@ -324,18 +348,62 @@ typedef struct {
     uint32_t c, h, w;
     bool flat;
     bool alias;                 /* another name of a layer's output (made by a node that read one) */
-    float *data;                /* constants */
+    TensorRef tensor;           /* constants: where their data is (in the file) */
+    float *data;                /* constants: their values as floats, once something needed them */
+    bool owned;                 /* data is this value's to free */
     int64_t dims[MAX_DIMS];
     int ndims;
     uint64_t count;
 } Value;
 
+/* Names to numbers: an open-addressing hash table. */
+typedef struct { Str name; uint32_t value; bool used; } Slot;
+typedef struct { Slot *slots; size_t cap, count; } Table;
+
+static uint64_t str_hash(Str s) {
+    uint64_t h = 1469598103934665603ull;                    /* FNV-1a */
+    for (size_t k = 0; k < s.n; k++) h = (h ^ (uint8_t)s.s[k]) * 1099511628211ull;
+    return h;
+}
+
+/* The slot of name: its entry, or the free slot where it goes (the table has room). */
+static Slot *table_slot(const Table *t, Str name) {
+    size_t k = (size_t)str_hash(name) & (t->cap - 1);
+    while (t->slots[k].used && !str_eq(t->slots[k].name, name)) k = (k + 1) & (t->cap - 1);
+    return &t->slots[k];
+}
+
+/* Room for one more entry: the table at most half full. */
+static bool table_room(Table *t) {
+    if (2 * (t->count + 1) <= t->cap) return true;
+    size_t cap = t->cap ? 2 * t->cap : 64;
+    Table grown = {(Slot *)calloc(cap, sizeof(Slot)), cap, t->count};
+    if (!grown.slots) return false;
+    for (size_t k = 0; k < t->cap; k++)
+        if (t->slots[k].used) *table_slot(&grown, t->slots[k].name) = t->slots[k];
+    free(t->slots);
+    *t = grown;
+    return true;
+}
+
+static const Slot *table_find(const Table *t, Str name) {
+    if (!t->cap) return NULL;
+    const Slot *slot = table_slot(t, name);
+    return slot->used ? slot : NULL;
+}
+
+/* An external data file, mapped once for every tensor in it. */
+typedef struct { Str location; SpgFileView view; } External;
+
 typedef struct {
     NeuralNetwork *net;
     Value *values;
     size_t nvalues, cap;
-    Str *uses;                  /* every node input and graph output, to count readers */
-    size_t nuses;
+    Table names;                /* value names: the index of the latest value of each */
+    Table uses;                 /* every node input and graph output: how often each name is read */
+    const char *dir;            /* the model's folder (with its separator), for external data; NULL: none */
+    External *externals;
+    size_t nexternals;
     char error[256];
     bool bias_open;             /* the last layer is a product whose bias a following Add may set */
 } Importer;
@@ -347,9 +415,8 @@ static bool fail(Importer *im, const char *fmt, Str a, Str b) {
 }
 
 static Value *find(Importer *im, Str name) {
-    for (size_t k = im->nvalues; k > 0; k--)
-        if (str_eq(im->values[k - 1].name, name)) return &im->values[k - 1];
-    return NULL;
+    const Slot *slot = table_find(&im->names, name);
+    return slot ? &im->values[slot->value] : NULL;
 }
 
 static Value *add_value(Importer *im, Str name) {
@@ -360,6 +427,10 @@ static Value *add_value(Importer *im, Str name) {
         im->values = v;
         im->cap = cap;
     }
+    if (!table_room(&im->names)) return NULL;
+    Slot *slot = table_slot(&im->names, name);
+    if (!slot->used) *slot = (Slot){name, 0, true}, im->names.count++;
+    slot->value = (uint32_t)im->nvalues;
     Value *v = &im->values[im->nvalues++];
     memset(v, 0, sizeof *v);
     v->name = name;
@@ -368,9 +439,36 @@ static Value *add_value(Importer *im, Str name) {
 
 /* Readers of a value (node inputs and graph outputs). */
 static uint32_t readers(const Importer *im, Str name) {
-    uint32_t n = 0;
-    for (size_t k = 0; k < im->nuses; k++) n += str_eq(im->uses[k], name);
-    return n;
+    const Slot *slot = table_find(&im->uses, name);
+    return slot ? slot->value : 0u;
+}
+
+/* A constant's values as floats: decoded when first needed. NULL when they cannot be read. */
+static const float *constant_floats(Importer *im, Value *v) {
+    static const float none = 0.0f;
+    if (v->data || v->count == 0) return v->data ? v->data : &none;
+    v->data = (float *)malloc((size_t)v->count * sizeof(float));
+    v->owned = v->data != NULL;
+    if (v->data && !tensor_floats(&v->tensor, v->data, v->count)) {
+        free(v->data);
+        v->data = NULL;
+        v->owned = false;
+    }
+    if (!v->data) fail(im, "ONNX import: the constant '%.*s' cannot be read%.*s", v->name, (Str){"", 0});
+    return v->data;
+}
+
+/* A constant's data for a weight conversion: its bytes in the file when they are raw values of a
+   numeric type, else its values decoded. */
+static const uint8_t *constant_bytes(Importer *im, Value *v, int *dtype) {
+    const TensorRef *t = &v->tensor;
+    const uint64_t size = spingalett_dtype_size(onnx_dtype(t->type));
+    if (!v->data && t->has_raw && !t->external && size && (uint64_t)(t->raw.end - t->raw.p) / size >= v->count) {
+        *dtype = onnx_dtype(t->type);
+        return t->raw.p;
+    }
+    *dtype = SPG_DTYPE_F32;
+    return (const uint8_t *)constant_floats(im, v);
 }
 
 /* Readers of a layer's output under all of its names, the nodes that only renamed it aside. */
@@ -393,14 +491,15 @@ static const Value *layer_input(Importer *im, const Node *n, int k) {
     return v;
 }
 
-static const Value *constant_input(Importer *im, const Node *n, int k, uint64_t count) {
+/* Input k as a constant of count values (any count: 0), its values decoded. */
+static Value *constant_input(Importer *im, const Node *n, int k, uint64_t count) {
     if (k >= n->ninputs || n->inputs[k].n == 0) return NULL;
-    const Value *v = find(im, n->inputs[k]);
+    Value *v = find(im, n->inputs[k]);
     if (!v || !v->constant || (count && v->count != count)) {
         fail(im, "ONNX import: %.*s needs the constant '%.*s' of the expected size", n->op, n->inputs[k]);
         return NULL;
     }
-    return v;
+    return constant_floats(im, v) ? v : NULL;
 }
 
 /* A new layer's output, viewed with the shape Spingalett gives it. */
@@ -517,7 +616,7 @@ static bool convert_conv(Importer *im, const Node *n) {
     const Value *x = layer_input(im, n, 0);
     if (!x) return false;
     if (x->flat) return fail(im, "ONNX import: Conv node '%.*s' reads a flattened tensor%.*s", n->name, (Str){"", 0});
-    const Value *W = find(im, n->inputs[1]);
+    Value *W = find(im, n->inputs[1]);
     if (!W || !W->constant || W->ndims != 4)
         return fail(im, "ONNX import: Conv node '%.*s' needs constant 4-D weights%.*s", n->name, (Str){"", 0});
     uint32_t kh, kw, sh, sw, ph, pw;
@@ -527,17 +626,20 @@ static bool convert_conv(Importer *im, const Node *n) {
         return fail(im, "ONNX import: Conv node '%.*s' has weights that do not fit its input%.*s", n->name, (Str){"", 0});
     const Value *B = n->ninputs > 2 && n->inputs[2].n ? constant_input(im, n, 2, OC) : NULL;
     if (n->ninputs > 2 && n->inputs[2].n && !B) return false;
+    int dtype;
+    const uint8_t *src = constant_bytes(im, W, &dtype);
+    float *scratch = (float *)malloc(spingalett_filters_scratch(CG, kh, kw) * sizeof(float));
+    if (!src || !scratch) {
+        free(scratch);
+        return fail(im, "ONNX import: the weights of Conv node '%.*s' cannot be read%.*s", n->name, (Str){"", 0});
+    }
     uint32_t l = conv2d(.net = im->net, .inputs = {x->layer}, .input_count = 1, .filters = OC, .kernel_h = kh,
                         .kernel_w = kw, .stride_h = sh, .stride_w = sw, .padding_h = ph, .padding_w = pw,
                         .groups = groups, .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_NONE);
-    if (!added(im, l, n)) return false;
+    if (!added(im, l, n)) { free(scratch); return false; }
     /* [OC][CG][KH][KW] -> [OC][KH][KW][CG] */
-    float *dst = layer_weights(im->net, l);
-    for (uint32_t o = 0; o < OC; o++)
-        for (uint32_t c = 0; c < CG; c++)
-            for (uint32_t i = 0; i < kh; i++)
-                for (uint32_t j = 0; j < kw; j++)
-                    dst[(((size_t)o * kh + i) * kw + j) * CG + c] = W->data[(((size_t)o * CG + c) * kh + i) * kw + j];
+    spingalett_import_filters(layer_weights(im->net, l), src, dtype, OC, CG, kh, kw, scratch);
+    free(scratch);
     if (B) memcpy(layer_biases(im->net, l), B->data, OC * sizeof(float));
     im->bias_open = B == NULL;
     return layer_output(im, n, l) != NULL;
@@ -545,24 +647,26 @@ static bool convert_conv(Importer *im, const Node *n) {
 
 /* A dense layer y = x W^T + b from rows of W (out x in, row-major) as the reading of x requires:
    the columns of a flattened map reordered from (c, h, w) to (h, w, c). */
-static bool dense_layer(Importer *im, const Node *n, const Value *x, const float *W, bool transposed, uint32_t out,
+static bool dense_layer(Importer *im, const Node *n, const Value *x, Value *W, bool transposed, uint32_t out,
                         uint32_t in, const float *bias, float alpha, float beta) {
     if (in != x->c * x->h * x->w)
         return fail(im, "ONNX import: %.*s node '%.*s' has weights that do not fit its input", n->op, n->name);
     if (x->h * x->w > 1 && !x->flat)
         return fail(im, "ONNX import: %.*s node '%.*s' multiplies a map that is not flattened", n->op, n->name);
+    const uint32_t C = x->c, HW = x->h * x->w;
+    int dtype;
+    const uint8_t *src = constant_bytes(im, W, &dtype);
+    float *scratch = (float *)malloc(spingalett_dense_scratch(out, in, transposed) * sizeof(float));
+    if (!src || !scratch) {
+        free(scratch);
+        return fail(im, "ONNX import: the weights of %.*s node '%.*s' cannot be read", n->op, n->name);
+    }
     uint32_t l = layer(.net = im->net, .inputs = {x->layer}, .input_count = 1, .neurons_amount = out,
                        .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_NONE);
-    if (!added(im, l, n)) return false;
-    float *dst = layer_weights(im->net, l);
-    const uint32_t C = x->c, HW = x->h * x->w;
-    for (uint32_t o = 0; o < out; o++)
-        for (uint32_t k = 0; k < in; k++) {
-            /* ONNX column k = (c, p) in c-major order; ours (p, c) */
-            uint32_t c = k / HW, p = k % HW;
-            float v = transposed ? W[(size_t)k * out + o] : W[(size_t)o * in + k];
-            dst[(size_t)o * in + (size_t)p * C + c] = alpha * v;
-        }
+    if (!added(im, l, n)) { free(scratch); return false; }
+    /* ONNX column k = (c, p) of a flattened map in c-major order; ours (p, c) */
+    spingalett_import_dense(layer_weights(im->net, l), src, dtype, out, in, C, HW, transposed, alpha, scratch);
+    free(scratch);
     float *b = layer_biases(im->net, l);
     for (uint32_t o = 0; o < out; o++) b[o] = bias ? beta * bias[o] : 0.0f;
     im->bias_open = bias == NULL;
@@ -575,7 +679,7 @@ static bool convert_gemm(Importer *im, const Node *n) {
     if (!x) return false;
     if (attr_int(n, "transA", 0) != 0)
         return fail(im, "ONNX import: Gemm node '%.*s' transposes its input (transA)%.*s", n->name, (Str){"", 0});
-    const Value *W = find(im, n->inputs[1]);
+    Value *W = find(im, n->inputs[1]);
     if (!W || !W->constant || W->ndims != 2)
         return fail(im, "ONNX import: Gemm node '%.*s' needs constant 2-D weights%.*s", n->name, (Str){"", 0});
     bool transB = attr_int(n, "transB", 0) != 0;
@@ -589,7 +693,7 @@ static bool convert_gemm(Importer *im, const Node *n) {
         if (!bias) return fail(im, "ONNX import: out of memory%.*s%.*s", (Str){"", 0}, (Str){"", 0});
         for (uint32_t o = 0; o < out; o++) bias[o] = C->count == 1 ? C->data[0] : C->data[o];
     }
-    bool ok = dense_layer(im, n, x, W->data, !transB, out, in, bias, attr_float(n, "alpha", 1.0f), attr_float(n, "beta", 1.0f));
+    bool ok = dense_layer(im, n, x, W, !transB, out, in, bias, attr_float(n, "alpha", 1.0f), attr_float(n, "beta", 1.0f));
     free(bias);
     return ok;
 }
@@ -597,20 +701,21 @@ static bool convert_gemm(Importer *im, const Node *n) {
 static bool convert_matmul(Importer *im, const Node *n) {
     const Value *x = layer_input(im, n, 0);
     if (!x) return false;
-    const Value *W = find(im, n->inputs[1]);
+    Value *W = find(im, n->inputs[1]);
     if (!W || !W->constant || W->ndims != 2)
         return fail(im, "ONNX import: MatMul node '%.*s' needs a constant 2-D right operand%.*s", n->name, (Str){"", 0});
-    return dense_layer(im, n, x, W->data, true, (uint32_t)W->dims[1], (uint32_t)W->dims[0], NULL, 1.0f, 1.0f);
+    return dense_layer(im, n, x, W, true, (uint32_t)W->dims[1], (uint32_t)W->dims[0], NULL, 1.0f, 1.0f);
 }
 
 static bool convert_add(Importer *im, const Node *n) {
     if (n->ninputs != 2) return fail(im, "ONNX import: Add node '%.*s' needs two inputs%.*s", n->name, (Str){"", 0});
-    const Value *a = find(im, n->inputs[0]), *b = find(im, n->inputs[1]);
+    Value *a = find(im, n->inputs[0]), *b = find(im, n->inputs[1]);
     if (!a || !b) return fail(im, "ONNX import: an input of Add node '%.*s' is unknown%.*s", n->name, (Str){"", 0});
     if (a->constant && b->constant) return fail(im, "ONNX import: Add node '%.*s' of two constants%.*s", n->name, (Str){"", 0});
     if (a->constant || b->constant) {
         /* a bias: per output of the product just added (MatMul, Gemm or Conv without one) */
-        const Value *x = a->constant ? b : a, *c = a->constant ? a : b;
+        const Value *x = a->constant ? b : a;
+        Value *c = a->constant ? a : b;
         NeuralNetwork *net = im->net;
         LayerType type = x->layer ? net->shapes[x->layer].type : LAYER_DENSE;
         uint32_t rows = x->layer ? spingalett_weight_rows(net, x->layer - 1) : 0;
@@ -619,8 +724,10 @@ static bool convert_add(Importer *im, const Node *n) {
             (c->count != rows && c->count != 1))
             return fail(im, "ONNX import: Add node '%.*s' adds a constant that is not the bias of a product%.*s", n->name,
                         (Str){"", 0});
+        const float *add = constant_floats(im, c);
+        if (!add) return false;
         float *bias = layer_biases(net, x->layer);
-        for (uint32_t o = 0; o < rows; o++) bias[o] += c->count == 1 ? c->data[0] : c->data[o];
+        for (uint32_t o = 0; o < rows; o++) bias[o] += c->count == 1 ? add[0] : add[o];
         im->bias_open = false;
         Value copy = *x;                /* before add_value, which may move the values */
         copy.alias = true;
@@ -722,11 +829,7 @@ static bool alias(Importer *im, const Node *n, bool flatten) {
     Value copy = *x;
     if (flatten && !x->constant) copy.flat = true;
     copy.alias = !x->constant;
-    if (x->constant && x->data) {   /* a renamed constant gets its own copy of the data */
-        copy.data = (float *)malloc((size_t)(x->count ? x->count : 1) * sizeof(float));
-        if (!copy.data) return false;
-        memcpy(copy.data, x->data, (size_t)x->count * sizeof(float));
-    }
+    copy.owned = false;             /* a renamed constant shares the data (freed with the values) */
     Value *y = add_value(im, n->outputs[0]);
     if (!y) return false;
     Str name = y->name;
@@ -737,15 +840,16 @@ static bool alias(Importer *im, const Node *n, bool flatten) {
 
 static bool convert_reshape(Importer *im, const Node *n) {
     const Value *x = find(im, n->inputs[0]);
-    const Value *shape = n->ninputs > 1 ? find(im, n->inputs[1]) : NULL;
+    Value *shape = n->ninputs > 1 ? find(im, n->inputs[1]) : NULL;
     if (!x || x->constant || !shape || !shape->constant)
         return fail(im, "ONNX import: Reshape node '%.*s' needs a layer output and a constant shape%.*s", n->name, (Str){"", 0});
+    const float *dims = constant_floats(im, shape);
+    if (!dims) return false;
     /* to [N, everything]: a flattening; to the shape it has: nothing */
     uint64_t units = (uint64_t)x->c * x->h * x->w;
-    if (shape->count == 2 && (shape->data[1] == -1.0f || (uint64_t)shape->data[1] == units))
+    if (shape->count == 2 && (dims[1] == -1.0f || (uint64_t)dims[1] == units))
         return alias(im, n, true);
-    if (shape->count == 4 && (uint64_t)shape->data[1] == x->c && (uint64_t)shape->data[2] == x->h &&
-        (uint64_t)shape->data[3] == x->w)
+    if (shape->count == 4 && (uint64_t)dims[1] == x->c && (uint64_t)dims[2] == x->h && (uint64_t)dims[3] == x->w)
         return alias(im, n, false);
     return fail(im, "ONNX import: Reshape node '%.*s' changes the shape other than by flattening it%.*s", n->name,
                 (Str){"", 0});
@@ -762,12 +866,14 @@ static bool convert_constant(Importer *im, const Node *n) {
             v->count = 1;
             v->ndims = 0;
             v->data = (float *)malloc(sizeof(float));
+            v->owned = true;
             if (v->data) v->data[0] = f->f;
         } else if (i) {
             v->count = (uint64_t)i->nints;
             v->ndims = 1;
             v->dims[0] = i->nints;
             v->data = (float *)malloc((size_t)(i->nints ? i->nints : 1) * sizeof(float));
+            v->owned = true;
             for (int k = 0; v->data && k < i->nints && k < MAX_DIMS; k++) v->data[k] = (float)i->ints[k];
         } else {
             return fail(im, "ONNX import: Constant node '%.*s' holds no tensor%.*s", n->name, (Str){"", 0});
@@ -784,9 +890,7 @@ static bool convert_constant(Importer *im, const Node *n) {
     v->ndims = t.ndims > MAX_DIMS ? MAX_DIMS : t.ndims;
     memcpy(v->dims, t.dims, sizeof v->dims);
     v->count = tensor_count(&t);
-    v->data = (float *)malloc((size_t)(v->count ? v->count : 1) * sizeof(float));
-    if (!v->data || !tensor_floats(&t, v->data, v->count))
-        return fail(im, "ONNX import: Constant node '%.*s' holds data that cannot be read%.*s", n->name, (Str){"", 0});
+    v->tensor = t;                  /* decoded when something reads it */
     return true;
 }
 
@@ -815,10 +919,11 @@ static bool convert_node(Importer *im, const Node *n) {
         const Value *x = layer_input(im, n, 0);
         if (!x) return false;
         const Attr *a = attr(n, "axes");
-        const Value *ax = n->ninputs > 1 && n->inputs[1].n ? find(im, n->inputs[1]) : NULL;
+        Value *ax = n->ninputs > 1 && n->inputs[1].n ? find(im, n->inputs[1]) : NULL;
+        const float *axv = !a && ax && ax->constant ? constant_floats(im, ax) : NULL;
         int64_t axes[2] = {0, 0};
-        int count = a ? a->nints : ax && ax->constant ? (int)ax->count : 0;
-        for (int k = 0; k < count && k < 2; k++) axes[k] = a ? a->ints[k] : (int64_t)ax->data[k];
+        int count = a ? a->nints : axv ? (int)ax->count : 0;
+        for (int k = 0; k < count && k < 2; k++) axes[k] = a ? a->ints[k] : (int64_t)axv[k];
         for (int k = 0; k < 2; k++) if (axes[k] < 0) axes[k] += 4;
         if (x->flat || count != 2 || !((axes[0] == 2 && axes[1] == 3) || (axes[0] == 3 && axes[1] == 2)))
             return fail(im, "ONNX import: ReduceMean node '%.*s' averages other axes than a map's height and width%.*s",
@@ -872,7 +977,65 @@ static bool input_shape(Pb vi, Str *name, int64_t *dims, int *ndims) {
     return typed && vi.ok;
 }
 
-NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size) {
+/* A name read once more. */
+static bool count_use(Importer *im, Str name) {
+    if (!table_room(&im->uses)) return false;
+    Slot *slot = table_slot(&im->uses, name);
+    if (!slot->used) *slot = (Slot){name, 0, true}, im->uses.count++;
+    slot->value++;
+    return true;
+}
+
+/* Points a tensor kept in an external file at its bytes there: the file named relative to the
+   model's folder, and inside it (mapped once for all of its tensors). */
+static bool resolve_external(Importer *im, TensorRef *t) {
+    const Str none = {"", 0}, loc = t->location;
+    if (!im->dir)
+        return fail(im, "ONNX import: initializer '%.*s' keeps its data in an external file, which only an import "
+                    "from the model's path can read%.*s", t->name, none);
+    bool inside = loc.n > 0 && loc.s[0] != '/' && loc.s[0] != '\\' && !(loc.n > 1 && loc.s[1] == ':') &&
+                  !memchr(loc.s, 0, loc.n);
+    for (size_t k = 0, start = 0; inside && k <= loc.n; k++)
+        if (k == loc.n || loc.s[k] == '/' || loc.s[k] == '\\') {
+            inside = !(k - start == 2 && loc.s[start] == '.' && loc.s[start + 1] == '.');
+            start = k + 1;
+        }
+    if (!inside)
+        return fail(im, "ONNX import: initializer '%.*s' names an external file outside the model's folder ('%.*s')",
+                    t->name, loc);
+    External *e = NULL;
+    for (size_t k = 0; k < im->nexternals && !e; k++)
+        if (str_eq(im->externals[k].location, loc)) e = &im->externals[k];
+    if (!e) {
+        External *grown = (External *)realloc(im->externals, (im->nexternals + 1) * sizeof(External));
+        size_t dir = strlen(im->dir);
+        char *path = (char *)malloc(dir + loc.n + 1);
+        if (grown) im->externals = grown;
+        if (!grown || !path) { free(path); return fail(im, "ONNX import: out of memory%.*s%.*s", none, none); }
+        memcpy(path, im->dir, dir);
+        memcpy(path + dir, loc.s, loc.n);
+        path[dir + loc.n] = 0;
+        e = &im->externals[im->nexternals];
+        bool opened = spingalett_file_open(&e->view, path);
+        free(path);
+        if (!opened)
+            return fail(im, "ONNX import: the external data file '%.*s' of initializer '%.*s' cannot be read", loc, t->name);
+        e->location = loc;
+        im->nexternals++;
+    }
+    const uint64_t size = e->view.size;
+    const uint64_t length = t->has_length ? t->length : t->offset <= size ? size - t->offset : 0;
+    if (t->offset > size || length > size - t->offset)
+        return fail(im, "ONNX import: the data of initializer '%.*s' lies outside its external file '%.*s'", t->name, loc);
+    t->raw = (Pb){e->view.data + t->offset, e->view.data + t->offset + length, true};
+    t->has_raw = true;
+    t->external = false;
+    return true;
+}
+
+/* The import of a model in memory; dir: its folder (ending in a separator, or empty), for external
+   data, or NULL. */
+static NeuralNetwork *import_onnx(const void *data, size_t size, const char *dir) {
     if (!data) {
         set_error(SPINGALETT_ERR_INVALID, "ONNX import: data is NULL");
         return NULL;
@@ -888,45 +1051,35 @@ NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size)
         return NULL;
     }
 
-    Importer im = {0};
+    Importer im = {.dir = dir};
     bool ok = true;
     /* readers of every value: node inputs and graph outputs */
-    size_t uses = 0;
-    for (int pass = 0; pass < 2 && ok; pass++) {
-        Pb g = graph;
-        while (pb_next(&g, &f, &w)) {
-            if (f == 1 && w == WIRE_BYTES) {
-                Node n;
-                ok = read_node(pb_bytes(&g), &n) && ok;
-                for (int k = 0; k < n.ninputs && k < MAX_NODE_INPUTS; k++, uses++)
-                    if (pass) im.uses[uses] = n.inputs[k];
-            } else if (f == 12 && w == WIRE_BYTES) {
-                Str name = {0};
-                int64_t dims[MAX_DIMS];
-                int nd;
-                (void)input_shape(pb_bytes(&g), &name, dims, &nd);
-                if (pass) im.uses[uses] = name;
-                uses++;
-            } else {
-                pb_skip(&g, w);
-            }
-        }
-        ok = ok && g.ok;
-        if (!pass && ok) {
-            im.uses = (Str *)calloc(uses + 1, sizeof(Str));
-            ok = im.uses != NULL;
-            im.nuses = uses;
-            uses = 0;
+    Pb g = graph;
+    while (ok && pb_next(&g, &f, &w)) {
+        if (f == 1 && w == WIRE_BYTES) {
+            Node n;
+            ok = read_node(pb_bytes(&g), &n);
+            for (int k = 0; ok && k < n.ninputs && k < MAX_NODE_INPUTS; k++) ok = count_use(&im, n.inputs[k]);
+        } else if (f == 12 && w == WIRE_BYTES) {
+            Str name = {0};
+            int64_t dims[MAX_DIMS];
+            int nd;
+            (void)input_shape(pb_bytes(&g), &name, dims, &nd);
+            ok = count_use(&im, name);
+        } else {
+            pb_skip(&g, w);
         }
     }
+    ok = ok && g.ok;
 
-    /* constants: the initializers */
-    Pb g = graph;
+    /* constants: the initializers, read where they are when a node needs them */
+    g = graph;
     while (ok && pb_next(&g, &f, &w)) {
         if (f != 5 || w != WIRE_BYTES) { pb_skip(&g, w); continue; }
         TensorRef t;
         read_tensor(pb_bytes(&g), &t);
-        if (t.ndims > MAX_DIMS || (!t.external && tensor_count(&t) > tensor_capacity(&t))) {
+        if (t.external && !resolve_external(&im, &t)) { ok = false; break; }
+        if (t.ndims > MAX_DIMS || tensor_count(&t) > tensor_capacity(&t)) {
             ok = fail(&im, "ONNX import: initializer '%.*s' holds less data than its shape needs%.*s", t.name, (Str){"", 0});
             break;
         }
@@ -937,11 +1090,7 @@ NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size)
         v->ndims = t.ndims > MAX_DIMS ? MAX_DIMS : t.ndims;
         memcpy(v->dims, t.dims, sizeof v->dims);
         v->count = tensor_count(&t);
-        v->data = (float *)malloc((size_t)(v->count ? v->count : 1) * sizeof(float));
-        if (!v->data || t.external || !tensor_floats(&t, v->data, v->count)) {
-            ok = fail(&im, "ONNX import: initializer '%.*s' cannot be read%.*s", t.name,
-                      t.external ? (Str){" (its data is in an external file)", 34} : (Str){"", 0});
-        }
+        v->tensor = t;
     }
 
     /* the input: the graph input that is no initializer */
@@ -1007,9 +1156,13 @@ NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size)
         ok = spingalett_check_graph(net, "ONNX import");
     }
 
-    for (size_t k = 0; k < im.nvalues; k++) free(im.values[k].data);
+    for (size_t k = 0; k < im.nvalues; k++)
+        if (im.values[k].owned) free(im.values[k].data);
     free(im.values);
-    free(im.uses);
+    free(im.names.slots);
+    free(im.uses.slots);
+    for (size_t k = 0; k < im.nexternals; k++) spingalett_file_close(&im.externals[k].view);
+    free(im.externals);
     if (!ok) {
         if (im.error[0]) {
             set_error(SPINGALETT_ERR_INVALID, im.error);
@@ -1028,10 +1181,23 @@ NeuralNetwork *spingalett_import_onnx(const char *path) {
         set_error(SPINGALETT_ERR_INVALID, "ONNX import: path is NULL");
         return NULL;
     }
-    size_t size = 0;
-    void *data = spingalett_read_file(path, &size);
-    if (!data) return NULL;
-    NeuralNetwork *net = spingalett_import_onnx_from_memory(data, size);
-    spingalett_aligned_free(data);
+    SpgFileView file;
+    if (!spingalett_file_open(&file, path)) return NULL;
+    /* the folder, for external data: the path up to its last separator */
+    size_t dir = strlen(path);
+    while (dir > 0 && path[dir - 1] != '/' && path[dir - 1] != '\\') dir--;
+    char *folder = (char *)malloc(dir + 1);
+    NeuralNetwork *net = NULL;
+    if (folder) {
+        memcpy(folder, path, dir);
+        folder[dir] = 0;
+        net = import_onnx(file.data, file.size, folder);
+    } else {
+        set_error(SPINGALETT_ERR_ALLOC, "ONNX import: out of memory");
+    }
+    free(folder);
+    spingalett_file_close(&file);
     return net;
 }
+
+NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size) { return import_onnx(data, size, NULL); }

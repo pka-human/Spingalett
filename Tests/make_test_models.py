@@ -2,10 +2,11 @@
 """Writes the PyTorch models of the `onnx` test group into Tests/Data, with sample inputs and
 PyTorch's outputs for them:
 
-    python Tests/make_test_models.py       # needs torch, onnxscript (the newer exporter) and safetensors
+    python Tests/make_test_models.py       # needs torch, onnx, onnxscript (the newer exporter) and safetensors
 
-ONNX models exported from PyTorch: NAME.onnx. State dicts: torch_cnn.pt (torch.save) and
-torch_cnn.safetensors, of the network the test builds by hand. For each, NAME.bin holds "SPGT", then
+ONNX models exported from PyTorch: NAME.onnx (onnx_external.onnx: onnx_cnn's weights in
+onnx_external.data). State dicts: torch_cnn.pt (torch.save; torch_cnn_strided.pt with tensors that
+are views) and torch_cnn.safetensors, of the network the test builds by hand. For each, NAME.bin holds "SPGT", then
 as 32-bit little-endian integers the sample count, the floats per input and per output, then the
 inputs (channels last, as Spingalett reads them) and the expected outputs as floats. The models are
 small, seeded and fixed, so the files only change when this script does.
@@ -132,8 +133,26 @@ def main():
         y = model(x)
     torch.save(model.state_dict(), os.path.join(OUT, "torch_cnn.pt"))
     save_file({k: v.contiguous() for k, v in model.state_dict().items()}, os.path.join(OUT, "torch_cnn.safetensors"))
+    # tensors that are views: a transposed dense weight, filters with permuted strides
+    state = model.state_dict()
+    state["body.13.weight"] = state["body.13.weight"].t().contiguous().t()
+    state["body.0.weight"] = state["body.0.weight"].permute(0, 2, 3, 1).contiguous().permute(0, 3, 1, 2)
+    torch.save(state, os.path.join(OUT, "torch_cnn_strided.pt"))
     write_expected("torch_cnn", x, y)
-    print("torch_cnn: .pt and .safetensors")
+    print("torch_cnn: .pt, .safetensors and strided .pt")
+
+    # the CNN with its weights in a file of their own (external data), and one naming a file outside
+    # its folder
+    import onnx
+    m = onnx.load(os.path.join(OUT, "onnx_cnn.onnx"))
+    onnx.save_model(m, os.path.join(OUT, "onnx_external.onnx"), save_as_external_data=True,
+                    all_tensors_to_one_file=True, location="onnx_external.data", size_threshold=0)
+    for t in m.graph.initializer:
+        for e in t.external_data:
+            if e.key == "location":
+                e.value = "../onnx_external.data"
+    onnx.save_model(m, os.path.join(OUT, "onnx_escape.onnx"))
+    print("onnx_external: .onnx and .data; onnx_escape")
 
 
 if __name__ == "__main__":

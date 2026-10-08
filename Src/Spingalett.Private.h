@@ -254,6 +254,34 @@ void spingalett_log(LogLevel level, const char *fmt, ...);
 /* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
    spingalett_aligned_free). NULL on error, with the error set. */
 void *spingalett_read_file(const char *path, size_t *size);
+/* ------------------------------------------------------------------------- importers (Import.c) */
+
+/* A file's bytes: mapped read-only where the platform allows, read into memory otherwise. */
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    void *handle;                   /* the view, or the buffer read */
+    bool mapped;
+} SpgFileView;
+bool spingalett_file_open(SpgFileView *f, const char *path);       /* false with the error set */
+void spingalett_file_close(SpgFileView *f);
+
+/* Element types of imported tensors (little-endian, at any alignment). */
+enum { SPG_DTYPE_F32, SPG_DTYPE_F16, SPG_DTYPE_BF16, SPG_DTYPE_F64, SPG_DTYPE_I32, SPG_DTYPE_I64, SPG_DTYPE_OTHER };
+size_t spingalett_dtype_size(int dtype);                            /* 0 for SPG_DTYPE_OTHER */
+void spingalett_decode(float *dst, const uint8_t *src, int dtype, size_t n);
+/* Filters [OC][CG][KH][KW] at src as [OC][KH][KW][CG], with spingalett_filters_scratch() floats of
+   scratch. */
+size_t spingalett_filters_scratch(uint32_t CG, uint32_t KH, uint32_t KW);
+void spingalett_import_filters(float *dst, const uint8_t *src, int dtype, uint32_t OC, uint32_t CG, uint32_t KH,
+                               uint32_t KW, float *scratch);
+/* Dense weights [out][in] (transposed: [in][out] at src) times alpha, the columns of a map of C
+   channels and HW cells read flat reordered from (c, p) to (p, c); spingalett_dense_scratch() floats
+   of scratch. */
+size_t spingalett_dense_scratch(uint32_t out, uint32_t in, bool transposed);
+void spingalett_import_dense(float *dst, const uint8_t *src, int dtype, uint32_t out, uint32_t in, uint32_t C,
+                             uint32_t HW, bool transposed, float alpha, float *scratch);
+
 /* count strings copied into one allocation (a NULL-terminated array of pointers; free() releases it). */
 char **spingalett_copy_names(const char *const *names, uint32_t count);
 /* load_spingalett_from_memory that also reports the precision of the first weight layer. */

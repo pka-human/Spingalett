@@ -3921,7 +3921,30 @@ static void onnx_models(void) {
         free_network(net);
     }
 
-    char path[512];
+    /* weights in an external file: the same network as with them inside; read from memory, or from a
+       file outside the model's folder, they are refused */
+    char path[512], inside[512];
+    snprintf(path, sizeof path, "%s/onnx_external.onnx", SPINGALETT_TEST_DATA_DIR);
+    snprintf(inside, sizeof inside, "%s/onnx_cnn.onnx", SPINGALETT_TEST_DATA_DIR);
+    NeuralNetwork *ext = spingalett_import_onnx(path), *own = spingalett_import_onnx(inside);
+    CHECK(ext && own && ext->total_weights == own->total_weights &&
+          !memcmp(ext->weights, own->weights, own->total_weights * sizeof(float)) &&
+          !memcmp(ext->biases, own->biases, own->total_biases * sizeof(float)),
+          "external data: %s", ext ? "other weights" : spingalett_last_error_message());
+    free_network(ext);
+    free_network(own);
+    long ext_size = 0;
+    unsigned char *ext_model = read_file(path, &ext_size);
+    spingalett_clear_error();
+    CHECK(ext_model && !spingalett_import_onnx_from_memory(ext_model, (size_t)ext_size) &&
+          strstr(spingalett_last_error_message(), "external"), "external data from memory: %s",
+          spingalett_last_error_message());
+    free(ext_model);
+    snprintf(path, sizeof path, "%s/onnx_escape.onnx", SPINGALETT_TEST_DATA_DIR);
+    spingalett_clear_error();
+    CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "outside"),
+          "an external file outside the model's folder: %s", spingalett_last_error_message());
+
     /* an operator it does not have is named; bytes that are no model fail */
     snprintf(path, sizeof path, "%s/onnx_unsupported.onnx", SPINGALETT_TEST_DATA_DIR);
     spingalett_clear_error();
@@ -3968,8 +3991,8 @@ static void pytorch_weights(void) {
     if (!data) return;
     uint32_t n = rd32(data + 4), in = rd32(data + 8), out = rd32(data + 12);
     const float *x = (const float *)(const void *)(data + 16), *expected = x + (size_t)n * in;
-    static const char *const files[] = {"torch_cnn.pt", "torch_cnn.safetensors"};
-    for (int f = 0; f < 2; f++) {
+    static const char *const files[] = {"torch_cnn.pt", "torch_cnn.safetensors", "torch_cnn_strided.pt"};
+    for (int f = 0; f < 3; f++) {
         NeuralNetwork *net = torch_cnn();
         snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, files[f]);
         CHECK(spingalett_load_pytorch(net, path, NULL, 0), "%s: %s", files[f], spingalett_last_error_message());
