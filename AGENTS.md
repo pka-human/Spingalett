@@ -7,8 +7,9 @@ documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; 
 ## What the project is
 
 Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch
-normalization layers), deployment models in FP32 down to INT2, a standalone inference engine for
-microcontrollers (one C file, no heap), Python bindings over ctypes, and the DigitPad demo app.
+normalization, adding and concatenating layers, as chains or graphs), deployment models in FP32 down
+to INT2, a standalone inference engine for microcontrollers (one C file, no heap), ONNX and PyTorch
+import, Python bindings over ctypes (wheels with the library inside), and the DigitPad demo app.
 Its promise is speed: **a change must not make anything slower**, and kernels are measured, not
 assumed (see [Performance work](#performance-work)).
 
@@ -23,12 +24,15 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Model.c` | Batched deployment models (`spingalett_model_predict`): weights prepared once per owned model, a workspace kept between calls |
 | `Src/Spingalett.Int8Tiles.c` | Batched INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product) |
 | `Src/Spingalett.GEMM.c` | Float matrix kernels, including implicit im2col and epilogues |
+| `Src/Spingalett.ConvGEMM.c` | Convolutions as indirect products: windows read through per-tap pointers (forward, data and weight gradients) |
+| `Src/Spingalett.Graph.c` | Adding, concatenating and global pooling layers; the plan by which inference outputs share memory |
+| `Src/Spingalett.Onnx.c`, `Src/Spingalett.Torch.c` | ONNX import (own protocol buffer reader); PyTorch state dicts (zip, a pickle interpreter that runs nothing) and safetensors |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
-| `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward, convolution and normalization layers |
+| `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution and normalization layers |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
-| `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, Python tests, `Layout.c` |
-| `Examples/`, `Apps/DigitPad/`, `Bindings/Python/` | Examples and tools, the demo app, the bindings |
+| `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
+| `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools, the demo app, the bindings (a package; `setup.py` builds wheels) |
 
 ## Build and test
 
@@ -36,7 +40,7 @@ assumed (see [Performance work](#performance-work)).
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
-Bin/SpingalettTests model                           # one group: grad conv norm equiv cont optim
+Bin/SpingalettTests model                           # one group: grad conv norm graph onnx equiv cont optim
                                                     # sched dropout gen predict valid step data io model xor
 ```
 
@@ -53,7 +57,9 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - the engine alone: `cc -std=c99 -Wall -Wextra -Wpedantic -Werror -DSPINGALETT_INFERENCE_ONLY -IInclude -ISrc -c Src/Spingalett.Inference.c`;
 - for SIMD changes, every instruction set the code has a path for. AArch64 cross builds run under
   `qemu-aarch64` (`QEMU_CPU=cortex-a53` for no dot product, `max` for all features); MinGW builds
-  run under Wine; `Examples/Embedded/run-qemu.sh` runs the engine on a Cortex-M4.
+  run under Wine; `Examples/Embedded/run-qemu.sh` runs the engine on a Cortex-M4. AVX-512 paths on
+  machines without it: Intel's SDE (`sde64 -spr -- Bin/SpingalettTests conv`) on a build with
+  run-time dispatch (`-DSPINGALETT_NATIVE_ARCH=OFF`).
 
 ## Invariants the tests hold you to
 
@@ -66,8 +72,12 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   produce the same 32-bit sums; tests compare with `== 0`, not with a tolerance.
 - **IEEE order in inference.** `Inference.c` and `Model.c` are compiled without reassociation or
   contraction; epilogues use `spingalett_int_output()` so every path rounds alike.
-- **Formats.** `.slett` versions 3 to 5 stay loadable; the writer picks the lowest version that
-  can hold the network. Any change to the format updates `docs/ModelFormat.md` and adds a version.
+- **Formats.** `.slett` versions 3 to 6 stay loadable; the writer picks the lowest version that
+  can hold the network (chains 3 to 5, graphs 6). Any change to the format updates
+  `docs/ModelFormat.md` and adds a version.
+- **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
+  their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
+  Chains must compute what they computed before graphs existed; `graph` group tests both.
 - **ABI with Python.** `Tests/Spingalett.Layout.c` and `test_python_layout.py` check that the
   ctypes structures match the C ones; a new field in a public struct needs both sides.
 - **Engine scratch.** The engine's workspace size comes from `slett_conv_scratch()`; kernels may
@@ -100,7 +110,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   after an epoch, or the saved files, against a build of the previous commit, and with a profile
   (`gprofng collect app` works with AVX-512, Valgrind does not; Release builds are stripped, so
   profile a `RelWithDebInfo` build).
-- Numbers quoted in README and CHANGELOG are measured, with the machine named.
+- Numbers quoted in README and CHANGELOG are measured, with the machine named. Laptops throttle:
+  watch the temperature and frequency (`/proc/cpuinfo`) and let a long run finish before measuring.
+- `-DSPINGALETT_NO_DIRECT_CONV` builds the library without the indirect convolution kernels, for
+  comparisons with the products of gathered windows.
 
 ## Style
 
@@ -119,7 +132,7 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 ## Releases
 
 The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`
-and `Bindings/Python/spingalett.py`. `.github/workflows/release.yml` builds packages for Linux
+and `Bindings/Python/spingalett/__init__.py`. `.github/workflows/release.yml` builds packages for Linux
 (x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), trains the DigitPad model
 (2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip. The
 maintainer merges pull requests and pushes tags.

@@ -95,6 +95,8 @@ typedef struct {
     float epsilon;                  /* batch normalization: added to the variance */
     float momentum;                 /* batch normalization: weight of each batch in the running
                                        statistics */
+    uint32_t input_count;           /* layers it reads (0 for the input layer) */
+    uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* their indices, all below `index` */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -195,13 +197,15 @@ typedef struct {
 typedef struct {
     NeuralNetwork *net;
     uint32_t neurons_amount;        /* dense: outputs; input layer: its size (or give its shape) */
-    ActivationFunction act_func;    /* dense, conv and batch normalization layers (pooling layers
-                                       have none) */
+    ActivationFunction act_func;    /* dense, conv, batch normalization, add and concatenation layers
+                                       (pooling layers have none); 0 is ACT_SIGMOID, so give ACT_NONE
+                                       for no activation */
     WeightInitialization weight_initialization;
     float dropout_rate;             /* [0, 1): inverted dropout on this layer's outputs during
                                        training; ignored on the input and output layers */
     LayerType type;                 /* LAYER_DENSE unless set; see conv2d(), max_pool2d(),
-                                       avg_pool2d(), batch_norm() */
+                                       avg_pool2d(), batch_norm(), add_layers(), concat_layers(),
+                                       global_avg_pool2d() */
     uint32_t height, width, channels;   /* input layer: the shape of a sample (channels-last), e.g.
                                        28 x 28 x 1 for MNIST; omitted: 1 x 1 x neurons_amount */
     uint32_t filters;               /* conv: output channels */
@@ -218,6 +222,13 @@ typedef struct {
     float epsilon;                  /* batch normalization: added to the variance; 0 = 1e-5 */
     float momentum;                 /* batch normalization: running statistics move this far towards
                                        each training batch's; 0 = 0.1 */
+    uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* the earlier layers this one reads, by index (as
+                                       layer() returns it; 0 is the input layer); none: the layer
+                                       added just before. Dense, convolution, pooling and batch
+                                       normalization layers read one, add_layers() and
+                                       concat_layers() one or more. */
+    uint32_t input_count;           /* entries of inputs; 0 counts them up to the last nonzero one,
+                                       so give it when the last input is the input layer */
 } LayerArgs;
 
 typedef struct {
@@ -291,6 +302,21 @@ typedef struct {
        augmented. */
     uint32_t augment_shift;
     bool augment_flip;
+
+    /* Label smoothing: training targets move this far towards the uniform distribution,
+       t' = (1 - label_smoothing) t + label_smoothing / outputs (/ 2 for each sigmoid output, its own
+       two classes), in [0, 1); the reported training loss is the smoothed targets' and validation
+       uses the targets as given. 0.1 is common for classifiers. */
+    float label_smoothing;
+
+    /* Reduce on plateau: when the monitored value (see monitor) has not improved for
+       lr_plateau_patience epochs, the learning rate (the schedule's, when there is one) is
+       multiplied by lr_plateau_factor, in (0, 1), for the rest of the run, again after every
+       lr_plateau_patience epochs without improvement, but never below lr_plateau_min_lr.
+       lr_plateau_patience 0: off. */
+    float lr_plateau_factor;
+    size_t lr_plateau_patience;
+    float lr_plateau_min_lr;
 } TrainArgs;
 
 typedef struct {
@@ -372,16 +398,29 @@ SPINGALETT_API bool spingalett_get_verbose(void);
 #define new_spingalett(...) new_spingalett_struct_arguments((NeuralNetworkArgs){__VA_ARGS__})
 SPINGALETT_API NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs args);
 
-/* Appends a layer; the first one is the input layer. Errors leave the network unchanged and set
-   the error (spingalett_last_error_code()). */
+/* Appends a layer and returns its index; the first one is the input layer (index 0). A layer reads
+   the one before it unless .inputs names others, so that networks can be graphs: residual blocks,
+   branches that are concatenated. The network's output is its last layer, which every other layer
+   must feed, directly or through later ones, before it trains or predicts. Errors leave the network
+   unchanged, set the error (spingalett_last_error_code()) and return SPINGALETT_NO_LAYER. */
+#define SPINGALETT_NO_LAYER UINT32_MAX
 #define layer(...) layer_struct_arguments((LayerArgs){__VA_ARGS__})
 #define conv2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONV2D, __VA_ARGS__})
 #define max_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_MAX_POOL2D, __VA_ARGS__})
 #define avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_AVG_POOL2D, __VA_ARGS__})
 #define batch_norm(...) layer_struct_arguments((LayerArgs){.type = LAYER_BATCH_NORM, __VA_ARGS__})
-SPINGALETT_API void layer_struct_arguments(LayerArgs args);
+/* The sum of .inputs (layers of one shape), then .act_func (ACT_NONE for the sum alone):
+   add_layers(.net = net, .inputs = {x, y}, .act_func = ACT_RELU) closes a residual block. */
+#define add_layers(...) layer_struct_arguments((LayerArgs){.type = LAYER_ADD, __VA_ARGS__})
+/* .inputs side by side along the channels (layers of one height and width), then .act_func (ACT_NONE
+   for none). */
+#define concat_layers(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONCAT, __VA_ARGS__})
+/* The mean of each channel over its cells (1 x 1 x channels); a pooling layer, without activation. */
+#define global_avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_GLOBAL_AVG_POOL, __VA_ARGS__})
+SPINGALETT_API uint32_t layer_struct_arguments(LayerArgs args);
 
-/* Describing a network. */
+/* Describing a network. Layers are numbered in the order they were added, every layer after its
+   inputs. */
 SPINGALETT_API uint32_t spingalett_layer_count(const NeuralNetwork *net);      /* input layer included */
 SPINGALETT_API bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, SpingalettNetworkLayer *layer);
 SPINGALETT_API uint32_t spingalett_input_size(const NeuralNetwork *net);
@@ -449,6 +488,9 @@ SPINGALETT_API bool spingalett_trainer_backward_output_grads(SpingalettTrainer *
 SPINGALETT_API bool spingalett_trainer_step(SpingalettTrainer *trainer, const OptimizerArgs *optimizer);
 /* Discards the gradient accumulated since the last step. */
 SPINGALETT_API void spingalett_trainer_zero_grad(SpingalettTrainer *trainer);
+/* Label smoothing for spingalett_trainer_backward() and spingalett_train_on_batch(), as
+   TrainArgs.label_smoothing (0, the default, uses the targets as given). False when out of [0, 1). */
+SPINGALETT_API bool spingalett_trainer_set_label_smoothing(SpingalettTrainer *trainer, float label_smoothing);
 /* Forward, backward with the network's loss and a step on one batch; returns its mean loss
    (NaN on error). */
 SPINGALETT_API float spingalett_train_on_batch(SpingalettTrainer *trainer, const float *inputs, const float *targets,
@@ -471,6 +513,40 @@ SPINGALETT_API void *spingalett_save_to_memory(const NeuralNetwork *net, Precisi
 SPINGALETT_API NeuralNetwork *load_spingalett_from_memory(const void *data, size_t size);
 /* Releases memory the library returned (spingalett_save_to_memory). */
 SPINGALETT_API void spingalett_free(void *ptr);
+
+/*
+ * ONNX import: a model of the operators Spingalett has (Conv with groups, Gemm, MatMul with a
+ * constant right operand, MaxPool, AveragePool, GlobalAveragePool (or ReduceMean over the height and
+ * width), BatchNormalization, Add, Concat along the channels, Relu, Sigmoid, Tanh, LeakyRelu with
+ * slope 0.01, Softmax over vectors,
+ * Flatten, Reshape that flattens, Identity, Dropout, Constant), as a network to train further, save
+ * or deploy. The network takes channels-last samples: an input of shape [N, C, H, W] becomes an
+ * input layer of H x W x C, so images in NCHW order must be transposed to H, W, C; a dense layer
+ * after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy when
+ * the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator or
+ * node that cannot be imported; the model's weights must be inside the file (no external data).
+ */
+SPINGALETT_API NeuralNetwork *spingalett_import_onnx(const char *path);
+SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
+
+/*
+ * PyTorch weights into a network of the same architecture: a state dict saved with torch.save
+ * (.pt, .pth; also a checkpoint dictionary holding one under "state_dict", "model_state_dict" or
+ * "model") or a .safetensors file. The pickle inside torch.save files is read without running any
+ * of it: only dictionaries of tensors are recognized. The tensors of each module (the name up to
+ * its last dot: "features.0" for "features.0.weight") go, module by module, to the layers with
+ * parameters in their order: dense layers take weight [out, in] and bias, convolutions weight
+ * [out, in / groups, kh, kw] and bias, batch normalizations weight, bias, running_mean and
+ * running_var. The modules come in the order of the state dict (torch.save files keep it) or, in
+ * safetensors files, which sort names, in natural order of their names ("2" before "10", as
+ * nn.Sequential numbers them); `modules` (module_count names, or NULL) gives the order explicitly.
+ * Weights are reordered for channels-last data as spingalett_import_onnx() does. On error (a shape
+ * that does not fit, names the file does not have) the network is unchanged.
+ */
+SPINGALETT_API bool spingalett_load_pytorch(NeuralNetwork *net, const char *path, const char *const *modules,
+                                            uint32_t module_count);
+SPINGALETT_API bool spingalett_load_pytorch_from_memory(NeuralNetwork *net, const void *data, size_t size,
+                                                        const char *const *modules, uint32_t module_count);
 
 /*
  * Deployment. A SpingalettModel (Spingalett.Inference.h) is a read-only network that computes in the

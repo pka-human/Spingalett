@@ -1,6 +1,6 @@
 # Roadmap
 
-Where Spingalett is going after 0.9, roughly in order. Plans change as the work shows what is
+Where Spingalett is going after 0.10, roughly in order. Plans change as the work shows what is
 worth doing; the [CHANGELOG](CHANGELOG.md) records what was actually done. Every release keeps the
 project's rule: nothing gets slower, and new kernels are measured against the previous release and
 against PyTorch on the same machine.
@@ -15,53 +15,34 @@ against PyTorch on the same machine.
 | 0.7 | Convolutions and pooling, opaque network handle, model format 4 |
 | 0.8 | Batch normalization (folded at inference), grouped and depthwise convolutions, augmentation, CIFAR-10, INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product), macOS packages with OpenMP |
 | 0.9 | "Bottlenecks": `.slettd` format 2 (rANS coder, input shape, class names, several sets of targets), streaming readers that decode ahead or on the OpenMP threads, 8-bit data sets in memory, `DatasetTool cifar` and image folders; models that prepare their weights once, dot-product kernels for products of a few rows, faster pooling and depthwise convolutions, model files three to ten times as fast, lighter Python calls |
+| 0.10 | "Graphs": networks as directed acyclic graphs (addition, concatenation, global average pooling; residual networks, ResNet-20 to 56 for CIFAR-10), `.slett` format 6 with outputs sharing memory in the engine, ONNX import, PyTorch weights (torch.save, safetensors), Python wheels for PyPI, convolutions as indirect matrix products, label smoothing, reduce on plateau |
 
-## 0.10: networks as graphs, interoperability, GPU groundwork
+## 0.11: a first GPU backend
 
-**Residual connections and graphs.** Today a network is a chain of layers. 0.10 turns it into a
-directed acyclic graph of layers, so that a layer can take the outputs of several earlier ones:
+**GPU training and inference.** A compute-mode backend behind the existing `ComputeMode` switch,
+starting with the matrix products, convolutions (as indirect products, like the CPU kernels of
+0.10) and the elementwise passes (activations, batch normalization, additions and concatenations of
+graphs), keeping parameters and activations resident on the device during training and copying
+only batches in and losses out. The candidates are Vulkan compute (portable: AMD, Intel, NVIDIA and
+Apple through MoltenVK; SPIR-V compiled at build time and embedded) and CUDA; the first one decides
+the internal interface that later backends implement. Deterministic reductions stay the default:
+fixed-order trees rather than atomics, so a GPU run gives the same bits every time.
 
-- `add` (residual connections, ResNet blocks) and `concat` along channels (Inception-style and
-  U-Net-style networks) as layer kinds;
-- a builder API next to the chain one, e.g. a layer argument naming its inputs, with chains still
-  built exactly as today;
-- training, the step API, `predict()`, models and the engine walking the graph in a fixed
-  topological order, keeping bit-identical results across thread counts;
-- buffer reuse: activations freed as soon as their last consumer has run, so a deep residual
-  network needs memory for its widest cut rather than for all of its layers;
-- `.slett` format version 6 for graphs (versions 3 to 5 still written for chains);
-- global average pooling as its own layer (today `avg_pool2d` with the full kernel), and the
-  examples: a small ResNet for CIFAR-10, aiming at about 92% test accuracy.
+**Smaller items considered for 0.11:**
 
-**ONNX import.** `spingalett_import_onnx()` and `ModelTool import`: reading the layers Spingalett
-has (Gemm/MatMul, Conv with groups, pooling, BatchNormalization, Add, Concat, Relu and the other
-activations, Softmax, Flatten/Reshape where it is a no-op in channels-last order) into a network
-or straight into a deployment model, with the NCHW to NHWC weight reordering done on import. A
-protobuf reader of our own (no dependency), errors that name the unsupported operator, and tests
-against models exported from PyTorch.
-
-**Python wheels on PyPI.** `pip install spingalett` with the shared library inside: manylinux
-x86-64 and AArch64, Windows, macOS universal, built by the release workflow from the same packages
-it already makes; NumPy arrays in and out as today. Typed stubs (`.pyi`) for editors.
-
-**A first GPU backend.** A compute-mode backend behind the existing `ComputeMode` switch, starting
-with the matrix products, convolutions (implicit GEMM) and elementwise epilogues, keeping
-parameters resident on the device during training. The candidates are Vulkan compute (portable,
-works on AMD, Intel, NVIDIA and Apple through MoltenVK) and CUDA; the first one decides the
-internal interface that later backends implement. Deterministic reductions stay the default.
-
-**Smaller items considered for 0.10:**
-
+- the convolution kernels of 0.10, further: kernel rows as one run of `kernel_w x channels` floats
+  (fewer pointers, and fast first layers of one or three channels), phases for the data gradient
+  of strided convolutions (three quarters of its products are zeros today), weights packed once
+  per deployment model;
 - per-sample INT8 kernels on AVX-512 VNNI for dense layers in the engine (512-bit rows), and tile
   kernels for depthwise and grouped integer convolutions in batched prediction;
 - AVX2 tiles for processors without VNNI, if they beat the current kernels;
 - INT8 calibration from sample data (per-layer activation ranges instead of per-sample scaling),
   as an option for models where it helps accuracy;
-- layer normalization (needed later for attention), label smoothing, and a
-  reduce-on-plateau learning-rate schedule;
-- what the 0.9 profiles left: packing for convolution weight gradients (a tenth of a small CNN's
-  training step), the weight gradient of depthwise convolutions, and threads idling in the
-  barriers of mini-batch steps on dense networks (a quarter of the time on four threads);
+- layer normalization (needed later for attention), upsampling and transposed convolutions (U-Net
+  style networks, more of ONNX);
+- threads idling in the barriers of mini-batch steps on dense networks (a quarter of the time on
+  four threads in 0.9's profiles), and the weight gradient of depthwise convolutions;
 - gradients and optimizer state allocated on the first training step, so that networks loaded
   only for inference take a quarter of the memory;
 - a faster data set decoder (the rANS coder decodes 30 to 40 MB/s per thread; streaming CIFAR-10

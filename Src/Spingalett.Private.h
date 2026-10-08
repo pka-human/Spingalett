@@ -51,7 +51,16 @@ static inline int spingalett_thread_num(void) { return 0; }
 #define SPINGALETT_WEIGHT_MTX_PTR(net, l)   ((net)->weights + (net)->weight_offsets[l])
 #define SPINGALETT_GRAD_W_MTX_PTR(net, l)   ((net)->grad_weights + (net)->weight_offsets[l])
 
-void set_error(int code, const char *msg);
+/* Error paths are rare: GCC and Clang keep them out of line, so that the thread-local error state
+   is not touched in the bodies of the functions that report errors (GCC 16 with LTO dropped the
+   stack realignment of a function that inlined it and still read its arguments through it). */
+#if defined(__GNUC__)
+#define SPINGALETT_COLD __attribute__((cold, noinline))
+#else
+#define SPINGALETT_COLD
+#endif
+
+SPINGALETT_COLD void set_error(int code, const char *msg);
 
 
 /* Training-time dropout state. Masks are a hash of (seed, step, position, layer, unit), so every
@@ -74,8 +83,15 @@ typedef struct SpingalettGemmScratch SpingalettGemmScratch;
 
 /* Activations (and, when training, deltas and dropout masks) for up to `capacity` samples. */
 typedef struct BatchWorkspace {
-    float **act;            /* act[0]: inputs of the chunk; act[l]: [capacity x topology[l]] */
+    float **act;            /* act[0]: inputs of the chunk; act[l]: [capacity x topology[l]]. For
+                               inference, outputs that are never alive at the same time share
+                               memory (spingalett_plan_outputs), and act[l] of a layer whose output
+                               is never stored (a product with its normalization fused) is NULL */
     float **delta;          /* training only: delta[l] for l >= 1 */
+    uint32_t *uses;         /* per layer: the inputs of later layers that name it */
+    uint32_t *pending;      /* training: uses whose gradient has not arrived yet (backward pass) */
+    float *gtmp;            /* training: a gradient contribution to a layer that feeds several
+                               (capacity x its outputs), added to its delta */
     float **dmask;          /* training only: dropout mask * f'(a) per hidden layer with dropout */
     float *flat;            /* storage of act[1..] (and delta[1..]) */
     float *dmask_flat;
@@ -106,6 +122,46 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws);
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
+/* Inference: whether layer l (dense or convolution, no activation) feeds only the batch
+   normalization l + 1, which then runs in its product's epilogue and l's output is never stored. */
+bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint32_t l);
+
+/* Graphs (Spingalett.Graph.c). Offsets of the outputs of an inference pass, per sample in floats
+   (multiples of 16), so that outputs alive at the same time do not overlap: an output lives from
+   the step that computes it to the last step that reads it. Layer 0 and the last layer (the
+   caller's buffers) and the products whose normalization is fused take none (UINT64_MAX). Returns
+   the floats per sample all outputs need. */
+uint64_t spingalett_plan_outputs(const NeuralNetwork *net, const uint32_t *uses, uint64_t *offsets);
+/* The same over `count` steps from a description of each: steps[s] is the output it computes,
+   reads[s] the outputs it reads (read_count[s] of them), sizes[t] the floats of output t (0: not
+   stored); output t is computed by step `producer[t]` or never. Generic so that deployment models
+   and model files share it. offsets of outputs that are not stored are UINT64_MAX. */
+uint64_t spingalett_plan_buffers(uint32_t outputs, const uint64_t *sizes, uint32_t count, const uint32_t *steps,
+                                 const uint32_t *const *reads, const uint32_t *read_count, uint64_t align,
+                                 uint64_t *offsets);
+/* y = act(x[0] + x[1] + ...) over n samples of `size` floats, the inputs added in their order. */
+void spingalett_add_forward(const float *const *x, uint32_t count, float *y, uint32_t n, uint64_t size,
+                            ActivationFunction act, ComputeMode mode);
+/* y = act(concatenation of x[k], channels[k] each) over n samples of `cells` cells. */
+void spingalett_concat_forward(const float *const *x, const uint32_t *channels, uint32_t count, float *y, uint32_t n,
+                               uint64_t cells, ActivationFunction act, ComputeMode mode);
+/* y[c] = act(mean over the cells of x[., c]) for n samples of `cells` x C. */
+void spingalett_global_pool_forward(const float *x, float *y, uint32_t n, uint64_t cells, uint32_t C,
+                                    ActivationFunction act, ComputeMode mode);
+/* dx (= dx + when accumulate) = the part of dy (rows of C channels) at channels [c0, c0 + ck), over
+   n samples of `cells` cells: the gradient of a concatenation's input; with act, times the
+   derivative read from x (that input's output; not with accumulate). An addition's input is the
+   whole of dy (c0 = 0, ck = C). */
+void spingalett_slice_backward(const float *dy, uint32_t C, uint32_t c0, uint32_t ck, float *dx, const float *x,
+                               uint32_t n, uint64_t cells, ActivationFunction act, bool accumulate, ComputeMode mode);
+/* dx (= dx + when accumulate) = dy[c] / cells at every cell, the gradient of a global pooling's
+   input; with act, times the derivative read from x (not with accumulate). */
+void spingalett_global_pool_backward(const float *dy, float *dx, const float *x, uint32_t n, uint64_t cells, uint32_t C,
+                                     ActivationFunction act, bool accumulate, ComputeMode mode);
+/* delta (rows of `size`) += add over n samples, then, with last, times dmask (when set) or the
+   derivative of act read from y. */
+void spingalett_gradient_sum(float *delta, const float *add, const float *y, const float *dmask, uint32_t n,
+                             uint64_t size, ActivationFunction act, bool last, ComputeMode mode);
 /* Summed loss and number of correctly classified samples (see EvalMetrics) over n samples, in
    chunks of ws->capacity. ws is an inference workspace; out_buf holds [capacity x output size]. */
 void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
@@ -172,6 +228,8 @@ void spingalett_bn_backward_data(const NeuralNetwork *net, uint32_t l, const flo
                                  float *coef, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
+/* Whether every layer of net but the last feeds a later one; sets the error (naming `who`) when not. */
+bool spingalett_check_graph(const NeuralNetwork *net, const char *who);
 /* Gives an empty network room for these totals (zeroed), so that adding its layers moves nothing. */
 bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t weights, uint64_t biases);
 /* The arguments that add layer l of net again (to another network: set .net), parameters aside. */
@@ -306,6 +364,90 @@ SPINGALETT_GEMM_KERNELS(spingalett_gemm_avx2)
 SPINGALETT_GEMM_KERNELS(spingalett_gemm_avx512)
 #undef SPINGALETT_GEMM_KERNELS
 #endif
+
+/* Convolutions as indirect matrix products (Spingalett.ConvGEMM.c): windows read straight from the
+   image through per-tap pointers. They run where spingalett_conv_direct() holds (native kernels,
+   not depthwise, at most SPINGALETT_CONV_DIRECT_TAPS taps), the weight gradient where
+   spingalett_conv_direct_wgrad() does too, a group at a time; the scratch they take is sized by the
+   functions below, from the widest panels and tiles of any kernel set. The epilogue (or NULL) runs
+   on every tile of rows of the group's columns. */
+#define SPINGALETT_CONV_DIRECT_TAPS 64u
+#define SPINGALETT_CONV_NR_MAX 32u
+#define SPINGALETT_CONV_MR_MAX 12u
+#define SPINGALETT_CONV_WGRAD_MIN 1024u     /* pixels per slot of the weight gradient, at least */
+#define SPINGALETT_CONV_WGRAD_SLOTS 32u     /* slots at most */
+#define SPINGALETT_CONV_WGRAD_BLOCK 128u    /* pixels whose tap pointers are made at once */
+
+static inline bool spingalett_conv_direct(const LayerShape *in, const LayerShape *out, ComputeMode mode) {
+#if defined(SPINGALETT_NO_DIRECT_CONV)      /* for comparisons with the products of gathered windows */
+    (void)in; (void)out; (void)mode;
+    return false;
+#endif
+    uint32_t G = out->groups ? out->groups : 1u;
+    return mode != COMPUTE_OPENBLAS && !(G > 1 && in->channels == G) &&
+           (uint64_t)out->kernel_h * out->kernel_w <= SPINGALETT_CONV_DIRECT_TAPS;
+}
+
+static inline bool spingalett_conv_direct_wgrad(const LayerShape *in, const LayerShape *out, ComputeMode mode) {
+    uint32_t G = out->groups ? out->groups : 1u;
+    return spingalett_conv_direct(in, out, mode) && (in->channels / G) % 16u == 0 &&
+           out->channels / G >= SPINGALETT_CONV_MR_MAX;
+}
+
+static inline size_t spingalett_conv_direct_packed_floats(uint32_t cols, uint32_t K) {
+    return ((((size_t)cols + SPINGALETT_CONV_NR_MAX - 1) / SPINGALETT_CONV_NR_MAX * SPINGALETT_CONV_NR_MAX * K) + 15u) &
+           ~(size_t)15u;
+}
+
+static inline uint32_t spingalett_conv_wgrad_slots(uint64_t pixels) {
+    uint64_t slots = pixels / SPINGALETT_CONV_WGRAD_MIN;
+    if (slots > SPINGALETT_CONV_WGRAD_SLOTS) slots = SPINGALETT_CONV_WGRAD_SLOTS;
+    return slots < 1 ? 1u : (uint32_t)slots;
+}
+
+static inline size_t spingalett_conv_wgrad_partial_floats(uint32_t OG, uint32_t K, uint32_t slots) {
+    return (((size_t)OG + SPINGALETT_CONV_MR_MAX - 1) * ((size_t)K + SPINGALETT_CONV_NR_MAX - 1) * slots + 15u) &
+           ~(size_t)15u;
+}
+
+static inline size_t spingalett_conv_wgrad_zero_floats(uint32_t CG) {
+    return ((size_t)CG + SPINGALETT_CONV_NR_MAX + 15u) & ~(size_t)15u;
+}
+
+/* Floats of scratch the direct passes of a convolution need: the forward pass and data gradient
+   their packed weights and zeros, the weight gradient its partial sums, zeros and tap pointers. */
+static inline size_t spingalett_conv_direct_scratch(const LayerShape *in, const LayerShape *out, uint32_t n,
+                                                    bool training, int threads) {
+    const uint32_t G = out->groups ? out->groups : 1u, CG = in->channels / G, OG = out->channels / G;
+    const uint32_t taps = out->kernel_h * out->kernel_w, wide = (CG > OG ? CG : OG) + 32u;
+    size_t need = spingalett_conv_direct_packed_floats(OG, taps * CG) + wide;
+    if (training) {
+        size_t data = spingalett_conv_direct_packed_floats(CG, taps * OG) + wide;
+        if (data > need) need = data;
+        if (spingalett_conv_direct_wgrad(in, out, COMPUTE_SINGLE_THREADED)) {
+            uint64_t pixels = (uint64_t)n * out->height * out->width;
+            size_t w = spingalett_conv_wgrad_partial_floats(OG, taps * CG, spingalett_conv_wgrad_slots(pixels)) +
+                       spingalett_conv_wgrad_zero_floats(CG) +
+                       (size_t)(threads > 0 ? threads : 1) * 2u * SPINGALETT_CONV_WGRAD_BLOCK * 2u + 16u;
+            if (w > need) need = w;
+        }
+    }
+    return need;
+}
+
+void spingalett_conv_direct_forward(const LayerShape *in, const LayerShape *out, uint32_t g, const float *W,
+                                    const float *x, float *y, uint32_t n, float *scratch,
+                                    const SpingalettGemmHooks *epilogue, bool parallel, int threads);
+void spingalett_conv_direct_backward_data(const LayerShape *in, const LayerShape *out, uint32_t g, const float *W,
+                                          const float *dy, float *dx, uint32_t n, float *scratch,
+                                          const SpingalettGemmHooks *epilogue, bool parallel, int threads);
+/* gW = scale * (sum over the batch) + beta * gW for group g's filters (the bias gradient is the
+   caller's) */
+void spingalett_conv_direct_backward_weights(const LayerShape *in, const LayerShape *out, uint32_t g, const float *x,
+                                             const float *dy, uint32_t n, float scale, float beta, float *gW,
+                                             float *scratch, bool parallel, int threads);
+/* Threads a GEMM scratch was made for. */
+int spingalett_gemm_scratch_threads(const SpingalettGemmScratch *scratch);
 
 /* An epilogue adding a bias per column, after multiplying by a scale per column when scale is set,
    and applying an element-wise activation (not softmax). Rows are activated one by one: tile

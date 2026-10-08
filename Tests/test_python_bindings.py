@@ -501,6 +501,118 @@ with tempfile.TemporaryDirectory() as d:
         p = m.predict(xg)
         check(np.array_equal(p[3], m(xg[3])) and np.abs(p - gnet.forward(xg)).max() < 0.1, "grouped INT8 model")
 
+# graphs: a residual block and branches that are concatenated, checked against numpy
+def np_graph(net, x):
+    out = []
+    for sample in x:
+        acts = [sample.reshape(net.layer(0).shape)]
+        for i in range(1, len(net)):
+            d = net.layer(i)
+            src = acts[d.inputs[0]]
+            if d.type == sg.LayerType.CONV2D:
+                w = net.get_weights(i - 1)
+                v = np_conv(src, w, net.get_biases(i - 1), d.stride[0], d.padding[0])
+            elif d.type == sg.LayerType.ADD:
+                v = sum(acts[j] for j in d.inputs)
+            elif d.type == sg.LayerType.CONCAT:
+                v = np.concatenate([acts[j] for j in d.inputs], axis=2)
+            elif d.type == sg.LayerType.GLOBAL_AVG_POOL:
+                v = src.mean(axis=(0, 1)).reshape(1, 1, -1)
+            else:
+                v = (net.get_weights(i - 1) @ src.reshape(-1) + net.get_biases(i - 1)).reshape(1, 1, -1)
+            if d.activation == sg.Activation.RELU: v = np.maximum(v, 0)
+            elif d.activation == sg.Activation.TANH: v = np.tanh(v)
+            elif d.activation == sg.Activation.SOFTMAX: v = np.exp(v - v.max()); v = v / v.sum()
+            acts.append(v)
+        out.append(acts[-1].reshape(-1))
+    return np.array(out)
+
+rnet = sg.Network(sg.Loss.CROSS_ENTROPY)
+rnet.add_input(6, 6, 2)
+stem = rnet.add_conv2d(4, 3, padding=1, activation=sg.Activation.RELU).last
+rnet.add_conv2d(4, 3, padding=1, activation=sg.Activation.TANH)
+rnet.add_conv2d(4, 3, padding=1, activation=sg.Activation.NONE)
+block = rnet.add_add([stem, -1], activation=sg.Activation.RELU).last
+rnet.add_conv2d(3, 1, activation=sg.Activation.TANH, inputs=stem)
+rnet.add_concat([block, -1])
+rnet.add_global_avg_pool()
+rnet.add_layer(3, sg.Activation.SOFTMAX, sg.Init.XAVIER)
+check(len(rnet) == 9 and rnet.layer(4).inputs == (1, 3) and rnet.layer(6).inputs == (4, 5) and
+      rnet.layer(5).inputs == (1,) and rnet.layer(6).shape == (6, 6, 7), f"graph layers: {rnet.layers}")
+xr = rng.normal(size=(6, 72)).astype(np.float32)
+check(np.allclose(rnet.forward(xr), np_graph(rnet, xr), atol=1e-5), "graph forward vs numpy")
+yr = np.eye(3, dtype=np.float32)[np.arange(6) % 3]
+before = rnet.evaluate(xr, yr).loss
+rnet.train(xr, yr, epochs=40, optimizer=sg.Optimizer.ADAM, learning_rate=0.02)
+check(rnet.evaluate(xr, yr).loss < before * 0.5, "graph network trains")
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "graph.slett")
+    rnet.save(path)
+    check(open(path, "rb").read()[6] == 6, "graphs are saved as format version 6")
+    with sg.Network.load(path) as back:
+        check(back.layers == rnet.layers and np.array_equal(back.forward(xr), rnet.forward(xr)), "graph save/load")
+    with rnet.to_model(sg.Precision.INT8) as m:
+        check(m.layers[3].type == sg.LayerType.ADD and m.layers[3].input_layers == (1, 3), f"graph model: {m.layers[3]}")
+        p = m.predict(xr)
+        check(np.array_equal(p[2], m(xr[2])) and np.abs(p - rnet.forward(xr)).max() < 0.1, "graph INT8 model")
+spec = sg.Network(sg.Loss.MSE, [sg.Input(4, 4, 1), sg.Conv2D(1, 3, padding=1, activation=sg.Activation.NONE),
+                                sg.Add([-1, 0]), sg.GlobalAvgPool(), sg.Layer(1, sg.Activation.NONE)])
+check(spec.layer(2).type == sg.LayerType.ADD and spec.layer(2).inputs == (1, 0), f"graph from specs: {spec.layer(2)}")
+for bad in ([50], [1, 2, 3] * 6):
+    try:
+        rnet.add_add(bad); check(False, f"inputs {bad} accepted")
+    except (IndexError, ValueError):
+        pass
+try:
+    sg.Network(sg.Loss.MSE, [sg.Input(4, 4, 2), sg.Conv2D(2, 3), sg.Add([0, 1])]); check(False, "mismatched add accepted")
+except sg.SpingalettError:
+    pass
+
+# ONNX files and PyTorch weights (the files of Tests/Data), and PyTorch itself where it is installed
+data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data")
+with open(os.path.join(data_dir, "onnx_resnet.bin"), "rb") as f:
+    head = np.frombuffer(f.read(16), dtype="<u4")
+    count, n_in, n_out = int(head[1]), int(head[2]), int(head[3])
+    xo = np.frombuffer(f.read(count * n_in * 4), dtype="<f4").reshape(count, n_in)
+    yo = np.frombuffer(f.read(count * n_out * 4), dtype="<f4").reshape(count, n_out)
+onnx_net = sg.Network.from_onnx(os.path.join(data_dir, "onnx_resnet.onnx"))
+check(np.abs(onnx_net.forward(xo) - yo).max() < 1e-5 and onnx_net.loss == sg.Loss.CROSS_ENTROPY, "ONNX import")
+with open(os.path.join(data_dir, "onnx_resnet.onnx"), "rb") as f:
+    check(np.array_equal(sg.Network.from_onnx(f.read()).forward(xo), onnx_net.forward(xo)), "ONNX import from bytes")
+try:
+    sg.Network.from_onnx(os.path.join(data_dir, "onnx_unsupported.onnx")); check(False, "Resize imported")
+except sg.SpingalettError as e:
+    check("Resize" in str(e), f"unsupported operator message: {e}")
+torch_like = sg.Network(sg.Loss.MSE, [sg.Input(8, 8, 3), sg.Conv2D(8, 3, padding=1, activation=sg.Activation.NONE),
+                                      sg.BatchNorm(sg.Activation.RELU), sg.MaxPool2D(2),
+                                      sg.Conv2D(8, 3, padding=1, groups=4, activation=sg.Activation.NONE),
+                                      sg.BatchNorm(sg.Activation.RELU), sg.Layer(16, sg.Activation.TANH),
+                                      sg.Layer(4, sg.Activation.NONE)])
+with open(os.path.join(data_dir, "torch_cnn.bin"), "rb") as f:
+    head = np.frombuffer(f.read(16), dtype="<u4")
+    count, n_in, n_out = int(head[1]), int(head[2]), int(head[3])
+    xt = np.frombuffer(f.read(count * n_in * 4), dtype="<f4").reshape(count, n_in)
+    yt = np.frombuffer(f.read(count * n_out * 4), dtype="<f4").reshape(count, n_out)
+for name in ("torch_cnn.pt", "torch_cnn.safetensors"):
+    torch_like.load_pytorch(os.path.join(data_dir, name))
+    check(np.abs(torch_like.forward(xt) - yt).max() < 1e-5, f"PyTorch weights from {name}")
+try:
+    import torch
+except ImportError:
+    torch = None
+if torch is not None:
+    torch.manual_seed(3)
+    tm = torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.BatchNorm2d(8), torch.nn.ReLU(),
+                             torch.nn.Flatten(), torch.nn.Linear(8 * 6 * 6, 5), torch.nn.Softmax(1)).eval()
+    tx = torch.rand(4, 3, 6, 6)
+    with torch.no_grad():
+        ty = tm(tx).numpy()
+    hwc = tx.numpy().transpose(0, 2, 3, 1).reshape(4, -1)
+    check(np.abs(sg.Network.from_torch(tm, tx[:1]).forward(hwc) - ty).max() < 1e-5, "Network.from_torch")
+    same = sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Input(6, 6, 3), sg.Conv2D(8, 3, padding=1, activation=sg.Activation.NONE),
+                                              sg.BatchNorm(sg.Activation.RELU), sg.Layer(5, sg.Activation.SOFTMAX)])
+    check(np.abs(same.load_pytorch(tm.state_dict()).forward(hwc) - ty).max() < 1e-5, "load_pytorch(state_dict)")
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")

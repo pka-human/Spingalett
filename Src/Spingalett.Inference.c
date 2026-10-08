@@ -4,8 +4,8 @@
 */
 
 /*
- * The inference engine (Spingalett.Inference.h) and the parts of the .slett format versions 3, 4
- * and 5 the rest of the library shares with it (Spingalett.Engine.h). With -DSPINGALETT_INFERENCE_ONLY
+ * The inference engine (Spingalett.Inference.h) and the parts of the .slett format versions 3 to 6
+ * the rest of the library shares with it (Spingalett.Engine.h). With -DSPINGALETT_INFERENCE_ONLY
  * this file builds on its own and calls nothing beyond memcpy, memset, memcmp, expf, tanhf, sqrtf
  * and lrintf.
  *
@@ -1248,10 +1248,11 @@ void spingalett_engine_activate(float *y, uint32_t n, ActivationFunction act) {
 #endif
 }
 
-/* ------------------------------------------------------------------------- formats 3 to 5 */
+/* ------------------------------------------------------------------------- formats 3 to 6 */
 
 static inline size_t entry_size(uint16_t version) {
-    return version >= 5u ? SLETT_LAYER_ENTRY_SIZE_5 : version == 4u ? SLETT_LAYER_ENTRY_SIZE_4 : SLETT_LAYER_ENTRY_SIZE;
+    return version >= 6u ? SLETT_LAYER_ENTRY_SIZE_6 : version == 5u ? SLETT_LAYER_ENTRY_SIZE_5
+         : version == 4u ? SLETT_LAYER_ENTRY_SIZE_4 : SLETT_LAYER_ENTRY_SIZE;
 }
 
 static inline const uint8_t *entry_at(const uint8_t *image, uint32_t index) {
@@ -1284,15 +1285,30 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         layer->stride_w = slett_get16(e + 58);
         layer->pad_h = slett_get16(e + 60);
         layer->pad_w = slett_get16(e + 62);
-        if (index == 0) {           /* the input layer's shape is in the header */
+        /* the input: layer `index` before version 6, the first one the entry names from version 6
+           on (an entry naming a later layer keeps no shape, which validation rejects) */
+        uint32_t from = index;
+        layer->input_count = 1;
+        layer->input0 = index;
+        if (version >= 6u) {
+            layer->input_count = slett_get32(e + 80);
+            layer->input0 = slett_get32(e + 84);
+            layer->input_list = slett_get64(e + 88);
+            layer->act_offset = slett_get64(e + 96);
+            from = layer->input0 <= index ? layer->input0 : UINT32_MAX;
+        }
+        if (from == 0) {            /* the input layer's shape is in the header */
             layer->in_h = slett_get32(image + 32);
             layer->in_w = slett_get32(image + 36);
-        } else {
-            const uint8_t *prev = entry_at(image, index - 1);
+        } else if (from != UINT32_MAX) {
+            const uint8_t *prev = entry_at(image, from - 1);
             layer->in_h = slett_get16(prev + 48);
             layer->in_w = slett_get16(prev + 50);
         }
         if (layer->type == LAYER_CONV2D) layer->groups = 1;
+    } else {
+        layer->input_count = 1;
+        layer->input0 = index;
     }
     if (version >= 5u) {
         layer->groups = slett_get32(e + 64);
@@ -1317,22 +1333,91 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
     }
 }
 
+uint64_t spingalett_slett_act_offset(const uint8_t *image, uint32_t j) {
+    return slett_get64(entry_at(image, j - 1) + 96);
+}
+
+void spingalett_slett_output_shape(const uint8_t *image, uint32_t j, uint32_t *height, uint32_t *width,
+                                   uint32_t *units) {
+    if (slett_get16(image + 6) < 4u) {
+        *height = *width = 1;
+    } else if (j == 0) {
+        *height = slett_get32(image + 32);
+        *width = slett_get32(image + 36);
+    } else {
+        *height = slett_get16(entry_at(image, j - 1) + 48);
+        *width = slett_get16(entry_at(image, j - 1) + 50);
+    }
+    *units = j == 0 ? slett_get32(entry_at(image, 0)) : slett_get32(entry_at(image, j - 1) + 4);
+}
+
 /* [offset, offset + bytes) lies within size and offset is a multiple of `align`. */
 static bool section_ok(uint64_t offset, uint64_t bytes, uint64_t size, uint64_t align) {
     return offset >= SLETT_HEADER_SIZE && offset % align == 0 && offset <= size && bytes <= size - offset;
 }
 
-/* The shape fields of a version 4 or 5 entry agree with its kind and its input. */
+/* Bytes of a layer's output among a workspace's activations. */
+static inline uint64_t output_bytes(uint32_t units) {
+    return slett_align((uint64_t)units * 4u);
+}
+
+/* The inputs of version 6 entry `index` (layer index + 1): earlier layers, in a list section when
+   there are several; the layers an addition or concatenation reads agree with its shape. */
+static bool inputs_ok(const uint8_t *p, uint32_t index, const SlettLayer *L, uint64_t file_size) {
+    if (L->input_count == 0 || L->input_count > SPINGALETT_MAX_INPUTS || L->input0 > index) return false;
+    bool combines = L->type == LAYER_ADD || L->type == LAYER_CONCAT;
+    if (L->input_count == 1 ? L->input_list != 0
+                            : !combines || !section_ok(L->input_list, 4u * (uint64_t)L->input_count, file_size, 4) ||
+                              slett_get32(p + L->input_list) != L->input0)
+        return false;
+    if (!combines) return true;
+    uint64_t channels = 0;
+    for (uint32_t k = 0; k < L->input_count; k++) {
+        uint32_t j = spingalett_slett_input(p, L, k), h, w, units;
+        if (j > index) return false;
+        spingalett_slett_output_shape(p, j, &h, &w, &units);
+        if (h == 0 || w == 0 || h != L->out_h || w != L->out_w || (L->type == LAYER_ADD && units != L->outputs))
+            return false;
+        channels += units / ((uint64_t)h * w);
+    }
+    return L->type == LAYER_ADD || channels == L->out_c;
+}
+
+/* The output of version 6 entry `index` lies among the activations, apart from its inputs' (the last
+   layer writes the caller's buffer instead). */
+static bool act_offset_ok(const uint8_t *p, uint32_t index, const SlettLayer *L, uint32_t layers, uint64_t arena) {
+    if (index + 2 == layers) return L->act_offset == 0;
+    uint64_t at = L->act_offset, bytes = output_bytes(L->outputs);
+    if (at % SLETT_SECTION_ALIGN != 0 || at > arena || bytes > arena - at) return false;
+    for (uint32_t k = 0; k < L->input_count; k++) {
+        uint32_t j = spingalett_slett_input(p, L, k), h, w, units;
+        if (j == 0) continue;
+        spingalett_slett_output_shape(p, j, &h, &w, &units);
+        uint64_t other = spingalett_slett_act_offset(p, j);
+        if (at < other + output_bytes(units) && other < at + bytes) return false;
+    }
+    return true;
+}
+
+/* The shape fields of a version 4 to 6 entry agree with its kind and its (first) input. */
 static bool shape_ok(const SlettLayer *L, uint16_t version) {
     uint64_t in_cells = (uint64_t)L->in_h * L->in_w, out_cells = (uint64_t)L->out_h * L->out_w;
     if ((unsigned)L->type >= LAYER_TYPE_COUNT || in_cells == 0 || out_cells == 0 || L->in_c == 0 || L->out_c == 0 ||
         in_cells * L->in_c != L->inputs || out_cells * L->out_c != L->outputs ||
         L->in_h > SLETT_MAX_EXTENT || L->in_w > SLETT_MAX_EXTENT)
         return false;
-    if (L->type == LAYER_BATCH_NORM && version < 5u)
+    if ((L->type == LAYER_BATCH_NORM && version < 5u) || (L->type > LAYER_BATCH_NORM && version < 6u))
         return false;
     bool windowless = L->kernel_h == 0 && L->kernel_w == 0 && L->stride_h == 0 && L->stride_w == 0 &&
                       L->pad_h == 0 && L->pad_w == 0;
+    bool parameterless = L->weights == 0 && L->scales == 0 && L->biases == 0 && L->optimizer == 0;
+    if (L->type == LAYER_ADD || L->type == LAYER_CONCAT || L->type == LAYER_GLOBAL_AVG_POOL) {
+        /* no window, no parameters; the shapes of all inputs are checked with them */
+        if (!windowless || !parameterless || L->groups != 0 || L->eps != 0.0f || L->momentum != 0.0f) return false;
+        if (L->type == LAYER_GLOBAL_AVG_POOL)
+            return L->out_h == 1 && L->out_w == 1 && L->out_c == L->in_c && L->activation == ACT_NONE;
+        return L->out_h == L->in_h && L->out_w == L->in_w && (L->type == LAYER_CONCAT || L->out_c == L->in_c);
+    }
     /* version 5: groups for convolutions only, epsilon and momentum for batch normalization only */
     if (L->type != LAYER_CONV2D && L->groups != 0) return false;
     if (L->type != LAYER_BATCH_NORM && (L->eps != 0.0f || L->momentum != 0.0f)) return false;
@@ -1350,8 +1435,7 @@ static bool shape_ok(const SlettLayer *L, uint16_t version) {
     if (L->type == LAYER_CONV2D)
         return L->groups != 0 && L->in_c % L->groups == 0 && L->out_c % L->groups == 0 && L->row_len != 0;
     /* pooling: per channel, no activation, no parameters */
-    return L->out_c == L->in_c && L->activation == ACT_NONE && L->weights == 0 && L->scales == 0 &&
-           L->biases == 0 && L->optimizer == 0;
+    return L->out_c == L->in_c && L->activation == ACT_NONE && parameterless;
 }
 
 int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
@@ -1359,9 +1443,9 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
     if (!spingalett_host_is_little_endian())
         return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: the .slett format needs a little-endian host");
     if (size < 8 || memcmp(p, SLETT_MAGIC, 6) != 0)
-        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3, 4 or 5 image");
+        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3 to 6 image");
     uint16_t version = slett_get16(p + 6);
-    if (version < 3 || version > 5)
+    if (version < 3 || version > 6)
         return ENGINE_FAIL(SPINGALETT_ERR_FORMAT_VERSION, "model: unsupported format version");
     if (size < SLETT_HEADER_SIZE)
         return ENGINE_FAIL(SPINGALETT_ERR_FILE_IO, "model: image is truncated");
@@ -1386,12 +1470,20 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
     info->flags = p[13];
     info->time_step = slett_get64(p + 16);
     info->size = file_size;
+    uint64_t arena = version >= 6u ? slett_get64(p + 40) : 0u;
 
     uint32_t prev_out = 0;
     for (uint32_t i = 0; i + 1 < layers; i++) {
         SlettLayer L;
         spingalett_slett_layer(p, i, &L);
-        if (L.inputs == 0 || L.outputs == 0 || (i > 0 && L.inputs != prev_out) ||
+        /* the input's units: the previous entry's outputs, from version 6 on those of the first
+           input (the network's input for the first entry) */
+        bool linked = version >= 6u ? inputs_ok(p, i, &L, file_size) &&
+                                      (L.input0 == 0 ? i == 0 || L.inputs == slett_get32(p + SLETT_HEADER_SIZE)
+                                                     : L.inputs == slett_get32(entry_at(p, L.input0 - 1) + 4)) &&
+                                      act_offset_ok(p, i, &L, layers, arena)
+                                    : i == 0 || L.inputs == prev_out;
+        if (L.inputs == 0 || L.outputs == 0 || !linked ||
             (unsigned)L.activation >= ACT_COUNT || (unsigned)L.precision >= PRECISION_COUNT ||
             !(L.dropout >= 0.0f && L.dropout < 1.0f) || (version >= 4 && !shape_ok(&L, version)))
             return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
@@ -1422,14 +1514,11 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
         if (slett_conv_scratch(&L) > info->conv_scratch) info->conv_scratch = slett_conv_scratch(&L);
         prev_out = L.outputs;
     }
+    info->activations = version >= 6u ? arena : 2u * output_bytes(info->max_width);
     return SPINGALETT_OK;
 }
 
 /* ------------------------------------------------------------------------- the engine */
-
-static size_t workspace_float_bytes(uint32_t width) {
-    return (size_t)slett_align((uint64_t)width * 4u);
-}
 
 int spingalett_model_init(SpingalettModel *model, const void *image, size_t size) {
     if (!model || !image)
@@ -1445,10 +1534,9 @@ int spingalett_model_init(SpingalettModel *model, const void *image, size_t size
     SlettLayer first, last;
     spingalett_slett_layer((const uint8_t *)image, 0, &first);
     spingalett_slett_layer((const uint8_t *)image, info.layers - 2, &last);
-    /* two activation buffers, the quantized input of an integer layer, convolution scratch */
-    uint64_t workspace = 2u * (uint64_t)workspace_float_bytes(info.max_width) + slett_align(info.max_int_inputs) +
-                         slett_align(info.conv_scratch);
-    if (workspace > SIZE_MAX)
+    /* the layers' outputs, the quantized input of an integer layer, convolution scratch */
+    uint64_t workspace = info.activations + slett_align(info.max_int_inputs) + slett_align(info.conv_scratch);
+    if (info.activations > SIZE_MAX || workspace > SIZE_MAX)
         return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: the workspace exceeds the address space");
 
     model->input_size = first.inputs;
@@ -1461,6 +1549,7 @@ int spingalett_model_init(SpingalettModel *model, const void *image, size_t size
     model->max_width_ = info.max_width;
     model->max_int_inputs_ = info.max_int_inputs;
     model->conv_scratch_ = (size_t)info.conv_scratch;
+    model->activations_ = (size_t)info.activations;
     return SPINGALETT_OK;
 }
 
@@ -1488,6 +1577,9 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
     info->stride_w = L.stride_w;
     info->padding_h = L.pad_h;
     info->padding_w = L.pad_w;
+    info->input_count = L.input_count;
+    for (uint32_t k = 0; k < L.input_count; k++)
+        info->input_layers[k] = spingalett_slett_input((const uint8_t *)model->image, &L, k);
     return true;
 }
 
@@ -1882,6 +1974,33 @@ static void norm_forward(const uint8_t *image, const SlettLayer *L, const float 
         for (uint32_t c = 0; c < C; c++) y[i + c] = x[i + c] * coef[c] + coef[C + c];
 }
 
+void spingalett_engine_add(const float *const *x, uint32_t count, float *y, uint32_t n) {
+    if (count == 1) {
+        memcpy(y, x[0], (size_t)n * sizeof(float));
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) y[i] = x[0][i] + x[1][i];
+    for (uint32_t k = 2; k < count; k++)
+        for (uint32_t i = 0; i < n; i++) y[i] += x[k][i];
+}
+
+void spingalett_engine_concat(const float *const *x, const uint32_t *channels, uint32_t count, float *y,
+                              uint32_t cells) {
+    uint32_t C = 0, c0 = 0;
+    for (uint32_t k = 0; k < count; k++) C += channels[k];
+    for (uint32_t k = 0; k < count; c0 += channels[k], k++)
+        for (uint32_t p = 0; p < cells; p++)
+            memcpy(y + (size_t)p * C + c0, x[k] + (size_t)p * channels[k], (size_t)channels[k] * sizeof(float));
+}
+
+void spingalett_engine_global_pool(const float *x, float *y, uint32_t cells, uint32_t channels) {
+    const float inv = 1.0f / (float)cells;
+    for (uint32_t c = 0; c < channels; c++) y[c] = x[c];
+    for (uint32_t p = 1; p < cells; p++)
+        for (uint32_t c = 0; c < channels; c++) y[c] += x[(size_t)p * channels + c];
+    for (uint32_t c = 0; c < channels; c++) y[c] *= inv;
+}
+
 /* One layer on one sample: x [inputs] -> y [outputs], activation included. */
 static void layer_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
                           void *window) {
@@ -1924,18 +2043,44 @@ int spingalett_model_run(const SpingalettModel *model, const float *input, float
         return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model run: the workspace address must be a multiple of 4");
 
     const uint8_t *image = (const uint8_t *)model->image;
-    size_t width_bytes = workspace_float_bytes(model->max_width_);
-    float *buffers[2] = {(float *)workspace, (float *)(void *)((uint8_t *)workspace + width_bytes)};
-    int8_t *xq = (int8_t *)workspace + 2u * width_bytes;
+    uint8_t *activations = (uint8_t *)workspace;
+    int8_t *xq = (int8_t *)workspace + model->activations_;
     void *window = (uint8_t *)xq + slett_align(model->max_int_inputs_);
 
-    const float *x = input;
-    for (uint32_t i = 0; i < model->layer_count; i++) {
-        SlettLayer L;
-        spingalett_slett_layer(image, i, &L);
-        float *y = i + 1 == model->layer_count ? output : buffers[i & 1u];
-        layer_forward(image, &L, x, y, xq, window);
-        x = y;
+    if (slett_get16(image + 6) < 6u) {
+        /* a chain: the outputs alternate between two buffers */
+        float *buffers[2] = {(float *)workspace, (float *)(void *)(activations + model->activations_ / 2u)};
+        const float *x = input;
+        for (uint32_t i = 0; i < model->layer_count; i++) {
+            SlettLayer L;
+            spingalett_slett_layer(image, i, &L);
+            float *y = i + 1 == model->layer_count ? output : buffers[i & 1u];
+            layer_forward(image, &L, x, y, xq, window);
+            x = y;
+        }
+    } else {
+        /* a graph: every output in its place among the activations, until its last reader is done */
+        for (uint32_t i = 0; i < model->layer_count; i++) {
+            SlettLayer L;
+            spingalett_slett_layer(image, i, &L);
+            float *y = i + 1 == model->layer_count ? output : (float *)(void *)(activations + L.act_offset);
+            const float *x[SPINGALETT_MAX_INPUTS];
+            uint32_t channels[SPINGALETT_MAX_INPUTS];
+            for (uint32_t k = 0; k < L.input_count; k++) {
+                uint32_t j = spingalett_slett_input(image, &L, k), h, w, units;
+                x[k] = j == 0 ? input : (const float *)(const void *)(activations + spingalett_slett_act_offset(image, j));
+                spingalett_slett_output_shape(image, j, &h, &w, &units);
+                channels[k] = units / (h * w);
+            }
+            if (L.type == LAYER_ADD) spingalett_engine_add(x, L.input_count, y, L.outputs);
+            else if (L.type == LAYER_CONCAT) spingalett_engine_concat(x, channels, L.input_count, y, L.out_h * L.out_w);
+            else if (L.type == LAYER_GLOBAL_AVG_POOL) spingalett_engine_global_pool(x[0], y, L.in_h * L.in_w, L.in_c);
+            else {
+                layer_forward(image, &L, x[0], y, xq, window);
+                continue;
+            }
+            spingalett_engine_activate(y, L.outputs, L.activation);
+        }
     }
 #if !defined(SPINGALETT_INFERENCE_ONLY)
     spingalett_aligned_free(temp);

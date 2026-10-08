@@ -2,11 +2,11 @@
 # Copyright (c) 2026 pka_human (pka_human@proton.me)
 """Python bindings for the Spingalett C23 deep learning engine.
 
-Pure ``ctypes`` over the shared library: nothing is compiled at install time.
-The library is located in this order:
+Pure ``ctypes`` over the shared library: nothing is compiled at install time, and the wheels on
+PyPI carry the library inside the package. The library is located in this order:
 
 1. the ``SPINGALETT_LIBRARY`` environment variable (full path to the library),
-2. next to this module, then the repository's ``Bin/`` directory,
+2. inside this package (wheels), then the repository's ``Bin/`` directory,
 3. the system loader (``LD_LIBRARY_PATH``, ``DYLD_LIBRARY_PATH``, ``PATH``).
 
 Example::
@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -115,6 +115,12 @@ class LayerType(enum.IntEnum):
     MAX_POOL2D = 2
     AVG_POOL2D = 3
     BATCH_NORM = 4
+    ADD = 5
+    CONCAT = 6
+    GLOBAL_AVG_POOL = 7
+
+
+MAX_INPUTS = 16     # inputs of a layer, at most (SPINGALETT_MAX_INPUTS)
 
 
 class AutoSave(enum.IntEnum):
@@ -195,6 +201,8 @@ class _NetworkLayer(Structure):
         ("groups", c_uint32),
         ("epsilon", c_float),
         ("momentum", c_float),
+        ("input_count", c_uint32),
+        ("inputs", c_uint32 * MAX_INPUTS),
     ]
 
 
@@ -265,6 +273,8 @@ class _LayerArgs(Structure):
         ("groups", c_uint32),
         ("epsilon", c_float),
         ("momentum", c_float),
+        ("inputs", c_uint32 * MAX_INPUTS),
+        ("input_count", c_uint32),
     ]
 
 
@@ -321,6 +331,10 @@ class _TrainArgs(Structure):
         ("blas_num_threads", c_int),
         ("augment_shift", c_uint32),
         ("augment_flip", c_bool),
+        ("label_smoothing", c_float),
+        ("lr_plateau_factor", c_float),
+        ("lr_plateau_patience", c_size_t),
+        ("lr_plateau_min_lr", c_float),
     ]
 
 
@@ -434,6 +448,7 @@ class _Model(Structure):
         ("max_int_inputs_", c_uint32),
         ("conv_scratch_", c_size_t),
         ("owner_", c_void_p),
+        ("activations_", c_size_t),
     ]
 
 
@@ -461,6 +476,8 @@ class _LayerInfo(Structure):
         ("padding_w", c_uint32),
         ("groups", c_uint32),
         ("epsilon", c_float),
+        ("input_count", c_uint32),
+        ("input_layers", c_uint32 * MAX_INPUTS),
     ]
 
 
@@ -490,8 +507,10 @@ def _load_library() -> ctypes.CDLL:
         return ctypes.CDLL(env)
 
     here = os.path.dirname(os.path.abspath(__file__))
+    if sys.platform.startswith("win") and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(here)              # the runtime DLLs a wheel carries next to the library
     candidates = [os.path.join(here, n) for n in _library_names()]
-    candidates += [os.path.join(here, "..", "..", "Bin", n) for n in _library_names()]
+    candidates += [os.path.join(here, "..", "..", "..", "Bin", n) for n in _library_names()]   # a checkout
     for path in candidates:
         if os.path.exists(path):
             return ctypes.CDLL(os.path.normpath(path))
@@ -533,7 +552,7 @@ def _bind(name, restype, argtypes):
 
 
 _new = _bind("new_spingalett_struct_arguments", _NetPtr, [_NeuralNetworkArgs])
-_layer = _bind("layer_struct_arguments", None, [_LayerArgs])
+_layer = _bind("layer_struct_arguments", c_uint32, [_LayerArgs])
 _layer_count = _bind("spingalett_layer_count", c_uint32, [_NetPtr])
 _input_size = _bind("spingalett_input_size", c_uint32, [_NetPtr])
 _output_size = _bind("spingalett_output_size", c_uint32, [_NetPtr])
@@ -586,6 +605,11 @@ _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POI
 _model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, _FloatArray, c_uint32, _FloatArray])
 _model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _FloatArray, _FloatArray, c_uint32])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
+_import_onnx = _bind("spingalett_import_onnx", _NetPtr, [c_char_p])
+_import_onnx_from_memory = _bind("spingalett_import_onnx_from_memory", _NetPtr, [c_char_p, c_size_t])
+_load_pytorch = _bind("spingalett_load_pytorch", c_bool, [_NetPtr, c_char_p, POINTER(c_char_p), c_uint32])
+_load_pytorch_from_memory = _bind("spingalett_load_pytorch_from_memory", c_bool,
+                                  [_NetPtr, c_char_p, c_size_t, POINTER(c_char_p), c_uint32])
 _free = _bind("free_network", None, [_NetPtr])
 _print_parameters = _bind("print_parameters", None, [_NetPtr])
 
@@ -757,6 +781,12 @@ class _NativeGenerator:
     fn: object      # a _DataGeneratorFn pointing into the library
     data: object
 
+# Layer specifications for Network(layers=[...]). ``inputs`` names the earlier layers a layer reads,
+# by index (0 is the input layer, negative indices count back from the layer itself, -1 being the
+# one before it); None reads the layer before it.
+_Inputs = Optional[Union[int, Sequence[int]]]
+
+
 @dataclasses.dataclass
 class Layer:
     """Dense layer description. Activation, init and dropout are ignored for the input layer."""
@@ -764,6 +794,7 @@ class Layer:
     activation: Activation = Activation.SIGMOID
     init: Init = Init.RANDOM
     dropout: float = 0.0
+    inputs: _Inputs = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -786,6 +817,7 @@ class Conv2D:
     init: Init = Init.HE
     dropout: float = 0.0
     groups: int = 1
+    inputs: _Inputs = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -795,6 +827,7 @@ class BatchNorm:
     epsilon: float = 1e-5
     momentum: float = 0.1
     dropout: float = 0.0
+    inputs: _Inputs = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -803,6 +836,7 @@ class MaxPool2D:
     kernel: int
     stride: int = 0
     padding: int = 0
+    inputs: _Inputs = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -811,6 +845,30 @@ class AvgPool2D:
     kernel: int
     stride: int = 0
     padding: int = 0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Add:
+    """The sum of earlier layers of one shape (a residual connection), then ``activation``."""
+    inputs: _Inputs
+    activation: Activation = Activation.NONE
+    dropout: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Concat:
+    """Earlier layers of one height and width side by side along the channels, then ``activation``."""
+    inputs: _Inputs
+    activation: Activation = Activation.NONE
+    dropout: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class GlobalAvgPool:
+    """The mean of each channel over all cells: (1, 1, channels), without activation."""
+    dropout: float = 0.0
+    inputs: _Inputs = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -829,6 +887,7 @@ class LayerDescription:
     groups: int = 0                 # convolutions: channel groups
     epsilon: float = 0.0            # batch normalization
     momentum: float = 0.0
+    inputs: Tuple[int, ...] = ()    # the layers it reads (none for the input layer)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -902,6 +961,10 @@ class TrainConfig:
     blas_num_threads: int = 0
     augment_shift: int = 0              # images: random shifts by up to this many cells (zero fill)
     augment_flip: bool = False          # images: mirror left to right half of the time
+    label_smoothing: float = 0.0        # targets moved this far towards uniform (0.1 is common)
+    lr_plateau_factor: float = 0.0      # reduce on plateau: multiply the learning rate by this...
+    lr_plateau_patience: int = 0        # ...after this many epochs without improvement (0: off)
+    lr_plateau_min_lr: float = 0.0      # ...but not below this
 
 
 def _as_float(data) -> np.ndarray:
@@ -939,18 +1002,24 @@ class Network:
             raise SpingalettError(-1, "network allocation failed")
         for spec in layers or ():
             if isinstance(spec, Layer):
-                self.add_layer(spec.neurons, spec.activation, spec.init, spec.dropout)
+                self.add_layer(spec.neurons, spec.activation, spec.init, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, Input):
                 self.add_input(spec.height, spec.width, spec.channels)
             elif isinstance(spec, Conv2D):
                 self.add_conv2d(spec.filters, spec.kernel, spec.stride, spec.padding, spec.activation, spec.init,
-                                spec.dropout, spec.groups)
+                                spec.dropout, spec.groups, inputs=spec.inputs)
             elif isinstance(spec, BatchNorm):
-                self.add_batch_norm(spec.activation, spec.epsilon, spec.momentum, spec.dropout)
+                self.add_batch_norm(spec.activation, spec.epsilon, spec.momentum, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, MaxPool2D):
-                self.add_max_pool2d(spec.kernel, spec.stride, spec.padding)
+                self.add_max_pool2d(spec.kernel, spec.stride, spec.padding, inputs=spec.inputs)
             elif isinstance(spec, AvgPool2D):
-                self.add_avg_pool2d(spec.kernel, spec.stride, spec.padding)
+                self.add_avg_pool2d(spec.kernel, spec.stride, spec.padding, inputs=spec.inputs)
+            elif isinstance(spec, Add):
+                self.add_add(spec.inputs, spec.activation, spec.dropout)
+            elif isinstance(spec, Concat):
+                self.add_concat(spec.inputs, spec.activation, spec.dropout)
+            elif isinstance(spec, GlobalAvgPool):
+                self.add_global_avg_pool(spec.dropout, inputs=spec.inputs)
             else:
                 self.add_layer(int(spec))
 
@@ -995,14 +1064,37 @@ class Network:
         return self._ptr
 
     # ---- structure
-    def _add(self, **fields) -> "Network":
-        _call(_layer, _LayerArgs(net=self._net, **fields))
+    def _add(self, inputs: _Inputs = None, **fields) -> "Network":
+        args = _LayerArgs(net=self._net, **fields)
+        if inputs is not None:
+            count = _layer_count(self._net)
+            listed = [inputs] if isinstance(inputs, (int, np.integer)) else list(inputs)
+            if not 1 <= len(listed) <= MAX_INPUTS:
+                raise ValueError(f"a layer reads 1 to {MAX_INPUTS} layers, not {len(listed)}")
+            for k, index in enumerate(listed):
+                index = int(index)
+                if not -count <= index < count:
+                    raise IndexError(f"input layer {index} out of range for {count} layers")
+                args.inputs[k] = index % count
+            args.input_count = len(listed)
+        _call(_layer, args)
         return self
 
+    def __len__(self) -> int:
+        return int(_layer_count(self._net))
+
+    @property
+    def last(self) -> int:
+        """Index of the layer added last (the output layer so far): what later layers name in
+        ``inputs`` to read it."""
+        return len(self) - 1
+
     def add_layer(self, neurons: int, activation: Activation = Activation.SIGMOID,
-                  init: Init = Init.RANDOM, dropout: float = 0.0) -> "Network":
-        """Append a dense layer; the first layer added is the input layer."""
-        return self._add(neurons_amount=int(neurons), act_func=int(activation), weight_initialization=int(init),
+                  init: Init = Init.RANDOM, dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
+        """Append a dense layer; the first layer added is the input layer. Every layer reads the one
+        before it unless ``inputs`` names another (an index, negative ones counting back from the new
+        layer: -1 is the layer before it)."""
+        return self._add(inputs, neurons_amount=int(neurons), act_func=int(activation), weight_initialization=int(init),
                          dropout_rate=float(dropout))
 
     def add_input(self, height: int, width: int, channels: int = 1) -> "Network":
@@ -1011,30 +1103,47 @@ class Network:
 
     def add_conv2d(self, filters: int, kernel: int, stride: int = 1, padding: int = 0,
                    activation: Activation = Activation.RELU, init: Init = Init.HE, dropout: float = 0.0,
-                   groups: int = 1) -> "Network":
+                   groups: int = 1, inputs: _Inputs = None) -> "Network":
         """Append a 2D convolution: ``filters`` output channels, ``kernel`` x ``kernel`` windows,
         ``padding`` zeros on each side (kernel // 2 keeps the size of odd kernels at stride 1). With
         ``groups``, input channels and filters split into that many groups and each filter sees the
         input channels of its own (groups = input channels: a depthwise convolution)."""
-        return self._add(type=int(LayerType.CONV2D), filters=int(filters), kernel=int(kernel), stride=int(stride),
-                         padding=int(padding), act_func=int(activation), weight_initialization=int(init),
-                         dropout_rate=float(dropout), groups=int(groups))
+        return self._add(inputs, type=int(LayerType.CONV2D), filters=int(filters), kernel=int(kernel),
+                         stride=int(stride), padding=int(padding), act_func=int(activation),
+                         weight_initialization=int(init), dropout_rate=float(dropout), groups=int(groups))
 
     def add_batch_norm(self, activation: Activation = Activation.NONE, epsilon: float = 1e-5, momentum: float = 0.1,
-                       dropout: float = 0.0) -> "Network":
+                       dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
         """Append batch normalization of the previous layer, per channel, then ``activation``: while
         training with the batch's mean and variance, otherwise with running averages of them (each
         batch moves them ``momentum`` of the way)."""
-        return self._add(type=int(LayerType.BATCH_NORM), act_func=int(activation), epsilon=float(epsilon),
+        return self._add(inputs, type=int(LayerType.BATCH_NORM), act_func=int(activation), epsilon=float(epsilon),
                          momentum=float(momentum), dropout_rate=float(dropout))
 
-    def add_max_pool2d(self, kernel: int, stride: int = 0, padding: int = 0) -> "Network":
+    def add_max_pool2d(self, kernel: int, stride: int = 0, padding: int = 0, inputs: _Inputs = None) -> "Network":
         """Append max pooling over ``kernel`` x ``kernel`` windows (stride 0 = the kernel size)."""
-        return self._add(type=int(LayerType.MAX_POOL2D), kernel=int(kernel), stride=int(stride), padding=int(padding))
+        return self._add(inputs, type=int(LayerType.MAX_POOL2D), kernel=int(kernel), stride=int(stride),
+                         padding=int(padding))
 
-    def add_avg_pool2d(self, kernel: int, stride: int = 0, padding: int = 0) -> "Network":
+    def add_avg_pool2d(self, kernel: int, stride: int = 0, padding: int = 0, inputs: _Inputs = None) -> "Network":
         """Append average pooling over ``kernel`` x ``kernel`` windows (stride 0 = the kernel size)."""
-        return self._add(type=int(LayerType.AVG_POOL2D), kernel=int(kernel), stride=int(stride), padding=int(padding))
+        return self._add(inputs, type=int(LayerType.AVG_POOL2D), kernel=int(kernel), stride=int(stride),
+                         padding=int(padding))
+
+    def add_add(self, inputs: _Inputs, activation: Activation = Activation.NONE, dropout: float = 0.0) -> "Network":
+        """Append the sum of earlier layers of one shape, then ``activation``: with the input of a
+        block and its last layer, a residual connection."""
+        return self._add(inputs, type=int(LayerType.ADD), act_func=int(activation), dropout_rate=float(dropout))
+
+    def add_concat(self, inputs: _Inputs, activation: Activation = Activation.NONE, dropout: float = 0.0) -> "Network":
+        """Append earlier layers of one height and width side by side along the channels, in the
+        order given, then ``activation``."""
+        return self._add(inputs, type=int(LayerType.CONCAT), act_func=int(activation), dropout_rate=float(dropout))
+
+    def add_global_avg_pool(self, dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
+        """Append the mean of each channel over all cells: shape (1, 1, channels), a pooling layer
+        without activation."""
+        return self._add(inputs, type=int(LayerType.GLOBAL_AVG_POOL), dropout_rate=float(dropout))
 
     def layer(self, index: int) -> LayerDescription:
         """Layer ``index`` (0 is the input layer)."""
@@ -1047,7 +1156,7 @@ class Network:
                                 Activation(info.activation), float(info.dropout_rate), (info.kernel_h, info.kernel_w),
                                 (info.stride_h, info.stride_w), (info.padding_h, info.padding_w),
                                 int(info.weight_count), int(info.bias_count), int(info.groups), float(info.epsilon),
-                                float(info.momentum))
+                                float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -1095,7 +1204,7 @@ class Network:
         i = index % count + 1
         info = self.layer(i)
         if info.type == LayerType.CONV2D:
-            shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(i - 1).shape[2] // info.groups)
+            shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(info.inputs[0]).shape[2] // info.groups)
         elif info.type == LayerType.BATCH_NORM:
             shape = (info.bias_count,)
         else:
@@ -1367,6 +1476,10 @@ class Network:
             blas_num_threads=int(cfg.blas_num_threads),
             augment_shift=int(cfg.augment_shift),
             augment_flip=bool(cfg.augment_flip),
+            label_smoothing=float(cfg.label_smoothing),
+            lr_plateau_factor=float(cfg.lr_plateau_factor),
+            lr_plateau_patience=int(cfg.lr_plateau_patience),
+            lr_plateau_min_lr=float(cfg.lr_plateau_min_lr),
         )
         r = _call(_train, args)
         del keep
@@ -1399,6 +1512,80 @@ class Network:
         if not ptr:
             raise SpingalettError(-1, "could not load the network")
         return cls._wrap(ptr)
+
+    @classmethod
+    def from_onnx(cls, source) -> "Network":
+        """A network from an ONNX model: a path, or the model's bytes. It takes channels-last
+        samples: an ONNX input [N, C, H, W] becomes an input layer of shape (H, W, C), so NCHW images
+        must be transposed (``images.transpose(0, 2, 3, 1)``); see spingalett_import_onnx() for the
+        operators it reads."""
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            ptr = _call(_import_onnx_from_memory, data, len(data))
+        else:
+            ptr = _call(_import_onnx, _encode_path(source))
+        if not ptr:
+            raise SpingalettError(-1, "could not import the ONNX model")
+        return cls._wrap(ptr)
+
+    @classmethod
+    def from_torch(cls, module, example_input) -> "Network":
+        """A network computing what a PyTorch module computes, through an ONNX export in memory
+        (``torch.onnx.export``; ``example_input`` is a tensor of the module's input shape, NCHW for
+        images). The module is exported in evaluation mode. Like :meth:`from_onnx`, the network takes
+        channels-last samples."""
+        import io
+        import torch
+        was_training = module.training
+        module.eval()
+        try:
+            buffer = io.BytesIO()
+            try:
+                torch.onnx.export(module, (example_input,), buffer, dynamo=False, do_constant_folding=True)
+            except TypeError:       # releases without the dynamo argument
+                torch.onnx.export(module, (example_input,), buffer, do_constant_folding=True)
+        finally:
+            module.train(was_training)
+        return cls.from_onnx(buffer.getvalue())
+
+    def load_pytorch(self, source, modules: Optional[Sequence[str]] = None) -> "Network":
+        """Copies PyTorch weights into this network, which must have the same layers: a state dict
+        (``module.state_dict()``, of tensors or NumPy arrays), a torch.save file (.pt, .pth) or a
+        .safetensors file, as a path or bytes. The tensors of each module go to the layers with
+        parameters in order (see spingalett_load_pytorch()); ``modules`` names the modules in that
+        order when the source's order differs. Filters and dense weights are reordered for
+        channels-last data. The network is unchanged on error."""
+        names = None
+        if isinstance(source, dict):
+            import json, struct
+            header, chunks, offset, order = {}, [], 0, []
+            for key, value in source.items():
+                if key.endswith("num_batches_tracked"):
+                    continue
+                if hasattr(value, "detach"):            # a torch tensor
+                    value = value.detach().cpu().float().numpy()
+                array = np.ascontiguousarray(value, dtype="<f4")
+                header[key] = {"dtype": "F32", "shape": list(array.shape), "data_offsets": [offset, offset + array.nbytes]}
+                chunks.append(array.tobytes())
+                offset += array.nbytes
+                module = key.rsplit(".", 1)[0] if "." in key else ""
+                if module not in order:
+                    order.append(module)
+            text = json.dumps(header).encode()
+            data = struct.pack("<Q", len(text)) + text + b"".join(chunks)
+            names = list(modules) if modules is not None else order
+            source = data
+        elif modules is not None:
+            names = list(modules)
+        encoded = (c_char_p * max(1, len(names or ())))(*[n.encode() for n in names or ()])
+        count = len(names) if names is not None else 0
+        array = encoded if names is not None else None
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            _call(_load_pytorch_from_memory, self._net, data, len(data), array, count)
+        else:
+            _call(_load_pytorch, self._net, _encode_path(source), array, count)
+        return self
 
     # ---- deployment
     def to_model(self, precision: Precision = Precision.INT8) -> "Model":
@@ -1439,6 +1626,7 @@ class LayerInfo:
     padding: Tuple[int, int] = (0, 0)
     groups: int = 0
     epsilon: float = 0.0
+    input_layers: Tuple[int, ...] = ()  # network layers it reads (0: the input; i + 1: layer i here)
 
 
 class Model:
@@ -1532,7 +1720,8 @@ class Model:
                                  kernel=(int(info.kernel_h), int(info.kernel_w)),
                                  stride=(int(info.stride_h), int(info.stride_w)),
                                  padding=(int(info.padding_h), int(info.padding_w)),
-                                 groups=int(info.groups), epsilon=float(info.epsilon)))
+                                 groups=int(info.groups), epsilon=float(info.epsilon),
+                                 input_layers=tuple(int(info.input_layers[k]) for k in range(info.input_count))))
         return out
 
     def to_bytes(self) -> bytes:

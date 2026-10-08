@@ -133,7 +133,8 @@ void spingalett_model_free(SpingalettModel *model) {
 #define MODEL_CHUNK 1024u                        /* samples per pass through the layers, at most */
 
 struct PredictWorkspace {
-    float *act[2];                              /* [chunk x max_width] each */
+    float *act[2];                              /* [chunk x max_width] each; for a graph (format 6) act[0]
+                                                   holds every output at chunk times its offset */
     int8_t *xq;                                 /* [chunk x max_int_inputs] */
     float *xs;                                  /* per-sample activation scales */
     int8_t *window;                             /* a quantized convolution window or one pixel's sums, per thread */
@@ -354,10 +355,15 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
             }
         }
     }
-    size_t width = (size_t)chunk * (model->max_width_ ? model->max_width_ : 1u);
-    w->act[0] = (float *)workspace_alloc(w, width * sizeof(float));
-    w->act[1] = (float *)workspace_alloc(w, width * sizeof(float));
-    ok = w->act[0] && w->act[1];
+    if (slett_get16(image + 6) >= 6u) {
+        w->act[0] = (float *)workspace_alloc(w, (model->activations_ ? model->activations_ : 4u) * (size_t)chunk);
+        ok = w->act[0] != NULL;
+    } else {
+        size_t width = (size_t)chunk * (model->max_width_ ? model->max_width_ : 1u);
+        w->act[0] = (float *)workspace_alloc(w, width * sizeof(float));
+        w->act[1] = (float *)workspace_alloc(w, width * sizeof(float));
+        ok = w->act[0] && w->act[1];
+    }
     if (ok && int_inputs) {
         w->xq = (int8_t *)workspace_alloc(w, (size_t)chunk * int_inputs);
         w->xs = (float *)workspace_alloc(w, (size_t)chunk * sizeof(float));
@@ -554,6 +560,24 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const Pr
     activate_samples(y, n, out, L->activation, mode);
 }
 
+/* An addition, concatenation or global pooling over n samples, sample by sample with the engine's
+   functions, so that the results are the engine's (x[k]: input k, units[k] per sample). */
+static void predict_combine(const SlettLayer *L, const float *const *x, const uint32_t *units, const uint32_t *channels,
+                            float *y, uint32_t n, ComputeMode mode) {
+    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, (uint64_t)n * L->outputs * L->input_count),
+        for (int64_t s = 0; s < (int64_t)n; s++) {
+            const float *xs[SPINGALETT_MAX_INPUTS];
+            for (uint32_t k = 0; k < L->input_count; k++) xs[k] = x[k] + (size_t)s * units[k];
+            float *ys = y + (size_t)s * L->outputs;
+            if (L->type == LAYER_ADD) spingalett_engine_add(xs, L->input_count, ys, L->outputs);
+            else if (L->type == LAYER_CONCAT) spingalett_engine_concat(xs, channels, L->input_count, ys, L->out_h * L->out_w);
+            else spingalett_engine_global_pool(xs[0], ys, L->in_h * L->in_w, L->in_c);
+            spingalett_engine_activate(ys, L->outputs, L->activation);
+        }
+    );
+    (void)mode;
+}
+
 /* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included. A dense
    layer's interleaved rows are read only in calls with dense_tiles (others may be building them). */
 static void predict_layer(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, bool dense_tiles,
@@ -687,9 +711,14 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
     if (count == 0) return true;
 
     ComputeMode mode = resolve_compute_mode();
-    /* fewer samples per pass when the layers are wide (convolutions) */
-    uint32_t width = model->max_width_ > model->input_size ? model->max_width_ : model->input_size;
-    uint32_t cap = SPINGALETT_BATCH_FLOATS / 4u / (width ? width : 1u);
+    const uint8_t *image = (const uint8_t *)model->image;
+    const bool graph = slett_get16(image + 6) >= 6u;
+    /* fewer samples per pass when the layers are wide (convolutions): the outputs of a graph and
+       the two alternating buffers of a chain hold at most SPINGALETT_BATCH_FLOATS / 2 floats */
+    uint64_t width = graph ? model->activations_ / 8u : model->max_width_;
+    if (width < model->input_size) width = model->input_size;
+    uint64_t cap64 = SPINGALETT_BATCH_FLOATS / 4u / (width ? width : 1u);
+    uint32_t cap = cap64 > MODEL_CHUNK ? MODEL_CHUNK : (uint32_t)cap64;
     if (cap > MODEL_CHUNK) cap = MODEL_CHUNK;
     if (cap < 1) cap = 1;
     uint32_t chunk = count < cap ? count : cap;
@@ -728,16 +757,33 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
         return false;
     }
 
-    const uint8_t *image = (const uint8_t *)model->image;
     for (uint32_t start = 0; start < count; start += chunk) {
         uint32_t n = count - start < chunk ? count - start : chunk;
         const float *x = inputs + (size_t)start * model->input_size;
+        float *out = outputs + (size_t)start * model->output_size;
         for (uint32_t i = 0; i < model->layer_count; i++) {
             SlettLayer L;
             spingalett_slett_layer(image, i, &L);
-            float *y = i + 1 == model->layer_count ? outputs + (size_t)start * model->output_size : w->act[i & 1u];
-            predict_layer(image, &L, &layers[i], dense_tiles, x, y, n, w, mode);
-            x = y;
+            if (!graph) {
+                float *y = i + 1 == model->layer_count ? out : w->act[i & 1u];
+                predict_layer(image, &L, &layers[i], dense_tiles, x, y, n, w, mode);
+                x = y;
+                continue;
+            }
+            /* a graph: each output at chunk times its place in the engine's activations */
+            float *y = i + 1 == model->layer_count ? out : w->act[0] + L.act_offset / 4u * chunk;
+            const float *xs[SPINGALETT_MAX_INPUTS];
+            uint32_t units[SPINGALETT_MAX_INPUTS], channels[SPINGALETT_MAX_INPUTS];
+            for (uint32_t k = 0; k < L.input_count; k++) {
+                uint32_t j = spingalett_slett_input(image, &L, k), h, wd;
+                spingalett_slett_output_shape(image, j, &h, &wd, &units[k]);
+                channels[k] = units[k] / (h * wd);
+                xs[k] = j == 0 ? x : w->act[0] + spingalett_slett_act_offset(image, j) / 4u * chunk;
+            }
+            if (L.type == LAYER_ADD || L.type == LAYER_CONCAT || L.type == LAYER_GLOBAL_AVG_POOL)
+                predict_combine(&L, xs, units, channels, y, n, mode);
+            else
+                predict_layer(image, &L, &layers[i], dense_tiles, xs[0], y, n, w, mode);
         }
     }
     if (owner && w->bytes <= SPARE_WORKSPACE_MAX) w = atomic_exchange(&owner->spare, w);

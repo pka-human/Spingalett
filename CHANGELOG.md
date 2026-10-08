@@ -5,7 +5,91 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
-## [0.9.0] - Unreleased
+## [0.10.0] - 2026-10-08
+
+"Graphs": networks become directed acyclic graphs of layers (residual connections, concatenated
+branches), models come in from ONNX and PyTorch, the Python package goes to PyPI with the library
+inside, and convolutions read their windows straight from the image.
+
+### Added
+- Networks as graphs: `LayerArgs.inputs` and `.input_count` name the earlier layers a layer reads
+  (by default the one before it, so chains are built as before), and `layer()` and the other
+  builders return the new layer's index (`SPINGALETT_NO_LAYER` on error). New kinds of layers:
+  `LAYER_ADD` (`add_layers()`, the sum of layers of one shape: residual connections),
+  `LAYER_CONCAT` (`concat_layers()`, layers side by side along the channels) and
+  `LAYER_GLOBAL_AVG_POOL` (`global_avg_pool2d()`). A layer reads at most `SPINGALETT_MAX_INPUTS`
+  (16) layers; the last layer is the output, and every other layer must feed a later one before a
+  network trains or predicts. Training, the step API, `predict()`, `forward()`, `evaluate()`,
+  deployment models in every precision and the inference engine run graphs; training stays
+  bit-identical on any number of threads (a layer read by several gets their gradients in a fixed
+  order). `SpingalettNetworkLayer` and `SpingalettLayerInfo` list a layer's inputs.
+- `.slett` format version 6 (see `docs/ModelFormat.md`): each layer's inputs and where its output
+  lives among the engine's activations, planned by the writer so that outputs whose lives do not
+  overlap share memory. Chains are still written as versions 3 to 5. Batch normalizations fold into
+  products that feed nothing else.
+- ONNX import: `spingalett_import_onnx()` and `_from_memory()`, `ModelTool import`, Python
+  `Network.from_onnx()` and `Network.from_torch()` (through an ONNX export in memory). A protocol
+  buffer reader of the library's own; Conv (groups, strides, symmetric and same padding), Gemm,
+  MatMul with a constant operand (a following Add becomes the bias), MaxPool, AveragePool,
+  GlobalAveragePool and ReduceMean over the height and width, BatchNormalization, Add, Concat along
+  the channels, Relu, Sigmoid, Tanh, LeakyRelu, Softmax, Flatten, flattening Reshape, Identity,
+  Dropout and Constant; weights reordered for channels-last data; errors name the operator and node.
+  Models exported from PyTorch 2.14 with either exporter agree with PyTorch within 1e-7.
+- PyTorch weights: `spingalett_load_pytorch()` and `_from_memory()` copy a state dict saved with
+  `torch.save` (or a checkpoint holding one) or a safetensors file into a network of the same
+  layers, module by module in order (or in an explicit order), checking shapes and leaving the
+  network unchanged on error. The pickle inside `.pt` files is interpreted without running any of
+  it. Python: `Network.load_pytorch()` also takes a state dict directly.
+- Label smoothing: `TrainArgs.label_smoothing`, `spingalett_trainer_set_label_smoothing()`, Python
+  `TrainConfig.label_smoothing`.
+- Reduce on plateau: `TrainArgs.lr_plateau_factor`, `.lr_plateau_patience` and `.lr_plateau_min_lr`
+  scale the learning rate (the schedule's, when there is one) after epochs without improvement of
+  the monitored value; Python `TrainConfig` has the same fields.
+- Python wheels with the library inside (manylinux 2.28 x86-64 and AArch64, Windows x86-64, macOS
+  universal2, for any Python 3), built and tested by the release workflow, attached to releases and
+  uploaded to PyPI by trusted publishing. The bindings are a typed package (`py.typed`).
+- `Examples/CIFAR10.c` builds ResNet-20 to ResNet-56 (`resnet20`, `resnet32`, ..., `wide`), trained
+  with SGD, momentum, a cosine schedule and label smoothing: ResNet-20 reaches 91.55% test accuracy
+  in 100 epochs (INT8 model 91.58%, 281 KB); `Bin/Benchmark` and `Examples/benchmark_pytorch.py`
+  measure ResNet-20 (on the i7-12650H, 1.1 to 1.8 times PyTorch's training speed and 1.5 to 2.8
+  times its inference speed).
+- Tests: the `graph` group (gradient checks of residual, projected, branching and multiply-read
+  layers, determinism, inference in every precision, files, folding, memory, validation) and the
+  `onnx` group (models and state dicts exported from PyTorch, written by
+  `Tests/make_test_models.py`, unsupported operators, truncated files); the importers ran 24,000
+  mutated files under AddressSanitizer and UBSan.
+
+### Changed
+- Convolutions run as indirect matrix products: the matrix kernels read each pixel's window from the
+  image through one pointer per kernel tap (Dukhan's indirect convolution) instead of gathering
+  windows and transposing them into panels, for the forward pass, the data gradient (of strided
+  convolutions a phase of input cells at a time, over the taps that cover them only: a quarter of
+  the products of a 3 x 3 kernel with stride 2) and the weight gradient (tiles of filters by window
+  elements summed over the pixels in registers, in slots fixed by the shape). Threads take tiles
+  dynamically, which keeps the performance cores of hybrid processors busy. Measured on an
+  i7-12650H (medians of three interleaved runs of `Bin/Benchmark`, samples per second, 0.9 ->
+  0.10): the MNIST CNN trains at 2,615 -> 3,090 on one thread and 12,230 -> 14,591 on eight and
+  infers at 9,174 -> 11,183 and 44,227 -> 50,862; with batch normalization 2,259 -> 2,639,
+  9,745 -> 11,027, 9,205 -> 11,378 and 43,980 -> 55,646. ResNet-20 trains at 234 -> 377 and
+  986 -> 1,584 and infers at 958 -> 1,387 and 4,798 -> 6,402 (against 0.10 built without the new
+  kernels, `-DSPINGALETT_NO_DIRECT_CONV`). Dense networks and deployment models are unchanged.
+  Float results of convolutions change in the last bits (another summation order); training
+  remains the same bits on any number of threads. Depthwise convolutions, kernels of more than 64
+  taps and OpenBLAS keep the previous products.
+- `layer_struct_arguments()` returns the layer's index (it returned nothing).
+- `LayerArgs`, `SpingalettNetworkLayer`, `SpingalettLayerInfo`, `SpingalettModel` and `TrainArgs`
+  have new fields; zero-initialized arguments keep the previous behavior.
+- Inference outputs share memory where their lives do not overlap: `predict()` needs a few of the
+  widest layers per sample instead of all of them, which also makes it faster.
+- The Python bindings are a package (`Bindings/Python/spingalett/`); `import spingalett` is
+  unchanged.
+
+### Fixed
+- Release builds with GCC 16 crashed in `evaluate()` (and four test groups failed): with LTO, GCC
+  16.1 dropped the stack realignment of a function that inlined the thread-local error state and
+  still read its arguments through it. `set_error()` now stays out of line.
+
+## [0.9.0] - 2026-10-08
 
 "Bottlenecks": every part of the library profiled and its slow paths removed, from data set files
 through training and inference to model files and the Python bindings. Measurements on a 4-vCPU
@@ -116,7 +200,7 @@ Xeon @ 2.1 GHz with AVX-512, 4 threads unless noted.
 - Threads opening data sets at the same time no longer race to build the table of 8-bit values.
 - Builds with `SPINGALETT_PORTABLE_KERNELS` and without `-march=native` link again (broken in 0.8).
 
-## [0.8.0] - Unreleased
+## [0.8.0] - 2026-10-08
 
 Deeper convolutional networks: batch normalization, grouped and depthwise convolutions, image
 augmentation and a CIFAR-10 example.
@@ -489,6 +573,9 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[0.10.0]: https://github.com/pka-human/Spingalett/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/pka-human/Spingalett/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/pka-human/Spingalett/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pka-human/Spingalett/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pka-human/Spingalett/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/pka-human/Spingalett/compare/v0.4.1...v0.5.0

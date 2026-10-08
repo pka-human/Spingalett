@@ -254,6 +254,18 @@ static void output_delta_from_grad(ActivationFunction act, const float *out, con
     apply_derivative_batch(delta, out, (uint64_t)n, act);
 }
 
+/* Smoothed targets of n samples: dst = (1 - eps) t + eps / k, k the outputs (2 for sigmoid outputs,
+   each its own pair of classes). */
+static void smooth_targets(const float *t, float *dst, uint32_t n, uint32_t outputs, ActivationFunction act, float eps,
+                           ComputeMode mode) {
+    const float keep = 1.0f - eps, share = eps / (act == ACT_SIGMOID ? 2.0f : (float)outputs);
+    const uint64_t total = (uint64_t)n * outputs;
+    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, total) && n > 1,
+        for (int64_t i = 0; i < (int64_t)total; i++) dst[i] = keep * t[i] + share;
+    );
+    (void)mode;
+}
+
 /* ---- batch path (all backends): see Spingalett.Batch.c for the workspace and forward pass ---- */
 
 /* Output deltas of N samples from targets (the network's loss) or from dL/d(output) rows. */
@@ -272,49 +284,90 @@ static void batch_output_deltas(NeuralNetwork *net, BatchWorkspace *ws, const fl
     }
 }
 
-/* Propagates the output deltas back through the hidden layers. */
-static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode) {
-    uint32_t last = net->layers - 1;
-    for (uint32_t l = last - 1; l > 0; l--) {
-        uint32_t cur_sz  = net->topology[l];
-        uint32_t next_sz = net->topology[l + 1];
-
-        /* the derivative of layer l's activation is applied by the convolution and pooling
-           kernels while their output is in cache; dropout masks hold it already */
-        ActivationFunction act = net->act_func[l - 1];
-        ActivationFunction fused = ws->dmask[l] ? ACT_NONE : act;
-        switch (net->shapes[l + 1].type) {
-            case LAYER_DENSE:       /* delta[l] = delta[l+1] * W, W stored [next x cur] */
-                spingalett_gemm(ws->gemm, mode, false, false, N, cur_sz, next_sz, 1.0f,
-                                ws->delta[l + 1], next_sz, SPINGALETT_WEIGHT_MTX_PTR(net, l), cur_sz,
-                                0.0f, ws->delta[l], cur_sz);
-                break;
-            case LAYER_CONV2D:
-                spingalett_conv_backward_data(net, l, ws->delta[l + 1], ws->delta[l], N, ws->act[l], fused, ws->conv,
-                                              ws->gemm, mode);
-                break;
-            case LAYER_BATCH_NORM:  /* the sums are also the parameters' gradients */
-                spingalett_bn_backward_sums(net, l, ws->act[l], ws->delta[l + 1], N, ws->bn_stats[l + 1],
-                                            ws->bn_sums[l + 1], ws->bn_scratch, mode);
-                spingalett_bn_backward_data(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, ws->bn_stats[l + 1],
-                                            ws->bn_sums[l + 1], fused, ws->bn_coef, mode);
-                break;
-            default:                /* pooling has no activation: delta[l+1] is dL/d(its output) */
-                spingalett_pool_backward(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, fused, mode);
-                break;
+/* The gradient that input k of layer c gets from it (delta[c] = dL/d(c's pre-activation)): written
+   to dst, or added to it with accumulate (dense, adding, concatenating and global pooling layers
+   only), times the derivative of the input's activation `fused` (ACT_NONE: none; never with
+   accumulate) when the kernel can apply it while the result is in cache. Returns whether it did. */
+static bool input_gradient(NeuralNetwork *net, BatchWorkspace *ws, uint32_t c, uint32_t k, float *dst, uint32_t N,
+                           ActivationFunction fused, bool accumulate, ComputeMode mode) {
+    const uint32_t *in = spingalett_inputs(net, c), i = in[k];
+    const uint32_t cur_sz = net->topology[i], next_sz = net->topology[c];
+    const LayerShape *s = &net->shapes[c];
+    switch (s->type) {
+        case LAYER_DENSE:           /* dst = delta[c] * W, W stored [next x cur] */
+            spingalett_gemm(ws->gemm, mode, false, false, N, cur_sz, next_sz, 1.0f, ws->delta[c], next_sz,
+                            SPINGALETT_WEIGHT_MTX_PTR(net, c - 1), cur_sz, accumulate ? 1.0f : 0.0f, dst, cur_sz);
+            return false;
+        case LAYER_CONV2D:
+            spingalett_conv_backward_data(net, c - 1, ws->delta[c], dst, N, ws->act[i], fused, ws->conv, ws->gemm, mode);
+            return true;
+        case LAYER_BATCH_NORM:      /* the sums are left by the backward pass */
+            spingalett_bn_backward_data(net, c - 1, ws->act[i], ws->delta[c], dst, N, ws->bn_stats[c], ws->bn_sums[c],
+                                        fused, ws->bn_coef, mode);
+            return true;
+        case LAYER_ADD:
+        case LAYER_CONCAT: {        /* the input's channels of delta[c] */
+            uint32_t c0 = 0;
+            for (uint32_t j = 0; s->type == LAYER_CONCAT && j < k; j++) c0 += net->shapes[in[j]].channels;
+            spingalett_slice_backward(ws->delta[c], s->channels, c0, net->shapes[i].channels, dst, ws->act[i], N,
+                                      (uint64_t)s->height * s->width, fused, accumulate, mode);
+            return true;
         }
-        if (net->shapes[l + 1].type != LAYER_DENSE && !ws->dmask[l])
-            continue;
+        case LAYER_GLOBAL_AVG_POOL: {
+            const LayerShape *x = &net->shapes[i];
+            spingalett_global_pool_backward(ws->delta[c], dst, ws->act[i], N, (uint64_t)x->height * x->width, x->channels,
+                                            fused, accumulate, mode);
+            return true;
+        }
+        default:                    /* pooling has no activation: delta[c] is dL/d(its output) */
+            spingalett_pool_backward(net, c - 1, ws->act[i], ws->delta[c], dst, N, fused, mode);
+            return true;
+    }
+}
+
+/* Propagates the output deltas back through the hidden layers, from the last layer down: a layer's
+   delta is complete once every later layer that reads it has run. A layer that feeds several gets
+   their gradients in that fixed order (the first written, the others added), so the sums do not
+   depend on the thread count, and the derivative of its activation after the last. */
+static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode) {
+    const uint32_t last = net->layers - 1;
+    memcpy(ws->pending, ws->uses, net->layers * sizeof(uint32_t));
+    for (uint32_t c = last; c > 0; c--) {
+        const uint32_t count = spingalett_input_count(net, c), *in = spingalett_inputs(net, c);
+        const LayerType type = net->shapes[c].type;
+        if (type == LAYER_BATCH_NORM)       /* also the parameters' gradients, whatever the input */
+            spingalett_bn_backward_sums(net, c - 1, ws->act[in[0]], ws->delta[c], N, ws->bn_stats[c], ws->bn_sums[c],
+                                        ws->bn_scratch, mode);
+        for (uint32_t k = 0; k < count; k++) {
+            const uint32_t l = in[k], cur_sz = net->topology[l];
+            if (l == 0) continue;           /* the network's inputs need no gradient */
+            ActivationFunction act = net->act_func[l - 1];
+            if (ws->uses[l] > 1) {
+                const bool first = ws->pending[l] == ws->uses[l], done = --ws->pending[l] == 0;
+                const bool direct = first || type == LAYER_DENSE || type == LAYER_ADD || type == LAYER_CONCAT ||
+                                    type == LAYER_GLOBAL_AVG_POOL;
+                input_gradient(net, ws, c, k, direct ? ws->delta[l] : ws->gtmp, N, ACT_NONE, !first, mode);
+                if (!direct || done)
+                    spingalett_gradient_sum(ws->delta[l], direct ? NULL : ws->gtmp, ws->act[l], ws->dmask[l], N, cur_sz,
+                                            act, done, mode);
+                continue;
+            }
+            /* the derivative of layer l's activation is applied by the convolution and pooling
+               kernels while their output is in cache; dropout masks hold it already */
+            if (input_gradient(net, ws, c, k, ws->delta[l], N, ws->dmask[l] ? ACT_NONE : act, false, mode) &&
+                !ws->dmask[l])
+                continue;
 
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * cur_sz))
 #endif
-        for (int64_t s = 0; s < (int64_t)N; s++) {
-            size_t off = (size_t)s * cur_sz;
-            if (ws->dmask[l])
-                spingalett_vec_mul(ws->delta[l] + off, ws->dmask[l] + off, cur_sz);
-            else
-                apply_derivative_batch(ws->delta[l] + off, ws->act[l] + off, cur_sz, act);
+            for (int64_t s = 0; s < (int64_t)N; s++) {
+                size_t off = (size_t)s * cur_sz;
+                if (ws->dmask[l])
+                    spingalett_vec_mul(ws->delta[l] + off, ws->dmask[l] + off, cur_sz);
+                else
+                    apply_derivative_batch(ws->delta[l] + off, ws->act[l] + off, cur_sz, act);
+            }
         }
     }
 }
@@ -325,14 +378,15 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
 static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                                        float scale, float beta, ComputeMode mode, const OptimizerStep *o) {
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
-        uint32_t in_sz  = net->topology[l];
+        const uint32_t src = spingalett_source(net, l + 1);
+        uint32_t in_sz  = net->topology[src];
         uint32_t out_sz = net->topology[l + 1];
         LayerType type = net->shapes[l + 1].type;
 
         if (type == LAYER_DENSE) {
             /* gW[out x in] = delta^T[out x N] * act[N x in] */
             spingalett_gemm(ws->gemm, mode, true, false, out_sz, in_sz, N, scale,
-                            ws->delta[l + 1], out_sz, ws->act[l], in_sz,
+                            ws->delta[l + 1], out_sz, ws->act[src], in_sz,
                             beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
 
             float *gB = net->grad_biases + net->bias_offsets[l];
@@ -341,13 +395,10 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
             for (uint32_t s = 0; s < N; s++)
                 spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
         } else if (type == LAYER_CONV2D) {
-            spingalett_conv_backward_weights(net, l, ws->act[l], ws->delta[l + 1], N, scale, beta, ws->conv,
+            spingalett_conv_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
                                              ws->gemm, mode);
         } else if (type == LAYER_BATCH_NORM) {
-            /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass, except after the input) */
-            if (l == 0)
-                spingalett_bn_backward_sums(net, l, ws->act[0], ws->delta[1], N, ws->bn_stats[1], ws->bn_sums[1],
-                                            ws->bn_scratch, mode);
+            /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass) */
             const double *sums = ws->bn_sums[l + 1];
             const uint32_t C = net->shapes[l + 1].channels;
             float *gW = net->grad_weights + net->weight_offsets[l], *gB = net->grad_biases + net->bias_offsets[l];
@@ -357,7 +408,7 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
                 gB[c] = beta == 0.0f ? db : db + beta * gB[c];
             }
         } else {
-            continue;               /* pooling has no parameters */
+            continue;               /* pooling, adding and concatenating layers have no parameters */
         }
 
         if (o) {
@@ -505,6 +556,7 @@ typedef struct {
     bool augment;               /* augment_shift or augment_flip */
     uint64_t augment_seed;      /* drawn once per train() call */
     float *augmented;           /* per-sample path: one augmented input */
+    float *smoothed;            /* label smoothing: the targets of a chunk (or a sample), smoothed */
 
     BatchWorkspace *val_ws;     /* validation: inference workspace and output rows */
     float *val_out;
@@ -513,6 +565,7 @@ typedef struct {
 
 static void trainer_free(Trainer *t) {
     spingalett_aligned_free(t->augmented);
+    spingalett_aligned_free(t->smoothed);
     spingalett_aligned_free(t->gen_inputs);
     spingalett_aligned_free(t->gen_targets);
     free(t->order);
@@ -557,10 +610,17 @@ static bool trainer_alloc(Trainer *t) {
         if (!t->gen_inputs || !t->gen_targets) return false;
     }
 
+    uint32_t out_sz = net->topology[net->layers - 1];
     if (t->use_batch_path) {
         uint32_t capacity = spingalett_batch_capacity(net, t->batch_size);
         t->ws = spingalett_batch_workspace_create(net, capacity, true, t->order != NULL || t->augment, t->mode);
-        return t->ws != NULL;
+        if (t->args->label_smoothing > 0.0f)
+            t->smoothed = (float *)spingalett_aligned_alloc((size_t)capacity * out_sz * sizeof(float));
+        return t->ws != NULL && (t->args->label_smoothing <= 0.0f || t->smoothed);
+    }
+    if (t->args->label_smoothing > 0.0f) {
+        t->smoothed = (float *)spingalett_aligned_alloc((size_t)out_sz * sizeof(float));
+        if (!t->smoothed) return false;
     }
     if (t->augment) {
         t->augmented = (float *)spingalett_aligned_alloc((size_t)net->topology[0] * sizeof(float));
@@ -668,6 +728,10 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
                 targets = targets_in + (size_t)(start + c0) * out_sz;
             }
 
+            if (t->smoothed) {
+                smooth_targets(targets, t->smoothed, n, out_sz, out_act, args->label_smoothing, t->mode);
+                targets = t->smoothed;
+            }
             spingalett_batch_forward(net, ws, n, dropout, c0, t->mode);
             loss += batch_compute_loss(net, ws, targets, n);
             batch_output_deltas(net, ws, targets, NULL, n);
@@ -691,6 +755,10 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
     for (uint32_t s = 0; s < count; s++) {
         uint32_t idx = order ? order[start + s] : start + s;
         const float *target = targets_in + (size_t)idx * out_sz;
+        if (t->smoothed) {
+            smooth_targets(target, t->smoothed, 1, out_sz, out_act, args->label_smoothing, COMPUTE_SINGLE_THREADED);
+            target = t->smoothed;
+        }
 
         /* Every online step holds one sample, so its position within the step is 0. */
         t->dropout.step = net->time_step;
@@ -737,7 +805,7 @@ static bool check_trainable(const NeuralNetwork *net) {
             return false;
         }
     }
-    return true;
+    return spingalett_check_graph(net, "train");
 }
 
 static TrainReport train_failed(const char *message) {
@@ -806,7 +874,10 @@ TrainReport train_struct_arguments(TrainArgs args) {
         monitor = has_validation ? MONITOR_VAL_LOSS : MONITOR_TRAIN_LOSS;
     if ((monitor == MONITOR_VAL_LOSS || monitor == MONITOR_VAL_ACCURACY) && !has_validation)
         return train_failed("Monitoring a validation metric needs validation data (val_inputs, val_targets, val_count)");
-    bool monitoring = has_validation || args.early_stopping_patience > 0 || args.restore_best_weights;
+    const bool plateau = args.lr_plateau_patience > 0;
+    if (plateau && !(args.lr_plateau_factor > 0.0f && args.lr_plateau_factor < 1.0f))
+        return train_failed("lr_plateau_factor must be in (0, 1) when lr_plateau_patience is set");
+    bool monitoring = has_validation || args.early_stopping_patience > 0 || args.restore_best_weights || plateau;
     bool higher_is_better = (monitor == MONITOR_VAL_ACCURACY);
     float min_delta = fabsf(args.early_stopping_min_delta);
 
@@ -825,6 +896,8 @@ TrainReport train_struct_arguments(TrainArgs args) {
         args.batch_size = sample_count;
     if ((args.augment_shift > 0 || args.augment_flip) && net->shapes[0].height * net->shapes[0].width == 1)
         return train_failed("Augmentation needs an input layer with a height and width (an image)");
+    if (!(args.label_smoothing >= 0.0f && args.label_smoothing < 1.0f))
+        return train_failed("label_smoothing must be in [0, 1)");
     uint32_t step_samples = training_strategy == STRATEGY_SMALL_BATCH ? args.batch_size : sample_count;
     for (uint32_t l = 1; step_samples == 1 && l < net->layers; l++)
         if (net->shapes[l].type == LAYER_BATCH_NORM && net->shapes[l].height * net->shapes[l].width == 1)
@@ -952,8 +1025,9 @@ TrainReport train_struct_arguments(TrainArgs args) {
         .validation = {NAN, NAN}, .monitor = monitor, .best_value = NAN,
     };
     float best = higher_is_better ? -INFINITY : INFINITY;
-    size_t epochs_without_improvement = 0;
+    size_t epochs_without_improvement = 0, stale = 0;
     bool lr_warned = false;
+    float lr_scale = 1.0f, base_lr = args.learning_rate;   /* reduce on plateau: the scale it reached */
 
     for (size_t epoch = 1; epoch <= epochs; epoch++) {
         float total_error = 0.0f;
@@ -961,13 +1035,15 @@ TrainReport train_struct_arguments(TrainArgs args) {
         if (args.lr_scheduler) {
             float lr = args.lr_scheduler(epoch - 1, epochs, args.learning_rate, args.lr_scheduler_data);
             if (lr >= 0.0f && isfinite(lr)) {
-                t.opt.lr = lr;
+                base_lr = lr;
             } else if (!lr_warned) {
                 lr_warned = true;
                 spingalett_log(LOG_WARNING, "LR scheduler returned %g at epoch %zu; keeping lr=%g",
-                               (double)lr, epoch, (double)t.opt.lr);
+                               (double)lr, epoch, (double)base_lr);
             }
         }
+        /* reductions on plateau scale the base rate, down to lr_plateau_min_lr (never above the base) */
+        t.opt.lr = lr_scale < 1.0f ? fmaxf(base_lr * lr_scale, fminf(args.lr_plateau_min_lr, base_lr)) : base_lr;
 
         uint64_t epoch_samples = 0;
 
@@ -1049,11 +1125,18 @@ TrainReport train_struct_arguments(TrainArgs args) {
             } else {
                 epochs_without_improvement++;
             }
+            stale = improved ? 0 : stale + 1;
+            if (plateau && stale >= args.lr_plateau_patience) {
+                lr_scale *= args.lr_plateau_factor;
+                stale = 0;
+                spingalett_log(LOG_INFO, "No improvement for %zu epochs: learning rate scaled to %g of the schedule's",
+                               args.lr_plateau_patience, (double)lr_scale);
+            }
         }
 
         if (should_report(epoch, epochs, args.report_interval)) {
             char lr_text[32] = "", val_text[64] = "";
-            if (args.lr_scheduler)
+            if (args.lr_scheduler || lr_scale < 1.0f)
                 snprintf(lr_text, sizeof lr_text, ", LR: %g", (double)t.opt.lr);
             if (has_validation)
                 snprintf(val_text, sizeof val_text, ", Val loss: %f, Val accuracy: %.2f%%",
@@ -1113,6 +1196,8 @@ struct SpingalettTrainer {
     DropoutContext dropout;
     uint32_t pending;           /* samples of the last forward pass, until it is back-propagated */
     uint32_t accumulated;       /* samples in the network's gradient since the last step */
+    float label_smoothing;
+    float *smoothed;            /* the smoothed targets of a batch */
 };
 
 SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch) {
@@ -1144,7 +1229,26 @@ SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch
 void spingalett_trainer_free(SpingalettTrainer *tr) {
     if (!tr) return;
     spingalett_batch_workspace_free(tr->ws);
+    spingalett_aligned_free(tr->smoothed);
     free(tr);
+}
+
+bool spingalett_trainer_set_label_smoothing(SpingalettTrainer *tr, float label_smoothing) {
+    if (!tr || !(label_smoothing >= 0.0f && label_smoothing < 1.0f)) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_set_label_smoothing: NULL trainer or a value outside [0, 1)");
+        return false;
+    }
+    if (label_smoothing > 0.0f && !tr->smoothed) {
+        const NeuralNetwork *net = tr->net;
+        tr->smoothed = (float *)spingalett_aligned_alloc((size_t)tr->ws->capacity * net->topology[net->layers - 1] *
+                                                         sizeof(float));
+        if (!tr->smoothed) {
+            set_error(SPINGALETT_ERR_ALLOC, "spingalett_trainer_set_label_smoothing: allocation failed");
+            return false;
+        }
+    }
+    tr->label_smoothing = label_smoothing;
+    return true;
 }
 
 const float *spingalett_trainer_forward(SpingalettTrainer *tr, const float *inputs, uint32_t count) {
@@ -1177,6 +1281,11 @@ static bool trainer_backward(SpingalettTrainer *tr, const float *targets, const 
     }
     NeuralNetwork *net = tr->net;
     uint32_t n = tr->pending;
+    if (targets && tr->label_smoothing > 0.0f) {
+        smooth_targets(targets, tr->smoothed, n, net->topology[net->layers - 1], net->act_func[net->layers - 2],
+                       tr->label_smoothing, tr->mode);
+        targets = tr->smoothed;
+    }
     if (loss)
         *loss = batch_compute_loss(net, tr->ws, targets, n);
 

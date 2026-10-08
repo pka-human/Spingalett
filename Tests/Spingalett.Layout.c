@@ -23,7 +23,7 @@ int main(void) {
     FIELD(LayerArgs, kernel); FIELD(LayerArgs, stride); FIELD(LayerArgs, padding);
     FIELD(LayerArgs, kernel_h); FIELD(LayerArgs, kernel_w); FIELD(LayerArgs, stride_h); FIELD(LayerArgs, stride_w);
     FIELD(LayerArgs, padding_h); FIELD(LayerArgs, padding_w); FIELD(LayerArgs, groups); FIELD(LayerArgs, epsilon);
-    FIELD(LayerArgs, momentum);
+    FIELD(LayerArgs, momentum); FIELD(LayerArgs, inputs); FIELD(LayerArgs, input_count);
 
     SIZE(SpingalettNetworkLayer);
     FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
@@ -32,6 +32,7 @@ int main(void) {
     FIELD(SpingalettNetworkLayer, stride_h); FIELD(SpingalettNetworkLayer, stride_w); FIELD(SpingalettNetworkLayer, padding_h);
     FIELD(SpingalettNetworkLayer, padding_w); FIELD(SpingalettNetworkLayer, weight_count); FIELD(SpingalettNetworkLayer, bias_count);
     FIELD(SpingalettNetworkLayer, groups); FIELD(SpingalettNetworkLayer, epsilon); FIELD(SpingalettNetworkLayer, momentum);
+    FIELD(SpingalettNetworkLayer, input_count); FIELD(SpingalettNetworkLayer, inputs);
 
     SIZE(ForwardArgs); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
@@ -50,7 +51,8 @@ int main(void) {
     FIELD(TrainArgs, val_inputs); FIELD(TrainArgs, val_targets); FIELD(TrainArgs, val_count);
     FIELD(TrainArgs, monitor); FIELD(TrainArgs, early_stopping_patience); FIELD(TrainArgs, early_stopping_min_delta);
     FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads); FIELD(TrainArgs, augment_shift);
-    FIELD(TrainArgs, augment_flip);
+    FIELD(TrainArgs, augment_flip); FIELD(TrainArgs, label_smoothing);
+    FIELD(TrainArgs, lr_plateau_factor); FIELD(TrainArgs, lr_plateau_patience); FIELD(TrainArgs, lr_plateau_min_lr);
 
     SIZE(EvalMetrics); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
 
@@ -109,7 +111,7 @@ int main(void) {
     FIELD(SpingalettModel, input_size); FIELD(SpingalettModel, output_size); FIELD(SpingalettModel, layer_count);
     FIELD(SpingalettModel, loss); FIELD(SpingalettModel, workspace_size); FIELD(SpingalettModel, image);
     FIELD(SpingalettModel, image_size); FIELD(SpingalettModel, max_width_); FIELD(SpingalettModel, max_int_inputs_);
-    FIELD(SpingalettModel, conv_scratch_); FIELD(SpingalettModel, owner_);
+    FIELD(SpingalettModel, conv_scratch_); FIELD(SpingalettModel, owner_); FIELD(SpingalettModel, activations_);
 
     SIZE(SpingalettLayerInfo);
     FIELD(SpingalettLayerInfo, type); FIELD(SpingalettLayerInfo, inputs); FIELD(SpingalettLayerInfo, outputs);
@@ -118,7 +120,8 @@ int main(void) {
     FIELD(SpingalettLayerInfo, height); FIELD(SpingalettLayerInfo, width); FIELD(SpingalettLayerInfo, channels);
     FIELD(SpingalettLayerInfo, kernel_h); FIELD(SpingalettLayerInfo, kernel_w); FIELD(SpingalettLayerInfo, stride_h);
     FIELD(SpingalettLayerInfo, stride_w); FIELD(SpingalettLayerInfo, padding_h); FIELD(SpingalettLayerInfo, padding_w);
-    FIELD(SpingalettLayerInfo, groups); FIELD(SpingalettLayerInfo, epsilon);
+    FIELD(SpingalettLayerInfo, groups); FIELD(SpingalettLayerInfo, epsilon); FIELD(SpingalettLayerInfo, input_count);
+    FIELD(SpingalettLayerInfo, input_layers);
 
     SIZE(LRScheduleParams);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);

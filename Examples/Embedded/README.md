@@ -105,6 +105,11 @@ model is read-only: several tasks can share it, each with its own workspace. On 
 DSP extension (Cortex-M4, M7, M33) the INT8 dot products use `SMLAD`, two multiply-accumulates
 per instruction.
 
+Graphs (residual blocks, concatenated branches; `.slett` format version 6) run the same way. The
+file records where each layer's output lives in the workspace, planned when the model was saved so
+that outputs alive at the same time do not overlap: the workspace holds a few of the network's
+widest outputs, not all of them, however deep the network is.
+
 ## Files
 
 | File | Contents |

@@ -7,8 +7,9 @@
  * Spingalett inference engine.
  *
  * Runs a network stored as a .slett image (format version 3; 4 for networks with convolution and
- * pooling layers; 5 for networks with batch normalization or grouped convolutions) in place, in the
- * precision its parameters were saved in. The image can be a file read into memory, a const array
+ * pooling layers; 5 for networks with batch normalization or grouped convolutions; 6 for networks
+ * whose layers read other layers than the one before them, such as residual connections) in place,
+ * in the precision its parameters were saved in. The image can be a file read into memory, a const array
  * compiled into the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing,
  * does no I/O and keeps no global state: apart from the image it only needs a workspace from the
  * caller, so it runs on microcontrollers as well as on desktops, and any number of threads can share
@@ -24,7 +25,7 @@
  * products with the weights accumulate in 32-bit integers, and each output is rescaled by its weight
  * row's scale. FLOAT32, FP16 and BFLOAT16 layers run in float. Convolutions compute each output
  * pixel as such dot products of the filters with the window it reads; pooling and batch
- * normalization run in float.
+ * normalization run in float, and so do the layers that add or concatenate the outputs of others.
  */
 #pragma once
 
@@ -52,9 +53,13 @@ extern "C" {
 
 /* Newest version of the .slett model format. save_spingalett writes the oldest version that holds
    the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch
-   normalization or grouped convolutions, so that engines of earlier releases still run what they
-   can; versions 1 and 2 still load. */
-#define SPINGALETT_FORMAT_VERSION 5
+   normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one
+   before them, add or concatenate several, or pool globally), so that engines of earlier releases
+   still run what they can; versions 1 and 2 still load. */
+#define SPINGALETT_FORMAT_VERSION 6
+
+/* Most inputs a layer can have (LAYER_ADD and LAYER_CONCAT read several). */
+#define SPINGALETT_MAX_INPUTS 16
 
 /* File name extensions: models (save_spingalett appends it when the name has none) and data sets. */
 #define SPINGALETT_MODEL_EXTENSION   ".slett"
@@ -86,7 +91,9 @@ typedef enum {
 /*
  * Kinds of layers. Data flows through a network as one tensor per sample, height x width x channels
  * in channels-last order (element (y, x, c) at (y * width + x) * channels + c); a dense layer reads
- * it as a flat vector, so a dense layer after convolutions needs no flattening.
+ * it as a flat vector, so a dense layer after convolutions needs no flattening. A layer reads the
+ * layer before it unless it names its inputs: any earlier layers, which makes the network a directed
+ * acyclic graph whose last layer is the output.
  */
 typedef enum {
     LAYER_DENSE,                    /* fully connected: neurons_amount outputs */
@@ -96,6 +103,12 @@ typedef enum {
     LAYER_BATCH_NORM,               /* per channel: gamma (x - mean) / sqrt(variance + epsilon) + beta,
                                        with the batch's statistics while training and running
                                        averages of them otherwise */
+    LAYER_ADD,                      /* the sum of its inputs, which share one shape (residual
+                                       connections); with one input, the input itself */
+    LAYER_CONCAT,                   /* its inputs side by side along the channels, in the order
+                                       given; they share height and width */
+    LAYER_GLOBAL_AVG_POOL,          /* the mean of each channel over all cells: 1 x 1 x channels (no
+                                       activation, like the other pooling layers) */
     LAYER_TYPE_COUNT
 } LayerType;
 
@@ -128,6 +141,7 @@ typedef struct {
     uint32_t max_int_inputs_;       /* private: widest input of an integer layer */
     size_t conv_scratch_;           /* private: bytes of convolution scratch */
     void *owner_;                   /* private: memory released by spingalett_model_free */
+    size_t activations_;            /* private: bytes of the layers' outputs in the workspace */
 } SpingalettModel;
 
 typedef struct {
@@ -141,10 +155,14 @@ typedef struct {
     uint32_t kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w;  /* conv and pooling, else 0 */
     uint32_t groups;                /* conv: channel groups (1: every filter sees every input channel) */
     float epsilon;                  /* batch normalization: added to the variance */
+    uint32_t input_count;           /* layers it reads (several for LAYER_ADD and LAYER_CONCAT) */
+    uint32_t input_layers[SPINGALETT_MAX_INPUTS];   /* their indices in the network: 0 is the input,
+                                       i + 1 the output of weight layer i; in_height, in_width and
+                                       in_channels describe the first */
 } SpingalettLayerInfo;
 
 /*
- * Checks a .slett image (format version 3, 4 or 5: header, layer table, shapes, bounds and CRC-32
+ * Checks a .slett image (format version 3 to 6: header, layer table, shapes, bounds and CRC-32
  * checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in
  * use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region).
  * Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format

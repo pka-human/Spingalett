@@ -1,17 +1,26 @@
 # Spingalett for Python
 
 Thin `ctypes` bindings over the Spingalett shared library: no compiler is needed to install them,
-only NumPy and a built `libspingalett` (`.so` / `.dylib` / `.dll`).
+only NumPy and `libspingalett` (`.so` / `.dylib` / `.dll`). The wheels on PyPI and on the GitHub
+releases carry the library inside (Linux x86-64 and AArch64 with glibc 2.28 or newer, Windows
+x86-64, macOS 11 and newer, for any Python 3), with OpenMP:
 
 ```bash
-cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENBLAS=ON
+pip install spingalett
+```
+
+From a source checkout, build the library and point the bindings at it:
+
+```bash
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel            # produces Bin/libspingalett.so
 pip install ./Bindings/Python
 export SPINGALETT_LIBRARY=$PWD/Bin/libspingalett.so   # or put Bin/ on the library path
 ```
 
-Without `SPINGALETT_LIBRARY` the module looks next to itself, then in the repository's `Bin/`
-directory (when imported from a checkout), then on the system library path.
+Without `SPINGALETT_LIBRARY` the package looks inside itself (wheels), then in the repository's
+`Bin/` directory (when imported from a checkout), then on the system library path. The package is
+typed (`py.typed`): editors and type checkers read its annotations.
 
 ```python
 import numpy as np
@@ -69,6 +78,24 @@ bn = sg.Network(sg.Loss.CROSS_ENTROPY, [
 bn.train(x_cifar, y_cifar, epochs=5, strategy=sg.Strategy.MINI_BATCH, batch_size=128,
          optimizer=sg.Optimizer.ADAMW, learning_rate=2e-3, augment_shift=4, augment_flip=True)
 
+# a residual block: inputs= names earlier layers, add_add / add_concat combine them
+res = sg.Network(sg.Loss.CROSS_ENTROPY)
+x = res.add_input(32, 32, 3).add_conv2d(16, 3, padding=1, activation=sg.Activation.NONE) \
+       .add_batch_norm(sg.Activation.RELU).last
+res.add_conv2d(16, 3, padding=1, activation=sg.Activation.NONE).add_batch_norm(sg.Activation.RELU)
+res.add_conv2d(16, 3, padding=1, activation=sg.Activation.NONE).add_batch_norm()
+res.add_add([x, -1], activation=sg.Activation.RELU)       # -1: the layer before
+res.add_global_avg_pool().add_layer(10, sg.Activation.SOFTMAX, sg.Init.XAVIER)
+
+# PyTorch: a module through ONNX in memory, or a state dict into a network of the same layers
+import torch
+model = torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.ReLU(), torch.nn.Flatten(),
+                            torch.nn.Linear(8 * 32 * 32, 10))
+net = sg.Network.from_torch(model, torch.rand(1, 3, 32, 32))     # takes (32, 32, 3) channels-last images
+same = sg.Network(sg.Loss.MSE, [sg.Input(32, 32, 3), sg.Conv2D(8, 3, padding=1), sg.Layer(10, sg.Activation.NONE)])
+same.load_pytorch(model.state_dict())                              # or "model.pt", "model.safetensors"
+onnx = sg.Network.from_onnx("model.onnx")
+
 with sg.Network.load("xor.slett") as net:
     print(net.topology, net.forward([1, 0]))
     # deployment: a read-only INT8 model with integer kernels, and a C header for firmware
@@ -79,12 +106,16 @@ with sg.Network.load("xor.slett") as net:
 
 | API | Notes |
 |---|---|
-| `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer; `layers` may mix `Layer`, `Input`, `Conv2D`, `MaxPool2D`, `AvgPool2D`, `BatchNorm` and plain widths |
+| `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer; `layers` may mix `Layer`, `Input`, `Conv2D`, `MaxPool2D`, `AvgPool2D`, `BatchNorm`, `Add`, `Concat`, `GlobalAvgPool` and plain widths |
+| `inputs=` on every `add_*`, `last`, `len(net)` | a layer reads the one before it, or the earlier layers `inputs` names (indices; negative ones count back from the new layer); `last` is the index of the layer added last |
+| `add_add(inputs, activation=NONE, dropout=0)`, `add_concat(inputs, ...)`, `add_global_avg_pool(dropout=0, inputs=None)` | the sum of layers of one shape (residual connections), layers side by side along the channels, the mean of each channel |
+| `Network.from_onnx(path or bytes)`, `Network.from_torch(module, example_input)` | ONNX models (and PyTorch modules, exported to ONNX in memory) as networks with channels-last inputs: transpose NCHW images with `x.transpose(0, 2, 3, 1)` |
+| `load_pytorch(state_dict, path or bytes, modules=None)` | PyTorch weights (`state_dict()`, `torch.save` or safetensors files) into a network of the same layers, reordered for channels-last data; the network is unchanged on error |
 | `add_input(h, w, c)`, `add_conv2d(filters, kernel, stride=1, padding=0, activation=RELU, init=HE, dropout=0, groups=1)`, `add_max_pool2d(kernel, stride=0, padding=0)`, `add_avg_pool2d(...)` | convolution (grouped or depthwise with `groups`) and pooling over channels-last tensors; pooling's stride defaults to the kernel size |
 | `add_batch_norm(activation=NONE, epsilon=1e-5, momentum=0.1, dropout=0)` | per-channel normalization of the previous layer: batch statistics while training, running averages otherwise; `get_running_statistics(i)` / `set_running_statistics(i, mean, var)` |
-| `layers`, `layer(i)`, `topology` | `LayerDescription(type, shape, outputs, activation, dropout, kernel, stride, padding, weight_count, bias_count, groups, epsilon, momentum)` per layer |
+| `layers`, `layer(i)`, `topology` | `LayerDescription(type, shape, outputs, activation, dropout, kernel, stride, padding, weight_count, bias_count, groups, epsilon, momentum, inputs)` per layer |
 | `forward(x)` | 1-D input -> vector, 2-D batch -> matrix (one batched `predict()` call; results are copies) |
-| `train(x, y, config=None, validation_data=None, **overrides)` | fields of `TrainConfig` (e.g. `epochs`, `strategy`, `batch_size`, `shuffle`, `early_stopping_patience`, `restore_best_weights`, `augment_shift`, `augment_flip`); returns a `TrainResult`; `callback(network, progress)` gets a `Progress`; exceptions raised in callbacks stop training and are re-raised |
+| `train(x, y, config=None, validation_data=None, **overrides)` | fields of `TrainConfig` (e.g. `epochs`, `strategy`, `batch_size`, `shuffle`, `early_stopping_patience`, `restore_best_weights`, `augment_shift`, `augment_flip`, `label_smoothing`); returns a `TrainResult`; `callback(network, progress)` gets a `Progress`; exceptions raised in callbacks stop training and are re-raised |
 | `train_from_generator(fn, samples_per_epoch=0, validation_data=None, ...)` | `fn(inputs, targets)` fills the given arrays and returns the number of rows; 0 ends the epoch |
 | `evaluate(x, y)` | `Metrics(loss, accuracy)` |
 | `Trainer(net, max_batch)` | `forward(x)`, `backward(y)`, `backward_output_grads(dl_dout)` for custom losses, `step(optimizer=..., learning_rate=...)`, `zero_grad()`, `train_on_batch(x, y, ...)`; gradients via `net.get_weight_gradients(i)` / `get_bias_gradients(i)` |
@@ -98,7 +129,7 @@ with sg.Network.load("xor.slett") as net:
 | `to_model(precision=INT8)` | a `Model`: read-only, computes in its precision (integer kernels for INT8, INT4, INT2) |
 | `Model.load(path)`, `Model.from_bytes(data)`, `model.to_bytes()` | models from and to `.slett` files of any version |
 | `model.predict(x)` / `model(x)`, `model.evaluate(x, y)` | 1-D input -> vector, 2-D batch -> matrix; `Metrics(loss, accuracy)` |
-| `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding, groups, epsilon)` per layer (normalizations after a dense or convolution layer are folded into it); image and C workspace bytes |
+| `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding, groups, epsilon, input_layers)` per layer (normalizations after a dense or convolution layer are folded into it); image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
 | `cpu_kernels()`, `library_version()`, `library_path()` | the matrix kernels in use (`"AVX-512"`, `"AVX2"`, ...), the loaded library |

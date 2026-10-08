@@ -26,7 +26,7 @@ void spingalett_clear_error(void) {
     last_error_message[0] = '\0';
 }
 
-void set_error(int code, const char *msg) {
+SPINGALETT_COLD void set_error(int code, const char *msg) {
     last_error_code = code;
     (void)snprintf(last_error_message, SPINGALETT_ERRMSG_MAX, "%s", msg ? msg : "unknown error");
 }

@@ -1,0 +1,517 @@
+
+pytorch
+2.14.1+cpu:ÆÔ
+Û
+x
+stem.0.weight
+stem.0.biasgetitemnode_Conv_44"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ *
+kernel_shape@@ JÔ
+	namespaceÆ: __main__.Residual/stem: torch.nn.modules.container.Sequential/stem.1: torch.nn.modules.batchnorm.BatchNorm2d/_native_batch_norm_legit_no_training: aten._native_batch_norm_legit_no_training.defaultJ:
+!pkg.onnxscript.rewriter.rule_nameFuseBatchNormIntoConvJÀ
+pkg.torch.onnx.class_hierarchy['__main__.Residual', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.batchnorm.BatchNorm2d', 'aten._native_batch_norm_legit_no_training.default']J 
+pkg.torch.onnx.fx_node…%_native_batch_norm_legit_no_training : [num_users=1] = call_function[target=torch.ops.aten._native_batch_norm_legit_no_training.default](args = (%conv2d, %p_stem_1_weight, %p_stem_1_bias, %b_stem_1_running_mean, %b_stem_1_running_var, 0.1, 1e-05), kwargs = {})J\
+pkg.torch.onnx.name_scopes>['', 'stem', 'stem.1', '_native_batch_norm_legit_no_training']JĞ
+pkg.torch.onnx.stack_trace±File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 36, in forward
+    x = self.stem(x)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 259, in forward
+    input = module(input)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/batchnorm.py", line 210, in forward
+    return F.batch_norm(
+ü
+getitemrelu	node_relu"ReluJ
+	namespace€: __main__.Residual/stem: torch.nn.modules.container.Sequential/stem.2: torch.nn.modules.activation.ReLU/relu: aten.relu.defaultJ™
+pkg.torch.onnx.class_hierarchyw['__main__.Residual', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']J„
+pkg.torch.onnx.fx_nodej%relu : [num_users=2] = call_function[target=torch.ops.aten.relu.default](args = (%getitem,), kwargs = {})J<
+pkg.torch.onnx.name_scopes['', 'stem', 'stem.2', 'relu']Jç
+pkg.torch.onnx.stack_traceÈFile "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 36, in forward
+    x = self.stem(x)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 259, in forward
+    input = module(input)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
+    return F.relu(input, inplace=self.inplace)
+á
+
+relu
+	c1.weight
+c1.weight_bias	getitem_3node_Conv_46"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ *
+kernel_shape@@ J¦
+	namespace˜: __main__.Residual/b1: torch.nn.modules.batchnorm.BatchNorm2d/_native_batch_norm_legit_no_training_1: aten._native_batch_norm_legit_no_training.defaultJV
+!pkg.onnxscript.rewriter.rule_name1FuseBatchNormIntoConv, RemoveOptionalBiasFromConvJ–
+pkg.torch.onnx.class_hierarchyt['__main__.Residual', 'torch.nn.modules.batchnorm.BatchNorm2d', 'aten._native_batch_norm_legit_no_training.default']J”
+pkg.torch.onnx.fx_nodeù%_native_batch_norm_legit_no_training_1 : [num_users=1] = call_function[target=torch.ops.aten._native_batch_norm_legit_no_training.default](args = (%conv2d_1, %p_b1_weight, %p_b1_bias, %b_b1_running_mean, %b_b1_running_var, 0.1, 1e-05), kwargs = {})JR
+pkg.torch.onnx.name_scopes4['', 'b1', '_native_batch_norm_legit_no_training_1']J¤
+pkg.torch.onnx.stack_trace…File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 37, in forward
+    x = torch.relu(self.b2(self.c2(torch.relu(self.b1(self.c1(x))))) + x)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/batchnorm.py", line 210, in forward
+    return F.batch_norm(
+°
+	getitem_3relu_1node_relu_1"ReluJ:
+	namespace-: __main__.Residual/relu_1: aten.relu.defaultJL
+pkg.torch.onnx.class_hierarchy*['__main__.Residual', 'aten.relu.default']Jˆ
+pkg.torch.onnx.fx_noden%relu_1 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%getitem_3,), kwargs = {})J,
+pkg.torch.onnx.name_scopes['', 'relu_1']JÄ
+pkg.torch.onnx.stack_trace¥File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 37, in forward
+    x = torch.relu(self.b2(self.c2(torch.relu(self.b1(self.c1(x))))) + x)
+ã
+
+relu_1
+	c2.weight
+c2.weight_bias	getitem_6node_Conv_48"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ *
+kernel_shape@@ J¦
+	namespace˜: __main__.Residual/b2: torch.nn.modules.batchnorm.BatchNorm2d/_native_batch_norm_legit_no_training_2: aten._native_batch_norm_legit_no_training.defaultJV
+!pkg.onnxscript.rewriter.rule_name1FuseBatchNormIntoConv, RemoveOptionalBiasFromConvJ–
+pkg.torch.onnx.class_hierarchyt['__main__.Residual', 'torch.nn.modules.batchnorm.BatchNorm2d', 'aten._native_batch_norm_legit_no_training.default']J”
+pkg.torch.onnx.fx_nodeù%_native_batch_norm_legit_no_training_2 : [num_users=1] = call_function[target=torch.ops.aten._native_batch_norm_legit_no_training.default](args = (%conv2d_2, %p_b2_weight, %p_b2_bias, %b_b2_running_mean, %b_b2_running_var, 0.1, 1e-05), kwargs = {})JR
+pkg.torch.onnx.name_scopes4['', 'b2', '_native_batch_norm_legit_no_training_2']J¤
+pkg.torch.onnx.stack_trace…File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 37, in forward
+    x = torch.relu(self.b2(self.c2(torch.relu(self.b1(self.c1(x))))) + x)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/batchnorm.py", line 210, in forward
+    return F.batch_norm(
+¦
+	getitem_6
+reluaddnode_add"AddJ5
+	namespace(: __main__.Residual/add: aten.add.TensorJJ
+pkg.torch.onnx.class_hierarchy(['__main__.Residual', 'aten.add.Tensor']J‰
+pkg.torch.onnx.fx_nodeo%add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%getitem_6, %relu), kwargs = {})J)
+pkg.torch.onnx.name_scopes['', 'add']JÄ
+pkg.torch.onnx.stack_trace¥File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 37, in forward
+    x = torch.relu(self.b2(self.c2(torch.relu(self.b1(self.c1(x))))) + x)
+¤
+addrelu_2node_relu_2"ReluJ:
+	namespace-: __main__.Residual/relu_2: aten.relu.defaultJL
+pkg.torch.onnx.class_hierarchy*['__main__.Residual', 'aten.relu.default']J‚
+pkg.torch.onnx.fx_nodeh%relu_2 : [num_users=2] = call_function[target=torch.ops.aten.relu.default](args = (%add,), kwargs = {})J,
+pkg.torch.onnx.name_scopes['', 'relu_2']JÄ
+pkg.torch.onnx.stack_trace¥File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 37, in forward
+    x = torch.relu(self.b2(self.c2(torch.relu(self.b1(self.c1(x))))) + x)
+¥
+relu_2
+down.weight
+	down.biasconv2d_3node_conv2d_3"Conv*
+group *
+pads@@@@ *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ *
+kernel_shape@@ Ja
+	namespaceT: __main__.Residual/down: torch.nn.modules.conv.Conv2d/conv2d_3: aten.conv2d.defaultJn
+pkg.torch.onnx.class_hierarchyL['__main__.Residual', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']J·
+pkg.torch.onnx.fx_nodeœ%conv2d_3 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_2, %p_down_weight, %p_down_bias, [2, 2], [1, 1]), kwargs = {})J6
+pkg.torch.onnx.name_scopes['', 'down', 'conv2d_3']J©
+pkg.torch.onnx.stack_traceŠFile "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 38, in forward
+    y = torch.relu(self.down(x) + self.proj(x))
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+
+relu_2
+proj.weight
+	proj.biasconv2d_4node_conv2d_4"Conv*
+group *
+pads@ @ @ @  *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ *
+kernel_shape@@ Ja
+	namespaceT: __main__.Residual/proj: torch.nn.modules.conv.Conv2d/conv2d_4: aten.conv2d.defaultJn
+pkg.torch.onnx.class_hierarchyL['__main__.Residual', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']J¯
+pkg.torch.onnx.fx_node”%conv2d_4 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_2, %p_proj_weight, %p_proj_bias, [2, 2]), kwargs = {})J6
+pkg.torch.onnx.name_scopes['', 'proj', 'conv2d_4']J©
+pkg.torch.onnx.stack_traceŠFile "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 38, in forward
+    y = torch.relu(self.down(x) + self.proj(x))
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+œ
+conv2d_3
+conv2d_4add_1
+node_add_1"AddJ7
+	namespace*: __main__.Residual/add_1: aten.add.TensorJJ
+pkg.torch.onnx.class_hierarchy(['__main__.Residual', 'aten.add.Tensor']J
+pkg.torch.onnx.fx_nodet%add_1 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%conv2d_3, %conv2d_4), kwargs = {})J+
+pkg.torch.onnx.name_scopes['', 'add_1']Jª
+pkg.torch.onnx.stack_trace‹File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 38, in forward
+    y = torch.relu(self.down(x) + self.proj(x))
+
+add_1relu_3node_relu_3"ReluJ:
+	namespace-: __main__.Residual/relu_3: aten.relu.defaultJL
+pkg.torch.onnx.class_hierarchy*['__main__.Residual', 'aten.relu.default']J„
+pkg.torch.onnx.fx_nodej%relu_3 : [num_users=2] = call_function[target=torch.ops.aten.relu.default](args = (%add_1,), kwargs = {})J,
+pkg.torch.onnx.name_scopes['', 'relu_3']Jª
+pkg.torch.onnx.stack_trace‹File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 38, in forward
+    y = torch.relu(self.down(x) + self.proj(x))
+§
+relu_3
+branch.weight
+branch.biasconv2d_5node_conv2d_5"Conv*
+group *
+pads@ @ @ @  *
+auto_pad"NOTSET *
+strides@@ *
+	dilations@@ *
+kernel_shape@@ Jc
+	namespaceV: __main__.Residual/branch: torch.nn.modules.conv.Conv2d/conv2d_5: aten.conv2d.defaultJn
+pkg.torch.onnx.class_hierarchyL['__main__.Residual', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']J«
+pkg.torch.onnx.fx_node%conv2d_5 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_3, %p_branch_weight, %p_branch_bias), kwargs = {})J8
+pkg.torch.onnx.name_scopes['', 'branch', 'conv2d_5']J¯
+pkg.torch.onnx.stack_traceFile "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 39, in forward
+    z = torch.cat([y, torch.tanh(self.branch(y))], 1)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+
+conv2d_5tanh	node_tanh"TanhJ8
+	namespace+: __main__.Residual/tanh: aten.tanh.defaultJL
+pkg.torch.onnx.class_hierarchy*['__main__.Residual', 'aten.tanh.default']J…
+pkg.torch.onnx.fx_nodek%tanh : [num_users=1] = call_function[target=torch.ops.aten.tanh.default](args = (%conv2d_5,), kwargs = {})J*
+pkg.torch.onnx.name_scopes['', 'tanh']J°
+pkg.torch.onnx.stack_trace‘File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 39, in forward
+    z = torch.cat([y, torch.tanh(self.branch(y))], 1)
+¤
+relu_3
+tanhcatnode_cat"Concat*
+axis J6
+	namespace): __main__.Residual/cat: aten.cat.defaultJK
+pkg.torch.onnx.class_hierarchy)['__main__.Residual', 'aten.cat.default']JŒ
+pkg.torch.onnx.fx_noder%cat : [num_users=1] = call_function[target=torch.ops.aten.cat.default](args = ([%relu_3, %tanh], 1), kwargs = {})J)
+pkg.torch.onnx.name_scopes['', 'cat']J°
+pkg.torch.onnx.stack_trace‘File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 39, in forward
+    z = torch.cat([y, torch.tanh(self.branch(y))], 1)
+ñ
+cat
+val_33mean	node_mean"
+ReduceMean*
+noop_with_empty_axes  *
+keepdims J4
+	namespace': __main__.Residual/mean: aten.mean.dimJH
+pkg.torch.onnx.class_hierarchy&['__main__.Residual', 'aten.mean.dim']J‹
+pkg.torch.onnx.fx_nodeq%mean : [num_users=1] = call_function[target=torch.ops.aten.mean.dim](args = (%cat, [-1, -2], True), kwargs = {})J*
+pkg.torch.onnx.name_scopes['', 'mean']JÜ
+pkg.torch.onnx.stack_trace½File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 40, in forward
+    return torch.softmax(self.head(torch.flatten(nn.functional.adaptive_avg_pool2d(z, 1), 1)), 1)
+Ù
+mean
+val_37view	node_view"Reshape*
+	allowzero J8
+	namespace+: __main__.Residual/view: aten.view.defaultJL
+pkg.torch.onnx.class_hierarchy*['__main__.Residual', 'aten.view.default']J‰
+pkg.torch.onnx.fx_nodeo%view : [num_users=1] = call_function[target=torch.ops.aten.view.default](args = (%mean, [1, 16]), kwargs = {})J*
+pkg.torch.onnx.name_scopes['', 'view']JÜ
+pkg.torch.onnx.stack_trace½File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 40, in forward
+    return torch.softmax(self.head(torch.flatten(nn.functional.adaptive_avg_pool2d(z, 1), 1)), 1)
+ÿ
+view
+head.weight
+	head.biaslinearnode_linear"Gemm*
+beta  €? *
+transB *
+alpha  €? *
+transA  Ja
+	namespaceT: __main__.Residual/head: torch.nn.modules.linear.Linear/linear: aten.linear.defaultJp
+pkg.torch.onnx.class_hierarchyN['__main__.Residual', 'torch.nn.modules.linear.Linear', 'aten.linear.default']J£
+pkg.torch.onnx.fx_nodeˆ%linear : [num_users=1] = call_function[target=torch.ops.aten.linear.default](args = (%view, %p_head_weight, %p_head_bias), kwargs = {})J4
+pkg.torch.onnx.name_scopes['', 'head', 'linear']JÓ
+pkg.torch.onnx.stack_trace´File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 40, in forward
+    return torch.softmax(self.head(torch.flatten(nn.functional.adaptive_avg_pool2d(z, 1), 1)), 1)
+  File "/tmp/claude-1000/-home-pka-human-Projects-SP-Spingalett/9df51b7a-a80a-4c79-b70b-ed21adb55911/scratchpad/venv/lib/python3.14/site-packages/torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+Ö
+linearsoftmaxnode_softmax"Softmax*
+axis J:
+	namespace-: __main__.Residual/softmax: aten.softmax.intJK
+pkg.torch.onnx.class_hierarchy)['__main__.Residual', 'aten.softmax.int']J‡
+pkg.torch.onnx.fx_nodem%softmax : [num_users=1] = call_function[target=torch.ops.aten.softmax.int](args = (%linear, 1), kwargs = {})J-
+pkg.torch.onnx.name_scopes['', 'softmax']JÜ
+pkg.torch.onnx.stack_trace½File "/home/pka_human/Projects/SP/Spingalett/Tests/make_onnx_tests.py", line 40, in forward
+    return torch.softmax(self.head(torch.flatten(nn.functional.adaptive_avg_pool2d(z, 1), 1)), 1)
+main_graph*¤Bstem.0.weightJˆ+ƒ=ˆ¶¬=JØ‡»Ä8®»pg=sCv=!­‡½ÑÙ½@NÕ=?%Z½İÔº=»ÿŸ=rñ¿=œ!‹=Bvú<\µ§= ÷¼?;<)”7=‘°=šY»½í*=¥»–œ=«
+½ÌĞ1½.fé<(Ã½‚ºj=ñpŸ½0¾Fr">Êˆ¨½)>ÕÍ>&·½S½˜¾'¨ü½²+¾«s+<Ì¯I¼ÛpX½iö½¿wZ¼‚òˆ<ËÎU½$,,=çï4¼›šš=æã¾”Ï§=.¾Ø>¬ñÛ½·Y=vQ§¼138¾Cz ¾Ğ9ìIæ»Æxæ=Qlœ<R=>pÌ<ÕÓ¼˜}>å–5¾P±°½3G»Úš™=êÎ¢ºçZ×½Kâ(½ªÊ…=ç®='çs=§FºUA</ƒ<^^z½:6|½Ğ;-¾îÈ‹<aÉ>o¾M0¾‰ÙQ¼;ò­½¾¾ÁÆC=­*¾mñÛ½?Ü:¾Ğ>à‰ı<ƒD(>Ì¾AD½êĞ=W<>Û5>Noı=^ş(¾/-½Ë98=Ü×3>®½‘½ ½zùá½š6>CÒ=<:¾©Ş=óCt¼µº=È"©<§ì¾«S¼Â>ó
+ó=Îÿ½rÁƒ¼x>U)=ï5.¾§}@=cH>µo½FÇ:ºÙ™=»²³½?½âİ4=(¾ˆ;=Ì=ş<Ö¡½cÂæ=Š®ó½<k">_l‚=}
+½6½ÌØ…=½ı…<‹}î=÷=Š´²=\¾ãq'½v\ ½uí½<½FŒ€»%/é¼˜"E<¯Î½û‰!¾aœ>$Ú ½*+Bstem.0.biasJû½>EÓñ>IQ”¾Òô=!D>ñQ>*¨
+B	c1.weightJ
+%7
+¾‡™r½A; =²Óª½4©U=À£=|Ô”;Ÿdø»E±š=Âg¾ó$Ì½Ÿ=®,‘ºLİ½Â›X<vü=b<é=@Ìµ½>öå½ıß>Ÿ³º½¶«<>Á¾ÂÜ„=Ã–>óåà=Æú¹¼İà>Õ«¨;¤LD<¡º¼²=b¥=Lâ“=šk¯=î,6=@¯ì½íÁ-½rØ›½n!µ½¤1¼ÿŠ¾¿!­=i½GfV;5‰=º½¢Jş½¤œ¾4‹½Ÿœé<€ßˆ½÷s½¿(½.w‰<#Ïy»®÷‡½<Ø¼B¡¶½	9]=Ïš”½Ã°½âG=ÎÔˆ¼I<¸=ÓÅ>½«%¶½¤X½ÙÛ–½Çx¼¢=g<$B`=8Ë¼‚}=*2³¼ƒç—½ÙA£=4…¬<ÎU¼loÃ=ua=Ua½¶»Š=q2%=hfÈ=7ª½wx½´
+…=>Í½m|)<£Ó¼Tªk=!ÙÛ¼Ğ×=5“=¹­	½ğ—=ZF‹=k´`½¨y‚½¡c°=¯ÇN=ØY<],­=TÉ’½w`g¼ÿïo=ï4'='½”»óú½¿dÚ;CÇÏ½€ª ½El=ÛÛ•½“çf½ïú½†Œ½á,º½uBm=5A[½X›±½§R=¶¾Üù=éû¼ó¼Êµ¼=ué‹=\nQ=õÅV»Ûë¾!Öë=Åv=éß¾0ç=ˆ2Œ»ÖN<_9È=uªœ½×
+>†««½š»<ÅûÂ»Ù4æ½£ï½j((<ü¿å½€7Ä¼^.=çl½Á¾ç½‡ñÁ½nrx<%>[)ß½8§=“¯Ï<•â“½}®½µ¸½Ôİ%<ìñ¡=”‹½ßÌ=™Ø½5â ½Ñ¶Ÿ½¢Oµ½·k¼=Ç‹²¼]µA½´=ñiª<‘âN½†=üÎ9=G€=Ò’a=İU]½¹ô¼$K¼¼zÇÖ¼.¼dÜç¼\9½Œ)Z½kÿ´¼h^_½èm½½Áä¼(k<´Ò|=)Œ1=û÷=Ae= C =¬¤;Á‹>;¹¸¦=¨[ı¼çU	=–è¤»¶”¼L8¿½+MU½E\á;Rª½òÇ½H½Vx<éO=uE›»¯<1½¹B¢½Fb³=ªŸ=l
+!=GÎ¼ÔR½ ;7»çå¼}Áî<ã^Ù<ŒÁD<H#®<o@;¼µ&=<em=5œ[½ñ²W½ÜR¼8˜<4{>=FF3½¨õ=ØŞ_={u=ïh=yøc=â^à<İ=½j~m=µø¼Ö$½ş»Ğ±<ÖN=±ÎP=-ŒÌ<²u¼f·<Æ(ºH­Ë<d\ò¼_)½Íê^=­<dÔE= “î¼Æúµ¼*ÚÄ<»Œš¼Æek=˜qG=îg=[Ò¼HÊ<ŞGX½²Œ½‡ö—=Â¼óGR=ÕX=c–÷<|È=ã%Ä½€2á¼¯4½–ÜÊ½¾;±½œá?<ÊÎª=Û~½Îª>Èß> î³½’=§Lé½gï=;CJ=ìmõ=~¸:«›Ì½˜§Ô¼%4Ş=ãÅ=—­½÷ä<48	>o&š<¿qX=üÎ½Ê]>¨ÈÖ=W»Q½6¶=
+½Œ‹½ %¬=ğ”ó¼6_¶½Î”=y0=Qš¼Ÿ$–½dÏÈ=Î¶û;rø(½¥Îƒ<øu=ª„|= Hé;nÑ½*¨
+B	c2.weightJ
+ëã=´`¾OÆZ¾è;ó=ÉZ>¶
+>Òèû¼¡nx½”A$>ìÖĞ;Q>I˜>¶¾r<ê>¾¬Z¾® p>f@0>Cb¯=²tÀ½¯zV¾vˆ<Oû›=à,i¾‘Ê¾…PÇ½Š}ş<9¡º½nÊ-¾¡ğv½‡êÜ½`†+=•Şï=´c<!å8¾~Ï7¾h8[>¶ˆß½WŸ<íÿ
+¾7cu<œ›½XR3¾O'¾L
+5¾‚%>g¾e:m>ùÒr¾ÂxÕ½ıPQ¾¤NC¾c]>o2>0=®)»Ó¾¶÷½µÜÿ<|rz½Ca¾÷&=’¶Ê<9œ½½÷<ßõ¦½t´½Ío>¥J>ä¼°k«½0êÆ½;²
+¾nn½Şâ=©‹=Ğæ½k0=¾Z=Nro=a™.=¬¨¼8Ù>ƒO‚=ä$Ò=0²®=#„½àíØ½b÷>>…<Déû<ŒŞ<Œµ	¾èØ=”G¼òÉ=p—™<{h>ò==._Ò½<B>Ûú< Ú¾P¸Í½¡X&½ª«½=ŠyÍ=$W¼ õó»ÚI—=G2“½ƒkÄ;:Ä½¦zP½rM½ï¦†=ß,€==½h"<m“(¼ag}½ø O=1]=ñ†½2/ö¼½Ì¼¸æ|=Æ=†‡{½°/½òä;—¸£¼z†½Ô5Ğ<ä¨z½pÛ»¼?==‰—z½Zi2¼Ö±»p³Ò;è]½3³ú<ŠFå¼†mc½ıõT½F|¼RY¾¼ßÒ®<¿¨¼°?½%ìQ½×‚}<äp½»…¼³ÿ+=wŒg½ÿŞL<£û<ÒôŒ=¯è„½ZóÑ»‚ç=#y<	8=< <¥=Ò!’¼«R«=tËœ½«Å¡¼ºÏ²=TX½!Nœ½ëÿÕ;*¾ƒ=ÏL½ˆû¼&}y=ø'¸¼:Û;–˜½!)¶;âwh½íÆ>½TŠ=ü3³½³Œ?½²i<,=„u›;ò†‹=$Í…=€£=óø½R7=¬®¼÷hş¼köp½ÉÂ…=|Ü<ßÄ+=Ï+š½W=ú£½‚ÿ=¢^<È½AÃä<1è,»U;©&D¼o==”¥=š½<£®†=÷L=sP=ÿô=iLÍ¼ş«<»Î9=¦Ï{<kşºÅˆ+<©Ò¼—0¼ˆõ‹<+ïV<cùü9Â°<ÛÔ=fÊ¼5@=ÏS~¼ğCR=»Ü×<éB_<¸uL<¬+½ ÷A=ÉS<åOZ¼Ca<`}kºò`Ñ¼ˆ¸ë¼ÕğÔ<pİºL^J¼–A¬¼ù¨R½š“<=†<<½FFÂ¼Ê»=o»ù¼‹Z/=Qò;h@½@¥=¦>Ö<3);}û#¼#=fş<Ùš<Êrû;´‘Ö»İà‡<Õ©=¶{ø½¸ÂÁ¼`{´¼0‰±=—‰¯<òÙ=`²;¿ú¼m&¾Çÿ¼“X-<¤Ëè½0ÕÖ¼ªëÖ=ğÔ/½®©ä¼-;å½Ïfx½Ï¾&ÿ½—C:=ótÒ<0š=;ò»=eX<{§¦<Ÿ)½¦ Ş=ŸÏd½[½Ò<»›É=ùõ=ªğ&=ª=[<2xs=ìõ…½¾:N=øô7<wŒF½9=/ƒ=æğ=,›Ş=İ·ä=læ=i›(½Iõ½aW=†9Û½|½hO¾BÔº<8©½*ºBdown.weightJ ³ƒ=íıÁ½ıÈ=Üû¼â_‹=__<Ğ.B½äE>ÈÇ¦=ó¥é½n@&¼q›>ÿx¼ŠÑ÷½èhÖ=Œø=»Š½óJ9½Å™\½Ù½ì©=C/›½G í¼¨
+¾·AÙ½»7¾»4î=æ3½.ñº=„œW=/Q©=l˜>ë¶½¡ÈL½†5ó=RB5¼	+=4È¾§°=õ£…='E¼É†½äà	>Ô	è=¥9GºÎ½°îŞ=»X >m•¼¶j=`C<{«=o>;¦/Ë=¿ğ½½*5(½_tš½tš½Qcš=T.í=ğ¥o=÷n+¼ì)Œ=Kú=qUÕ½×e½TÆà<½ÿï¼ß]´½88½‹ı= ßÓ=jÙ½ƒïÃ=¡0µ;§½=^œ¼ğ»å=^Öü=H| >¾×­½²_Î½bˆ¼ØŠß½èùg=ıó¼X×d½f/¢½ŠŠƒ½ÊáÔ½É±ˆ¼Ö§=Ò.Ò½X =:œã¼‡‹½•Pi½z·=¾¼š<]Şu;£û0=„î¾©ù½Ì¦í½"Şõ½Ş<òü½õH¤<º>g<ˆ6‘½8=<-
+¾4ı½“)ä=Ø=Ïô=nY@½ò»J½£cá»¨ë—=ªŠ<è¿=7š»¡‚·½“@=«½Üß?½ÚL½Aº"=¨b¬=a;â=Å¾…£ù½<ä½™ÿH=£bÑ½:Øä=«”:p´=ò‚½…3 =¾¨ê=æ%n;¹<\;Ş‚=ßH<e)j=Gõ÷=×E½z¿À¼x½¾A¸=Ë6‚=B™õ½¢R
+¾Ilâ½?”¾S.½+=ÇÃµ½¡4ª½RÇÑ=İ´C½3¯s=øÊæ=à¡é½{ö•½|î½‚ Å=«E=Fò½‘ŸÎ½´ŞK=¦½ úÄ=FJè=£—=âQ½XĞ ¾%[õ½J©*=•)­=§fà=ÿâ‹:\×´:Œ‡Ø<Õ±=/sÙ½/‘Õ=ƒBØ½å¶z=œ§Ÿ¼ş¡‹=¬¼èİ½t»½2pÄ= I½ÆË=HZ^½Æú“=Y3;ŠÓ=,@<ˆAm=ÓD;ä±/=Ç6ï=´—½s¾¼€	=„Ã=ç=êÈ=Š§ø½û?¾Ä…J=g”¼0t½Ÿ>·=ö„’=Át5=€İ†=Uí¯=ªÕÃ½öù½ëq’=ep˜=¿°¾&†i=Ä¡À=i¿½µiû½;<õ½¦Ø½¤	×½tå<tİ=WÉ´<$—½ï„¾Zı¾Ÿ6K=y(½ ¸®=mËœ=gá	¾¹u‚=ğ˜‡½E„/= 5J¼úq´½øĞ,½íëù¼»%½ 	=ØŸ;Fìƒ½·“û½Â–=º*¬<1#¨=Æw¼çÓ=ß1>İÿ,½¯-m»“E£½OŒ=²ğö½‹íü<=4n=`Ì½±™~½÷O’½—w÷=¤åŞ=cœ=U¡ƒ=J¨Ä=£9=½Í´½ŠZä½pƒ½9D¶½òúê½c&‚½—Œ’¼"kW¼ş'½ôDí½pØñ=£«Ñ¼¾o†½İ„‡=vé»=e+*½eHƒ¼"è›½šE½	”A½ŒÉ|¼ş²˜½G©á<§r9»ïS=_¶c="·§<Ç"^=óó‹½ğ>½áïâ= .û<Ü=°½*^Ô½ê¼•úÅ=µâ=D=:Æë=°»=ï[>™=«ûŞ½<==*`<h[ó=’F>ö¡½Š§¼ú"é½9½ƒ½Dã½M5·½Áuğ¼‹h¼Å¯’:³ê½ë»¾›\›¼Ì=™½O¼²Ï½ù­y=y*=yÚ½PÜ=L†<ÏY½§*Ø=âP$¼…Í§=~ >$V¼|û½×rİ=“Ê¼¨Ø=Ğ]Å=õ¨›=:½Ú=7a>ëÈ°=P¥â½a}‡½¬Ê—¼ğò<3—ÿ½£Ì>è=ÉMô=D>1={Uø¼î½â}½ +ş¼™}Å=€±µ;¼Æx;è½Ç~è=ğ†Î½Ç¾ipå½"í==˜Üc=óËï½eJù¼Æ‘>±;x™¶½<“=–^¿½ÚÈºìö˜=ğXÏ½ÙÀ=ë“=9×±½ÎÚ¼~^†<+fì½^.½ ÛŠ½”ˆÂ<ÿİ»QK&;´½Ll|=ûX=TX/½Ôl½Uù=D-=ÿ¦>İÍ{:¿É„½GÂÚ¼k++½ûîö=Án¾İñ£<ª¢=X×=ö\¢½!ı‡½•:V¼Jê;ìvx½°S“½à†ºi´P<”·=›ü½Üœ½XN‹½FñÏ=
+‹/=R²¤<0^W½©çÓ½“¿=ŸÜ=™‘É½Sò½FŠÇ=¾Í‘½Èn½*³&½1¡½rvû½Ö[»¹ã¼Ù¿¨¼ğ-v½\i¾,µ=G¼·½pã=¡<†ü½GÑî=FÉ<ˆÏÙ=wâR½ºÑÌ=ñ(â=ö¦<•ø¼I˜U½G†Š½˜-¾½%Ë=¨î½£½ßb„»ÏÕ“=ci>C3	¾ú«$=š üº,º½F ½şĞ½"õ¾=@<M“:ÉOØ¼#Ê=ÉÏ¼òş¯½Ş-ğ=ï8B=“Œä=Ğ¤½ãº¿½{6£<‹“ ½ºî=qk™=½)Ğ<5¾¾¼'i8<Ş¹Ç=µa¤½—.Ù<kr=|!Ò½ˆ‡Å=ıÌï½QÎë½ü%<:’(½ƒÚ=v;ØÓ&½@Š
+>v–>tøH½6 Û½ÔÊå=Lİ½³´½êƒƒ½á¹=›Ü¼Wq˜½Oı«=u„<CE=”ÓÄ=Ãí[=47ì½!7½øø=C½N§
+¾ÊºŒ¼ê– ¾38=8¬»õü¼|÷!=Cm=1æv½ş Ò½|iZ=¥–=Ì§À¼bˆ
+¾p”ë½jö=9­I=ŞR›½¨½Šƒë<®í¼§k¾ëál=>€†=„zú=Òfy=ğO
+>¹GX»½=§|E;ÅA[½á¼;ßO¤=]¾Ä¼¼(½½â¥=Îy‹=i÷½ÕÎµ½¾Ps½OX¾—½óÿ½
+¢¼dÇ=òõ½gsu<µ0;=İÿ½ÈÏô=·¾=Œ=Xˆ:½Ä0e¼É›Š½™0=`c½òµ¾²½qT¿½J¿C=òMà½Ÿ™¶¼wÿ„=Ò©Ğ½õG…½f}	¾Œn;ï	>¬q˜½Éªİ;Ó½Ÿu#½ø<Çä‡½è>¼mÌÄ½7½í=iÛ>šLÎ=™U½i=Óò›½ãã’=ßŠ¨=vº=9€	¾ª08½|«N¼¸€à½±‘†=Á0ó=è×¼Û]U=-1 <‹‘§¼Dãd¼Z ¯<ºÆ)½j
+ø½N‡¯½o³½#uï¼±/=,)´;áóZ<J@Ò½úO£=*AB	down.biasJ0£k=+ø½3ÿó½ÅÙ½.5@=G§;ˆÛ¸=ı\=j‚J½©²˜<2œ
+¾ãÓ=*ºBproj.weightJ ^E'½íëA¾X¬=×(>Xûl>ƒ³¾¦&Â¾¶B†>²(î½2†…¾ñ­¾ä)¶> 4¾nY<“y…>¾<¾Ş«Â=:ÈP=hªÄ>TG²=ÈÖc¾Ï|Â>Âƒå½ó³>hŞ_½šâ%¾K<·‹¾ÔS¿>Ò¨½ë½Z=X+¾S^¾L·K>{Ì€>T´E>pV±¾“·¾¹P^=ëH4>ÁZÄ>ğZ¤=Â?K>ÄÉ±<Ö§¾B>_~”>¸+¾ÄU>êÆt¾ZV†¾ØŒ>Ç‰ù¼@‹•¾ş®/¾?Ğm¾µw>ÄÛö=Øî¾–\,¾¶>ìå’¾B4ª>5h¿>W¥7¾É˜µ¾şn>~-¾Â5ª¾5&³¾ºF¾*AB	proj.biasJ0ìi€> çš¾vº­>×i:" >Æs=UEÀ>%r¸¾ü‘¨>Ô?¾-:Ñ:/IÉ¾*ÜBbranch.weightJÀ¬àe¾j#<>uöe=¥•=ÊM>ÿvñ=hª¼7-}¾äƒ5¼dUl>¨%t>iF¾¹Õ=¹‰/¾_ÇÒ¼“á¾eà„>aV¥=‹<~¾ïD^½»¥Â=Äµn>ç;Î½<†p¾çÈ½Ô}ç»os°=ãæ=R¾·+ã½6©>3%Ş½Ğ‡>Âh¾H%¹½0¼ˆ>ó¬=ÁÖ½°$>æÑ½ñ«=8b!¾G9“¾xs>>1¡¼PÏ=\Ãá<ë¿„¾*#Bbranch.biasJK§>!a:>ûúN>0*‹¾*ÖBhead.weightJÀ¶Û¾ø¾ S<ØSb>Şk¾Øzî=üH =>Ün¾öÚ%>87>hì\¾°ìÂ=`ø:>Fç>h¾À®=PÃ(¾ ûl=Üañ½ÜØ½”óA>;l>È0õ= ¤½¬¼@>@@%¼p¸<P&t¾@˜í;Ëp>xw=ZÚ8>Ä|E¾l˜Ğ½¨{O½tÑ¾ÈrF½ÖÑ9¾°æ)¾^ÂZ¾<ÎÊ=X;^> Ç*¾òBW¾@;İ¼Â%>ZqI>àƒ>([j¾€Ğ4½`Ø->D’Ó½(kM½ĞË=xğ»=0KÍ<˜o>˜qM½N½D)n¾Dıß=ğ‚8>ğˆ¨¼€$±<à»€<0G¡¼Paã<”°Õ=Èáb¾`:š½øDm¾xg¾ ù;Æz¾ ]Â½ .<¼sk> ã=ĞÚ=”=*%B	head.biasJD>šud>¬ˆš½’X¾ö‡@>*Bval_33Jÿÿÿÿÿÿÿÿşÿÿÿÿÿÿÿ*Bval_37J              *.Bc1.weight_biasJj‹š>°–Ã=Ö.É=A F<&Ô½[xÖ¾*.Bc2.weight_biasJ˜^*½›¸Ò>Š~0>X
+K½ş9÷½Ş//>Z™
+x
+
+
+
+
+"=
+/pkg.torch.export.graph_signature.InputSpec.kind
+USER_INPUT"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNonebZ
+softmax
+
+
+"?
+0pkg.torch.export.graph_signature.OutputSpec.kindUSER_OUTPUTj'
+stem.0.weight
+
+
+
+
+j
+stem.0.bias
+
+
+j#
+	c1.weight
+
+
+
+
+j#
+	c2.weight
+
+
+
+
+jÖ
+down.weight
+
+
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"2
+!pkg.torch.onnx.original_node_namep_down_weightjÆ
+	down.bias
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"0
+!pkg.torch.onnx.original_node_namep_down_biasjÖ
+proj.weight
+
+
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"2
+!pkg.torch.onnx.original_node_namep_proj_weightjÆ
+	proj.bias
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"0
+!pkg.torch.onnx.original_node_namep_proj_biasjÚ
+branch.weight
+
+
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"4
+!pkg.torch.onnx.original_node_namep_branch_weightjÊ
+branch.bias
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"2
+!pkg.torch.onnx.original_node_namep_branch_biasjÎ
+head.weight
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"2
+!pkg.torch.onnx.original_node_namep_head_weightjÆ
+	head.bias
+
+
+"<
+/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
+5pkg.torch.export.graph_signature.InputSpec.persistentNone"0
+!pkg.torch.onnx.original_node_namep_head_biasjR
+val_33
+
+
+"<
+$pkg.onnxscript.optimizer.folded_from['val_31', 'val_32']jR
+val_37
+
+
+"<
+$pkg.onnxscript.optimizer.folded_from['val_35', 'val_36']j
+c1.weight_bias
+
+
+j
+c2.weight_bias
+
+
+j!
+getitem
+
+
+
+
+j
+relu
+
+
+
+
+j#
+	getitem_3
+
+
+
+
+j 
+relu_1
+
+
+
+
+j#
+	getitem_6
+
+
+
+
+j
+add
+
+
+
+
+j 
+relu_2
+
+
+
+
+j"
+conv2d_3
+
+
+
+
+j"
+conv2d_4
+
+
+
+
+j
+add_1
+
+
+
+
+j 
+relu_3
+
+
+
+
+j"
+conv2d_5
+
+
+
+
+j
+tanh
+
+
+
+
+j
+cat
+
+
+
+
+j
+mean
+
+
+
+
+j
+view
+
+
+j
+linear
+
+
+‚ 
+0pkg.torch.export.ExportedProgram.graph_signatureë
+# inputs
+p_stem_0_weight: PARAMETER target='stem.0.weight'
+p_stem_0_bias: PARAMETER target='stem.0.bias'
+p_stem_1_weight: PARAMETER target='stem.1.weight'
+p_stem_1_bias: PARAMETER target='stem.1.bias'
+p_c1_weight: PARAMETER target='c1.weight'
+p_b1_weight: PARAMETER target='b1.weight'
+p_b1_bias: PARAMETER target='b1.bias'
+p_c2_weight: PARAMETER target='c2.weight'
+p_b2_weight: PARAMETER target='b2.weight'
+p_b2_bias: PARAMETER target='b2.bias'
+p_down_weight: PARAMETER target='down.weight'
+p_down_bias: PARAMETER target='down.bias'
+p_proj_weight: PARAMETER target='proj.weight'
+p_proj_bias: PARAMETER target='proj.bias'
+p_branch_weight: PARAMETER target='branch.weight'
+p_branch_bias: PARAMETER target='branch.bias'
+p_head_weight: PARAMETER target='head.weight'
+p_head_bias: PARAMETER target='head.bias'
+b_stem_1_running_mean: BUFFER target='stem.1.running_mean' persistent=True
+b_stem_1_running_var: BUFFER target='stem.1.running_var' persistent=True
+b_stem_1_num_batches_tracked: BUFFER target='stem.1.num_batches_tracked' persistent=True
+b_b1_running_mean: BUFFER target='b1.running_mean' persistent=True
+b_b1_running_var: BUFFER target='b1.running_var' persistent=True
+b_b1_num_batches_tracked: BUFFER target='b1.num_batches_tracked' persistent=True
+b_b2_running_mean: BUFFER target='b2.running_mean' persistent=True
+b_b2_running_var: BUFFER target='b2.running_var' persistent=True
+b_b2_num_batches_tracked: BUFFER target='b2.num_batches_tracked' persistent=True
+x: USER_INPUT
+
+# outputs
+softmax: USER_OUTPUT
+‚r
+2pkg.torch.export.ExportedProgram.range_constraints<{s83: VR[0, int_oo], s64: VR[0, int_oo], s21: VR[0, int_oo]}B
+ 
