@@ -51,7 +51,16 @@ static inline int spingalett_thread_num(void) { return 0; }
 #define SPINGALETT_WEIGHT_MTX_PTR(net, l)   ((net)->weights + (net)->weight_offsets[l])
 #define SPINGALETT_GRAD_W_MTX_PTR(net, l)   ((net)->grad_weights + (net)->weight_offsets[l])
 
-void set_error(int code, const char *msg);
+/* Error paths are rare: GCC and Clang keep them out of line, so that the thread-local error state
+   is not touched in the bodies of the functions that report errors (GCC 16 with LTO dropped the
+   stack realignment of a function that inlined it and still read its arguments through it). */
+#if defined(__GNUC__)
+#define SPINGALETT_COLD __attribute__((cold, noinline))
+#else
+#define SPINGALETT_COLD
+#endif
+
+SPINGALETT_COLD void set_error(int code, const char *msg);
 
 
 /* Training-time dropout state. Masks are a hash of (seed, step, position, layer, unit), so every
