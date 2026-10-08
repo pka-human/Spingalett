@@ -5,44 +5,68 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
-## [Unreleased]
+## [0.12.0] - 2026-10-09
+
+"Tensor cores": the GPU's matrix units in bfloat16, the custom-loop API on the GPU, fixes from a
+review of the GPU backend; model import ten to a hundred times as fast; networks that predict hold
+their parameters once.
 
 ### Added
 - `spingalett_set_gpu_precision(PRECISION_BFLOAT16)` (Python `set_gpu_precision()`): the GPU's matrix
-  products in bfloat16 on its matrix units (`VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16`),
-  the products added in single precision, everything else (the parameters, the optimizer, batch
-  normalization) in single precision; products smaller than a block of the matrix units stay in
-  single precision. Runs stay deterministic. On an RTX 4050 Laptop GPU, ResNet-20 trains 17 to 18%
-  faster than in single precision and the MNIST CNN infers 8% faster. `Examples/CIFAR10.c bf16`.
+  products in bfloat16 on its matrix units (tensor cores; `VK_KHR_cooperative_matrix` with
+  `VK_KHR_shader_bfloat16`), the products added in single precision; the parameters, the optimizer
+  and batch normalization stay in single precision, and so do products smaller than a block of the
+  matrix units. Runs stay deterministic. It returns whether the GPU multiplies in the precision set.
+  The tiles of the matrix units are many subgroups with one or two accumulators each, all of them
+  timed on first use. On an RTX 4050 Laptop GPU (`Bin/Benchmark gpu`, medians of three interleaved
+  runs, samples per second, single precision then bfloat16): ResNet-20 trains at 8,750 and 9,960 and
+  infers at 22,630 and 25,300; the MNIST CNN trains at 73,680 and 85,950 and infers at 219,600 and
+  257,300; the 784-512-1000-10 MLP trains mini-batches of 64 at 225,500 and 264,100. ResNet-20
+  reaches 91.61% test accuracy on CIFAR-10 in bfloat16 (`Examples/CIFAR10.c bf16`), 91.55% in single
+  precision. PyTorch 2.14 with autocast to bfloat16 on the same GPU (`benchmark_pytorch.py
+  --cuda-bf16`, new) trains ResNet-20 at 12,160 and the MNIST CNN at 99,120.
+- The custom-loop API on the GPU: a trainer made with `COMPUTE_VULKAN` (`spingalett_trainer_new()`,
+  Python `Trainer`) runs its forward, backward and optimizer passes there, the outputs coming back
+  for the caller's loss and gradients adding up on the device until the step; the parameters stay
+  on the GPU between passes, and functions that read the network copy them back first. ResNet-20 in
+  batches of 128 through `spingalett_train_on_batch()`: 7,372 samples/s, as fast as `train()`, against
+  972 on the CPU.
 - ONNX models whose weights are kept in external files (`torch.onnx.export` of models over 2 GB,
   `onnx.save_model(..., save_as_external_data=True)`) import from their path; the files must lie in
   the model's folder.
-- PyTorch weights stored as views (a transposed or permuted tensor in the state dict) and 32-bit
+- PyTorch weights stored as views (a transposed or permuted tensor in a state dict) and 32-bit
   integer tensors load.
-- `SpingalettGpuTests bench` lists every tile's time with `SPINGALETT_BENCH_TILES` set.
+- `Bin/Benchmark gpu` runs the GPU's rows only, and the GPU's rows run again in bfloat16 where the
+  GPU has matrix units; `SpingalettGpuTests bench` lists every tile's time with
+  `SPINGALETT_BENCH_TILES` set.
 
 ### Changed
 - Networks allocate their gradients and optimizer state when they first train (`train()`,
   `spingalett_trainer_new()`, a file with optimizer state, or setting a gradient), so that networks
-  loaded or imported for inference hold their parameters once instead of four times. Parameter
-  arrays grow by half again when a layer does not fit, instead of to the exact size every time.
-  Building a network of 1000 layers, which copied its parameters once per layer, takes 0.02 s
-  instead of 5.6 s.
+  loaded or imported to predict hold their parameters once instead of four times. Parameter arrays
+  grow by half again when a layer does not fit, instead of to the exact size every time: building a
+  network of 1000 layers, which copied its parameters once per layer, takes 0.02 s instead of 5.6 s.
 - ONNX import and PyTorch weights: files are mapped instead of read, and each tensor is converted
-  straight into the layer in one pass (no float copy of every initializer, no table of indices as
+  straight into its layer in one pass (no float copy of every initializer, no table of indices as
   large as the tensor, no copy of the network's parameters to restore on error: everything is
   checked before anything is written); names resolve through hash tables. On an i7-12650H:
   ResNet-50 (100 MB) imports in 0.085 s instead of 1.02 s, peaking at 360 MB instead of 1139 MB; a
   126M-parameter VGG head (504 MB) in 0.17 s instead of 1.94 s, peaking at 1271 MB instead of
   4747 MB, and its state dict loads in 0.08 s instead of 1.0 s.
 - GPU: the executor waits for the older of the two chunks in flight before filling the next one
-  (it waited for both), and a chunk's last barrier no longer holds back the next one's copies: the
-  MNIST CNN trains 8 to 17% faster on the RTX 4050 Laptop GPU and infers 6 to 10% faster.
+  (it waited for both), and a chunk's last barrier no longer holds back the next one's copies; with
+  the other changes the MLP trains 7 to 11% faster on the RTX 4050 Laptop GPU and infers 19% faster,
+  and the MNIST CNN trains 5% faster (`Bin/Benchmark`, against 0.11).
 - GPU: matrix products of more row tiles than a dispatch may have go in parts, tiles whose columns
   would exceed the device's limit are not chosen, and the gradient norm's sums loop over at most
   65535 workgroups (Intel and lavapipe allow 65535 workgroups in x; every device in y).
 - GPU: tanh takes an odd polynomial below |x| = 0.3, as the CPU's vector kernel does (the formula
   through exp lost its relative precision there); the matrix kernel's accumulators are `precise`.
+- Building: a glslc too old for the bfloat16 kernel (Ubuntu 24.04's) builds the library without it,
+  which then multiplies in single precision; release packages and wheels take shaders compiled once
+  with a current shaderc, checked by spirv-val.
+- Nothing on the CPU: interleaved runs of `Bin/Benchmark` on the i7-12650H, 0.11.0 against 0.12.0,
+  agree within 3% on every workload.
 
 ### Fixed
 - GPU: validation during training ran batch normalization with the validation chunk's own
@@ -56,7 +80,7 @@ changes, which are listed under **Changed**.
   features enabled (NVIDIA tolerates it, a stricter driver may refuse the pipeline); it takes its
   subgroup from `gl_SubgroupID` and asks for complete subgroups where the device allows.
 - GPU: the 32-bit index check skipped the input layer; devices were asked for Vulkan 1.2 features
-  before their version was checked.
+  before their version was checked; the pipeline cache passed NULL to `memcpy`.
 - README: the DeepWiki badge (its image server refuses GitHub's image proxy) and the introduction,
   which still said the library ran on the CPU only.
 
@@ -679,6 +703,7 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[0.12.0]: https://github.com/pka-human/Spingalett/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/pka-human/Spingalett/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/pka-human/Spingalett/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/pka-human/Spingalett/compare/v0.8.0...v0.9.0
