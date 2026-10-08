@@ -232,6 +232,9 @@ bool spingalett_add_layer(LayerArgs args);
 bool spingalett_check_graph(const NeuralNetwork *net, const char *who);
 /* Gives an empty network room for these totals (zeroed), so that adding its layers moves nothing. */
 bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t weights, uint64_t biases);
+/* Allocates the gradients and optimizer state (zero) unless they exist: networks get them when they
+   first train, so that those used for inference only hold their parameters once. Sets the error. */
+bool spingalett_training_state(NeuralNetwork *net);
 /* The arguments that add layer l of net again (to another network: set .net), parameters aside. */
 LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l);
 /* The image of a deployment model: net with every batch normalization that directly follows a dense

@@ -181,37 +181,67 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
 }
 
 /* An array of `need` floats whose first `keep` are those of `old`, the rest zero: `old` itself when
-   it holds `cap` >= need floats (the rest is still zero then), a new array otherwise. */
-static float *grow_floats(float *old, uint64_t keep, uint64_t need, uint64_t cap) {
-    if (old && need <= cap) return old;
-    float *p = (float *)spingalett_aligned_alloc((size_t)need * sizeof(float));
-    if (!p) return NULL;
-    if (keep) memcpy(p, old, (size_t)keep * sizeof(float));
+   it holds `cap` >= need floats, a new array of `grown` floats otherwise. */
+static float *grow_floats(float *old, uint64_t keep, uint64_t need, uint64_t cap, uint64_t grown) {
+    float *p = old;
+    if (!old || need > cap) {
+        p = (float *)spingalett_aligned_alloc((size_t)grown * sizeof(float));
+        if (!p) return NULL;
+        if (keep) memcpy(p, old, (size_t)keep * sizeof(float));
+    }
     memset(p + keep, 0, (size_t)(need - keep) * sizeof(float));
     return p;
+}
+
+/* The capacity an array that must hold `need` floats moves to: half as much again as it had, so that
+   building a network layer by layer copies its parameters a few times in all rather than once per
+   layer. The room past `need` is never written, which leaves the pages of large arrays unused. */
+static uint64_t grown_capacity(uint64_t need, uint64_t cap) {
+    uint64_t grown = cap + cap / 2;
+    return grown > need ? grown : need;
 }
 
 bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t weights, uint64_t biases) {
     if (!net || net->layers != 0 || net->neurons) return false;
     if (weights == 0) weights = 1;
     if (biases == 0) biases = 1;
-    float *n = (float *)spingalett_aligned_calloc((size_t)neurons + 1, sizeof(float)), *w[4], *b[6];
-    bool ok = n != NULL;
-    for (int k = 0; k < 4; k++) ok = (w[k] = (float *)spingalett_aligned_calloc((size_t)weights, sizeof(float))) && ok;
-    for (int k = 0; k < 6; k++) ok = (b[k] = (float *)spingalett_aligned_calloc((size_t)biases, sizeof(float))) && ok;
+    float *n = (float *)spingalett_aligned_calloc((size_t)neurons + 1, sizeof(float)), *b[3];
+    float *w = (float *)spingalett_aligned_calloc((size_t)weights, sizeof(float));
+    bool ok = n && w;
+    for (int k = 0; k < 3; k++) ok = (b[k] = (float *)spingalett_aligned_calloc((size_t)biases, sizeof(float))) && ok;
     if (!ok) {
         spingalett_aligned_free(n);
-        for (int k = 0; k < 4; k++) spingalett_aligned_free(w[k]);
-        for (int k = 0; k < 6; k++) spingalett_aligned_free(b[k]);
+        spingalett_aligned_free(w);
+        for (int k = 0; k < 3; k++) spingalett_aligned_free(b[k]);
         return false;                   /* the layers then allocate as they are added */
     }
     net->neurons = n;
-    net->weights = w[0]; net->grad_weights = w[1]; net->opt_m_weights = w[2]; net->opt_v_weights = w[3];
-    net->biases = b[0]; net->grad_biases = b[1]; net->opt_m_biases = b[2]; net->opt_v_biases = b[3];
-    net->running_mean = b[4]; net->running_var = b[5];
+    net->weights = w;
+    net->biases = b[0]; net->running_mean = b[1]; net->running_var = b[2];
     net->cap_neurons = neurons + 1;
     net->cap_weights = weights;
     net->cap_biases = biases;
+    return true;
+}
+
+bool spingalett_training_state(NeuralNetwork *net) {
+    if (net->grad_weights) return true;
+    const size_t nw = net->cap_weights ? (size_t)net->cap_weights : 1u, nb = net->cap_biases ? (size_t)net->cap_biases : 1u;
+    float *w[3], *b[3];
+    bool ok = true;
+    for (int k = 0; k < 3; k++) {
+        ok = (w[k] = (float *)spingalett_aligned_calloc(nw, sizeof(float))) && ok;
+        ok = (b[k] = (float *)spingalett_aligned_calloc(nb, sizeof(float))) && ok;
+    }
+    if (!ok) {
+        for (int k = 0; k < 3; k++) { spingalett_aligned_free(w[k]); spingalett_aligned_free(b[k]); }
+        set_error(SPINGALETT_ERR_ALLOC, "Allocation of the gradients and optimizer state failed");
+        return false;
+    }
+    net->grad_weights = w[0]; net->opt_m_weights = w[1]; net->opt_v_weights = w[2];
+    net->grad_biases = b[0]; net->opt_m_biases = b[1]; net->opt_v_biases = b[2];
+    net->cap_weights = nw;
+    net->cap_biases = nb;
     return true;
 }
 
@@ -290,22 +320,29 @@ bool spingalett_add_layer(LayerArgs args) {
     uint32_t old_inputs = net->layers ? net->input_offsets[net->layers] : 0u;
     uint32_t           *t_ilist   = (uint32_t *)           malloc((old_inputs + input_count + 1) * sizeof(uint32_t));
 
-    /* The big arrays stay where they are when they have room (a loader reserved the final sizes);
-       otherwise they move to arrays of the new size: the old values copied, the rest zeroed. */
+    /* The big arrays stay where they are when they have room (a loader reserved the final sizes, or
+       an earlier move left some); otherwise they move to larger arrays: the old values copied, the
+       rest zeroed. Gradients and optimizer state exist once training has started only. */
     ActivationFunction *t_act     = NULL;
     /* sizes of at least 1: pooling layers add no parameters, and a network of pooling layers has none */
     size_t nw = new_tw ? new_tw : 1, nb = new_tb ? new_tb : 1;
+    const uint64_t cap_w = nw > net->cap_weights ? grown_capacity(nw, net->cap_weights) : net->cap_weights;
+    const uint64_t cap_b = nb > net->cap_biases ? grown_capacity(nb, net->cap_biases) : net->cap_biases;
+    const uint64_t cap_n = new_tn > net->cap_neurons ? grown_capacity(new_tn, net->cap_neurons) : net->cap_neurons;
+    const bool state = net->grad_weights != NULL;
     float *const old_w[4] = {net->weights, net->grad_weights, net->opt_m_weights, net->opt_v_weights};
-    float *const old_b[6] = {net->biases, net->grad_biases, net->opt_m_biases, net->opt_v_biases,
-                             net->running_mean, net->running_var};
-    float *t_neurons = grow_floats(net->neurons, net->total_neurons, new_tn, net->cap_neurons);
+    float *const old_b[6] = {net->biases, net->running_mean, net->running_var, net->grad_biases, net->opt_m_biases,
+                             net->opt_v_biases};
+    float *t_neurons = grow_floats(net->neurons, net->total_neurons, new_tn, net->cap_neurons, cap_n);
     float *t_wa[4] = {NULL, NULL, NULL, NULL}, *t_ba[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
     bool ok = t_topo && t_shapes && t_noff && t_woff && t_boff && t_neurons && t_drop && t_ioff && t_ilist;
     if (nl > 1) {
         t_act = (ActivationFunction *)malloc((nl - 1) * sizeof(ActivationFunction));
         ok = ok && t_act;
-        for (int k = 0; k < 4; k++) ok = ok && (t_wa[k] = grow_floats(old_w[k], net->total_weights, nw, net->cap_weights));
-        for (int k = 0; k < 6; k++) ok = ok && (t_ba[k] = grow_floats(old_b[k], net->total_biases, nb, net->cap_biases));
+        for (int k = 0; k < (state ? 4 : 1); k++)
+            ok = ok && (t_wa[k] = grow_floats(old_w[k], net->total_weights, nw, net->cap_weights, cap_w));
+        for (int k = 0; k < (state ? 6 : 3); k++)
+            ok = ok && (t_ba[k] = grow_floats(old_b[k], net->total_biases, nb, net->cap_biases, cap_b));
     }
 
     if (!ok) {
@@ -319,7 +356,7 @@ bool spingalett_add_layer(LayerArgs args) {
         return false;
     }
     float *t_w = t_wa[0], *t_gw = t_wa[1], *t_mw = t_wa[2], *t_vw = t_wa[3];
-    float *t_b = t_ba[0], *t_gb = t_ba[1], *t_mb = t_ba[2], *t_vb = t_ba[3], *t_rm = t_ba[4], *t_rv = t_ba[5];
+    float *t_b = t_ba[0], *t_rm = t_ba[1], *t_rv = t_ba[2], *t_gb = t_ba[3], *t_mb = t_ba[4], *t_vb = t_ba[5];
 
     if (net->layers > 0) {
         memcpy(t_topo, net->topology, net->layers * sizeof(uint32_t));
@@ -387,16 +424,16 @@ bool spingalett_add_layer(LayerArgs args) {
     free(net->input_list);
     if (t_neurons != net->neurons) {
         spingalett_aligned_free(net->neurons);
-        net->cap_neurons = new_tn;
+        net->cap_neurons = cap_n;
     }
     if (nl > 1) {
-        if (t_w != old_w[0]) net->cap_weights = nw;
-        if (t_b != old_b[0]) net->cap_biases = nb;
-        for (int k = 0; k < 4; k++) if (t_wa[k] != old_w[k]) spingalett_aligned_free(old_w[k]);
-        for (int k = 0; k < 6; k++) if (t_ba[k] != old_b[k]) spingalett_aligned_free(old_b[k]);
+        if (t_w != old_w[0]) net->cap_weights = cap_w;
+        if (t_b != old_b[0]) net->cap_biases = cap_b;
+        for (int k = 0; k < (state ? 4 : 1); k++) if (t_wa[k] != old_w[k]) spingalett_aligned_free(old_w[k]);
+        for (int k = 0; k < (state ? 6 : 3); k++) if (t_ba[k] != old_b[k]) spingalett_aligned_free(old_b[k]);
     } else {                            /* the input layer: arrays reserved for the parameters stay */
         t_w = old_w[0]; t_gw = old_w[1]; t_mw = old_w[2]; t_vw = old_w[3];
-        t_b = old_b[0]; t_gb = old_b[1]; t_mb = old_b[2]; t_vb = old_b[3]; t_rm = old_b[4]; t_rv = old_b[5];
+        t_b = old_b[0]; t_rm = old_b[1]; t_rv = old_b[2]; t_gb = old_b[3]; t_mb = old_b[4]; t_vb = old_b[5];
     }
 
     net->layers         = nl;
@@ -552,9 +589,11 @@ uint64_t spingalett_optimizer_steps(const NeuralNetwork *net) {
     return net ? net->time_step : 0;
 }
 
-/* The array of `kind` feeding layer index and its length; NULL (error set) when out of range. */
+/* The array of `kind` feeding layer index and its length; NULL when out of range (error set, *valid
+   false) or when it is a gradient of a network that has not trained yet (*valid true). */
 static float *parameter_block(const NeuralNetwork *net, uint32_t index, ParameterKind kind, uint64_t count,
-                              const char *who) {
+                              const char *who, bool *valid) {
+    *valid = false;
     if (!net || index == 0 || index >= net->layers || (unsigned)kind >= PARAM_KIND_COUNT) {
         set_error(SPINGALETT_ERR_INVALID, who);
         return NULL;
@@ -567,27 +606,35 @@ static float *parameter_block(const NeuralNetwork *net, uint32_t index, Paramete
         set_error(SPINGALETT_ERR_INVALID, who);
         return NULL;
     }
+    *valid = true;
     uint64_t b = net->bias_offsets[index - 1];
     switch (kind) {
         case PARAM_WEIGHTS:          return net->weights + net->weight_offsets[index - 1];
         case PARAM_BIASES:           return net->biases + b;
-        case PARAM_WEIGHT_GRADIENTS: return net->grad_weights + net->weight_offsets[index - 1];
-        case PARAM_BIAS_GRADIENTS:   return net->grad_biases + b;
+        case PARAM_WEIGHT_GRADIENTS: return net->grad_weights ? net->grad_weights + net->weight_offsets[index - 1] : NULL;
+        case PARAM_BIAS_GRADIENTS:   return net->grad_biases ? net->grad_biases + b : NULL;
         case PARAM_RUNNING_MEAN:     return net->running_mean + b;
         default:                     return net->running_var + b;
     }
 }
 
 bool spingalett_get_parameters(const NeuralNetwork *net, uint32_t index, ParameterKind kind, float *values, uint64_t count) {
+    bool valid;
     const float *p = parameter_block(net, index, kind, count,
-                                     "spingalett_get_parameters: invalid layer, kind or count");
-    if (!p || (!values && count > 0)) return false;
-    if (count) memcpy(values, p, (size_t)count * sizeof(float));
+                                     "spingalett_get_parameters: invalid layer, kind or count", &valid);
+    if (!valid || (!values && count > 0)) return false;
+    if (count && p) memcpy(values, p, (size_t)count * sizeof(float));
+    else if (count) memset(values, 0, (size_t)count * sizeof(float));     /* gradients before any training */
     return true;
 }
 
 bool spingalett_set_parameters(NeuralNetwork *net, uint32_t index, ParameterKind kind, const float *values, uint64_t count) {
-    float *p = parameter_block(net, index, kind, count, "spingalett_set_parameters: invalid layer, kind or count");
+    bool valid;
+    float *p = parameter_block(net, index, kind, count, "spingalett_set_parameters: invalid layer, kind or count", &valid);
+    if (valid && !p) {
+        if (!spingalett_training_state(net)) return false;
+        p = parameter_block(net, index, kind, count, "spingalett_set_parameters: invalid layer, kind or count", &valid);
+    }
     if (!p || (!values && count > 0)) return false;
     if (count) memcpy(p, values, (size_t)count * sizeof(float));
     return true;

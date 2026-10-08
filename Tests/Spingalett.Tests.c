@@ -2867,6 +2867,7 @@ static void model_conv(void) {
 
     /* the layer table, and the version: 4 here, 3 for dense networks */
     size_t size = 0, dense_size = 0;
+    spingalett_trainer_free(spingalett_trainer_new(net, 1));      /* allocates the optimizer state */
     for (uint64_t i = 0; i < net->total_weights; i++) { net->opt_m_weights[i] = frand(); net->opt_v_weights[i] = frand(); }
     net->time_step = 17;
     uint8_t *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &size);
@@ -3920,8 +3921,8 @@ static void onnx_models(void) {
         free_network(net);
     }
 
-    /* an operator it does not have is named; bytes that are no model fail */
     char path[512];
+    /* an operator it does not have is named; bytes that are no model fail */
     snprintf(path, sizeof path, "%s/onnx_unsupported.onnx", SPINGALETT_TEST_DATA_DIR);
     spingalett_clear_error();
     CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Resize"),

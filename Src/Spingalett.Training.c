@@ -820,7 +820,7 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
 }
 
 /* Checks that a network can be trained; logs and sets the error otherwise. */
-static bool check_trainable(const NeuralNetwork *net) {
+static bool check_trainable(NeuralNetwork *net) {
     if (!net || net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "Network must have at least 2 layers for training");
         spingalett_log(LOG_ERROR, "Network must have at least 2 layers for training");
@@ -842,7 +842,7 @@ static bool check_trainable(const NeuralNetwork *net) {
             return false;
         }
     }
-    return spingalett_check_graph(net, "train");
+    return spingalett_check_graph(net, "train") && spingalett_training_state(net);
 }
 
 static TrainReport train_failed(const char *message) {

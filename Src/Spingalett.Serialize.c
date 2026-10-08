@@ -284,7 +284,7 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             memcpy(img + off[4 * l + 1] + (size_t)rows * 4u, net->running_var + net->bias_offsets[l], (size_t)rows * 4u);
         }
         memcpy(img + off[4 * l + 2], net->biases + net->bias_offsets[l], (size_t)rows * 4u);
-        if (save_optimizer) {
+        if (save_optimizer && net->opt_m_weights) {     /* without, before any training: the zeros the image has */
             uint8_t *o = img + off[4 * l + 3];
             size_t wbytes = (size_t)rows * row_len * 4u, bbytes = (size_t)rows * 4u;
             memcpy(o, net->opt_m_weights + net->weight_offsets[l], wbytes);
@@ -604,6 +604,10 @@ static NeuralNetwork *load_image(const uint8_t *p, size_t size, PrecisionMode *p
     if (spingalett_slett_validate(p, size, &info) != SPINGALETT_OK) return NULL;
     NeuralNetwork *net = network_of_image(p, &info);
     if (!net) return NULL;
+    if ((info.flags & SLETT_FLAG_OPTIMIZER) && !spingalett_training_state(net)) {
+        free_network(net);
+        return NULL;
+    }
 
     uint32_t L = info.layers - 1;
     int8_t *codes = NULL;
@@ -773,6 +777,10 @@ static NeuralNetwork *load_legacy(const uint8_t *data, size_t size, PrecisionMod
     free(dropout);
     if (!net) return NULL;
     net->time_step = ts;
+    if (has_optimizer && !spingalett_training_state(net)) {
+        free_network(net);
+        return NULL;
+    }
 
     bool read_ok = true;
     for (uint32_t l = 0; l + 1 < layers && read_ok; l++) {
