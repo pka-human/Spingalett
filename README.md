@@ -1138,8 +1138,10 @@ engine and model format versions 3 to 6 are meant to stay stable from here on.
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
 - 0.13: transposed convolutions, upsampling and layer normalization (U-Net-style networks, more of
-  ONNX), deployment models on the GPU, fewer GPU passes
-- 1.0: API freeze, C++ wrapper
+  ONNX)
+- 0.14, the release candidate: every public name under the library's prefix, structs that can
+  grow, the formats frozen, a C++ wrapper
+- 1.0: the API and ABI frozen
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 
 ## Contributing
