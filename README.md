@@ -9,21 +9,22 @@
 [![CI](https://github.com/pka-human/Spingalett/actions/workflows/ci.yml/badge.svg)](https://github.com/pka-human/Spingalett/actions/workflows/ci.yml)
 [![Standard](https://img.shields.io/badge/C-23-blue.svg?style=flat-square)](https://en.wikipedia.org/wiki/C23_(C_standard_revision))
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pka-human/Spingalett)
+[![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue.svg?style=flat-square)](https://deepwiki.com/pka-human/Spingalett)
 
 </div>
 
 Spingalett is a neural-network library written in C23 for training and running fully connected
-and convolutional networks on the CPU, chains of layers or graphs of them (residual connections,
-concatenated branches). It depends only on the C standard library: batch training
-and inference run as matrix-matrix products on built-in AVX-512, AVX2, NEON or portable kernels (on
+and convolutional networks, chains of layers or graphs of them (residual connections, concatenated
+branches), on the CPU and on GPUs through Vulkan compute. It depends only on the C standard library
+(the Vulkan loader is opened at run time where there is one): on the CPU, batch
+training and inference run as matrix-matrix products on built-in AVX-512, AVX2, NEON or portable kernels (on
 x86-64, chosen for the processor at run time), with OpenMP and OpenBLAS as optional build-time
 accelerators; results are the same bits on one thread and many. Networks are declared with C23
 designated initializers and all parameters live in flat contiguous arrays. For deployment, a trained network becomes a read-only
 model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
-alike. Models come in from ONNX files and PyTorch weights, and Python bindings (wheels on PyPI)
-are included.
+alike. Models come in from ONNX files and PyTorch weights, and Python bindings (wheels with
+the library inside) are included.
 
 ## Contents
 
