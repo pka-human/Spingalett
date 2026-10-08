@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
-## [0.11.0] - Unreleased
+## [0.11.0] - 2026-10-08
 
 "GPU": training and inference on a GPU through Vulkan compute, deterministic, with every kind of
 layer the CPU runs.
