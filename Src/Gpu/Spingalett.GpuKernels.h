@@ -18,6 +18,7 @@ typedef struct {
     uint32_t slices, slice_k;
     float alpha, beta;
     uint32_t flags;
+    uint32_t m_tile0;               /* set by spg_gemm(): the first tile of rows of a dispatch */
 } SpgGemmPush;
 
 enum { SPG_A_ROW, SPG_A_COL, SPG_A_CONV };

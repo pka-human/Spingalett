@@ -52,6 +52,8 @@ uint64_t spg_gpu_memory(void);
 /* Bytes of shared memory a workgroup may use; the subgroup size. */
 uint32_t spg_gpu_shared_memory(void);
 uint32_t spg_gpu_subgroup_size(void);
+/* Workgroups a dispatch may have along axis 0 (x), 1 (y) or 2 (z): 65535 at least. */
+uint32_t spg_gpu_max_workgroups(uint32_t axis);
 /* Whether the device multiplies bfloat16 cooperative matrices (16 x 16 x 16, sums in float). */
 bool spg_gpu_mma_bf16(void);
 

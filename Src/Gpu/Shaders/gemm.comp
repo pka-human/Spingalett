@@ -82,7 +82,7 @@ void store_tiles() {
 void main() {
     tid = gl_LocalInvocationID.x;
     const uint z = gl_WorkGroupID.z, g = z / p.slices, s = z % p.slices;
-    m0 = gl_WorkGroupID.x * BM;
+    m0 = (p.m_tile0 + gl_WorkGroupID.x) * BM;
     n0 = gl_WorkGroupID.y * BN;
     const uint kbeg = s * p.slice_k;
     kend = min(p.K, kbeg + p.slice_k);

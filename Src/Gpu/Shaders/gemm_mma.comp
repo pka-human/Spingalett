@@ -76,7 +76,7 @@ void store_tiles() {
 void main() {
     tid = gl_LocalInvocationID.x;
     const uint z = gl_WorkGroupID.z, g = z / p.slices, s = z % p.slices;
-    m0 = gl_WorkGroupID.x * BM;
+    m0 = (p.m_tile0 + gl_WorkGroupID.x) * BM;
     n0 = gl_WorkGroupID.y * BN;
     const uint kbeg = s * p.slice_k;
     kend = min(p.K, kbeg + p.slice_k);
@@ -84,8 +84,10 @@ void main() {
     boff = g * p.b_group;
     prepare(kbeg);
 
-    /* subgroup (sm, sn) computes rows sm 16 WM .. + 16 WM and columns sn 16 WN .. + 16 WN */
-    const uint sg = tid / SG, lane = tid % SG, sm = sg % SGM, sn = sg / SGM;
+    /* subgroup (sm, sn) computes rows sm 16 WM .. + 16 WM and columns sn 16 WN .. + 16 WN (the workgroup
+       holds THREADS / SG complete subgroups of SG invocations: the subgroup size of the device, which
+       shaders of SPIR-V 1.5 run with, and complete where the host can ask for it) */
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID, sm = sg % SGM, sn = sg / SGM;
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[WM * WN];
     for (uint i = 0; i < WM * WN; i++) acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 

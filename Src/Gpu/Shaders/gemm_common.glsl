@@ -34,6 +34,8 @@ layout(push_constant) uniform Push {
     uint slices, slice_k;
     float alpha, beta;
     uint flags;
+    uint m_tile0;                       /* the first tile of rows: a product of more tiles than a
+                                           dispatch may have is dispatched in parts */
 } p;
 
 /* geometry: rows over an RH x RW grid of pixels, gathered from a GH x GW x GC tensor */

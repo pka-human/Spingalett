@@ -1002,7 +1002,7 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
         Access a = {0};
         reads(&a, grads);
         writes(&a, span(g->part.address, slices));
-        kernel(r, &a, SPG_KERNEL_sumsq, &spec, 1, &sp, sizeof sp, slices, 1, 1);
+        kernel(r, &a, SPG_KERNEL_sumsq, &spec, 1, &sp, sizeof sp, groups(slices, 1u), 1, 1);
         spec = SPG_SUMSQ_CLIP;
         Access b = {0};
         reads(&b, span(g->part.address, slices));
