@@ -737,13 +737,13 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
   custom-loop API (`spingalett_trainer_*`) and deployment models run on the CPU.
 - Results are deterministic: every sum runs in a fixed order, never through atomics, so a run gives
   the same bits every time on one device. They agree with the CPU's up to rounding: the products
-  use fused multiply-adds and other tiles, and batch normalization adds its sums in single rather
-  than double precision.
-- The first products of each shape are timed with a few tile sizes and the fastest is kept for the
-  life of the process. Tiles change the speed, never the results; `SPINGALETT_GPU_TUNE=0` estimates
-  instead of timing. With that, the first `train()` of a process takes about a second longer
-  (ResNet-20 on the RTX 4050 Laptop GPU); the very first on a machine, ten seconds or so, while the
-  driver compiles the kernels it then keeps on disk.
+  add in another order, with fused multiply-adds, and batch normalization adds its sums in single
+  rather than double precision.
+- The first products of each shape are timed with a few tile sizes, and the fastest is kept for the
+  life of the process: the first `train()` of a process takes about a second longer (ResNet-20 on an
+  RTX 4050 Laptop GPU), and the very first on a machine some ten seconds, while the driver compiles
+  the kernels, which it then keeps on disk. Tiles change the speed, never the results;
+  `SPINGALETT_GPU_TUNE=0` estimates them instead.
 - Samples are processed in chunks of up to 2048 that fit in half the GPU's memory; full-batch
   training of networks with batch normalization normalizes over each chunk, as on the CPU.
 - `SPINGALETT_GPU_DEVICE=n` picks the n-th device of the Vulkan device list instead of the first
@@ -967,7 +967,8 @@ Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 effici
 and AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16
 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel
 MKL and oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13
-to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was:
+to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was;
+0.11 leaves all of them as they were on the CPU (within 2% of 0.10 in interleaved runs):
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
@@ -1003,6 +1004,32 @@ mini-batches 1.9 to 2 times as fast, full batches 1.1 to 1.6 times and infers 1.
 fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: built without them
 (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
 and 4,798.
+
+On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 0.11 runs
+the same workloads with `COMPUTE_VULKAN` (`Bin/Benchmark` runs them after the CPU's), against
+PyTorch 2.14.1 with CUDA 13.0 and cuDNN (`python Examples/benchmark_pytorch.py --cuda`, with
+PyTorch's default TF32 convolutions, and `--cuda-fp32`), medians of three interleaved runs.
+PyTorch's data is in GPU memory from the start; Spingalett takes the host arrays and copies every
+batch to the GPU, overlapped with the work on the batch before:
+
+| On the GPU | Spingalett | PyTorch (TF32) | PyTorch (FP32) |
+|---|---:|---:|---:|
+| ResNet-20, training | 8,900 | 8,510 | 7,140 |
+| ResNet-20, inference | 22,900 | 19,700 | 19,400 |
+| Convolutional network, training | 62,900 | 56,900 | 60,000 |
+| Convolutional network, inference | 227,700 | 132,000 | 143,600 |
+| With batch normalization, training | 48,400 | 48,500 | 48,500 |
+| With batch normalization, inference | 149,400 | 107,300 | 114,100 |
+| Fully connected network, mini-batch 64 | 188,600 | 80,600 | 80,400 |
+| Fully connected network, full batch | 497,200 | 1,051,500 | 1,047,600 |
+| Fully connected network, inference | 967,000 | 2,957,000 | 2,964,700 |
+
+On the GPU Spingalett trains ResNet-20 5.7 times as fast as on the eight threads of the CPU, and
+1.05 times as fast as PyTorch with TF32 (1.25 times in single precision); it trains the
+convolutional networks as fast as PyTorch or faster and runs them 1.3 to 1.7 times as fast, and
+trains mini-batches of the fully connected network 2.3 times as fast. PyTorch leads on large dense
+products: full batches of the fully connected network train at half its speed, and its inference
+runs at a third, most of that time spent copying the 20,000 samples (63 MB) from host memory.
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
@@ -1052,7 +1079,8 @@ VM. `Examples/MNIST_CNN.c` reaches 98.9% after two epochs of about 9 seconds eac
 `Examples/CIFAR10.c` reaches 87.8% test accuracy after 20 epochs, 20 minutes on four threads of the
 Sapphire Rapids VM (760 images per second with augmentation); its INT8 model keeps 87.8%. With
 `resnet20` it reaches 91.55% after 100 epochs (12 threads of the i7-12650H, before the indirect
-kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB).
+kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB), and the same 91.55% trained on the
+RTX 4050 Laptop GPU (`gpu`) in 9 minutes; with `resnet32`, 92.39% (INT8 model 92.43% in 480 KB).
 
 ## Project layout
 

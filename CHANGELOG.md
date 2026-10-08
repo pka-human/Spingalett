@@ -20,12 +20,15 @@ layer the CPU runs.
   label smoothing, augmentation (on the host, overlapped), validation and early stopping; the
   parameters stay on the device for a `train()` call and come back at the end of every epoch.
   Sums run in fixed orders, so GPU runs repeat bit for bit. Python: `ComputeMode.VULKAN`,
-  `gpu_device()`. Measured on an RTX 4050 Laptop GPU (`Bin/Benchmark`, samples per second, against
-  eight threads of the i7-12650H): ResNet-20 trains at 9,600 (CPU 1,584) and infers at 20,450; the
-  MNIST CNN trains at 64,000 (14,600); the 784-512-1000-10 MLP trains full batches at 570,000
-  (114,600) and mini-batches of 64 at 204,000 (52,900). PyTorch 2.14 with CUDA and cuDNN on the
-  same GPU trains ResNet-20 at 7,750 (8,540 with its default TF32 convolutions), the MNIST CNN at
-  60,200 and the MLP's mini-batches at 107,700.
+  `gpu_device()`. Measured on an RTX 4050 Laptop GPU (`Bin/Benchmark`, medians of three runs,
+  samples per second; in parentheses the eight threads of the i7-12650H, then PyTorch 2.14 with CUDA
+  and cuDNN on the same GPU, with its default TF32 and in single precision): ResNet-20 trains at
+  8,900 (1,573; 8,508 and 7,139) and infers at 22,892 (6,163; 19,742 and 19,409); the MNIST CNN
+  trains at 62,926 (14,298; 56,906 and 59,993) and infers at 227,667 (51,250; 132,016 and 143,565);
+  with batch normalization 48,387 (10,791; 48,481 and 48,477) and 149,371 (53,411; 107,254 and
+  114,126); the 784-512-1000-10 MLP trains mini-batches of 64 at 188,642 (52,688; 80,581 and
+  80,413), full batches at 497,191 (112,991; about 1,050,000) and infers at 967,009 (284,002; about
+  2,960,000, its data already on the GPU).
 - The GPU's matrix kernel serves dense layers, convolutions (windows read through a tap table,
   groups), data gradients (one stride-1 product per phase of a stride) and weight gradients (sums
   split into slices added in a fixed order), with vector loads along each operand's contiguous axis;
@@ -47,6 +50,8 @@ layer the CPU runs.
 
 ### Changed
 - `ComputeMode` has a new value, `COMPUTE_VULKAN`, before `COMPUTE_COUNT`.
+- Nothing on the CPU: interleaved runs of `Bin/Benchmark` on the i7-12650H, 0.10.0 against 0.11.0,
+  agree within 2% on every workload and thread count (the runs of either vary by more).
 
 ### Fixed
 - README: a repeated phrase in the performance section.
