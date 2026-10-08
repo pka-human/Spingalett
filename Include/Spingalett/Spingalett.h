@@ -390,6 +390,16 @@ SPINGALETT_API void spingalett_set_compute_mode(ComputeMode mode);
    addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
    SPINGALETT_GPU_DEVICE picks one by its index in the Vulkan device list. */
 SPINGALETT_API const char *spingalett_gpu_device(void);
+/* Precision of the GPU's matrix products: PRECISION_FLOAT32 (the default: single precision, as on
+   the CPU) or PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
+   multiplied on the GPU's matrix units with the products added in single precision: faster; the
+   rest of training, the parameters among it, stays in single precision). Devices without bfloat16
+   cooperative matrices keep single precision. Applies from the next train(), predict() or
+   evaluate() call, or the next trainer; results stay deterministic. Returns whether the GPU
+   multiplies in that precision (false without a device, or for bfloat16 without its matrix
+   units); other values are ignored and return false. */
+SPINGALETT_API bool spingalett_set_gpu_precision(PrecisionMode precision);
+SPINGALETT_API PrecisionMode spingalett_get_gpu_precision(void);
 SPINGALETT_API unsigned spingalett_get_num_threads(void);
 SPINGALETT_API void spingalett_set_num_threads(unsigned n);
 
@@ -478,6 +488,12 @@ SPINGALETT_API TrainReport train_struct_arguments(TrainArgs args);
  * grad_biases hold the sum over the samples since the last step) and a step applies the mean of
  * that sum with the given optimizer, so a step's batch can be split into several backward passes.
  * Optimizer state and the step count live in the network and are shared with train().
+ *
+ * With COMPUTE_VULKAN (when spingalett_trainer_new() is called) the passes run on the GPU, which keeps
+ * the parameters, gradients and optimizer state between them: functions that read the network
+ * (predict(), save_spingalett(), spingalett_get_parameters() and the others) copy them back first,
+ * and parameters set on the host go to the GPU before the next forward pass. A trainer is used from
+ * one thread at a time, and the network is not read from another thread while it runs a pass.
  */
 SPINGALETT_API SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch);
 SPINGALETT_API void spingalett_trainer_free(SpingalettTrainer *trainer);

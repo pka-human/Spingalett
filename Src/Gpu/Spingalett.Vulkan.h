@@ -37,8 +37,8 @@ typedef enum {
     SPG_KERNEL_COUNT
 } SpgKernel;
 
-/* Most specialization constants a kernel takes (constant_id 0 to 11) and bytes of push constants. */
-#define SPG_SPEC_MAX   12u
+/* Most specialization constants a kernel takes (constant_id 0 to 15) and bytes of push constants. */
+#define SPG_SPEC_MAX   16u
 #define SPG_PUSH_BYTES 128u
 
 typedef struct SpgGpuCommands SpgGpuCommands;
@@ -49,8 +49,13 @@ bool spg_gpu_open(void);
 const char *spg_gpu_device_name(void);
 /* Bytes of the device's largest device-local memory heap (0 without a device). */
 uint64_t spg_gpu_memory(void);
-/* Bytes of shared memory a workgroup may use. */
+/* Bytes of shared memory a workgroup may use; the subgroup size. */
 uint32_t spg_gpu_shared_memory(void);
+uint32_t spg_gpu_subgroup_size(void);
+/* Workgroups a dispatch may have along axis 0 (x), 1 (y) or 2 (z): 65535 at least. */
+uint32_t spg_gpu_max_workgroups(uint32_t axis);
+/* Whether the device multiplies bfloat16 cooperative matrices (16 x 16 x 16, sums in float). */
+bool spg_gpu_mma_bf16(void);
 
 bool spg_gpu_buffer_create(SpgGpuBuffer *buffer, size_t bytes, bool host_visible);
 void spg_gpu_buffer_free(SpgGpuBuffer *buffer);
@@ -68,6 +73,9 @@ void spg_gpu_dispatch(SpgGpuCommands *commands, SpgKernel kernel, const uint32_t
 /* Every dispatch and copy recorded before it completes before any recorded after it starts, and
    their results are visible to the host once the commands have run. */
 void spg_gpu_barrier(SpgGpuCommands *commands);
+/* The results of what was recorded before it are visible to the host once the commands have run;
+   commands submitted later need not wait for them (only their own barriers order them). */
+void spg_gpu_barrier_host(SpgGpuCommands *commands);
 void spg_gpu_copy(SpgGpuCommands *commands, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
                   size_t dst_offset, size_t bytes);
 /* bytes and offset multiples of 4 */

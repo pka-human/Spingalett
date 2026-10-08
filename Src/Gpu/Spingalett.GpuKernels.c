@@ -15,11 +15,11 @@
 #include <windows.h>
 #endif
 
-/* Tiles: rows x columns per workgroup, the k-step, rows x columns per thread (multiples of four).
-   Columns of 144 fit the windows of 3 x 3 convolutions over multiples of 16 channels (weight
-   gradients). */
+/* Tiles of gemm.comp: rows x columns per workgroup, the k-step, rows x columns per thread (multiples
+   of four). Columns of 144 fit the windows of 3 x 3 convolutions over multiples of 16 channels
+   (weight gradients). */
 typedef struct { uint32_t bm, bn, bk, tm, tn; } Tile;
-static const Tile tiles[] = {
+static const Tile fp32_tiles[] = {
     {128, 128, 16, 8, 8}, {128, 64, 16, 8, 4}, {64, 128, 16, 4, 8}, {64, 64, 16, 4, 4}, {128, 32, 16, 4, 4},
     {32, 128, 16, 4, 4}, {256, 32, 16, 8, 4}, {512, 16, 16, 8, 4}, {256, 16, 16, 8, 4}, {256, 16, 16, 4, 4},
     {16, 256, 16, 4, 4}, {64, 32, 16, 4, 4}, {32, 64, 16, 4, 4}, {128, 16, 16, 4, 4}, {16, 128, 16, 4, 4},
@@ -28,36 +28,63 @@ static const Tile tiles[] = {
     {256, 64, 8, 8, 8}, {128, 32, 16, 8, 4}, {128, 64, 8, 8, 4},
 };
 
-/* Bytes of shared memory a tile takes (gemm.comp: BK rows of BM / 4 + 1 and BN / 4 + 1 vec4). */
-static uint32_t tile_shared(const Tile *t) {
+/* Tiles of gemm_mma.comp: rows x columns per workgroup, the k-step, accumulators of 16 x 16 per
+   subgroup in rows x columns (the workgroup's subgroups tile it). */
+static const Tile mma_tiles[] = {
+    {128, 64, 32, 2, 1}, {64, 64, 32, 1, 1}, {128, 32, 32, 2, 1}, {64, 32, 32, 1, 1}, {32, 64, 32, 1, 1},
+    {64, 128, 32, 1, 2}, {128, 64, 32, 1, 1}, {32, 64, 32, 1, 2}, {32, 32, 32, 1, 1},
+    {64, 32, 32, 2, 1}, {128, 16, 32, 2, 1}, {64, 16, 32, 2, 1}, {32, 16, 32, 1, 1}, {16, 32, 32, 1, 1},
+};
+
+typedef struct { const Tile *list; uint32_t count; } Table;
+
+static Table table(bool mma) {
+    return mma ? (Table){mma_tiles, sizeof mma_tiles / sizeof mma_tiles[0]}
+               : (Table){fp32_tiles, sizeof fp32_tiles / sizeof fp32_tiles[0]};
+}
+
+static uint32_t tile_threads(const Tile *t, bool mma) {
+    return mma ? (t->bm / (16u * t->tm)) * (t->bn / (16u * t->tn)) * spg_gpu_subgroup_size()
+               : (t->bm / t->tm) * (t->bn / t->tn);
+}
+
+/* Bytes of shared memory a tile takes: gemm.comp's BK rows of BM / 4 + 1 and BN / 4 + 1 vec4;
+   gemm_mma.comp's BK rows of BM + 8 and BN + 8 bfloat16, and a 16 x 16 block of floats a subgroup. */
+static uint32_t tile_shared(const Tile *t, bool mma) {
+    if (mma) return ((t->bk + 8u) * (t->bm + t->bn) + 8u * 2u * t->bk + t->bk * 16u) * 2u +
+                    tile_threads(t, true) / spg_gpu_subgroup_size() * 1024u;       /* the larger of the layouts */
     return t->bk * (t->bm / 4u + 1u + t->bn / 4u + 1u) * 16u;
 }
 
-static bool tile_fits(const Tile *t) {
-    return tile_shared(t) <= spg_gpu_shared_memory();
+/* Whether the device can run the tile on N columns: its shared memory, its threads, and the tiles of
+   columns in y (those of rows go in parts when there are more than a dispatch may have). */
+static bool tile_fits(const Tile *t, bool mma, uint32_t N) {
+    return tile_shared(t, mma) <= spg_gpu_shared_memory() && tile_threads(t, mma) <= 1024u &&
+           (N + t->bn - 1) / t->bn <= spg_gpu_max_workgroups(1);
 }
 
-uint32_t spg_gemm_tiles(void) {
-    return (uint32_t)(sizeof tiles / sizeof tiles[0]);
+uint32_t spg_gemm_tiles(bool mma) {
+    return table(mma).count;
 }
 
-void spg_gemm_tile(uint32_t index, uint32_t *bm, uint32_t *bn, uint32_t *bk, uint32_t *tm, uint32_t *tn) {
-    const Tile *t = &tiles[index];
+void spg_gemm_tile(bool mma, uint32_t index, uint32_t *bm, uint32_t *bn, uint32_t *bk, uint32_t *tm, uint32_t *tn) {
+    const Tile *t = &table(mma).list[index];
     *bm = t->bm; *bn = t->bn; *bk = t->bk; *tm = t->tm; *tn = t->tn;
 }
 
 /* The tile that wastes the least work on padding per unit of register reuse, among those that give
    enough workgroups to fill the device when any does; smaller workgroups count as less reuse. */
-static Tile choose_tile(uint32_t M, uint32_t N, uint32_t z) {
+static Tile choose_tile(uint32_t M, uint32_t N, uint32_t z, bool mma) {
+    const Table tab = table(mma);
     double best = 0.0;
-    Tile chosen = tiles[0];
+    Tile chosen = tab.list[0];
     for (int pass = 0; pass < 2 && best == 0.0; pass++) {
-        for (size_t k = 0; k < sizeof tiles / sizeof tiles[0]; k++) {
-            const Tile *t = &tiles[k];
+        for (uint32_t k = 0; k < tab.count; k++) {
+            const Tile *t = &tab.list[k];
             uint64_t wg = (uint64_t)((M + t->bm - 1) / t->bm) * ((N + t->bn - 1) / t->bn) * z;
-            if ((pass == 0 && wg < 64) || !tile_fits(t)) continue;
+            if ((pass == 0 && wg < 64) || !tile_fits(t, mma, N)) continue;
             double padded = (double)((M + t->bm - 1) / t->bm * t->bm) * ((N + t->bn - 1) / t->bn * t->bn);
-            uint32_t threads = (t->bm / t->tm) * (t->bn / t->tn);
+            uint32_t threads = tile_threads(t, mma);
             double reuse = (double)(t->tm * t->tn) / (t->tm + t->tn) * (threads >= 128 ? 1.0 : 0.75);
             double cost = padded / reuse;
             if (best == 0.0 || cost < best) { best = cost; chosen = *t; }
@@ -67,7 +94,7 @@ static Tile choose_tile(uint32_t M, uint32_t N, uint32_t z) {
 }
 
 uint64_t spg_gemm_workgroups(uint32_t M, uint32_t N, uint32_t z) {
-    Tile t = choose_tile(M, N, z);
+    Tile t = choose_tile(M, N, z, false);
     return (uint64_t)((M + t.bm - 1) / t.bm) * ((N + t.bn - 1) / t.bn) * z;
 }
 
@@ -88,14 +115,15 @@ static bool aligned(uint64_t address, uint32_t group) {
 /* ------------------------------------------------------------------------- tile choice by timing */
 
 /*
- * Every tile computes each output as the same chain of fused multiply-adds in the order of k, so the
- * choice of tile changes the speed, never the bits: products are timed with each candidate tile on
- * their first use (outputs to scratch memory) and the fastest is kept for the life of the process.
- * SPINGALETT_GPU_TUNE=0 keeps the estimate of choose_tile() instead.
+ * Every tile computes each output as the same chain of fused multiply-adds in the order of k (on the
+ * matrix units, of 16 x 16 x 16 products in the order of k), so the choice of tile changes the
+ * speed, never the bits: products are timed with each candidate tile on their first use (outputs to
+ * scratch memory) and the fastest is kept for the life of the process. SPINGALETT_GPU_TUNE=0 keeps
+ * the estimate of choose_tile() instead.
  */
 typedef struct {
-    uint32_t key[14];
-    uint32_t tile;                  /* index of the fastest */
+    uint32_t key[15];
+    uint32_t tile;                  /* index of the fastest in its table */
 } Choice;
 
 static struct {
@@ -126,10 +154,24 @@ void spg_gemm_release(void) {
     spg_unlock(tuner.lock);
 }
 
-static void make_key(uint32_t *key, const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec) {
-    const uint32_t values[14] = {m->amode, m->bmode, m->epi, vec, m->phased, m->groups, p->M, p->N, p->K, p->slices,
-                                 p->slice_k, p->lda, p->ldb, p->ldc};
+static void make_key(uint32_t *key, const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, bool mma) {
+    const uint32_t values[15] = {m->amode, m->bmode, m->epi, vec, m->phased, m->groups, p->M, p->N, p->K, p->slices,
+                                 p->slice_k, p->lda, p->ldb, p->ldc, mma};
     memcpy(key, values, sizeof values);
+}
+
+/* Records the product with tile t (gemm_mma.comp with mma). */
+static void dispatch_tile(SpgGpuCommands *c, const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, const Tile *t,
+                          bool mma) {
+    uint32_t spec[13] = {t->bm, t->bn, t->bk, t->tm, t->tn, m->amode, m->bmode, m->epi, m->act, tile_threads(t, mma),
+                         m->phased ? 1u : 0u, vec, spg_gpu_subgroup_size()};
+    /* tiles of rows in parts of at most what a dispatch may have in x */
+    const uint32_t tiles = (p->M + t->bm - 1) / t->bm, most = spg_gpu_max_workgroups(0);
+    SpgGemmPush q = *p;
+    for (q.m_tile0 = 0; q.m_tile0 < tiles; q.m_tile0 += most)
+        spg_gpu_dispatch(c, mma ? SPG_KERNEL_gemm_mma : SPG_KERNEL_gemm, spec, mma ? 13u : 12u, &q, sizeof q,
+                         tiles - q.m_tile0 < most ? tiles - q.m_tile0 : most, (p->N + t->bn - 1) / t->bn,
+                         m->groups * p->slices);
 }
 
 double spg_seconds(void) {
@@ -148,17 +190,13 @@ double spg_seconds(void) {
 }
 
 /* Seconds per run of the product with tile t (0 when it cannot run). */
-static double time_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, const Tile *t, int reps) {
+static double time_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, const Tile *t, bool mma, int reps) {
     SpgGpuCommands *c = spg_gpu_commands_create();
     if (!c) return 0.0;
     spg_gpu_commands_untimed(c);
-    const uint32_t threads = (t->bm / t->tm) * (t->bn / t->tn);
-    uint32_t spec[12] = {t->bm, t->bn, t->bk, t->tm, t->tn, m->amode, m->bmode, m->epi, m->act, threads,
-                         m->phased ? 1u : 0u, vec};
     bool ok = spg_gpu_record_begin(c);
     for (int r = 0; ok && r < reps; r++) {
-        spg_gpu_dispatch(c, SPG_KERNEL_gemm, spec, 12, p, sizeof *p, (p->M + t->bm - 1) / t->bm,
-                         (p->N + t->bn - 1) / t->bn, m->groups * p->slices);
+        dispatch_tile(c, p, m, vec, t, mma);
         spg_gpu_barrier(c);
     }
     ok = ok && spg_gpu_record_end(c);
@@ -170,10 +208,11 @@ static double time_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec
 }
 
 /* The fastest tile for this product, timed now if it is new; -1 when it cannot be timed. */
-static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec) {
+static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, bool mma) {
     if (m->c_floats == 0 || !tuner_ready()) return -1;
-    uint32_t key[14];
-    make_key(key, p, m, vec);
+    const Table tab = table(mma);
+    uint32_t key[15];
+    make_key(key, p, m, vec, mma);
     int found = -1;
     spg_lock(tuner.lock);
     for (size_t k = 0; k < tuner.count && found < 0; k++)
@@ -199,18 +238,18 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec) 
        those with the most register reuse among those that give enough workgroups (when some do) */
     const uint32_t z = m->groups * p->slices;
     double least = 0.0;
-    for (size_t k = 0; k < sizeof tiles / sizeof tiles[0]; k++) {
-        double padded = (double)((p->M + tiles[k].bm - 1) / tiles[k].bm * tiles[k].bm) *
-                        ((p->N + tiles[k].bn - 1) / tiles[k].bn * tiles[k].bn);
-        if ((least == 0.0 || padded < least) && tile_fits(&tiles[k])) least = padded;
-    }
-    int order[sizeof tiles / sizeof tiles[0]];
-    double score[sizeof tiles / sizeof tiles[0]];
-    uint32_t count = 0;
-    for (size_t k = 0; k < sizeof tiles / sizeof tiles[0]; k++) {
-        const Tile *t = &tiles[k];
+    for (uint32_t k = 0; k < tab.count; k++) {
+        const Tile *t = &tab.list[k];
         double padded = (double)((p->M + t->bm - 1) / t->bm * t->bm) * ((p->N + t->bn - 1) / t->bn * t->bn);
-        if (padded > 1.5 * least || !tile_fits(t)) continue;
+        if ((least == 0.0 || padded < least) && tile_fits(t, mma, p->N)) least = padded;
+    }
+    int order[64];
+    double score[64];
+    uint32_t count = 0;
+    for (uint32_t k = 0; k < tab.count && count < 64; k++) {
+        const Tile *t = &tab.list[k];
+        double padded = (double)((p->M + t->bm - 1) / t->bm * t->bm) * ((p->N + t->bn - 1) / t->bn * t->bn);
+        if (padded > 1.5 * least || !tile_fits(t, mma, p->N)) continue;
         double wg = (double)((p->M + t->bm - 1) / t->bm) * ((p->N + t->bn - 1) / t->bn) * z;
         double reuse = (double)(t->tm * t->tn) / (t->tm + t->tn);
         score[count] = reuse * (wg < 128.0 ? wg / 128.0 : 1.0) * least / padded;
@@ -222,14 +261,14 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec) 
                 double ts = score[a]; score[a] = score[b]; score[b] = ts;
                 int to = order[a]; order[a] = order[b]; order[b] = to;
             }
-    if (count > 8) count = 8;
+    if (count > (mma ? 16u : 8u)) count = mma ? 16u : 8u;
     double best = 0.0;
     int chosen = -1;
     for (uint32_t c = 0; c < count; c++) {
-        const Tile *t = &tiles[order[c]];
-        time_tile(&q, m, vec, t, 1);            /* the pipeline made, the caches warm */
-        double s = time_tile(&q, m, vec, t, 3);
-        if (s > 0.0 && s < 0.0005) s = time_tile(&q, m, vec, t, (int)(0.0015 / s) + 1);  /* at least ~1.5 ms */
+        const Tile *t = &tab.list[order[c]];
+        time_tile(&q, m, vec, t, mma, 1);       /* the pipeline made, the caches warm */
+        double s = time_tile(&q, m, vec, t, mma, 3);
+        if (s > 0.0 && s < 0.0005) s = time_tile(&q, m, vec, t, mma, (int)(0.0015 / s) + 1);   /* about 1.5 ms */
         if (s > 0.0 && (chosen < 0 || s < best)) { best = s; chosen = order[c]; }
     }
     if (chosen >= 0) {
@@ -253,14 +292,12 @@ void spg_gemm(SpgGpuCommands *c, SpgGemmPush *p, const SpgGemmMode *mode) {
     if (mode->bmode == SPG_B_COL) vb = vb && k_ok && p->ldb % 4u == 0;
     else vb = vb && p->N % 4u == 0 && (mode->bmode != SPG_B_ROW || p->ldb % 4u == 0);
     const uint32_t vec = (va ? 1u : 0u) | (vb ? 2u : 0u);
-    int tuned = mode->tile ? -1 : tuned_tile(p, mode, vec);
-    Tile t = mode->tile && tile_fits(&tiles[mode->tile - 1]) ? tiles[mode->tile - 1]
-           : tuned >= 0 ? tiles[tuned] : choose_tile(p->M, p->N, mode->groups * p->slices);
-    const uint32_t threads = (t.bm / t.tm) * (t.bn / t.tn);
-    uint32_t spec[12] = {t.bm, t.bn, t.bk, t.tm, t.tn, mode->amode, mode->bmode, mode->epi, mode->act, threads,
-                         mode->phased ? 1u : 0u, vec};
-    spg_gpu_dispatch(c, SPG_KERNEL_gemm, spec, 12, p, sizeof *p, (p->M + t.bm - 1) / t.bm, (p->N + t.bn - 1) / t.bn,
-                     mode->groups * p->slices);
+    const bool mma = mode->bf16 && spg_gpu_mma_bf16();
+    const Table tab = table(mma);
+    int tuned = mode->tile ? -1 : tuned_tile(p, mode, vec, mma);
+    Tile t = mode->tile && mode->tile <= tab.count && tile_fits(&tab.list[mode->tile - 1], mma, p->N) ? tab.list[mode->tile - 1]
+           : tuned >= 0 ? tab.list[tuned] : choose_tile(p->M, p->N, mode->groups * p->slices, mma);
+    dispatch_tile(c, p, mode, vec, &t, mma);
 }
 
 /* ------------------------------------------------------------------------- convolution geometry */

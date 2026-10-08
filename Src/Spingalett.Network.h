@@ -81,6 +81,13 @@ struct NeuralNetwork {
        for the layers as they were, its parameters copied to it on every call); a call takes it and
        puts it back, so that concurrent calls make their own */
     _Atomic(struct SpgGpuNet *) gpu_predict;
+
+    /* the step API on the GPU: its copy of the network, newer than these arrays while gpu_newer
+       (spingalett_network_sync() brings it back); param_version counts writes to the arrays on the
+       host, after which the trainer copies them to the device again */
+    struct SpgGpuNet *gpu_trainer;
+    bool gpu_newer;
+    uint64_t param_version;
 };
 
 /* The layers layer l (>= 1) reads, and the first of them (its source). */

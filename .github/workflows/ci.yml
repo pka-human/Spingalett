@@ -56,6 +56,27 @@ jobs:
           ./XOR
           ./DigitPad --help
 
+  # Ubuntu's glslc is too old for the bfloat16 kernel, which the builds above leave out: the shaders
+  # compile with Arch Linux's and pass spirv-val
+  shaders:
+    name: shaders (recent glslc)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed cmake ninja gcc shaderc vulkan-headers spirv-tools
+      - uses: actions/checkout@v4
+      - name: Compile and validate
+        run: |
+          glslc --version
+          for f in Src/Gpu/Shaders/*.comp; do
+            echo "$f"
+            glslc --target-env=vulkan1.2 -O -o shader.spv "$f" && spirv-val --target-env vulkan1.2 shader.spv
+          done
+          cmake -S . -B Build -G Ninja -DSPINGALETT_VULKAN=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF
+          cmake --build Build --target spingalett_shaders
+          for f in Build/Gpu/*.spv.inc; do grep -q 0x07230203 "$f" || { echo "::error::$f is empty"; exit 1; }; done
+
   sanitizers:
     name: gcc / ASan + UBSan
     runs-on: ubuntu-24.04

@@ -25,10 +25,11 @@
  * (lr 0.1 after a warm-up, cosine decay, weight decay 5e-4) and label smoothing of 0.1.
  *
  *   Examples/download_cifar10.sh data/cifar10      # fetch the binary batches once
- *   Bin/CIFAR10 data/cifar10 [epochs] [separable | resnet20 | resnet32 ... [wide]] [st|omp|blas|gpu]
+ *   Bin/CIFAR10 data/cifar10 [epochs] [separable | resnet20 | resnet32 ... [wide]] [st|omp|blas|gpu|bf16]
  *
  * "gpu" trains and evaluates on the GPU (COMPUTE_VULKAN), when the library has the backend and finds
- * a device.
+ * a device; "bf16" too, with the matrix products in bfloat16 on its matrix units where it has them
+ * (spingalett_set_gpu_precision()).
  *
  * Training augments the images with random shifts of up to 4 pixels and mirror images. 5,000 training
  * images are held out to keep the weights of the best epoch; the test accuracy follows, then that of
@@ -140,6 +141,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "omp")) mode = COMPUTE_OPENMP;
         else if (!strcmp(argv[i], "st")) mode = COMPUTE_SINGLE_THREADED;
         else if (!strcmp(argv[i], "gpu")) mode = COMPUTE_VULKAN;
+        else if (!strcmp(argv[i], "bf16")) mode = COMPUTE_VULKAN, spingalett_set_gpu_precision(PRECISION_BFLOAT16);
     }
 
     SpingalettDataset train_set, val_set, test_set;

@@ -1,6 +1,6 @@
 # Roadmap
 
-Where Spingalett is going after 0.11, roughly in order. Plans change as the work shows what is
+Where Spingalett is going after 0.12, roughly in order. Plans change as the work shows what is
 worth doing; the [CHANGELOG](CHANGELOG.md) records what was actually done. Every release keeps the
 project's rule: nothing gets slower, and new kernels are measured against the previous release and
 against PyTorch on the same machine.
@@ -17,41 +17,44 @@ against PyTorch on the same machine.
 | 0.9 | "Bottlenecks": `.slettd` format 2 (rANS coder, input shape, class names, several sets of targets), streaming readers that decode ahead or on the OpenMP threads, 8-bit data sets in memory, `DatasetTool cifar` and image folders; models that prepare their weights once, dot-product kernels for products of a few rows, faster pooling and depthwise convolutions, model files three to ten times as fast, lighter Python calls |
 | 0.10 | "Graphs": networks as directed acyclic graphs (addition, concatenation, global average pooling; residual networks, ResNet-20 to 56 for CIFAR-10), `.slett` format 6 with outputs sharing memory in the engine, ONNX import, PyTorch weights (torch.save, safetensors), Python wheels for PyPI, convolutions as indirect matrix products, label smoothing, reduce on plateau |
 | 0.11 | "GPU": training, `predict()` and `evaluate()` on a GPU through Vulkan compute (NVIDIA, AMD, Intel, Apple through MoltenVK), every kind of layer, deterministic; one matrix kernel for dense layers, convolutions and their gradients with tiles chosen by timing; the backend in every package and wheel, tested on lavapipe in CI |
+| 0.12 | "Tensor cores": matrix products in bfloat16 on the GPU's matrix units (opt-in, faster than single precision), the custom-loop API on the GPU, fixes from a review of the GPU backend; ONNX import and PyTorch weights ten to a hundred times as fast (mapped files, one pass per tensor, external data files); gradients and optimizer state allocated when a network first trains; the first wheels on PyPI |
 
-## 0.12: the GPU, further
+## 0.13: layers
 
-0.11 brought training and inference on the GPU through Vulkan compute: every kind of layer,
-deterministic, on par with PyTorch and cuDNN on convolutional networks. Next:
+0.12 took the GPU further (bfloat16 on its matrix units, the custom-loop API there) and made model
+import fast. Next, what U-Net-style networks and more of ONNX need, on the CPU, the GPU and in the
+engine:
 
-- **Tensor cores and other matrix units** through `VK_KHR_cooperative_matrix` (NVIDIA, AMD RDNA 3,
-  Intel Arc), as an opt-in mixed precision: products of FP16 or BF16 operands accumulated in FP32,
-  master weights in FP32, loss scaling where FP16 needs it. Single precision stays the default.
-- **Deployment models on the GPU**: `spingalett_model_predict()` with FP16 and INT8 weights (the
-  dot product extension, `VK_KHR_shader_integer_dot_product`), exact against the CPU's integer
-  results like every other backend.
-- **The step API on the GPU** (`spingalett_trainer_*`), so that custom losses and loops train there
-  too, and per-sample training through chunks of one.
-- **Fewer passes**: batch normalization's sums in the epilogue of the convolution before it, its
-  normalization applied as the next layer reads its input, pooling fused into the convolution it
-  follows; a kernel of its own for depthwise convolutions; the first layer's three channels padded
-  to four for vector loads.
-- **More of the queue**: copies on a transfer queue, and the inputs of a whole epoch in device
-  memory when they fit (gathered and augmented on the GPU).
+- **Transposed convolutions** (strides, padding, output padding, groups): the data gradient of a
+  convolution run forward, which the kernels of both backends already compute by phases.
+- **Upsampling**: nearest and bilinear by integer factors (ONNX Resize and Upsample, PyTorch's
+  `nn.Upsample`).
+- **Layer normalization** over the channels of each cell (and over a vector), with its
+  parameters; the first step towards attention.
+- `.slett` format version 7 for them, the engine and deployment models in every precision, ONNX
+  (`ConvTranspose`, `Resize`, `LayerNormalization`) and PyTorch weights, and an example that
+  segments images.
 
-**CPU items carried over:**
+**The GPU, further:**
 
-- the convolution kernels of 0.10, further: kernel rows as one run of `kernel_w x channels` floats
-  (fewer pointers, and fast first layers of one or three channels), weights packed once per
-  deployment model;
-- per-sample INT8 kernels on AVX-512 VNNI for dense layers in the engine (512-bit rows), and tile
-  kernels for depthwise and grouped integer convolutions in batched prediction;
-- INT8 calibration from sample data (per-layer activation ranges instead of per-sample scaling),
-  as an option for models where it helps accuracy;
-- layer normalization (needed later for attention), upsampling and transposed convolutions (U-Net
-  style networks, more of ONNX);
-- gradients and optimizer state allocated on the first training step, so that networks loaded
-  only for inference take a quarter of the memory;
-- a faster data set decoder (the rANS coder decodes 30 to 40 MB/s per thread).
+- **Deployment models on the GPU**: `spingalett_model_predict()` with FP16 weights, and with INT8
+  weights where the result can stay exact against the CPU's (integer sums are; activations other
+  than piecewise-linear ones go through `expf` and `tanhf` of the C library, which a GPU does not
+  reproduce bit for bit).
+- **Fewer passes**: batch normalization's sums with the convolution before it, its normalization
+  applied as the next layer reads its input; a kernel of its own for depthwise convolutions; the
+  first layer's three channels padded to four for vector loads.
+
+**CPU items carried over:** convolution windows as runs of `kernel_w x channels` floats (fast first
+layers), weights packed once per deployment model; per-sample INT8 kernels on AVX-512 VNNI for dense
+layers in the engine and tile kernels for depthwise and grouped integer convolutions; INT8
+calibration from sample data; a data set coder whose streams decode in independent lanes (the rANS
+coder decodes 30 to 40 MB/s per thread, each byte's context depending on the last).
+
+**Measured and set aside:** keeping training sets in GPU memory and gathering (and augmenting)
+batches there. With an i7-12650H feeding an RTX 4050 it won 5 to 11% for full-batch training over
+many epochs and lost 2 to 3% for mini-batches, where the host's copies already overlap the GPU's
+work; it may return for slower hosts.
 
 ## 1.0: stability
 
