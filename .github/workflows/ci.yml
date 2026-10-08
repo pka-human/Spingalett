@@ -43,6 +43,13 @@ jobs:
       - name: Test
         run: ctest --test-dir Build --output-on-failure
 
+      # ctest counts the GPU tests as passed when they find no device: here they must find lavapipe
+      - name: GPU tests (lavapipe)
+        run: |
+          Bin/SpingalettGpuTests | tee gpu-kernels.txt
+          Bin/SpingalettTests gpu | tee gpu-group.txt
+          grep -q "^device: llvmpipe" gpu-kernels.txt && grep -q "device: llvmpipe" gpu-group.txt
+
       - name: Examples
         working-directory: Bin
         run: |
