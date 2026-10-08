@@ -26,7 +26,8 @@
  *
  * With a usable GPU (spingalett_gpu_device()), every workload also runs with COMPUTE_VULKAN, after a
  * first run that is not timed (it makes the GPU's pipelines and times the matrix products' tiles,
- * once per process).
+ * once per process), and again with the products in bfloat16 when the GPU has matrix units for them
+ * (spingalett_set_gpu_precision()).
  *
  * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
@@ -301,7 +302,15 @@ int main(int argc, char **argv) {
     run_benchmark("OpenBLAS", COMPUTE_OPENBLAS, inputs, targets);
 #endif
     const char *gpu = spingalett_gpu_device();
+    /* and with the matrix products in bfloat16 on its matrix units, where it has them */
+    const bool bf16 = gpu && spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+    spingalett_set_gpu_precision(PRECISION_FLOAT32);
     if (gpu) run_benchmark("Vulkan GPU", COMPUTE_VULKAN, inputs, targets);
+    if (bf16) {
+        spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+        run_benchmark("Vulkan GPU bf16", COMPUTE_VULKAN, inputs, targets);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    }
     deployment_benchmark(inputs);
 
     /* the convolutional network: random images, one-hot labels */
@@ -327,6 +336,11 @@ int main(int argc, char **argv) {
         cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, normalized, images, labels);
 #endif
         if (gpu) cnn_benchmark("Vulkan GPU", COMPUTE_VULKAN, normalized, images, labels);
+        if (bf16) {
+            spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+            cnn_benchmark("Vulkan GPU bf16", COMPUTE_VULKAN, normalized, images, labels);
+            spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        }
     }
 
     free(images);
@@ -351,6 +365,11 @@ int main(int argc, char **argv) {
     resnet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
 #endif
     if (gpu) resnet_benchmark("Vulkan GPU", COMPUTE_VULKAN, images, labels);
+    if (bf16) {
+        spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+        resnet_benchmark("Vulkan GPU bf16", COMPUTE_VULKAN, images, labels);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    }
     free(images);
     free(labels);
     free(inputs);

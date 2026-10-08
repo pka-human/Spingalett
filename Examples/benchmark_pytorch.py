@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """PyTorch counterpart of Examples/Benchmark.c: same networks, data shapes, optimizers and schedules.
 
-    python Examples/benchmark_pytorch.py [threads] [--cuda | --cuda-fp32]
+    python Examples/benchmark_pytorch.py [threads] [--cuda | --cuda-fp32 | --cuda-bf16]
 
 784-512-1000-10 MLP (ReLU, softmax + cross-entropy on soft targets, Adam, lr 1e-3), 20,000
 synthetic samples: full batch (5 epochs), mini-batches of 64 (1 epoch) and inference. Then the
@@ -16,8 +16,10 @@ counted.
 --cuda runs everything on the GPU (data in device memory, times taken after synchronizing), with
 PyTorch's defaults: convolutions in cuDNN may use TF32 tensor cores, which round the inputs of
 products to 10 bits of mantissa. --cuda-fp32 turns TF32 off, so that products are in single
-precision throughout, as Spingalett's are.
+precision throughout, as Spingalett's are. --cuda-bf16 runs the forward passes under autocast to
+bfloat16, the counterpart of spingalett_set_gpu_precision(PRECISION_BFLOAT16).
 """
+import contextlib
 import sys
 import time
 
@@ -27,6 +29,12 @@ from torch import nn
 SAMPLES, EPOCHS, MINI_BATCH = 20000, 5, 64
 CNN_SAMPLES, CNN_BATCH = 10000, 128
 DEVICE = "cpu"
+BF16 = False
+
+
+def amp():
+    """Autocast to bfloat16 with --cuda-bf16, nothing otherwise."""
+    return torch.autocast("cuda", dtype=torch.bfloat16) if BF16 else contextlib.nullcontext()
 
 
 def sync():
@@ -50,7 +58,9 @@ def train_throughput(x, y, batch, epochs):
 
     def step(xb, yb):
         opt.zero_grad(set_to_none=True)
-        loss_fn(model(xb), yb).backward()
+        with amp():
+            loss = loss_fn(model(xb), yb)
+        loss.backward()
         opt.step()
 
     step(x[:batch], y[:batch])               # warm-up
@@ -65,7 +75,7 @@ def train_throughput(x, y, batch, epochs):
 
 def inference_throughput(x):
     model = make_model().to(DEVICE).eval()
-    with torch.inference_mode():
+    with torch.inference_mode(), amp():
         torch.softmax(model(x[:64]), dim=1)  # warm-up
         start = clock()
         torch.softmax(model(x), dim=1)
@@ -87,7 +97,9 @@ def cnn_throughput(x, y, normalized=False):
 
     def step(xb, yb):
         opt.zero_grad(set_to_none=True)
-        loss_fn(model(xb), yb).backward()
+        with amp():
+            loss = loss_fn(model(xb), yb)
+        loss.backward()
         opt.step()
 
     step(x[:CNN_BATCH], y[:CNN_BATCH])       # warm-up
@@ -98,7 +110,7 @@ def cnn_throughput(x, y, normalized=False):
         step(x[idx], y[idx])
     train = CNN_SAMPLES / (clock() - start)
     model.eval()
-    with torch.inference_mode():
+    with torch.inference_mode(), amp():
         torch.softmax(model(x[:64]), dim=1)  # warm-up
         start = clock()
         for i in range(0, CNN_SAMPLES, 1000):
@@ -141,7 +153,9 @@ def resnet_throughput(x, y):
 
     def step(xb, yb):
         opt.zero_grad(set_to_none=True)
-        loss_fn(model(xb), yb).backward()
+        with amp():
+            loss = loss_fn(model(xb), yb)
+        loss.backward()
         opt.step()
 
     step(x[:CNN_BATCH], y[:CNN_BATCH])       # warm-up
@@ -152,7 +166,7 @@ def resnet_throughput(x, y):
         step(x[idx], y[idx])
     train = RESNET_SAMPLES / (clock() - start)
     model.eval()
-    with torch.inference_mode():
+    with torch.inference_mode(), amp():
         torch.softmax(model(x[:64]), dim=1)  # warm-up
         start = clock()
         for i in range(0, RESNET_SAMPLES, 1000):
@@ -162,12 +176,13 @@ def resnet_throughput(x, y):
 
 
 def main():
-    global DEVICE
+    global DEVICE, BF16
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if args:
         torch.set_num_threads(int(args[0]))
-    if "--cuda" in sys.argv or "--cuda-fp32" in sys.argv:
+    if "--cuda" in sys.argv or "--cuda-fp32" in sys.argv or "--cuda-bf16" in sys.argv:
         DEVICE = "cuda"
+        BF16 = "--cuda-bf16" in sys.argv
         torch.backends.cudnn.allow_tf32 = "--cuda-fp32" not in sys.argv
         torch.backends.cuda.matmul.allow_tf32 = "--cuda-fp32" not in sys.argv and torch.backends.cuda.matmul.allow_tf32
     torch.manual_seed(42)
@@ -178,6 +193,8 @@ def main():
     where = f"threads: {torch.get_num_threads()}"
     if DEVICE != "cpu":
         where = f"GPU: {torch.cuda.get_device_name(0)}, TF32 convolutions {'on' if torch.backends.cudnn.allow_tf32 else 'off'}"
+        if BF16:
+            where += ", autocast to bfloat16"
     print(f"PyTorch {torch.__version__}, {where}\n")
     print(f"{'samples/s':<16} {'full batch':>14} {'mini-batch 64':>14} {'inference':>14}")
     full = train_throughput(x, y, SAMPLES, EPOCHS)

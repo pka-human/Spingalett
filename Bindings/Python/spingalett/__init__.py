@@ -624,7 +624,7 @@ _set_compute_mode = _bind("spingalett_set_compute_mode", None, [c_int])
 _get_num_threads = _bind("spingalett_get_num_threads", ctypes.c_uint, [])
 _cpu_kernels = _bind("spingalett_cpu_kernels", c_char_p, [])
 _gpu_device = _bind("spingalett_gpu_device", c_char_p, [])
-_set_gpu_precision = _bind("spingalett_set_gpu_precision", None, [c_int])
+_set_gpu_precision = _bind("spingalett_set_gpu_precision", c_bool, [c_int])
 _get_gpu_precision = _bind("spingalett_get_gpu_precision", c_int, [])
 _set_num_threads = _bind("spingalett_set_num_threads", None, [ctypes.c_uint])
 _set_log_callback = _bind("spingalett_set_log_callback", None, [_LogCallbackFn])
@@ -695,11 +695,12 @@ def gpu_device() -> Optional[str]:
     return name.decode() if name else None
 
 
-def set_gpu_precision(precision: "Precision") -> None:
+def set_gpu_precision(precision: "Precision") -> bool:
     """Precision of the GPU's matrix products: Precision.FLOAT32 (the default) or Precision.BFLOAT16
     (operands rounded to bfloat16 on the GPU's matrix units, products added in single precision).
-    Devices without bfloat16 matrix units keep single precision."""
-    _set_gpu_precision(int(precision))
+    Devices without bfloat16 matrix units keep single precision. Returns whether the GPU multiplies
+    in that precision."""
+    return bool(_set_gpu_precision(int(precision)))
 
 
 def get_gpu_precision() -> "Precision":

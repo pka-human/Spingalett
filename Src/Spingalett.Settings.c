@@ -178,9 +178,10 @@ const char *spingalett_gpu_device(void) {
     return spingalett_gpu_name();
 }
 
-void spingalett_set_gpu_precision(PrecisionMode precision) {
-    if (precision == PRECISION_FLOAT32 || precision == PRECISION_BFLOAT16)
-        atomic_store(&s_gpu_precision, precision);
+bool spingalett_set_gpu_precision(PrecisionMode precision) {
+    if (precision != PRECISION_FLOAT32 && precision != PRECISION_BFLOAT16) return false;
+    atomic_store(&s_gpu_precision, precision);
+    return spingalett_gpu_available() && (precision == PRECISION_FLOAT32 || spingalett_gpu_bf16());
 }
 
 PrecisionMode spingalett_get_gpu_precision(void) {

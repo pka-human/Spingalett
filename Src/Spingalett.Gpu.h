@@ -40,8 +40,10 @@ typedef struct {
 
 #if defined(SPINGALETT_HAS_VULKAN)
 
-/* Whether a device is usable (opens it on first use), and its name. */
+/* Whether a device is usable (opens it on first use), and its name; whether it multiplies bfloat16
+   matrices on matrix units. */
 bool spingalett_gpu_available(void);
+bool spingalett_gpu_bf16(void);
 const char *spingalett_gpu_name(void);
 /* Whether the GPU runs every layer of the network (names the first it does not in `why`). */
 bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why);
@@ -92,6 +94,7 @@ bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const Spg
 #else
 
 static inline bool spingalett_gpu_available(void) { return false; }
+static inline bool spingalett_gpu_bf16(void) { return false; }
 static inline const char *spingalett_gpu_name(void) { return NULL; }
 static inline bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
     (void)net;

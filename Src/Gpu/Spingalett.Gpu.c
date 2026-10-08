@@ -100,6 +100,10 @@ bool spingalett_gpu_available(void) {
     return spg_gpu_open();
 }
 
+bool spingalett_gpu_bf16(void) {
+    return spg_gpu_open() && spg_gpu_mma_bf16();
+}
+
 const char *spingalett_gpu_name(void) {
     return spg_gpu_device_name();
 }
