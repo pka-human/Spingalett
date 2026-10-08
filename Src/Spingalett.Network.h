@@ -48,6 +48,9 @@ struct NeuralNetwork {
     uint64_t total_neurons;
     uint64_t total_weights;
     uint64_t total_biases;
+    /* floats the neuron, weight-sized and bias-sized arrays hold (at least the totals): a loader
+       reserves the final sizes, so that adding layers does not move the arrays */
+    uint64_t cap_neurons, cap_weights, cap_biases;
 
     uint64_t time_step;
     LossFunction loss_func;

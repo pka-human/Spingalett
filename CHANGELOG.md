@@ -5,6 +5,117 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.9.0] - Unreleased
+
+"Bottlenecks": every part of the library profiled and its slow paths removed, from data set files
+through training and inference to model files and the Python bindings. Measurements on a 4-vCPU
+Xeon @ 2.1 GHz with AVX-512, 4 threads unless noted.
+
+### Added
+- `ROADMAP.md` (plans for the next releases, 1.0 and later) and `AGENTS.md` (layout, checks and
+  invariants for coding agents and contributors).
+- `.slettd` format version 2 (see `docs/DatasetFormat.md`): metadata records for the input shape,
+  names of sets of targets, class names, and further sets of targets for the same samples (such as
+  CIFAR-100's fine and coarse labels); and an rANS coder of half-bytes that decodes dense data such
+  as photographs two to three times as fast as the binary range coder at about the same size.
+  The writer chooses the coder per stream, and still writes version 1 for data sets that need
+  neither. CIFAR-10's training set takes 112.1 MB (`xz -9` of the original batches: 116.3 MB).
+- `SpingalettDataset.height`, `.width`, `.channels` and `.class_names`, filled by
+  `spingalett_load_idx()`, `spingalett_load_cifar()` (class names from `batches.meta.txt`,
+  `fine_label_names.txt` or `coarse_label_names.txt` next to the batches) and `.slettd` files, kept
+  by `spingalett_dataset_split()`; `spingalett_dataset_set_class_names()`.
+- `DatasetSaveOptions.target_name`, `.extra_targets` and `.extra_target_count`
+  (`SpingalettTargetSet`), `spingalett_load_dataset_targets()` and
+  `spingalett_load_dataset_from_memory_targets()`; `SpingalettDatasetInfo.format_version`,
+  `.height`, `.width`, `.channels`, `.target_set_count` and `.target_set`;
+  `spingalett_dataset_target_set_name()`, `spingalett_dataset_class_name()` and
+  `spingalett_dataset_target_set_size()`.
+- `spingalett_dataset_open_ex()` with `DatasetReaderOptions`: `in_memory` decodes the file once and
+  keeps its values in their compact form (a byte per 8-bit value, a quarter of float32) with
+  every pass shuffling all samples; `target_set` serves another set of targets; `no_prefetch`
+  keeps decoding off a background thread. `spingalett_dataset_open_u8()` trains from 8-bit data in
+  memory without a float copy.
+- `DatasetTool cifar` (CIFAR-10, and CIFAR-100 with both sets of labels), `DatasetTool images`
+  (one subfolder per class; PNG, JPEG, BMP and other formats through stb_image, optional resizing)
+  and `DatasetTool verify`; `DatasetTool info` prints the shape, sets of targets and class names.
+- Python: `save_dataset(..., shape, class_names, target_name, extra_targets)`,
+  `load_dataset(path, target_set)`, the shape and sets of targets in `dataset_info()`, and
+  `train_from_file(..., in_memory, prefetch, target_set)`.
+
+### Changed
+- Deployment models made by the library (`spingalett_model_from_network()`, `_load()`,
+  `_from_memory()`) prepare what batched prediction runs on once, on the first call that needs it:
+  FP16 and BF16 weights expanded to float, INT4 and INT2 rows unpacked, integer rows interleaved
+  for the tile kernels, transposed filters and row sums. Before, `spingalett_model_predict()` built
+  them, and all of its buffers, on every call; it now also keeps the last call's workspace for the
+  next one. Models stay safe to share between threads (the preparation takes a lock, the workspace
+  an atomic exchange); models filled in by `spingalett_model_init()` own nothing and prepare on
+  every call as before. The prepared forms take memory next to the image: up to the float size of
+  FP16 layers and four times the packed size of INT2 layers. `predict()` of one sample of a
+  784-256-128-10 MLP: FP32 63 -> 12 us, FP16 403 -> 8 us, INT8 10.5 -> 4.4 us, INT4 27 -> 4.2 us;
+  batches of 1024: FP16 2.04 -> 0.92 us, INT8 0.54 -> 0.31 us per sample.
+- Matrix products of at most 8 rows (4 with AVX2, 2 without AVX) from row-major operands, such as
+  a dense layer on one sample or a few, take dot products instead of packing all of the weights:
+  the FP32 MLP above predicts 8 samples in 2.2 us each instead of 7.9, and training it with batches
+  of 2, 4 and 8 takes 0.33, 0.175 and 0.076 s per 4096 samples instead of 0.57, 0.28 and 0.093.
+  Float outputs of one sample or a few may now differ in the last bits from those of the same
+  samples in a larger batch; integer models still compute exactly what single runs compute, and
+  results still do not depend on the thread count.
+- Loops that would run on one thread no longer enter an OpenMP parallel region (whose false `if`
+  clause still cost about 0.2 us), and integer layers start threads from 2^19 multiply-adds instead
+  of 2^15: `predict()` of one sample of a 4-8-8-2 INT8 model takes 0.21 us instead of 2.19.
+- Pooling (forward and backward) runs a whole block of 16 channels without a test per channel, so
+  that it vectorizes; depthwise convolutions with one filter per channel and 16, 32 or 64 channels
+  sum their taps in registers, forward and for the data gradient; the tile kernels' epilogue, window
+  gathering and the activation maximum of integer layers lost their overheads. Results are the same
+  bits as before. Batched INT8 prediction of a small CIFAR-sized CNN: 36.6 -> 33.3 us per sample;
+  training a depthwise-separable block on 32 x 32 x 3 images: 3017 -> 3514 samples/s, a small CNN
+  with batch normalization 7188 -> 7529.
+- A mini-batch step gathers and augments its samples on the OpenMP threads.
+- Model files load and save three to ten times as fast: CRC-32 eight bytes at a time in the library
+  (the engine alone keeps its byte-wise loop and 1 KB table), FP16 conversion eight values at a
+  time with F16C (the same halves as the portable conversion for every value but NaN, which keeps
+  the portable path), and networks built without reallocating every parameter array for each layer
+  (adding a layer copied and zeroed all of them; loaders now reserve the final sizes). Files are
+  byte for byte the same. A 924,930-parameter MLP: FP32 save 10.8 -> 2.5 ms, load 26 -> 8.3 ms, as
+  a model 9.5 -> 2.4 ms; FP16 save 15.2 -> 1.4 ms; INT8 load 13 -> 1.3 ms.
+- Python: `Network.input_size` / `output_size` read the sizes instead of describing every layer,
+  and per-batch calls pass arrays by address: `forward()` of a 4-8-2 network 42.6 -> 7.8 us, of the
+  MLP above on one sample 69 -> 22 us, `Model.predict()` of one sample 9.1 -> 5.4 us,
+  `Network.from_bytes()` of that MLP 6.2 -> 0.75 ms.
+- Streaming readers decode the next chunks on a background thread when a processor is free for it
+  (fewer OpenMP threads than processors), and otherwise several chunks at a time on the OpenMP
+  threads when they are needed: a thread competing with the OpenMP threads for the processors
+  stalls their barriers. Chunks stay in their compact form until a batch is read, and batches
+  convert to float on the OpenMP threads. One epoch of a small CNN on CIFAR-10 streamed from a
+  `.slettd` file: 14.7 s with 0.8, 5.5 s now (4.5 s from float arrays, 4.6 s from the file in
+  memory).
+- A reader's shuffled order is drawn from a seed taken when it opens and from the number of the
+  pass or chunk, so it is the same with or without a background thread and on any number of
+  threads; it differs from 0.8's order for the same `spingalett_seed()`.
+- `spingalett_save_dataset()` compresses chunks in parallel (CIFAR-10's training set: 12.4 s
+  before, 2.2 s on 4 threads; MNIST: 1.11 s before, 0.47 s).
+- `SpingalettDataset` has new fields: a data set built by hand must be zero-initialized
+  (`SpingalettDataset d = {0};`), because `spingalett_save_dataset()` reads them and
+  `spingalett_dataset_free()` frees `class_names`. The loaders initialize every field.
+- `SpingalettDatasetInfo` and `DatasetSaveOptions` have new fields; zero-initialized options keep
+  the previous behavior.
+- Python: `uint8` inputs are 8-bit images, value q read as q / 255, in `train()`, `forward()`,
+  `predict()`, `evaluate()` and `save_dataset()` (before, they were converted to floats 0 to 255).
+  `train()` keeps them as bytes and converts a batch at a time. Targets keep their values.
+- `DigitPadTrain` prints each epoch's time and the time since training began.
+
+### Fixed
+- `.slettd` readers reject index entries whose offset plus size wraps around (they read before the
+  file's buffer), and metadata records or set numbers of 2^32 - 1, which plus one named the inputs
+  (a name record shorter than 4 bytes scanned past the metadata). `spingalett_save_dataset()`
+  rejects `extra_target_count` of 255 or more instead of overflowing the set count. The Python
+  bindings reject a negative `target_set`.
+- Streaming and loading `.slettd` files of 2 GB or more on Windows, where `long` file offsets have
+  32 bits.
+- Threads opening data sets at the same time no longer race to build the table of 8-bit values.
+- Builds with `SPINGALETT_PORTABLE_KERNELS` and without `-march=native` link again (broken in 0.8).
+
 ## [0.8.0] - Unreleased
 
 Deeper convolutional networks: batch normalization, grouped and depthwise convolutions, image

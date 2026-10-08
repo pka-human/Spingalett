@@ -130,12 +130,55 @@ static const uint32_t crc_table[256] = {
     0xB40BBE37u, 0xC30C8EA1u, 0x5A05DF1Bu, 0x2D02EF8Du,
 };
 
+#if defined(SPINGALETT_INFERENCE_ONLY)
 uint32_t spingalett_crc32(uint32_t crc, const void *data, size_t n) {
     const uint8_t *p = (const uint8_t *)data;
     crc = ~crc;
     for (size_t i = 0; i < n; i++) crc = crc_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
     return ~crc;
 }
+#else
+/* The library checks whole model and data set files: eight bytes at a time ("slicing by 8"),
+   with crc_slices[k][b] the CRC of byte b followed by k zero bytes, built from crc_table on first
+   use (once, whichever thread gets there first). The engine alone keeps the byte-wise loop and its
+   single table. */
+#include <stdatomic.h>
+
+static uint32_t crc_slices[8][256];
+static atomic_int crc_slices_state;     /* 0: not built, 1: being built, 2: ready */
+
+static void crc_slices_build(void) {
+    if (atomic_load_explicit(&crc_slices_state, memory_order_acquire) == 2) return;
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&crc_slices_state, &expected, 1)) {
+        for (int b = 0; b < 256; b++) {
+            uint32_t c = crc_table[b];
+            crc_slices[0][b] = c;
+            for (int k = 1; k < 8; k++) crc_slices[k][b] = c = crc_table[c & 0xFFu] ^ (c >> 8);
+        }
+        atomic_store_explicit(&crc_slices_state, 2, memory_order_release);
+        return;
+    }
+    while (atomic_load_explicit(&crc_slices_state, memory_order_acquire) != 2) {}     /* microseconds */
+}
+
+uint32_t spingalett_crc32(uint32_t crc, const void *data, size_t n) {
+    const uint8_t *p = (const uint8_t *)data;
+    crc = ~crc;
+    if (n >= 64) {
+        crc_slices_build();
+        const uint32_t (*t)[256] = (const uint32_t (*)[256])crc_slices;
+        for (; n >= 8; n -= 8, p += 8) {
+            uint32_t a = crc ^ ((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
+            uint32_t b = (uint32_t)p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16 | (uint32_t)p[7] << 24;
+            crc = t[7][a & 0xFFu] ^ t[6][(a >> 8) & 0xFFu] ^ t[5][(a >> 16) & 0xFFu] ^ t[4][a >> 24] ^
+                  t[3][b & 0xFFu] ^ t[2][(b >> 8) & 0xFFu] ^ t[1][(b >> 16) & 0xFFu] ^ t[0][b >> 24];
+        }
+    }
+    for (; n > 0; n--, p++) crc = crc_table[(crc ^ *p) & 0xFFu] ^ (crc >> 8);
+    return ~crc;
+}
+#endif
 
 uint16_t spingalett_float_to_fp16(float x) {
     uint32_t f;
@@ -1111,6 +1154,19 @@ float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q) {
 #if defined(SPG_AVX)
     __m256 vmax = _mm256_setzero_ps(), vbad = _mm256_setzero_ps();
     const __m256 sign = _mm256_set1_ps(-0.0f), big = _mm256_set1_ps(FLT_MAX);
+    /* four maxima side by side, then together (the largest magnitude does not depend on the order) */
+    __m256 m1 = vmax, m2 = vmax, m3 = vmax;
+    for (; k + 32u <= n; k += 32u) {
+        __m256 a0 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k)), a1 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k + 8));
+        __m256 a2 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k + 16)), a3 = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k + 24));
+        vbad = _mm256_or_ps(vbad, _mm256_or_ps(_mm256_or_ps(_mm256_cmp_ps(a0, big, _CMP_NLE_UQ), _mm256_cmp_ps(a1, big, _CMP_NLE_UQ)),
+                                               _mm256_or_ps(_mm256_cmp_ps(a2, big, _CMP_NLE_UQ), _mm256_cmp_ps(a3, big, _CMP_NLE_UQ))));
+        vmax = _mm256_max_ps(vmax, a0);
+        m1 = _mm256_max_ps(m1, a1);
+        m2 = _mm256_max_ps(m2, a2);
+        m3 = _mm256_max_ps(m3, a3);
+    }
+    vmax = _mm256_max_ps(_mm256_max_ps(vmax, m1), _mm256_max_ps(m2, m3));
     for (; k + 8u <= n; k += 8u) {
         __m256 a = _mm256_andnot_ps(sign, _mm256_loadu_ps(x + k));
         vbad = _mm256_or_ps(vbad, _mm256_cmp_ps(a, big, _CMP_NLE_UQ));     /* NaN or infinite */
@@ -1491,6 +1547,10 @@ void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, u
         int64_t ih = ih0 + kh;
         if (ih < 0 || ih >= (int64_t)L->in_h || a == b) { memset(d, 0, run); continue; }
         const uint8_t *src = (const uint8_t *)x + ((size_t)ih * L->in_w + (size_t)(iw0 + a)) * C * elem;
+        if (a == 0 && b == (int64_t)KW) {       /* the whole row is inside: one copy */
+            memcpy(d, src, run);
+            continue;
+        }
         memset(d, 0, (size_t)a * C * elem);
         memcpy(d + (size_t)a * C * elem, src, (size_t)(b - a) * C * elem);
         memset(d + (size_t)b * C * elem, 0, (size_t)(KW - b) * C * elem);

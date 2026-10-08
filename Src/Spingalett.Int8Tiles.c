@@ -42,7 +42,9 @@
 #    define TILE_KERNEL 128
 #  endif
 #endif
-#if defined(SPINGALETT_INT8_DISPATCH) && !defined(SPINGALETT_I8_TILE_VARIANT) && !defined(TILE_KERNEL)
+/* (portable kernels: no dispatch either, the variants compile to nothing) */
+#if defined(SPINGALETT_INT8_DISPATCH) && !defined(SPINGALETT_I8_TILE_VARIANT) && !defined(TILE_KERNEL) && \
+    !defined(SPINGALETT_PORTABLE_KERNELS)
 #  if defined(__x86_64__) || defined(__i386__)
 #    include <cpuid.h>
 #    define TILE_DISPATCH_X86 1

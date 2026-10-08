@@ -175,6 +175,43 @@ with tempfile.TemporaryDirectory() as d:
     except sg.SpingalettError as e:
         check(e.code == sg.ErrorCode.FILE_IO, "missing data set error code")
 
+    # shape, class names and a second set of targets; uint8 images; in-memory and u8 training
+    imgs = rng.integers(0, 256, size=(300, 4, 4, 3), dtype=np.uint8)
+    labels = rng.integers(0, 3, 300)
+    yd = np.eye(3, dtype=np.float32)[labels]
+    yp = np.eye(2, dtype=np.float32)[labels % 2]
+    meta = os.path.join(d, "meta.slettd")
+    sg.save_dataset(meta, imgs, yd, class_names=["cat", "dog", "fox"], target_name="animal",
+                    extra_targets=[{"targets": yp, "name": "parity", "class_names": ["even", "odd"]}])
+    info = sg.dataset_info(meta)
+    check(info["shape"] == (4, 4, 3) and info["format_version"] == 2 and info["input_encoding"] == sg.DatasetEncoding.U8_UNIT
+          and info["target_sets"] == [{"name": "animal", "size": 3, "class_names": ["cat", "dog", "fox"]},
+                                      {"name": "parity", "size": 2, "class_names": ["even", "odd"]}], f"slettd metadata {info}")
+    mx, my = sg.load_dataset(meta)
+    check(np.array_equal(mx, imgs.reshape(300, -1).astype(np.float64).__truediv__(255.0).astype(np.float32))
+          and np.array_equal(my, yd), "uint8 images round trip as q / 255")
+    _, mp = sg.load_dataset(meta, target_set=1)
+    for bad in (-1, 2):     # -1 would wrap around to the inputs in C
+        try:
+            sg.load_dataset(meta, target_set=bad)
+            check(False, f"load_dataset(target_set={bad}) did not raise")
+        except (ValueError, sg.SpingalettError):
+            pass
+    check(np.array_equal(mp, yp), "second set of targets")
+    def image_net():
+        sg.seed(48)
+        return sg.Network(sg.Loss.CROSS_ENTROPY, [48, sg.Layer(8, sg.Activation.RELU, sg.Init.HE),
+                                                  sg.Layer(3, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
+    with image_net() as a, image_net() as b, image_net() as c:
+        a.train(mx, yd, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=32, shuffle=False, optimizer=sg.Optimizer.ADAM)
+        b.train(imgs.reshape(300, -1), yd, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=32, shuffle=False,
+                optimizer=sg.Optimizer.ADAM)
+        c.train_from_file(meta, in_memory=True, shuffle=False, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=32,
+                          optimizer=sg.Optimizer.ADAM)
+        check(np.array_equal(a.get_weights(0), b.get_weights(0)) and np.array_equal(a.get_weights(0), c.get_weights(0)),
+              "training on uint8 arrays and in memory == training on floats")
+        check(np.array_equal(a.forward(imgs.reshape(300, -1)[:5]), a.forward(mx[:5])), "forward reads uint8 as q / 255")
+
 # dropout + save/load + precision
 with tempfile.TemporaryDirectory() as d:
     sg.seed(3)
@@ -257,7 +294,11 @@ with sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Layer(12), sg.Layer(20, sg.Activation
                   [l.precision for l in m.layers] == [p, p] and m.layers[0].activation == sg.Activation.RELU,
                   f"model description {m!r}")
             check(np.abs(out - ref).max() < tol, f"model {p.name} vs network: {np.abs(out - ref).max():.2e}")
-            check(np.array_equal(m(x[7]), out[7]), "model single sample")
+            # integer models compute a sample exactly as in a batch; float ones may round differently
+            # (one sample or a few run through dot products)
+            single = m(x[7])
+            check(np.array_equal(single, out[7]) if p in (sg.Precision.INT8, sg.Precision.INT4)
+                  else np.allclose(single, out[7], rtol=1e-5, atol=1e-6), "model single sample")
             metrics = m.evaluate(x, ref)
             check(0 <= metrics.accuracy <= 1 and math.isfinite(metrics.loss), "model evaluate")
             with sg.Model.from_bytes(m.to_bytes()) as copy:

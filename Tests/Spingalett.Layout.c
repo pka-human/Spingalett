@@ -75,16 +75,29 @@ int main(void) {
 
     SIZE(SpingalettDataset);
     FIELD(SpingalettDataset, count); FIELD(SpingalettDataset, input_size); FIELD(SpingalettDataset, target_size);
-    FIELD(SpingalettDataset, inputs); FIELD(SpingalettDataset, targets);
+    FIELD(SpingalettDataset, inputs); FIELD(SpingalettDataset, targets); FIELD(SpingalettDataset, height);
+    FIELD(SpingalettDataset, width); FIELD(SpingalettDataset, channels); FIELD(SpingalettDataset, class_names);
+
+    SIZE(SpingalettTargetSet);
+    FIELD(SpingalettTargetSet, name); FIELD(SpingalettTargetSet, size); FIELD(SpingalettTargetSet, targets);
+    FIELD(SpingalettTargetSet, class_names); FIELD(SpingalettTargetSet, encoding);
 
     SIZE(DatasetSaveOptions);
     FIELD(DatasetSaveOptions, input_encoding); FIELD(DatasetSaveOptions, target_encoding);
-    FIELD(DatasetSaveOptions, no_compression);
+    FIELD(DatasetSaveOptions, no_compression); FIELD(DatasetSaveOptions, target_name);
+    FIELD(DatasetSaveOptions, extra_targets); FIELD(DatasetSaveOptions, extra_target_count);
 
     SIZE(SpingalettDatasetInfo);
     FIELD(SpingalettDatasetInfo, count); FIELD(SpingalettDatasetInfo, input_size); FIELD(SpingalettDatasetInfo, target_size);
     FIELD(SpingalettDatasetInfo, input_encoding); FIELD(SpingalettDatasetInfo, target_encoding);
     FIELD(SpingalettDatasetInfo, chunk_count); FIELD(SpingalettDatasetInfo, file_size);
+    FIELD(SpingalettDatasetInfo, format_version); FIELD(SpingalettDatasetInfo, height); FIELD(SpingalettDatasetInfo, width);
+    FIELD(SpingalettDatasetInfo, channels); FIELD(SpingalettDatasetInfo, target_set_count);
+    FIELD(SpingalettDatasetInfo, target_set);
+
+    SIZE(DatasetReaderOptions);
+    FIELD(DatasetReaderOptions, shuffle); FIELD(DatasetReaderOptions, in_memory); FIELD(DatasetReaderOptions, no_prefetch);
+    FIELD(DatasetReaderOptions, target_set);
 
     SIZE(PredictArgs);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);

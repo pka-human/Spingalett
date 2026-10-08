@@ -24,6 +24,26 @@ static inline bool spingalett_use_omp(ComputeMode mode, uint64_t work) {
     return mode == COMPUTE_OPENMP && work >= SPINGALETT_OMP_MIN_WORK;
 }
 
+/* SPINGALETT_PARALLEL_FOR(cond, for (...) body) runs the loop on the OpenMP threads (static
+   schedule) when cond holds, and as plain code otherwise: a parallel region whose if clause is
+   false still costs about 0.2 us to enter, more than many of the loops it would guard. The _THREADS
+   form also names the number of threads. Bodies cannot hold preprocessor lines; they get their
+   thread's number from spingalett_thread_num(). */
+#define SPINGALETT_PRAGMA(x) _Pragma(#x)
+#if defined(_OPENMP)
+#include <omp.h>
+#define SPINGALETT_PARALLEL_FOR(cond, ...) \
+    do { if (cond) { SPINGALETT_PRAGMA(omp parallel for schedule(static)) __VA_ARGS__ } else { __VA_ARGS__ } } while (0)
+#define SPINGALETT_PARALLEL_FOR_THREADS(threads, cond, ...) \
+    do { if (cond) { SPINGALETT_PRAGMA(omp parallel for schedule(static) num_threads(threads)) __VA_ARGS__ } \
+         else { __VA_ARGS__ } } while (0)
+static inline int spingalett_thread_num(void) { return omp_get_thread_num(); }
+#else
+#define SPINGALETT_PARALLEL_FOR(cond, ...) do { (void)(cond); __VA_ARGS__ } while (0)
+#define SPINGALETT_PARALLEL_FOR_THREADS(threads, cond, ...) do { (void)(threads); (void)(cond); __VA_ARGS__ } while (0)
+static inline int spingalett_thread_num(void) { return 0; }
+#endif
+
 #define SPINGALETT_NEURON(net, l, j)        ((net)->neurons[(net)->neuron_offsets[l] + (uint64_t)(j)])
 #define SPINGALETT_LAYER_PTR(net, l)        ((net)->neurons + (net)->neuron_offsets[l])
 
@@ -152,6 +172,8 @@ void spingalett_bn_backward_data(const NeuralNetwork *net, uint32_t l, const flo
                                  float *coef, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
+/* Gives an empty network room for these totals (zeroed), so that adding its layers moves nothing. */
+bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t weights, uint64_t biases);
 /* The arguments that add layer l of net again (to another network: set .net), parameters aside. */
 LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l);
 /* The image of a deployment model: net with every batch normalization that directly follows a dense
@@ -171,6 +193,8 @@ void spingalett_log(LogLevel level, const char *fmt, ...);
 /* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
    spingalett_aligned_free). NULL on error, with the error set. */
 void *spingalett_read_file(const char *path, size_t *size);
+/* count strings copied into one allocation (a NULL-terminated array of pointers; free() releases it). */
+char **spingalett_copy_names(const char *const *names, uint32_t count);
 /* load_spingalett_from_memory that also reports the precision of the first weight layer. */
 NeuralNetwork *spingalett_load_from_memory_ex(const void *data, size_t size, PrecisionMode *precision);
 /* Whether a sample counts as correctly classified (see EvalMetrics). */
@@ -232,6 +256,8 @@ typedef struct {
 
 SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads);
 void spingalett_gemm_scratch_free(SpingalettGemmScratch *scratch);
+/* Bytes a scratch for `threads` threads holds when it is created. */
+size_t spingalett_gemm_scratch_bytes(int threads);
 void spingalett_gemm_native(SpingalettGemmScratch *scratch, bool trans_a, bool trans_b,
                             uint32_t M, uint32_t N, uint32_t K, float alpha,
                             const float *A, size_t lda, const float *B, size_t ldb,
@@ -333,6 +359,9 @@ void spingalett_vec_scale(float *data, uint64_t n, float scale);
 void spingalett_vec_mul(float *restrict y, const float *restrict x, uint64_t n);
 void spingalett_vec_scaled_copy(float *restrict dst, const float *restrict src, uint64_t n, float alpha);
 void spingalett_vec_axpy(float *restrict y, const float *restrict x, uint64_t n, float alpha);
+/* dst[i] = spingalett_float_to_fp16(src[i]) for n values: with F16C eight at a time (its rounding
+   gives the same halves for every value but NaN, whose blocks take the portable conversion). */
+void spingalett_fp16_encode(const float *restrict src, size_t n, uint16_t *restrict dst);
 
 float spingalett_clip_grad_norm(NeuralNetwork *net, float max_norm);
 

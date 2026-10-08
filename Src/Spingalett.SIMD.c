@@ -578,3 +578,18 @@ float compute_sample_loss(const float *output, const float *target,
 
     return loss;
 }
+
+void spingalett_fp16_encode(const float *restrict src, size_t n, uint16_t *restrict dst) {
+    size_t i = 0;
+#if defined(__F16C__)
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        if (_mm256_movemask_ps(_mm256_cmp_ps(v, v, _CMP_UNORD_Q))) {   /* a NaN: as the engine converts it */
+            for (size_t k = i; k < i + 8; k++) dst[k] = spingalett_float_to_fp16(src[k]);
+            continue;
+        }
+        _mm_storeu_si128((__m128i *)(void *)(dst + i), _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+#endif
+    for (; i < n; i++) dst[i] = spingalett_float_to_fp16(src[i]);
+}

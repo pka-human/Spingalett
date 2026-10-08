@@ -616,10 +616,12 @@ static void augment_image(const Trainer *t, const float *src, float *dst, uint64
             memset(row + (size_t)b * C, 0, (size_t)((int64_t)W - b) * C * sizeof(float));
             continue;
         }
-        for (uint32_t x = 0; x < W; x++) {
+        for (uint32_t x = 0; x < W; x++) {             /* a pixel at a time: a few channels each */
             int64_t sx = (int64_t)(W - 1u - x) + dx;
-            if (sx < 0 || sx >= (int64_t)W) memset(row + (size_t)x * C, 0, (size_t)C * sizeof(float));
-            else memcpy(row + (size_t)x * C, srow + (size_t)sx * C, (size_t)C * sizeof(float));
+            float *d = row + (size_t)x * C;
+            if (sx < 0 || sx >= (int64_t)W) { for (uint32_t c = 0; c < C; c++) d[c] = 0.0f; continue; }
+            const float *v = srow + (size_t)sx * C;
+            for (uint32_t c = 0; c < C; c++) d[c] = v[c];
         }
     }
 }
@@ -645,16 +647,19 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
             uint32_t n = (count - c0 < ws->capacity) ? count - c0 : ws->capacity;
             const float *targets;
             if (order || t->augment) {
-                for (uint32_t s = 0; s < n; s++) {
-                    uint32_t idx = order ? order[start + c0 + s] : start + c0 + s;
-                    const float *src = inputs + (size_t)idx * in_sz;
-                    if (t->augment)
-                        augment_image(t, src, ws->inputs + (size_t)s * in_sz, net->time_step, c0 + s);
-                    else
-                        memcpy(ws->inputs + (size_t)s * in_sz, src, in_sz * sizeof(float));
-                    if (order)
-                        memcpy(ws->targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
-                }
+                /* the step's samples, gathered (and augmented) side by side */
+                SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, (uint64_t)n * in_sz * (t->augment ? 4u : 1u)) && n > 1,
+                    for (int64_t s = 0; s < (int64_t)n; s++) {
+                        uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
+                        const float *src = inputs + (size_t)idx * in_sz;
+                        if (t->augment)
+                            augment_image(t, src, ws->inputs + (size_t)s * in_sz, net->time_step, c0 + (uint32_t)s);
+                        else
+                            memcpy(ws->inputs + (size_t)s * in_sz, src, in_sz * sizeof(float));
+                        if (order)
+                            memcpy(ws->targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
+                    }
+                );
                 ws->act[0] = ws->inputs;
                 targets = order ? ws->targets : targets_in + (size_t)(start + c0) * out_sz;
             } else {

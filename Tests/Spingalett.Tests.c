@@ -1623,6 +1623,7 @@ static float ds_roundtrip(const char *name, const SpingalettDataset *d, DatasetE
 }
 
 static void make_ds(SpingalettDataset *d, uint32_t count, uint32_t in, uint32_t out) {
+    memset(d, 0, sizeof *d);
     d->count = count; d->input_size = in; d->target_size = out;
     d->inputs = calloc((size_t)count * in, sizeof(float));
     d->targets = calloc((size_t)count * out, sizeof(float));
@@ -1716,7 +1717,7 @@ static void dataset_files(void) {
         CHECK(!spingalett_load_dataset_from_memory(good, (size_t)size - 1, &bad) && spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO,
               "truncated data set not detected");
         memcpy(copy, good, (size_t)size);
-        copy[6] = 2;                             /* a future format version, with a valid checksum */
+        copy[6] = 3;                             /* a future format version, with a valid checksum */
         uint32_t crc = test_crc32(copy, 60);
         for (int k = 0; k < 4; k++) copy[60 + k] = (unsigned char)(crc >> (8 * k));
         CHECK(!spingalett_load_dataset_from_memory(copy, (size_t)size, &bad) && spingalett_last_error_code() == SPINGALETT_ERR_FORMAT_VERSION,
@@ -1805,6 +1806,275 @@ static void dataset_files(void) {
     remove("spingalett_test_ds.slettd");
     spingalett_dataset_free(&img);
     spingalett_dataset_free(&fl);
+}
+
+/* Reads every sample of one pass: the order of the samples (their first input value identifies
+   them when it is unique, as below) and whether inputs and targets match the data set. */
+static bool read_pass(SpingalettDatasetReader *r, const SpingalettDataset *d, uint32_t *order, uint32_t batch) {
+    float *x = malloc((size_t)batch * d->input_size * sizeof(float)), *y = malloc((size_t)batch * d->target_size * sizeof(float));
+    uint32_t total = 0, got;
+    bool exact = x && y;
+    while (exact && (got = spingalett_dataset_read(r, x, y, batch)) > 0)
+        for (uint32_t k = 0; k < got && exact; k++, total++) {
+            uint32_t idx = (uint32_t)(x[(size_t)k * d->input_size] * 255.0f + 0.5f) |
+                           (uint32_t)(x[(size_t)k * d->input_size + 1] * 255.0f + 0.5f) << 8;
+            exact = idx < d->count && total < d->count &&
+                    !memcmp(d->inputs + (size_t)idx * d->input_size, x + (size_t)k * d->input_size, d->input_size * sizeof(float)) &&
+                    !memcmp(d->targets + (size_t)idx * d->target_size, y + (size_t)k * d->target_size, d->target_size * sizeof(float));
+            if (exact) order[total] = idx;
+        }
+    free(x);
+    free(y);
+    return exact && total == d->count;
+}
+
+static uint32_t le32(const unsigned char *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static void put_le32(unsigned char *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (unsigned char)(v >> (8 * i)); }
+
+/* A .slettd image altered after its header: the index checksum made right again, so that the
+   reader gets as far as the altered fields. */
+static void slettd_fix_index_crc(unsigned char *b) {
+    uint32_t pbytes = le32(b + 48), sets = le32(b + 52) ? le32(b + 52) : 1u, mbytes = le32(b + 56), chunks = le32(b + 28);
+    size_t meta = 64 + (size_t)pbytes + mbytes + (size_t)chunks * (12 + 4 * (1 + sets)) + 4;
+    put_le32(b + meta - 4, test_crc32(b + 64, meta - 68));
+}
+
+/* The first metadata record with this tag (its header: 2 bytes of tag, 4 of length), or NULL. */
+static unsigned char *slettd_record(unsigned char *b, uint32_t tag) {
+    unsigned char *p = b + 64 + le32(b + 48), *end = p + le32(b + 56);
+    while (end - p >= 6) {
+        if ((uint32_t)(p[0] | p[1] << 8) == tag) return p;
+        p += 6 + le32(p + 2);
+    }
+    return NULL;
+}
+
+/* Crafted files whose fields would make the reader index past what it holds are rejected. */
+static void dataset_crafted(const char *path, const SpingalettDataset *ph) {
+    long size = 0;
+    unsigned char *good = read_file(path, &size), *b = good ? malloc((size_t)size) : NULL;
+    if (!b) { CHECK(false, "crafted: cannot read %s", path); free(good); return; }
+    SpingalettDataset d;
+    struct { const char *what; uint32_t tag; int field; } cases[] = {
+        {"a name record shorter than its set number", 1, -1},           /* the shape record, made a NAME of length 0 */
+        {"a set record for set 2^32 - 1", 2, 0},
+        {"a class-name record for set 2^32 - 1", 4, 0},
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        memcpy(b, good, (size_t)size);
+        unsigned char *r = slettd_record(b, cases[k].tag);
+        if (!r) { CHECK(false, "crafted: no record %u", cases[k].tag); continue; }
+        if (cases[k].field < 0) { r[0] = 3; r[1] = 0; put_le32(r + 2, 0); }
+        else put_le32(r + 6 + 4 * cases[k].field, 0xFFFFFFFFu);
+        slettd_fix_index_crc(b);
+        CHECK(!spingalett_load_dataset_from_memory(b, (size_t)size, &d) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "crafted: %s not rejected", cases[k].what);
+    }
+    /* a chunk offset whose sum with the chunk's size wraps around past zero */
+    memcpy(b, good, (size_t)size);
+    uint32_t sets = le32(b + 52), streams = 1 + sets;
+    unsigned char *entry = b + 64 + le32(b + 48) + le32(b + 56);
+    put_le32(entry, 0xFFFF0000u);
+    put_le32(entry + 4, 0xFFFFFFFFu);
+    put_le32(entry + 8, 0x10000u);
+    for (uint32_t s = 1; s < streams; s++) put_le32(entry + 8 + 4 * s, 0x80u);
+    slettd_fix_index_crc(b);
+    CHECK(!spingalett_load_dataset_from_memory(b, (size_t)size, &d) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "crafted: a chunk offset that wraps around not rejected");
+    free(b);
+    free(good);
+    /* a set number of 2^32 - 1, which plus one is 0, the inputs */
+    CHECK(!spingalett_load_dataset_targets(path, UINT32_MAX, &d) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "crafted: set 2^32 - 1 loaded");
+    DatasetReaderOptions o = {.target_set = UINT32_MAX};
+    CHECK(spingalett_dataset_open_ex(path, &o) == NULL, "crafted: a reader of set 2^32 - 1 opened");
+    SpingalettDatasetReader *r = spingalett_dataset_open(path, false);
+    CHECK(r && !spingalett_dataset_target_set_name(r, UINT32_MAX) && !spingalett_dataset_class_name(r, UINT32_MAX, 0) &&
+          spingalett_dataset_target_set_size(r, UINT32_MAX) == 0, "crafted: reader names of set 2^32 - 1");
+    spingalett_dataset_close(r);
+    /* 2^32 - 1 further sets: their count plus one is 0 */
+    SpingalettTargetSet extra = {.size = ph->target_size, .targets = ph->targets};
+    DatasetSaveOptions many = {.extra_targets = &extra, .extra_target_count = UINT32_MAX};
+    CHECK(!spingalett_save_dataset(ph, "spingalett_test_many.slettd", &many) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "crafted: 2^32 - 1 further sets of targets accepted");
+    remove("spingalett_test_many.slettd");
+}
+
+static void dataset_files_v2(void) {
+    /* dense 8-bit "photographs" (smooth colour fields with noise), 32 x 32 x 3; the first two
+       values of a sample encode its index */
+    SpingalettDataset ph, back;
+    make_ds(&ph, 1200, 3072, 10);
+    lcg_state = 77;
+    for (uint32_t i = 0; i < ph.count; i++) {
+        float fx = frand() * 0.2f, fy = frand() * 0.2f, base = frand() * 120.0f;
+        for (int y = 0; y < 32; y++)
+            for (int x = 0; x < 32; x++)
+                for (int c = 0; c < 3; c++) {
+                    float v = base + 60.0f * sinf(fx * x + c) + 50.0f * cosf(fy * y) + frand() * 24.0f;
+                    int q = (int)(v < 0 ? 0 : v > 255 ? 255 : v);
+                    ph.inputs[(size_t)i * 3072 + (y * 32 + x) * 3 + c] = (float)q / 255.0f;
+                }
+        ph.inputs[(size_t)i * 3072] = (float)(i & 255) / 255.0f;
+        ph.inputs[(size_t)i * 3072 + 1] = (float)(i >> 8) / 255.0f;
+        ph.targets[(size_t)i * 10 + i % 10] = 1.0f;
+    }
+    const char *path = "spingalett_test_v2.slettd";
+    CHECK(spingalett_save_dataset(&ph, path, NULL), "v2: save dense data");
+    SpingalettDatasetInfo info = file_info(path);
+    SpingalettDataset ld;
+    bool ok = spingalett_load_dataset(path, &ld);
+    printf("  slettd dense u8 (rANS)        %8llu bytes (%5.1f%% of the bytes), version %u, chunks %u\n",
+           (unsigned long long)info.file_size, 100.0 * (double)info.file_size / ((double)ph.count * 3073), info.format_version,
+           info.chunk_count);
+    /* the writer took the rANS coder (only version 2 files have it) and the data comes back exactly */
+    CHECK(ok && info.format_version == 2 && info.input_encoding == DATASET_ENCODING_U8_UNIT && same_dataset(&ph, &ld),
+          "v2: dense data round trip through the rANS coder (version %u)", info.format_version);
+    if (ok) spingalett_dataset_free(&ld);
+    long size = 0;
+    unsigned char *good = read_file(path, &size);
+    if (good) {
+        /* a flipped bit in a coded stream is caught (by the checksum, and the coder's final state) */
+        unsigned char *copy = malloc((size_t)size);
+        memcpy(copy, good, (size_t)size);
+        copy[size - 1000] ^= 0x04;
+        CHECK(!spingalett_load_dataset_from_memory(copy, (size_t)size, &ld) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "v2: corrupt rANS chunk not detected");
+        /* streaming readers report it when they reach the chunk, from any decoding thread */
+        write_file("spingalett_test_bad.slettd", copy, size);
+        ComputeMode mode = spingalett_get_compute_mode();
+        for (int v = 0; v < 3; v++) {
+            spingalett_set_compute_mode(v == 2 ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+            DatasetReaderOptions o = {.shuffle = true, .no_prefetch = v == 1};
+            SpingalettDatasetReader *r = spingalett_dataset_open_ex("spingalett_test_bad.slettd", &o);
+            float *x = malloc((size_t)100 * 3072 * sizeof(float)), *y = malloc((size_t)100 * 10 * sizeof(float));
+            uint32_t total = 0, got;
+            while (r && (got = spingalett_dataset_read(r, x, y, 100)) > 0) total += got;
+            CHECK(r && total < ph.count && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+                  spingalett_dataset_read(r, x, y, 100) == 0, "v2: reader %d: corrupt chunk not reported", v);
+            spingalett_dataset_close(r);
+            free(x);
+            free(y);
+        }
+        spingalett_set_compute_mode(mode);
+        remove("spingalett_test_bad.slettd");
+        free(copy);
+        free(good);
+    }
+
+    /* shape, class names, a second set of targets with its own names */
+    static const char *const names[10] = {"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"};
+    static const char *const parity[2] = {"even", "odd"};
+    ph.height = ph.width = 32;
+    ph.channels = 3;
+    CHECK(spingalett_dataset_set_class_names(&ph, names, 10), "v2: set class names");
+    float *odd = calloc((size_t)ph.count * 2, sizeof(float));
+    for (uint32_t i = 0; i < ph.count; i++) odd[(size_t)i * 2 + (i % 10) % 2] = 1.0f;
+    SpingalettTargetSet extra = {.name = "parity", .size = 2, .targets = odd, .class_names = parity};
+    DatasetSaveOptions opt = {.target_name = "digit", .extra_targets = &extra, .extra_target_count = 1};
+    CHECK(spingalett_save_dataset(&ph, path, &opt), "v2: save with metadata and two sets of targets");
+    ok = spingalett_load_dataset(path, &ld);
+    CHECK(ok && same_dataset(&ph, &ld) && ld.height == 32 && ld.width == 32 && ld.channels == 3 && ld.class_names &&
+          !strcmp(ld.class_names[7], "seven") && ld.class_names[10] == NULL, "v2: shape and class names come back");
+    if (ok) spingalett_dataset_free(&ld);
+    ok = spingalett_load_dataset_targets(path, 1, &ld);
+    bool parity_ok = ok && ld.target_size == 2 && ld.count == ph.count && ld.class_names && !strcmp(ld.class_names[1], "odd") &&
+                     !memcmp(ld.targets, odd, (size_t)ph.count * 2 * sizeof(float)) &&
+                     !memcmp(ld.inputs, ph.inputs, (size_t)ph.count * 3072 * sizeof(float));
+    CHECK(parity_ok, "v2: the second set of targets loads with the inputs");
+    if (ok) spingalett_dataset_free(&ld);
+    CHECK(!spingalett_load_dataset_targets(path, 2, &ld) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "v2: a set of targets that is not there");
+    SpingalettDatasetReader *r = spingalett_dataset_open(path, false);
+    info = spingalett_dataset_info(r);
+    CHECK(r && info.target_set_count == 2 && info.height == 32 && info.channels == 3 &&
+          !strcmp(spingalett_dataset_target_set_name(r, 0), "digit") && !strcmp(spingalett_dataset_target_set_name(r, 1), "parity") &&
+          spingalett_dataset_target_set_size(r, 1) == 2 && !strcmp(spingalett_dataset_class_name(r, 1, 0), "even") &&
+          spingalett_dataset_class_name(r, 1, 2) == NULL && spingalett_dataset_class_name(r, 0, 3) &&
+          !strcmp(spingalett_dataset_class_name(r, 0, 3), "three"), "v2: reader metadata");
+    spingalett_dataset_close(r);
+    /* the shape and names also survive a split */
+    SpingalettDataset copy = {0}, tail = {0};
+    ok = spingalett_load_dataset(path, &copy) && spingalett_dataset_split(&copy, 100, &tail);
+    CHECK(ok && tail.height == 32 && tail.class_names && !strcmp(tail.class_names[9], "nine"), "v2: split keeps shape and names");
+    spingalett_dataset_free(&copy);
+    spingalett_dataset_free(&tail);
+    dataset_crafted(path, &ph);
+
+    /* readers: shuffled passes are the same with a decoding thread (single-threaded mode leaves
+       processors free), one chunk at a time on the caller, and chunks decoded together by the
+       OpenMP threads (which take every processor); in memory every pass holds each sample once;
+       a u8 reader serves what it was given */
+    uint32_t *o1 = malloc(ph.count * sizeof(uint32_t)), *o2 = malloc(ph.count * sizeof(uint32_t));
+    bool same = true, exact = true;
+    ComputeMode mode = spingalett_get_compute_mode();
+    static const ComputeMode open_modes[3] = {COMPUTE_SINGLE_THREADED, COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP};
+    for (int pass = 0; pass < 3; pass++) {
+        SpingalettDatasetReader *rs[3];
+        for (int v = 0; v < 3; v++) {
+            DatasetReaderOptions o = {.shuffle = true, .no_prefetch = v == 1};
+            spingalett_set_compute_mode(open_modes[v]);
+            spingalett_seed(5);
+            rs[v] = spingalett_dataset_open_ex(path, &o);
+            exact = exact && rs[v];
+        }
+        spingalett_set_compute_mode(COMPUTE_OPENMP);
+        for (int k = 0; k <= pass && exact; k++) {
+            exact = read_pass(rs[0], &ph, o1, 29 + 7 * k);
+            for (int v = 1; v < 3 && exact; v++) {
+                exact = read_pass(rs[v], &ph, o2, v == 1 ? 64 : 17);
+                same = same && !memcmp(o1, o2, ph.count * sizeof(uint32_t));
+            }
+        }
+        for (int v = 0; v < 3; v++) spingalett_dataset_close(rs[v]);
+    }
+    spingalett_set_compute_mode(mode);
+    CHECK(exact && same, "v2: streaming readers (exact %d, same order %d)", exact, same);
+    DatasetReaderOptions m = {.shuffle = true, .in_memory = true};
+    r = spingalett_dataset_open_ex(path, &m);
+    bool spread = false;                /* in memory the passes shuffle across chunks */
+    exact = r != NULL;
+    for (int pass = 0; pass < 2 && r; pass++) {
+        exact = exact && read_pass(r, &ph, o1, 50);
+        for (uint32_t k = 0; k + 1 < 20 && exact; k++) {
+            uint32_t a1 = o1[k], b1 = o1[k + 1];
+            if ((a1 > b1 ? a1 - b1 : b1 - a1) > 600) spread = true;
+        }
+    }
+    CHECK(exact && spread, "v2: in-memory reader (exact %d, shuffled across chunks %d)", exact, spread);
+    spingalett_dataset_close(r);
+    uint8_t *bytes = malloc((size_t)ph.count * 3072);
+    for (size_t i = 0; i < (size_t)ph.count * 3072; i++) bytes[i] = (uint8_t)(ph.inputs[i] * 255.0f + 0.5f);
+    r = spingalett_dataset_open_u8(bytes, ph.targets, ph.count, 3072, 10, false);
+    exact = r && read_pass(r, &ph, o1, 33);
+    for (uint32_t k = 0; exact && k < ph.count; k++) exact = o1[k] == k;
+    CHECK(exact, "v2: u8 reader");
+    /* training through the u8 reader equals training on the arrays (in order) */
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    NeuralNetwork *na = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY), *nb = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    for (int n = 0; n < 2; n++) {
+        NeuralNetwork *net = n ? nb : na;
+        layer(net, 3072);
+        layer(net, 16, ACT_RELU, WEIGHT_INITIALIZATION_HE);
+        layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    }
+    memcpy(nb->weights, na->weights, na->total_weights * sizeof(float));
+    train(.net = na, .inputs = ph.inputs, .targets = ph.targets, .sample_count = ph.count, .epochs = 2,
+          .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32, .do_not_shuffle = true, .optimizer_type = OPTIMIZER_ADAM);
+    train(.net = nb, .training_mode = MODE_GENERATOR_FUNCTION, .generator = spingalett_dataset_generator, .generator_data = r,
+          .epochs = 2, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32, .optimizer_type = OPTIMIZER_ADAM);
+    CHECK(max_abs_diff(na->weights, nb->weights, na->total_weights) == 0.0f && na->time_step == nb->time_step,
+          "v2: training from the u8 reader");
+    free_network(na);
+    free_network(nb);
+    spingalett_dataset_close(r);
+    free(bytes);
+    free(o1);
+    free(o2);
+    free(odd);
+    remove(path);
+    spingalett_dataset_free(&ph);
+    (void)back;
 }
 
 
@@ -2003,6 +2273,92 @@ static void model_inference(PrecisionMode p, float tol) {
 }
 
 /* The validator must reject every damaged image without reading out of bounds. */
+#if !defined(_WIN32)
+#include <pthread.h>
+
+typedef struct {
+    const SpingalettModel *model;
+    const float *x;
+    float *const *expect;               /* outputs for each count in counts */
+    const uint32_t *counts;
+    uint32_t sizes, seed;
+    bool same;
+} PredictJob;
+
+static void *predict_job(void *arg) {
+    PredictJob *j = (PredictJob *)arg;
+    float *y = malloc((size_t)40 * j->model->output_size * sizeof(float));
+    j->same = y != NULL;
+    for (uint32_t r = 0; r < 40 && j->same; r++) {
+        uint32_t k = (r * 5 + j->seed) % j->sizes, n = j->counts[k];
+        j->same = spingalett_model_predict(j->model, j->x, n, y) &&
+                  !memcmp(y, j->expect[k], (size_t)n * j->model->output_size * sizeof(float));
+    }
+    free(y);
+    return NULL;
+}
+#endif
+
+/* Models prepare their weights once and keep a workspace between calls: results are the same for
+   repeated calls of any size, for a model that owns nothing (spingalett_model_init over the same
+   image, which prepares on every call), and for calls from several threads at once. */
+static void model_shared(void) {
+    spingalett_seed(41);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .groups = 8, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    max_pool2d(.net = net, .kernel = 2);
+    layer(net, 24, ACT_RELU, WEIGHT_INITIALIZATION_HE);
+    layer(net, 5, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    static const uint32_t counts[] = {1, 2, 5, 12, 13, 40};
+    enum { SIZES = sizeof counts / sizeof *counts };
+    float *x = malloc((size_t)40 * 192 * sizeof(float));
+    lcg_state = 9;
+    for (size_t i = 0; i < (size_t)40 * 192; i++) x[i] = frand();
+    ComputeMode mode = spingalett_get_compute_mode();
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    for (int p = 0; p < PRECISION_COUNT; p++) {
+        SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+        float *expect[SIZES], *y = malloc((size_t)40 * 5 * sizeof(float));
+        bool same = m && y;
+        for (int k = 0; k < SIZES; k++) {
+            expect[k] = malloc((size_t)counts[k] * 5 * sizeof(float));
+            same = same && expect[k] && spingalett_model_predict(m, x, counts[k], expect[k]);
+        }
+        SpingalettModel bare;
+        same = same && spingalett_model_init(&bare, m->image, m->image_size) == SPINGALETT_OK;
+        for (int k = SIZES; k-- > 0 && same;) {      /* in the other order, on both models */
+            same = spingalett_model_predict(m, x, counts[k], y) && !memcmp(y, expect[k], (size_t)counts[k] * 5 * sizeof(float));
+            same = same && spingalett_model_predict(&bare, x, counts[k], y) &&
+                   !memcmp(y, expect[k], (size_t)counts[k] * 5 * sizeof(float));
+        }
+        CHECK(same, "model p=%d: repeated predictions or a model without an owner differ", p);
+#if !defined(_WIN32)
+        PredictJob jobs[4];
+        pthread_t threads[4];
+        int started = 0;
+        for (int t = 0; t < 4 && same; t++) {
+            jobs[t] = (PredictJob){m, x, expect, counts, SIZES, (uint32_t)t * 3u, false};
+            if (pthread_create(&threads[t], NULL, predict_job, &jobs[t]) == 0) started++;
+        }
+        bool threaded = started == 4;
+        for (int t = 0; t < started; t++) {
+            pthread_join(threads[t], NULL);
+            threaded = threaded && jobs[t].same;
+        }
+        CHECK(!same || threaded, "model p=%d: predictions from several threads differ", p);
+#endif
+        for (int k = 0; k < SIZES; k++) free(expect[k]);
+        free(y);
+        spingalett_model_free(m);
+    }
+    spingalett_set_compute_mode(mode);
+    free(x);
+    free_network(net);
+    printf("  shared models: repeated, unowned and concurrent predictions agree\n");
+}
+
 static void model_validation(void) {
     NeuralNetwork *net = deploy_net();
     size_t size = 0;
@@ -3081,6 +3437,7 @@ int main(int argc, char **argv) {
         datasets();
         cifar_files();
         dataset_files();
+        dataset_files_v2();
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");
@@ -3100,6 +3457,7 @@ int main(int argc, char **argv) {
         model_inference(PRECISION_INT8, 3e-2f);
         model_inference(PRECISION_INT4, 0.1f);
         model_inference(PRECISION_INT2, 0.5f);
+        model_shared();
         model_validation();
         model_files();
         for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);

@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -268,8 +268,13 @@ class _LayerArgs(Structure):
     ]
 
 
+# Arrays passed in and out of the calls made per batch go by address (c_void_p, from
+# ndarray.ctypes.data): building a ctypes float pointer costs about a microsecond more per array.
+_FloatArray = c_void_p
+
+
 class _ForwardArgs(Structure):
-    _fields_ = [("net", _NetPtr), ("input", POINTER(c_float))]
+    _fields_ = [("net", _NetPtr), ("input", _FloatArray)]
 
 
 class _TrainArgs(Structure):
@@ -322,17 +327,17 @@ class _TrainArgs(Structure):
 class _PredictArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
-        ("inputs", POINTER(c_float)),
+        ("inputs", _FloatArray),
         ("sample_count", c_uint32),
-        ("outputs", POINTER(c_float)),
+        ("outputs", _FloatArray),
     ]
 
 
 class _EvaluateArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
-        ("inputs", POINTER(c_float)),
-        ("targets", POINTER(c_float)),
+        ("inputs", _FloatArray),
+        ("targets", _FloatArray),
         ("sample_count", c_uint32),
     ]
 
@@ -357,11 +362,32 @@ class _Dataset(Structure):
         ("target_size", c_uint32),
         ("inputs", POINTER(c_float)),
         ("targets", POINTER(c_float)),
+        ("height", c_uint32),
+        ("width", c_uint32),
+        ("channels", c_uint32),
+        ("class_names", POINTER(c_char_p)),
+    ]
+
+
+class _TargetSet(Structure):
+    _fields_ = [
+        ("name", c_char_p),
+        ("size", c_uint32),
+        ("targets", POINTER(c_float)),
+        ("class_names", POINTER(c_char_p)),
+        ("encoding", c_int),
     ]
 
 
 class _DatasetSaveOptions(Structure):
-    _fields_ = [("input_encoding", c_int), ("target_encoding", c_int), ("no_compression", c_bool)]
+    _fields_ = [
+        ("input_encoding", c_int),
+        ("target_encoding", c_int),
+        ("no_compression", c_bool),
+        ("target_name", c_char_p),
+        ("extra_targets", POINTER(_TargetSet)),
+        ("extra_target_count", c_uint32),
+    ]
 
 
 class _DatasetInfo(Structure):
@@ -373,7 +399,17 @@ class _DatasetInfo(Structure):
         ("target_encoding", c_int),
         ("chunk_count", c_uint32),
         ("file_size", c_uint64),
+        ("format_version", c_uint32),
+        ("height", c_uint32),
+        ("width", c_uint32),
+        ("channels", c_uint32),
+        ("target_set_count", c_uint32),
+        ("target_set", c_uint32),
     ]
+
+
+class _DatasetReaderOptions(Structure):
+    _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32)]
 
 
 class _SaveArgs(Structure):
@@ -499,6 +535,8 @@ def _bind(name, restype, argtypes):
 _new = _bind("new_spingalett_struct_arguments", _NetPtr, [_NeuralNetworkArgs])
 _layer = _bind("layer_struct_arguments", None, [_LayerArgs])
 _layer_count = _bind("spingalett_layer_count", c_uint32, [_NetPtr])
+_input_size = _bind("spingalett_input_size", c_uint32, [_NetPtr])
+_output_size = _bind("spingalett_output_size", c_uint32, [_NetPtr])
 _network_layer = _bind("spingalett_network_layer", c_bool, [_NetPtr, c_uint32, POINTER(_NetworkLayer)])
 _parameter_count = _bind("spingalett_parameter_count", c_uint64, [_NetPtr])
 _network_loss = _bind("spingalett_network_loss", c_int, [_NetPtr])
@@ -507,16 +545,16 @@ _get_parameters = _bind("spingalett_get_parameters", c_bool, [_NetPtr, c_uint32,
 _set_parameters = _bind("spingalett_set_parameters", c_bool, [_NetPtr, c_uint32, c_int, POINTER(c_float), c_uint64])
 _PARAM_WEIGHTS, _PARAM_BIASES, _PARAM_WEIGHT_GRADIENTS, _PARAM_BIAS_GRADIENTS = 0, 1, 2, 3
 _PARAM_RUNNING_MEAN, _PARAM_RUNNING_VARIANCE = 4, 5
-_forward = _bind("forward_struct_arguments", POINTER(c_float), [_ForwardArgs])
+_forward = _bind("forward_struct_arguments", c_void_p, [_ForwardArgs])
 _predict = _bind("predict_struct_arguments", c_bool, [_PredictArgs])
 _train = _bind("train_struct_arguments", _TrainReport, [_TrainArgs])
 _evaluate = _bind("evaluate_struct_arguments", _EvalMetrics, [_EvaluateArgs])
 _TrainerPtr = c_void_p
 _trainer_new = _bind("spingalett_trainer_new", _TrainerPtr, [_NetPtr, c_uint32])
 _trainer_free = _bind("spingalett_trainer_free", None, [_TrainerPtr])
-_trainer_forward = _bind("spingalett_trainer_forward", POINTER(c_float), [_TrainerPtr, POINTER(c_float), c_uint32])
-_trainer_backward = _bind("spingalett_trainer_backward", c_float, [_TrainerPtr, POINTER(c_float)])
-_trainer_backward_grads = _bind("spingalett_trainer_backward_output_grads", c_bool, [_TrainerPtr, POINTER(c_float)])
+_trainer_forward = _bind("spingalett_trainer_forward", c_void_p, [_TrainerPtr, _FloatArray, c_uint32])
+_trainer_backward = _bind("spingalett_trainer_backward", c_float, [_TrainerPtr, _FloatArray])
+_trainer_backward_grads = _bind("spingalett_trainer_backward_output_grads", c_bool, [_TrainerPtr, _FloatArray])
 _trainer_step = _bind("spingalett_trainer_step", c_bool, [_TrainerPtr, POINTER(_OptimizerArgs)])
 _trainer_zero_grad = _bind("spingalett_trainer_zero_grad", None, [_TrainerPtr])
 _load_idx = _bind("spingalett_load_idx", c_bool, [c_char_p, c_char_p, c_uint32, POINTER(_Dataset)])
@@ -524,8 +562,14 @@ _load_cifar = _bind("spingalett_load_cifar", c_bool, [POINTER(c_char_p), c_uint3
 _load_csv = _bind("spingalett_load_csv", c_bool, [c_char_p, c_uint32, c_uint32, POINTER(_Dataset)])
 _dataset_free = _bind("spingalett_dataset_free", None, [POINTER(_Dataset)])
 _save_dataset = _bind("spingalett_save_dataset", c_bool, [POINTER(_Dataset), c_char_p, POINTER(_DatasetSaveOptions)])
-_load_dataset = _bind("spingalett_load_dataset", c_bool, [c_char_p, POINTER(_Dataset)])
-_dataset_open = _bind("spingalett_dataset_open", c_void_p, [c_char_p, c_bool])
+_load_dataset = _bind("spingalett_load_dataset_targets", c_bool, [c_char_p, c_uint32, POINTER(_Dataset)])
+_dataset_set_class_names = _bind("spingalett_dataset_set_class_names", c_bool, [POINTER(_Dataset), POINTER(c_char_p), c_uint32])
+_dataset_open = _bind("spingalett_dataset_open_ex", c_void_p, [c_char_p, POINTER(_DatasetReaderOptions)])
+_dataset_open_u8 = _bind("spingalett_dataset_open_u8", c_void_p,
+                         [POINTER(ctypes.c_uint8), POINTER(c_float), c_uint32, c_uint32, c_uint32, c_bool])
+_dataset_target_set_name = _bind("spingalett_dataset_target_set_name", c_char_p, [c_void_p, c_uint32])
+_dataset_class_name = _bind("spingalett_dataset_class_name", c_char_p, [c_void_p, c_uint32, c_uint32])
+_dataset_target_set_size = _bind("spingalett_dataset_target_set_size", c_uint32, [c_void_p, c_uint32])
 _dataset_close = _bind("spingalett_dataset_close", None, [c_void_p])
 _dataset_info = _bind("spingalett_dataset_info", _DatasetInfo, [c_void_p])
 _dataset_generator = _DataGeneratorFn(ctypes.cast(_lib.spingalett_dataset_generator, c_void_p).value)
@@ -539,8 +583,8 @@ _model_load = _bind("spingalett_model_load", _ModelPtr, [c_char_p])
 _model_from_memory = _bind("spingalett_model_from_memory", _ModelPtr, [c_char_p, c_size_t])
 _model_free = _bind("spingalett_model_free", None, [_ModelPtr])
 _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
-_model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, POINTER(c_float), c_uint32, POINTER(c_float)])
-_model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, POINTER(c_float), POINTER(c_float), c_uint32])
+_model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, _FloatArray, c_uint32, _FloatArray])
+_model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _FloatArray, _FloatArray, c_uint32])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
 _free = _bind("free_network", None, [_NetPtr])
 _print_parameters = _bind("print_parameters", None, [_NetPtr])
@@ -860,8 +904,19 @@ class TrainConfig:
     augment_flip: bool = False          # images: mirror left to right half of the time
 
 
-def _as_matrix(data, width: int, name: str) -> np.ndarray:
-    arr = np.ascontiguousarray(data, dtype=np.float32)
+def _as_float(data) -> np.ndarray:
+    """float32 values; uint8 arrays are image bytes, value q read as q / 255 (as the C readers and
+    the U8_UNIT encoding read them)."""
+    arr = np.asarray(data)
+    if arr.dtype == np.uint8:
+        return (arr.astype(np.float64) / 255.0).astype(np.float32)
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _as_matrix(data, width: int, name: str, images: bool = True) -> np.ndarray:
+    """Rows of `width` float32 values; uint8 inputs are image bytes (see _as_float), while targets
+    and gradients (images=False) keep their values."""
+    arr = np.ascontiguousarray(_as_float(data) if images else np.asarray(data, dtype=np.float32))
     if arr.ndim == 1:
         if arr.size % width != 0:
             raise ValueError(f"{name}: {arr.size} values do not split into rows of {width}")
@@ -1017,11 +1072,11 @@ class Network:
 
     @property
     def input_size(self) -> int:
-        return self.topology[0]
+        return int(_input_size(self._net))
 
     @property
     def output_size(self) -> int:
-        return self.topology[-1]
+        return int(_output_size(self._net))
 
     @property
     def num_parameters(self) -> int:
@@ -1090,17 +1145,17 @@ class Network:
         """Run inference. A 1-D input returns one output vector; a 2-D batch returns one row per
         sample and runs as a single batched call (matrix-matrix products on every backend)."""
         n_in, n_out = self.input_size, self.output_size
-        arr = np.ascontiguousarray(inputs, dtype=np.float32)
+        arr = _as_float(inputs)
         single = arr.ndim == 1 and arr.size == n_in
         batch = _as_matrix(arr, n_in, "inputs")
         out = np.empty((batch.shape[0], n_out), dtype=np.float32)
         if single:
-            ptr = _call(_forward, _ForwardArgs(self._ptr, _float_ptr(batch[0])))
+            ptr = _call(_forward, _ForwardArgs(self._ptr, batch.ctypes.data))
             ctypes.memmove(out.ctypes.data, ptr, n_out * 4)
             return out[0]
         if batch.shape[0]:
             self._net  # raise if closed
-            _call(_predict, _PredictArgs(self._ptr, _float_ptr(batch), batch.shape[0], _float_ptr(out)))
+            _call(_predict, _PredictArgs(self._ptr, batch.ctypes.data, batch.shape[0], out.ctypes.data))
         return out
 
     __call__ = forward
@@ -1109,11 +1164,11 @@ class Network:
         """Mean loss (as reported by training) and accuracy over a data set. Accuracy compares
         the argmax of outputs and targets; with a single output, their side of 0.5."""
         x, y = self._pair(inputs, targets, "")
-        return _metrics(_call(_evaluate, _EvaluateArgs(self._ptr, _float_ptr(x), _float_ptr(y), x.shape[0])))
+        return _metrics(_call(_evaluate, _EvaluateArgs(self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0])))
 
     def _pair(self, inputs, targets, what: str):
         x = _as_matrix(inputs, self.input_size, what + "inputs")
-        y = _as_matrix(targets, self.output_size, what + "targets")
+        y = _as_matrix(targets, self.output_size, what + "targets", images=False)
         if x.shape[0] != y.shape[0]:
             raise ValueError(f"{what}inputs have {x.shape[0]} rows but {what}targets have {y.shape[0]}")
         if x.shape[0] == 0:
@@ -1140,6 +1195,20 @@ class Network:
         ``lr_scheduler`` is a built-in schedule or ``fn(epoch, total_epochs, initial_lr) -> lr``.
         """
         cfg = dataclasses.replace(config or TrainConfig(), **overrides)
+        raw = np.asarray(inputs)
+        if raw.dtype == np.uint8:
+            # image bytes stay bytes: a reader converts a batch at a time (a quarter of the memory)
+            xb = np.ascontiguousarray(raw).reshape(-1, self.input_size) if raw.size % self.input_size == 0 else None
+            y = _as_matrix(targets, self.output_size, "targets", images=False)
+            if xb is None or xb.shape[0] != y.shape[0] or xb.shape[0] == 0:
+                raise ValueError(f"inputs {raw.shape} and targets {y.shape} do not match the network")
+            reader = _call(_dataset_open_u8, xb.ctypes.data_as(POINTER(ctypes.c_uint8)), _float_ptr(y),
+                           xb.shape[0], self.input_size, self.output_size, bool(cfg.shuffle))
+            try:
+                return self._run(cfg, _MODE_GENERATOR, None, None, int(xb.shape[0]),
+                                 _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
+            finally:
+                _dataset_close(reader)
         x, y = self._pair(inputs, targets, "")
         return self._run(cfg, _MODE_ARRAY, x, y, x.shape[0], None, validation_data)
 
@@ -1160,11 +1229,20 @@ class Network:
         return self._run(cfg, _MODE_GENERATOR, None, None, int(samples_per_epoch), generator, validation_data)
 
     def train_from_file(self, path, config: Optional[TrainConfig] = None, shuffle: bool = True,
-                        validation_data=None, **overrides) -> TrainResult:
-        """Train on a .slettd data set file, streamed chunk by chunk by the C reader (no Python
-        call per batch, memory for one chunk). ``shuffle`` reorders chunks and samples each epoch."""
+                        validation_data=None, in_memory: bool = False, prefetch: bool = True,
+                        target_set: int = 0, **overrides) -> TrainResult:
+        """Train on a .slettd data set file through the C reader (no Python call per batch).
+        By default it streams the file with memory for a few chunks, decoding the next chunks on a
+        background thread when a processor is free for it, or several at a time on the OpenMP
+        threads otherwise (``prefetch=False``: never on a background thread); ``shuffle`` reorders
+        chunks and samples each epoch. ``in_memory`` decodes the file once and keeps its values in
+        their compact form (a byte per 8-bit value), shuffling all samples each epoch.
+        ``target_set`` picks the set of targets of files that hold several."""
         cfg = dataclasses.replace(config or TrainConfig(), **overrides)
-        reader = _call(_dataset_open, _encode_path(path), bool(shuffle))
+        if int(target_set) < 0:
+            raise ValueError(f"target_set must be 0 or more, got {target_set}")
+        opts = _DatasetReaderOptions(bool(shuffle), bool(in_memory), not prefetch, int(target_set))
+        reader = _call(_dataset_open, _encode_path(path), ctypes.byref(opts))
         try:
             info = _dataset_info(reader)
             if (info.input_size, info.target_size) != (self.input_size, self.output_size):
@@ -1379,6 +1457,7 @@ class Model:
             raise SpingalettError(-1, "could not create the model")
         model = cls.__new__(cls)
         model._ptr = ptr
+        model._sizes = (int(ptr.contents.input_size), int(ptr.contents.output_size))   # read-only
         return model
 
     @classmethod
@@ -1465,13 +1544,14 @@ class Model:
     # ---- inference
     def predict(self, inputs) -> np.ndarray:
         """Outputs for one sample (1-D input) or a batch (one row per sample)."""
-        n_in = self.input_size
-        arr = np.ascontiguousarray(inputs, dtype=np.float32)
+        self._model  # raise if closed
+        n_in, n_out = self._sizes
+        arr = _as_float(inputs)
         single = arr.ndim == 1 and arr.size == n_in
         batch = _as_matrix(arr, n_in, "inputs")
-        out = np.empty((batch.shape[0], self.output_size), dtype=np.float32)
+        out = np.empty((batch.shape[0], n_out), dtype=np.float32)
         if batch.shape[0]:
-            _call(_model_predict, self._ptr, _float_ptr(batch), batch.shape[0], _float_ptr(out))
+            _call(_model_predict, self._ptr, batch.ctypes.data, batch.shape[0], out.ctypes.data)
         return out[0] if single else out
 
     __call__ = predict
@@ -1479,10 +1559,10 @@ class Model:
     def evaluate(self, inputs, targets) -> Metrics:
         """Mean loss and accuracy over a data set, as :meth:`Network.evaluate` computes them."""
         x = _as_matrix(inputs, self.input_size, "inputs")
-        y = _as_matrix(targets, self.output_size, "targets")
+        y = _as_matrix(targets, self.output_size, "targets", images=False)
         if x.shape[0] != y.shape[0] or x.shape[0] == 0:
             raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
-        return _metrics(_call(_model_evaluate, self._ptr, _float_ptr(x), _float_ptr(y), x.shape[0]))
+        return _metrics(_call(_model_evaluate, self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0]))
 
     def __repr__(self) -> str:
         if not getattr(self, "_ptr", None):
@@ -1543,7 +1623,7 @@ class Trainer:
         """Training-mode forward pass (dropout active); returns a copy of the outputs."""
         net = self._network
         x = _as_matrix(inputs, net.input_size, "inputs")
-        ptr = _call(_trainer_forward, self._handle(), _float_ptr(x), x.shape[0])
+        ptr = _call(_trainer_forward, self._handle(), x.ctypes.data, x.shape[0])
         self._rows = x.shape[0]
         out = np.empty((x.shape[0], net.output_size), dtype=np.float32)
         ctypes.memmove(out.ctypes.data, ptr, out.nbytes)
@@ -1551,17 +1631,17 @@ class Trainer:
 
     def backward(self, targets) -> float:
         """Back-propagates the network's loss for the last forward pass; returns the summed loss."""
-        y = _as_matrix(targets, self._network.output_size, "targets")
+        y = _as_matrix(targets, self._network.output_size, "targets", images=False)
         if y.shape[0] != self._rows:
             raise ValueError(f"targets have {y.shape[0]} rows, the last forward pass had {self._rows}")
-        return float(_call(_trainer_backward, self._handle(), _float_ptr(y)))
+        return float(_call(_trainer_backward, self._handle(), y.ctypes.data))
 
     def backward_output_grads(self, output_grads) -> None:
         """Back-propagates a custom loss given dL/d(output) for every sample of the last forward pass."""
-        g = _as_matrix(output_grads, self._network.output_size, "output_grads")
+        g = _as_matrix(output_grads, self._network.output_size, "output_grads", images=False)
         if g.shape[0] != self._rows:
             raise ValueError(f"output_grads have {g.shape[0]} rows, the last forward pass had {self._rows}")
-        _call(_trainer_backward_grads, self._handle(), _float_ptr(g))
+        _call(_trainer_backward_grads, self._handle(), g.ctypes.data)
 
     def step(self, optimizer: Optimizer = Optimizer.ADAM, learning_rate: float = 0.01, weight_decay: float = 0.0,
              momentum: float = 0.0, beta1: float = 0.0, beta2: float = 0.0, epsilon: float = 0.0,
@@ -1590,6 +1670,15 @@ def _take_dataset(ds: _Dataset):
     finally:
         _dataset_free(ctypes.byref(ds))
     return x, y
+
+
+def _names_array(names, count: int, what: str):
+    if names is None:
+        return None
+    names = [str(n).encode() for n in names]
+    if len(names) != count:
+        raise ValueError(f"{what}: {len(names)} names for {count} targets")
+    return (c_char_p * (count + 1))(*names, None)
 
 
 def load_idx(images_path, labels_path, num_classes: int = 0):
@@ -1622,36 +1711,89 @@ def load_csv(path, target_columns: int = 1, num_classes: int = 0):
 
 
 def save_dataset(path, inputs, targets, input_encoding: DatasetEncoding = DatasetEncoding.AUTO,
-                 target_encoding: DatasetEncoding = DatasetEncoding.AUTO, compress: bool = True) -> None:
+                 target_encoding: DatasetEncoding = DatasetEncoding.AUTO, compress: bool = True,
+                 shape=None, class_names=None, target_name=None, extra_targets=None) -> None:
     """Write ``(inputs, targets)`` to a .slettd file (".slettd" is appended when there is no
-    extension). AUTO picks the smallest lossless encoding; FP16, BFLOAT16 and U8_AFFINE are lossy."""
-    x = np.ascontiguousarray(inputs, dtype=np.float32)
+    extension). AUTO picks the smallest lossless encoding; FP16, BFLOAT16 and U8_AFFINE are lossy.
+    uint8 inputs are image bytes (q / 255) and are stored as such.
+
+    The file can also record the input ``shape`` (height, width, channels), the ``class_names`` of
+    the targets, a ``target_name`` for them, and ``extra_targets``: further sets of targets for
+    the same samples, each a dict with "targets" and optionally "name", "class_names" and
+    "encoding" (load one with ``load_dataset(path, target_set=k)``)."""
+    x = _as_float(inputs)
     y = np.ascontiguousarray(targets, dtype=np.float32)
     if x.ndim == 1:
         x = x.reshape(-1, 1)
+    elif x.ndim > 2:
+        if shape is None and x.ndim in (3, 4):
+            shape = tuple(x.shape[1:]) + ((1,) if x.ndim == 3 else ())
+        x = x.reshape(x.shape[0], -1)
     if y.ndim == 1:
         y = y.reshape(-1, 1)
     if x.ndim != 2 or y.ndim != 2 or x.shape[0] != y.shape[0] or x.shape[0] == 0:
         raise ValueError(f"inputs {x.shape} and targets {y.shape} must be non-empty matrices with the same rows")
+    x = np.ascontiguousarray(x)
     ds = _Dataset(x.shape[0], x.shape[1], y.shape[1], _float_ptr(x), _float_ptr(y))
-    opts = _DatasetSaveOptions(int(input_encoding), int(target_encoding), not compress)
+    if shape is not None:
+        h, w, c = (tuple(shape) + (1,))[:3] if len(shape) == 2 else tuple(shape)
+        if h * w * c != x.shape[1]:
+            raise ValueError(f"shape {tuple(shape)} does not hold {x.shape[1]} inputs")
+        ds.height, ds.width, ds.channels = int(h), int(w), int(c)
+    keep = []
+    names = _names_array(class_names, y.shape[1], "class_names")
+    if names is not None:
+        keep.append(names)
+        ds.class_names = ctypes.cast(names, POINTER(c_char_p))
+    sets = []
+    for k, extra in enumerate(extra_targets or []):
+        yk = np.ascontiguousarray(extra["targets"], dtype=np.float32)
+        if yk.ndim == 1:
+            yk = yk.reshape(-1, 1)
+        if yk.ndim != 2 or yk.shape[0] != x.shape[0]:
+            raise ValueError(f"extra_targets[{k}]: expected {x.shape[0]} rows, got {yk.shape}")
+        nk = _names_array(extra.get("class_names"), yk.shape[1], f"extra_targets[{k}] class_names")
+        keep.extend([yk, nk])
+        sets.append(_TargetSet(str(extra["name"]).encode() if extra.get("name") is not None else None, yk.shape[1],
+                               _float_ptr(yk), ctypes.cast(nk, POINTER(c_char_p)) if nk is not None else None,
+                               int(extra.get("encoding", DatasetEncoding.AUTO))))
+    set_array = (_TargetSet * len(sets))(*sets) if sets else None
+    opts = _DatasetSaveOptions(int(input_encoding), int(target_encoding), not compress,
+                               str(target_name).encode() if target_name is not None else None,
+                               ctypes.cast(set_array, POINTER(_TargetSet)) if set_array else None, len(sets))
     _call(_save_dataset, ctypes.byref(ds), _encode_path(path), ctypes.byref(opts))
+    del keep
 
 
-def load_dataset(path):
-    """Read a .slettd file as ``(inputs, targets)`` float32 arrays."""
+def load_dataset(path, target_set: int = 0):
+    """Read a .slettd file as ``(inputs, targets)`` float32 arrays; ``target_set`` picks the set of
+    targets of files that hold several (see :func:`dataset_info`)."""
+    if int(target_set) < 0:
+        raise ValueError(f"target_set must be 0 or more, got {target_set}")
     ds = _Dataset()
-    _call(_load_dataset, _encode_path(path), ctypes.byref(ds))
+    _call(_load_dataset, _encode_path(path), int(target_set), ctypes.byref(ds))
     return _take_dataset(ds)
 
 
 def dataset_info(path) -> dict:
-    """Header of a .slettd file: sample count, sizes, encodings, chunks and file size."""
-    reader = _call(_dataset_open, _encode_path(path), False)
+    """What a .slettd file holds: sample count, sizes, encodings, chunks, file size and format
+    version, the input "shape" (height, width, channels, or None) and its "target_sets", each a
+    dict with "name", "size" and "class_names" (None when the file records none)."""
+    opts = _DatasetReaderOptions(False, False, True, 0)
+    reader = _call(_dataset_open, _encode_path(path), ctypes.byref(opts))
     try:
         i = _dataset_info(reader)
+        sets = []
+        for k in range(i.target_set_count):
+            size = _dataset_target_set_size(reader, k)
+            name = _dataset_target_set_name(reader, k)
+            names = [_dataset_class_name(reader, k, c) for c in range(size)]
+            sets.append({"name": name.decode() if name is not None else None, "size": int(size),
+                         "class_names": [n.decode() for n in names] if all(n is not None for n in names) else None})
         return {"count": i.count, "input_size": i.input_size, "target_size": i.target_size,
                 "input_encoding": DatasetEncoding(i.input_encoding), "target_encoding": DatasetEncoding(i.target_encoding),
-                "chunk_count": i.chunk_count, "file_size": i.file_size}
+                "chunk_count": i.chunk_count, "file_size": i.file_size, "format_version": i.format_version,
+                "shape": (i.height, i.width, i.channels) if i.height or i.width or i.channels else None,
+                "target_sets": sets}
     finally:
         _dataset_close(reader)

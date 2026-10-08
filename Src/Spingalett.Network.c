@@ -126,6 +126,41 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerSh
     return true;
 }
 
+/* An array of `need` floats whose first `keep` are those of `old`, the rest zero: `old` itself when
+   it holds `cap` >= need floats (the rest is still zero then), a new array otherwise. */
+static float *grow_floats(float *old, uint64_t keep, uint64_t need, uint64_t cap) {
+    if (old && need <= cap) return old;
+    float *p = (float *)spingalett_aligned_alloc((size_t)need * sizeof(float));
+    if (!p) return NULL;
+    if (keep) memcpy(p, old, (size_t)keep * sizeof(float));
+    memset(p + keep, 0, (size_t)(need - keep) * sizeof(float));
+    return p;
+}
+
+bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t weights, uint64_t biases) {
+    if (!net || net->layers != 0 || net->neurons) return false;
+    if (weights == 0) weights = 1;
+    if (biases == 0) biases = 1;
+    float *n = (float *)spingalett_aligned_calloc((size_t)neurons + 1, sizeof(float)), *w[4], *b[6];
+    bool ok = n != NULL;
+    for (int k = 0; k < 4; k++) ok = (w[k] = (float *)spingalett_aligned_calloc((size_t)weights, sizeof(float))) && ok;
+    for (int k = 0; k < 6; k++) ok = (b[k] = (float *)spingalett_aligned_calloc((size_t)biases, sizeof(float))) && ok;
+    if (!ok) {
+        spingalett_aligned_free(n);
+        for (int k = 0; k < 4; k++) spingalett_aligned_free(w[k]);
+        for (int k = 0; k < 6; k++) spingalett_aligned_free(b[k]);
+        return false;                   /* the layers then allocate as they are added */
+    }
+    net->neurons = n;
+    net->weights = w[0]; net->grad_weights = w[1]; net->opt_m_weights = w[2]; net->opt_v_weights = w[3];
+    net->biases = b[0]; net->grad_biases = b[1]; net->opt_m_biases = b[2]; net->opt_v_biases = b[3];
+    net->running_mean = b[4]; net->running_var = b[5];
+    net->cap_neurons = neurons + 1;
+    net->cap_weights = weights;
+    net->cap_biases = biases;
+    return true;
+}
+
 bool spingalett_add_layer(LayerArgs args) {
     NeuralNetwork *net = args.net;
     ActivationFunction act_func = args.act_func;
@@ -188,50 +223,37 @@ bool spingalett_add_layer(LayerArgs args) {
     uint64_t           *t_noff    = (uint64_t *)           calloc(nl + 1, sizeof(uint64_t));
     uint64_t           *t_woff    = (uint64_t *)           calloc(nl, sizeof(uint64_t));
     uint64_t           *t_boff    = (uint64_t *)           calloc(nl, sizeof(uint64_t));
-    float              *t_neurons = (float *)              spingalett_aligned_calloc(new_tn, sizeof(float));
     float              *t_drop    = (float *)              malloc(nl * sizeof(float));
 
+    /* The big arrays stay where they are when they have room (a loader reserved the final sizes);
+       otherwise they move to arrays of the new size: the old values copied, the rest zeroed. */
     ActivationFunction *t_act     = NULL;
-    float *t_w = NULL, *t_b = NULL;
-    float *t_gw = NULL, *t_gb = NULL;
-    float *t_mw = NULL, *t_mb = NULL;
-    float *t_vw = NULL, *t_vb = NULL;
-    float *t_rm = NULL, *t_rv = NULL;
-
     /* sizes of at least 1: pooling layers add no parameters, and a network of pooling layers has none */
     size_t nw = new_tw ? new_tw : 1, nb = new_tb ? new_tb : 1;
+    float *const old_w[4] = {net->weights, net->grad_weights, net->opt_m_weights, net->opt_v_weights};
+    float *const old_b[6] = {net->biases, net->grad_biases, net->opt_m_biases, net->opt_v_biases,
+                             net->running_mean, net->running_var};
+    float *t_neurons = grow_floats(net->neurons, net->total_neurons, new_tn, net->cap_neurons);
+    float *t_wa[4] = {NULL, NULL, NULL, NULL}, *t_ba[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+    bool ok = t_topo && t_shapes && t_noff && t_woff && t_boff && t_neurons && t_drop;
     if (nl > 1) {
         t_act = (ActivationFunction *)malloc((nl - 1) * sizeof(ActivationFunction));
-        t_w   = (float *)spingalett_aligned_calloc(nw, sizeof(float));
-        t_b   = (float *)spingalett_aligned_calloc(nb, sizeof(float));
-        t_gw  = (float *)spingalett_aligned_calloc(nw, sizeof(float));
-        t_gb  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
-        t_mw  = (float *)spingalett_aligned_calloc(nw, sizeof(float));
-        t_mb  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
-        t_vw  = (float *)spingalett_aligned_calloc(nw, sizeof(float));
-        t_vb  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
-        t_rm  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
-        t_rv  = (float *)spingalett_aligned_calloc(nb, sizeof(float));
+        ok = ok && t_act;
+        for (int k = 0; k < 4; k++) ok = ok && (t_wa[k] = grow_floats(old_w[k], net->total_weights, nw, net->cap_weights));
+        for (int k = 0; k < 6; k++) ok = ok && (t_ba[k] = grow_floats(old_b[k], net->total_biases, nb, net->cap_biases));
     }
-
-    bool ok = t_topo && t_shapes && t_noff && t_woff && t_boff && t_neurons && t_drop;
-    if (nl > 1)
-        ok = ok && t_act && t_w && t_b && t_gw && t_gb && t_mw && t_mb && t_vw && t_vb && t_rm && t_rv;
 
     if (!ok) {
         free(t_topo); free(t_shapes); free(t_noff); free(t_woff); free(t_boff); free(t_drop);
-        spingalett_aligned_free(t_neurons);
-        if (nl > 1) {
-            free(t_act);
-            spingalett_aligned_free(t_w);  spingalett_aligned_free(t_b);
-            spingalett_aligned_free(t_gw); spingalett_aligned_free(t_gb);
-            spingalett_aligned_free(t_mw); spingalett_aligned_free(t_mb);
-            spingalett_aligned_free(t_vw); spingalett_aligned_free(t_vb);
-            spingalett_aligned_free(t_rm); spingalett_aligned_free(t_rv);
-        }
+        if (t_neurons != net->neurons) spingalett_aligned_free(t_neurons);
+        free(t_act);
+        for (int k = 0; k < 4; k++) if (t_wa[k] != old_w[k]) spingalett_aligned_free(t_wa[k]);
+        for (int k = 0; k < 6; k++) if (t_ba[k] != old_b[k]) spingalett_aligned_free(t_ba[k]);
         set_error(SPINGALETT_ERR_ALLOC, "Layer allocation failed");
         return false;
     }
+    float *t_w = t_wa[0], *t_gw = t_wa[1], *t_mw = t_wa[2], *t_vw = t_wa[3];
+    float *t_b = t_ba[0], *t_gb = t_ba[1], *t_mb = t_ba[2], *t_vb = t_ba[3], *t_rm = t_ba[4], *t_rv = t_ba[5];
 
     if (net->layers > 0) {
         memcpy(t_topo, net->topology, net->layers * sizeof(uint32_t));
@@ -244,28 +266,10 @@ bool spingalett_add_layer(LayerArgs args) {
         memcpy(t_drop, net->dropout_rates, net->layers * sizeof(float));
     t_drop[net->layers] = dropout_rate;
 
-    if (net->total_neurons > 0)
-        memcpy(t_neurons, net->neurons, net->total_neurons * sizeof(float));
-
     if (nl > 1) {
         if (net->layers > 1)
             memcpy(t_act, net->act_func, (net->layers - 1) * sizeof(ActivationFunction));
         t_act[net->layers - 1] = act_func;
-
-        if (net->total_weights > 0) {
-            memcpy(t_w,  net->weights,       net->total_weights * sizeof(float));
-            memcpy(t_gw, net->grad_weights,  net->total_weights * sizeof(float));
-            memcpy(t_mw, net->opt_m_weights, net->total_weights * sizeof(float));
-            memcpy(t_vw, net->opt_v_weights, net->total_weights * sizeof(float));
-        }
-        if (net->total_biases > 0) {
-            memcpy(t_b,  net->biases,        net->total_biases * sizeof(float));
-            memcpy(t_gb, net->grad_biases,   net->total_biases * sizeof(float));
-            memcpy(t_mb, net->opt_m_biases,  net->total_biases * sizeof(float));
-            memcpy(t_vb, net->opt_v_biases,  net->total_biases * sizeof(float));
-            memcpy(t_rm, net->running_mean,  net->total_biases * sizeof(float));
-            memcpy(t_rv, net->running_var,   net->total_biases * sizeof(float));
-        }
 
         /* Standard deviations: Glorot sqrt(2 / (fan_in + fan_out)), He sqrt(2 / fan_in),
            LeCun sqrt(1 / fan_in); a filter's fan-in is its window, its fan-out the window times
@@ -302,17 +306,19 @@ bool spingalett_add_layer(LayerArgs args) {
     free(net->neuron_offsets);
     free(net->weight_offsets);
     free(net->bias_offsets);
-    spingalett_aligned_free(net->neurons);
-    spingalett_aligned_free(net->weights);
-    spingalett_aligned_free(net->biases);
-    spingalett_aligned_free(net->grad_weights);
-    spingalett_aligned_free(net->grad_biases);
-    spingalett_aligned_free(net->opt_m_weights);
-    spingalett_aligned_free(net->opt_m_biases);
-    spingalett_aligned_free(net->opt_v_weights);
-    spingalett_aligned_free(net->opt_v_biases);
-    spingalett_aligned_free(net->running_mean);
-    spingalett_aligned_free(net->running_var);
+    if (t_neurons != net->neurons) {
+        spingalett_aligned_free(net->neurons);
+        net->cap_neurons = new_tn;
+    }
+    if (nl > 1) {
+        if (t_w != old_w[0]) net->cap_weights = nw;
+        if (t_b != old_b[0]) net->cap_biases = nb;
+        for (int k = 0; k < 4; k++) if (t_wa[k] != old_w[k]) spingalett_aligned_free(old_w[k]);
+        for (int k = 0; k < 6; k++) if (t_ba[k] != old_b[k]) spingalett_aligned_free(old_b[k]);
+    } else {                            /* the input layer: arrays reserved for the parameters stay */
+        t_w = old_w[0]; t_gw = old_w[1]; t_mw = old_w[2]; t_vw = old_w[3];
+        t_b = old_b[0]; t_gb = old_b[1]; t_mb = old_b[2]; t_vb = old_b[3]; t_rm = old_b[4]; t_rv = old_b[5];
+    }
 
     net->layers         = nl;
     net->topology       = t_topo;

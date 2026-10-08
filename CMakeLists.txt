@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.8.0 LANGUAGES C)
+project(Spingalett VERSION 0.9.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -51,6 +51,13 @@ target_include_directories(spingalett
 )
 
 target_compile_definitions(spingalett PRIVATE SPINGALETT_EXPORTS)
+
+# Background threads (the data set reader decodes ahead): POSIX threads, or Win32 on Windows
+if(NOT WIN32)
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+    target_link_libraries(spingalett PRIVATE Threads::Threads)
+endif()
 
 # ------------------------------------------------------------------------------
 # OpenMP
@@ -342,6 +349,9 @@ if(BUILD_EXAMPLE)
 
         add_executable(${EXAMPLE_NAME} ${EXAMPLE_SOURCE})
         target_link_libraries(${EXAMPLE_NAME} PRIVATE spingalett)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(${EXAMPLE_NAME} PRIVATE m)       # stb_image in DatasetTool
+        endif()
 
         if(UNIX AND NOT APPLE)
             set_target_properties(${EXAMPLE_NAME} PROPERTIES
@@ -424,6 +434,9 @@ if(BUILD_TESTS)
     if(UNIX AND NOT APPLE)
         target_link_libraries(SpingalettTests PRIVATE m)
         set_target_properties(SpingalettTests PROPERTIES BUILD_RPATH "$ORIGIN")
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(SpingalettTests PRIVATE Threads::Threads)     # predictions from several threads
     endif()
 
     # White-box GEMM test: compiles the kernel source itself with the library's ISA flags.

@@ -1,4 +1,4 @@
-# The .slettd data set format, version 1
+# The .slettd data set format, versions 1 and 2
 
 `.slettd` files store a data set (inputs and targets, one row per sample) compactly and load
 straight into `SpingalettDataset`. They are written by `spingalett_save_dataset()` and read by
@@ -8,36 +8,45 @@ independent reader.
 
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 
+Version 2 adds a metadata block (the input shape, further sets of targets, names of sets and of
+classes) and a second coder (rANS over half-bytes). Writers write version 1 when a data set needs
+neither, so that older readers can still load it; readers load both versions.
+
 ## Overview
 
 ```
-header (64 bytes) | parameters | chunk index | chunk 0 | chunk 1 | ...
+header (64 bytes) | parameters | metadata (version 2) | chunk index | chunk 0 | chunk 1 | ...
 ```
 
 The samples are split into chunks of `chunk_samples` consecutive samples (the last one may be
 shorter). Every chunk decodes on its own, so readers can stream a file chunk by chunk, visit chunks
-in any order and decode them in parallel. Writers aim at about 1 MiB of encoded values per chunk.
+in any order and decode them in parallel. Writers aim at about 1 MiB of encoded values (before
+compression) per chunk.
+
+A file holds *streams*: the inputs (stream 0), then one stream per set of targets (streams 1 to
+`sets`). Version 1 files have exactly one set of targets.
 
 ## Header
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 6 | magic `SLETTD` |
-| 6 | 2 | format version, 1 |
+| 6 | 2 | format version, 1 or 2 |
 | 8 | 4 | `count`: number of samples |
 | 12 | 4 | `input_size`: inputs per sample |
-| 16 | 4 | `target_size`: targets per sample, as loaded (for `CLASS`, the number of classes) |
+| 16 | 4 | `target_size`: targets per sample of set 0, as loaded (for `CLASS`, the number of classes) |
 | 20 | 1 | input encoding |
-| 21 | 1 | target encoding |
+| 21 | 1 | encoding of set 0 |
 | 22 | 1 | 1 if the writer tried compression, 0 if it stored everything (informational) |
 | 23 | 1 | reserved, 0 |
 | 24 | 4 | `chunk_samples` (at least 1) |
 | 28 | 4 | `chunk_count` = ceil(`count` / `chunk_samples`) |
 | 32 | 4 | input stride (coder context, at least 1) |
-| 36 | 4 | target stride |
+| 36 | 4 | stride of set 0 |
 | 40 | 8 | file size in bytes |
 | 48 | 4 | size of the parameters block in bytes |
-| 52 | 8 | reserved, 0 |
+| 52 | 4 | `sets`: number of sets of targets, 1 to 255 (version 2); 0 in version 1, meaning 1 |
+| 56 | 4 | size of the metadata block in bytes (version 2); 0 in version 1 |
 | 60 | 4 | CRC-32 of bytes 0 to 59 |
 
 CRC-32 is the IEEE polynomial (0xEDB88320, reflected, initial value and final XOR 0xFFFFFFFF), as
@@ -55,7 +64,7 @@ one value per sample.
 | 3 | `BFLOAT16` | 2 | the upper 16 bits of a float (written with round to nearest even) |
 | 4 | `U8_UNIT` | 1 | q / 255 for q in 0..255, rounded to float (`(float)(q / 255.0)`) |
 | 5 | `U8_AFFINE` | 1 | `min[f] + q * step[f]`, per feature f, computed in float |
-| 6 | `CLASS` | 1 if `target_size` <= 256, else 2 | class index c < `target_size`; the row loads as one-hot (1 at c, 0 elsewhere). Targets only |
+| 6 | `CLASS` | 1 if the set has at most 256 classes, else 2 (at most 65536) | class index c below the set's size; the row loads as one-hot (1 at c, 0 elsewhere). Targets only |
 
 Writers choose, by default, the smallest encoding that reproduces every value exactly:
 `CLASS` for targets whose rows are all one-hot, then `U8_UNIT`, `FP16` and `FLOAT32`. `FP16`,
@@ -64,31 +73,56 @@ each feature and a step of (max - min) / 255).
 
 ## Parameters
 
-For each stream (inputs first, then targets) whose encoding is `U8_AFFINE`, two floats per feature:
-`min[f], step[f]` for f = 0 .. size - 1. The block is empty otherwise.
+For each stream, in stream order (inputs, then the sets of targets), whose encoding is
+`U8_AFFINE`, two floats per feature: `min[f], step[f]` for f = 0 .. size - 1. The block is empty
+otherwise. The encoding of sets 1 and above is known from the metadata, which follows.
+
+## Metadata (version 2)
+
+A sequence of records, each a 2-byte tag, a 4-byte length and that many bytes of content. Readers
+skip records with tags they do not know, so later versions of the writer can add records without
+a new format version. Strings are UTF-8 without a terminating zero (and contain no zero byte).
+
+| Tag | Record | Content |
+|---:|---|---|
+| 1 | shape | `height`, `width`, `channels` (4 bytes each): the input shape, channels last |
+| 2 | set of targets | set k (4 bytes, 1 to `sets` - 1), size (4), encoding (1), 3 zero bytes, stride (4) |
+| 3 | name of a set | set k (4 bytes, 0 to `sets` - 1), then the name |
+| 4 | class names | set k (4 bytes), n (4 bytes, equal to the set's size), then n names, each a 2-byte length and the bytes |
+
+Set 0 is described by the header. Every set from 1 to `sets` - 1 has exactly one record with tag 2;
+a set has at most one name and one list of class names. Writers write the records in the order
+shape, then for each set: its description (sets 1 and above), its name, its class names.
 
 ## Chunk index
 
-`chunk_count` entries of 20 bytes, followed by a CRC-32 of the parameters block and all entries:
+`chunk_count` entries of 12 + 4 x (1 + `sets`) bytes (20 bytes in version 1), followed by a CRC-32
+of the parameters block, the metadata block and all entries:
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 8 | absolute file offset of the chunk |
-| 8 | 4 | size of the chunk's input stream in bytes |
-| 12 | 4 | size of the chunk's target stream in bytes |
-| 16 | 4 | CRC-32 of the chunk (both streams) |
+| 8 | 4 x (1 + `sets`) | size of each of the chunk's streams in bytes, inputs first |
+| 8 + 4 x (1 + `sets`) | 4 | CRC-32 of the chunk (all streams) |
 
-A chunk is its input stream immediately followed by its target stream.
+A chunk is its streams one after another, inputs first. The sizes include each stream's method
+byte, so every stream holds at least one byte.
 
 ## Streams
 
-The first byte of a stream is its method: 0 = stored, 1 = coded. The rest is the stream's values
-in byte planes: for the n values of the chunk (sample-major, feature-minor), plane k holds byte k
-(least significant first) of each value, and planes follow one another. A stored stream is exactly
-these `n * bytes_per_value` bytes. A coded stream holds them compressed as described below.
-Byte planes keep slowly varying bytes, such as float exponents, together.
+The first byte of a stream is its method: 0 = stored, 1 = binary range coder, 2 = rANS coder
+(version 2 only). The rest is the stream's values in byte planes: for the n values of the chunk
+(sample-major, feature-minor), plane k holds byte k (least significant first) of each value, and
+planes follow one another. A stored stream is exactly these `n * bytes_per_value` bytes. A coded
+stream holds them compressed as described below. Byte planes keep slowly varying bytes, such as
+float exponents, together.
 
-## The coder
+Writers choose a method per stream from the first chunk: rANS when its output there is at most 1%
+larger than the binary coder's (it decodes dense data such as photographs two to three times as
+fast), the binary coder otherwise. A chunk whose coded stream would not be smaller than the raw
+bytes stores it instead.
+
+## The binary range coder (method 1)
 
 Coded streams use an adaptive binary range coder (the one LZMA uses) with 11-bit probabilities:
 
@@ -120,18 +154,75 @@ the coded size of the first chunk for a few candidates (1 to 4, and every diviso
 per sample, with d - 1 and d + 1); for 28 x 28 images this finds the row length, so the pixel
 above is part of the context.
 
+## The rANS coder (method 2)
+
+Each byte is coded as two half-bytes (nibbles), the high one first, with adaptive frequency
+tables over 16 symbols and range asymmetric numeral systems (rANS) with 15-bit frequencies.
+
+**Contexts.** With p1, ps and ps1 as for the binary coder:
+
+```
+high context = (p1 >> 4) << 6 | (ps >> 4) << 2 | ps1 >> 6             (1024 tables)
+low context  = ((p1 >> 4) << 4 | ps >> 4) << 4 | high nibble          (4096 tables)
+```
+
+**Tables.** A table holds the cumulative frequencies c[0..14] (16-bit) and an update count u. Symbol
+k occupies the range [start(k), end(k)) of [0, 32768), with start(0) = 0, start(k) = c[k - 1],
+end(k) = c[k] for k < 15 and end(15) = 32768. A new table has c[k] = (k + 1) x 2048 and u = 0.
+Every table of the model is reset at the start of every plane. After coding symbol s in a table,
+with r = 3 + u:
+
+```
+for k in 0 .. 14:
+    target = k + 1               if k + 1 <= s
+             32768 - 15 + k      otherwise
+    c[k] += floor((target - c[k]) / 2^r)        (floor division, also for negative differences)
+if u < 3: u += 1
+```
+
+Every symbol keeps a frequency of at least 1.
+
+**States.** The decoder keeps two 32-bit states, x0 for high nibbles and x1 for low nibbles. The
+stream body starts with x0 and x1 (4 bytes each), followed by 16-bit words. To decode a nibble with
+state x and table t:
+
+```
+slot = x & 32767
+s = the number of k < 15 with c[k] <= slot
+x = (end(s) - start(s)) * (x >> 15) + slot - start(s)
+if x < 2^16: x = (x << 16) | next 16-bit word
+update t with s
+```
+
+The two nibbles of each byte are decoded in this order (high with x0, then low with x1), byte
+after byte and plane after plane. After the last byte the decoder must have read the whole stream,
+and both states must equal 2^16, the value the encoder starts from.
+
+**Encoding.** The encoder runs the model forwards to find each symbol's range, then codes the
+symbols in reverse order, each with the state of its kind, starting from x0 = x1 = 2^16: before
+coding a symbol of frequency f, while `x >= 2^17 * f` it emits the low 16 bits of x and shifts x
+right by 16; then `x = (x / f) * 32768 + x % f + start`. Words emitted later are placed earlier in
+the stream, and the final states are written in front of them.
+
 ## Validation
 
 Readers must check the magic, version, both metadata checksums and every chunk's checksum, that
-every chunk lies inside the file, that stored streams have exactly the expected size, and that
-class indices are below `target_size`. A coded stream cannot expand more than about 750 times
-(adapted probabilities stay between 15/2048 and 2033/2048, so every coded bit costs at least
-0.0106 bits), so the reference reader also rejects chunks claiming
-more than 4096 decoded bytes per stored byte, which keeps crafted files from requesting huge
-buffers.
+every chunk lies inside the file, that stored streams have exactly the expected size, that coded
+streams decode to exactly their raw size (for rANS, also the final states), that metadata records
+are well formed and describe every set, that the number of class names equals the set's size, and
+that class indices are below the set's size. The binary coder cannot expand a stored byte into
+more than about 750 decoded bytes (adapted probabilities stay between 15/2048 and 2033/2048, so
+every coded bit costs at least 0.0106 bits), and the rANS coder not into more than about 6050 (a
+nibble costs at least log2(32768 / 32753) bits), so the reference reader also rejects chunks
+claiming more than 8192 decoded bytes per stored byte, which keeps crafted files from requesting
+huge buffers.
 
-## Size on MNIST
+## Sizes
 
-The 60,000 training images and labels: 47.1 MB as IDX files, 190.6 MB as float32, 9.7 MB for the
-images alone with `gzip -9`, 7.9 MB with `xz -9`, and 7.8 MB as `.slettd`, which loads back bit for
-bit identical to `spingalett_load_idx()`.
+MNIST, the 60,000 training images and labels: 47.1 MB as IDX files, 190.6 MB as float32, 9.7 MB
+for the images alone with `gzip -9`, 7.9 MB with `xz -9`, and 7.8 MB as `.slettd` (binary coder,
+version 1), which loads back bit for bit identical to `spingalett_load_idx()`.
+
+CIFAR-10, the 50,000 training images and labels: 153.7 MB as binary batches, 616.4 MB as float32,
+141.7 MB for the batches with `gzip -9`, 116.3 MB with `xz -9`, and 112.1 MB as `.slettd` (rANS,
+version 2 with the shape and class names).

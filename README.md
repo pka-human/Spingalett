@@ -118,7 +118,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.8 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.9 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -450,15 +450,16 @@ the fine or coarse labels of CIFAR-100.
 `.slettd` is Spingalett's own data set format: binary, compact and loaded straight into a
 `SpingalettDataset`. By default every stream is stored in the smallest encoding that keeps all
 values exact (8-bit `q / 255` for image data, IEEE half, or float32; one-hot targets as class
-indices) and compressed with an adaptive context-model range coder that learns which earlier
-values predict the next, such as the pixel above in an image. Lossy FP16, BF16 and per-feature
-8-bit encodings are available on request. Files consist of independently decodable chunks with
-CRC-32 checksums, so they load in parallel with OpenMP and can be streamed into `train()` with only
-one chunk in memory:
+indices) and compressed with adaptive context models that learn which earlier values predict the
+next, such as the pixel above in an image: a binary range coder, or for dense data such as
+photographs an rANS coder of half-bytes that decodes two to three times as fast. Lossy FP16, BF16
+and per-feature 8-bit encodings are available on request. Files consist of independently
+decodable chunks with CRC-32 checksums, and can record the input shape, class names and further
+sets of targets for the same samples (CIFAR-100's fine and coarse labels, for example).
 
 ```c
 spingalett_save_dataset(&train_set, "mnist-train", NULL);         /* writes mnist-train.slettd */
-SpingalettDataset d;
+SpingalettDataset d = {0};
 spingalett_load_dataset("mnist-train.slettd", &d);                 /* bit-identical to train_set */
 
 SpingalettDatasetReader *r = spingalett_dataset_open("mnist-train.slettd", true);   /* shuffled */
@@ -467,16 +468,60 @@ train(.net = net, .training_mode = MODE_GENERATOR_FUNCTION, .generator = spingal
 spingalett_dataset_close(r);
 ```
 
-| MNIST training set (60,000 images and labels) | Size |
-|---|---:|
-| float32 in memory | 190.6 MB |
-| IDX files | 47.1 MB |
-| images only, `gzip -9` / `xz -9` | 9.7 / 7.9 MB |
-| `.slettd` (lossless) | 7.8 MB |
+A file can be used in three ways, chosen by its size against the memory at hand:
 
-`spingalett_load_dataset_from_memory()` reads a file image already in memory, and
-`Bin/DatasetTool` converts IDX and CSV files (`DatasetTool idx <images> <labels> out.slettd`) and
-prints a file's layout (`DatasetTool info file.slettd`). The format is specified in
+| Way | Memory | Use it when |
+|---|---|---|
+| `spingalett_load_dataset()`, then `train()` on the arrays | 4 bytes per value | the data fits in memory as float |
+| a reader with `.in_memory = true` (`spingalett_dataset_open_ex`) | 1 byte per 8-bit value, 2 per FP16 | it fits in its compact form; passes shuffle all samples, as with arrays |
+| a streaming reader (`spingalett_dataset_open`) | a few chunks of about 1 MB | it does not fit; passes shuffle the chunks, and the samples within each chunk |
+
+Loading decodes the chunks in parallel with OpenMP. Readers convert values to float a batch at a
+time. A streaming reader decodes the next chunks on a background thread when a processor is free
+for it, and otherwise decodes several chunks at a time on the OpenMP threads when it needs them,
+since a thread competing with the OpenMP threads for the processors would stall them; the samples
+come in the same order either way. With `spingalett_dataset_open_u8()`, 8-bit data already in
+memory trains through a reader without a float copy. One epoch of a small CNN on CIFAR-10 (two
+convolutions, 4 threads, Xeon @ 2.1 GHz, 4 vCPUs, medians):
+
+| Source of the 50,000 training images | Memory | Time per epoch |
+|---|---:|---:|
+| float arrays | 616 MB | 4.5 s |
+| `.slettd` in memory (8-bit) | 154 MB | 4.6 s |
+| `.slettd` streamed | about 10 MB | 5.5 s (0.8: 14.7 s) |
+
+Saving is parallel too: chunks are compressed side by side and written in order (CIFAR-10's
+training set: 2.2 s on 4 threads, loading 1.1 s against 2.7 s in 0.8).
+
+| Training set | float32 | Original files | `gzip -9` / `xz -9` of them | `.slettd` (lossless) |
+|---|---:|---:|---:|---:|
+| MNIST (60,000 images and labels) | 190.6 MB | 47.1 MB (IDX) | 9.7 / 7.9 MB (images only) | 7.8 MB |
+| CIFAR-10 (50,000 images and labels) | 616.4 MB | 153.7 MB (binary batches) | 141.7 / 116.3 MB | 112.1 MB |
+
+The shape and class names travel with a `SpingalettDataset` (`height`, `width`, `channels`,
+`class_names`, filled by the IDX and CIFAR readers and by `.slettd` files that record them; set
+names with `spingalett_dataset_set_class_names()`). Further sets of targets are saved through
+`DatasetSaveOptions.extra_targets` and loaded with `spingalett_load_dataset_targets(path, set, &d)`
+or `DatasetReaderOptions.target_set`; `spingalett_dataset_info()` and
+`spingalett_dataset_class_name()` describe a reader's file. `spingalett_load_dataset_from_memory()`
+reads a file image already in memory.
+
+`Bin/DatasetTool` converts data sets and inspects files:
+
+```sh
+DatasetTool idx train-images-idx3-ubyte train-labels-idx1-ubyte mnist-train.slettd
+DatasetTool csv data.csv 1 3 iris.slettd             # last column: a label of 3 classes
+DatasetTool cifar cifar10-train.slettd data_batch_{1,2,3,4,5}.bin
+DatasetTool cifar cifar100-train.slettd train.bin --cifar100      # fine and coarse labels
+DatasetTool images photos/ photos.slettd --size 64x64 --rgb       # one subfolder per class
+DatasetTool info cifar10-train.slettd                # encodings, shape, sets of targets, class names
+DatasetTool verify cifar10-train.slettd              # decodes every chunk, checks every checksum
+```
+
+`cifar` reads the class names from `batches.meta.txt` (CIFAR-10) or `fine_label_names.txt` and
+`coarse_label_names.txt` (CIFAR-100) next to the batches when they are there. `images` reads PNG,
+JPEG, BMP, TGA, GIF, PSD, HDR, PIC and PNM files (with stb_image), names the classes after the
+subfolders, and resizes by area averaging. The format is specified in
 [docs/DatasetFormat.md](docs/DatasetFormat.md).
 
 ### Inference
@@ -630,6 +675,19 @@ pixels or samples against weight rows interleaved for those instructions, every 
 for the tile. The release packages carry these kernels and choose them at run time (see
 [Performance](#performance) for what they gain).
 
+A model made by the library (`spingalett_model_from_network()`, `spingalett_model_load()`,
+`spingalett_model_from_memory()`) prepares what batched prediction runs on once, on the first call
+that needs it: FP16 and BF16 weights expanded to float, INT4 and INT2 rows unpacked to bytes,
+integer rows interleaved for the tiles. It keeps them, and the last call's buffers, until
+`spingalett_model_free()`, so a call on a single sample costs about what `spingalett_model_run()`
+does (4 to 12 us for a 784-256-128-10 MLP in any precision, 0.2 us for a tiny one). The prepared
+forms take memory next to the image: up to the float size of FP16 layers and four times the packed
+size of INT2 layers. A model stays safe to use from several threads at once. Models filled in by
+`spingalett_model_init()` over an image of your own prepare on every call. Float layers on one
+sample or a few compute through dot products rather than the batched kernels, so their outputs can
+differ in the last bits from those of the same samples in a larger batch; integer layers compute
+exactly what `spingalett_model_run()` computes, in batches of any size.
+
 Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
 (`spingalett_model_evaluate()`):
 
@@ -760,36 +818,52 @@ hidden dense layer. `Examples/benchmark_pytorch.py` runs the same workloads in P
 Run them with `Bin/Benchmark [threads]` and `python Examples/benchmark_pytorch.py [threads]`.
 
 Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.10 GHz, Sapphire Rapids, AVX-512), medians
-of three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.8 is
+of three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.9 is
 built with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the build from
-PyPI, run on the CPU (Intel MKL and oneDNN):
+PyPI, run on the CPU (Intel MKL and oneDNN). Spingalett 0.8, measured in the same runs, differs
+from 0.9 by less than 8% on each of these workloads, within the VM's noise (a targeted comparison
+of the convolutional network's inference finds 0.9 2 to 4% faster on one thread, the same on four):
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
-| Spingalett | 1 | 18,000 | 15,300 | 50,300 |
-| PyTorch | 1 | 15,500 | 6,060 | 40,000 |
-| Spingalett (OpenMP) | 4 | 61,800 | 33,400 | 170,000 |
-| PyTorch | 4 | 47,800 | 10,400 | 106,200 |
+| Spingalett | 1 | 25,100 | 18,200 | 71,700 |
+| PyTorch | 1 | 20,600 | 7,690 | 50,600 |
+| Spingalett (OpenMP) | 4 | 85,400 | 44,900 | 237,000 |
+| PyTorch | 4 | 63,100 | 14,900 | 160,300 |
 
 | Convolutional network | Threads | Training | Inference |
 |---|---:|---:|---:|
-| Spingalett | 1 | 1,530 | 4,960 |
-| PyTorch | 1 | 1,190 | 1,460 |
-| Spingalett (OpenMP) | 4 | 5,450 | 18,300 |
-| PyTorch | 4 | 3,220 | 4,480 |
+| Spingalett | 1 | 2,020 | 6,790 |
+| PyTorch | 1 | 1,640 | 1,990 |
+| Spingalett (OpenMP) | 4 | 7,530 | 26,500 |
+| PyTorch | 4 | 4,940 | 6,160 |
 | **With batch normalization** | | | |
-| Spingalett | 1 | 1,230 | 4,940 |
-| PyTorch | 1 | 850 | 1,100 |
-| Spingalett (OpenMP) | 4 | 4,910 | 19,800 |
-| PyTorch | 4 | 2,400 | 3,500 |
+| Spingalett | 1 | 1,630 | 7,170 |
+| PyTorch | 1 | 1,150 | 1,500 |
+| Spingalett (OpenMP) | 4 | 6,530 | 28,400 |
+| PyTorch | 4 | 3,190 | 4,890 |
 
-Spingalett trains the convolutional network 1.3 to 1.7 times as fast as PyTorch and runs it 3.4 to
-4.1 times as fast. With batch normalization the gap widens to 1.5 to 2 times and 4.5 to 5.6 times:
-normalization slows Spingalett's training by 10 to 20% (PyTorch's by 26 to 29%) and its inference
+Spingalett trains the convolutional network 1.2 to 1.5 times as fast as PyTorch and runs it 3.4 to
+4.3 times as fast. With batch normalization the gap widens to 1.4 to 2 times and 4.8 to 5.8 times:
+normalization slows Spingalett's training by 13 to 19% (PyTorch's by 30 to 35%) and its inference
 not at all, since it runs in the convolution's epilogue. For the fully connected network
-Spingalett trains mini-batches 2.5 to 3.2 times as fast, infers 1.3 to 1.6 times as fast and trains
-full batches 1.2 to 1.3 times as fast. The gap is largest for mini-batches, where fixed per-step
+Spingalett trains mini-batches 2.4 to 3 times as fast, infers 1.4 to 1.5 times as fast and trains
+full batches 1.2 to 1.35 times as fast. The gap is largest for mini-batches, where fixed per-step
 costs weigh most.
+
+0.9 took its time out of the calls these workloads do not measure: small batches and single
+samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
+[CHANGELOG](CHANGELOG.md) for more):
+
+| Call | 0.8 | 0.9 |
+|---|---:|---:|
+| `spingalett_model_predict()`, one sample, 784-256-128-10 MLP, FP32 / FP16 / INT8 | 63 / 403 / 10.5 us | 12 / 8 / 4.4 us |
+| the same, a batch of 1024, FP16 / INT8, per sample | 2.04 / 0.54 us | 0.92 / 0.31 us |
+| training that MLP with batches of 2 / 8, 4096 samples | 0.57 / 0.093 s | 0.33 / 0.076 s |
+| loading a 924,930-parameter FP32 network / INT8 network from memory | 26 / 13 ms | 8.3 / 1.3 ms |
+| saving it in FP32 / FP16 | 10.8 / 15.2 ms | 2.5 / 1.4 ms |
+| an epoch of a small CNN on CIFAR-10 streamed from a `.slettd` file (from float arrays: 4.7 / 4.5 s) | 14.7 s | 5.5 s |
+| Python `forward()` of one sample through that MLP | 69 us | 22 us |
 
 Deployment models of the CIFAR-10 network of `Examples/CIFAR10.c` (551K parameters, six
 convolutions with batch normalization folded in), `spingalett_model_predict()` on 4,000 test
@@ -843,15 +917,15 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.8; the C API may still change between minor versions (see
+Spingalett is at version 0.9; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.8`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.9`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
 engine and model format versions 3 to 5 are meant to stay stable from here on.
 
-Planned work, roughly in order:
+Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.9: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
+- 0.10: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
   backend
 - 1.0: API freeze, C++ wrapper
 - Later: CUDA/cuDNN backend, quantization-aware training, NEON kernels for training, further
@@ -863,7 +937,8 @@ Bug reports and pull requests are welcome. Please make sure the test suite passe
 (`ctest --test-dir Build --output-on-failure`) for both a minimal build and a build with
 `-DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON`, and add tests for new behaviour. CI runs the
 suite with GCC and Clang, without `-march=native` (portable kernels) and under AddressSanitizer
-and UndefinedBehaviorSanitizer.
+and UndefinedBehaviorSanitizer. [AGENTS.md](AGENTS.md) summarizes the layout, the checks and the
+invariants the tests enforce, for coding agents and new contributors alike.
 
 ## License
 
