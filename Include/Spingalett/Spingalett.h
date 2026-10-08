@@ -521,6 +521,25 @@ SPINGALETT_API NeuralNetwork *spingalett_import_onnx(const char *path);
 SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
 
 /*
+ * PyTorch weights into a network of the same architecture: a state dict saved with torch.save
+ * (.pt, .pth; also a checkpoint dictionary holding one under "state_dict", "model_state_dict" or
+ * "model") or a .safetensors file. The pickle inside torch.save files is read without running any
+ * of it: only dictionaries of tensors are recognized. The tensors of each module (the name up to
+ * its last dot: "features.0" for "features.0.weight") go, module by module, to the layers with
+ * parameters in their order: dense layers take weight [out, in] and bias, convolutions weight
+ * [out, in / groups, kh, kw] and bias, batch normalizations weight, bias, running_mean and
+ * running_var. The modules come in the order of the state dict (torch.save files keep it) or, in
+ * safetensors files, which sort names, in natural order of their names ("2" before "10", as
+ * nn.Sequential numbers them); `modules` (module_count names, or NULL) gives the order explicitly.
+ * Weights are reordered for channels-last data as spingalett_import_onnx() does. On error (a shape
+ * that does not fit, names the file does not have) the network is unchanged.
+ */
+SPINGALETT_API bool spingalett_load_pytorch(NeuralNetwork *net, const char *path, const char *const *modules,
+                                            uint32_t module_count);
+SPINGALETT_API bool spingalett_load_pytorch_from_memory(NeuralNetwork *net, const void *data, size_t size,
+                                                        const char *const *modules, uint32_t module_count);
+
+/*
  * Deployment. A SpingalettModel (Spingalett.Inference.h) is a read-only network that computes in the
  * precision its weights are stored in: INT8, INT4 and INT2 layers use integer kernels. The functions
  * below create models that own their image; release them with spingalett_model_free. Models made by

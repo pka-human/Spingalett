@@ -602,6 +602,9 @@ _model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
 _import_onnx = _bind("spingalett_import_onnx", _NetPtr, [c_char_p])
 _import_onnx_from_memory = _bind("spingalett_import_onnx_from_memory", _NetPtr, [c_char_p, c_size_t])
+_load_pytorch = _bind("spingalett_load_pytorch", c_bool, [_NetPtr, c_char_p, POINTER(c_char_p), c_uint32])
+_load_pytorch_from_memory = _bind("spingalett_load_pytorch_from_memory", c_bool,
+                                  [_NetPtr, c_char_p, c_size_t, POINTER(c_char_p), c_uint32])
 _free = _bind("free_network", None, [_NetPtr])
 _print_parameters = _bind("print_parameters", None, [_NetPtr])
 
@@ -1533,6 +1536,45 @@ class Network:
         finally:
             module.train(was_training)
         return cls.from_onnx(buffer.getvalue())
+
+    def load_pytorch(self, source, modules: Optional[Sequence[str]] = None) -> "Network":
+        """Copies PyTorch weights into this network, which must have the same layers: a state dict
+        (``module.state_dict()``, of tensors or NumPy arrays), a torch.save file (.pt, .pth) or a
+        .safetensors file, as a path or bytes. The tensors of each module go to the layers with
+        parameters in order (see spingalett_load_pytorch()); ``modules`` names the modules in that
+        order when the source's order differs. Filters and dense weights are reordered for
+        channels-last data. The network is unchanged on error."""
+        names = None
+        if isinstance(source, dict):
+            import json, struct
+            header, chunks, offset, order = {}, [], 0, []
+            for key, value in source.items():
+                if key.endswith("num_batches_tracked"):
+                    continue
+                if hasattr(value, "detach"):            # a torch tensor
+                    value = value.detach().cpu().float().numpy()
+                array = np.ascontiguousarray(value, dtype="<f4")
+                header[key] = {"dtype": "F32", "shape": list(array.shape), "data_offsets": [offset, offset + array.nbytes]}
+                chunks.append(array.tobytes())
+                offset += array.nbytes
+                module = key.rsplit(".", 1)[0] if "." in key else ""
+                if module not in order:
+                    order.append(module)
+            text = json.dumps(header).encode()
+            data = struct.pack("<Q", len(text)) + text + b"".join(chunks)
+            names = list(modules) if modules is not None else order
+            source = data
+        elif modules is not None:
+            names = list(modules)
+        encoded = (c_char_p * max(1, len(names or ())))(*[n.encode() for n in names or ()])
+        count = len(names) if names is not None else 0
+        array = encoded if names is not None else None
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            _call(_load_pytorch_from_memory, self._net, data, len(data), array, count)
+        else:
+            _call(_load_pytorch, self._net, _encode_path(source), array, count)
+        return self
 
     # ---- deployment
     def to_model(self, precision: Precision = Precision.INT8) -> "Model":

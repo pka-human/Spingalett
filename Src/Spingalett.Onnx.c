@@ -150,13 +150,30 @@ static void read_tensor(Pb r, TensorRef *t) {
     }
 }
 
+/* Elements of the shape; UINT64_MAX when the product overflows (no file holds that many). */
 static uint64_t tensor_count(const TensorRef *t) {
     uint64_t n = 1;
-    for (int d = 0; d < t->ndims && d < MAX_DIMS; d++) n *= t->dims[d] < 0 ? 0u : (uint64_t)t->dims[d];
+    for (int d = 0; d < t->ndims && d < MAX_DIMS; d++) {
+        uint64_t e = t->dims[d] < 0 ? 0u : (uint64_t)t->dims[d];
+        if (e && n > UINT64_MAX / e) return UINT64_MAX;
+        n *= e;
+    }
     return n;
 }
 
 static float half_to_float(uint16_t h) { return spingalett_fp16_to_float(h); }
+
+/* Elements the tensor's data can hold at most (raw: its bytes over the element size; typed fields:
+   one byte each at least), so that a shape larger than the file is rejected before allocating. */
+static uint64_t tensor_capacity(const TensorRef *t) {
+    if (t->has_raw) {
+        uint64_t size = t->type == ONNX_FLOAT || t->type == ONNX_INT32 ? 4u
+                      : t->type == ONNX_INT64 || t->type == ONNX_DOUBLE ? 8u
+                      : t->type == ONNX_FLOAT16 || t->type == ONNX_BFLOAT16 ? 2u : 0u;
+        return size ? (uint64_t)(t->raw.end - t->raw.p) / size : 0u;
+    }
+    return t->typed.ok ? (uint64_t)(t->typed.end - t->typed.p) : 0u;
+}
 
 /* The tensor's values as floats (count of them); false when the type is not numeric or the data is
    short. */
@@ -759,6 +776,8 @@ static bool convert_constant(Importer *im, const Node *n) {
     }
     TensorRef t;
     read_tensor(a->t, &t);
+    if (t.ndims > MAX_DIMS || tensor_count(&t) > tensor_capacity(&t))
+        return fail(im, "ONNX import: Constant node '%.*s' holds less data than its shape needs%.*s", n->name, (Str){"", 0});
     Value *v = add_value(im, n->outputs[0]);
     if (!v) return false;
     v->constant = true;
@@ -907,6 +926,10 @@ NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size)
         if (f != 5 || w != WIRE_BYTES) { pb_skip(&g, w); continue; }
         TensorRef t;
         read_tensor(pb_bytes(&g), &t);
+        if (t.ndims > MAX_DIMS || (!t.external && tensor_count(&t) > tensor_capacity(&t))) {
+            ok = fail(&im, "ONNX import: initializer '%.*s' holds less data than its shape needs%.*s", t.name, (Str){"", 0});
+            break;
+        }
         Value *v = add_value(&im, t.name);
         ok = v != NULL;
         if (!ok) break;

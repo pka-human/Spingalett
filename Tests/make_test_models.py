@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""Writes the ONNX models of the `onnx` test group into Tests/Data, exported from PyTorch, with sample
-inputs and PyTorch's outputs for them:
+"""Writes the PyTorch models of the `onnx` test group into Tests/Data, with sample inputs and
+PyTorch's outputs for them:
 
-    python Tests/make_onnx_tests.py        # needs torch (and onnxscript for the newer exporter)
+    python Tests/make_test_models.py       # needs torch, onnxscript (the newer exporter) and safetensors
 
-For each model NAME: NAME.onnx, and NAME.bin holding "SPGT", then as 32-bit little-endian integers the
-sample count, the floats per input and per output, then the inputs (channels last, as the imported
-network reads them) and the expected outputs as floats. The models are small, seeded and fixed, so
-the files only change when this script does.
+ONNX models exported from PyTorch: NAME.onnx. State dicts: torch_cnn.pt (torch.save) and
+torch_cnn.safetensors, of the network the test builds by hand. For each, NAME.bin holds "SPGT", then
+as 32-bit little-endian integers the sample count, the floats per input and per output, then the
+inputs (channels last, as Spingalett reads them) and the expected outputs as floats. The models are
+small, seeded and fixed, so the files only change when this script does.
 """
 import io
 import os
@@ -76,15 +77,42 @@ def models():
     yield "onnx_unsupported", Upsampled(), (2, 4, 4), dict(dynamo=False)
 
 
+class Weights(nn.Module):
+    """The network of the state dict tests: modules numbered past 10, a convolution without bias."""
+
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.BatchNorm2d(8), nn.ReLU(), nn.MaxPool2d(2),
+                                  nn.Conv2d(8, 8, 3, padding=1, groups=4, bias=False), nn.BatchNorm2d(8), nn.ReLU(),
+                                  *[nn.Identity() for _ in range(5)], nn.Flatten(), nn.Linear(8 * 4 * 4, 16),
+                                  nn.Tanh(), nn.Linear(16, 4))
+
+    def forward(self, x):
+        return self.body(x)
+
+
+def write_expected(name, x, y):
+    inputs = x.numpy().transpose(0, 2, 3, 1) if x.dim() == 4 else x.numpy()
+    outputs = y.numpy().reshape(x.shape[0], -1)
+    with open(os.path.join(OUT, name + ".bin"), "wb") as f:
+        f.write(b"SPGT" + struct.pack("<3I", x.shape[0], inputs[0].size, outputs.shape[1]))
+        f.write(np.ascontiguousarray(inputs, dtype="<f4").tobytes())
+        f.write(np.ascontiguousarray(outputs, dtype="<f4").tobytes())
+
+
+def randomize_statistics(model):
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):           # statistics other than the initial ones
+            m.running_mean.uniform_(-0.5, 0.5)
+            m.running_var.uniform_(0.5, 2.0)
+            m.weight.data.uniform_(0.5, 1.5)
+            m.bias.data.uniform_(-0.2, 0.2)
+
+
 def main():
     for name, model, shape, options in models():
         model.eval()
-        for m in model.modules():
-            if isinstance(m, nn.BatchNorm2d):           # statistics other than the initial ones
-                m.running_mean.uniform_(-0.5, 0.5)
-                m.running_var.uniform_(0.5, 2.0)
-                m.weight.data.uniform_(0.5, 1.5)
-                m.bias.data.uniform_(-0.2, 0.2)
+        randomize_statistics(model)
         x = torch.rand(4, *shape)
         with torch.no_grad():
             y = model(x)
@@ -92,13 +120,20 @@ def main():
         torch.onnx.export(model, (x[:1],), buffer, **options)
         with open(os.path.join(OUT, name + ".onnx"), "wb") as f:
             f.write(buffer.getvalue())
-        inputs = x.numpy().transpose(0, 2, 3, 1) if x.dim() == 4 else x.numpy()
-        outputs = y.numpy().reshape(4, -1)
-        with open(os.path.join(OUT, name + ".bin"), "wb") as f:
-            f.write(b"SPGT" + struct.pack("<3I", 4, inputs[0].size, outputs.shape[1]))
-            f.write(np.ascontiguousarray(inputs, dtype="<f4").tobytes())
-            f.write(np.ascontiguousarray(outputs, dtype="<f4").tobytes())
+        write_expected(name, x, y)
         print(f"{name}: {len(buffer.getvalue())} bytes")
+
+    from safetensors.torch import save_file
+    torch.manual_seed(11)
+    model = Weights().eval()
+    randomize_statistics(model)
+    x = torch.rand(3, 3, 8, 8)
+    with torch.no_grad():
+        y = model(x)
+    torch.save(model.state_dict(), os.path.join(OUT, "torch_cnn.pt"))
+    save_file({k: v.contiguous() for k, v in model.state_dict().items()}, os.path.join(OUT, "torch_cnn.safetensors"))
+    write_expected("torch_cnn", x, y)
+    print("torch_cnn: .pt and .safetensors")
 
 
 if __name__ == "__main__":

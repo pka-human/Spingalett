@@ -3803,6 +3803,67 @@ static void onnx_models(void) {
     free(model);
 }
 
+/* PyTorch state dicts (torch.save and safetensors, Tests/make_test_models.py) in a network built to
+   match compute what PyTorch computed; a network of other layers is refused and left unchanged. */
+static NeuralNetwork *torch_cnn(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    max_pool2d(.net = net, .kernel = 2);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .groups = 4, .act_func = ACT_NONE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    layer(.net = net, .neurons_amount = 16, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 4, .act_func = ACT_NONE);
+    return net;
+}
+
+static void pytorch_weights(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/torch_cnn.bin", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *data = read_file(path, &size);
+    CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+    if (!data) return;
+    uint32_t n = rd32(data + 4), in = rd32(data + 8), out = rd32(data + 12);
+    const float *x = (const float *)(const void *)(data + 16), *expected = x + (size_t)n * in;
+    static const char *const files[] = {"torch_cnn.pt", "torch_cnn.safetensors"};
+    for (int f = 0; f < 2; f++) {
+        NeuralNetwork *net = torch_cnn();
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, files[f]);
+        CHECK(spingalett_load_pytorch(net, path, NULL, 0), "%s: %s", files[f], spingalett_last_error_message());
+        float y[64], worst = 0.0f;
+        predict(.net = net, .inputs = x, .sample_count = n, .outputs = y);
+        for (size_t i = 0; i < (size_t)n * out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
+        CHECK(worst < 1e-5f && in == spingalett_input_size(net), "%s: outputs differ from PyTorch's by %g", files[f], worst);
+        printf("  %-22s |outputs - PyTorch| %.1e\n", files[f], worst);
+        free_network(net);
+    }
+    /* explicit module names, in another order: refused, as is a network of other layers */
+    NeuralNetwork *net = torch_cnn();
+    const float before = net->weights[0];
+    static const char *const wrong[] = {"body.13", "body.0", "body.1", "body.4", "body.5", "body.15"};
+    snprintf(path, sizeof path, "%s/torch_cnn.pt", SPINGALETT_TEST_DATA_DIR);
+    CHECK(!spingalett_load_pytorch(net, path, wrong, 6) && net->weights[0] == before, "modules in the wrong order accepted");
+    static const char *const right[] = {"body.0", "body.1", "body.4", "body.5", "body.13", "body.15"};
+    CHECK(spingalett_load_pytorch(net, path, right, 6), "modules named in order: %s", spingalett_last_error_message());
+    layer(.net = net, .neurons_amount = 2);
+    CHECK(!spingalett_load_pytorch(net, path, NULL, 0) && strstr(spingalett_last_error_message(), "layer 8"),
+          "a network with another layer: %s", spingalett_last_error_message());
+    free_network(net);
+    /* truncated files never crash and never load */
+    unsigned char *file = read_file(path, &size);
+    int accepted = 0;
+    for (long cut = 0; file && cut < size; cut += 61) {
+        NeuralNetwork *t = torch_cnn();
+        accepted += spingalett_load_pytorch_from_memory(t, file, (size_t)cut, NULL, 0);
+        free_network(t);
+    }
+    CHECK(accepted == 0, "%d truncated state dicts loaded", accepted);
+    free(file);
+    free(data);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "export-headers")) {
         spingalett_set_verbose(false);
@@ -3873,8 +3934,9 @@ int main(int argc, char **argv) {
         graph_validation();
     }
     if (!*only || !strcmp(only, "onnx")) {
-        printf("[ONNX import]\n");
+        printf("[ONNX import, PyTorch weights]\n");
         onnx_models();
+        pytorch_weights();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");
