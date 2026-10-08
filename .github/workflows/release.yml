@@ -59,7 +59,7 @@ jobs:
           { echo "version=$version"; echo "ref=$ref"; echo "publish=$publish"; echo "binaries=$binaries"; } >> "$GITHUB_OUTPUT"
 
   package:
-    needs: version
+    needs: [version, shaders]
     if: needs.version.outputs.binaries == 'true'
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -82,6 +82,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.ref }}
+
+      # the shaders, compiled once with a recent glslc (bfloat16 on the matrix units needs one)
+      - uses: actions/download-artifact@v4
+        with:
+          name: spirv
+          path: spirv
 
       - name: MSYS2 (UCRT64 GCC)
         if: runner.os == 'Windows'
@@ -146,7 +152,7 @@ jobs:
         run: |
           root=$PWD; [ "$RUNNER_OS" = Windows ] && root=$(cygpath -m "$PWD")    # native CMake, MSYS shell
           args=(-DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF "-DCMAKE_C_FLAGS=${{ matrix.flags }}"
-                -DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE" -DSPINGALETT_VULKAN=ON)
+                -DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE" -DSPINGALETT_VULKAN=ON -DSPINGALETT_SPIRV_DIR="$root/spirv")
           case "${{ matrix.name }}" in
             macos-*)   omp="$PWD/libomp"
                        args+=("-DSPINGALETT_VULKAN_INCLUDE=$(brew --prefix vulkan-headers)/include")
@@ -268,22 +274,31 @@ jobs:
 
   # manylinux wheels: the library built in the manylinux 2.28 images (glibc 2.28, any Linux of 2018
   # on), libgomp vendored by auditwheel; x86-64 builds choose AVX2 or AVX-512 kernels at run time
-  # The shaders as SPIR-V (the same for every platform), for the manylinux containers, which have no
-  # glslc
+  # The shaders as SPIR-V (the same for every platform), compiled once for every package and wheel:
+  # with Arch Linux's shaderc, recent enough for the bfloat16 kernel (Ubuntu's is not, and the
+  # manylinux containers have none); each is checked by spirv-val
   shaders:
     needs: version
     if: needs.version.outputs.binaries == 'true'
     runs-on: ubuntu-24.04
+    container: archlinux:latest
     steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed cmake ninja gcc shaderc vulkan-headers spirv-tools
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.ref }}
       - name: Compile
         run: |
-          sudo apt-get update && sudo apt-get install -y glslc libvulkan-dev
-          cmake -S . -B Build -DSPINGALETT_VULKAN=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF
+          glslc --version
+          cmake -S . -B Build -G Ninja -DSPINGALETT_VULKAN=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF
           cmake --build Build --target spingalett_shaders
           mkdir spirv && cp Build/Gpu/*.spv.inc spirv/
+          # every kernel compiled (an empty module would leave the matrix units out of the packages)
+          for f in spirv/*.spv.inc; do grep -q 0x07230203 "$f" || { echo "::error::$f is empty"; exit 1; }; done
+          for f in Src/Gpu/Shaders/*.comp; do
+            glslc --target-env=vulkan1.2 -O -o shader.spv "$f" && spirv-val --target-env vulkan1.2 shader.spv
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: spirv

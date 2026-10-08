@@ -273,7 +273,9 @@ static bool open_device(void) {
     CoopFeatures coop = {.sType = COOP_FEATURES_TYPE};
     Bf16Features bf16 = {.sType = BF16_FEATURES_TYPE};
     VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    if (has_extension(extensions, extension_count, "VK_KHR_cooperative_matrix") &&
+    /* (a build whose glslc could not compile the kernel holds an empty module for it) */
+    if (spg_kernel_spirv_size[SPG_KERNEL_gemm_mma] > 20u &&
+        has_extension(extensions, extension_count, "VK_KHR_cooperative_matrix") &&
         has_extension(extensions, extension_count, "VK_KHR_shader_bfloat16")) {
         coop.pNext = &bf16;
         bf16.pNext = &have12;
