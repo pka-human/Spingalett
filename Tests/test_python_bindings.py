@@ -568,6 +568,51 @@ try:
 except sg.SpingalettError:
     pass
 
+# ONNX files and PyTorch weights (the files of Tests/Data), and PyTorch itself where it is installed
+data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data")
+with open(os.path.join(data_dir, "onnx_resnet.bin"), "rb") as f:
+    head = np.frombuffer(f.read(16), dtype="<u4")
+    count, n_in, n_out = int(head[1]), int(head[2]), int(head[3])
+    xo = np.frombuffer(f.read(count * n_in * 4), dtype="<f4").reshape(count, n_in)
+    yo = np.frombuffer(f.read(count * n_out * 4), dtype="<f4").reshape(count, n_out)
+onnx_net = sg.Network.from_onnx(os.path.join(data_dir, "onnx_resnet.onnx"))
+check(np.abs(onnx_net.forward(xo) - yo).max() < 1e-5 and onnx_net.loss == sg.Loss.CROSS_ENTROPY, "ONNX import")
+with open(os.path.join(data_dir, "onnx_resnet.onnx"), "rb") as f:
+    check(np.array_equal(sg.Network.from_onnx(f.read()).forward(xo), onnx_net.forward(xo)), "ONNX import from bytes")
+try:
+    sg.Network.from_onnx(os.path.join(data_dir, "onnx_unsupported.onnx")); check(False, "Resize imported")
+except sg.SpingalettError as e:
+    check("Resize" in str(e), f"unsupported operator message: {e}")
+torch_like = sg.Network(sg.Loss.MSE, [sg.Input(8, 8, 3), sg.Conv2D(8, 3, padding=1, activation=sg.Activation.NONE),
+                                      sg.BatchNorm(sg.Activation.RELU), sg.MaxPool2D(2),
+                                      sg.Conv2D(8, 3, padding=1, groups=4, activation=sg.Activation.NONE),
+                                      sg.BatchNorm(sg.Activation.RELU), sg.Layer(16, sg.Activation.TANH),
+                                      sg.Layer(4, sg.Activation.NONE)])
+with open(os.path.join(data_dir, "torch_cnn.bin"), "rb") as f:
+    head = np.frombuffer(f.read(16), dtype="<u4")
+    count, n_in, n_out = int(head[1]), int(head[2]), int(head[3])
+    xt = np.frombuffer(f.read(count * n_in * 4), dtype="<f4").reshape(count, n_in)
+    yt = np.frombuffer(f.read(count * n_out * 4), dtype="<f4").reshape(count, n_out)
+for name in ("torch_cnn.pt", "torch_cnn.safetensors"):
+    torch_like.load_pytorch(os.path.join(data_dir, name))
+    check(np.abs(torch_like.forward(xt) - yt).max() < 1e-5, f"PyTorch weights from {name}")
+try:
+    import torch
+except ImportError:
+    torch = None
+if torch is not None:
+    torch.manual_seed(3)
+    tm = torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.BatchNorm2d(8), torch.nn.ReLU(),
+                             torch.nn.Flatten(), torch.nn.Linear(8 * 6 * 6, 5), torch.nn.Softmax(1)).eval()
+    tx = torch.rand(4, 3, 6, 6)
+    with torch.no_grad():
+        ty = tm(tx).numpy()
+    hwc = tx.numpy().transpose(0, 2, 3, 1).reshape(4, -1)
+    check(np.abs(sg.Network.from_torch(tm, tx[:1]).forward(hwc) - ty).max() < 1e-5, "Network.from_torch")
+    same = sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Input(6, 6, 3), sg.Conv2D(8, 3, padding=1, activation=sg.Activation.NONE),
+                                              sg.BatchNorm(sg.Activation.RELU), sg.Layer(5, sg.Activation.SOFTMAX)])
+    check(np.abs(same.load_pytorch(tm.state_dict()).forward(hwc) - ty).max() < 1e-5, "load_pytorch(state_dict)")
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")
