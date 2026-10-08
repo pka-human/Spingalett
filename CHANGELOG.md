@@ -87,9 +87,9 @@ Xeon @ 2.1 GHz with AVX-512, 4 threads unless noted.
   (fewer OpenMP threads than processors), and otherwise several chunks at a time on the OpenMP
   threads when they are needed: a thread competing with the OpenMP threads for the processors
   stalls their barriers. Chunks stay in their compact form until a batch is read, and batches
-  convert to float on the OpenMP threads. One epoch of a small CNN on CIFAR-10 (4 threads, Xeon @
-  2.1 GHz, 4 vCPUs) streamed from a `.slettd` file: 10.3 s before, 6.4 s now (5.4 s from float
-  arrays, 5.1 s from the file in memory).
+  convert to float on the OpenMP threads. One epoch of a small CNN on CIFAR-10 streamed from a
+  `.slettd` file: 14.7 s with 0.8, 5.5 s now (4.5 s from float arrays, 4.6 s from the file in
+  memory).
 - A reader's shuffled order is drawn from a seed taken when it opens and from the number of the
   pass or chunk, so it is the same with or without a background thread and on any number of
   threads; it differs from 0.8's order for the same `spingalett_seed()`.

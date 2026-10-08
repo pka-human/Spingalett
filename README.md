@@ -486,12 +486,12 @@ convolutions, 4 threads, Xeon @ 2.1 GHz, 4 vCPUs, medians):
 
 | Source of the 50,000 training images | Memory | Time per epoch |
 |---|---:|---:|
-| float arrays | 616 MB | 5.4 s |
-| `.slettd` in memory (8-bit) | 154 MB | 5.1 s |
-| `.slettd` streamed | about 10 MB | 6.4 s |
+| float arrays | 616 MB | 4.5 s |
+| `.slettd` in memory (8-bit) | 154 MB | 4.6 s |
+| `.slettd` streamed | about 10 MB | 5.5 s (0.8: 14.7 s) |
 
 Saving is parallel too: chunks are compressed side by side and written in order (CIFAR-10's
-training set: 2.2 s on 4 threads, loading 1.3 s).
+training set: 2.2 s on 4 threads, loading 1.1 s against 2.7 s in 0.8).
 
 | Training set | float32 | Original files | `gzip -9` / `xz -9` of them | `.slettd` (lossless) |
 |---|---:|---:|---:|---:|
@@ -818,36 +818,52 @@ hidden dense layer. `Examples/benchmark_pytorch.py` runs the same workloads in P
 Run them with `Bin/Benchmark [threads]` and `python Examples/benchmark_pytorch.py [threads]`.
 
 Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.10 GHz, Sapphire Rapids, AVX-512), medians
-of three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.8 is
+of three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.9 is
 built with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the build from
-PyPI, run on the CPU (Intel MKL and oneDNN):
+PyPI, run on the CPU (Intel MKL and oneDNN). Spingalett 0.8, measured in the same runs, differs
+from 0.9 by less than 8% on each of these workloads, within the VM's noise (a targeted comparison
+of the convolutional network's inference finds 0.9 2 to 4% faster on one thread, the same on four):
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
-| Spingalett | 1 | 18,000 | 15,300 | 50,300 |
-| PyTorch | 1 | 15,500 | 6,060 | 40,000 |
-| Spingalett (OpenMP) | 4 | 61,800 | 33,400 | 170,000 |
-| PyTorch | 4 | 47,800 | 10,400 | 106,200 |
+| Spingalett | 1 | 25,100 | 18,200 | 71,700 |
+| PyTorch | 1 | 20,600 | 7,690 | 50,600 |
+| Spingalett (OpenMP) | 4 | 85,400 | 44,900 | 237,000 |
+| PyTorch | 4 | 63,100 | 14,900 | 160,300 |
 
 | Convolutional network | Threads | Training | Inference |
 |---|---:|---:|---:|
-| Spingalett | 1 | 1,530 | 4,960 |
-| PyTorch | 1 | 1,190 | 1,460 |
-| Spingalett (OpenMP) | 4 | 5,450 | 18,300 |
-| PyTorch | 4 | 3,220 | 4,480 |
+| Spingalett | 1 | 2,020 | 6,790 |
+| PyTorch | 1 | 1,640 | 1,990 |
+| Spingalett (OpenMP) | 4 | 7,530 | 26,500 |
+| PyTorch | 4 | 4,940 | 6,160 |
 | **With batch normalization** | | | |
-| Spingalett | 1 | 1,230 | 4,940 |
-| PyTorch | 1 | 850 | 1,100 |
-| Spingalett (OpenMP) | 4 | 4,910 | 19,800 |
-| PyTorch | 4 | 2,400 | 3,500 |
+| Spingalett | 1 | 1,630 | 7,170 |
+| PyTorch | 1 | 1,150 | 1,500 |
+| Spingalett (OpenMP) | 4 | 6,530 | 28,400 |
+| PyTorch | 4 | 3,190 | 4,890 |
 
-Spingalett trains the convolutional network 1.3 to 1.7 times as fast as PyTorch and runs it 3.4 to
-4.1 times as fast. With batch normalization the gap widens to 1.5 to 2 times and 4.5 to 5.6 times:
-normalization slows Spingalett's training by 10 to 20% (PyTorch's by 26 to 29%) and its inference
+Spingalett trains the convolutional network 1.2 to 1.5 times as fast as PyTorch and runs it 3.4 to
+4.3 times as fast. With batch normalization the gap widens to 1.4 to 2 times and 4.8 to 5.8 times:
+normalization slows Spingalett's training by 13 to 19% (PyTorch's by 30 to 35%) and its inference
 not at all, since it runs in the convolution's epilogue. For the fully connected network
-Spingalett trains mini-batches 2.5 to 3.2 times as fast, infers 1.3 to 1.6 times as fast and trains
-full batches 1.2 to 1.3 times as fast. The gap is largest for mini-batches, where fixed per-step
+Spingalett trains mini-batches 2.4 to 3 times as fast, infers 1.4 to 1.5 times as fast and trains
+full batches 1.2 to 1.35 times as fast. The gap is largest for mini-batches, where fixed per-step
 costs weigh most.
+
+0.9 took its time out of the calls these workloads do not measure: small batches and single
+samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
+[CHANGELOG](CHANGELOG.md) for more):
+
+| Call | 0.8 | 0.9 |
+|---|---:|---:|
+| `spingalett_model_predict()`, one sample, 784-256-128-10 MLP, FP32 / FP16 / INT8 | 63 / 403 / 10.5 us | 12 / 8 / 4.4 us |
+| the same, a batch of 1024, FP16 / INT8, per sample | 2.04 / 0.54 us | 0.92 / 0.31 us |
+| training that MLP with batches of 2 / 8, 4096 samples | 0.57 / 0.093 s | 0.33 / 0.076 s |
+| loading a 924,930-parameter FP32 network / INT8 network from memory | 26 / 13 ms | 8.3 / 1.3 ms |
+| saving it in FP32 / FP16 | 10.8 / 15.2 ms | 2.5 / 1.4 ms |
+| an epoch of a small CNN on CIFAR-10 streamed from a `.slettd` file (from float arrays: 4.7 / 4.5 s) | 14.7 s | 5.5 s |
+| Python `forward()` of one sample through that MLP | 69 us | 22 us |
 
 Deployment models of the CIFAR-10 network of `Examples/CIFAR10.c` (551K parameters, six
 convolutions with batch normalization folded in), `spingalett_model_predict()` on 4,000 test
