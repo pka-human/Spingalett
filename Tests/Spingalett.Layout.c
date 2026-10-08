@@ -52,6 +52,7 @@ int main(void) {
     FIELD(TrainArgs, monitor); FIELD(TrainArgs, early_stopping_patience); FIELD(TrainArgs, early_stopping_min_delta);
     FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads); FIELD(TrainArgs, augment_shift);
     FIELD(TrainArgs, augment_flip); FIELD(TrainArgs, label_smoothing);
+    FIELD(TrainArgs, lr_plateau_factor); FIELD(TrainArgs, lr_plateau_patience); FIELD(TrainArgs, lr_plateau_min_lr);
 
     SIZE(EvalMetrics); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
 

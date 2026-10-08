@@ -308,6 +308,15 @@ typedef struct {
        two classes), in [0, 1); the reported training loss is the smoothed targets' and validation
        uses the targets as given. 0.1 is common for classifiers. */
     float label_smoothing;
+
+    /* Reduce on plateau: when the monitored value (see monitor) has not improved for
+       lr_plateau_patience epochs, the learning rate (the schedule's, when there is one) is
+       multiplied by lr_plateau_factor, in (0, 1), for the rest of the run, again after every
+       lr_plateau_patience epochs without improvement, but never below lr_plateau_min_lr.
+       lr_plateau_patience 0: off. */
+    float lr_plateau_factor;
+    size_t lr_plateau_patience;
+    float lr_plateau_min_lr;
 } TrainArgs;
 
 typedef struct {

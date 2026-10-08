@@ -874,7 +874,10 @@ TrainReport train_struct_arguments(TrainArgs args) {
         monitor = has_validation ? MONITOR_VAL_LOSS : MONITOR_TRAIN_LOSS;
     if ((monitor == MONITOR_VAL_LOSS || monitor == MONITOR_VAL_ACCURACY) && !has_validation)
         return train_failed("Monitoring a validation metric needs validation data (val_inputs, val_targets, val_count)");
-    bool monitoring = has_validation || args.early_stopping_patience > 0 || args.restore_best_weights;
+    const bool plateau = args.lr_plateau_patience > 0;
+    if (plateau && !(args.lr_plateau_factor > 0.0f && args.lr_plateau_factor < 1.0f))
+        return train_failed("lr_plateau_factor must be in (0, 1) when lr_plateau_patience is set");
+    bool monitoring = has_validation || args.early_stopping_patience > 0 || args.restore_best_weights || plateau;
     bool higher_is_better = (monitor == MONITOR_VAL_ACCURACY);
     float min_delta = fabsf(args.early_stopping_min_delta);
 
@@ -1022,8 +1025,9 @@ TrainReport train_struct_arguments(TrainArgs args) {
         .validation = {NAN, NAN}, .monitor = monitor, .best_value = NAN,
     };
     float best = higher_is_better ? -INFINITY : INFINITY;
-    size_t epochs_without_improvement = 0;
+    size_t epochs_without_improvement = 0, stale = 0;
     bool lr_warned = false;
+    float lr_scale = 1.0f, base_lr = args.learning_rate;   /* reduce on plateau: the scale it reached */
 
     for (size_t epoch = 1; epoch <= epochs; epoch++) {
         float total_error = 0.0f;
@@ -1031,13 +1035,15 @@ TrainReport train_struct_arguments(TrainArgs args) {
         if (args.lr_scheduler) {
             float lr = args.lr_scheduler(epoch - 1, epochs, args.learning_rate, args.lr_scheduler_data);
             if (lr >= 0.0f && isfinite(lr)) {
-                t.opt.lr = lr;
+                base_lr = lr;
             } else if (!lr_warned) {
                 lr_warned = true;
                 spingalett_log(LOG_WARNING, "LR scheduler returned %g at epoch %zu; keeping lr=%g",
-                               (double)lr, epoch, (double)t.opt.lr);
+                               (double)lr, epoch, (double)base_lr);
             }
         }
+        /* reductions on plateau scale the base rate, down to lr_plateau_min_lr (never above the base) */
+        t.opt.lr = lr_scale < 1.0f ? fmaxf(base_lr * lr_scale, fminf(args.lr_plateau_min_lr, base_lr)) : base_lr;
 
         uint64_t epoch_samples = 0;
 
@@ -1119,11 +1125,18 @@ TrainReport train_struct_arguments(TrainArgs args) {
             } else {
                 epochs_without_improvement++;
             }
+            stale = improved ? 0 : stale + 1;
+            if (plateau && stale >= args.lr_plateau_patience) {
+                lr_scale *= args.lr_plateau_factor;
+                stale = 0;
+                spingalett_log(LOG_INFO, "No improvement for %zu epochs: learning rate scaled to %g of the schedule's",
+                               args.lr_plateau_patience, (double)lr_scale);
+            }
         }
 
         if (should_report(epoch, epochs, args.report_interval)) {
             char lr_text[32] = "", val_text[64] = "";
-            if (args.lr_scheduler)
+            if (args.lr_scheduler || lr_scale < 1.0f)
                 snprintf(lr_text, sizeof lr_text, ", LR: %g", (double)t.opt.lr);
             if (has_validation)
                 snprintf(val_text, sizeof val_text, ", Val loss: %f, Val accuracy: %.2f%%",

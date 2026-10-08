@@ -332,6 +332,9 @@ class _TrainArgs(Structure):
         ("augment_shift", c_uint32),
         ("augment_flip", c_bool),
         ("label_smoothing", c_float),
+        ("lr_plateau_factor", c_float),
+        ("lr_plateau_patience", c_size_t),
+        ("lr_plateau_min_lr", c_float),
     ]
 
 
@@ -959,6 +962,9 @@ class TrainConfig:
     augment_shift: int = 0              # images: random shifts by up to this many cells (zero fill)
     augment_flip: bool = False          # images: mirror left to right half of the time
     label_smoothing: float = 0.0        # targets moved this far towards uniform (0.1 is common)
+    lr_plateau_factor: float = 0.0      # reduce on plateau: multiply the learning rate by this...
+    lr_plateau_patience: int = 0        # ...after this many epochs without improvement (0: off)
+    lr_plateau_min_lr: float = 0.0      # ...but not below this
 
 
 def _as_float(data) -> np.ndarray:
@@ -1471,6 +1477,9 @@ class Network:
             augment_shift=int(cfg.augment_shift),
             augment_flip=bool(cfg.augment_flip),
             label_smoothing=float(cfg.label_smoothing),
+            lr_plateau_factor=float(cfg.lr_plateau_factor),
+            lr_plateau_patience=int(cfg.lr_plateau_patience),
+            lr_plateau_min_lr=float(cfg.lr_plateau_min_lr),
         )
         r = _call(_train, args)
         del keep

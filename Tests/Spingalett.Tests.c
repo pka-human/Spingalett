@@ -3395,6 +3395,40 @@ static void norm_learns(ComputeMode mode) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* Reduce on plateau: a loss that cannot improve halves the learning rate after every epoch without
+   improvement, down to the floor; with a schedule, the schedule's rate is scaled. */
+static float plateau_lr[8];
+static bool record_lr(NeuralNetwork *n, const TrainProgress *p, void *u) {
+    (void)n; (void)u;
+    if (p->epoch <= 8) plateau_lr[p->epoch - 1] = p->learning_rate;
+    return false;
+}
+
+static void plateau(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .neurons_amount = 2);
+    layer(.net = net, .neurons_amount = 1, .act_func = ACT_SIGMOID, .weight_initialization = WEIGHT_INITIALIZATION_NONE);
+    float x[4] = {0, 1, 1, 0}, y[2] = {0.5f, 0.5f};    /* zero weights already give 0.5: no improvement */
+    TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = 2, .epochs = 8, .learning_rate = 0.4f,
+                          .training_strategy = STRATEGY_FULL_BATCH, .lr_plateau_factor = 0.5f, .lr_plateau_patience = 1,
+                          .lr_plateau_min_lr = 0.04f, .callback = record_lr);
+    static const float expected[8] = {0.4f, 0.4f, 0.2f, 0.1f, 0.05f, 0.04f, 0.04f, 0.04f};
+    bool ok = r.status == TRAIN_COMPLETED;
+    for (int e = 0; e < 8; e++) ok = ok && fabsf(plateau_lr[e] - expected[e]) < 1e-6f;
+    CHECK(ok, "reduce on plateau: rates %g %g %g %g %g %g", plateau_lr[0], plateau_lr[1], plateau_lr[2], plateau_lr[3],
+          plateau_lr[4], plateau_lr[5]);
+    printf("  reduce on plateau: %g %g %g %g %g %g %g\n", plateau_lr[0], plateau_lr[1], plateau_lr[2], plateau_lr[3],
+           plateau_lr[4], plateau_lr[5], plateau_lr[6]);
+    r = train(.net = net, .inputs = x, .targets = y, .sample_count = 2, .epochs = 4, .learning_rate = 0.4f,
+              .lr_plateau_factor = 0.25f, .lr_plateau_patience = 2, .lr_scheduler = spingalett_lr_linear_warmup,
+              .callback = record_lr, .training_strategy = STRATEGY_FULL_BATCH);
+    CHECK(r.status == TRAIN_COMPLETED && fabsf(plateau_lr[3] - 0.1f) < 1e-6f, "reduce on plateau with a schedule: %g",
+          plateau_lr[3]);
+    CHECK(train(.net = net, .inputs = x, .targets = y, .sample_count = 2, .epochs = 1, .lr_plateau_factor = 1.5f,
+                .lr_plateau_patience = 1).status == TRAIN_FAILED, "a plateau factor above 1 accepted");
+    free_network(net);
+}
+
 /* Label smoothing trains as the smoothed targets do, in train() and in the step API. */
 static void label_smoothing(void) {
     const uint32_t N = 12;
@@ -4132,6 +4166,7 @@ int main(int argc, char **argv) {
         trainer_custom_grads(LOSS_CROSS_ENTROPY, ACT_SOFTMAX);
         trainer_custom_grads(LOSS_CROSS_ENTROPY, ACT_SIGMOID);
         label_smoothing();
+        plateau();
     }
     if (!*only || !strcmp(only, "data")) {
         printf("[data sets]\n");
