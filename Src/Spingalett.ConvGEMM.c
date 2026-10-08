@@ -20,6 +20,8 @@
  * Every output element is summed over its taps and channels (the weight gradient: over the pixels)
  * in one fixed order, by one thread; the weight gradient cuts the pixels into slots fixed by the
  * shape and adds the slots' partial sums in order. So results do not depend on the thread count.
+ * Threads take tiles dynamically: on processors with cores of two speeds (performance and
+ * efficiency cores), equal shares would leave the fast ones waiting.
  *
  * x86-64 builds that are not tuned for the build machine compile this file again through
  * Kernels/Spingalett.ConvGEMM.AVX2.c and .AVX512.c, as Spingalett.GEMM.c.
@@ -285,7 +287,7 @@ static void indirect_product(const Taps *g, uint64_t rows_total, const float *pa
     const int64_t tiles = (int64_t)((rows_total + MR - 1) / MR);
     (void)threads; (void)parallel;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(threads) if(parallel && tiles > 1)
+#pragma omp parallel for schedule(dynamic, 8) num_threads(threads) if(parallel && tiles > 1)
 #endif
     for (int64_t t = 0; t < tiles; t++) {
         const float *p[MR * SPINGALETT_CONV_DIRECT_TAPS];
@@ -350,7 +352,7 @@ static void strided_backward_data(const LayerShape *in, const LayerShape *out, u
             const int64_t tiles = (int64_t)n * rows_h * per_row;
             (void)threads; (void)parallel;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(threads) if(parallel && tiles > 1)
+#pragma omp parallel for schedule(dynamic, 8) num_threads(threads) if(parallel && tiles > 1)
 #endif
             for (int64_t t = 0; t < tiles; t++) {
                 const float *p[MR * SPINGALETT_CONV_DIRECT_TAPS];
