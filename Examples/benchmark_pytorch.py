@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """PyTorch counterpart of Examples/Benchmark.c: same networks, data shapes, optimizers and schedules.
 
-    python Examples/benchmark_pytorch.py [threads]
+    python Examples/benchmark_pytorch.py [threads] [--cuda | --cuda-fp32]
 
 784-512-1000-10 MLP (ReLU, softmax + cross-entropy on soft targets, Adam, lr 1e-3), 20,000
 synthetic samples: full batch (5 epochs), mini-batches of 64 (1 epoch) and inference. Then the
@@ -12,6 +12,11 @@ layer. Then ResNet-20 (Examples/CIFAR10.c resnet20) on 4,096 synthetic 32 x 32 i
 of mini-batches of 128 with SGD and momentum, and inference in batches of 1,000. Each measurement
 runs on a fresh model after one untimed warm-up step, so lazy initialization inside PyTorch is not
 counted.
+
+--cuda runs everything on the GPU (data in device memory, times taken after synchronizing), with
+PyTorch's defaults: convolutions in cuDNN may use TF32 tensor cores, which round the inputs of
+products to 10 bits of mantissa. --cuda-fp32 turns TF32 off, so that products are in single
+precision throughout, as Spingalett's are.
 """
 import sys
 import time
@@ -21,6 +26,17 @@ from torch import nn
 
 SAMPLES, EPOCHS, MINI_BATCH = 20000, 5, 64
 CNN_SAMPLES, CNN_BATCH = 10000, 128
+DEVICE = "cpu"
+
+
+def sync():
+    if DEVICE != "cpu":
+        torch.cuda.synchronize()
+
+
+def clock():
+    sync()
+    return time.perf_counter()
 
 
 def make_model():
@@ -28,7 +44,7 @@ def make_model():
 
 
 def train_throughput(x, y, batch, epochs):
-    model = make_model()
+    model = make_model().to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()          # applies softmax; accepts probability targets
 
@@ -38,22 +54,22 @@ def train_throughput(x, y, batch, epochs):
         opt.step()
 
     step(x[:batch], y[:batch])               # warm-up
-    start = time.perf_counter()
+    start = clock()
     for _ in range(epochs):
-        perm = torch.randperm(SAMPLES) if batch < SAMPLES else None
+        perm = torch.randperm(SAMPLES, device=DEVICE) if batch < SAMPLES else None
         for i in range(0, SAMPLES, batch):
             idx = perm[i:i + batch] if perm is not None else slice(None)
             step(x[idx], y[idx])
-    return SAMPLES * epochs / (time.perf_counter() - start)
+    return SAMPLES * epochs / (clock() - start)
 
 
 def inference_throughput(x):
-    model = make_model().eval()
+    model = make_model().to(DEVICE).eval()
     with torch.inference_mode():
         torch.softmax(model(x[:64]), dim=1)  # warm-up
-        start = time.perf_counter()
+        start = clock()
         torch.softmax(model(x), dim=1)
-        return SAMPLES / (time.perf_counter() - start)
+        return SAMPLES / (clock() - start)
 
 
 def make_cnn(normalized=False):
@@ -65,7 +81,7 @@ def make_cnn(normalized=False):
 
 
 def cnn_throughput(x, y, normalized=False):
-    model = make_cnn(normalized)
+    model = make_cnn(normalized).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     loss_fn = nn.CrossEntropyLoss()
 
@@ -75,19 +91,19 @@ def cnn_throughput(x, y, normalized=False):
         opt.step()
 
     step(x[:CNN_BATCH], y[:CNN_BATCH])       # warm-up
-    start = time.perf_counter()
-    perm = torch.randperm(CNN_SAMPLES)
+    start = clock()
+    perm = torch.randperm(CNN_SAMPLES, device=DEVICE)
     for i in range(0, CNN_SAMPLES, CNN_BATCH):
         idx = perm[i:i + CNN_BATCH]
         step(x[idx], y[idx])
-    train = CNN_SAMPLES / (time.perf_counter() - start)
+    train = CNN_SAMPLES / (clock() - start)
     model.eval()
     with torch.inference_mode():
         torch.softmax(model(x[:64]), dim=1)  # warm-up
-        start = time.perf_counter()
+        start = clock()
         for i in range(0, CNN_SAMPLES, 1000):
             torch.softmax(model(x[i:i + 1000]), dim=1)
-        infer = CNN_SAMPLES / (time.perf_counter() - start)
+        infer = CNN_SAMPLES / (clock() - start)
     return train, infer
 
 
@@ -119,7 +135,7 @@ def make_resnet20():
 
 
 def resnet_throughput(x, y):
-    model = make_resnet20()
+    model = make_resnet20().to(DEVICE)
     opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
     loss_fn = nn.CrossEntropyLoss()
 
@@ -129,39 +145,48 @@ def resnet_throughput(x, y):
         opt.step()
 
     step(x[:CNN_BATCH], y[:CNN_BATCH])       # warm-up
-    start = time.perf_counter()
-    perm = torch.randperm(RESNET_SAMPLES)
+    start = clock()
+    perm = torch.randperm(RESNET_SAMPLES, device=DEVICE)
     for i in range(0, RESNET_SAMPLES, CNN_BATCH):
         idx = perm[i:i + CNN_BATCH]
         step(x[idx], y[idx])
-    train = RESNET_SAMPLES / (time.perf_counter() - start)
+    train = RESNET_SAMPLES / (clock() - start)
     model.eval()
     with torch.inference_mode():
         torch.softmax(model(x[:64]), dim=1)  # warm-up
-        start = time.perf_counter()
+        start = clock()
         for i in range(0, RESNET_SAMPLES, 1000):
             torch.softmax(model(x[i:i + 1000]), dim=1)
-        infer = RESNET_SAMPLES / (time.perf_counter() - start)
+        infer = RESNET_SAMPLES / (clock() - start)
     return train, infer
 
 
 def main():
-    if len(sys.argv) > 1:
-        torch.set_num_threads(int(sys.argv[1]))
+    global DEVICE
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args:
+        torch.set_num_threads(int(args[0]))
+    if "--cuda" in sys.argv or "--cuda-fp32" in sys.argv:
+        DEVICE = "cuda"
+        torch.backends.cudnn.allow_tf32 = "--cuda-fp32" not in sys.argv
+        torch.backends.cuda.matmul.allow_tf32 = "--cuda-fp32" not in sys.argv and torch.backends.cuda.matmul.allow_tf32
     torch.manual_seed(42)
-    x = torch.rand(SAMPLES, 784)
-    y = torch.rand(SAMPLES, 10)
+    x = torch.rand(SAMPLES, 784, device=DEVICE)
+    y = torch.rand(SAMPLES, 10, device=DEVICE)
     y /= y.sum(dim=1, keepdim=True)
 
-    print(f"PyTorch {torch.__version__}, threads: {torch.get_num_threads()}\n")
+    where = f"threads: {torch.get_num_threads()}"
+    if DEVICE != "cpu":
+        where = f"GPU: {torch.cuda.get_device_name(0)}, TF32 convolutions {'on' if torch.backends.cudnn.allow_tf32 else 'off'}"
+    print(f"PyTorch {torch.__version__}, {where}\n")
     print(f"{'samples/s':<16} {'full batch':>14} {'mini-batch 64':>14} {'inference':>14}")
     full = train_throughput(x, y, SAMPLES, EPOCHS)
     mini = train_throughput(x, y, MINI_BATCH, 1)
     infer = inference_throughput(x)
     print(f"{'PyTorch':<16} {full:14.0f} {mini:14.0f} {infer:14.0f}")
 
-    images = torch.rand(CNN_SAMPLES, 1, 28, 28)
-    labels = torch.randint(0, 10, (CNN_SAMPLES,))
+    images = torch.rand(CNN_SAMPLES, 1, 28, 28, device=DEVICE)
+    labels = torch.randint(0, 10, (CNN_SAMPLES,), device=DEVICE)
     for normalized in (False, True):
         print(f"\nconvolutional network (Examples/MNIST_CNN.c){' with batch normalization' if normalized else ''}, "
               f"{CNN_SAMPLES} images")
@@ -171,7 +196,8 @@ def main():
 
     print(f"\nResNet-20 (Examples/CIFAR10.c resnet20), {RESNET_SAMPLES} images")
     print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
-    train, infer = resnet_throughput(torch.rand(RESNET_SAMPLES, 3, 32, 32), torch.randint(0, 10, (RESNET_SAMPLES,)))
+    train, infer = resnet_throughput(torch.rand(RESNET_SAMPLES, 3, 32, 32, device=DEVICE),
+                                     torch.randint(0, 10, (RESNET_SAMPLES,), device=DEVICE))
     print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
 
 

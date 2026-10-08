@@ -296,7 +296,7 @@ bool predict_struct_arguments(PredictArgs args) {
             uint32_t n = args.sample_count - start < cap ? args.sample_count - start : cap;
             ok = spingalett_gpu_predict(gpu, args.inputs + (size_t)start * in_sz, args.outputs + (size_t)start * out_sz, n);
         }
-        spingalett_gpu_net_free(gpu);
+        spingalett_gpu_done(net, gpu);
         if (ok) return true;
         spingalett_log(LOG_WARNING, "predict: the GPU failed; predicting on the CPU");
     }
@@ -361,10 +361,24 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
         spingalett_log(LOG_WARNING, "The GPU cannot run this network (%s); running it on the CPU", why);
         return NULL;
     }
-    uint32_t capacity = spingalett_gpu_capacity(net, count, false);
-    SpgGpuNet *gpu = capacity ? spingalett_gpu_net_create(net, capacity, NULL) : NULL;
+    /* chunks of a power of two (at least 64) samples, so that calls of nearby sizes share one */
+    uint32_t want = 64;
+    while (want < count && want < SPINGALETT_BATCH_CHUNK) want *= 2;
+    uint32_t capacity = spingalett_gpu_capacity(net, want, false);
+    SpgGpuNet *gpu = atomic_exchange(&net->gpu_predict, NULL);
+    if (gpu && spingalett_gpu_net_capacity(gpu) >= capacity) {
+        if (spingalett_gpu_upload(gpu)) return gpu;     /* the parameters as they are now */
+    }
+    spingalett_gpu_net_free(gpu);
+    gpu = capacity ? spingalett_gpu_net_create(net, capacity, NULL) : NULL;
     if (!gpu) spingalett_log(LOG_WARNING, "Not enough GPU memory for the network; running it on the CPU");
     return gpu;
+}
+
+void spingalett_gpu_done(NeuralNetwork *net, SpgGpuNet *gpu) {
+    SpgGpuNet *empty = NULL;
+    if (!atomic_compare_exchange_strong(&net->gpu_predict, &empty, gpu))
+        spingalett_gpu_net_free(gpu);                   /* another call put one back first */
 }
 
 bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, float *out_buf, const float *inputs,
@@ -411,7 +425,7 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
         bool ok = buf && spingalett_gpu_evaluate(gpu, net, buf, args.inputs, args.targets, args.sample_count, &loss,
                                                  &correct);
         spingalett_aligned_free(buf);
-        spingalett_gpu_net_free(gpu);
+        spingalett_gpu_done(net, gpu);
         if (ok) {
             m.loss = (float)(loss / args.sample_count);
             m.accuracy = (float)correct / (float)args.sample_count;

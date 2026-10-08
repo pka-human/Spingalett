@@ -8,6 +8,7 @@
 #pragma once
 
 #include "Spingalett/Spingalett.h"
+#include <stdatomic.h>
 
 /* Layer l's output shape and, for conv and pooling layers, its window over its input. */
 typedef struct {
@@ -75,6 +76,11 @@ struct NeuralNetwork {
        sample, in this workspace (made on first use, for the compute mode it was made for) */
     struct BatchWorkspace *forward_ws;
     ComputeMode forward_mode;
+
+    /* predict() and evaluate() with COMPUTE_VULKAN: the network on the GPU, kept between calls (made
+       for the layers as they were, its parameters copied to it on every call); a call takes it and
+       puts it back, so that concurrent calls make their own */
+    _Atomic(struct SpgGpuNet *) gpu_predict;
 };
 
 /* The layers layer l (>= 1) reads, and the first of them (its source). */

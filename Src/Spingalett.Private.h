@@ -513,6 +513,8 @@ bool spingalett_use_gpu(void);
 /* A network on the GPU for inference over up to `count` samples a chunk, when COMPUTE_VULKAN is set
    and it fits (NULL otherwise, with a warning when the GPU was usable). */
 struct SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count);
+/* Gives a network got from spingalett_gpu_for() back to be kept. */
+void spingalett_gpu_done(NeuralNetwork *net, struct SpgGpuNet *gpu);
 /* spingalett_batch_evaluate() on the GPU; false when the device failed. */
 bool spingalett_gpu_evaluate(struct SpgGpuNet *gpu, NeuralNetwork *net, float *out_buf, const float *inputs,
                              const float *targets, uint32_t n, double *loss_sum, uint32_t *correct);
