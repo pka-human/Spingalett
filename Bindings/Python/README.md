@@ -131,8 +131,8 @@ with sg.Network.load("xor.slett") as net:
 | `model.predict(x)` / `model(x)`, `model.evaluate(x, y)` | 1-D input -> vector, 2-D batch -> matrix; `Metrics(loss, accuracy)` |
 | `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding, groups, epsilon, input_layers)` per layer (normalizations after a dense or convolution layer are folded into it); image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
-| `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings |
-| `cpu_kernels()`, `library_version()`, `library_path()` | the matrix kernels in use (`"AVX-512"`, `"AVX2"`, ...), the loaded library |
+| `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings; `ComputeMode.VULKAN` trains and predicts on the GPU |
+| `cpu_kernels()`, `gpu_device()`, `library_version()`, `library_path()` | the matrix kernels in use (`"AVX-512"`, `"AVX2"`, ...), the GPU `VULKAN` uses (`None` without one), the loaded library |
 
 `uint8` arrays stand for 8-bit images: value q means q / 255 in `train()`, `forward()`,
 `predict()`, `evaluate()` and `save_dataset()`. `train()` keeps such inputs as bytes, a quarter of

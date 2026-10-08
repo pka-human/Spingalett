@@ -1,0 +1,30 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * The weights of a convolution regrouped for its data gradient: filter f of group g holds taps x CG
+ * weights w[g OG + f][tap][c]; the data gradient multiplies by wt[g][order[tap]][f][c], the product's
+ * k = (tap, f) rows of CG columns, with the taps ordered by the phase of the stride they serve.
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    F32 w, wt;
+    U32 order;
+    uint total, OG, CG, taps;
+} p;
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        uint c = i % p.CG, q = i / p.CG, tap = q % p.taps, row = q / p.taps;     /* row = g OG + f */
+        uint g = row / p.OG, f = row % p.OG;
+        p.wt.v[((g * p.taps + p.order.v[tap]) * p.OG + f) * p.CG + c] = p.w.v[i];
+    }
+}

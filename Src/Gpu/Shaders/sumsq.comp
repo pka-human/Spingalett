@@ -1,0 +1,57 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Gradient norm clipping, in two passes of fixed order:
+ *   PARTIAL  part[w] = the sum of squares of a and b (n_a and n_b floats, seen as one array) over
+ *            slice w of 4096 elements
+ *   CLIP     scalars[0] = max_norm / norm when the norm of all slices is finite and above max_norm,
+ *            else 1 (one workgroup)
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(local_size_x = 256) in;
+
+#define PARTIAL 0u
+#define CLIP    1u
+#define SLICE   4096u
+
+layout(push_constant) uniform Push {
+    F32 a, b, part, scalars;
+    uint n_a, n_b, slices;
+    float max_norm;
+} p;
+
+shared float s[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float t = 0.0;
+    if (OP == PARTIAL) {
+        const uint total = p.n_a + p.n_b, i0 = gl_WorkGroupID.x * SLICE;
+        for (uint i = i0 + tid; i < min(total, i0 + SLICE); i += 256u) {
+            float v = i < p.n_a ? p.a.v[i] : p.b.v[i - p.n_a];
+            t = fma(v, v, t);
+        }
+    } else {
+        for (uint i = tid; i < p.slices; i += 256u) t += p.part.v[i];
+    }
+    s[tid] = t;
+    barrier();
+    for (uint half_n = 128u; half_n > 0u; half_n /= 2u) {
+        if (tid < half_n) s[tid] += s[tid + half_n];
+        barrier();
+    }
+    if (tid != 0u) return;
+    if (OP == PARTIAL) {
+        p.part.v[gl_WorkGroupID.x] = s[0];
+    } else {
+        float norm = sqrt(s[0]);
+        p.scalars.v[0] = (!isinf(norm) && !isnan(norm) && norm > p.max_norm) ? p.max_norm / norm : 1.0;
+    }
+}

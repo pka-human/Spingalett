@@ -234,6 +234,21 @@ with tempfile.TemporaryDirectory() as d:
         check("cannot open" in str(e) and e.code == sg.ErrorCode.FILE_IO, f"error: {e} code {e.code!r}")
 check(sg.library_version() == sg.__version__, f"library {sg.library_version()} vs bindings {sg.__version__}")
 check(sg.cpu_kernels() in ("AVX-512", "AVX2", "AVX", "SSE2", "NEON", "C"), f"cpu kernels {sg.cpu_kernels()!r}")
+check(sg.gpu_device() is None or isinstance(sg.gpu_device(), str), f"gpu device {sg.gpu_device()!r}")
+
+# the GPU (or, without one, the CPU it falls back to) trains and predicts as the CPU does
+gx = np.random.default_rng(3).normal(size=(64, 6)).astype(np.float32)
+gy = np.eye(3, dtype=np.float32)[np.arange(64) % 3]
+results = []
+for mode in (sg.ComputeMode.OPENMP, sg.ComputeMode.VULKAN):
+    sg.set_compute_mode(mode)
+    sg.seed(4)
+    with sg.Network(sg.Loss.CROSS_ENTROPY, [6, sg.Layer(8, sg.Activation.RELU), sg.Layer(3, sg.Activation.SOFTMAX)]) as gn:
+        gn.train(gx, gy, epochs=3, strategy=sg.Strategy.MINI_BATCH, batch_size=16, shuffle=False)
+        results.append(gn.forward(gx))
+check(sg.get_compute_mode() == sg.ComputeMode.VULKAN, "compute mode VULKAN")
+check(np.allclose(results[0], results[1], rtol=1e-4, atol=1e-6), "GPU training == CPU training")
+sg.set_compute_mode(sg.ComputeMode.OPENMP)
 
 # generator mode
 sg.set_compute_mode(sg.ComputeMode.OPENBLAS)

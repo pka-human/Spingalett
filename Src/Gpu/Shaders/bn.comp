@@ -1,0 +1,77 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Per-channel coefficients of batch normalization, one thread per channel, as Spingalett.Norm.c
+ * computes them (the slices of colsum.comp added in order, with compensated sums):
+ *
+ *   TRAIN     from the sums of (x - x[0]) and their squares over m rows: mean, 1 / std, and
+ *             a = gamma / std, b = beta - mean a (stats: mean, inv, a, b); the running statistics
+ *             move towards the batch's (the variance unbiased)
+ *   INFER     a = gamma / sqrt(running variance + eps), b = beta - running mean a (stats + 2C)
+ *   BACKWARD  from the sums of dy and dy (x - mean): the gradients of gamma and beta (scaled, added
+ *             to beta_g times the old ones) and dx = k dy + p x + q (coef: k, p, q)
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint MODE = 0;
+layout(local_size_x = 64) in;
+
+#define TRAIN    0u
+#define INFER    1u
+#define BACKWARD 2u
+
+layout(push_constant) uniform Push {
+    F32 part, x, gamma, beta, rmean, rvar, stats, coef;
+    F32 ggamma, gbeta;
+    uint C, slices;
+    float m, eps, momentum, scale, beta_g;
+} p;
+
+/* sums j (0 or 1) of channel c over the slices */
+float total(uint c, uint j) {
+    precise float sum = 0.0, comp = 0.0;
+    for (uint s = 0; s < p.slices; s++) {
+        precise float y = p.part.v[s * 2u * p.C + j * p.C + c] - comp;
+        precise float t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    return sum;
+}
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x, C = p.C;
+    if (c >= C) return;
+    if (MODE == INFER) {
+        float a = p.gamma.v[c] / sqrt(p.rvar.v[c] + p.eps);
+        p.stats.v[2u * C + c] = a;
+        p.stats.v[3u * C + c] = p.beta.v[c] - p.rmean.v[c] * a;
+        return;
+    }
+    if (MODE == TRAIN) {
+        float d = total(c, 0u) / p.m, var = max(total(c, 1u) / p.m - d * d, 0.0);
+        float mean = p.x.v[c] + d, inv = 1.0 / sqrt(var + p.eps);
+        p.stats.v[c] = mean;
+        p.stats.v[C + c] = inv;
+        p.rmean.v[c] += p.momentum * (mean - p.rmean.v[c]);
+        if (p.m > 1.0) p.rvar.v[c] += p.momentum * (var * p.m / (p.m - 1.0) - p.rvar.v[c]);
+        float a = p.gamma.v[c] * inv;
+        p.stats.v[2u * C + c] = a;
+        p.stats.v[3u * C + c] = p.beta.v[c] - mean * a;
+        return;
+    }
+    /* backward: s2 = sum of dy * xhat */
+    float inv = p.stats.v[C + c], s1 = total(c, 0u), s2 = total(c, 1u) * inv;
+    float dg = s2 * p.scale, db = s1 * p.scale;
+    p.ggamma.v[c] = p.beta_g == 0.0 ? dg : dg + p.beta_g * p.ggamma.v[c];
+    p.gbeta.v[c] = p.beta_g == 0.0 ? db : db + p.beta_g * p.gbeta.v[c];
+    float k = p.gamma.v[c] * inv, m1 = s1 / p.m, m2 = s2 / p.m;
+    p.coef.v[c] = k;
+    p.coef.v[C + c] = -k * inv * m2;
+    p.coef.v[2u * C + c] = -k * m1 + k * inv * m2 * p.stats.v[c];
+}

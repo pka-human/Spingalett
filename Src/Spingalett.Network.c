@@ -4,6 +4,7 @@
 */
 
 #include "Spingalett.Private.h"
+#include "Spingalett.Gpu.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
@@ -235,6 +236,7 @@ bool spingalett_add_layer(LayerArgs args) {
         return false;
     spingalett_batch_workspace_free(net->forward_ws);     /* made for the old layers */
     net->forward_ws = NULL;
+    spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));
     bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D || shape.type == LAYER_GLOBAL_AVG_POOL;
     if (pooling) act_func = ACT_NONE;
     static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add",
@@ -709,6 +711,7 @@ void print_parameters(const NeuralNetwork *net) {
 void free_network(NeuralNetwork *net) {
     if (!net) return;
     spingalett_batch_workspace_free(net->forward_ws);
+    spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));
     spingalett_aligned_free(net->neurons);
     spingalett_aligned_free(net->weights);
     spingalett_aligned_free(net->biases);

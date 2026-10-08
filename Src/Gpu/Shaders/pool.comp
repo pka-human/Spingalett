@@ -1,0 +1,86 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Max and average pooling over channels-last samples, as Spingalett.Conv.c computes them: windows
+ * clipped to the image (padded cells are ignored), the first maximum in row order wins, averages
+ * divide by the cells inside.
+ *
+ * Forward: one thread per output. Backward: one thread per input cell, which adds the gradients of
+ * the windows that cover it in row order (for max pooling, those whose maximum it is), then
+ * multiplies by the derivative of the input layer's activation: no cell is written twice.
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint MAXPOOL = 1;
+layout(constant_id = 1) const uint BACKWARD = 0;
+layout(constant_id = 2) const uint ACT = 6;     /* backward: the input layer's activation */
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    F32 x, y, dy, dx;
+    uint n, H, W, C, OH, OW;
+    uint KH, KW, SH, SW, PH, PW;
+} p;
+
+void window(uint oh, uint ow, out uint h0, out uint h1, out uint w0, out uint w1) {
+    int hs = int(oh * p.SH) - int(p.PH), ws = int(ow * p.SW) - int(p.PW);
+    h0 = uint(max(hs, 0)); h1 = uint(min(hs + int(p.KH), int(p.H)));
+    w0 = uint(max(ws, 0)); w1 = uint(min(ws + int(p.KW), int(p.W)));
+}
+
+void main() {
+    const uint C = p.C, stride = gl_NumWorkGroups.x * 256u;
+    if (BACKWARD == 0u) {
+        const uint total = p.n * p.OH * p.OW * C;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            uint c = i % C, q = i / C, ow = q % p.OW, oh = (q / p.OW) % p.OH, s = q / (p.OW * p.OH);
+            uint h0, h1, w0, w1;
+            window(oh, ow, h0, h1, w0, w1);
+            const uint base = s * p.H * p.W * C + c;
+            float acc = p.x.v[base + (h0 * p.W + w0) * C];
+            for (uint h = h0; h < h1; h++)
+                for (uint w = (h == h0 ? w0 + 1u : w0); w < w1; w++) {
+                    float v = p.x.v[base + (h * p.W + w) * C];
+                    if (MAXPOOL != 0u) { if (v > acc) acc = v; }
+                    else acc += v;
+                }
+            p.y.v[i] = MAXPOOL != 0u ? acc : acc * (1.0 / float((h1 - h0) * (w1 - w0)));
+        }
+        return;
+    }
+
+    const uint total = p.n * p.H * p.W * C;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        uint c = i % C, q = i / C, iw = q % p.W, ih = (q / p.W) % p.H, s = q / (p.W * p.H);
+        const uint base = s * p.H * p.W * C + c, obase = s * p.OH * p.OW * C + c;
+        /* the windows covering (ih, iw): oh * SH - PH <= ih < oh * SH - PH + KH */
+        int top = int(ih + p.PH) - int(p.KH) + 1, left = int(iw + p.PW) - int(p.KW) + 1;
+        uint oh0 = top <= 0 ? 0u : (uint(top) + p.SH - 1u) / p.SH, oh1 = min((ih + p.PH) / p.SH + 1u, p.OH);
+        uint ow0 = left <= 0 ? 0u : (uint(left) + p.SW - 1u) / p.SW, ow1 = min((iw + p.PW) / p.SW + 1u, p.OW);
+        float g = 0.0;
+        for (uint oh = oh0; oh < oh1; oh++)
+            for (uint ow = ow0; ow < ow1; ow++) {
+                uint h0, h1, w0, w1;
+                window(oh, ow, h0, h1, w0, w1);
+                float d = p.dy.v[obase + (oh * p.OW + ow) * C];
+                if (MAXPOOL == 0u) {
+                    g += d * (1.0 / float((h1 - h0) * (w1 - w0)));
+                    continue;
+                }
+                float best = p.x.v[base + (h0 * p.W + w0) * C];
+                uint at_h = h0, at_w = w0;
+                for (uint h = h0; h < h1; h++)
+                    for (uint w = (h == h0 ? w0 + 1u : w0); w < w1; w++) {
+                        float v = p.x.v[base + (h * p.W + w) * C];
+                        if (v > best) { best = v; at_h = h; at_w = w; }
+                    }
+                if (at_h == ih && at_w == iw) g += d;
+            }
+        p.dx.v[i] = ACT == ACT_NONE ? g : g * derivative(p.x.v[i], ACT);
+    }
+}

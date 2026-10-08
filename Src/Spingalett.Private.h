@@ -508,6 +508,16 @@ void spingalett_fp16_encode(const float *restrict src, size_t n, uint16_t *restr
 float spingalett_clip_grad_norm(NeuralNetwork *net, float max_norm);
 
 ComputeMode resolve_compute_mode(void);
+/* Whether the compute mode is COMPUTE_VULKAN and a device is usable (warns once when it is not). */
+bool spingalett_use_gpu(void);
+/* A network on the GPU for inference over up to `count` samples a chunk, when COMPUTE_VULKAN is set
+   and it fits (NULL otherwise, with a warning when the GPU was usable). */
+struct SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count);
+/* Gives a network got from spingalett_gpu_for() back to be kept. */
+void spingalett_gpu_done(NeuralNetwork *net, struct SpgGpuNet *gpu);
+/* spingalett_batch_evaluate() on the GPU; false when the device failed. */
+bool spingalett_gpu_evaluate(struct SpgGpuNet *gpu, NeuralNetwork *net, const float *inputs, const float *targets,
+                             uint32_t n, double *loss_sum, uint32_t *correct);
 
 void spingalett_fp_flush_denormals_begin(void);
 void spingalett_fp_flush_denormals_end(void);

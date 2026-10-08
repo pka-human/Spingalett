@@ -20,11 +20,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopenblas-dev libomp-dev python3-numpy libsdl2-dev
+          # glslc and the Vulkan headers build the GPU backend; Mesa's lavapipe (a Vulkan device on
+          # the CPU) runs its tests
+          sudo apt-get install -y libopenblas-dev libomp-dev python3-numpy libsdl2-dev \
+            glslc libvulkan-dev mesa-vulkan-drivers
 
       - name: Configure
         run: |
-          extra="-DBUILD_APPS=ON"
+          extra="-DBUILD_APPS=ON -DSPINGALETT_VULKAN=ON"
           if [ "${{ matrix.config }}" = full ]; then
             extra="$extra -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON"
           elif [ "${{ matrix.config }}" = generic ]; then
@@ -39,6 +42,13 @@ jobs:
 
       - name: Test
         run: ctest --test-dir Build --output-on-failure
+
+      # ctest counts the GPU tests as passed when they find no device: here they must find lavapipe
+      - name: GPU tests (lavapipe)
+        run: |
+          Bin/SpingalettGpuTests | tee gpu-kernels.txt
+          Bin/SpingalettTests gpu | tee gpu-group.txt
+          grep -q "^device: llvmpipe" gpu-kernels.txt && grep -q "device: llvmpipe" gpu-group.txt
 
       - name: Examples
         working-directory: Bin

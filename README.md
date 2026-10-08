@@ -57,7 +57,7 @@ are included.
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `forward()`, batched `predict()`, `evaluate()` (loss and accuracy) |
 | Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
-| Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS |
+| Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) for training, `predict()` and `evaluate()`, deterministic |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
@@ -73,13 +73,14 @@ the shared library, a CMake package, `DatasetTool` and `ModelTool`. Extract one 
 `-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
 when the processor has them, and the `-v3` build also compiles the rest of the library
 (activations, optimizers, the inference engine) for AVX2. The Windows DLL ships with import
-libraries for MinGW and MSVC. Every package is built with OpenMP; the macOS one (a universal
-library for Apple silicon and Intel, macOS 11 or newer) carries LLVM's OpenMP runtime,
-`libomp.dylib`, next to the library, since Apple's compilers come without one.
+libraries for MinGW and MSVC. Every package is built with OpenMP and the Vulkan GPU backend; the
+macOS one (a universal library for Apple silicon and Intel, macOS 11 or newer) carries LLVM's
+OpenMP runtime, `libomp.dylib`, next to the library, since Apple's compilers come without one.
 
 To build from source: requirements: CMake 3.21 or newer and a compiler with C23 support. GCC 13 and Clang 18 are tested
 in CI; MSVC 19.36 or newer is expected to work but is not tested. OpenMP and OpenBLAS are
-optional.
+optional, and so is the GPU backend, which needs the Vulkan headers and `glslc` (shaderc) to build
+(not Vulkan itself: the library opens it at run time).
 
 ```bash
 # Dependency-free build
@@ -89,6 +90,9 @@ cmake --build Build --parallel
 # With OpenMP and OpenBLAS (Debian/Ubuntu: apt install libopenblas-dev)
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON
 cmake --build Build --parallel
+
+# The GPU backend is built when glslc and the Vulkan headers are found
+# (Debian/Ubuntu: apt install glslc libvulkan-dev; macOS: brew install shaderc vulkan-headers)
 
 # Run the test suite
 ctest --test-dir Build --output-on-failure
@@ -114,6 +118,8 @@ the processor supports (`spingalett_cpu_kernels()` names it).
 | `SPINGALETT_INFERENCE_ONLY` | `OFF` | Build only the inference engine (`Spingalett.Inference.h`) as a static library: no training, file I/O, OpenMP or heap |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
 | `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` (GCC, Clang): on x86-64 also build AVX2 and AVX-512 matrix kernels and AVX-512 VNNI and AVX-VNNI integer kernels, on AArch64 Linux integer kernels for the dot product instructions, and choose at run time |
+| `SPINGALETT_VULKAN` | `AUTO` | The Vulkan GPU backend: `AUTO` builds it when `glslc` and the Vulkan headers are found, `ON` requires them, `OFF` leaves it out |
+| `SPINGALETT_SPIRV_DIR` | | Compiled shaders (`<kernel>.spv.inc` from another build's `Gpu/` directory) to use where there is no `glslc` |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
 
@@ -122,7 +128,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.9 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.11 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -671,7 +677,8 @@ corrupt files and for files with an invalid header.
 ### Backends and threading
 
 ```c
-spingalett_set_compute_mode(COMPUTE_OPENBLAS);   /* COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS */
+spingalett_set_compute_mode(COMPUTE_OPENBLAS);   /* COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS,
+                                                    COMPUTE_VULKAN (the GPU, see below) */
 spingalett_set_num_threads(8);                   /* 0 = runtime default */
 ```
 
@@ -690,8 +697,11 @@ matrix-matrix products (fewer when a sample's activations are large, so that a c
   OpenBLAS thread when each call is too small to amortize threading and the configured thread
   count otherwise, and restores the caller's setting afterwards; outside `train()`, OpenBLAS uses
   its own thread configuration (`OPENBLAS_NUM_THREADS`).
+- `COMPUTE_VULKAN` runs training, `predict()` and `evaluate()` on a GPU ([The GPU](#the-gpu)); what
+  stays on the CPU runs as with `COMPUTE_OPENMP`.
 - A requested backend that was not compiled in falls back to single-threaded with a one-time
-  warning. `COMPUTE_CUDA` is reserved and currently falls back as well.
+  warning (`COMPUTE_VULKAN` without a usable device: to the CPU, as above). `COMPUTE_CUDA` is
+  reserved and currently falls back as well.
 
 Results agree across backends up to floating-point rounding. For the duration of `train()`,
 denormal floats are flushed to zero on the calling thread and the OpenMP workers; the previous
@@ -699,6 +709,47 @@ floating-point mode is restored afterwards.
 
 A network must not be used by several threads at the same time. Compute mode, thread count and
 logging settings are process-wide; the random generator and the error state are per thread.
+
+### The GPU
+
+With `COMPUTE_VULKAN`, `train()` (full-batch and mini-batch strategies), `predict()` and
+`evaluate()` run on a GPU through Vulkan compute: NVIDIA, AMD and Intel GPUs on Linux and Windows,
+Apple GPUs through MoltenVK (from the Vulkan SDK, or `brew install molten-vk vulkan-loader`). The
+library opens the Vulkan loader when the mode is first used, so it needs no Vulkan to load or to
+run on the CPU. `spingalett_gpu_device()` names the device it uses, or returns `NULL` when there is
+none (it needs Vulkan 1.2 with buffer device addresses); the mode then falls back to the CPU with a
+warning.
+
+```c
+spingalett_set_compute_mode(COMPUTE_VULKAN);
+const char *gpu = spingalett_gpu_device();
+printf("training on %s\n", gpu ? gpu : "the CPU");
+train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
+      .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);   /* as on the CPU */
+```
+
+- Parameters, their gradients and the optimizer's moments stay in GPU memory for the whole
+  `train()` call. The host prepares a batch (gathering, augmentation, label smoothing) while the
+  GPU trains on the one before, and gets the losses and the parameters back at the end of every
+  epoch, where validation, callbacks, autosaves and the best weights see them.
+- Every kind of layer, activation, loss and optimizer runs on the GPU, with dropout (the same masks
+  as on the CPU), gradient clipping and batch normalization. Per-sample training, `forward()`, the
+  custom-loop API (`spingalett_trainer_*`) and deployment models run on the CPU.
+- Results are deterministic: every sum runs in a fixed order, never through atomics, so a run gives
+  the same bits every time on one device. They agree with the CPU's up to rounding: the products
+  add in another order, with fused multiply-adds, and batch normalization adds its sums in single
+  rather than double precision.
+- The first products of each shape are timed with a few tile sizes, and the fastest is kept for the
+  life of the process: the first `train()` of a process takes about a second longer (ResNet-20 on an
+  RTX 4050 Laptop GPU), and the very first on a machine some ten seconds, while the driver compiles
+  the kernels, which it then keeps on disk. Tiles change the speed, never the results;
+  `SPINGALETT_GPU_TUNE=0` estimates them instead.
+- Samples are processed in chunks of up to 2048 that fit in half the GPU's memory; full-batch
+  training of networks with batch normalization normalizes over each chunk, as on the CPU.
+- `SPINGALETT_GPU_DEVICE=n` picks the n-th device of the Vulkan device list instead of the first
+  discrete GPU; `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel when the process exits.
+
+In Python: `sg.set_compute_mode(sg.ComputeMode.VULKAN)` and `sg.gpu_device()`.
 
 ### Reproducibility
 
@@ -916,7 +967,8 @@ Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 effici
 and AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16
 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel
 MKL and oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13
-to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was:
+to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was;
+0.11 leaves all of them as they were on the CPU (within 2% of 0.10 in interleaved runs):
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
@@ -953,7 +1005,33 @@ fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: b
 (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
 and 4,798.
 
-0.9 took its time out of the calls these workloads do not measure0.9 took its time out of the calls these workloads do not measure: small batches and single
+On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 0.11 runs
+the same workloads with `COMPUTE_VULKAN` (`Bin/Benchmark` runs them after the CPU's), against
+PyTorch 2.14.1 with CUDA 13.0 and cuDNN (`python Examples/benchmark_pytorch.py --cuda`, with
+PyTorch's default TF32 convolutions, and `--cuda-fp32`), medians of three interleaved runs.
+PyTorch's data is in GPU memory from the start; Spingalett takes the host arrays and copies every
+batch to the GPU, overlapped with the work on the batch before:
+
+| On the GPU | Spingalett | PyTorch (TF32) | PyTorch (FP32) |
+|---|---:|---:|---:|
+| ResNet-20, training | 8,900 | 8,510 | 7,140 |
+| ResNet-20, inference | 22,900 | 19,700 | 19,400 |
+| Convolutional network, training | 62,900 | 56,900 | 60,000 |
+| Convolutional network, inference | 227,700 | 132,000 | 143,600 |
+| With batch normalization, training | 48,400 | 48,500 | 48,500 |
+| With batch normalization, inference | 149,400 | 107,300 | 114,100 |
+| Fully connected network, mini-batch 64 | 188,600 | 80,600 | 80,400 |
+| Fully connected network, full batch | 497,200 | 1,051,500 | 1,047,600 |
+| Fully connected network, inference | 967,000 | 2,957,000 | 2,964,700 |
+
+On the GPU Spingalett trains ResNet-20 5.7 times as fast as on the eight threads of the CPU, and
+1.05 times as fast as PyTorch with TF32 (1.25 times in single precision); it trains the
+convolutional networks as fast as PyTorch or faster and runs them 1.3 to 1.7 times as fast, and
+trains mini-batches of the fully connected network 2.3 times as fast. PyTorch leads on large dense
+products: full batches of the fully connected network train at half its speed, and its inference
+runs at a third, most of that time spent copying the 20,000 samples (63 MB) from host memory.
+
+0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
 [CHANGELOG](CHANGELOG.md) for more):
 
@@ -1001,7 +1079,8 @@ VM. `Examples/MNIST_CNN.c` reaches 98.9% after two epochs of about 9 seconds eac
 `Examples/CIFAR10.c` reaches 87.8% test accuracy after 20 epochs, 20 minutes on four threads of the
 Sapphire Rapids VM (760 images per second with augmentation); its INT8 model keeps 87.8%. With
 `resnet20` it reaches 91.55% after 100 epochs (12 threads of the i7-12650H, before the indirect
-kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB).
+kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB), and the same 91.55% trained on the
+RTX 4050 Laptop GPU (`gpu`) in 9 minutes; with `resnet32`, 92.39% (INT8 model 92.43% in 480 KB).
 
 ## Project layout
 
@@ -1009,6 +1088,7 @@ kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB).
 Include/Spingalett/   Public headers (Spingalett.h, the inference engine's Spingalett.Inference.h)
                       and the CMake-generated configuration header template
 Src/                  Library sources (network, training, kernels, serialization, inference engine, ...)
+Src/Gpu/              The Vulkan GPU backend: device layer, network executor and compute shaders
 Examples/             XOR, MNIST (dense and convolutional), throughput benchmark (C and PyTorch
                       counterpart), DatasetTool, ModelTool
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
@@ -1021,19 +1101,19 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.10; the C API may still change between minor versions (see
+Spingalett is at version 0.11; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.10`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.11`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
 engine and model format versions 3 to 6 are meant to stay stable from here on.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.11: a first GPU backend (Vulkan compute or CUDA), faster convolutions on the CPU, INT8
-  calibration, layer normalization
+- 0.12: the GPU further (tensor cores through cooperative matrices as an opt-in mixed precision,
+  deployment models and the step API on the GPU, fewer passes), INT8 calibration, layer
+  normalization
 - 1.0: API freeze, C++ wrapper
-- Later: CUDA/cuDNN backend, quantization-aware training, NEON kernels for training, further
-  language bindings
+- Later: quantization-aware training, NEON kernels for training, further language bindings
 
 ## Contributing
 

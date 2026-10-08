@@ -5,6 +5,57 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.11.0] - 2026-10-08
+
+"GPU": training and inference on a GPU through Vulkan compute, deterministic, with every kind of
+layer the CPU runs.
+
+### Added
+- `COMPUTE_VULKAN`: `train()` (full-batch and mini-batch strategies), `predict()` and `evaluate()`
+  on a GPU through Vulkan compute (NVIDIA, AMD and Intel GPUs; Apple GPUs through MoltenVK);
+  `spingalett_gpu_device()` names the device (the first discrete GPU, or `SPINGALETT_GPU_DEVICE`).
+  The Vulkan loader is opened at run time: the library loads and runs on the CPU without Vulkan, and
+  without a usable device the mode falls back to the CPU with a warning. Every kind of layer,
+  activation, loss and optimizer runs on the GPU, with dropout (the CPU's masks), gradient clipping,
+  label smoothing, augmentation (on the host, overlapped), validation and early stopping; the
+  parameters stay on the device for a `train()` call and come back at the end of every epoch.
+  Sums run in fixed orders, so GPU runs repeat bit for bit. Python: `ComputeMode.VULKAN`,
+  `gpu_device()`. Measured on an RTX 4050 Laptop GPU (`Bin/Benchmark`, medians of three runs,
+  samples per second; in parentheses the eight threads of the i7-12650H, then PyTorch 2.14 with CUDA
+  and cuDNN on the same GPU, with its default TF32 and in single precision): ResNet-20 trains at
+  8,900 (1,573; 8,508 and 7,139) and infers at 22,892 (6,163; 19,742 and 19,409); the MNIST CNN
+  trains at 62,926 (14,298; 56,906 and 59,993) and infers at 227,667 (51,250; 132,016 and 143,565);
+  with batch normalization 48,387 (10,791; 48,481 and 48,477) and 149,371 (53,411; 107,254 and
+  114,126); the 784-512-1000-10 MLP trains mini-batches of 64 at 188,642 (52,688; 80,581 and
+  80,413), full batches at 497,191 (112,991; about 1,050,000) and infers at 967,009 (284,002; about
+  2,960,000, its data already on the GPU).
+- The GPU's matrix kernel serves dense layers, convolutions (windows read through a tap table,
+  groups), data gradients (one stride-1 product per phase of a stride) and weight gradients (sums
+  split into slices added in a fixed order), with vector loads along each operand's contiguous axis;
+  the tile of each product shape is chosen by timing up to eight candidates on first use (about a
+  second for ResNet-20; `SPINGALETT_GPU_TUNE=0`: estimated), which cannot change a result since every
+  tile adds in the same order.
+  `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel at exit.
+- `Examples/CIFAR10.c gpu` trains on the GPU: ResNet-20 reaches the same 91.55% test accuracy as on
+  the CPU, in 9 minutes for 100 epochs (93 on twelve threads of the i7-12650H).
+- Building: `SPINGALETT_VULKAN` (`AUTO`, `ON`, `OFF`) needs `glslc` and the Vulkan headers;
+  `SPINGALETT_SPIRV_DIR` takes another build's compiled shaders. Release packages and wheels carry
+  the backend.
+- Tests: `SpingalettGpuTests` checks the matrix kernel in every mode and tile against double
+  precision and that tiles agree bit for bit; the `gpu` group trains networks with every kind of
+  layer on the GPU and the CPU and compares them. CI runs both on Mesa's lavapipe.
+- `Examples/benchmark_pytorch.py --cuda` (PyTorch's defaults) and `--cuda-fp32` (no TF32).
+- `Examples/CIFAR10.c resnet32` reaches 92.39% test accuracy in 100 epochs (INT8 model 92.43%,
+  480 KB).
+
+### Changed
+- `ComputeMode` has a new value, `COMPUTE_VULKAN`, before `COMPUTE_COUNT`.
+- Nothing on the CPU: interleaved runs of `Bin/Benchmark` on the i7-12650H, 0.10.0 against 0.11.0,
+  agree within 2% on every workload and thread count (the runs of either vary by more).
+
+### Fixed
+- README: a repeated phrase in the performance section.
+
 ## [0.10.0] - 2026-10-08
 
 "Graphs": networks become directed acyclic graphs of layers (residual connections, concatenated
@@ -573,6 +624,7 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[0.11.0]: https://github.com/pka-human/Spingalett/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/pka-human/Spingalett/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/pka-human/Spingalett/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/pka-human/Spingalett/compare/v0.7.0...v0.8.0

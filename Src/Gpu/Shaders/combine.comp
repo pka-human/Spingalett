@@ -1,0 +1,78 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * The layers of graphs (Spingalett.Graph.c): additions, concatenations along the channels and
+ * global average pooling, forward and backward. A sample is `cells` pixels; ck of the C channels of
+ * y (or dy) starting at c0 belong to the input x (or dx).
+ *
+ *   ADD      y = x + b, or y = y + x without b (FLAG_ACCUMULATE); act(y) after the last input
+ *   SLICE    forward: y[c0 .. c0 + ck) = act(x); backward: dx = (or +=) dy[c0 .. c0 + ck), times
+ *            act'(b) (b: the input's activation outputs)
+ *   GAP      forward: y[s][c] = act(mean over the cells of x[s][.][c]); backward: dx[s][p][c] = (or +=)
+ *            dy[s][c] / cells, times act'(b)
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint ACT = 6;
+layout(constant_id = 2) const uint BACKWARD = 0;
+layout(local_size_x = 256) in;
+
+#define ADD   0u
+#define SLICE 1u
+#define GAP   2u
+
+#define FLAG_ACCUMULATE 1u
+#define FLAG_LAST       2u      /* ADD: the last input, after which the activation applies */
+
+layout(push_constant) uniform Push {
+    F32 x, y, b;
+    uint n, cells, C, c0, ck;
+    uint flags;
+} p;
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    const bool accumulate = (p.flags & FLAG_ACCUMULATE) != 0u;
+    if (OP == ADD) {
+        const uint total = p.n * p.cells * p.C;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            float v = accumulate ? p.y.v[i] + p.x.v[i] : p.x.v[i] + p.b.v[i];
+            p.y.v[i] = (p.flags & FLAG_LAST) != 0u ? activate(v, ACT) : v;
+        }
+    } else if (OP == SLICE) {
+        const uint total = p.n * p.cells * p.ck;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            uint c = i % p.ck, q = i / p.ck, wide = q * p.C + p.c0 + c;
+            if (BACKWARD == 0u) {
+                p.y.v[wide] = activate(p.x.v[i], ACT);
+            } else {
+                float v = accumulate ? p.x.v[i] + p.y.v[wide] : p.y.v[wide];
+                p.x.v[i] = ACT == ACT_NONE ? v : v * derivative(p.b.v[i], ACT);
+            }
+        }
+    } else if (BACKWARD == 0u) {
+        const uint total = p.n * p.C;
+        const float inv = 1.0 / float(p.cells);
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            uint c = i % p.C, s = i / p.C, base = s * p.cells * p.C + c;
+            float v = p.x.v[base];
+            for (uint q = 1u; q < p.cells; q++) v += p.x.v[base + q * p.C];
+            p.y.v[i] = activate(v * inv, ACT);
+        }
+    } else {
+        const uint total = p.n * p.cells * p.C;
+        const float inv = 1.0 / float(p.cells);
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            uint c = i % p.C, s = i / (p.cells * p.C);
+            float g = p.y.v[s * p.C + c] * inv;
+            float v = accumulate ? p.x.v[i] + g : g;
+            p.x.v[i] = ACT == ACT_NONE ? v : v * derivative(p.b.v[i], ACT);
+        }
+    }
+}
