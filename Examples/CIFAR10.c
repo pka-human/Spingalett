@@ -25,7 +25,10 @@
  * (lr 0.1 after a warm-up, cosine decay, weight decay 5e-4) and label smoothing of 0.1.
  *
  *   Examples/download_cifar10.sh data/cifar10      # fetch the binary batches once
- *   Bin/CIFAR10 data/cifar10 [epochs] [separable | resnet20 | resnet32 ... [wide]] [st|omp|blas]
+ *   Bin/CIFAR10 data/cifar10 [epochs] [separable | resnet20 | resnet32 ... [wide]] [st|omp|blas|gpu]
+ *
+ * "gpu" trains and evaluates on the GPU (COMPUTE_VULKAN), when the library has the backend and finds
+ * a device.
  *
  * Training augments the images with random shifts of up to 4 pixels and mirror images. 5,000 training
  * images are held out to keep the weights of the best epoch; the test accuracy follows, then that of
@@ -136,6 +139,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "blas")) mode = COMPUTE_OPENBLAS;
         else if (!strcmp(argv[i], "omp")) mode = COMPUTE_OPENMP;
         else if (!strcmp(argv[i], "st")) mode = COMPUTE_SINGLE_THREADED;
+        else if (!strcmp(argv[i], "gpu")) mode = COMPUTE_VULKAN;
     }
 
     SpingalettDataset train_set, val_set, test_set;
@@ -154,6 +158,7 @@ int main(int argc, char **argv) {
 
     spingalett_set_verbose(false);
     spingalett_set_compute_mode(mode);
+    if (mode == COMPUTE_VULKAN) printf("GPU: %s\n", spingalett_gpu_device() ? spingalett_gpu_device() : "none (the CPU)");
 
     if (depth && (depth < 8 || (depth - 2) % 6 != 0)) {
         fprintf(stderr, "a residual network has 6n + 2 layers (resnet20, resnet32, resnet44, resnet56, ...)\n");

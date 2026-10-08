@@ -128,7 +128,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.9 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.11 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -739,9 +739,11 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
   the same bits every time on one device. They agree with the CPU's up to rounding: the products
   use fused multiply-adds and other tiles, and batch normalization adds its sums in single rather
   than double precision.
-- The first products of each shape are timed with several tile sizes and the fastest is kept for
-  the life of the process (a second or two the first time a network trains). Tiles change the
-  speed, never the results; `SPINGALETT_GPU_TUNE=0` estimates instead of timing.
+- The first products of each shape are timed with a few tile sizes and the fastest is kept for the
+  life of the process. Tiles change the speed, never the results; `SPINGALETT_GPU_TUNE=0` estimates
+  instead of timing. With that, the first `train()` of a process takes about a second longer
+  (ResNet-20 on the RTX 4050 Laptop GPU); the very first on a machine, ten seconds or so, while the
+  driver compiles the kernels it then keeps on disk.
 - Samples are processed in chunks of up to 2048 that fit in half the GPU's memory; full-batch
   training of networks with batch normalization normalizes over each chunk, as on the CPU.
 - `SPINGALETT_GPU_DEVICE=n` picks the n-th device of the Vulkan device list instead of the first

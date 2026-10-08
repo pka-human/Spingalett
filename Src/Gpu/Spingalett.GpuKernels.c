@@ -195,23 +195,42 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec) 
     SpgGemmPush q = *p;
     q.c = tuner.scratch.address;
     q.beta = 0.0f;
-    /* candidates: the tiles that waste at most half again the least padding */
+    /* candidates: the tiles that waste at most half again the least padding, at most eight of them,
+       those with the most register reuse among those that give enough workgroups (when some do) */
+    const uint32_t z = m->groups * p->slices;
     double least = 0.0;
     for (size_t k = 0; k < sizeof tiles / sizeof tiles[0]; k++) {
         double padded = (double)((p->M + tiles[k].bm - 1) / tiles[k].bm * tiles[k].bm) *
                         ((p->N + tiles[k].bn - 1) / tiles[k].bn * tiles[k].bn);
         if ((least == 0.0 || padded < least) && tile_fits(&tiles[k])) least = padded;
     }
-    double best = 0.0;
-    int chosen = -1;
+    int order[sizeof tiles / sizeof tiles[0]];
+    double score[sizeof tiles / sizeof tiles[0]];
+    uint32_t count = 0;
     for (size_t k = 0; k < sizeof tiles / sizeof tiles[0]; k++) {
         const Tile *t = &tiles[k];
         double padded = (double)((p->M + t->bm - 1) / t->bm * t->bm) * ((p->N + t->bn - 1) / t->bn * t->bn);
         if (padded > 1.5 * least || !tile_fits(t)) continue;
+        double wg = (double)((p->M + t->bm - 1) / t->bm) * ((p->N + t->bn - 1) / t->bn) * z;
+        double reuse = (double)(t->tm * t->tn) / (t->tm + t->tn);
+        score[count] = reuse * (wg < 128.0 ? wg / 128.0 : 1.0) * least / padded;
+        order[count++] = (int)k;
+    }
+    for (uint32_t a = 0; a < count; a++)            /* best score first */
+        for (uint32_t b = a + 1; b < count; b++)
+            if (score[b] > score[a]) {
+                double ts = score[a]; score[a] = score[b]; score[b] = ts;
+                int to = order[a]; order[a] = order[b]; order[b] = to;
+            }
+    if (count > 8) count = 8;
+    double best = 0.0;
+    int chosen = -1;
+    for (uint32_t c = 0; c < count; c++) {
+        const Tile *t = &tiles[order[c]];
         time_tile(&q, m, vec, t, 1);            /* the pipeline made, the caches warm */
-        double s = time_tile(&q, m, vec, t, 4);
-        if (s > 0.0 && s < 0.002) s = time_tile(&q, m, vec, t, (int)(0.002 / s) * 4 + 4);
-        if (s > 0.0 && (chosen < 0 || s < best)) { best = s; chosen = (int)k; }
+        double s = time_tile(&q, m, vec, t, 3);
+        if (s > 0.0 && s < 0.0005) s = time_tile(&q, m, vec, t, (int)(0.0015 / s) + 1);  /* at least ~1.5 ms */
+        if (s > 0.0 && (chosen < 0 || s < best)) { best = s; chosen = order[c]; }
     }
     if (chosen >= 0) {
         memcpy(tuner.choices[tuner.count].key, key, sizeof key);

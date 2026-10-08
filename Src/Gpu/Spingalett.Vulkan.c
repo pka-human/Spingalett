@@ -68,7 +68,7 @@ static PFN_vkVoidFunction loader_symbol(void *lib, const char *name) {
     X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
     X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkGetBufferDeviceAddress) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkCreateComputePipelines) \
-    X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) X(vkBeginCommandBuffer) \
+    X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
     X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkResetFences) \
     X(vkWaitForFences) X(vkQueueSubmit) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) \
@@ -101,12 +101,11 @@ static struct {
     uint64_t heap;
     uint32_t shared;
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
-    VkCommandPool pool;
     VkPipelineLayout layout;
     VkShaderModule modules[SPG_KERNEL_COUNT];
     Pipeline *pipelines;            /* made so far, in the order they were */
     size_t pipeline_count, pipeline_cap;
-    SpgSignal *lock;                /* the pipelines, the queue and the command pool */
+    SpgSignal *lock;                /* the pipelines and the queue */
     float tick_ns;                  /* timestamp period */
     bool profile;                   /* SPINGALETT_GPU_PROFILE: time every dispatch */
     struct { char label[48]; double ms; uint64_t calls; } stats[256];
@@ -250,9 +249,6 @@ static bool open_device(void) {
 #undef LOAD_DEVICE
     vkGetDeviceQueue(gpu.device, gpu.family, 0, &gpu.queue);
 
-    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
-                                   VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, gpu.family};
-    if (vkCreateCommandPool(gpu.device, &pci, NULL, &gpu.pool) != VK_SUCCESS) return false;
     VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, SPG_PUSH_BYTES};
     VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 0, NULL, 1, &range};
     if (vkCreatePipelineLayout(gpu.device, &lci, NULL, &gpu.layout) != VK_SUCCESS) return false;
@@ -392,7 +388,10 @@ void spg_gpu_buffer_free(SpgGpuBuffer *b) {
 
 /* ------------------------------------------------------------------------- commands */
 
+/* Each command buffer has a pool of its own: recording into buffers of one pool needs the pool
+   synchronized, and networks may record on several threads at once. */
 struct SpgGpuCommands {
+    VkCommandPool pool;
     VkCommandBuffer cb;
     VkFence fence;
     bool pending;                   /* submitted and not waited for */
@@ -406,13 +405,14 @@ SpgGpuCommands *spg_gpu_commands_create(void) {
     if (!spg_gpu_open()) return NULL;
     SpgGpuCommands *c = (SpgGpuCommands *)calloc(1, sizeof *c);
     if (!c) return NULL;
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, gpu.pool,
+    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
+                                   VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, gpu.family};
+    bool ok = vkCreateCommandPool(gpu.device, &pci, NULL, &c->pool) == VK_SUCCESS;
+    if (!ok) c->pool = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, c->pool,
                                       VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0};
-    spg_lock(gpu.lock);
-    bool ok = vkAllocateCommandBuffers(gpu.device, &ai, &c->cb) == VK_SUCCESS;
-    spg_unlock(gpu.lock);
-    if (!ok) c->cb = VK_NULL_HANDLE;
+    ok = ok && vkAllocateCommandBuffers(gpu.device, &ai, &c->cb) == VK_SUCCESS;
     if (!ok || vkCreateFence(gpu.device, &fci, NULL, &c->fence) != VK_SUCCESS) {
         spg_gpu_commands_free(c);
         return NULL;
@@ -437,11 +437,7 @@ void spg_gpu_commands_free(SpgGpuCommands *c) {
     if (c->fence) vkDestroyFence(gpu.device, c->fence, NULL);
     if (c->queries) vkDestroyQueryPool(gpu.device, c->queries, NULL);
     free(c->labels);
-    if (c->cb) {
-        spg_lock(gpu.lock);
-        vkFreeCommandBuffers(gpu.device, gpu.pool, 1, &c->cb);
-        spg_unlock(gpu.lock);
-    }
+    if (c->pool) vkDestroyCommandPool(gpu.device, c->pool, NULL);       /* its buffer with it */
     free(c);
 }
 

@@ -29,9 +29,12 @@ layer the CPU runs.
 - The GPU's matrix kernel serves dense layers, convolutions (windows read through a tap table,
   groups), data gradients (one stride-1 product per phase of a stride) and weight gradients (sums
   split into slices added in a fixed order), with vector loads along each operand's contiguous axis;
-  the tile of each product shape is chosen by timing on first use (`SPINGALETT_GPU_TUNE=0`:
-  estimated), which cannot change a result since every tile adds in the same order.
+  the tile of each product shape is chosen by timing up to eight candidates on first use (about a
+  second for ResNet-20; `SPINGALETT_GPU_TUNE=0`: estimated), which cannot change a result since every
+  tile adds in the same order.
   `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel at exit.
+- `Examples/CIFAR10.c gpu` trains on the GPU: ResNet-20 reaches the same 91.55% test accuracy as on
+  the CPU, in 9 minutes for 100 epochs (93 on twelve threads of the i7-12650H).
 - Building: `SPINGALETT_VULKAN` (`AUTO`, `ON`, `OFF`) needs `glslc` and the Vulkan headers;
   `SPINGALETT_SPIRV_DIR` takes another build's compiled shaders. Release packages and wheels carry
   the backend.

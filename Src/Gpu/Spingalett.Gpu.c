@@ -111,6 +111,10 @@ bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
             if (why) *why = "convolution windows over 255 cells or layers of over 65535 channels";
             return false;
         }
+        if (s->type == LAYER_CONV2D && s->stride_h * s->stride_w > SPG_MAX_PHASES) {
+            if (why) *why = "convolutions whose strides multiply to over 64";
+            return false;
+        }
         if ((uint64_t)net->topology[l] * SPINGALETT_BATCH_CHUNK > UINT32_MAX) {
             if (why) *why = "layers of over 2^32 / 2048 outputs";
             return false;

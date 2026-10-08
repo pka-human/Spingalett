@@ -4269,6 +4269,64 @@ static void gpu_training_options(void) {
     free(t);
 }
 
+/* Networks trained on the GPU from two threads at once get the same bits as one after the other. */
+typedef struct { int which; float *params; size_t count; } GpuJob;
+
+static void *gpu_train_job(void *arg) {
+    GpuJob *job = (GpuJob *)arg;
+    NeuralNetwork *net = gpu_net(job->which);
+    SpingalettNetworkLayer first, last;
+    spingalett_network_layer(net, 0, &first);
+    spingalett_network_layer(net, spingalett_layer_count(net) - 1, &last);
+    const uint32_t n = 96;
+    float *x = (float *)malloc((size_t)n * first.outputs * sizeof(float));
+    float *t = (float *)calloc((size_t)n * last.outputs, sizeof(float));
+    for (size_t i = 0; i < (size_t)n * first.outputs; i++) x[i] = (float)((i * 2654435761u) % 1000u) / 500.0f - 1.0f;
+    for (uint32_t s = 0; s < n; s++) t[(size_t)s * last.outputs + s % last.outputs] = 1.0f;
+    spingalett_seed(7);
+    train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .batch_size = 16,
+          .training_strategy = STRATEGY_SMALL_BATCH, .optimizer_type = OPTIMIZER_MOMENTUM, .learning_rate = 0.05f,
+          .report_interval = 0);
+    job->count = 0;
+    for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+        SpingalettNetworkLayer info;
+        spingalett_network_layer(net, l, &info);
+        job->count += info.weight_count;
+    }
+    job->params = (float *)malloc((job->count + 1) * sizeof(float));
+    size_t off = 0;
+    for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+        SpingalettNetworkLayer info;
+        spingalett_network_layer(net, l, &info);
+        if (info.weight_count) spingalett_get_parameters(net, l, PARAM_WEIGHTS, job->params + off, info.weight_count);
+        off += info.weight_count;
+    }
+    free_network(net);
+    free(x);
+    free(t);
+    return NULL;
+}
+
+static void gpu_threads(void) {
+#if !defined(_WIN32)
+    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    GpuJob alone[2] = {{1, NULL, 0}, {2, NULL, 0}}, together[2] = {{1, NULL, 0}, {2, NULL, 0}};
+    for (int k = 0; k < 2; k++) gpu_train_job(&alone[k]);
+    pthread_t threads[2];
+    int started = 0;
+    for (int k = 0; k < 2; k++)
+        if (pthread_create(&threads[k], NULL, gpu_train_job, &together[k]) == 0) started++;
+    for (int k = 0; k < started; k++) pthread_join(threads[k], NULL);
+    bool same = started == 2;
+    for (int k = 0; same && k < 2; k++)
+        same = alone[k].count == together[k].count &&
+               !memcmp(alone[k].params, together[k].params, alone[k].count * sizeof(float));
+    CHECK(same, "gpu: networks trained on two threads at once differ from one at a time");
+    for (int k = 0; k < 2; k++) { free(alone[k].params); free(together[k].params); }
+    printf("  gpu: two threads training at once\n");
+#endif
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "export-headers")) {
         spingalett_set_verbose(false);
@@ -4472,6 +4530,7 @@ int main(int argc, char **argv) {
             printf("  device: %s\n", spingalett_gpu_device());
             for (int k = 0; k < 6; k++) gpu_equivalence(k);
             gpu_training_options();
+            gpu_threads();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }
