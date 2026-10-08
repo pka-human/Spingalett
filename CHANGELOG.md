@@ -5,6 +5,61 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [Unreleased]
+
+### Added
+- `spingalett_set_gpu_precision(PRECISION_BFLOAT16)` (Python `set_gpu_precision()`): the GPU's matrix
+  products in bfloat16 on its matrix units (`VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16`),
+  the products added in single precision, everything else (the parameters, the optimizer, batch
+  normalization) in single precision; products smaller than a block of the matrix units stay in
+  single precision. Runs stay deterministic. On an RTX 4050 Laptop GPU, ResNet-20 trains 17 to 18%
+  faster than in single precision and the MNIST CNN infers 8% faster. `Examples/CIFAR10.c bf16`.
+- ONNX models whose weights are kept in external files (`torch.onnx.export` of models over 2 GB,
+  `onnx.save_model(..., save_as_external_data=True)`) import from their path; the files must lie in
+  the model's folder.
+- PyTorch weights stored as views (a transposed or permuted tensor in the state dict) and 32-bit
+  integer tensors load.
+- `SpingalettGpuTests bench` lists every tile's time with `SPINGALETT_BENCH_TILES` set.
+
+### Changed
+- Networks allocate their gradients and optimizer state when they first train (`train()`,
+  `spingalett_trainer_new()`, a file with optimizer state, or setting a gradient), so that networks
+  loaded or imported for inference hold their parameters once instead of four times. Parameter
+  arrays grow by half again when a layer does not fit, instead of to the exact size every time.
+  Building a network of 1000 layers, which copied its parameters once per layer, takes 0.02 s
+  instead of 5.6 s.
+- ONNX import and PyTorch weights: files are mapped instead of read, and each tensor is converted
+  straight into the layer in one pass (no float copy of every initializer, no table of indices as
+  large as the tensor, no copy of the network's parameters to restore on error: everything is
+  checked before anything is written); names resolve through hash tables. On an i7-12650H:
+  ResNet-50 (100 MB) imports in 0.085 s instead of 1.02 s, peaking at 360 MB instead of 1139 MB; a
+  126M-parameter VGG head (504 MB) in 0.17 s instead of 1.94 s, peaking at 1271 MB instead of
+  4747 MB, and its state dict loads in 0.08 s instead of 1.0 s.
+- GPU: the executor waits for the older of the two chunks in flight before filling the next one
+  (it waited for both), and a chunk's last barrier no longer holds back the next one's copies: the
+  MNIST CNN trains 8 to 17% faster on the RTX 4050 Laptop GPU and infers 6 to 10% faster.
+- GPU: matrix products of more row tiles than a dispatch may have go in parts, tiles whose columns
+  would exceed the device's limit are not chosen, and the gradient norm's sums loop over at most
+  65535 workgroups (Intel and lavapipe allow 65535 workgroups in x; every device in y).
+- GPU: tanh takes an odd polynomial below |x| = 0.3, as the CPU's vector kernel does (the formula
+  through exp lost its relative precision there); the matrix kernel's accumulators are `precise`.
+
+### Fixed
+- GPU: validation during training ran batch normalization with the validation chunk's own
+  statistics and moved the running statistics towards the validation data; it uses the running
+  statistics now, as the CPU does.
+- GPU: a concatenation (or a one-input addition, which ONNX import makes for activations it cannot
+  fuse) that directly followed another could read its input without a barrier.
+- GPU: a chunk whose command recording failed stayed cached and was submitted half-recorded by the
+  next call of its size; a lost device made predictions and losses read garbage as success.
+- GPU: the bfloat16 kernel used the Vulkan memory model and 16-bit floats without the device
+  features enabled (NVIDIA tolerates it, a stricter driver may refuse the pipeline); it takes its
+  subgroup from `gl_SubgroupID` and asks for complete subgroups where the device allows.
+- GPU: the 32-bit index check skipped the input layer; devices were asked for Vulkan 1.2 features
+  before their version was checked.
+- README: the DeepWiki badge (its image server refuses GitHub's image proxy) and the introduction,
+  which still said the library ran on the CPU only.
+
 ## [0.11.0] - 2026-10-08
 
 "GPU": training and inference on a GPU through Vulkan compute, deterministic, with every kind of
