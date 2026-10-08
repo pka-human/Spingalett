@@ -393,7 +393,7 @@ static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t coun
     spg_lock(gpu.lock);
     for (size_t k = 0; k < gpu.pipeline_count && !found; k++) {
         const Pipeline *e = &gpu.pipelines[k];
-        if (e->kernel == kernel && e->count == count && !memcmp(e->spec, spec, count * sizeof(uint32_t)))
+        if (e->kernel == kernel && e->count == count && (!count || !memcmp(e->spec, spec, count * sizeof(uint32_t))))
             found = e->pipeline;
     }
     if (!found && gpu.pipeline_count == gpu.pipeline_cap) {
@@ -424,7 +424,7 @@ static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t coun
             Pipeline *e = &gpu.pipelines[gpu.pipeline_count++];
             e->kernel = kernel;
             e->count = count;
-            memcpy(e->spec, spec, count * sizeof(uint32_t));
+            if (count) memcpy(e->spec, spec, count * sizeof(uint32_t));
             e->pipeline = found = made;
         }
     }

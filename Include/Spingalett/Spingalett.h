@@ -486,6 +486,12 @@ SPINGALETT_API TrainReport train_struct_arguments(TrainArgs args);
  * grad_biases hold the sum over the samples since the last step) and a step applies the mean of
  * that sum with the given optimizer, so a step's batch can be split into several backward passes.
  * Optimizer state and the step count live in the network and are shared with train().
+ *
+ * With COMPUTE_VULKAN (when spingalett_trainer_new() is called) the passes run on the GPU, which keeps
+ * the parameters, gradients and optimizer state between them: functions that read the network
+ * (predict(), save_spingalett(), spingalett_get_parameters() and the others) copy them back first,
+ * and parameters set on the host go to the GPU before the next forward pass. A trainer is used from
+ * one thread at a time, and the network is not read from another thread while it runs a pass.
  */
 SPINGALETT_API SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch);
 SPINGALETT_API void spingalett_trainer_free(SpingalettTrainer *trainer);

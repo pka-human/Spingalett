@@ -77,6 +77,18 @@ bool spingalett_gpu_take_loss(SpgGpuNet *g, float *loss);
    statistics, no dropout), in chunks of up to `capacity` that overlap with the copies. */
 bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n);
 
+/* The step API: one pass at a time, each waited for. The inputs of the next forward pass and the
+   targets (or dL/d(outputs) of a loss of the caller's) of the next backward pass go where these point.
+   The forward pass trains (batch statistics, dropout of the step and positions from `position`) and
+   returns its outputs (valid until the next pass); the backward pass back-propagates it and adds the
+   samples' gradients to those since the last step (add) or starts them, *loss = the sum of the
+   samples' losses (from targets); the step applies the gradients times grad_scale with the
+   optimizer of cfg. */
+float *spingalett_gpu_pass_buffers(SpgGpuNet *g, float **targets);
+const float *spingalett_gpu_pass_forward(SpgGpuNet *g, uint32_t n, uint32_t position, uint64_t step);
+bool spingalett_gpu_pass_backward(SpgGpuNet *g, uint32_t n, bool from_grads, bool add, float *loss);
+bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const SpgGpuStep *step, float grad_scale);
+
 #else
 
 static inline bool spingalett_gpu_available(void) { return false; }
@@ -111,6 +123,23 @@ static inline bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t
 static inline bool spingalett_gpu_take_loss(SpgGpuNet *g, float *loss) { (void)g; (void)loss; return false; }
 static inline bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n) {
     (void)g; (void)inputs; (void)outputs; (void)n;
+    return false;
+}
+static inline float *spingalett_gpu_pass_buffers(SpgGpuNet *g, float **targets) {
+    (void)g; (void)targets;
+    return NULL;
+}
+static inline const float *spingalett_gpu_pass_forward(SpgGpuNet *g, uint32_t n, uint32_t position, uint64_t step) {
+    (void)g; (void)n; (void)position; (void)step;
+    return NULL;
+}
+static inline bool spingalett_gpu_pass_backward(SpgGpuNet *g, uint32_t n, bool from_grads, bool add, float *loss) {
+    (void)g; (void)n; (void)from_grads; (void)add; (void)loss;
+    return false;
+}
+static inline bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const SpgGpuStep *step,
+                                            float grad_scale) {
+    (void)g; (void)cfg; (void)step; (void)grad_scale;
     return false;
 }
 

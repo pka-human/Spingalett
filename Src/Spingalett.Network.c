@@ -224,6 +224,18 @@ bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t w
     return true;
 }
 
+void spingalett_network_sync(const NeuralNetwork *cnet) {
+    NeuralNetwork *net = (NeuralNetwork *)cnet;         /* the values the network holds do not change */
+    if (!net || !net->gpu_newer || !net->gpu_trainer) return;
+    if (!spingalett_gpu_download(net->gpu_trainer))
+        spingalett_log(LOG_ERROR, "The parameters could not be copied back from the GPU");
+    net->gpu_newer = false;
+}
+
+void spingalett_network_written(NeuralNetwork *net) {
+    if (net) net->param_version++;
+}
+
 bool spingalett_training_state(NeuralNetwork *net) {
     if (net->grad_weights) return true;
     const size_t nw = net->cap_weights ? (size_t)net->cap_weights : 1u, nb = net->cap_biases ? (size_t)net->cap_biases : 1u;
@@ -620,6 +632,7 @@ static float *parameter_block(const NeuralNetwork *net, uint32_t index, Paramete
 
 bool spingalett_get_parameters(const NeuralNetwork *net, uint32_t index, ParameterKind kind, float *values, uint64_t count) {
     bool valid;
+    spingalett_network_sync(net);
     const float *p = parameter_block(net, index, kind, count,
                                      "spingalett_get_parameters: invalid layer, kind or count", &valid);
     if (!valid || (!values && count > 0)) return false;
@@ -636,7 +649,9 @@ bool spingalett_set_parameters(NeuralNetwork *net, uint32_t index, ParameterKind
         p = parameter_block(net, index, kind, count, "spingalett_set_parameters: invalid layer, kind or count", &valid);
     }
     if (!p || (!values && count > 0)) return false;
+    spingalett_network_sync(net);
     if (count) memcpy(p, values, (size_t)count * sizeof(float));
+    spingalett_network_written(net);
     return true;
 }
 
@@ -696,6 +711,7 @@ float *forward_struct_arguments(ForwardArgs args) {
         set_error(SPINGALETT_ERR_INVALID, "forward: net or input is NULL");
         return NULL;
     }
+    spingalett_network_sync(net);
 
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "Network must have at least 2 layers for forward pass");
@@ -729,6 +745,7 @@ float *forward_struct_arguments(ForwardArgs args) {
 }
 
 void print_parameters(const NeuralNetwork *net) {
+    spingalett_network_sync(net);
     if (!net || net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "print_parameters: network must have at least 2 layers");
         return;

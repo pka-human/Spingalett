@@ -937,7 +937,9 @@ bool spingalett_load_pytorch_from_memory(NeuralNetwork *net, const void *data, s
     const uint8_t *p = (const uint8_t *)data;
     bool zip = size >= 4 && slett_get32(p) == 0x04034b50u;
     bool ok = zip ? read_torch_zip(p, size, &w, &u) : read_safetensors(p, size, &w);
+    if (ok) spingalett_network_sync(net);
     ok = ok && assign(net, &w, modules, module_count, !zip);
+    if (ok) spingalett_network_written(net);
     for (uint32_t k = 0; k < u.count; k++) free(u.obs[k].items);
     free(u.obs);
     free(u.stack);

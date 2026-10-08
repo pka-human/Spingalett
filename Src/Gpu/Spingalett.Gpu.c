@@ -1104,11 +1104,12 @@ static SpgGpuCommands *forget(Slot *s, SpgGpuCommands *c) {
     return NULL;
 }
 
-/* The slot's command buffer for chunks of this kind, recorded on first use. */
-static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint32_t n, uint32_t count, bool first,
-                                      bool last, bool train) {
+/* The slot's command buffer of this key; *fresh when it is to be recorded (NULL: out of memory). */
+static SpgGpuCommands *cache_entry(Slot *s, uint64_t key, bool *fresh) {
+    *fresh = false;
     for (uint32_t e = 0; e < s->used; e++)
         if (s->cache[e].key == key) return s->cache[e].commands;
+    *fresh = true;
     SpgGpuCommands *c = NULL;
     if (s->used < sizeof s->cache / sizeof s->cache[0]) {
         c = spg_gpu_commands_create();
@@ -1122,6 +1123,15 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
         s->cache[s->used - 1].key = key;
         s->cache[s->used - 1].commands = c;
     }
+    return c;
+}
+
+/* The slot's command buffer for chunks of this kind, recorded on first use. */
+static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint32_t n, uint32_t count, bool first,
+                                      bool last, bool train) {
+    bool fresh;
+    SpgGpuCommands *c = cache_entry(s, key, &fresh);
+    if (!c || !fresh) return c;
     const NeuralNetwork *net = g->net;
     const uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
     Recorder *r = spg_gpu_record_begin(c) ? (Recorder *)calloc(1, sizeof *r) : NULL;
@@ -1161,11 +1171,10 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
     return spg_gpu_record_end(c) ? c : forget(s, c);
 }
 
-bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32_t position, bool first, bool last,
-                                const SpgGpuStep *step) {
-    if (!g->training || g->lost || n == 0 || n > g->capacity) return false;
-    Slot *s = &g->slots[g->next];
-    uint32_t header[SPG_STEP_HEADER] = {0};
+/* The step header (common.glsl's STEP_* entries). */
+static void step_header(const SpgGpuNet *g, const SpgGpuStep *step, uint32_t position, float grad_scale,
+                        uint32_t header[SPG_STEP_HEADER]) {
+    memset(header, 0, SPG_STEP_HEADER * sizeof(uint32_t));
     memcpy(&header[0], &step->lr, 4);
     memcpy(&header[1], &step->m_factor, 4);
     memcpy(&header[2], &step->v_factor, 4);
@@ -1174,6 +1183,15 @@ bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32
     header[5] = (uint32_t)step->step;
     header[6] = (uint32_t)(step->step >> 32);
     header[7] = position;
+    memcpy(&header[9], &grad_scale, 4);
+}
+
+bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32_t position, bool first, bool last,
+                                const SpgGpuStep *step) {
+    if (!g->training || g->lost || n == 0 || n > g->capacity) return false;
+    Slot *s = &g->slots[g->next];
+    uint32_t header[SPG_STEP_HEADER];
+    step_header(g, step, position, 1.0f, header);
     /* the commands depend on n, on count (gradients scaled by 1 / count) and on where the chunk is in
        its step */
     const uint64_t key = (uint64_t)n | (uint64_t)count << 24 | (first ? 1ull << 56 : 0) | (last ? 1ull << 57 : 0);
@@ -1219,4 +1237,132 @@ bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, u
     }
     drain(g);
     return !g->lost;
+}
+
+/* ------------------------------------------------------------------------- passes (the step API) */
+
+/*
+ * The step API (spingalett_trainer_*) runs one pass at a time and waits for it: a forward pass in
+ * training mode whose outputs the caller reads, a backward pass from targets or from the gradient of
+ * the caller's own loss, which adds the samples' gradients up, and an optimizer step with their mean.
+ * They use slot 0 and its cache, recorded once per size like chunks.
+ */
+
+enum { PASS_FORWARD = 1, PASS_LOSS = 2, PASS_GRADS = 3, PASS_STEP = 4 };
+
+static SpgGpuCommands *pass_commands(SpgGpuNet *g, uint32_t n, uint32_t kind, bool add) {
+    Slot *s = &g->slots[0];
+    bool fresh;
+    SpgGpuCommands *c = cache_entry(s, (uint64_t)n | 1ull << 62 | (uint64_t)kind << 58 | (add ? 1ull << 57 : 0), &fresh);
+    if (!c || !fresh) return c;
+    const NeuralNetwork *net = g->net;
+    const uint32_t in = net->topology[0], out = net->topology[net->layers - 1], L = net->layers - 1;
+    Recorder *r = spg_gpu_record_begin(c) ? (Recorder *)calloc(1, sizeof *r) : NULL;
+    if (!r) return forget(s, c);
+    r->c = c;
+    g->act[0] = s->input;
+    g->header = s->header;
+    g->targets = s->target;
+    if (kind == PASS_FORWARD) {
+        spg_gpu_copy(c, &s->staging, 0, &s->header, 0, SPG_STEP_HEADER * 4u);
+        spg_gpu_copy(c, &s->staging, s->inputs, &s->input, 0, (size_t)n * in * 4u);
+        barrier(r);
+        record_forward(g, r, n, true);
+        barrier(r);
+        spg_gpu_copy(c, &g->act[L], 0, &s->staging, s->outputs, (size_t)n * out * 4u);
+    } else if (kind == PASS_STEP) {
+        spg_gpu_copy(c, &s->staging, 0, &s->header, 0, SPG_STEP_HEADER * 4u);
+        barrier(r);
+        /* the mean of the samples' gradients, added up by the backward passes */
+        Access a = {0};
+        reads(&a, whole(&g->grads));
+        reads(&a, whole(&g->header));
+        writes(&a, whole(&g->grads));
+        eltwise(g, r, &a, SPG_ELT_SCALE, ACT_NONE, g->grads.address, 0, at(&g->header, 9), 0, g->Wp + g->Bp, 1);
+        optimizer(g, r);
+    } else {
+        /* the targets, or dL/d(output) of the caller's loss, then the backward pass */
+        spg_gpu_copy(c, &s->staging, s->targets, &s->target, 0, (size_t)n * out * 4u);
+        barrier(r);
+        SpgOutputPush p = {g->act[L].address, g->targets.address, g->delta[L].address, s->staging.address + s->losses,
+                           n, out};
+        uint32_t spec[3] = {kind == PASS_GRADS ? SPG_OUT_GRADS : SPG_OUT_LOSS, net->act_func[L - 1], net->loss_func};
+        Access a = {0};
+        reads(&a, whole(&g->act[L]));
+        reads(&a, whole(&g->targets));
+        writes(&a, whole(&g->delta[L]));
+        writes(&a, span(s->staging.address + s->losses, n));
+        kernel(r, &a, SPG_KERNEL_output, spec, 3, &p, sizeof p, (n + 63u) / 64u, 1, 1);
+        record_backward(g, r, n, 1.0f, add ? 1.0f : 0.0f);
+    }
+    spg_gpu_barrier_host(c);
+    free(r);
+    return spg_gpu_record_end(c) ? c : forget(s, c);
+}
+
+/* Runs a pass's commands with the header given (NULL: the staging's as it is) and waits. */
+static bool run_pass(SpgGpuNet *g, SpgGpuCommands *c, const uint32_t *header) {
+    Slot *s = &g->slots[0];
+    if (!c || g->lost) return false;
+    if (header) memcpy(s->staging.mapped, header, SPG_STEP_HEADER * sizeof(uint32_t));
+    if (!spg_gpu_submit(c)) return false;
+    if (!spg_gpu_wait(c)) g->lost = true;
+    return !g->lost;
+}
+
+float *spingalett_gpu_pass_buffers(SpgGpuNet *g, float **targets) {
+    drain(g);
+    g->next = 0;
+    Slot *s = &g->slots[0];
+    if (targets) *targets = (float *)((char *)s->staging.mapped + s->targets);
+    return (float *)((char *)s->staging.mapped + s->inputs);
+}
+
+const float *spingalett_gpu_pass_forward(SpgGpuNet *g, uint32_t n, uint32_t position, uint64_t step) {
+    if (!g->training || n == 0 || n > g->capacity) return NULL;
+    const SpgGpuStep st = {0.0f, 0.0f, 0.0f, step};
+    uint32_t header[SPG_STEP_HEADER];
+    step_header(g, &st, position, 1.0f, header);
+    if (!run_pass(g, pass_commands(g, n, PASS_FORWARD, false), header)) return NULL;
+    Slot *s = &g->slots[0];
+    return (const float *)((const char *)s->staging.mapped + s->outputs);
+}
+
+bool spingalett_gpu_pass_backward(SpgGpuNet *g, uint32_t n, bool from_grads, bool add, float *loss) {
+    if (!g->training || n == 0 || n > g->capacity) return false;
+    if (!run_pass(g, pass_commands(g, n, from_grads ? PASS_GRADS : PASS_LOSS, add), NULL)) return false;
+    if (loss) {
+        Slot *s = &g->slots[0];
+        const float *losses = (const float *)((const char *)s->staging.mapped + s->losses);
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < n; k++) sum += losses[k];
+        *loss = sum;
+    }
+    return true;
+}
+
+bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const SpgGpuStep *step, float grad_scale) {
+    if (!g->training) return false;
+    /* the optimizer's settings are recorded in its commands: other settings record them again */
+    Slot *s = &g->slots[0];
+    const uint64_t seed = g->cfg.dropout_seed;
+    SpgGpuTraining want = *cfg;
+    want.dropout_seed = seed;
+    if (memcmp(&want, &g->cfg, sizeof want) != 0) {
+        g->cfg = want;
+        for (uint32_t e = 0; e < s->used; e++)
+            if (s->cache[e].key == ((uint64_t)1u << 62 | (uint64_t)PASS_STEP << 58)) {
+                forget(s, s->cache[e].commands);
+                break;
+            }
+    }
+    if ((cfg->optimizer == OPTIMIZER_MOMENTUM || cfg->optimizer == OPTIMIZER_ADAM || cfg->optimizer == OPTIMIZER_ADAMW) &&
+        !g->moment1.buffer)
+        return false;
+    if ((cfg->optimizer == OPTIMIZER_RMSPROP || cfg->optimizer == OPTIMIZER_ADAM || cfg->optimizer == OPTIMIZER_ADAMW) &&
+        !g->moment2.buffer)
+        return false;
+    uint32_t header[SPG_STEP_HEADER];
+    step_header(g, step, 0, grad_scale, header);
+    return run_pass(g, pass_commands(g, 0, PASS_STEP, false), header);
 }

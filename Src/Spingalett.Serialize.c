@@ -404,6 +404,7 @@ void *spingalett_save_deployment(const NeuralNetwork *net, PrecisionMode precisi
         set_error(SPINGALETT_ERR_INVALID, "save: net or size is NULL");
         return NULL;
     }
+    spingalett_network_sync(net);
     bool failed;
     NeuralNetwork *folded = fold_batch_norm(net, &failed);
     if (failed) return NULL;
@@ -418,6 +419,7 @@ void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precisio
         set_error(SPINGALETT_ERR_INVALID, "save: net or size is NULL");
         return NULL;
     }
+    spingalett_network_sync(net);
     /* quantized files without optimizer state are for deployment: normalizations are folded */
     if (precision != PRECISION_FLOAT32 && !save_optimizer)
         return spingalett_save_deployment(net, precision, size);

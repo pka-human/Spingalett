@@ -278,6 +278,7 @@ bool predict_struct_arguments(PredictArgs args) {
         set_error(SPINGALETT_ERR_INVALID, "predict: net, inputs or outputs is NULL");
         return false;
     }
+    spingalett_network_sync(net);
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "predict: network must have at least 2 layers");
         return false;
@@ -407,6 +408,7 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
         set_error(SPINGALETT_ERR_INVALID, "evaluate: net, inputs or targets is NULL, or sample_count is 0");
         return m;
     }
+    spingalett_network_sync(net);
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "evaluate: network must have at least 2 layers");
         return m;

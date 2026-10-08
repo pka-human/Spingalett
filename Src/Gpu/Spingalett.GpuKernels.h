@@ -122,7 +122,7 @@ typedef struct {
     uint64_t y, t, delta, loss;
     uint32_t rows, n;
 } SpgOutputPush;
-enum { SPG_OUT_SOFTMAX, SPG_OUT_LOSS };
+enum { SPG_OUT_SOFTMAX, SPG_OUT_LOSS, SPG_OUT_GRADS };
 
 /* pool.comp */
 typedef struct {

@@ -9,6 +9,7 @@
  *   SOFTMAX   y = softmax(y), as apply_softmax() computes it
  *   LOSS      loss[s] = the sample's loss (compute_sample_loss()) and delta = dL/dz of the output
  *             layer (output_delta() in Spingalett.Training.c), from targets t
+ *   GRADS     delta = dL/dz from t = dL/dy of a loss of the caller's (output_delta_from_grad())
  */
 
 #version 460
@@ -21,6 +22,7 @@ layout(local_size_x = 64) in;
 
 #define SOFTMAX 0u
 #define LOSS_OP 1u
+#define GRADS   2u
 
 #define LOSS_MSE 0u
 #define LOSS_CROSS_ENTROPY 1u
@@ -46,6 +48,17 @@ void main() {
         if (sum > 0.0) {
             float inv = 1.0 / sum;
             for (uint k = 0; k < n; k++) p.y.v[base + k] *= inv;
+        }
+        return;
+    }
+
+    if (OP == GRADS) {
+        if (ACT == ACT_SOFTMAX) {
+            float dot = 0.0;
+            for (uint k = 0; k < n; k++) dot += p.t.v[base + k] * p.y.v[base + k];
+            for (uint k = 0; k < n; k++) p.delta.v[base + k] = p.y.v[base + k] * (p.t.v[base + k] - dot);
+        } else {
+            for (uint k = 0; k < n; k++) p.delta.v[base + k] = p.t.v[base + k] * derivative(p.y.v[base + k], ACT);
         }
         return;
     }

@@ -232,6 +232,12 @@ bool spingalett_add_layer(LayerArgs args);
 bool spingalett_check_graph(const NeuralNetwork *net, const char *who);
 /* Gives an empty network room for these totals (zeroed), so that adding its layers moves nothing. */
 bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t weights, uint64_t biases);
+/* The parameters back from a GPU trainer that has run passes since they were last brought back (the
+   step API on the GPU): every function that reads a network's parameters calls it first. */
+void spingalett_network_sync(const NeuralNetwork *net);
+/* Notes a write of the parameters on the host (after spingalett_network_sync()), so that a GPU
+   trainer copies them to the device again. */
+void spingalett_network_written(NeuralNetwork *net);
 /* Allocates the gradients and optimizer state (zero) unless they exist: networks get them when they
    first train, so that those used for inference only hold their parameters once. Sets the error. */
 bool spingalett_training_state(NeuralNetwork *net);
