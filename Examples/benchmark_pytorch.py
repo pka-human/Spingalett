@@ -8,8 +8,10 @@ synthetic samples: full batch (5 epochs), mini-batches of 64 (1 epoch) and infer
 convolutional network of Examples/MNIST_CNN.c (channels first, as PyTorch prefers) on 10,000
 synthetic 28 x 28 images: one epoch of mini-batches of 128 with AdamW, and inference in batches of
 1,000; and the same network with batch normalization after each convolution and the hidden dense
-layer. Each measurement runs on a fresh model after one untimed warm-up step, so lazy
-initialization inside PyTorch is not counted.
+layer. Then ResNet-20 (Examples/CIFAR10.c resnet20) on 4,096 synthetic 32 x 32 images: one epoch
+of mini-batches of 128 with SGD and momentum, and inference in batches of 1,000. Each measurement
+runs on a fresh model after one untimed warm-up step, so lazy initialization inside PyTorch is not
+counted.
 """
 import sys
 import time
@@ -89,6 +91,60 @@ def cnn_throughput(x, y, normalized=False):
     return train, infer
 
 
+RESNET_SAMPLES = 4096
+
+
+class Block(nn.Module):
+    """A residual block: two normalized 3 x 3 convolutions added to the input (a 1 x 1 projection
+    where the shape changes), then ReLU."""
+
+    def __init__(self, cin, cout, stride):
+        super().__init__()
+        self.c1, self.b1 = nn.Conv2d(cin, cout, 3, stride, 1), nn.BatchNorm2d(cout)
+        self.c2, self.b2 = nn.Conv2d(cout, cout, 3, 1, 1), nn.BatchNorm2d(cout)
+        self.shortcut = (nn.Sequential(nn.Conv2d(cin, cout, 1, stride), nn.BatchNorm2d(cout))
+                         if stride != 1 or cin != cout else nn.Identity())
+
+    def forward(self, x):
+        return torch.relu(self.b2(self.c2(torch.relu(self.b1(self.c1(x))))) + self.shortcut(x))
+
+
+def make_resnet20():
+    layers, cin = [nn.Conv2d(3, 16, 3, 1, 1), nn.BatchNorm2d(16), nn.ReLU()], 16
+    for stage in range(3):
+        for b in range(3):
+            layers.append(Block(cin, 16 << stage, 2 if stage > 0 and b == 0 else 1))
+            cin = 16 << stage
+    return nn.Sequential(*layers, nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(cin, 10))
+
+
+def resnet_throughput(x, y):
+    model = make_resnet20()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+    loss_fn = nn.CrossEntropyLoss()
+
+    def step(xb, yb):
+        opt.zero_grad(set_to_none=True)
+        loss_fn(model(xb), yb).backward()
+        opt.step()
+
+    step(x[:CNN_BATCH], y[:CNN_BATCH])       # warm-up
+    start = time.perf_counter()
+    perm = torch.randperm(RESNET_SAMPLES)
+    for i in range(0, RESNET_SAMPLES, CNN_BATCH):
+        idx = perm[i:i + CNN_BATCH]
+        step(x[idx], y[idx])
+    train = RESNET_SAMPLES / (time.perf_counter() - start)
+    model.eval()
+    with torch.inference_mode():
+        torch.softmax(model(x[:64]), dim=1)  # warm-up
+        start = time.perf_counter()
+        for i in range(0, RESNET_SAMPLES, 1000):
+            torch.softmax(model(x[i:i + 1000]), dim=1)
+        infer = RESNET_SAMPLES / (time.perf_counter() - start)
+    return train, infer
+
+
 def main():
     if len(sys.argv) > 1:
         torch.set_num_threads(int(sys.argv[1]))
@@ -112,6 +168,11 @@ def main():
         print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
         train, infer = cnn_throughput(images, labels, normalized)
         print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
+
+    print(f"\nResNet-20 (Examples/CIFAR10.c resnet20), {RESNET_SAMPLES} images")
+    print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
+    train, infer = resnet_throughput(torch.rand(RESNET_SAMPLES, 3, 32, 32), torch.randint(0, 10, (RESNET_SAMPLES,)))
+    print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
 
 
 if __name__ == "__main__":

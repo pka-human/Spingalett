@@ -20,6 +20,10 @@
  * inference; and the same network with batch normalization after each convolution and the hidden
  * dense layer (which then take no activation, the normalizations ReLU).
  *
+ * Then ResNet-20 (He et al.'s residual network for CIFAR-10, Examples/CIFAR10.c resnet20) on 4,096
+ * synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with SGD and momentum, and
+ * inference.
+ *
  * Usage: Benchmark [threads]. Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
 
@@ -143,6 +147,57 @@ static void cnn_benchmark(const char *name, ComputeMode mode, bool normalized, c
     free_network(net);
 }
 
+#define RESNET_SAMPLES 4096
+
+/* ResNet-20: a residual block reads x, two normalized 3 x 3 convolutions add to it (a 1 x 1
+   projection where the shape changes) before the ReLU. */
+static uint32_t residual_block(NeuralNetwork *net, uint32_t x, uint32_t filters, uint32_t stride) {
+    SpingalettNetworkLayer in;
+    spingalett_network_layer(net, x, &in);
+    conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 3, .padding = 1, .stride = stride,
+           .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    uint32_t y = batch_norm(.net = net, .act_func = ACT_NONE), shortcut = x;
+    if (stride != 1 || in.channels != filters) {
+        conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride, .act_func = ACT_NONE,
+               .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        shortcut = batch_norm(.net = net, .act_func = ACT_NONE);
+    }
+    return add_layers(.net = net, .inputs = {shortcut, y}, .act_func = ACT_RELU);
+}
+
+static NeuralNetwork *create_resnet20(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 32, .width = 32, .channels = 3);
+    conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    uint32_t x = batch_norm(.net = net, .act_func = ACT_RELU);
+    for (uint32_t stage = 0; stage < 3; stage++)
+        for (uint32_t b = 0; b < 3; b++) x = residual_block(net, x, 16u << stage, stage > 0 && b == 0 ? 2u : 1u);
+    global_avg_pool2d(.net = net);
+    layer(.net = net, .neurons_amount = 10, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+    return net;
+}
+
+static void resnet_benchmark(const char *name, ComputeMode mode, const float *images, const float *labels) {
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *net = create_resnet20();
+    double start = now();
+    train(.net = net, .inputs = images, .targets = labels, .sample_count = RESNET_SAMPLES, .epochs = 1,
+          .learning_rate = 0.1f, .momentum = 0.9f, .weight_decay = 5e-4f, .optimizer_type = OPTIMIZER_MOMENTUM,
+          .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = CNN_BATCH);
+    double trained = now() - start;
+    float *outputs = (float *)malloc((size_t)RESNET_SAMPLES * OUTPUT_SIZE * sizeof(float));
+    start = now();
+    predict(.net = net, .inputs = images, .sample_count = RESNET_SAMPLES, .outputs = outputs);
+    double inferred = now() - start;
+    printf("%-16s %14.0f %14.0f\n", name, RESNET_SAMPLES / trained, RESNET_SAMPLES / inferred);
+    free(outputs);
+    free_network(net);
+}
+
 static void run_benchmark(const char *name, ComputeMode mode, const float *inputs, const float *targets) {
     spingalett_set_compute_mode(mode);
     double full = train_throughput(inputs, targets, STRATEGY_FULL_BATCH, EPOCHS);
@@ -257,6 +312,27 @@ int main(int argc, char **argv) {
 #endif
     }
 
+    free(images);
+    free(labels);
+
+    /* ResNet-20 on random 32 x 32 x 3 images */
+    images = (float *)malloc((size_t)RESNET_SAMPLES * 3072 * sizeof(float));
+    labels = (float *)calloc((size_t)RESNET_SAMPLES * OUTPUT_SIZE, sizeof(float));
+    if (!images || !labels) {
+        fprintf(stderr, "Allocation failed\n");
+        return 1;
+    }
+    for (size_t i = 0; i < (size_t)RESNET_SAMPLES * 3072; i++) images[i] = (float)rand() / (float)RAND_MAX;
+    for (size_t s = 0; s < RESNET_SAMPLES; s++) labels[s * OUTPUT_SIZE + (size_t)rand() % OUTPUT_SIZE] = 1.0f;
+    NeuralNetwork *resnet = create_resnet20();
+    printf("\nResNet-20 (Examples/CIFAR10.c resnet20), %u layers, %" PRIu64 " parameters, %d images\n",
+           spingalett_layer_count(resnet), spingalett_parameter_count(resnet), RESNET_SAMPLES);
+    free_network(resnet);
+    printf("%-16s %14s %14s\n", "samples/s", "training", "inference");
+    resnet_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, images, labels);
+#if defined(SPINGALETT_HAS_OPENMP)
+    resnet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
+#endif
     free(images);
     free(labels);
     free(inputs);
