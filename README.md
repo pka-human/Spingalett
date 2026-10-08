@@ -14,14 +14,16 @@
 </div>
 
 Spingalett is a neural-network library written in C23 for training and running fully connected
-and convolutional networks on the CPU. It depends only on the C standard library: batch training
+and convolutional networks on the CPU, chains of layers or graphs of them (residual connections,
+concatenated branches). It depends only on the C standard library: batch training
 and inference run as matrix-matrix products on built-in AVX-512, AVX2, NEON or portable kernels (on
 x86-64, chosen for the processor at run time), with OpenMP and OpenBLAS as optional build-time
 accelerators; results are the same bits on one thread and many. Networks are declared with C23
 designated initializers and all parameters live in flat contiguous arrays. For deployment, a trained network becomes a read-only
 model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
-alike. Python bindings are included.
+alike. Models come in from ONNX files and PyTorch weights, and Python bindings (wheels on PyPI)
+are included.
 
 ## Contents
 
@@ -42,7 +44,8 @@ alike. Python bindings are included.
 
 | Area | Supported |
 |---|---|
-| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), max and average pooling, batch normalization; channels-last tensors; optional dropout per layer |
+| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), max, average and global average pooling, batch normalization, addition and concatenation of layers; channels-last tensors; optional dropout per layer |
+| Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs) |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
@@ -57,7 +60,8 @@ alike. Python bindings are included.
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
-| Bindings | Python (ctypes + NumPy) |
+| Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
+| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed) |
 
 ## Building
 
@@ -235,13 +239,15 @@ divides by the cells inside), and max pooling passes the gradient to the first m
 training strategy, optimizer, schedule, the custom training loop and `predict()` work with these
 layers as with dense ones.
 
-Convolutions run as matrix products whose input windows are gathered by the matrix kernels
-themselves (implicit im2col: no window matrix is stored), with the bias and activation applied to
-each tile of the result while it is in cache; weight gradients split their long summation over all
-pixels into fixed slots that the threads share. Depthwise convolutions are computed directly, all
-of a pixel's channels at once, and other grouped ones as one product per group. The network of
-`Examples/MNIST_CNN.c` trains 1.3 to 1.7 times as fast as in PyTorch and infers 3.4 to 4.1 times as
-fast (see [Performance](#performance)).
+Convolutions run as indirect matrix products: the matrix kernels read each pixel's window straight
+from the image through one pointer per kernel tap, so no window is ever gathered or copied, with the
+bias and activation applied to each tile of the result while it is in cache. The data gradient of
+strided convolutions runs a phase of input cells at a time, over the taps that cover them only, and
+weight gradients split their long summation over all pixels into slots fixed by the shape that the
+threads share. Depthwise convolutions are computed directly, all of a pixel's channels at once, and
+other grouped ones as one product per group. The network of `Examples/MNIST_CNN.c` trains 1.4 to
+2.3 times as fast as in PyTorch and infers 2.6 to 3.9 times as fast, ResNet-20 1.1 to 1.8 and 1.5 to
+2.8 times as fast (see [Performance](#performance)).
 
 ### Batch normalization
 
@@ -265,6 +271,84 @@ files saved in other precisions than FP32 without optimizer state) fold it into 
 weights and biases. A normalization of a dense layer needs batches of at least 2 samples.
 `PARAM_RUNNING_MEAN` and `PARAM_RUNNING_VARIANCE` read and write the statistics, and
 `restore_best_weights` restores them with the weights.
+
+### Graphs: residual connections and branches
+
+Every builder returns the index of the layer it adds (`SPINGALETT_NO_LAYER` on error), and
+`.inputs` names the earlier layers a layer reads; without it a layer reads the one added before it,
+so chains are built as before. Two kinds of layers combine others: `add_layers()` sums layers of
+one shape and `concat_layers()` puts layers of one height and width side by side along the
+channels, each followed by its `.act_func` (0 is `ACT_SIGMOID`: give `ACT_NONE` for none).
+`global_avg_pool2d()` averages each channel over all cells. A residual block of ResNet:
+
+```c
+uint32_t block(NeuralNetwork *net, uint32_t x, uint32_t filters, uint32_t stride) {
+    conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 3, .padding = 1, .stride = stride,
+           .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    uint32_t y = batch_norm(.net = net, .act_func = ACT_NONE);
+    uint32_t shortcut = x;
+    if (stride != 1) {                      /* the shortcut changes shape too: a 1 x 1 projection */
+        conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride,
+               .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        shortcut = batch_norm(.net = net, .act_func = ACT_NONE);
+    }
+    return add_layers(.net = net, .inputs = {shortcut, y}, .act_func = ACT_RELU);
+}
+```
+
+and Inception-style branches, concatenated:
+
+```c
+uint32_t x = layer(.net = net, .height = 32, .width = 32, .channels = 16);
+uint32_t a = conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 1, .act_func = ACT_RELU);
+uint32_t b = conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_RELU);
+uint32_t c = max_pool2d(.net = net, .inputs = {x}, .kernel = 3, .stride = 1, .padding = 1);
+concat_layers(.net = net, .inputs = {a, b, c}, .act_func = ACT_NONE);                 /* 32 x 32 x 32 */
+```
+
+`.input_count` gives the number of inputs; left 0 it counts `.inputs` up to the last nonzero entry,
+so it is needed when the last input is the input layer (`.inputs = {a, 0}, .input_count = 2`). A
+layer reads at most `SPINGALETT_MAX_INPUTS` (16) layers. The last layer is the network's output,
+and every other layer must feed a later one before the network trains or predicts.
+
+Layers run in the order they were added, which puts each after its inputs. Training follows the
+graph backwards: a layer that feeds several gets their gradients in a fixed order, so training is
+still the same bits on any number of threads. At inference, outputs share memory where their lives
+do not overlap, in `predict()`, deployment models and the engine (whose `.slett` files, format
+version 6, record where each output lives): a residual network of 16 blocks needs memory for a few
+of its widest outputs, not for all of them. `spingalett_network_layer()` reports each layer's
+`inputs`, and `ModelTool info` lists them. `Examples/CIFAR10.c` builds ResNet-20 to ResNet-56
+(`resnet20`, `resnet32`, ...).
+
+### Importing models: ONNX and PyTorch
+
+`spingalett_import_onnx(path)` (or `_from_memory`) turns an ONNX model into a network that trains,
+saves and deploys like any other: convolutions with groups, Gemm and MatMul, max, average and
+global average pooling, batch normalization, Add, Concat along the channels, Relu, Sigmoid, Tanh,
+LeakyRelu, Softmax, Flatten and flattening Reshape, Identity and Dropout. The reader of the protocol
+buffer format is the library's own; an operator it does not have is named in the error. Spingalett
+works channels-last, so an ONNX input of shape `[N, C, H, W]` becomes an input layer of
+`H x W x C`: transpose NCHW images before feeding them (`x.transpose(0, 2, 3, 1)` in NumPy).
+Weights are reordered on import, including the columns of a dense layer after a flattened map, so
+the network computes what the model does. `ModelTool import model.onnx model.slett` converts a
+file; models exported from PyTorch with either exporter agree with PyTorch within 1e-7.
+
+PyTorch weights load into a network built with the same layers:
+`spingalett_load_pytorch(net, "model.pt", NULL, 0)` reads a state dict saved with `torch.save`
+(or a checkpoint dictionary holding one) or a `.safetensors` file. Modules are matched to layers
+with parameters in order (the state dict's order, or the natural order of the names in
+safetensors files, which sort them; a list of module names gives any order), shapes are checked
+and the network is left unchanged when anything does not fit. The pickle inside `.pt` files is
+interpreted without running any of it: only dictionaries of tensors are understood.
+
+```c
+NeuralNetwork *net = spingalett_import_onnx("resnet.onnx");      /* NULL on error */
+float out[10];
+predict(.net = net, .inputs = image_hwc, .sample_count = 1, .outputs = out);
+```
 
 ### Inspecting a network
 
@@ -380,6 +464,13 @@ train(.net = net, /* ... */ .learning_rate = 1e-3f,
 | `spingalett_lr_linear_warmup` | `warmup_epochs` (default 5% of the run) |
 | `spingalett_lr_step_decay` | `step_size` (default a third of the run), `gamma` (default 0.1) |
 | `spingalett_lr_warmup_cosine` | `warmup_epochs`, `min_lr` |
+
+Reduce on plateau works with or without a schedule: with `.lr_plateau_patience = 5` and
+`.lr_plateau_factor = 0.5f`, five epochs without improvement of the monitored value (`monitor`:
+the validation loss when there is validation data) halve the learning rate for the rest of the run,
+and five more halve it again, never below `.lr_plateau_min_lr`. Label smoothing
+(`.label_smoothing = 0.1f`) trains classifiers on targets moved that far towards the uniform
+distribution.
 
 ### Data generators
 
@@ -766,11 +857,11 @@ ModelTool bench model.slett                             latency and throughput i
 ## Python bindings
 
 `Bindings/Python` contains pure-Python bindings built on `ctypes` and NumPy; nothing is compiled
-at install time.
+at install time. The wheels carry the library (Linux x86-64 and AArch64, Windows, macOS):
 
 ```bash
-pip install ./Bindings/Python
-export SPINGALETT_LIBRARY=$PWD/Bin/libspingalett.so
+pip install spingalett                                  # or, from a checkout:
+pip install ./Bindings/Python && export SPINGALETT_LIBRARY=$PWD/Bin/libspingalett.so
 ```
 
 ```python
@@ -792,6 +883,8 @@ with sg.Network(sg.Loss.MSE, [sg.Layer(2),
 cnn = sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Input(28, 28, 1), sg.Conv2D(32, 3, padding=1), sg.MaxPool2D(2),
                                          sg.Layer(10, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
 print(cnn.layers[1].shape, cnn.get_weights(0).shape)    # (28, 28, 32) (32, 3, 3, 1)
+
+resnet = sg.Network.from_torch(torch_module, torch.rand(1, 3, 32, 32))   # through ONNX, channels last
 ```
 
 See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
@@ -814,44 +907,53 @@ cross-entropy, Adam) on 20,000 synthetic samples: full-batch training (5 epochs)
 training (batches of 64, one epoch) and batched inference; then the convolutional network of
 `Examples/MNIST_CNN.c` (422K parameters) on 10,000 synthetic images: one epoch of mini-batches of
 128 with AdamW, and inference, without and with batch normalization after each convolution and the
-hidden dense layer. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch.
-Run them with `Bin/Benchmark [threads]` and `python Examples/benchmark_pytorch.py [threads]`.
+hidden dense layer; and ResNet-20 (`Examples/CIFAR10.c resnet20`, 273K parameters, 54 layers) on
+4,096 synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with SGD and momentum, and
+inference. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch. Run them with
+`Bin/Benchmark [threads]` and `python Examples/benchmark_pytorch.py [threads]`.
 
-Samples per second on a 4-vCPU cloud VM (Intel Xeon @ 2.10 GHz, Sapphire Rapids, AVX-512), medians
-of three interleaved runs (the VM is shared and single runs vary by up to 20%). Spingalett 0.9 is
-built with GCC 13 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the build from
-PyPI, run on the CPU (Intel MKL and oneDNN). Spingalett 0.8, measured in the same runs, differs
-from 0.9 by less than 8% on each of these workloads, within the VM's noise (a targeted comparison
-of the convolutional network's inference finds 0.9 2 to 4% faster on one thread, the same on four):
+Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 efficiency cores, AVX2
+and AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16
+and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel
+MKL and oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13
+to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was:
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
-| Spingalett | 1 | 25,100 | 18,200 | 71,700 |
-| PyTorch | 1 | 20,600 | 7,690 | 50,600 |
-| Spingalett (OpenMP) | 4 | 85,400 | 44,900 | 237,000 |
-| PyTorch | 4 | 63,100 | 14,900 | 160,300 |
+| Spingalett | 1 | 25,700 | 20,200 | 67,100 |
+| PyTorch | 1 | 24,000 | 10,800 | 60,800 |
+| Spingalett (OpenMP) | 8 | 114,600 | 52,900 | 287,400 |
+| PyTorch | 8 | 73,000 | 26,100 | 168,200 |
 
 | Convolutional network | Threads | Training | Inference |
 |---|---:|---:|---:|
-| Spingalett | 1 | 2,020 | 6,790 |
-| PyTorch | 1 | 1,640 | 1,990 |
-| Spingalett (OpenMP) | 4 | 7,530 | 26,500 |
-| PyTorch | 4 | 4,940 | 6,160 |
+| Spingalett | 1 | 3,090 | 11,180 |
+| PyTorch | 1 | 2,260 | 4,370 |
+| Spingalett (OpenMP) | 8 | 14,590 | 50,860 |
+| PyTorch | 8 | 6,210 | 13,020 |
 | **With batch normalization** | | | |
-| Spingalett | 1 | 1,630 | 7,170 |
-| PyTorch | 1 | 1,150 | 1,500 |
-| Spingalett (OpenMP) | 4 | 6,530 | 28,400 |
-| PyTorch | 4 | 3,190 | 4,890 |
+| Spingalett | 1 | 2,640 | 11,380 |
+| PyTorch | 1 | 1,770 | 3,340 |
+| Spingalett (OpenMP) | 8 | 11,030 | 55,650 |
+| PyTorch | 8 | 4,630 | 10,160 |
 
-Spingalett trains the convolutional network 1.2 to 1.5 times as fast as PyTorch and runs it 3.4 to
-4.3 times as fast. With batch normalization the gap widens to 1.4 to 2 times and 4.8 to 5.8 times:
-normalization slows Spingalett's training by 13 to 19% (PyTorch's by 30 to 35%) and its inference
-not at all, since it runs in the convolution's epilogue. For the fully connected network
-Spingalett trains mini-batches 2.4 to 3 times as fast, infers 1.4 to 1.5 times as fast and trains
-full batches 1.2 to 1.35 times as fast. The gap is largest for mini-batches, where fixed per-step
-costs weigh most.
+| ResNet-20 | Threads | Training | Inference |
+|---|---:|---:|---:|
+| Spingalett | 1 | 377 | 1,387 |
+| PyTorch | 1 | 342 | 900 |
+| Spingalett (OpenMP) | 8 | 1,584 | 6,402 |
+| PyTorch | 8 | 896 | 2,323 |
 
-0.9 took its time out of the calls these workloads do not measure: small batches and single
+Spingalett trains the convolutional network 1.4 to 2.3 times as fast as PyTorch and runs it 2.6 to
+3.9 times as fast; with batch normalization 1.5 to 2.4 times and 3.4 to 5.5 times, since the
+normalization runs in the convolution's epilogue at inference. ResNet-20 trains 1.1 to 1.8 times as
+fast and runs 1.5 to 2.8 times as fast. For the fully connected network Spingalett trains
+mini-batches 1.9 to 2 times as fast, full batches 1.1 to 1.6 times and infers 1.1 to 1.7 times as
+fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: built without them
+(`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
+and 4,798.
+
+0.9 took its time out of the calls these workloads do not measure0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
 [CHANGELOG](CHANGELOG.md) for more):
 
@@ -897,7 +999,9 @@ mini-batches of 128) on 55,000 images, keeps the epoch with the best accuracy on
 and reaches 98.2% test accuracy after 10 epochs, which take a few seconds with OpenMP on the same
 VM. `Examples/MNIST_CNN.c` reaches 98.9% after two epochs of about 9 seconds each on four threads.
 `Examples/CIFAR10.c` reaches 87.8% test accuracy after 20 epochs, 20 minutes on four threads of the
-Sapphire Rapids VM (760 images per second with augmentation); its INT8 model keeps 87.8%.
+Sapphire Rapids VM (760 images per second with augmentation); its INT8 model keeps 87.8%. With
+`resnet20` it reaches 91.55% after 100 epochs (12 threads of the i7-12650H, before the indirect
+kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB).
 
 ## Project layout
 
@@ -917,16 +1021,16 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.9; the C API may still change between minor versions (see
+Spingalett is at version 0.10; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.9`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.10`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
-engine and model format versions 3 to 5 are meant to stay stable from here on.
+engine and model format versions 3 to 6 are meant to stay stable from here on.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.10: residual connections (networks as graphs), ONNX import, Python wheels on PyPI, a first GPU
-  backend
+- 0.11: a first GPU backend (Vulkan compute or CUDA), faster convolutions on the CPU, INT8
+  calibration, layer normalization
 - 1.0: API freeze, C++ wrapper
 - Later: CUDA/cuDNN backend, quantization-aware training, NEON kernels for training, further
   language bindings
