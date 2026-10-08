@@ -341,7 +341,11 @@ works channels-last, so an ONNX input of shape `[N, C, H, W]` becomes an input l
 `H x W x C`: transpose NCHW images before feeding them (`x.transpose(0, 2, 3, 1)` in NumPy).
 Weights are reordered on import, including the columns of a dense layer after a flattened map, so
 the network computes what the model does. `ModelTool import model.onnx model.slett` converts a
-file; models exported from PyTorch with either exporter agree with PyTorch within 1e-7.
+file; models exported from PyTorch with either exporter agree with PyTorch within 1e-7. Weights kept
+in an external file next to the model (`torch.onnx.export` of models over 2 GB) are read from the
+model's folder when importing from its path. Files are mapped rather than read, and each tensor goes
+into its layer in one pass: on an i7-12650H a 100 MB ResNet-50 imports in 0.09 s and a 500 MB model
+in 0.17 s.
 
 PyTorch weights load into a network built with the same layers:
 `spingalett_load_pytorch(net, "model.pt", NULL, 0)` reads a state dict saved with `torch.save`
@@ -349,7 +353,8 @@ PyTorch weights load into a network built with the same layers:
 with parameters in order (the state dict's order, or the natural order of the names in
 safetensors files, which sort them; a list of module names gives any order), shapes are checked
 and the network is left unchanged when anything does not fit. The pickle inside `.pt` files is
-interpreted without running any of it: only dictionaries of tensors are understood.
+interpreted without running any of it: only dictionaries of tensors are understood (tensors that
+are views, such as a transposed weight, load as well).
 
 ```c
 NeuralNetwork *net = spingalett_import_onnx("resnet.onnx");      /* NULL on error */
@@ -698,8 +703,8 @@ matrix-matrix products (fewer when a sample's activations are large, so that a c
   OpenBLAS thread when each call is too small to amortize threading and the configured thread
   count otherwise, and restores the caller's setting afterwards; outside `train()`, OpenBLAS uses
   its own thread configuration (`OPENBLAS_NUM_THREADS`).
-- `COMPUTE_VULKAN` runs training, `predict()` and `evaluate()` on a GPU ([The GPU](#the-gpu)); what
-  stays on the CPU runs as with `COMPUTE_OPENMP`.
+- `COMPUTE_VULKAN` runs training, the custom-loop API, `predict()` and `evaluate()` on a GPU
+  ([The GPU](#the-gpu)); what stays on the CPU runs as with `COMPUTE_OPENMP`.
 - A requested backend that was not compiled in falls back to single-threaded with a one-time
   warning (`COMPUTE_VULKAN` without a usable device: to the CPU, as above). `COMPUTE_CUDA` is
   reserved and currently falls back as well.
@@ -713,8 +718,8 @@ logging settings are process-wide; the random generator and the error state are 
 
 ### The GPU
 
-With `COMPUTE_VULKAN`, `train()` (full-batch and mini-batch strategies), `predict()` and
-`evaluate()` run on a GPU through Vulkan compute: NVIDIA, AMD and Intel GPUs on Linux and Windows,
+With `COMPUTE_VULKAN`, `train()` (full-batch and mini-batch strategies), the custom-loop API
+(`spingalett_trainer_*`), `predict()` and `evaluate()` run on a GPU through Vulkan compute: NVIDIA, AMD and Intel GPUs on Linux and Windows,
 Apple GPUs through MoltenVK (from the Vulkan SDK, or `brew install molten-vk vulkan-loader`). The
 library opens the Vulkan loader when the mode is first used, so it needs no Vulkan to load or to
 run on the CPU. `spingalett_gpu_device()` names the device it uses, or returns `NULL` when there is
@@ -734,8 +739,21 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
   GPU trains on the one before, and gets the losses and the parameters back at the end of every
   epoch, where validation, callbacks, autosaves and the best weights see them.
 - Every kind of layer, activation, loss and optimizer runs on the GPU, with dropout (the same masks
-  as on the CPU), gradient clipping and batch normalization. Per-sample training, `forward()`, the
-  custom-loop API (`spingalett_trainer_*`) and deployment models run on the CPU.
+  as on the CPU), gradient clipping and batch normalization. Per-sample training, `forward()` and
+  deployment models run on the CPU.
+- A trainer (`spingalett_trainer_new()`) made with `COMPUTE_VULKAN` runs its passes on the GPU, one
+  at a time: the forward pass's outputs come back for the caller's loss, and backward passes from
+  targets or from the caller's dL/d(output) add up on the device until the step. The parameters stay
+  there between passes; functions that read the network (`predict()`, `save_spingalett()`,
+  `spingalett_get_parameters()` and the others) copy them back first, and parameters set on the host
+  go to the GPU before the next forward pass.
+- `spingalett_set_gpu_precision(PRECISION_BFLOAT16)` multiplies matrices in bfloat16 on the GPU's
+  matrix units (tensor cores; `VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16`), the
+  products added in single precision; the parameters, the optimizer and batch normalization stay in
+  single precision, and so do products smaller than a block of the matrix units. Runs stay
+  deterministic. On an RTX 4050 Laptop GPU ResNet-20 trains 17 to 18% faster than in single
+  precision, and reaches the same CIFAR-10 test accuracy (91.61% against 91.55%). Devices without
+  the extensions keep single precision.
 - Results are deterministic: every sum runs in a fixed order, never through atomics, so a run gives
   the same bits every time on one device. They agree with the CPU's up to rounding: the products
   add in another order, with fused multiply-adds, and batch normalization adds its sums in single
@@ -750,7 +768,8 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
 - `SPINGALETT_GPU_DEVICE=n` picks the n-th device of the Vulkan device list instead of the first
   discrete GPU; `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel when the process exits.
 
-In Python: `sg.set_compute_mode(sg.ComputeMode.VULKAN)` and `sg.gpu_device()`.
+In Python: `sg.set_compute_mode(sg.ComputeMode.VULKAN)`, `sg.gpu_device()` and
+`sg.set_gpu_precision(sg.Precision.BFLOAT16)`.
 
 ### Reproducibility
 
@@ -787,8 +806,9 @@ the minimum level and `spingalett_set_verbose(false)` suppresses everything belo
 
 ## Deployment
 
-A `NeuralNetwork` is built for training: float parameters, gradients and optimizer state. To run a
-trained network, turn it into a model, a read-only network that keeps its weights in the precision
+A `NeuralNetwork` is built for training: float parameters, and the gradients and optimizer state
+it allocates when it first trains (a network loaded or imported only to predict holds its
+parameters once). To run a trained network, turn it into a model, a read-only network that keeps its weights in the precision
 they are stored in and computes with them:
 
 ```c
@@ -1102,17 +1122,16 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.11; the C API may still change between minor versions (see
+Spingalett is at version 0.12; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.11`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.12`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
 engine and model format versions 3 to 6 are meant to stay stable from here on.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.12: the GPU further (tensor cores through cooperative matrices as an opt-in mixed precision,
-  deployment models and the step API on the GPU, fewer passes), INT8 calibration, layer
-  normalization
+- 0.13: transposed convolutions, upsampling and layer normalization (U-Net-style networks, more of
+  ONNX), deployment models on the GPU, fewer GPU passes
 - 1.0: API freeze, C++ wrapper
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 

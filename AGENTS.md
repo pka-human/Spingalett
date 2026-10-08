@@ -27,7 +27,8 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.GEMM.c` | Float matrix kernels, including implicit im2col and epilogues |
 | `Src/Spingalett.ConvGEMM.c` | Convolutions as indirect products: windows read through per-tap pointers (forward, data and weight gradients) |
 | `Src/Spingalett.Graph.c` | Adding, concatenating and global pooling layers; the plan by which inference outputs share memory |
-| `Src/Spingalett.Onnx.c`, `Src/Spingalett.Torch.c` | ONNX import (own protocol buffer reader); PyTorch state dicts (zip, a pickle interpreter that runs nothing) and safetensors |
+| `Src/Spingalett.Onnx.c`, `Src/Spingalett.Torch.c` | ONNX import (own protocol buffer reader, external data files); PyTorch state dicts (zip, a pickle interpreter that runs nothing) and safetensors |
+| `Src/Spingalett.Import.c` | What the importers share: files mapped into memory, tensors decoded and reordered to channels-last in one pass |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
 | `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution and normalization layers |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
@@ -101,6 +102,14 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - **GPU dispatches state their memory.** The executor records a barrier only where a dispatch reads
   or writes what an earlier one wrote or read (`Recorder` in `Spingalett.Gpu.c`): every dispatch
   lists every range it reads and writes, or it will race with its neighbours.
+- **Parameters on the GPU.** A trainer made with `COMPUTE_VULKAN` keeps the network's parameters on
+  the device between passes: every public function that reads a network's parameters calls
+  `spingalett_network_sync()` first, and every one that writes them on the host calls
+  `spingalett_network_written()` after. A new reader or writer needs the call, or it sees stale
+  values (the `gpu` group's `gpu_trainer` reads and rewrites weights between steps).
+- **Lazy training state.** Gradients and optimizer moments exist once a network has trained
+  (`spingalett_training_state()`); code that reads them before (saving optimizer state,
+  `spingalett_get_parameters()` of a gradient) treats them as zero.
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
   `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
   read afterwards (`model_shared` in the `model` group runs four threads; run it under
@@ -131,8 +140,9 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   comparisons with the products of gathered windows.
 - GPU: `SPINGALETT_GPU_PROFILE=1` prints the time of every kernel and mode at exit (timestamps
   around each dispatch; trial runs of the tile choice excluded); `Bin/SpingalettGpuTests bench`
-  times every tile on the products of ResNet-20 and the benchmark's MLP. Compare against
-  `python Examples/benchmark_pytorch.py --cuda` (and `--cuda-fp32`) on the same GPU. Laptop GPUs
+  times every tile on the products of ResNet-20 and the benchmark's MLP (`SPINGALETT_BENCH_TILES=1`
+  lists each tile's time, `bench bf16` the matrix units' tiles). Compare against
+  `python Examples/benchmark_pytorch.py --cuda` (and `--cuda-fp32`, `--cuda-bf16`) on the same GPU. Laptop GPUs
   throttle hard when warm (`nvidia-smi --query-gpu=temperature.gpu,clocks.sm --format=csv`): with
   the CPU busy, an RTX 4050 fell to 57% of its clock.
 
