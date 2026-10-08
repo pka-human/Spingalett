@@ -4,18 +4,23 @@
 # The Vulkan compute backend (Src/Gpu): the shaders of Spingalett.Kernels.def compiled to SPIR-V
 # with glslc and embedded in the library. Vulkan itself is opened at run time, so building it
 # needs only the headers and glslc, and the library loads and runs on the CPU without Vulkan.
+# SPIR-V is the same on every platform: SPINGALETT_SPIRV_DIR takes the compiled shaders of another
+# build (its Gpu/<kernel>.spv.inc files) where there is no glslc.
 
 set(SPINGALETT_VULKAN AUTO CACHE STRING "Vulkan compute backend: AUTO (when glslc and the Vulkan headers are found), ON or OFF")
 set_property(CACHE SPINGALETT_VULKAN PROPERTY STRINGS AUTO ON OFF)
+set(SPINGALETT_SPIRV_DIR "" CACHE PATH "Compiled shaders (<kernel>.spv.inc) to use instead of glslc")
 set(SPINGALETT_HAS_VULKAN OFF)
 
 if(NOT SPINGALETT_VULKAN STREQUAL "OFF")
-    find_program(SPINGALETT_GLSLC glslc HINTS $ENV{VULKAN_SDK}/bin)
+    if(NOT SPINGALETT_SPIRV_DIR)
+        find_program(SPINGALETT_GLSLC glslc HINTS $ENV{VULKAN_SDK}/bin)
+    endif()
     find_path(SPINGALETT_VULKAN_INCLUDE vulkan/vulkan_core.h HINTS $ENV{VULKAN_SDK}/include)
-    if(SPINGALETT_GLSLC AND SPINGALETT_VULKAN_INCLUDE)
+    if((SPINGALETT_GLSLC OR SPINGALETT_SPIRV_DIR) AND SPINGALETT_VULKAN_INCLUDE)
         set(SPINGALETT_HAS_VULKAN ON)
     elseif(SPINGALETT_VULKAN STREQUAL "ON")
-        message(FATAL_ERROR "SPINGALETT_VULKAN=ON needs glslc (shaderc) and the Vulkan headers")
+        message(FATAL_ERROR "SPINGALETT_VULKAN=ON needs glslc (shaderc) or SPINGALETT_SPIRV_DIR, and the Vulkan headers")
     else()
         message(STATUS "Spingalett: Vulkan backend off (glslc or the Vulkan headers not found)")
     endif()
@@ -36,12 +41,20 @@ if(SPINGALETT_HAS_VULKAN)
         string(REGEX REPLACE "^SPG_KERNEL\\(([A-Za-z0-9_]+)\\).*" "\\1" kernel "${line}")
         set(src ${gpu_dir}/Shaders/${kernel}.comp)
         set(out ${out_dir}/${kernel}.spv.inc)
-        add_custom_command(OUTPUT ${out}
-            COMMAND ${SPINGALETT_GLSLC} --target-env=vulkan1.2 -O -mfmt=c -MD -MF ${out}.d -o ${out} ${src}
-            DEPENDS ${src}
-            DEPFILE ${out}.d
-            COMMENT "Compiling shader ${kernel}.comp"
-            VERBATIM)
+        if(SPINGALETT_SPIRV_DIR)
+            add_custom_command(OUTPUT ${out}
+                COMMAND ${CMAKE_COMMAND} -E copy ${SPINGALETT_SPIRV_DIR}/${kernel}.spv.inc ${out}
+                DEPENDS ${SPINGALETT_SPIRV_DIR}/${kernel}.spv.inc
+                COMMENT "Taking shader ${kernel} from ${SPINGALETT_SPIRV_DIR}"
+                VERBATIM)
+        else()
+            add_custom_command(OUTPUT ${out}
+                COMMAND ${SPINGALETT_GLSLC} --target-env=vulkan1.2 -O -mfmt=c -MD -MF ${out}.d -o ${out} ${src}
+                DEPENDS ${src}
+                DEPFILE ${out}.d
+                COMMENT "Compiling shader ${kernel}.comp"
+                VERBATIM)
+        endif()
         list(APPEND spirv_files ${out})
         string(APPEND header "static const uint32_t spg_spirv_${kernel}[] =\n#include \"${kernel}.spv.inc\"\n;\n")
         string(APPEND table "    spg_spirv_${kernel},\n")
@@ -60,5 +73,9 @@ if(SPINGALETT_HAS_VULKAN)
     if(NOT WIN32)
         target_link_libraries(spingalett PRIVATE ${CMAKE_DL_LIBS})
     endif()
-    message(STATUS "Spingalett: Vulkan backend on (${SPINGALETT_GLSLC})")
+    if(SPINGALETT_SPIRV_DIR)
+        message(STATUS "Spingalett: Vulkan backend on (shaders from ${SPINGALETT_SPIRV_DIR})")
+    else()
+        message(STATUS "Spingalett: Vulkan backend on (${SPINGALETT_GLSLC})")
+    endif()
 endif()

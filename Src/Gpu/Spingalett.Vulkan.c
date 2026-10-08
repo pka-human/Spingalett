@@ -34,7 +34,11 @@ static PFN_vkVoidFunction loader_symbol(void *lib, const char *name) {
 static void *open_loader(void) {
     static const char *const names[] = {
 #if defined(__APPLE__)
-        "libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib",
+        /* the Vulkan SDK's or Homebrew's loader (Homebrew's directories are not searched by default),
+           or MoltenVK itself */
+        "libvulkan.1.dylib", "libvulkan.dylib", "/opt/homebrew/lib/libvulkan.1.dylib",
+        "/usr/local/lib/libvulkan.1.dylib", "libMoltenVK.dylib", "/opt/homebrew/lib/libMoltenVK.dylib",
+        "/usr/local/lib/libMoltenVK.dylib",
 #else
         "libvulkan.so.1", "libvulkan.so",
 #endif
