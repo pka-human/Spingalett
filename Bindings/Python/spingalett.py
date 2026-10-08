@@ -1239,6 +1239,8 @@ class Network:
         their compact form (a byte per 8-bit value), shuffling all samples each epoch.
         ``target_set`` picks the set of targets of files that hold several."""
         cfg = dataclasses.replace(config or TrainConfig(), **overrides)
+        if int(target_set) < 0:
+            raise ValueError(f"target_set must be 0 or more, got {target_set}")
         opts = _DatasetReaderOptions(bool(shuffle), bool(in_memory), not prefetch, int(target_set))
         reader = _call(_dataset_open, _encode_path(path), ctypes.byref(opts))
         try:
@@ -1766,6 +1768,8 @@ def save_dataset(path, inputs, targets, input_encoding: DatasetEncoding = Datase
 def load_dataset(path, target_set: int = 0):
     """Read a .slettd file as ``(inputs, targets)`` float32 arrays; ``target_set`` picks the set of
     targets of files that hold several (see :func:`dataset_info`)."""
+    if int(target_set) < 0:
+        raise ValueError(f"target_set must be 0 or more, got {target_set}")
     ds = _Dataset()
     _call(_load_dataset, _encode_path(path), int(target_set), ctypes.byref(ds))
     return _take_dataset(ds)

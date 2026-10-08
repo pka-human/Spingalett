@@ -105,6 +105,17 @@ Xeon @ 2.1 GHz with AVX-512, 4 threads unless noted.
   `train()` keeps them as bytes and converts a batch at a time. Targets keep their values.
 - `DigitPadTrain` prints each epoch's time and the time since training began.
 
+### Fixed
+- `.slettd` readers reject index entries whose offset plus size wraps around (they read before the
+  file's buffer), and metadata records or set numbers of 2^32 - 1, which plus one named the inputs
+  (a name record shorter than 4 bytes scanned past the metadata). `spingalett_save_dataset()`
+  rejects `extra_target_count` of 255 or more instead of overflowing the set count. The Python
+  bindings reject a negative `target_set`.
+- Streaming and loading `.slettd` files of 2 GB or more on Windows, where `long` file offsets have
+  32 bits.
+- Threads opening data sets at the same time no longer race to build the table of 8-bit values.
+- Builds with `SPINGALETT_PORTABLE_KERNELS` and without `-march=native` link again (broken in 0.8).
+
 ## [0.8.0] - Unreleased
 
 Deeper convolutional networks: batch normalization, grouped and depthwise convolutions, image

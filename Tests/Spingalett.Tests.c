@@ -1828,6 +1828,78 @@ static bool read_pass(SpingalettDatasetReader *r, const SpingalettDataset *d, ui
     return exact && total == d->count;
 }
 
+static uint32_t le32(const unsigned char *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static void put_le32(unsigned char *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (unsigned char)(v >> (8 * i)); }
+
+/* A .slettd image altered after its header: the index checksum made right again, so that the
+   reader gets as far as the altered fields. */
+static void slettd_fix_index_crc(unsigned char *b) {
+    uint32_t pbytes = le32(b + 48), sets = le32(b + 52) ? le32(b + 52) : 1u, mbytes = le32(b + 56), chunks = le32(b + 28);
+    size_t meta = 64 + (size_t)pbytes + mbytes + (size_t)chunks * (12 + 4 * (1 + sets)) + 4;
+    put_le32(b + meta - 4, test_crc32(b + 64, meta - 68));
+}
+
+/* The first metadata record with this tag (its header: 2 bytes of tag, 4 of length), or NULL. */
+static unsigned char *slettd_record(unsigned char *b, uint32_t tag) {
+    unsigned char *p = b + 64 + le32(b + 48), *end = p + le32(b + 56);
+    while (end - p >= 6) {
+        if ((uint32_t)(p[0] | p[1] << 8) == tag) return p;
+        p += 6 + le32(p + 2);
+    }
+    return NULL;
+}
+
+/* Crafted files whose fields would make the reader index past what it holds are rejected. */
+static void dataset_crafted(const char *path, const SpingalettDataset *ph) {
+    long size = 0;
+    unsigned char *good = read_file(path, &size), *b = good ? malloc((size_t)size) : NULL;
+    if (!b) { CHECK(false, "crafted: cannot read %s", path); free(good); return; }
+    SpingalettDataset d;
+    struct { const char *what; uint32_t tag; int field; } cases[] = {
+        {"a name record shorter than its set number", 1, -1},           /* the shape record, made a NAME of length 0 */
+        {"a set record for set 2^32 - 1", 2, 0},
+        {"a class-name record for set 2^32 - 1", 4, 0},
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        memcpy(b, good, (size_t)size);
+        unsigned char *r = slettd_record(b, cases[k].tag);
+        if (!r) { CHECK(false, "crafted: no record %u", cases[k].tag); continue; }
+        if (cases[k].field < 0) { r[0] = 3; r[1] = 0; put_le32(r + 2, 0); }
+        else put_le32(r + 6 + 4 * cases[k].field, 0xFFFFFFFFu);
+        slettd_fix_index_crc(b);
+        CHECK(!spingalett_load_dataset_from_memory(b, (size_t)size, &d) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "crafted: %s not rejected", cases[k].what);
+    }
+    /* a chunk offset whose sum with the chunk's size wraps around past zero */
+    memcpy(b, good, (size_t)size);
+    uint32_t sets = le32(b + 52), streams = 1 + sets;
+    unsigned char *entry = b + 64 + le32(b + 48) + le32(b + 56);
+    put_le32(entry, 0xFFFF0000u);
+    put_le32(entry + 4, 0xFFFFFFFFu);
+    put_le32(entry + 8, 0x10000u);
+    for (uint32_t s = 1; s < streams; s++) put_le32(entry + 8 + 4 * s, 0x80u);
+    slettd_fix_index_crc(b);
+    CHECK(!spingalett_load_dataset_from_memory(b, (size_t)size, &d) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "crafted: a chunk offset that wraps around not rejected");
+    free(b);
+    free(good);
+    /* a set number of 2^32 - 1, which plus one is 0, the inputs */
+    CHECK(!spingalett_load_dataset_targets(path, UINT32_MAX, &d) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "crafted: set 2^32 - 1 loaded");
+    DatasetReaderOptions o = {.target_set = UINT32_MAX};
+    CHECK(spingalett_dataset_open_ex(path, &o) == NULL, "crafted: a reader of set 2^32 - 1 opened");
+    SpingalettDatasetReader *r = spingalett_dataset_open(path, false);
+    CHECK(r && !spingalett_dataset_target_set_name(r, UINT32_MAX) && !spingalett_dataset_class_name(r, UINT32_MAX, 0) &&
+          spingalett_dataset_target_set_size(r, UINT32_MAX) == 0, "crafted: reader names of set 2^32 - 1");
+    spingalett_dataset_close(r);
+    /* 2^32 - 1 further sets: their count plus one is 0 */
+    SpingalettTargetSet extra = {.size = ph->target_size, .targets = ph->targets};
+    DatasetSaveOptions many = {.extra_targets = &extra, .extra_target_count = UINT32_MAX};
+    CHECK(!spingalett_save_dataset(ph, "spingalett_test_many.slettd", &many) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "crafted: 2^32 - 1 further sets of targets accepted");
+    remove("spingalett_test_many.slettd");
+}
+
 static void dataset_files_v2(void) {
     /* dense 8-bit "photographs" (smooth colour fields with noise), 32 x 32 x 3; the first two
        values of a sample encode its index */
@@ -1927,6 +1999,7 @@ static void dataset_files_v2(void) {
     CHECK(ok && tail.height == 32 && tail.class_names && !strcmp(tail.class_names[9], "nine"), "v2: split keeps shape and names");
     spingalett_dataset_free(&copy);
     spingalett_dataset_free(&tail);
+    dataset_crafted(path, &ph);
 
     /* readers: shuffled passes are the same with a decoding thread (single-threaded mode leaves
        processors free), one chunk at a time on the caller, and chunks decoded together by the

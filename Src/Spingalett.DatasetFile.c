@@ -22,8 +22,12 @@
  * the compact encoded form and convert a batch at a time.
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L         /* fseeko, ftello: offsets past 2 GB */
+#endif
 #include "Spingalett.Private.h"
 #include "Spingalett.Thread.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -493,12 +497,17 @@ static uint32_t stream_width(DatasetEncoding e, uint32_t size) {
 }
 
 static float unit_lut[256];
-static bool unit_ready;
+static atomic_int unit_state;           /* 0: not built, 1: being built, 2: ready (once, any thread) */
 
 static void unit_init(void) {
-    if (unit_ready) return;
-    for (int q = 0; q < 256; q++) unit_lut[q] = (float)((double)q / 255.0);   /* exactly q / 255.0f */
-    unit_ready = true;
+    if (atomic_load_explicit(&unit_state, memory_order_acquire) == 2) return;
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&unit_state, &expected, 1)) {
+        for (int q = 0; q < 256; q++) unit_lut[q] = (float)((double)q / 255.0);   /* exactly q / 255.0f */
+        atomic_store_explicit(&unit_state, 2, memory_order_release);
+        return;
+    }
+    while (atomic_load_explicit(&unit_state, memory_order_acquire) != 2) {}
 }
 
 static int unit_quantize(float v) {
@@ -761,6 +770,11 @@ static char *copy_string(const uint8_t *p, size_t len) {
     return s;
 }
 
+/* Whether k names a set of targets of the file (stream k + 1), without the k + 1 wrapping around. */
+static bool known_set(const Layout *L, uint32_t k) {
+    return L->streams >= 2 && k < L->streams - 1;
+}
+
 /* Reads the metadata records (shape, sets of targets, names). */
 static bool parse_metadata(const uint8_t *p, size_t size, Layout *L) {
     bool *described = (bool *)calloc(L->streams, sizeof(bool));
@@ -779,7 +793,7 @@ static bool parse_metadata(const uint8_t *p, size_t size, Layout *L) {
             if (ok) { L->height = get32(q); L->width = get32(q + 4); L->channels = get32(q + 8); }
         } else if (tag == META_TARGETS) {
             uint32_t k = len >= 16 ? get32(q) : 0;
-            ok = k >= 1 && k + 1 < L->streams && !described[k + 1];
+            ok = k >= 1 && known_set(L, k) && !described[k + 1];
             if (ok) {
                 StreamInfo *st = &L->st[k + 1];
                 st->size = get32(q + 4);
@@ -788,12 +802,12 @@ static bool parse_metadata(const uint8_t *p, size_t size, Layout *L) {
                 described[k + 1] = true;
             }
         } else if (tag == META_NAME) {
-            uint32_t k = len >= 4 ? get32(q) : UINT32_MAX;
-            ok = k + 1 < L->streams && !L->st[k + 1].name && memchr(q + 4, 0, len - 4) == NULL;
+            uint32_t k = len >= 4 ? get32(q) : 0;
+            ok = len >= 4 && known_set(L, k) && !L->st[k + 1].name && memchr(q + 4, 0, len - 4) == NULL;
             if (ok) ok = (L->st[k + 1].name = copy_string(q + 4, len - 4)) != NULL;
         } else if (tag == META_CLASSES) {
-            uint32_t k = len >= 8 ? get32(q) : UINT32_MAX, n = len >= 8 ? get32(q + 4) : 0;
-            ok = k + 1 < L->streams && !L->st[k + 1].class_names && n > 0 && n <= 65536;
+            uint32_t k = len >= 8 ? get32(q) : 0, n = len >= 8 ? get32(q + 4) : 0;
+            ok = len >= 8 && known_set(L, k) && !L->st[k + 1].class_names && n > 0 && n <= 65536;
             /* the strings, then one block of pointers and characters */
             const uint8_t *r = q + 8, *qend = q + len;
             size_t chars = 0;
@@ -925,7 +939,8 @@ static bool parse_header(const uint8_t *h, size_t size, Layout *L, size_t *need)
             plausible = plausible && b > 0 && stream_raw(L, s, rows) <= (uint64_t)b * SLETTD_MAX_EXPANSION;
         }
         L->crc[c] = get32(p + 8 + 4 * (size_t)L->streams);
-        if (L->offset[c] < meta || L->offset[c] + chunk_bytes(L, c) > L->file_size || !plausible) {
+        if (L->offset[c] < meta || L->offset[c] > L->file_size || chunk_bytes(L, c) > L->file_size - L->offset[c] ||
+            !plausible) {
             layout_free(L);
             return fail(SPINGALETT_ERR_INVALID, "corrupt .slettd index (chunk outside the file)");
         }
@@ -1182,6 +1197,8 @@ bool spingalett_save_dataset(const SpingalettDataset *d, const char *path, const
     DatasetSaveOptions opt = options ? *options : (DatasetSaveOptions){0};
     if (!d || !path || !d->inputs || !d->targets || d->count == 0 || d->input_size == 0 || d->target_size == 0)
         return fail(SPINGALETT_ERR_INVALID, "spingalett_save_dataset: empty or NULL data set or path");
+    if (opt.extra_targets && opt.extra_target_count >= SLETTD_MAX_SETS)
+        return fail(SPINGALETT_ERR_INVALID, "spingalett_save_dataset: too many sets of targets");
     uint32_t sets = 1 + (opt.extra_targets ? opt.extra_target_count : 0);
     bool ok = sets <= SLETTD_MAX_SETS &&
               (unsigned)opt.input_encoding < DATASET_ENCODING_COUNT && opt.input_encoding != DATASET_ENCODING_CLASS &&
@@ -1461,7 +1478,7 @@ static bool parse_image(const uint8_t *bytes, size_t size, Layout *L) {
 }
 
 static bool check_set(Layout *L, uint32_t target_set) {
-    if (target_set + 1 < L->streams) return true;
+    if (known_set(L, target_set)) return true;
     layout_free(L);
     return fail(SPINGALETT_ERR_INVALID, "the .slettd file has no such set of targets");
 }
@@ -1487,6 +1504,23 @@ bool spingalett_load_dataset_from_memory(const void *data, size_t size, Spingale
 }
 
 /* The whole file in memory. */
+/* fseek / ftell with 64-bit offsets (long has 32 bits on Windows) */
+static bool file_seek(FILE *f, uint64_t offset, int whence) {
+#if defined(_WIN32)
+    return _fseeki64(f, (__int64)offset, whence) == 0;
+#else
+    return fseeko(f, (off_t)offset, whence) == 0;
+#endif
+}
+
+static int64_t file_tell(FILE *f) {
+#if defined(_WIN32)
+    return (int64_t)_ftelli64(f);
+#else
+    return (int64_t)ftello(f);
+#endif
+}
+
 static uint8_t *read_whole(const char *path, size_t *size) {
     FILE *f = path ? fopen(path, "rb") : NULL;
     if (!f) {
@@ -1495,10 +1529,10 @@ static uint8_t *read_whole(const char *path, size_t *size) {
         return NULL;
     }
     uint8_t *buf = NULL;
-    long len = -1;
-    if (fseek(f, 0, SEEK_END) == 0) len = ftell(f);
-    bool ok = len >= 0 && fseek(f, 0, SEEK_SET) == 0 && (buf = (uint8_t *)malloc((size_t)len + 1)) != NULL &&
-              fread(buf, 1, (size_t)len, f) == (size_t)len;
+    int64_t len = -1;
+    if (file_seek(f, 0, SEEK_END)) len = file_tell(f);
+    bool ok = len >= 0 && (uint64_t)len < SIZE_MAX && file_seek(f, 0, SEEK_SET) &&
+              (buf = (uint8_t *)malloc((size_t)len + 1)) != NULL && fread(buf, 1, (size_t)len, f) == (size_t)len;
     fclose(f);
     if (!ok) {
         fail(buf || len < 0 ? SPINGALETT_ERR_FILE_IO : SPINGALETT_ERR_ALLOC, "cannot read data set file");
@@ -1666,7 +1700,7 @@ static bool slot_read(SpingalettDatasetReader *r, Slot *s) {
         s->raw = p;
         s->raw_cap = size;
     }
-    if (fseek(r->file, (long)L->offset[s->chunk], SEEK_SET) != 0 || fread(s->raw, 1, size, r->file) != size) {
+    if (!file_seek(r->file, L->offset[s->chunk], SEEK_SET) || fread(s->raw, 1, size, r->file) != size) {
         set_error(SPINGALETT_ERR_FILE_IO, "truncated .slettd data set");
         return false;
     }
@@ -1723,6 +1757,11 @@ static void reader_thread(void *arg) {
 /* Decodes every requested chunk on the caller's thread: read one after the other, then decoded
    side by side by the OpenMP threads, which have nothing else to do while the caller waits. */
 static void reader_burst(SpingalettDatasetReader *r) {
+    /* chunks requested ahead keep their errors in their slots: the caller sees one when it takes
+       the chunk, not before */
+    int code = spingalett_last_error_code();
+    char message[SPINGALETT_ERRMSG_MAX];
+    snprintf(message, sizeof message, "%s", spingalett_last_error_message());
     int64_t n = 0;
     for (uint64_t q = r->taken; q < r->requested; q++) {
         Slot *s = &r->slots[q % r->slot_count];
@@ -1734,6 +1773,8 @@ static void reader_burst(SpingalettDatasetReader *r) {
 #pragma omp parallel for schedule(dynamic) if(n > 1 && resolve_compute_mode() == COMPUTE_OPENMP)
 #endif
     for (int64_t i = 0; i < n; i++) slot_done(r->jobs[i], slot_decode(r, r->jobs[i]));
+    if (code == SPINGALETT_OK) spingalett_clear_error();
+    else set_error(code, message);
 }
 
 /* Issues requests into the free slots (one stays with the chunk being read); a pass's order is
@@ -1990,12 +2031,12 @@ SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDatasetReader *r) 
 }
 
 const char *spingalett_dataset_target_set_name(const SpingalettDatasetReader *r, uint32_t target_set) {
-    if (!r || !r->layout.st || target_set + 1 >= r->layout.streams) return NULL;
+    if (!r || !r->layout.st || !known_set(&r->layout, target_set)) return NULL;
     return r->layout.st[target_set + 1].name;
 }
 
 const char *spingalett_dataset_class_name(const SpingalettDatasetReader *r, uint32_t target_set, uint32_t index) {
-    if (!r || !r->layout.st || target_set + 1 >= r->layout.streams) return NULL;
+    if (!r || !r->layout.st || !known_set(&r->layout, target_set)) return NULL;
     const StreamInfo *st = &r->layout.st[target_set + 1];
     return st->class_names && index < st->size ? st->class_names[index] : NULL;
 }
@@ -2003,7 +2044,7 @@ const char *spingalett_dataset_class_name(const SpingalettDatasetReader *r, uint
 uint32_t spingalett_dataset_target_set_size(const SpingalettDatasetReader *r, uint32_t target_set) {
     if (!r) return 0;
     if (!r->layout.st) return target_set == 0 ? r->target_size : 0;
-    return target_set + 1 < r->layout.streams ? r->layout.st[target_set + 1].size : 0;
+    return known_set(&r->layout, target_set) ? r->layout.st[target_set + 1].size : 0;
 }
 
 /* Converts samples idx[0..n) of a store of values to floats (sample i's values at base + i x

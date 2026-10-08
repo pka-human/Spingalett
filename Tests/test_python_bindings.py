@@ -191,6 +191,12 @@ with tempfile.TemporaryDirectory() as d:
     check(np.array_equal(mx, imgs.reshape(300, -1).astype(np.float64).__truediv__(255.0).astype(np.float32))
           and np.array_equal(my, yd), "uint8 images round trip as q / 255")
     _, mp = sg.load_dataset(meta, target_set=1)
+    for bad in (-1, 2):     # -1 would wrap around to the inputs in C
+        try:
+            sg.load_dataset(meta, target_set=bad)
+            check(False, f"load_dataset(target_set={bad}) did not raise")
+        except (ValueError, sg.SpingalettError):
+            pass
     check(np.array_equal(mp, yp), "second set of targets")
     def image_net():
         sg.seed(48)

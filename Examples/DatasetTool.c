@@ -313,8 +313,8 @@ static int images(int argc, char **argv, const char **out, SpingalettDataset *d,
         d->channels = (uint32_t)channels;
         spingalett_dataset_set_class_names(d, (const char *const *)classes.items, (uint32_t)classes.count);
         printf("%zu images of %d x %d x %d in %zu classes\n", done, w, h, channels, classes.count);
-    } else if (pixels) {
-        spingalett_dataset_free(d);
+    } else {
+        spingalett_dataset_free(d);         /* whatever was allocated before the failure */
     }
     free(pixels);
     for (size_t c = 0; c < classes.count; c++) names_free(&files[c]);
