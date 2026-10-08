@@ -557,6 +557,13 @@ void spg_gpu_barrier(SpgGpuCommands *c) {
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
+void spg_gpu_barrier_host(SpgGpuCommands *c) {
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
 void spg_gpu_copy(SpgGpuCommands *c, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
                   size_t dst_offset, size_t bytes) {
     if (bytes == 0) return;

@@ -71,6 +71,9 @@ void spg_gpu_dispatch(SpgGpuCommands *commands, SpgKernel kernel, const uint32_t
 /* Every dispatch and copy recorded before it completes before any recorded after it starts, and
    their results are visible to the host once the commands have run. */
 void spg_gpu_barrier(SpgGpuCommands *commands);
+/* The results of what was recorded before it are visible to the host once the commands have run;
+   commands submitted later need not wait for them (only their own barriers order them). */
+void spg_gpu_barrier_host(SpgGpuCommands *commands);
 void spg_gpu_copy(SpgGpuCommands *commands, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
                   size_t dst_offset, size_t bytes);
 /* bytes and offset multiples of 4 */

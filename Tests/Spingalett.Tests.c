@@ -4260,6 +4260,36 @@ static void gpu_training_options(void) {
     CHECK(gpu_max_rel(w[0], w[1], count) < 1e-3, "gpu: restored weights differ by %.2e", gpu_max_rel(w[0], w[1], count));
     free(w[0]); free(w[1]);
 
+    /* validation of a network with batch normalization runs on the running statistics, as on the CPU,
+       and leaves them alone */
+    {
+        const uint32_t m = 96, bin = 8 * 8 * 4, bout = 7;
+        float *bx = (float *)malloc((size_t)m * bin * sizeof(float)), *bt = (float *)calloc((size_t)m * bout, sizeof(float));
+        for (size_t i = 0; i < (size_t)m * bin; i++) bx[i] = frand() * 2.0f - 1.0f;
+        for (uint32_t i = 0; i < m; i++) bt[i * bout + (uint32_t)(frand() * bout) % bout] = 1.0f;
+        float val[2], mean[2][16], var[2][16];
+        for (int k = 0; k < 2; k++) {
+            NeuralNetwork *net = gpu_net(2);
+            spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+            spingalett_seed(9);
+            TrainReport rb = train(.net = net, .inputs = bx, .targets = bt, .sample_count = 64, .val_inputs = bx + 64 * bin,
+                                   .val_targets = bt + 64 * bout, .val_count = 32, .epochs = 3, .batch_size = 16,
+                                   .training_strategy = STRATEGY_SMALL_BATCH, .optimizer_type = OPTIMIZER_MOMENTUM,
+                                   .learning_rate = 0.05f, .report_interval = 0);
+            val[k] = rb.validation.loss;
+            spingalett_get_parameters(net, 2, PARAM_RUNNING_MEAN, mean[k], 16);
+            spingalett_get_parameters(net, 2, PARAM_RUNNING_VARIANCE, var[k], 16);
+            free_network(net);
+        }
+        CHECK(fabsf(val[0] - val[1]) < 1e-3f * fabsf(val[0]), "gpu: validation with batch normalization %g / %g",
+              (double)val[0], (double)val[1]);
+        CHECK(gpu_max_rel(mean[0], mean[1], 16) < 1e-3 && gpu_max_rel(var[0], var[1], 16) < 1e-3,
+              "gpu: running statistics after validation differ by %.2e, %.2e", gpu_max_rel(mean[0], mean[1], 16),
+              gpu_max_rel(var[0], var[1], 16));
+        free(bx);
+        free(bt);
+    }
+
     /* a generator gives the same steps as the arrays */
     TrainReport g[2];
     for (int k = 0; k < 2; k++) {
