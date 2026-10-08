@@ -15,6 +15,7 @@
  *   AFFINE    y = act(x a[c] + b[c])            (batch normalization)
  *   BDATA     y = (a[c] x + (a[C + c] b + a[2C + c])) act'(b)    (its data gradient; x = dy, b = input)
  *   SCALE     y = y a[0]                        (gradient clipping)
+ *   AFFINE_ADD  y = act(z + (x a[c] + b[c]))   (a batch normalization added to z: residual blocks)
  */
 
 #version 460
@@ -32,6 +33,7 @@ layout(local_size_x = 256) in;
 #define AFFINE   5u
 #define BDATA    6u
 #define SCALE    7u
+#define AFFINE_ADD 8u
 
 #define FLAG_A   1u
 
@@ -42,6 +44,7 @@ layout(push_constant) uniform Push {
     uint layer, threshold;
     float keep_scale;
     uint flags;
+    F32 z;
 } p;
 
 /* 64-bit arithmetic on (low, high) pairs, for the dropout hash */
@@ -112,6 +115,9 @@ void main() {
             p.y.v[i] = ACT == ACT_NONE ? v : v * derivative(xin, ACT);
         } else if (OP == SCALE) {
             p.y.v[i] *= p.a.v[0];
+        } else if (OP == AFFINE_ADD) {
+            uint c = i % p.n;
+            p.y.v[i] = activate(p.z.v[i] + (p.x.v[i] * p.a.v[c] + p.b.v[c]), ACT);
         }
     }
 }

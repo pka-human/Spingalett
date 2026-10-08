@@ -108,9 +108,10 @@ typedef struct {
     uint32_t total, n, layer, threshold;
     float keep_scale;
     uint32_t flags;
+    uint64_t z;
 } SpgEltwisePush;
 enum { SPG_ELT_BIAS_ACT, SPG_ELT_DERIV, SPG_ELT_MUL, SPG_ELT_ADD, SPG_ELT_DROPOUT, SPG_ELT_AFFINE, SPG_ELT_BDATA,
-       SPG_ELT_SCALE };
+       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD };
 
 /* output.comp */
 typedef struct {

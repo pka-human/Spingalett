@@ -62,7 +62,7 @@ layout(local_size_x_id = 9) in;
 #define EPI_BIAS_ACT    1u      /* C = act(AB + bias[column]) */
 #define EPI_SCALE_ACT   2u      /* C = act(AB * scale[column] + shift[column]) */
 #define EPI_PARTIAL     3u      /* partial[z] = AB */
-#define EPI_DERIV       4u      /* C = AB * act'(e0), e0 laid out like C */
+#define EPI_DERIV       4u      /* C = (alpha AB + beta C) * act'(e0), e0 laid out like C */
 
 #define FLAG_BIAS       1u
 
@@ -302,6 +302,8 @@ void main() {
             } else if (EPI == EPI_SCALE_ACT) {
                 v = activate(v * p.e0.v[coff + n] + p.e1.v[coff + n], ACT);
             } else if (EPI == EPI_DERIV) {
+                v *= p.alpha;
+                if (p.beta != 0.0) v += p.beta * p.c.v[at];
                 v *= derivative(p.e0.v[at], ACT);
             }
             p.c.v[at] = v;

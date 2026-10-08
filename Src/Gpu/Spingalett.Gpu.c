@@ -67,6 +67,10 @@ struct SpgGpuNet {
     SpgGpuBuffer wt;                /* convolution weights regrouped for data gradients */
     SpgGpuBuffer transfer;          /* host-visible: parameters on their way in or out */
     uint32_t *uses, *pending;       /* consumers of each layer, and those not yet back-propagated */
+    /* batch normalization layers (no activation, no dropout) read only by an addition of two layers,
+       which applies them as it adds (their own outputs are never stored, and their gradient is the
+       addition's): fold[l] = that addition, or 0 */
+    uint32_t *fold;
 
     Slot slots[2];
     uint32_t next;                  /* the slot of the next chunk */
@@ -294,6 +298,9 @@ void spingalett_gpu_net_free(SpgGpuNet *g) {
     }
     if (g->act) memset(&g->act[0], 0, sizeof g->act[0]);  /* a slot's */
     for (uint32_t l = 0; l < g->layers; l++) {
+        if (g->fold && g->fold[l] && g->delta) memset(&g->delta[l], 0, sizeof g->delta[l]);   /* the addition's */
+    }
+    for (uint32_t l = 0; l < g->layers; l++) {
         if (g->conv) free(g->conv[l]);
         if (g->act) spg_gpu_buffer_free(&g->act[l]);
         if (g->delta) spg_gpu_buffer_free(&g->delta[l]);
@@ -305,7 +312,7 @@ void spingalett_gpu_net_free(SpgGpuNet *g) {
                               &g->wt, &g->transfer};
     for (size_t k = 0; k < sizeof single / sizeof single[0]; k++) spg_gpu_buffer_free(single[k]);
     free(g->act); free(g->delta); free(g->dmask); free(g->geo); free(g->conv); free(g->bn);
-    free(g->uses); free(g->pending); free(g->woff); free(g->boff);
+    free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold);
     free(g);
     spg_gemm_release();
 }
@@ -330,11 +337,24 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
     g->pending = (uint32_t *)calloc(L, sizeof(uint32_t));
     g->woff = (uint64_t *)calloc(L, sizeof(uint64_t));
     g->boff = (uint64_t *)calloc(L, sizeof(uint64_t));
+    g->fold = (uint32_t *)calloc(L, sizeof(uint32_t));
     if (!g->act || !g->delta || !g->dmask || !g->geo || !g->conv || !g->bn || !g->uses || !g->pending ||
-        !g->woff || !g->boff)
+        !g->woff || !g->boff || !g->fold)
         goto fail;
     for (uint32_t l = 1; l < L; l++)
         for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) g->uses[spingalett_inputs(net, l)[k]]++;
+    for (uint32_t c = 1; c < L; c++) {
+        if (net->shapes[c].type != LAYER_ADD || spingalett_input_count(net, c) != 2) continue;
+        for (uint32_t k = 2; k-- > 0;) {        /* one input of an addition: the later */
+            const uint32_t l = spingalett_inputs(net, c)[k];
+            const uint32_t other = spingalett_inputs(net, c)[1 - k];
+            if (l != other && net->shapes[l].type == LAYER_BATCH_NORM && net->act_func[l - 1] == ACT_NONE &&
+                g->uses[l] == 1 && net->dropout_rates[l] == 0.0f) {
+                g->fold[l] = c;
+                break;
+            }
+        }
+    }
     /* every layer's parameters at a multiple of four floats */
     for (uint32_t l = 0; l + 1 < L; l++) {
         uint64_t rows = spingalett_weight_rows(net, l);
@@ -353,8 +373,9 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
     uint64_t widest_shared = 0, wt = 0;
     for (uint32_t l = 0; ok && l < L; l++) {
         const LayerShape *s = &net->shapes[l];
-        if (l > 0) ok = spg_gpu_buffer_create(&g->act[l], (uint64_t)capacity * net->topology[l] * 4u, false);
-        if (ok && training && l > 0) ok = spg_gpu_buffer_create(&g->delta[l], (uint64_t)capacity * net->topology[l] * 4u, false);
+        if (l > 0 && !g->fold[l]) ok = spg_gpu_buffer_create(&g->act[l], (uint64_t)capacity * net->topology[l] * 4u, false);
+        if (ok && training && l > 0 && !g->fold[l])
+            ok = spg_gpu_buffer_create(&g->delta[l], (uint64_t)capacity * net->topology[l] * 4u, false);
         if (ok && training && l > 0 && l + 1 < L && net->dropout_rates[l] > 0.0f)
             ok = spg_gpu_buffer_create(&g->dmask[l], (uint64_t)capacity * net->topology[l] * 4u, false);
         if (l > 0 && g->uses[l] > 1 && net->topology[l] > widest_shared) widest_shared = net->topology[l];
@@ -365,6 +386,8 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
         }
         if (ok && s->type == LAYER_BATCH_NORM) ok = spg_gpu_buffer_create(&g->bn[l], 7u * s->channels * 4u, false);
     }
+    for (uint32_t l = 1; ok && training && l < L; l++)
+        if (g->fold[l]) g->delta[l] = g->delta[g->fold[l]];     /* the addition's gradient, shared */
     if (ok && wt > 0 && training) ok = spg_gpu_buffer_create(&g->wt, wt * 4u, false);
     if (ok && training) {
         /* gradients and moments start zeroed: their padding is never written */
@@ -499,7 +522,7 @@ static void column_sums(SpgGpuNet *g, Recorder *r, const SpgGpuBuffer *x, uint32
 
 static void eltwise(SpgGpuNet *g, Recorder *r, const Access *a, uint32_t op, uint32_t act, uint64_t y, uint64_t x,
                     uint64_t pa, uint64_t pb, uint64_t total, uint32_t n) {
-    SpgEltwisePush p = {y, x, pa, pb, g->header.address, (uint32_t)total, n, 0, 0, 0.0f, 0};
+    SpgEltwisePush p = {y, x, pa, pb, g->header.address, (uint32_t)total, n, 0, 0, 0.0f, 0, 0};
     uint32_t spec[2] = {op, act};
     kernel(r, a, SPG_KERNEL_eltwise, spec, 2, &p, sizeof p, groups(total, 256u), 1, 1);
 }
@@ -578,6 +601,7 @@ static void bn_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32
         writes(&a, span(running_at(g, l - 1, 1), C));
     }
     kernel(r, &a, SPG_KERNEL_bn, &mode, 1, &bp, sizeof bp, (C + 63u) / 64u, 1, 1);
+    if (g->fold[l]) return;                     /* applied by the addition that reads it */
     Access b = {0};
     reads(&b, whole(&g->act[src]));
     reads(&b, span(stats, 4u * C));
@@ -612,6 +636,23 @@ static void combine_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, u
             writes(&a, whole(&g->act[l]));
             kernel(r, &a, SPG_KERNEL_combine, spec, 3, &p, sizeof p, groups((uint64_t)n * cells * ck, 256u), 1, 1);
         }
+        return;
+    }
+    /* an addition of a normalization it applies: act(other + normalized) in one pass */
+    for (uint32_t k = 0; k < count; k++) {
+        const uint32_t i = in[k];
+        if (g->fold[i] != l) continue;
+        const uint32_t src = spingalett_source(net, i), other = in[1 - k], C = net->shapes[i].channels;
+        const uint64_t stats = g->bn[i].address;
+        SpgEltwisePush p = {g->act[l].address, g->act[src].address, stats + 8u * C, stats + 12u * C, 0,
+                            n * net->topology[l], C, 0, 0, 0.0f, 0, g->act[other].address};
+        uint32_t spec[2] = {SPG_ELT_AFFINE_ADD, act};
+        Access a = {0};
+        reads(&a, whole(&g->act[src]));
+        reads(&a, whole(&g->act[other]));
+        reads(&a, span(stats, 4u * C));
+        writes(&a, whole(&g->act[l]));
+        kernel(r, &a, SPG_KERNEL_eltwise, spec, 2, &p, sizeof p, groups((uint64_t)n * net->topology[l], 256u), 1, 1);
         return;
     }
     /* additions: the first two inputs, then each further one, the activation after the last */
@@ -675,7 +716,8 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
         if (masked) {
             const float rate = net->dropout_rates[l];
             SpgEltwisePush p = {g->act[l].address, g->dmask[l].address, 0, 0, g->header.address, (uint32_t)total,
-                                net->topology[l], l, (uint32_t)((double)rate * 4294967296.0), 1.0f / (1.0f - rate), 0};
+                                net->topology[l], l, (uint32_t)((double)rate * 4294967296.0), 1.0f / (1.0f - rate), 0,
+                                0};
             uint32_t spec[2] = {SPG_ELT_DROPOUT, act};
             Access a = {0};
             reads(&a, whole(&g->act[l]));
@@ -689,14 +731,15 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
 
 /* ---- backward ---- */
 
-/* The gradient input k of layer cl gets from it, into dst (added to it with accumulate), times
-   act'(the input's outputs) when fused is not ACT_NONE. Returns whether the derivative was applied. */
+/* The gradient input k of layer cl gets from it, into dst (added to it with accumulate: dense,
+   convolution, adding, concatenating and global pooling layers), then times act'(the input's
+   outputs) when fused is not ACT_NONE. Returns whether the derivative was applied. */
 static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, const SpgGpuBuffer *dst, uint32_t n,
                            uint32_t fused, bool accumulate) {
     const NeuralNetwork *net = g->net;
     const uint32_t *in = spingalett_inputs(net, cl), i = in[k];
     const LayerShape *s = &net->shapes[cl], *x = &net->shapes[i];
-    const bool derive = fused != ACT_NONE && !accumulate;
+    const bool derive = fused != ACT_NONE;
     Access a = {0};
     reads(&a, whole(&g->delta[cl]));
     if (derive || s->type == LAYER_BATCH_NORM || s->type == LAYER_MAX_POOL2D || s->type == LAYER_AVG_POOL2D)
@@ -889,7 +932,7 @@ static void record_backward(SpgGpuNet *g, Recorder *r, uint32_t n, float scale, 
         if (type == LAYER_BATCH_NORM) bn_backward(g, r, cl, n, scale, beta);
         for (uint32_t k = 0; k < count; k++) {
             const uint32_t l = in[k];
-            if (l == 0) continue;
+            if (l == 0 || g->fold[l] == cl) continue;   /* its gradient is the addition's own */
             const ActivationFunction act = net->act_func[l - 1];
             const uint64_t total = (uint64_t)n * net->topology[l];
             const bool masked = g->dmask[l].buffer != NULL;
@@ -899,11 +942,14 @@ static void record_backward(SpgGpuNet *g, Recorder *r, uint32_t n, float scale, 
             writes(&fix, whole(&g->delta[l]));
             if (g->uses[l] > 1) {
                 const bool first = g->pending[l] == g->uses[l], done = --g->pending[l] == 0;
-                const bool direct = first || type == LAYER_DENSE || type == LAYER_ADD || type == LAYER_CONCAT ||
-                                    type == LAYER_GLOBAL_AVG_POOL;
-                /* the first gradient is written, later ones added (into gtmp first by the layers that
-                   cannot add) */
-                input_gradient(g, r, cl, k, direct ? &g->delta[l] : &g->gtmp, n, ACT_NONE, direct && !first);
+                /* the first gradient is written, later ones added (in the kernel's last step: products
+                   add in their epilogue, as the sums of the CPU run; batch normalization and pooling
+                   through gtmp), the derivative applied with the last one where the kernel can */
+                const bool direct = first || type == LAYER_DENSE || type == LAYER_CONV2D || type == LAYER_ADD ||
+                                    type == LAYER_CONCAT || type == LAYER_GLOBAL_AVG_POOL;
+                const uint32_t fused = direct && done && !masked ? act : ACT_NONE;
+                bool applied = input_gradient(g, r, cl, k, direct ? &g->delta[l] : &g->gtmp, n, fused,
+                                              direct && !first) && fused != ACT_NONE;
                 if (!direct) {
                     Access add = {0};
                     reads(&add, whole(&g->delta[l]));
@@ -911,7 +957,7 @@ static void record_backward(SpgGpuNet *g, Recorder *r, uint32_t n, float scale, 
                     writes(&add, whole(&g->delta[l]));
                     eltwise(g, r, &add, SPG_ELT_ADD, ACT_NONE, g->delta[l].address, g->gtmp.address, 0, 0, total, 1);
                 }
-                if (done)
+                if (done && !applied)
                     eltwise(g, r, &fix, masked ? SPG_ELT_MUL : SPG_ELT_DERIV, masked ? ACT_NONE : act,
                             g->delta[l].address, masked ? g->dmask[l].address : g->act[l].address, 0, 0, total, 1);
                 continue;
