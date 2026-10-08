@@ -7,11 +7,13 @@ name: Release
 # "true" (trusted publishing: PyPI must list this repository, release.yml and the environment "pypi"
 # as a publisher of the project). workflow_dispatch (re)publishes an existing tag, optionally without
 # binaries for versions that predate this workflow. Only the highest version is marked as the
-# latest release.
+# latest release. Pushes to dev/ branches build and test everything like a pull request, without
+# publishing.
 
 on:
   push:
     tags: ['v*']
+    branches: ['dev/**']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -44,7 +46,7 @@ jobs:
         run: |
           version=$(sed -n 's/^project(Spingalett VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
           publish=false; binaries=true; ref=$GITHUB_SHA
-          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || [ "$GITHUB_REF_TYPE" = tag ]; then
             publish=true
             ref=$TAG
             if [ "$TAG" != "v$version" ]; then
