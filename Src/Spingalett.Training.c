@@ -254,6 +254,18 @@ static void output_delta_from_grad(ActivationFunction act, const float *out, con
     apply_derivative_batch(delta, out, (uint64_t)n, act);
 }
 
+/* Smoothed targets of n samples: dst = (1 - eps) t + eps / k, k the outputs (2 for sigmoid outputs,
+   each its own pair of classes). */
+static void smooth_targets(const float *t, float *dst, uint32_t n, uint32_t outputs, ActivationFunction act, float eps,
+                           ComputeMode mode) {
+    const float keep = 1.0f - eps, share = eps / (act == ACT_SIGMOID ? 2.0f : (float)outputs);
+    const uint64_t total = (uint64_t)n * outputs;
+    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, total) && n > 1,
+        for (int64_t i = 0; i < (int64_t)total; i++) dst[i] = keep * t[i] + share;
+    );
+    (void)mode;
+}
+
 /* ---- batch path (all backends): see Spingalett.Batch.c for the workspace and forward pass ---- */
 
 /* Output deltas of N samples from targets (the network's loss) or from dL/d(output) rows. */
@@ -544,6 +556,7 @@ typedef struct {
     bool augment;               /* augment_shift or augment_flip */
     uint64_t augment_seed;      /* drawn once per train() call */
     float *augmented;           /* per-sample path: one augmented input */
+    float *smoothed;            /* label smoothing: the targets of a chunk (or a sample), smoothed */
 
     BatchWorkspace *val_ws;     /* validation: inference workspace and output rows */
     float *val_out;
@@ -552,6 +565,7 @@ typedef struct {
 
 static void trainer_free(Trainer *t) {
     spingalett_aligned_free(t->augmented);
+    spingalett_aligned_free(t->smoothed);
     spingalett_aligned_free(t->gen_inputs);
     spingalett_aligned_free(t->gen_targets);
     free(t->order);
@@ -596,10 +610,17 @@ static bool trainer_alloc(Trainer *t) {
         if (!t->gen_inputs || !t->gen_targets) return false;
     }
 
+    uint32_t out_sz = net->topology[net->layers - 1];
     if (t->use_batch_path) {
         uint32_t capacity = spingalett_batch_capacity(net, t->batch_size);
         t->ws = spingalett_batch_workspace_create(net, capacity, true, t->order != NULL || t->augment, t->mode);
-        return t->ws != NULL;
+        if (t->args->label_smoothing > 0.0f)
+            t->smoothed = (float *)spingalett_aligned_alloc((size_t)capacity * out_sz * sizeof(float));
+        return t->ws != NULL && (t->args->label_smoothing <= 0.0f || t->smoothed);
+    }
+    if (t->args->label_smoothing > 0.0f) {
+        t->smoothed = (float *)spingalett_aligned_alloc((size_t)out_sz * sizeof(float));
+        if (!t->smoothed) return false;
     }
     if (t->augment) {
         t->augmented = (float *)spingalett_aligned_alloc((size_t)net->topology[0] * sizeof(float));
@@ -707,6 +728,10 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
                 targets = targets_in + (size_t)(start + c0) * out_sz;
             }
 
+            if (t->smoothed) {
+                smooth_targets(targets, t->smoothed, n, out_sz, out_act, args->label_smoothing, t->mode);
+                targets = t->smoothed;
+            }
             spingalett_batch_forward(net, ws, n, dropout, c0, t->mode);
             loss += batch_compute_loss(net, ws, targets, n);
             batch_output_deltas(net, ws, targets, NULL, n);
@@ -730,6 +755,10 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
     for (uint32_t s = 0; s < count; s++) {
         uint32_t idx = order ? order[start + s] : start + s;
         const float *target = targets_in + (size_t)idx * out_sz;
+        if (t->smoothed) {
+            smooth_targets(target, t->smoothed, 1, out_sz, out_act, args->label_smoothing, COMPUTE_SINGLE_THREADED);
+            target = t->smoothed;
+        }
 
         /* Every online step holds one sample, so its position within the step is 0. */
         t->dropout.step = net->time_step;
@@ -864,6 +893,8 @@ TrainReport train_struct_arguments(TrainArgs args) {
         args.batch_size = sample_count;
     if ((args.augment_shift > 0 || args.augment_flip) && net->shapes[0].height * net->shapes[0].width == 1)
         return train_failed("Augmentation needs an input layer with a height and width (an image)");
+    if (!(args.label_smoothing >= 0.0f && args.label_smoothing < 1.0f))
+        return train_failed("label_smoothing must be in [0, 1)");
     uint32_t step_samples = training_strategy == STRATEGY_SMALL_BATCH ? args.batch_size : sample_count;
     for (uint32_t l = 1; step_samples == 1 && l < net->layers; l++)
         if (net->shapes[l].type == LAYER_BATCH_NORM && net->shapes[l].height * net->shapes[l].width == 1)
@@ -1152,6 +1183,8 @@ struct SpingalettTrainer {
     DropoutContext dropout;
     uint32_t pending;           /* samples of the last forward pass, until it is back-propagated */
     uint32_t accumulated;       /* samples in the network's gradient since the last step */
+    float label_smoothing;
+    float *smoothed;            /* the smoothed targets of a batch */
 };
 
 SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch) {
@@ -1183,7 +1216,26 @@ SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch
 void spingalett_trainer_free(SpingalettTrainer *tr) {
     if (!tr) return;
     spingalett_batch_workspace_free(tr->ws);
+    spingalett_aligned_free(tr->smoothed);
     free(tr);
+}
+
+bool spingalett_trainer_set_label_smoothing(SpingalettTrainer *tr, float label_smoothing) {
+    if (!tr || !(label_smoothing >= 0.0f && label_smoothing < 1.0f)) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_set_label_smoothing: NULL trainer or a value outside [0, 1)");
+        return false;
+    }
+    if (label_smoothing > 0.0f && !tr->smoothed) {
+        const NeuralNetwork *net = tr->net;
+        tr->smoothed = (float *)spingalett_aligned_alloc((size_t)tr->ws->capacity * net->topology[net->layers - 1] *
+                                                         sizeof(float));
+        if (!tr->smoothed) {
+            set_error(SPINGALETT_ERR_ALLOC, "spingalett_trainer_set_label_smoothing: allocation failed");
+            return false;
+        }
+    }
+    tr->label_smoothing = label_smoothing;
+    return true;
 }
 
 const float *spingalett_trainer_forward(SpingalettTrainer *tr, const float *inputs, uint32_t count) {
@@ -1216,6 +1268,11 @@ static bool trainer_backward(SpingalettTrainer *tr, const float *targets, const 
     }
     NeuralNetwork *net = tr->net;
     uint32_t n = tr->pending;
+    if (targets && tr->label_smoothing > 0.0f) {
+        smooth_targets(targets, tr->smoothed, n, net->topology[net->layers - 1], net->act_func[net->layers - 2],
+                       tr->label_smoothing, tr->mode);
+        targets = tr->smoothed;
+    }
     if (loss)
         *loss = batch_compute_loss(net, tr->ws, targets, n);
 

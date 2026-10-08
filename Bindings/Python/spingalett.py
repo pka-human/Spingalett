@@ -331,6 +331,7 @@ class _TrainArgs(Structure):
         ("blas_num_threads", c_int),
         ("augment_shift", c_uint32),
         ("augment_flip", c_bool),
+        ("label_smoothing", c_float),
     ]
 
 
@@ -951,6 +952,7 @@ class TrainConfig:
     blas_num_threads: int = 0
     augment_shift: int = 0              # images: random shifts by up to this many cells (zero fill)
     augment_flip: bool = False          # images: mirror left to right half of the time
+    label_smoothing: float = 0.0        # targets moved this far towards uniform (0.1 is common)
 
 
 def _as_float(data) -> np.ndarray:
@@ -1463,6 +1465,7 @@ class Network:
             blas_num_threads=int(cfg.blas_num_threads),
             augment_shift=int(cfg.augment_shift),
             augment_flip=bool(cfg.augment_flip),
+            label_smoothing=float(cfg.label_smoothing),
         )
         r = _call(_train, args)
         del keep

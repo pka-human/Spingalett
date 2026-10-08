@@ -301,6 +301,12 @@ typedef struct {
        augmented. */
     uint32_t augment_shift;
     bool augment_flip;
+
+    /* Label smoothing: training targets move this far towards the uniform distribution,
+       t' = (1 - label_smoothing) t + label_smoothing / outputs (/ 2 for each sigmoid output, its own
+       two classes), in [0, 1); the reported training loss is the smoothed targets' and validation
+       uses the targets as given. 0.1 is common for classifiers. */
+    float label_smoothing;
 } TrainArgs;
 
 typedef struct {
@@ -471,6 +477,9 @@ SPINGALETT_API bool spingalett_trainer_backward_output_grads(SpingalettTrainer *
 SPINGALETT_API bool spingalett_trainer_step(SpingalettTrainer *trainer, const OptimizerArgs *optimizer);
 /* Discards the gradient accumulated since the last step. */
 SPINGALETT_API void spingalett_trainer_zero_grad(SpingalettTrainer *trainer);
+/* Label smoothing for spingalett_trainer_backward() and spingalett_train_on_batch(), as
+   TrainArgs.label_smoothing (0, the default, uses the targets as given). False when out of [0, 1). */
+SPINGALETT_API bool spingalett_trainer_set_label_smoothing(SpingalettTrainer *trainer, float label_smoothing);
 /* Forward, backward with the network's loss and a step on one batch; returns its mean loss
    (NaN on error). */
 SPINGALETT_API float spingalett_train_on_batch(SpingalettTrainer *trainer, const float *inputs, const float *targets,

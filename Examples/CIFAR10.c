@@ -16,8 +16,16 @@
  * convolution, then a pointwise 1 x 1 one, each normalized): far fewer parameters and
  * multiply-adds, for some accuracy.
  *
+ * With "resnet20" (or resnet32, resnet44, resnet56: 6n + 2 layers), a residual network as He et al.
+ * built it for CIFAR-10: a normalized 3 x 3 convolution of 16 filters, then three stages of n blocks
+ * of two normalized 3 x 3 convolutions with 16, 32 and 64 filters, each block adding its input to its
+ * output before the ReLU (the first block of the second and third stages halves the size with a
+ * stride of 2, and its shortcut is a normalized 1 x 1 convolution of stride 2), global average
+ * pooling and a dense softmax layer. "wide" doubles the filters. It trains with SGD and momentum
+ * (lr 0.1 after a warm-up, cosine decay, weight decay 5e-4) and label smoothing of 0.1.
+ *
  *   Examples/download_cifar10.sh data/cifar10      # fetch the binary batches once
- *   Bin/CIFAR10 data/cifar10 [epochs] [separable] [st|omp|blas]
+ *   Bin/CIFAR10 data/cifar10 [epochs] [separable | resnet20 | resnet32 ... [wide]] [st|omp|blas]
  *
  * Training augments the images with random shifts of up to 4 pixels and mirror images. 5,000 training
  * images are held out to keep the weights of the best epoch; the test accuracy follows, then that of
@@ -78,6 +86,26 @@ static void conv_block(NeuralNetwork *net, uint32_t filters, bool separable) {
     batch_norm(.net = net, .act_func = ACT_RELU);
 }
 
+/* A residual block reading x: two normalized 3 x 3 convolutions, the first of the given stride, and
+   x itself added before the ReLU (through a normalized 1 x 1 convolution where the shape changes). */
+static uint32_t residual_block(NeuralNetwork *net, uint32_t x, uint32_t filters, uint32_t stride) {
+    SpingalettNetworkLayer in;
+    spingalett_network_layer(net, x, &in);
+    conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 3, .padding = 1, .stride = stride,
+           .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    uint32_t y = batch_norm(.net = net);
+    uint32_t shortcut = x;
+    if (stride != 1 || in.channels != filters) {
+        conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride, .act_func = ACT_NONE,
+               .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        shortcut = batch_norm(.net = net);
+    }
+    return add_layers(.net = net, .inputs = {shortcut, y}, .act_func = ACT_RELU);
+}
+
 static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *started) {
     (void)net;
     printf("epoch %2zu  lr %.5f  loss %.4f  validation loss %.4f  accuracy %.2f%%%s  (%.0f s)\n", p->epoch,
@@ -89,18 +117,22 @@ static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *started) 
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <cifar10-dir> [epochs] [separable] [st|omp|blas]\n"
+        fprintf(stderr, "usage: %s <cifar10-dir> [epochs] [separable | resnet20 | resnet32 | resnet44 | resnet56 [wide]] "
+                        "[st|omp|blas]\n"
                         "Download the data with Examples/download_cifar10.sh <cifar10-dir>.\n", argv[0]);
         return 1;
     }
     size_t epochs = argc > 2 ? (size_t)strtoul(argv[2], NULL, 10) : 20;
-    bool separable = false;
+    bool separable = false, wide = false;
+    uint32_t depth = 0;                 /* a residual network of this many layers, 0 for none */
     ComputeMode mode = COMPUTE_SINGLE_THREADED;
 #if defined(SPINGALETT_HAS_OPENMP)
     mode = COMPUTE_OPENMP;
 #endif
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "separable")) separable = true;
+        else if (!strncmp(argv[i], "resnet", 6)) depth = (uint32_t)strtoul(argv[i] + 6, NULL, 10);
+        else if (!strcmp(argv[i], "wide")) wide = true;
         else if (!strcmp(argv[i], "blas")) mode = COMPUTE_OPENBLAS;
         else if (!strcmp(argv[i], "omp")) mode = COMPUTE_OPENMP;
         else if (!strcmp(argv[i], "st")) mode = COMPUTE_SINGLE_THREADED;
@@ -123,19 +155,37 @@ int main(int argc, char **argv) {
     spingalett_set_verbose(false);
     spingalett_set_compute_mode(mode);
 
+    if (depth && (depth < 8 || (depth - 2) % 6 != 0)) {
+        fprintf(stderr, "a residual network has 6n + 2 layers (resnet20, resnet32, resnet44, resnet56, ...)\n");
+        return 1;
+    }
     NeuralNetwork *net = new_spingalett(LOSS_CROSS_ENTROPY);
     layer(.net = net, .height = 32, .width = 32, .channels = 3);
-    const uint32_t widths[3] = {32, 64, 128};
-    for (int stage = 0; stage < 3; stage++) {
-        conv_block(net, widths[stage], separable && stage > 0);
-        conv_block(net, widths[stage], separable);
-        max_pool2d(.net = net, .kernel = 2);
+    if (depth) {
+        const uint32_t base = wide ? 32u : 16u;
+        conv2d(.net = net, .filters = base, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+               .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        uint32_t x = batch_norm(.net = net, .act_func = ACT_RELU);
+        for (uint32_t stage = 0; stage < 3; stage++)
+            for (uint32_t b = 0; b < (depth - 2) / 6; b++)
+                x = residual_block(net, x, base << stage, stage > 0 && b == 0 ? 2u : 1u);
+        global_avg_pool2d(.net = net);
+    } else {
+        const uint32_t widths[3] = {32, 64, 128};
+        for (int stage = 0; stage < 3; stage++) {
+            conv_block(net, widths[stage], separable && stage > 0);
+            conv_block(net, widths[stage], separable);
+            max_pool2d(.net = net, .kernel = 2);
+        }
+        layer(net, 128, ACT_NONE, WEIGHT_INITIALIZATION_HE);
+        batch_norm(.net = net, .act_func = ACT_RELU, .dropout_rate = 0.3f);
     }
-    layer(net, 128, ACT_NONE, WEIGHT_INITIALIZATION_HE);
-    batch_norm(.net = net, .act_func = ACT_RELU, .dropout_rate = 0.3f);
     layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
-    printf("network%s: %u layers, %llu parameters\n", separable ? " (depthwise-separable)" : "",
-           spingalett_layer_count(net), (unsigned long long)spingalett_parameter_count(net));
+    char name[48] = "";
+    if (depth) snprintf(name, sizeof name, " (ResNet-%u%s)", depth, wide ? ", wide" : "");
+    else if (separable) snprintf(name, sizeof name, " (depthwise-separable)");
+    printf("network%s: %u layers, %llu parameters\n", name, spingalett_layer_count(net),
+           (unsigned long long)spingalett_parameter_count(net));
 
     LRScheduleParams schedule = {.warmup_epochs = 1, .min_lr = 1e-5f};
     double started = now();
@@ -147,9 +197,10 @@ int main(int argc, char **argv) {
         .epochs = epochs,
         .training_strategy = STRATEGY_SMALL_BATCH,
         .batch_size = 128,
-        .optimizer_type = OPTIMIZER_ADAMW,
-        .learning_rate = 2e-3f,
+        .optimizer_type = depth ? OPTIMIZER_MOMENTUM : OPTIMIZER_ADAMW,
+        .learning_rate = depth ? 0.1f : 2e-3f,
         .weight_decay = 5e-4f,
+        .label_smoothing = depth ? 0.1f : 0.0f,
         .lr_scheduler = spingalett_lr_warmup_cosine,
         .lr_scheduler_data = &schedule,
         .augment_shift = 4,

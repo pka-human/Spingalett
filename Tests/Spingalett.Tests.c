@@ -3289,6 +3289,58 @@ static void norm_learns(ComputeMode mode) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* Label smoothing trains as the smoothed targets do, in train() and in the step API. */
+static void label_smoothing(void) {
+    const uint32_t N = 12;
+    float x[12 * 4], t[12 * 3], ts[12 * 3];
+    lcg_state = 321;
+    for (int i = 0; i < 48; i++) x[i] = frand() * 2 - 1;
+    for (uint32_t s = 0; s < N; s++)
+        for (uint32_t k = 0; k < 3; k++) t[s * 3 + k] = k == s % 3 ? 1.0f : 0.0f;
+    for (int i = 0; i < 36; i++) ts[i] = 0.85f * t[i] + 0.15f / 3.0f;
+    float w[2][64];
+    for (int v = 0; v < 2; v++) {
+        spingalett_seed(5);
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = 4);
+        layer(.net = net, .neurons_amount = 6, .act_func = ACT_TANH, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+        layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+        TrainReport r = train(.net = net, .inputs = x, .targets = v ? ts : t, .sample_count = N, .epochs = 3,
+                              .learning_rate = 0.1f, .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH,
+                              .batch_size = 4, .do_not_shuffle = true, .label_smoothing = v ? 0.0f : 0.15f);
+        CHECK(r.status == TRAIN_COMPLETED, "label smoothing: training failed");
+        memcpy(w[v], net->weights, net->total_weights * sizeof(float));
+        if (v == 0) {
+            CHECK(train(.net = net, .inputs = x, .targets = t, .sample_count = N, .epochs = 1,
+                        .label_smoothing = 1.0f).status == TRAIN_FAILED, "label smoothing of 1 accepted");
+            /* the step API, against the smoothed targets */
+            SpingalettTrainer *tr = spingalett_trainer_new(net, N);
+            OptimizerArgs sgd = {.type = OPTIMIZER_SGD, .learning_rate = 0.5f};
+            float before[64], before_b[16];
+            memcpy(before, net->weights, net->total_weights * sizeof(float));
+            memcpy(before_b, net->biases, net->total_biases * sizeof(float));
+            CHECK(spingalett_trainer_set_label_smoothing(tr, 0.15f) && !spingalett_trainer_set_label_smoothing(tr, -0.1f),
+                  "trainer label smoothing setter");
+            float a = spingalett_train_on_batch(tr, x, t, N, &sgd);
+            float after[64];
+            memcpy(after, net->weights, net->total_weights * sizeof(float));
+            memcpy(net->weights, before, net->total_weights * sizeof(float));
+            memcpy(net->biases, before_b, net->total_biases * sizeof(float));
+            spingalett_trainer_set_label_smoothing(tr, 0.0f);
+            float b = spingalett_train_on_batch(tr, x, ts, N, &sgd);
+            float diff = 0.0f;
+            for (uint64_t i = 0; i < net->total_weights; i++) diff = fmaxf(diff, fabsf(after[i] - net->weights[i]));
+            CHECK(fabsf(a - b) < 1e-5f && diff < 1e-5f, "label smoothing in the step API: loss %g vs %g, weights %g", a, b, diff);
+            spingalett_trainer_free(tr);
+        }
+        free_network(net);
+    }
+    float diff = 0.0f;
+    for (int i = 0; i < 6 * 4 + 3 * 6; i++) diff = fmaxf(diff, fabsf(w[0][i] - w[1][i]));
+    CHECK(diff < 1e-5f, "label smoothing differs from smoothed targets by %g", diff);
+    printf("  label smoothing: as the smoothed targets (largest difference %.1e)\n", diff);
+}
+
 /* ------------------------------------------------------------------------- graphs */
 
 /* Networks whose layers read other layers than the one before them. */
@@ -3835,6 +3887,7 @@ int main(int argc, char **argv) {
         trainer_custom_grads(LOSS_MSE, ACT_SOFTMAX);
         trainer_custom_grads(LOSS_CROSS_ENTROPY, ACT_SOFTMAX);
         trainer_custom_grads(LOSS_CROSS_ENTROPY, ACT_SIGMOID);
+        label_smoothing();
     }
     if (!*only || !strcmp(only, "data")) {
         printf("[data sets]\n");
