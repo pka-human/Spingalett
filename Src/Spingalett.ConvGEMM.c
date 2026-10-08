@@ -314,6 +314,77 @@ void CONV_NAME(spingalett_conv_direct_forward)(const LayerShape *in, const Layer
                      parallel, threads);
 }
 
+/* The data gradient of a strided convolution, a phase at a time: the input cells (h, w) with
+   h = ph (mod stride_h) and w = pw (mod stride_w) are covered by the same taps, those with
+   kh = ph + pad_h (mod stride_h) and kw alike, so each phase is a product over its own taps only
+   (with stride 2, a quarter of a 3 x 3 kernel's on average); a phase no tap covers gets zeros. */
+static void strided_backward_data(const LayerShape *in, const LayerShape *out, uint32_t g, const float *W,
+                                  const float *dy, float *dx, uint32_t n, float *packed, const float *zeros,
+                                  const SpingalettGemmHooks *epilogue, bool parallel, int threads) {
+    const uint32_t G = out->groups ? out->groups : 1u, C = in->channels, CG = C / G, OC = out->channels, OG = OC / G;
+    const uint32_t KH = out->kernel_h, KW = out->kernel_w, SH = out->stride_h, SW = out->stride_w;
+    const uint32_t H = in->height, Wd = in->width, OH = out->height, OW = out->width, K = KH * KW * CG;
+    const float *Wg = W + (size_t)g * OG * K;
+    for (uint32_t ph = 0; ph < SH && ph < H; ph++)
+        for (uint32_t pw = 0; pw < SW && pw < Wd; pw++) {
+            /* the phase's taps */
+            uint32_t th[SPINGALETT_CONV_DIRECT_TAPS], tw[SPINGALETT_CONV_DIRECT_TAPS], nh = 0, nw = 0;
+            for (uint32_t kh = 0; kh < KH; kh++) if ((ph + out->pad_h + SH * KH - kh) % SH == 0) th[nh++] = kh;
+            for (uint32_t kw = 0; kw < KW; kw++) if ((pw + out->pad_w + SW * KW - kw) % SW == 0) tw[nw++] = kw;
+            const uint32_t taps = nh * nw, KR = taps * OG;
+            const uint32_t rows_h = (H - ph + SH - 1) / SH, rows_w = (Wd - pw + SW - 1) / SW;
+            /* B[(t, oc)][j] = W[g OG + oc][(kh_t, kw_t) CG + j] over the phase's taps */
+            for (uint32_t j0 = 0; taps && j0 < CG; j0 += NR) {
+                uint32_t width = CG - j0 < NR ? CG - j0 : NR;
+                float *dst = packed + (size_t)j0 * KR;
+                for (uint32_t a = 0; a < nh; a++)
+                    for (uint32_t b = 0; b < nw; b++)
+                        for (uint32_t oc = 0; oc < OG; oc++, dst += NR) {
+                            const float *src = Wg + (size_t)oc * K + ((size_t)th[a] * KW + tw[b]) * CG + j0;
+                            for (uint32_t j = 0; j < width; j++) dst[j] = src[j];
+                            for (uint32_t j = width; j < NR; j++) dst[j] = 0.0f;
+                        }
+            }
+            /* tiles of MR cells of one row of the phase */
+            const uint32_t per_row = (rows_w + MR - 1) / MR;
+            const int64_t tiles = (int64_t)n * rows_h * per_row;
+            (void)threads; (void)parallel;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(parallel && tiles > 1)
+#endif
+            for (int64_t t = 0; t < tiles; t++) {
+                const float *p[MR * SPINGALETT_CONV_DIRECT_TAPS];
+                const uint64_t row = (uint64_t)t / per_row, s = row / rows_h;
+                const uint32_t i = (uint32_t)(row % rows_h), j0 = (uint32_t)((uint64_t)t % per_row) * MR;
+                const uint32_t rows = rows_w - j0 < MR ? rows_w - j0 : MR, h = ph + i * SH;
+                const uint64_t first = (s * H + h) * Wd + pw + (uint64_t)j0 * SW;    /* the tile's first cell */
+                float *c = dx + first * C + (size_t)g * CG;
+                if (taps == 0) {
+                    for (uint32_t r = 0; r < rows; r++) memset(c + (size_t)r * SW * C, 0, CG * sizeof(float));
+                    continue;
+                }
+                const float *map = dy + s * (uint64_t)OH * OW * OC + (size_t)g * OG;
+                for (uint32_t r = 0; r < MR; r++) {
+                    const uint32_t w = pw + (j0 + r) * SW;
+                    for (uint32_t a = 0, k = 0; a < nh; a++)
+                        for (uint32_t b = 0; b < nw; b++, k++) {
+                            /* (h + pad - kh) and (w + pad - kw) are multiples of the strides */
+                            int64_t oh = ((int64_t)h + out->pad_h - th[a]) / SH, ow = ((int64_t)w + out->pad_w - tw[b]) / SW;
+                            bool inside = r < rows && (int64_t)h + out->pad_h >= th[a] && (int64_t)w + out->pad_w >= tw[b] &&
+                                          oh < OH && ow < OW;
+                            p[k * MR + r] = inside ? map + ((uint64_t)oh * OW + (uint64_t)ow) * OC : zeros;
+                        }
+                }
+                for (uint32_t j = 0; j < CG; j += NR)
+                    ikernel(taps, OG, p, packed + (size_t)j * KR, c + j, (size_t)SW * C, rows, CG - j < NR ? CG - j : NR);
+                if (epilogue && epilogue->epilogue)
+                    for (uint32_t r = 0; r < rows; r++)
+                        epilogue->epilogue(epilogue->epilogue_ctx, (uint32_t)(first + (uint64_t)r * SW), 1, 0, CG,
+                                           c + (size_t)r * SW * C, C);
+            }
+        }
+}
+
 void CONV_NAME(spingalett_conv_direct_backward_data)(const LayerShape *in, const LayerShape *out, uint32_t g,
                                                      const float *W, const float *dy, float *dx, uint32_t n,
                                                      float *scratch, const SpingalettGemmHooks *epilogue, bool parallel,
@@ -322,6 +393,10 @@ void CONV_NAME(spingalett_conv_direct_backward_data)(const LayerShape *in, const
     const uint32_t taps = out->kernel_h * out->kernel_w, K = taps * CG, KR = taps * OG;
     float *packed = scratch, *zeros = scratch + spingalett_conv_direct_packed_floats(CG, KR);
     memset(zeros, 0, ((size_t)(CG > OG ? CG : OG) + 32u) * sizeof(float));
+    if (out->stride_h > 1 || out->stride_w > 1) {
+        strided_backward_data(in, out, g, W, dy, dx, n, packed, zeros, epilogue, parallel, threads);
+        return;
+    }
     /* B[t * OG + oc][j] = W[g OG + oc][t CG + j] */
     const float *Wg = W + (size_t)g * OG * K;
     for (uint32_t j0 = 0; j0 < CG; j0 += NR) {

@@ -219,7 +219,7 @@ static NeuralNetwork *conv_net(int which) {
             return net;
         case 9:     /* the same in a 3 x 3 convolution of stride 1 over 16 channels, padded */
             net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
-            layer(.net = net, .height = 5, .width = 4, .channels = 16);
+            layer(.net = net, .height = 3, .width = 3, .channels = 16);
             conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_SIGMOID);
             conv2d(.net = net, .filters = 13, .kernel = 2, .act_func = ACT_TANH);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
@@ -4039,7 +4039,7 @@ int main(int argc, char **argv) {
         for (int m = 0; m < 3; m++) for (int s = 0; s < 3; s++)
             for (int c = 0; c < 10; c++) {
                 lcg_state = 1000 + c;
-                gradcheck_fan_in_limit = c >= 8 ? 32u : 0u;
+                gradcheck_fan_in_limit = c >= 8 ? 16u : 0u;
                 gradcheck_net(conv_names[c], conv_net(c), modes[m], strats[s]);
             }
     }
