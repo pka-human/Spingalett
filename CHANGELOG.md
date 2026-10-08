@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.11.0] - Unreleased
+
+"GPU": training and inference on a GPU through Vulkan compute, deterministic, with every kind of
+layer the CPU runs.
+
+### Added
+- `COMPUTE_VULKAN`: `train()` (full-batch and mini-batch strategies), `predict()` and `evaluate()`
+  on a GPU through Vulkan compute (NVIDIA, AMD and Intel GPUs; Apple GPUs through MoltenVK);
+  `spingalett_gpu_device()` names the device (the first discrete GPU, or `SPINGALETT_GPU_DEVICE`).
+  The Vulkan loader is opened at run time: the library loads and runs on the CPU without Vulkan, and
+  without a usable device the mode falls back to the CPU with a warning. Every kind of layer,
+  activation, loss and optimizer runs on the GPU, with dropout (the CPU's masks), gradient clipping,
+  label smoothing, augmentation (on the host, overlapped), validation and early stopping; the
+  parameters stay on the device for a `train()` call and come back at the end of every epoch.
+  Sums run in fixed orders, so GPU runs repeat bit for bit. Python: `ComputeMode.VULKAN`,
+  `gpu_device()`. Measured on an RTX 4050 Laptop GPU (`Bin/Benchmark`, samples per second, against
+  eight threads of the i7-12650H): ResNet-20 trains at 9,600 (CPU 1,584) and infers at 20,450; the
+  MNIST CNN trains at 64,000 (14,600); the 784-512-1000-10 MLP trains full batches at 570,000
+  (114,600) and mini-batches of 64 at 204,000 (52,900). PyTorch 2.14 with CUDA and cuDNN on the
+  same GPU trains ResNet-20 at 7,750 (8,540 with its default TF32 convolutions), the MNIST CNN at
+  60,200 and the MLP's mini-batches at 107,700.
+- The GPU's matrix kernel serves dense layers, convolutions (windows read through a tap table,
+  groups), data gradients (one stride-1 product per phase of a stride) and weight gradients (sums
+  split into slices added in a fixed order), with vector loads along each operand's contiguous axis;
+  the tile of each product shape is chosen by timing on first use (`SPINGALETT_GPU_TUNE=0`:
+  estimated), which cannot change a result since every tile adds in the same order.
+  `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel at exit.
+- Building: `SPINGALETT_VULKAN` (`AUTO`, `ON`, `OFF`) needs `glslc` and the Vulkan headers;
+  `SPINGALETT_SPIRV_DIR` takes another build's compiled shaders. Release packages and wheels carry
+  the backend.
+- Tests: `SpingalettGpuTests` checks the matrix kernel in every mode and tile against double
+  precision and that tiles agree bit for bit; the `gpu` group trains networks with every kind of
+  layer on the GPU and the CPU and compares them. CI runs both on Mesa's lavapipe.
+- `Examples/benchmark_pytorch.py --cuda` (PyTorch's defaults) and `--cuda-fp32` (no TF32).
+- `Examples/CIFAR10.c resnet32` reaches 92.39% test accuracy in 100 epochs (INT8 model 92.43%,
+  480 KB).
+
+### Changed
+- `ComputeMode` has a new value, `COMPUTE_VULKAN`, before `COMPUTE_COUNT`.
+
+### Fixed
+- README: a repeated phrase in the performance section.
+
 ## [0.10.0] - 2026-10-08
 
 "Graphs": networks become directed acyclic graphs of layers (residual connections, concatenated
@@ -573,6 +616,7 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[0.11.0]: https://github.com/pka-human/Spingalett/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/pka-human/Spingalett/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/pka-human/Spingalett/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/pka-human/Spingalett/compare/v0.7.0...v0.8.0
