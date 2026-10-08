@@ -137,8 +137,8 @@ layer 0): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output chan
   input it passes that input on (to give it an activation of its own).
 - Concatenation (version 6): `k` inputs of the entry's output height and width whose channels add
   up to `out_c`; kernel, stride, padding, groups, epsilon and momentum 0, no sections.
-- Global average pooling (version 6): output `1 x 1 x in_c`; kernel, stride, padding, groups,
-  epsilon and momentum 0, no sections.
+- Global average pooling (version 6): output `1 x 1 x in_c`, activation 6 (none); kernel, stride,
+  padding, groups, epsilon and momentum 0, no sections.
 
 The precision byte of kinds without parameters is the file's precision, which they do not use.
 

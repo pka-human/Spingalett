@@ -16,6 +16,9 @@
  *                                      accuracy and loss in every precision (or in P)
  *   ModelTool bench <model.slett> [--precision P]
  *                                      latency of one sample and batched throughput
+ *   ModelTool import <model.onnx> <out.slett> [--precision P]
+ *                                      an ONNX model as a network (FLOAT32 unless P is given;
+ *                                      its input is channels-last)
  *
  * P is fp32, fp16, bf16, int8, int4 or int2; by default the precision the model is stored in.
  */
@@ -93,7 +96,7 @@ static int info(const char *path) {
     if (input.height > 1 || input.width > 1)
         printf("  input: %u x %u x %u\n", input.height, input.width, input.channels);
     static const char *const kinds[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add", "concat",
-                                        "global_avg_pool2d"};
+                                        "global_pool"};
     for (uint32_t i = 0; i < m->layer_count; i++) {
         SpingalettLayerInfo l;
         spingalett_model_layer(m, i, &l);
@@ -221,6 +224,24 @@ static int bench(const char *path, bool have_precision, PrecisionMode precision)
     return 0;
 }
 
+static int import(const char *in, const char *out, bool have_precision, PrecisionMode precision) {
+    NeuralNetwork *net = spingalett_import_onnx(in);
+    if (!net) return fail(in);
+    SpingalettNetworkLayer input;
+    spingalett_network_layer(net, 0, &input);
+    save_spingalett(.net = net, .filename = out, .do_not_save_optimizer = true,
+                    .precision = have_precision ? precision : PRECISION_FLOAT32);
+    if (spingalett_last_error_code() != SPINGALETT_OK) {
+        free_network(net);
+        return fail(out);
+    }
+    printf("wrote %s: %u layers, %llu parameters, input %u x %u x %u (channels last), %u outputs, %s\n", out,
+           spingalett_layer_count(net), (unsigned long long)spingalett_parameter_count(net), input.height, input.width,
+           input.channels, spingalett_output_size(net), precision_name(have_precision ? precision : PRECISION_FLOAT32));
+    free_network(net);
+    return 0;
+}
+
 static int usage(void) {
     fprintf(stderr,
         "usage: ModelTool info <model.slett>\n"
@@ -228,6 +249,7 @@ static int usage(void) {
         "       ModelTool header <model.slett> <out.h> <name> [--precision P]\n"
         "       ModelTool eval <model.slett> <data.slettd | images labels> [--precision P]\n"
         "       ModelTool bench <model.slett> [--precision P]\n"
+        "       ModelTool import <model.onnx> <out.slett> [--precision P]\n"
         "P: fp32, fp16, bf16, int8, int4, int2 (default: as stored)\n");
     return 2;
 }
@@ -259,5 +281,6 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "header") && nargs == 3) return header(args[0], args[1], args[2], have_precision, precision);
     if (!strcmp(cmd, "eval") && (nargs == 2 || nargs == 3)) return eval(args[0], args[1], nargs == 3 ? args[2] : NULL, have_precision, precision);
     if (!strcmp(cmd, "bench") && nargs == 1) return bench(args[0], have_precision, precision);
+    if (!strcmp(cmd, "import") && nargs == 2) return import(args[0], args[1], have_precision, precision);
     return usage();
 }

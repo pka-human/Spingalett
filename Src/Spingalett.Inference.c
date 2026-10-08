@@ -1414,7 +1414,8 @@ static bool shape_ok(const SlettLayer *L, uint16_t version) {
     if (L->type == LAYER_ADD || L->type == LAYER_CONCAT || L->type == LAYER_GLOBAL_AVG_POOL) {
         /* no window, no parameters; the shapes of all inputs are checked with them */
         if (!windowless || !parameterless || L->groups != 0 || L->eps != 0.0f || L->momentum != 0.0f) return false;
-        if (L->type == LAYER_GLOBAL_AVG_POOL) return L->out_h == 1 && L->out_w == 1 && L->out_c == L->in_c;
+        if (L->type == LAYER_GLOBAL_AVG_POOL)
+            return L->out_h == 1 && L->out_w == 1 && L->out_c == L->in_c && L->activation == ACT_NONE;
         return L->out_h == L->in_h && L->out_w == L->in_w && (L->type == LAYER_CONCAT || L->out_c == L->in_c);
     }
     /* version 5: groups for convolutions only, epsilon and momentum for batch normalization only */

@@ -235,7 +235,7 @@ bool spingalett_add_layer(LayerArgs args) {
         return false;
     spingalett_batch_workspace_free(net->forward_ws);     /* made for the old layers */
     net->forward_ws = NULL;
-    bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D;
+    bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D || shape.type == LAYER_GLOBAL_AVG_POOL;
     if (pooling) act_func = ACT_NONE;
     static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add",
                                              "concat", "global_avg_pool2d"};

@@ -600,6 +600,8 @@ _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POI
 _model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, _FloatArray, c_uint32, _FloatArray])
 _model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _FloatArray, _FloatArray, c_uint32])
 _load = _bind("load_spingalett", _NetPtr, [c_char_p])
+_import_onnx = _bind("spingalett_import_onnx", _NetPtr, [c_char_p])
+_import_onnx_from_memory = _bind("spingalett_import_onnx_from_memory", _NetPtr, [c_char_p, c_size_t])
 _free = _bind("free_network", None, [_NetPtr])
 _print_parameters = _bind("print_parameters", None, [_NetPtr])
 
@@ -856,8 +858,7 @@ class Concat:
 
 @dataclasses.dataclass(frozen=True)
 class GlobalAvgPool:
-    """The mean of each channel over all cells: (1, 1, channels)."""
-    activation: Activation = Activation.NONE
+    """The mean of each channel over all cells: (1, 1, channels), without activation."""
     dropout: float = 0.0
     inputs: _Inputs = None
 
@@ -1007,7 +1008,7 @@ class Network:
             elif isinstance(spec, Concat):
                 self.add_concat(spec.inputs, spec.activation, spec.dropout)
             elif isinstance(spec, GlobalAvgPool):
-                self.add_global_avg_pool(spec.activation, spec.dropout, inputs=spec.inputs)
+                self.add_global_avg_pool(spec.dropout, inputs=spec.inputs)
             else:
                 self.add_layer(int(spec))
 
@@ -1128,11 +1129,10 @@ class Network:
         order given, then ``activation``."""
         return self._add(inputs, type=int(LayerType.CONCAT), act_func=int(activation), dropout_rate=float(dropout))
 
-    def add_global_avg_pool(self, activation: Activation = Activation.NONE, dropout: float = 0.0,
-                            inputs: _Inputs = None) -> "Network":
-        """Append the mean of each channel over all cells: shape (1, 1, channels)."""
-        return self._add(inputs, type=int(LayerType.GLOBAL_AVG_POOL), act_func=int(activation),
-                         dropout_rate=float(dropout))
+    def add_global_avg_pool(self, dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
+        """Append the mean of each channel over all cells: shape (1, 1, channels), a pooling layer
+        without activation."""
+        return self._add(inputs, type=int(LayerType.GLOBAL_AVG_POOL), dropout_rate=float(dropout))
 
     def layer(self, index: int) -> LayerDescription:
         """Layer ``index`` (0 is the input layer)."""
@@ -1498,6 +1498,41 @@ class Network:
         if not ptr:
             raise SpingalettError(-1, "could not load the network")
         return cls._wrap(ptr)
+
+    @classmethod
+    def from_onnx(cls, source) -> "Network":
+        """A network from an ONNX model: a path, or the model's bytes. It takes channels-last
+        samples: an ONNX input [N, C, H, W] becomes an input layer of shape (H, W, C), so NCHW images
+        must be transposed (``images.transpose(0, 2, 3, 1)``); see spingalett_import_onnx() for the
+        operators it reads."""
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            ptr = _call(_import_onnx_from_memory, data, len(data))
+        else:
+            ptr = _call(_import_onnx, _encode_path(source))
+        if not ptr:
+            raise SpingalettError(-1, "could not import the ONNX model")
+        return cls._wrap(ptr)
+
+    @classmethod
+    def from_torch(cls, module, example_input) -> "Network":
+        """A network computing what a PyTorch module computes, through an ONNX export in memory
+        (``torch.onnx.export``; ``example_input`` is a tensor of the module's input shape, NCHW for
+        images). The module is exported in evaluation mode. Like :meth:`from_onnx`, the network takes
+        channels-last samples."""
+        import io
+        import torch
+        was_training = module.training
+        module.eval()
+        try:
+            buffer = io.BytesIO()
+            try:
+                torch.onnx.export(module, (example_input,), buffer, dynamo=False, do_constant_folding=True)
+            except TypeError:       # releases without the dynamo argument
+                torch.onnx.export(module, (example_input,), buffer, do_constant_folding=True)
+        finally:
+            module.train(was_training)
+        return cls.from_onnx(buffer.getvalue())
 
     # ---- deployment
     def to_model(self, precision: Precision = Precision.INT8) -> "Model":

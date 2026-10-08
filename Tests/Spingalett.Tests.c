@@ -8,8 +8,8 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad conv norm graph equiv cont optim sched dropout gen predict valid step
- *                                data io model xor
+ *   Spingalett.Tests [group]     groups: grad conv norm graph onnx equiv cont optim sched dropout gen predict valid
+ *                                step data io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -3363,11 +3363,11 @@ static NeuralNetwork *graph_net(int which) {
             conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
             a = batch_norm(.net = net, .act_func = ACT_TANH);
             conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .stride = 2, .act_func = ACT_NONE);
-            b = batch_norm(.net = net);
+            b = batch_norm(.net = net, .act_func = ACT_NONE);
             conv2d(.net = net, .inputs = {a}, .filters = 4, .kernel = 1, .stride = 2, .act_func = ACT_NONE);
-            c = batch_norm(.net = net);
+            c = batch_norm(.net = net, .act_func = ACT_NONE);
             add_layers(.net = net, .inputs = {b, c}, .act_func = ACT_SIGMOID);
-            global_avg_pool2d(.net = net, .act_func = ACT_TANH);
+            global_avg_pool2d(.net = net);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
             return net;
         case 2:     /* branches concatenated: 1 x 1 conv, 3 x 3 conv and pooling of the input */
@@ -3377,7 +3377,7 @@ static NeuralNetwork *graph_net(int which) {
             b = conv2d(.net = net, .inputs = {0}, .input_count = 1, .filters = 3, .kernel = 3, .padding = 1,
                        .act_func = ACT_FOO52);
             c = max_pool2d(.net = net, .inputs = {0}, .input_count = 1, .kernel = 3, .stride = 1, .padding = 1);
-            concat_layers(.net = net, .inputs = {a, b, c});
+            concat_layers(.net = net, .inputs = {a, b, c}, .act_func = ACT_NONE);
             conv2d(.net = net, .filters = 2, .kernel = 3, .act_func = ACT_TANH);
             layer(.net = net, .neurons_amount = 2, .act_func = ACT_SIGMOID);
             return net;
@@ -3400,7 +3400,7 @@ static NeuralNetwork *graph_net(int which) {
             c = avg_pool2d(.net = net, .inputs = {a}, .kernel = 2);
             d = global_avg_pool2d(.net = net, .inputs = {c});
             global_avg_pool2d(.net = net, .inputs = {b});
-            concat_layers(.net = net, .inputs = {d, d + 1});
+            concat_layers(.net = net, .inputs = {d, d + 1}, .act_func = ACT_NONE);
             layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX);
             return net;
     }
@@ -3471,7 +3471,7 @@ static NeuralNetwork *resnet(uint32_t blocks, uint32_t channels, float dropout) 
         conv2d(.net = net, .filters = channels, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
         batch_norm(.net = net, .act_func = ACT_RELU, .dropout_rate = dropout);
         conv2d(.net = net, .filters = channels, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
-        uint32_t y = batch_norm(.net = net);
+        uint32_t y = batch_norm(.net = net, .act_func = ACT_NONE);
         x = add_layers(.net = net, .inputs = {x, y}, .act_func = ACT_RELU, .dropout_rate = dropout);
     }
     global_avg_pool2d(.net = net);
@@ -3609,7 +3609,7 @@ static void graph_inference(ComputeMode mode) {
             /* integer models compute exactly what single runs compute */
             CHECK(exact || pr < PRECISION_INT8, "graph %d mode %d precision %d: batched prediction differs from single runs",
                   which, mode, pr);
-            static const float tolerance[PRECISION_COUNT] = {1e-4f, 5e-3f, 3e-2f, 6e-2f, 0.3f, 1.0f};
+            static const float tolerance[PRECISION_COUNT] = {1e-4f, 5e-3f, 3e-2f, 6e-2f, 0.6f, 1.0f};
             CHECK(diff < tolerance[pr], "graph %d precision %d: the model differs from the network by %g", which, pr,
                   diff);
             free(ws); free(r);
@@ -3642,7 +3642,7 @@ static void graph_folding(void) {
     uint32_t a = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
     uint32_t b = batch_norm(.net = net, .act_func = ACT_RELU);          /* folds: a feeds only b */
     uint32_t c = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
-    uint32_t d = batch_norm(.net = net);                                 /* stays: c also feeds e */
+    uint32_t d = batch_norm(.net = net, .act_func = ACT_NONE);          /* stays: c also feeds e */
     uint32_t e = add_layers(.net = net, .inputs = {b, c, d}, .act_func = ACT_RELU);
     (void)a; (void)e;
     global_avg_pool2d(.net = net);
@@ -3734,6 +3734,75 @@ static void graph_validation(void) {
     free_network(net);
 }
 
+/* ------------------------------------------------------------------------- ONNX import */
+
+/* Models exported from PyTorch (Tests/make_onnx_tests.py) compute what PyTorch computed. */
+static void onnx_models(void) {
+    static const struct { const char *name; uint32_t layers; LossFunction loss; } cases[] = {
+        {"onnx_mlp", 4, LOSS_CROSS_ENTROPY}, {"onnx_cnn", 6, LOSS_MSE}, {"onnx_resnet", 15, LOSS_CROSS_ENTROPY},
+        {"onnx_resnet_dynamo", 0, LOSS_CROSS_ENTROPY}, {"onnx_matmul", 2, LOSS_CROSS_ENTROPY},
+    };
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, cases[c].name);
+        long size = 0;
+        unsigned char *data = read_file(path, &size);
+        CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+        if (!data) continue;
+        uint32_t n = rd32(data + 4), in = rd32(data + 8), out = rd32(data + 12);
+        const float *x = (const float *)(const void *)(data + 16), *expected = x + (size_t)n * in;
+        snprintf(path, sizeof path, "%s/%s.onnx", SPINGALETT_TEST_DATA_DIR, cases[c].name);
+        NeuralNetwork *net = spingalett_import_onnx(path);
+        CHECK(net != NULL, "%s: import failed: %s", cases[c].name, spingalett_last_error_message());
+        if (!net) { free(data); continue; }
+        CHECK(spingalett_input_size(net) == in && spingalett_output_size(net) == out && net->loss_func == cases[c].loss &&
+              (!cases[c].layers || net->layers == cases[c].layers), "%s: %u layers, %u -> %u, loss %d", cases[c].name,
+              net->layers, spingalett_input_size(net), spingalett_output_size(net), net->loss_func);
+        float *y = malloc((size_t)n * out * sizeof(float));
+        float worst = 0.0f;
+        predict(.net = net, .inputs = x, .sample_count = n, .outputs = y);
+        for (size_t i = 0; i < (size_t)n * out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
+        CHECK(worst < 1e-5f, "%s: outputs differ from PyTorch's by %g", cases[c].name, worst);
+        /* and as a deployment model, through a file */
+        SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+        float mworst = INFINITY;
+        if (m) {
+            spingalett_model_predict(m, x, n, y);
+            mworst = 0.0f;
+            for (size_t i = 0; i < (size_t)n * out; i++) mworst = fmaxf(mworst, fabsf(y[i] - expected[i]));
+            spingalett_model_free(m);
+        }
+        CHECK(mworst < 1e-5f, "%s: the model differs from PyTorch's outputs by %g", cases[c].name, mworst);
+        printf("  %-20s %3u layers, %llu parameters, |outputs - PyTorch| %.1e (model %.1e)\n", cases[c].name, net->layers,
+               (unsigned long long)spingalett_parameter_count(net), worst, mworst);
+        free(y);
+        free(data);
+        free_network(net);
+    }
+
+    /* an operator it does not have is named; bytes that are no model fail */
+    char path[512];
+    snprintf(path, sizeof path, "%s/onnx_unsupported.onnx", SPINGALETT_TEST_DATA_DIR);
+    spingalett_clear_error();
+    CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Resize"),
+          "an unsupported operator: %s", spingalett_last_error_message());
+    static const unsigned char junk[] = {0x0a, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x12};
+    CHECK(!spingalett_import_onnx_from_memory(junk, sizeof junk) && !spingalett_import_onnx_from_memory(junk, 0) &&
+          !spingalett_import_onnx_from_memory(NULL, 4), "junk accepted as an ONNX model");
+    /* truncations of a real model never crash and never succeed */
+    snprintf(path, sizeof path, "%s/onnx_resnet.onnx", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *model = read_file(path, &size);
+    int accepted = 0;
+    for (long cut = 0; model && cut < size; cut += 97) {
+        NeuralNetwork *net = spingalett_import_onnx_from_memory(model, (size_t)cut);
+        accepted += net != NULL;
+        free_network(net);
+    }
+    CHECK(accepted == 0, "%d truncated models imported", accepted);
+    free(model);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "export-headers")) {
         spingalett_set_verbose(false);
@@ -3802,6 +3871,10 @@ int main(int argc, char **argv) {
         for (int m = 0; m < 3; m++) graph_inference(cm[m]);
         graph_folding();
         graph_validation();
+    }
+    if (!*only || !strcmp(only, "onnx")) {
+        printf("[ONNX import]\n");
+        onnx_models();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");

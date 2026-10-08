@@ -96,12 +96,12 @@ static uint32_t residual_block(NeuralNetwork *net, uint32_t x, uint32_t filters,
     batch_norm(.net = net, .act_func = ACT_RELU);
     conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
            .weight_initialization = WEIGHT_INITIALIZATION_HE);
-    uint32_t y = batch_norm(.net = net);
+    uint32_t y = batch_norm(.net = net, .act_func = ACT_NONE);
     uint32_t shortcut = x;
     if (stride != 1 || in.channels != filters) {
         conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride, .act_func = ACT_NONE,
                .weight_initialization = WEIGHT_INITIALIZATION_HE);
-        shortcut = batch_norm(.net = net);
+        shortcut = batch_norm(.net = net, .act_func = ACT_NONE);
     }
     return add_layers(.net = net, .inputs = {shortcut, y}, .act_func = ACT_RELU);
 }

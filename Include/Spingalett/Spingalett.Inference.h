@@ -107,7 +107,8 @@ typedef enum {
                                        connections); with one input, the input itself */
     LAYER_CONCAT,                   /* its inputs side by side along the channels, in the order
                                        given; they share height and width */
-    LAYER_GLOBAL_AVG_POOL,          /* the mean of each channel over all cells: 1 x 1 x channels */
+    LAYER_GLOBAL_AVG_POOL,          /* the mean of each channel over all cells: 1 x 1 x channels (no
+                                       activation, like the other pooling layers) */
     LAYER_TYPE_COUNT
 } LayerType;
 

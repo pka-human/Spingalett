@@ -197,8 +197,9 @@ typedef struct {
 typedef struct {
     NeuralNetwork *net;
     uint32_t neurons_amount;        /* dense: outputs; input layer: its size (or give its shape) */
-    ActivationFunction act_func;    /* dense, conv and batch normalization layers (pooling layers
-                                       have none) */
+    ActivationFunction act_func;    /* dense, conv, batch normalization, add and concatenation layers
+                                       (pooling layers have none); 0 is ACT_SIGMOID, so give ACT_NONE
+                                       for no activation */
     WeightInitialization weight_initialization;
     float dropout_rate;             /* [0, 1): inverted dropout on this layer's outputs during
                                        training; ignored on the input and output layers */
@@ -399,12 +400,13 @@ SPINGALETT_API NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs 
 #define max_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_MAX_POOL2D, __VA_ARGS__})
 #define avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_AVG_POOL2D, __VA_ARGS__})
 #define batch_norm(...) layer_struct_arguments((LayerArgs){.type = LAYER_BATCH_NORM, __VA_ARGS__})
-/* The sum of .inputs (layers of one shape), then .act_func: add_layers(.net = net, .inputs = {x, y},
-   .act_func = ACT_RELU) closes a residual block. */
+/* The sum of .inputs (layers of one shape), then .act_func (ACT_NONE for the sum alone):
+   add_layers(.net = net, .inputs = {x, y}, .act_func = ACT_RELU) closes a residual block. */
 #define add_layers(...) layer_struct_arguments((LayerArgs){.type = LAYER_ADD, __VA_ARGS__})
-/* .inputs side by side along the channels (layers of one height and width), then .act_func. */
+/* .inputs side by side along the channels (layers of one height and width), then .act_func (ACT_NONE
+   for none). */
 #define concat_layers(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONCAT, __VA_ARGS__})
-/* The mean of each channel over its cells (1 x 1 x channels), then .act_func. */
+/* The mean of each channel over its cells (1 x 1 x channels); a pooling layer, without activation. */
 #define global_avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_GLOBAL_AVG_POOL, __VA_ARGS__})
 SPINGALETT_API uint32_t layer_struct_arguments(LayerArgs args);
 
@@ -502,6 +504,21 @@ SPINGALETT_API void *spingalett_save_to_memory(const NeuralNetwork *net, Precisi
 SPINGALETT_API NeuralNetwork *load_spingalett_from_memory(const void *data, size_t size);
 /* Releases memory the library returned (spingalett_save_to_memory). */
 SPINGALETT_API void spingalett_free(void *ptr);
+
+/*
+ * ONNX import: a model of the operators Spingalett has (Conv with groups, Gemm, MatMul with a
+ * constant right operand, MaxPool, AveragePool, GlobalAveragePool (or ReduceMean over the height and
+ * width), BatchNormalization, Add, Concat along the channels, Relu, Sigmoid, Tanh, LeakyRelu with
+ * slope 0.01, Softmax over vectors,
+ * Flatten, Reshape that flattens, Identity, Dropout, Constant), as a network to train further, save
+ * or deploy. The network takes channels-last samples: an input of shape [N, C, H, W] becomes an
+ * input layer of H x W x C, so images in NCHW order must be transposed to H, W, C; a dense layer
+ * after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy when
+ * the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator or
+ * node that cannot be imported; the model's weights must be inside the file (no external data).
+ */
+SPINGALETT_API NeuralNetwork *spingalett_import_onnx(const char *path);
+SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
 
 /*
  * Deployment. A SpingalettModel (Spingalett.Inference.h) is a read-only network that computes in the
