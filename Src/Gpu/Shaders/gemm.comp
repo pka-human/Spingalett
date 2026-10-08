@@ -92,7 +92,9 @@ void main() {
 
     /* thread (tr, tc) computes rows tr TM .. + TM and columns tc TN .. + TN of the tile */
     const uint tc = tid % (BN / TN), tr = tid / (BN / TN);
-    vec4 acc[TM * TN / 4];          /* acc[i * TN / 4 + j]: row i, columns 4j .. 4j + 3 */
+    /* acc[i * TN / 4 + j]: row i, columns 4j .. 4j + 3; precise, so that every fma() stays fused (the
+       same chain of fused multiply-adds whatever the tile) */
+    precise vec4 acc[TM * TN / 4];
     for (uint i = 0; i < TM * TN / 4u; i++) acc[i] = vec4(0.0);
 
     if (kbeg < kend) fetch(kbeg);

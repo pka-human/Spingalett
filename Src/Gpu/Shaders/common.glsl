@@ -28,7 +28,19 @@ float activate(float x, uint act) {
         case ACT_LEAKY_RELU:    return x > 0.0 ? x : 0.01 * x;
         case ACT_SIGMOID:       return 1.0 / (1.0 + exp(-x));
         case ACT_TANH: {        /* tanh() of some drivers overflows to NaN for large arguments */
-            float e = exp(-2.0 * abs(x)), t = (1.0 - e) / (1.0 + e);
+            /* (1 - e) / (1 + e), e = exp(-2|x|), loses relative precision below |x| = 0.3: an odd
+               Taylor polynomial there, as the CPU's vector kernel has (Spingalett.SIMD.c) */
+            float a = abs(x), t;
+            if (a < 0.3) {
+                float a2 = a * a, q = fma(-8.86323552990219656e-3, a2, 2.18694885361552028e-2);
+                q = fma(q, a2, -5.39682539682539683e-2);
+                q = fma(q, a2, 1.33333333333333333e-1);
+                q = fma(q, a2, -3.33333333333333333e-1);
+                t = fma(a * a2, q, a);
+            } else {
+                float e = exp(-2.0 * a);
+                t = (1.0 - e) / (1.0 + e);
+            }
             return x < 0.0 ? -t : t;
         }
         case ACT_FOO52:         return x > 1.0 ? 1.0 + 0.01 * (x - 1.0) : (x < 0.0 ? 0.01 * x : x);
