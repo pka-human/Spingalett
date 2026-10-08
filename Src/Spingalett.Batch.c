@@ -289,13 +289,7 @@ bool predict_struct_arguments(PredictArgs args) {
 
     SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
     if (gpu) {
-        const uint32_t cap = spingalett_gpu_net_capacity(gpu), in_sz = net->topology[0];
-        const uint32_t out_sz = net->topology[net->layers - 1];
-        bool ok = true;
-        for (uint32_t start = 0; ok && start < args.sample_count; start += cap) {
-            uint32_t n = args.sample_count - start < cap ? args.sample_count - start : cap;
-            ok = spingalett_gpu_predict(gpu, args.inputs + (size_t)start * in_sz, args.outputs + (size_t)start * out_sz, n);
-        }
+        bool ok = spingalett_gpu_predict(gpu, args.inputs, args.outputs, args.sample_count);
         spingalett_gpu_done(net, gpu);
         if (ok) return true;
         spingalett_log(LOG_WARNING, "predict: the GPU failed; predicting on the CPU");
@@ -381,25 +375,29 @@ void spingalett_gpu_done(NeuralNetwork *net, SpgGpuNet *gpu) {
         spingalett_gpu_net_free(gpu);                   /* another call put one back first */
 }
 
-bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, float *out_buf, const float *inputs,
-                             const float *targets, uint32_t n, double *loss_sum, uint32_t *correct) {
+bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, const float *inputs, const float *targets,
+                             uint32_t n, double *loss_sum, uint32_t *correct) {
     const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
-    const uint32_t cap = spingalett_gpu_net_capacity(gpu);
+    /* blocks of up to eight chunks, predicted in one go so that they overlap with the copies */
+    const uint32_t block = 8u * spingalett_gpu_net_capacity(gpu) < n ? 8u * spingalett_gpu_net_capacity(gpu) : n;
     const ActivationFunction out_act = net->act_func[net->layers - 2];
+    float *out_buf = (float *)spingalett_aligned_alloc((size_t)block * out_sz * sizeof(float));
     double loss = 0.0;
     uint32_t hits = 0;
-    for (uint32_t start = 0; start < n; start += cap) {
-        uint32_t count = n - start < cap ? n - start : cap;
-        if (!spingalett_gpu_predict(gpu, inputs + (size_t)start * in_sz, out_buf, count)) return false;
-        for (uint32_t s = 0; s < count; s++) {
+    bool ok = out_buf != NULL;
+    for (uint32_t start = 0; ok && start < n; start += block) {
+        uint32_t count = n - start < block ? n - start : block;
+        ok = spingalett_gpu_predict(gpu, inputs + (size_t)start * in_sz, out_buf, count);
+        for (uint32_t s = 0; ok && s < count; s++) {
             const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * out_sz;
             loss += compute_sample_loss(o, t, out_sz, net->loss_func, out_act);
             hits += spingalett_sample_correct(o, t, out_sz);
         }
     }
+    spingalett_aligned_free(out_buf);
     *loss_sum = loss;
     *correct = hits;
-    return true;
+    return ok;
 }
 
 EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
@@ -418,13 +416,9 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
 
     SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
     if (gpu) {
-        float *buf = (float *)spingalett_aligned_alloc((size_t)spingalett_gpu_net_capacity(gpu) *
-                                                       net->topology[net->layers - 1] * sizeof(float));
         double loss;
         uint32_t correct;
-        bool ok = buf && spingalett_gpu_evaluate(gpu, net, buf, args.inputs, args.targets, args.sample_count, &loss,
-                                                 &correct);
-        spingalett_aligned_free(buf);
+        bool ok = spingalett_gpu_evaluate(gpu, net, args.inputs, args.targets, args.sample_count, &loss, &correct);
         spingalett_gpu_done(net, gpu);
         if (ok) {
             m.loss = (float)(loss / args.sample_count);

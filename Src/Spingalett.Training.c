@@ -596,11 +596,7 @@ static bool trainer_alloc(Trainer *t) {
             t->order[i] = i;
     }
 
-    if (t->args->val_count > 0 && t->gpu) {
-        t->val_out = (float *)spingalett_aligned_alloc((size_t)spingalett_gpu_net_capacity(t->gpu) *
-                                                      net->topology[net->layers - 1] * sizeof(float));
-        if (!t->val_out) return false;
-    } else if (t->args->val_count > 0) {
+    if (t->args->val_count > 0 && !t->gpu) {
         uint32_t capacity = spingalett_batch_capacity(net, t->args->val_count);
         t->val_ws = spingalett_batch_workspace_create(net, capacity, false, false, t->mode);
         t->val_out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
@@ -1179,8 +1175,8 @@ TrainReport train_struct_arguments(TrainArgs args) {
             double loss;
             uint32_t correct;
             if (t.gpu) {
-                if (!spingalett_gpu_evaluate(t.gpu, net, t.val_out, args.val_inputs, args.val_targets, args.val_count,
-                                             &loss, &correct)) {
+                if (!spingalett_gpu_evaluate(t.gpu, net, args.val_inputs, args.val_targets, args.val_count, &loss,
+                                             &correct)) {
                     set_error(SPINGALETT_ERR_INVALID, "The GPU failed during validation");
                     spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
                     report.status = TRAIN_FAILED;

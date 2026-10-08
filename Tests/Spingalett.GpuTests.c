@@ -390,6 +390,57 @@ static void bench(void) {
         conv_free(&b);
         free(x); free(w); free(dy);
     }
+    /* the MLP of Examples/Benchmark.c: products of 2048 rows, forward, data and weight gradients */
+    static const uint32_t dense[][2] = {{784, 512}, {512, 1000}};
+    for (size_t k = 0; k < 2; k++) {
+        const uint32_t n = 2048, in = dense[k][0], out = dense[k][1];
+        const double flops = 2.0 * n * in * out;
+        SpgGpuBuffer bx, bw, bd, by;
+        float *host = malloc((size_t)n * (in > out ? in : out) * 4);
+        for (size_t i = 0; i < (size_t)n * (in > out ? in : out); i++) host[i] = uniform();
+        upload(&bx, host, (size_t)n * in * 4);
+        upload(&bw, host, (size_t)out * in * 4);
+        upload(&bd, host, (size_t)n * out * 4);
+        spg_gpu_buffer_create(&by, (size_t)(n > out ? n : out) * (in > out ? in : out) * 4, false);
+        printf("dense %u x %u -> %u (%.0f MFLOP a product)\n", n, in, out, flops * 1e-6);
+        static const char *names[] = {"forward", "data", "weights"};
+        for (int pass = 0; pass < 3; pass++) {
+            double best = 1e9, chosen = 0;
+            uint32_t best_tile = 0;
+            for (uint32_t tile = 0; tile <= spg_gemm_tiles(); tile++) {
+                SpgGemmPush p;
+                SpgGemmMode m;
+                if (pass == 0) {
+                    p = (SpgGemmPush){.a = bx.address, .b = bw.address, .c = by.address, .M = n, .N = out, .K = in,
+                                      .lda = in, .ldb = in, .ldc = out, .alpha = 1.0f};
+                    m = (SpgGemmMode){SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, 6, 1, false, true, true, tile,
+                                      (uint64_t)n * out};
+                } else if (pass == 1) {
+                    p = (SpgGemmPush){.a = bd.address, .b = bw.address, .c = by.address, .M = n, .N = in, .K = out,
+                                      .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
+                    m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, true, true, tile,
+                                      (uint64_t)n * in};
+                } else {
+                    p = (SpgGemmPush){.a = bd.address, .b = bx.address, .c = by.address, .M = out, .N = in, .K = n,
+                                      .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
+                    m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, true, true, tile,
+                                      (uint64_t)out * in};
+                }
+                run(&p, &m, 2);
+                double t = run(&p, &m, 20);
+                if (tile == 0) chosen = t;
+                else if (t > 0 && t < best) { best = t; best_tile = tile; }
+            }
+            uint32_t bm, bn, bk, tm, tn;
+            spg_gemm_tile(best_tile - 1, &bm, &bn, &bk, &tm, &tn);
+            printf("  %-8s chosen %7.1f us %5.2f TFLOPS   best %7.1f us %5.2f TFLOPS (%ux%u k%u, %ux%u a thread)\n",
+                   names[pass], chosen * 1e6, flops / chosen * 1e-12, best * 1e6, flops / best * 1e-12, bm, bn, bk, tm,
+                   tn);
+        }
+        SpgGpuBuffer *all[] = {&bx, &bw, &bd, &by};
+        for (size_t j = 0; j < 4; j++) spg_gpu_buffer_free(all[j]);
+        free(host);
+    }
 }
 
 int main(int argc, char **argv) {

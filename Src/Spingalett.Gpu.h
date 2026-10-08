@@ -71,8 +71,8 @@ bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32
    added up as the CPU does (samples of a chunk in order, then chunks, then steps). */
 bool spingalett_gpu_take_loss(SpgGpuNet *g, float *loss);
 
-/* outputs = the network's outputs for n <= capacity samples (inference: batch normalization with
-   the running statistics, no dropout). */
+/* outputs = the network's outputs for n samples (inference: batch normalization with the running
+   statistics, no dropout), in chunks of up to `capacity` that overlap with the copies. */
 bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n);
 
 #else

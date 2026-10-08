@@ -516,8 +516,8 @@ struct SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count);
 /* Gives a network got from spingalett_gpu_for() back to be kept. */
 void spingalett_gpu_done(NeuralNetwork *net, struct SpgGpuNet *gpu);
 /* spingalett_batch_evaluate() on the GPU; false when the device failed. */
-bool spingalett_gpu_evaluate(struct SpgGpuNet *gpu, NeuralNetwork *net, float *out_buf, const float *inputs,
-                             const float *targets, uint32_t n, double *loss_sum, uint32_t *correct);
+bool spingalett_gpu_evaluate(struct SpgGpuNet *gpu, NeuralNetwork *net, const float *inputs, const float *targets,
+                             uint32_t n, double *loss_sum, uint32_t *correct);
 
 void spingalett_fp_flush_denormals_begin(void);
 void spingalett_fp_flush_denormals_end(void);
