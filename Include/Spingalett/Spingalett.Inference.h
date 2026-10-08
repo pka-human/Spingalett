@@ -54,9 +54,10 @@ extern "C" {
 /* Newest version of the .slett model format. save_spingalett writes the oldest version that holds
    the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch
    normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one
-   before them, add or concatenate several, or pool globally), so that engines of earlier releases
-   still run what they can; versions 1 and 2 still load. */
-#define SPINGALETT_FORMAT_VERSION 6
+   before them, add or concatenate several, or pool globally), 7 with transposed convolutions,
+   upsampling or layer normalization, so that engines of earlier releases still run what they can;
+   versions 1 and 2 still load. */
+#define SPINGALETT_FORMAT_VERSION 7
 
 /* Most inputs a layer can have (LAYER_ADD and LAYER_CONCAT read several). */
 #define SPINGALETT_MAX_INPUTS 16

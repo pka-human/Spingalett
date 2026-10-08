@@ -2513,7 +2513,7 @@ static void model_validation(void) {
     }
 
     memcpy(buf, img, size);
-    buf[6] = 7;                                                  /* a future format version */
+    buf[6] = 8;                                                  /* a future format version */
     reseal(buf, size);
     CHECK(spingalett_model_init(&m, buf, size) == SPINGALETT_ERR_FORMAT_VERSION, "validation: future version");
     CHECK(spingalett_model_init(NULL, img, size) == SPINGALETT_ERR_INVALID && spingalett_model_init(&m, NULL, size) == SPINGALETT_ERR_INVALID,
@@ -3732,10 +3732,13 @@ static void graph_determinism(void) {
    prediction equals single runs bit for bit; outputs share memory. */
 static void graph_inference(ComputeMode mode) {
     spingalett_set_compute_mode(mode);
-    for (int which = 0; which < 6; which++) {
+    for (int which = 0; which < 9; which++) {
         lcg_state = 4000 + which;
         spingalett_seed(10 + which);
-        NeuralNetwork *net = which < 5 ? graph_net(which) : resnet(3, 16, 0.0f);
+        /* graphs 0 to 4, a residual network, then the graphs of transposed convolutions, upsampling and
+           layer normalization (format 7) */
+        NeuralNetwork *net = which < 5 ? graph_net(which) : which == 5 ? resnet(3, 16, 0.0f) : graph_net(which - 1);
+        const uint16_t format = which >= 6 ? 7 : 6;
         graph_init(net);
         const uint32_t n = 37, in = net->topology[0], out = net->topology[net->layers - 1];
         float *x, *y;
@@ -3752,10 +3755,10 @@ static void graph_inference(ComputeMode mode) {
         }
         CHECK(worst < 1e-5f, "graph %d mode %d: forward differs from predict by %g", which, mode, worst);
 
-        /* through a file: format 6, the same network and the same outputs */
+        /* through a file: format 6 (7), the same network and the same outputs */
         size_t size = 0;
         void *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &size);
-        CHECK(img && rd16((const uint8_t *)img + 6) == 6, "graph %d: written in format %u", which,
+        CHECK(img && rd16((const uint8_t *)img + 6) == format, "graph %d: written in format %u", which,
               img ? rd16((const uint8_t *)img + 6) : 0);
         NeuralNetwork *back = img ? load_spingalett_from_memory(img, size) : NULL;
         CHECK(back && back->layers == net->layers && back->total_weights == net->total_weights,

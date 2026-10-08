@@ -100,8 +100,11 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
 }
 
 /* The oldest format version that holds the network: 3 for dense layers only, 4 with convolution or
-   pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs. */
+   pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs, 7 with
+   transposed convolutions, upsampling or layer normalization. */
 static uint16_t format_version(const NeuralNetwork *net) {
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type > LAYER_GLOBAL_AVG_POOL) return 7u;
     if (net->graph) return 6u;
     uint16_t version = 3u;
     for (uint32_t l = 1; l < net->layers; l++) {
@@ -112,9 +115,10 @@ static uint16_t format_version(const NeuralNetwork *net) {
     return version;
 }
 
-/* Batch normalization keeps its parameters and statistics in FLOAT32 whatever the file's precision. */
+/* Normalizations keep their parameters (and batch normalization its statistics) in FLOAT32 whatever
+   the file's precision. */
 static inline PrecisionMode layer_precision(const NeuralNetwork *net, uint32_t l, PrecisionMode precision) {
-    return net->shapes[l + 1].type == LAYER_BATCH_NORM ? PRECISION_FLOAT32 : precision;
+    return spingalett_normalization(net->shapes[l + 1].type) ? PRECISION_FLOAT32 : precision;
 }
 
 /* Byte offsets of the layers' outputs among the engine's activations (version 6), every layer
@@ -160,12 +164,6 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
     const size_t entry_size = version == 3u ? SLETT_LAYER_ENTRY_SIZE : version == 4u ? SLETT_LAYER_ENTRY_SIZE_4
                             : version == 5u ? SLETT_LAYER_ENTRY_SIZE_5 : SLETT_LAYER_ENTRY_SIZE_6;
     uint32_t L = net->layers - 1;              /* weight layers */
-    for (uint32_t l = 1; l < net->layers; l++)
-        if (net->shapes[l].type > LAYER_GLOBAL_AVG_POOL) {
-            set_error(SPINGALETT_ERR_INVALID, "save: transposed convolutions, upsampling and layer normalization "
-                                              "cannot be saved yet");
-            return NULL;
-        }
     for (uint32_t l = 0; l < L; l++)
         if (spingalett_precision_is_int(layer_precision(net, l, precision)) &&
             spingalett_weight_row_len(net, l) > SLETT_MAX_INT_INPUTS) {
@@ -263,12 +261,13 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             for (int k = 0; k < 8; k++) slett_put16(e + 48 + 2 * k, (uint16_t)fields[k]);
         }
         if (version >= 5u) {
-            slett_put32(e + 64, shape->type == LAYER_CONV2D ? shape->groups : 0u);
+            slett_put32(e + 64, spingalett_filters(shape->type) ? shape->groups : 0u);
             memcpy(&bits, &shape->eps, 4);
             slett_put32(e + 68, bits);
             memcpy(&bits, &shape->momentum, 4);
             slett_put32(e + 72, bits);
         }
+        if (version >= 7u) slett_put32(e + 76, shape->type == LAYER_UPSAMPLE ? shape->mode : 0u);
         if (version >= 6u) {
             const uint32_t count = spingalett_input_count(net, l + 1), *in = spingalett_inputs(net, l + 1);
             slett_put32(e + 80, count);
@@ -315,7 +314,7 @@ static bool foldable(const NeuralNetwork *net, const uint32_t *uses, uint32_t l)
     uint32_t s = spingalett_source(net, l);
     if (s == 0) return false;
     LayerType type = net->shapes[s].type;
-    return (type == LAYER_DENSE || type == LAYER_CONV2D) && net->act_func[s - 1] == ACT_NONE && uses[s] == 1;
+    return (type == LAYER_DENSE || spingalett_filters(type)) && net->act_func[s - 1] == ACT_NONE && uses[s] == 1;
 }
 
 /* A copy of net with its foldable batch normalizations folded into the layers before them: those
@@ -585,14 +584,23 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
         for (uint32_t k = 0; k < e.input_count; k++) a.inputs[k] = spingalett_slett_input(p, &e, k);
         if (e.type == LAYER_DENSE) {
             a.neurons_amount = e.outputs;
-        } else if (e.type == LAYER_BATCH_NORM) {
+        } else if (e.type == LAYER_BATCH_NORM || e.type == LAYER_LAYER_NORM) {
             a.epsilon = e.eps;
             a.momentum = e.momentum;
         } else if (e.type == LAYER_ADD || e.type == LAYER_CONCAT || e.type == LAYER_GLOBAL_AVG_POOL) {
             /* the inputs give the shape */
+        } else if (e.type == LAYER_UPSAMPLE) {
+            a.stride_h = e.stride_h;
+            a.stride_w = e.stride_w;
+            a.upsample = (UpsampleMode)e.mode;
         } else {
-            a.filters = e.type == LAYER_CONV2D ? e.out_c : 0;
-            a.groups = e.type == LAYER_CONV2D ? e.groups : 0;
+            const bool filters = e.type == LAYER_CONV2D || e.type == LAYER_CONV_TRANSPOSE2D;
+            a.filters = filters ? e.out_c : 0;
+            a.groups = filters ? e.groups : 0;
+            if (e.type == LAYER_CONV_TRANSPOSE2D) {
+                a.output_padding_h = e.out_h - ((e.in_h - 1) * e.stride_h - 2 * e.pad_h + e.kernel_h);
+                a.output_padding_w = e.out_w - ((e.in_w - 1) * e.stride_w - 2 * e.pad_w + e.kernel_w);
+            }
             a.kernel_h = e.kernel_h; a.kernel_w = e.kernel_w;
             a.stride_h = e.stride_h; a.stride_w = e.stride_w;
             a.padding_h = e.pad_h; a.padding_w = e.pad_w;
@@ -625,7 +633,10 @@ static NeuralNetwork *load_image(const uint8_t *p, size_t size, PrecisionMode *p
     for (uint32_t l = 0; l < L; l++) {
         SlettLayer e;
         spingalett_slett_layer(p, l, &e);
-        if (first && (e.type == LAYER_DENSE || e.type == LAYER_CONV2D)) { *precision = e.precision; first = false; }
+        if (first && (e.type == LAYER_DENSE || e.type == LAYER_CONV2D || e.type == LAYER_CONV_TRANSPOSE2D)) {
+            *precision = e.precision;
+            first = false;
+        }
         if (e.rows == 0) continue;
         if (e.rows != spingalett_weight_rows(net, l) || e.row_len != spingalett_weight_row_len(net, l)) {
             free(codes);
