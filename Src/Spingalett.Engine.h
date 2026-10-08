@@ -151,6 +151,19 @@ void spingalett_engine_add(const float *const *x, uint32_t count, float *y, uint
 void spingalett_engine_concat(const float *const *x, const uint32_t *channels, uint32_t count, float *y,
                               uint32_t cells);
 void spingalett_engine_global_pool(const float *x, float *y, uint32_t cells, uint32_t channels);
+/* x (in_h x in_w x channels) upsampled by sh x sw into y: copies (UPSAMPLE_NEAREST) or bilinear with
+   the cells' centres aligned and the edges repeated; the same everywhere it runs (training, batched
+   models, the engine). */
+void spingalett_engine_upsample(const float *x, uint32_t in_h, uint32_t in_w, uint32_t channels, uint32_t sh,
+                                uint32_t sw, uint32_t mode, float *y);
+/* The rows and weight of the input row (or column) that output row o reads from below, bilinearly:
+   o reads rows r0 and r0 + 1 (or r0 alone at the edges), the second weighted w. */
+void spingalett_engine_bilinear(uint32_t o, uint32_t factor, uint32_t in, uint32_t *r0, uint32_t *r1, float *w);
+/* Layer normalization of `cells` cells of `channels` values: y = gamma (x - mean) / sqrt(var + eps)
+   + beta per cell, mean and variance over its channels (float sums in channel order); stats, when
+   not NULL, gets each cell's mean and 1 / sqrt(var + eps). */
+void spingalett_engine_layer_norm(const float *x, uint32_t cells, uint32_t channels, const float *gamma,
+                                  const float *beta, float eps, float *y, float *stats);
 
 /* Bytes of engine scratch layer L needs: a convolution its transposed filters and one pixel's sums,
    or a gathered window (of its group's channels; an INT8 convolution with one group four windows

@@ -160,6 +160,12 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
     const size_t entry_size = version == 3u ? SLETT_LAYER_ENTRY_SIZE : version == 4u ? SLETT_LAYER_ENTRY_SIZE_4
                             : version == 5u ? SLETT_LAYER_ENTRY_SIZE_5 : SLETT_LAYER_ENTRY_SIZE_6;
     uint32_t L = net->layers - 1;              /* weight layers */
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type > LAYER_GLOBAL_AVG_POOL) {
+            set_error(SPINGALETT_ERR_INVALID, "save: transposed convolutions, upsampling and layer normalization "
+                                              "cannot be saved yet");
+            return NULL;
+        }
     for (uint32_t l = 0; l < L; l++)
         if (spingalett_precision_is_int(layer_precision(net, l, precision)) &&
             spingalett_weight_row_len(net, l) > SLETT_MAX_INT_INPUTS) {

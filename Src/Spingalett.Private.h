@@ -108,6 +108,10 @@ typedef struct BatchWorkspace {
     float *bn_coef;         /* 3 x the most channels */
     float *bn_flat;
     double *bn_sums_flat;
+    /* layer normalization, training only: bn_stats[l] of a normalizing layer l holds each cell's mean
+       and 1 / std (2 x capacity x cells, in ln_flat), ln_scratch its parameter gradients' partial sums */
+    float *ln_flat;
+    double *ln_scratch;
     bool training;          /* normalize with batch statistics */
     uint32_t capacity;
 } BatchWorkspace;
@@ -183,6 +187,16 @@ void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const f
 void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
                                       float scale, float beta, float *scratch, SpingalettGemmScratch *gemm,
                                       ComputeMode mode);
+/* Transposed convolutions (weight layer l, LAYER_CONV_TRANSPOSE2D), as the passes above. */
+void spingalett_conv_transpose_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                                       ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm,
+                                       ComputeMode mode);
+void spingalett_conv_transpose_backward_data(const NeuralNetwork *net, uint32_t l, const float *dy, float *dx,
+                                             uint32_t n, const float *x, ActivationFunction act, float *scratch,
+                                             SpingalettGemmScratch *gemm, ComputeMode mode);
+void spingalett_conv_transpose_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy,
+                                                uint32_t n, float scale, float beta, float *scratch,
+                                                SpingalettGemmScratch *gemm, ComputeMode mode);
 void spingalett_pool_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ComputeMode mode);
 /* The forward passes from shapes and parameters alone (batched inference of models): W holds
@@ -226,6 +240,24 @@ void spingalett_bn_backward_sums(const NeuralNetwork *net, uint32_t l, const flo
 void spingalett_bn_backward_data(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
                                  uint32_t n, const float *stats, const double *sums, ActivationFunction act,
                                  float *coef, ComputeMode mode);
+/* Layer normalization (Spingalett.Norm.c) of weight layer l: the forward pass (act applied unless
+   softmax; stats, when training, gets each cell's mean and 1 / std), the data gradient (times the
+   input's activation derivative act), the parameters' gradients (g = scale * sum + beta * g) with
+   spingalett_ln_scratch_doubles() doubles of scratch. */
+size_t spingalett_ln_scratch_doubles(const NeuralNetwork *net, uint32_t capacity);
+void spingalett_ln_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                           ActivationFunction act, float *stats, ComputeMode mode);
+void spingalett_ln_backward_data(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
+                                 uint32_t n, const float *stats, ActivationFunction act, ComputeMode mode);
+void spingalett_ln_backward_params(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
+                                   const float *stats, float scale, float beta, double *partial, ComputeMode mode);
+/* Upsampling (Spingalett.Graph.c): n samples of in_h x in_w x C by sh x sw (UpsampleMode upsample);
+   the backward pass writes dx (or adds to it with accumulate, then without act) times act'(x). */
+void spingalett_upsample_forward(const float *x, float *y, uint32_t n, uint32_t in_h, uint32_t in_w, uint32_t C,
+                                 uint32_t sh, uint32_t sw, uint32_t upsample, ComputeMode mode);
+void spingalett_upsample_backward(const float *dy, float *dx, const float *x, uint32_t n, uint32_t in_h, uint32_t in_w,
+                                  uint32_t C, uint32_t sh, uint32_t sw, uint32_t upsample, ActivationFunction act,
+                                  bool accumulate, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
 /* Whether every layer of net but the last feeds a later one; sets the error (naming `who`) when not. */

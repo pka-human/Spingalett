@@ -299,7 +299,7 @@ static void conv_api(void) {
         {{.type = LAYER_CONV2D, .filters = 2, .kernel = 3, .padding = 3}, "padding >= kernel"},
         {{.type = LAYER_CONV2D, .filters = 2, .kernel = 6}, "kernel larger than the input"},
         {{.type = LAYER_MAX_POOL2D, .kernel = 5, .padding = 5}, "pool padding >= kernel"},
-        {{.type = (LayerType)9, .neurons_amount = 3}, "unknown layer type"},
+        {{.type = LAYER_TYPE_COUNT, .neurons_amount = 3}, "unknown layer type"},
     };
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         bad[i].a.net = net;
@@ -3532,6 +3532,45 @@ static NeuralNetwork *graph_net(int which) {
             concat_layers(.net = net, .inputs = {c, d, 0}, .input_count = 3, .act_func = ACT_TANH);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
             return net;
+        case 5:     /* a small U-Net: a strided convolution, a transposed one back up, concatenated with the
+                       full-size maps, nearest upsampling of pooled maps */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 6, .width = 6, .channels = 2);
+            a = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_TANH);
+            b = conv2d(.net = net, .filters = 4, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_TANH);
+            c = conv_transpose2d(.net = net, .filters = 3, .kernel = 2, .stride = 2, .act_func = ACT_TANH);
+            d = avg_pool2d(.net = net, .inputs = {b}, .kernel = 3);
+            d = upsample2d(.net = net, .inputs = {d}, .stride = 6);
+            concat_layers(.net = net, .inputs = {a, c, d}, .act_func = ACT_NONE);
+            conv2d(.net = net, .filters = 2, .kernel = 3, .stride = 2, .act_func = ACT_SIGMOID);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            return net;
+        case 6:     /* a grouped transposed convolution with padding and output padding, bilinear
+                       upsampling, layer normalization of maps */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 3, .width = 4, .channels = 4);
+            conv_transpose2d(.net = net, .filters = 6, .kernel = 3, .stride = 2, .padding = 1, .output_padding = 1,
+                             .groups = 2, .act_func = ACT_NONE);
+            layer_norm(.net = net, .act_func = ACT_TANH);
+            upsample2d(.net = net, .stride_h = 2, .stride_w = 3, .upsample = UPSAMPLE_BILINEAR);
+            conv2d(.net = net, .filters = 2, .kernel = 3, .stride = 3, .act_func = ACT_TANH);
+            layer(.net = net, .neurons_amount = 2, .act_func = ACT_SIGMOID);
+            return net;
+        case 7:     /* layer normalization of vectors, read by two layers; a transposed convolution of
+                       stride 1 (a convolution with the window turned around) */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 4, .width = 4, .channels = 2);
+            conv_transpose2d(.net = net, .filters = 3, .kernel = 3, .act_func = ACT_LEAKY_RELU);
+            global_avg_pool2d(.net = net);
+            a = layer(.net = net, .neurons_amount = 7, .act_func = ACT_NONE);
+            b = layer_norm(.net = net, .act_func = ACT_TANH);
+            c = layer(.net = net, .neurons_amount = 5, .act_func = ACT_SIGMOID);
+            d = layer(.net = net, .inputs = {b}, .neurons_amount = 5, .act_func = ACT_TANH);
+            add_layers(.net = net, .inputs = {c, d}, .act_func = ACT_NONE);
+            layer_norm(.net = net, .act_func = ACT_NONE);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            (void)a;
+            return net;
         default:    /* a normalization and a pooling of the same maps, an identity layer, pooled maps pooled */
             net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
             layer(.net = net, .height = 4, .width = 6, .channels = 2);
@@ -3553,7 +3592,7 @@ static void graph_init(NeuralNetwork *net) {
         uint64_t w = net->weight_offsets[l - 1], b = net->bias_offsets[l - 1];
         uint64_t nw = (l + 1 < net->layers ? net->weight_offsets[l] : net->total_weights) - w;
         uint64_t nb = (l + 1 < net->layers ? net->bias_offsets[l] : net->total_biases) - b;
-        bool norm = net->shapes[l].type == LAYER_BATCH_NORM;
+        bool norm = net->shapes[l].type == LAYER_BATCH_NORM || net->shapes[l].type == LAYER_LAYER_NORM;
         for (uint64_t i = 0; i < nw; i++) net->weights[w + i] = norm ? 0.6f + frand() * 0.8f : frand() * 1.2f - 0.6f;
         for (uint64_t i = 0; i < nb; i++) net->biases[b + i] = norm ? frand() * 0.4f - 0.2f : frand() * 0.2f - 0.1f;
     }
@@ -4579,7 +4618,7 @@ int main(int argc, char **argv) {
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         TrainingStrategy strats[] = {STRATEGY_FULL_BATCH, STRATEGY_SMALL_BATCH};
         for (int m = 0; m < 3; m++) for (int s = 0; s < 2; s++)
-            for (int k = 0; k < 5; k++) graph_gradcheck(k, cm[m], strats[s]);
+            for (int k = 0; k < 8; k++) graph_gradcheck(k, cm[m], strats[s]);
         graph_determinism();
         for (int m = 0; m < 3; m++) graph_inference(cm[m]);
         graph_folding();

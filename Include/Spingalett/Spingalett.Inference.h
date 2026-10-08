@@ -109,8 +109,28 @@ typedef enum {
                                        given; they share height and width */
     LAYER_GLOBAL_AVG_POOL,          /* the mean of each channel over all cells: 1 x 1 x channels (no
                                        activation, like the other pooling layers) */
+    LAYER_CONV_TRANSPOSE2D,         /* transposed 2D convolution, a convolution's data gradient run
+                                       forward: `filters` output channels; each input cell adds its
+                                       window of weights to the output cells (in - 1) stride - padding
+                                       on, so that the output has (in - 1) stride - 2 padding + kernel +
+                                       output_padding cells along each axis */
+    LAYER_UPSAMPLE,                 /* each cell repeated (nearest) or interpolated (bilinear) into
+                                       stride_h x stride_w cells, per channel (no parameters, no
+                                       activation) */
+    LAYER_LAYER_NORM,               /* per cell: gamma (x - mean) / sqrt(variance + epsilon) + beta over
+                                       its channels, with the cell's own statistics (a dense layer is
+                                       one cell): parameters per channel, no running statistics */
     LAYER_TYPE_COUNT
 } LayerType;
+
+/* How LAYER_UPSAMPLE fills its cells: copies of the input cell, or bilinear interpolation of the
+   four nearest input cells with their centres aligned (PyTorch's align_corners=False, ONNX Resize
+   with half_pixel), the edges repeated. */
+typedef enum {
+    UPSAMPLE_NEAREST,
+    UPSAMPLE_BILINEAR,
+    UPSAMPLE_MODE_COUNT
+} UpsampleMode;
 
 /* How parameters are stored: in .slett files, and as the weights a model computes with. The
    integer precisions keep one scale per weight row (output unit). */
@@ -159,6 +179,7 @@ typedef struct {
     uint32_t input_layers[SPINGALETT_MAX_INPUTS];   /* their indices in the network: 0 is the input,
                                        i + 1 the output of weight layer i; in_height, in_width and
                                        in_channels describe the first */
+    UpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
 } SpingalettLayerInfo;
 
 /*

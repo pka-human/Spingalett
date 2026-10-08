@@ -126,6 +126,71 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
     } else if (args->type == LAYER_GLOBAL_AVG_POOL) {
         shape->channels = net->shapes[inputs[0]].channels;
         units = shape->channels;
+    } else if (args->type == LAYER_UPSAMPLE) {
+        /* every cell into stride_h x stride_w cells */
+        const LayerShape *in = &net->shapes[inputs[0]];
+        uint32_t sh = args->stride_h ? args->stride_h : args->stride ? args->stride : 2u;
+        uint32_t sw = args->stride_w ? args->stride_w : args->stride ? args->stride : 2u;
+        if ((unsigned)args->upsample >= UPSAMPLE_MODE_COUNT)
+            return layer_error("Invalid upsampling mode");
+        if ((uint64_t)in->height * sh > 65535 || (uint64_t)in->width * sw > 65535)
+            return layer_error("Layer heights and widths are limited to 65535");
+        shape->stride_h = sh;
+        shape->stride_w = sw;
+        shape->mode = args->upsample;
+        shape->height = in->height * sh;
+        shape->width = in->width * sw;
+        shape->channels = in->channels;
+        units = (uint64_t)shape->height * shape->width * shape->channels;
+    } else if (args->type == LAYER_LAYER_NORM) {
+        /* the input's shape, normalized per cell */
+        const LayerShape *in = &net->shapes[inputs[0]];
+        if (!(args->epsilon >= 0.0f && args->epsilon < 1.0f))
+            return layer_error("Layer normalization needs epsilon in [0, 1)");
+        shape->height = in->height;
+        shape->width = in->width;
+        shape->channels = in->channels;
+        shape->eps = args->epsilon > 0.0f ? args->epsilon : 1e-5f;
+        units = net->topology[inputs[0]];
+    } else if (args->type == LAYER_CONV_TRANSPOSE2D) {
+        /* each input cell adds its window (kernel_h x kernel_w) to the output from (y stride - padding,
+           x stride - padding) on */
+        const LayerShape *in = &net->shapes[inputs[0]];
+        uint32_t kh = args->kernel_h ? args->kernel_h : args->kernel;
+        uint32_t kw = args->kernel_w ? args->kernel_w : args->kernel;
+        uint32_t sh = args->stride_h ? args->stride_h : args->stride ? args->stride : 1u;
+        uint32_t sw = args->stride_w ? args->stride_w : args->stride ? args->stride : 1u;
+        uint32_t ph = args->padding_h ? args->padding_h : args->padding;
+        uint32_t pw = args->padding_w ? args->padding_w : args->padding;
+        uint32_t oh = args->output_padding_h ? args->output_padding_h : args->output_padding;
+        uint32_t ow = args->output_padding_w ? args->output_padding_w : args->output_padding;
+        uint32_t groups = args->groups ? args->groups : 1u;
+        if (kh == 0 || kw == 0)
+            return layer_error("A transposed convolution needs a kernel size");
+        if (kh > 255 || kw > 255 || sh > 255 || sw > 255)
+            return layer_error("Transposed convolutions are limited to kernels and strides of 255");
+        if (ph >= kh || pw >= kw)
+            return layer_error("Padding must be smaller than the kernel");
+        if (oh >= sh || ow >= sw)
+            return layer_error("Output padding must be smaller than the stride");
+        if (args->filters == 0)
+            return layer_error("A transposed convolution layer needs filters > 0");
+        if (in->channels % groups != 0 || args->filters % groups != 0)
+            return layer_error("Convolution groups must divide the input channels and the filters");
+        int64_t height = ((int64_t)in->height - 1) * sh - 2 * (int64_t)ph + kh + oh;
+        int64_t width = ((int64_t)in->width - 1) * sw - 2 * (int64_t)pw + kw + ow;
+        if (height < 1 || width < 1)
+            return layer_error("The padding leaves the transposed convolution no output");
+        if (height > 65535 || width > 65535)
+            return layer_error("Layer heights and widths are limited to 65535");
+        shape->groups = groups;
+        shape->kernel_h = kh; shape->kernel_w = kw;
+        shape->stride_h = sh; shape->stride_w = sw;
+        shape->pad_h = ph; shape->pad_w = pw;
+        shape->height = (uint32_t)height;
+        shape->width = (uint32_t)width;
+        shape->channels = args->filters;
+        units = (uint64_t)shape->height * shape->width * shape->channels;
     } else if (args->type == LAYER_BATCH_NORM) {
         /* the input's shape, normalized per channel */
         const LayerShape *in = &net->shapes[inputs[0]];
@@ -279,10 +344,12 @@ bool spingalett_add_layer(LayerArgs args) {
     spingalett_batch_workspace_free(net->forward_ws);     /* made for the old layers */
     net->forward_ws = NULL;
     spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));
-    bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D || shape.type == LAYER_GLOBAL_AVG_POOL;
+    bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D ||
+                   shape.type == LAYER_GLOBAL_AVG_POOL || shape.type == LAYER_UPSAMPLE;
     if (pooling) act_func = ACT_NONE;
     static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add",
-                                             "concat", "global_avg_pool2d"};
+                                             "concat", "global_avg_pool2d", "conv_transpose2d", "upsample2d",
+                                             "layer_norm"};
 
     uint32_t nl = net->layers + 1;
 
@@ -310,11 +377,11 @@ bool spingalett_add_layer(LayerArgs args) {
     uint32_t prev_neurons = (net->layers > 0) ? net->topology[inputs[0]] : 0;
     uint32_t rows = 0, row_len = 0;
     if (nl > 1 && shape.type == LAYER_DENSE) { rows = neurons_amount; row_len = prev_neurons; }
-    if (nl > 1 && shape.type == LAYER_CONV2D) {
+    if (nl > 1 && spingalett_filters(shape.type)) {
         rows = shape.channels;
         row_len = shape.kernel_h * shape.kernel_w * (net->shapes[inputs[0]].channels / shape.groups);
     }
-    if (nl > 1 && shape.type == LAYER_BATCH_NORM) { rows = shape.channels; row_len = 1; }
+    if (nl > 1 && spingalett_normalization(shape.type)) { rows = shape.channels; row_len = 1; }
     uint64_t add_w = (uint64_t)rows * row_len;
     uint64_t add_b = rows;
 
@@ -399,9 +466,12 @@ bool spingalett_add_layer(LayerArgs args) {
 
         /* Standard deviations: Glorot sqrt(2 / (fan_in + fan_out)), He sqrt(2 / fan_in),
            LeCun sqrt(1 / fan_in); a filter's fan-in is its window, its fan-out the window times
-           the filters of its group. */
+           the filters of its group. An output of a transposed convolution gathers about its window
+           over the strides: that is its fan-in. */
         float fan_in = (float)row_len;
-        float fan_out = shape.type == LAYER_CONV2D
+        if (shape.type == LAYER_CONV_TRANSPOSE2D && row_len >= shape.stride_h * shape.stride_w)
+            fan_in = (float)row_len / (float)(shape.stride_h * shape.stride_w);
+        float fan_out = spingalett_filters(shape.type)
                       ? (float)shape.kernel_h * (float)shape.kernel_w * (float)(rows / shape.groups) : (float)rows;
         float scale = 1.0f;
         if (wi == WEIGHT_INITIALIZATION_XAVIER)
@@ -413,7 +483,7 @@ bool spingalett_add_layer(LayerArgs args) {
 
         for (uint64_t idx = 0; idx < add_w; idx++) {
             uint64_t pos = net->total_weights + idx;
-            if (shape.type == LAYER_BATCH_NORM)
+            if (spingalett_normalization(shape.type))
                 t_w[pos] = 1.0f;                        /* gamma; beta starts at 0 */
             else if (wi == WEIGHT_INITIALIZATION_RANDOM)
                 t_w[pos] = random_uniform_weight();
@@ -527,6 +597,7 @@ LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
             a.neurons_amount = net->topology[l];
             break;
         case LAYER_BATCH_NORM:
+        case LAYER_LAYER_NORM:
             a.epsilon = s->eps;
             a.momentum = s->momentum;
             break;
@@ -534,9 +605,19 @@ LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
         case LAYER_CONCAT:
         case LAYER_GLOBAL_AVG_POOL:
             break;
+        case LAYER_UPSAMPLE:
+            a.stride_h = s->stride_h; a.stride_w = s->stride_w;
+            a.upsample = (UpsampleMode)s->mode;
+            break;
+        case LAYER_CONV_TRANSPOSE2D: {
+            const LayerShape *in = &net->shapes[spingalett_source(net, l)];
+            a.output_padding_h = s->height - ((in->height - 1) * s->stride_h - 2 * s->pad_h + s->kernel_h);
+            a.output_padding_w = s->width - ((in->width - 1) * s->stride_w - 2 * s->pad_w + s->kernel_w);
+        }
+            [[fallthrough]];                /* the window */
         default:
-            a.filters = s->type == LAYER_CONV2D ? s->channels : 0u;
-            a.groups = s->type == LAYER_CONV2D ? s->groups : 0u;
+            a.filters = spingalett_filters(s->type) ? s->channels : 0u;
+            a.groups = spingalett_filters(s->type) ? s->groups : 0u;
             a.kernel_h = s->kernel_h; a.kernel_w = s->kernel_w;
             a.stride_h = s->stride_h; a.stride_w = s->stride_w;
             a.padding_h = s->pad_h; a.padding_w = s->pad_w;
@@ -569,9 +650,10 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->stride_w = s->stride_w;
     layer->padding_h = s->pad_h;
     layer->padding_w = s->pad_w;
-    layer->groups = s->type == LAYER_CONV2D ? s->groups : 0u;
+    layer->groups = spingalett_filters(s->type) ? s->groups : 0u;
     layer->epsilon = s->eps;
     layer->momentum = s->momentum;
+    layer->upsample = (UpsampleMode)s->mode;
     if (index > 0) {
         layer->bias_count = spingalett_weight_rows(net, index - 1);
         layer->weight_count = layer->bias_count * spingalett_weight_row_len(net, index - 1);

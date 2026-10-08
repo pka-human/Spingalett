@@ -2001,6 +2001,73 @@ void spingalett_engine_global_pool(const float *x, float *y, uint32_t cells, uin
     for (uint32_t c = 0; c < channels; c++) y[c] *= inv;
 }
 
+void spingalett_engine_bilinear(uint32_t o, uint32_t factor, uint32_t in, uint32_t *r0, uint32_t *r1, float *w) {
+    /* source coordinate (o + 1/2) / factor - 1/2 = (2 o + 1 - factor) / (2 factor), at least 0 */
+    const int64_t num = 2 * (int64_t)o + 1 - (int64_t)factor, den = 2 * (int64_t)factor;
+    if (num <= 0) {
+        *r0 = *r1 = 0;
+        *w = 0.0f;
+        return;
+    }
+    *r0 = (uint32_t)(num / den);
+    *r1 = *r0 + 1 < in ? *r0 + 1 : *r0;
+    *w = (float)(num % den) / (float)den;
+}
+
+void spingalett_engine_upsample(const float *x, uint32_t in_h, uint32_t in_w, uint32_t channels, uint32_t sh,
+                                uint32_t sw, uint32_t mode, float *y) {
+    const uint32_t H = in_h * sh, W = in_w * sw, C = channels;
+    if (mode == UPSAMPLE_NEAREST) {
+        for (uint32_t oy = 0; oy < H; oy++) {
+            const float *row = x + (size_t)(oy / sh) * in_w * C;
+            float *out = y + (size_t)oy * W * C;
+            for (uint32_t ox = 0; ox < W; ox++) memcpy(out + (size_t)ox * C, row + (size_t)(ox / sw) * C, (size_t)C * sizeof(float));
+        }
+        return;
+    }
+    for (uint32_t oy = 0; oy < H; oy++) {
+        uint32_t y0, y1, x0, x1;
+        float ly, lx;
+        spingalett_engine_bilinear(oy, sh, in_h, &y0, &y1, &ly);
+        const float hy = 1.0f - ly;
+        const float *r0 = x + (size_t)y0 * in_w * C, *r1 = x + (size_t)y1 * in_w * C;
+        float *out = y + (size_t)oy * W * C;
+        for (uint32_t ox = 0; ox < W; ox++) {
+            spingalett_engine_bilinear(ox, sw, in_w, &x0, &x1, &lx);
+            const float hx = 1.0f - lx;
+            const float *a = r0 + (size_t)x0 * C, *b = r0 + (size_t)x1 * C, *c = r1 + (size_t)x0 * C, *d = r1 + (size_t)x1 * C;
+            float *o = out + (size_t)ox * C;
+            for (uint32_t k = 0; k < C; k++) {
+                float top = hx * a[k] + lx * b[k], bottom = hx * c[k] + lx * d[k];
+                o[k] = hy * top + ly * bottom;
+            }
+        }
+    }
+}
+
+void spingalett_engine_layer_norm(const float *x, uint32_t cells, uint32_t channels, const float *gamma,
+                                  const float *beta, float eps, float *y, float *stats) {
+    const float inv = 1.0f / (float)channels;
+    for (uint32_t p = 0; p < cells; p++) {
+        const float *v = x + (size_t)p * channels;
+        float *o = y + (size_t)p * channels;
+        float sum = 0.0f;
+        for (uint32_t c = 0; c < channels; c++) sum += v[c];
+        const float mean = sum * inv;
+        float var = 0.0f;
+        for (uint32_t c = 0; c < channels; c++) {
+            float d = v[c] - mean;
+            var += d * d;
+        }
+        const float rstd = 1.0f / sqrtf(var * inv + eps);
+        for (uint32_t c = 0; c < channels; c++) o[c] = (v[c] - mean) * rstd * gamma[c] + beta[c];
+        if (stats) {
+            stats[2u * p] = mean;
+            stats[2u * p + 1u] = rstd;
+        }
+    }
+}
+
 /* One layer on one sample: x [inputs] -> y [outputs], activation included. */
 static void layer_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
                           void *window) {

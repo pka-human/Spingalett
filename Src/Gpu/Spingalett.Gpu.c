@@ -109,6 +109,13 @@ const char *spingalett_gpu_name(void) {
 }
 
 bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
+    for (uint32_t l = 1; l < net->layers; l++) {
+        const LayerType type = net->shapes[l].type;
+        if (type == LAYER_CONV_TRANSPOSE2D || type == LAYER_UPSAMPLE || type == LAYER_LAYER_NORM) {
+            if (why) *why = "transposed convolutions, upsampling and layer normalization run on the CPU only";
+            return false;
+        }
+    }
     for (uint32_t l = 0; l < net->layers; l++)
         if ((uint64_t)net->topology[l] * SPINGALETT_BATCH_CHUNK > UINT32_MAX) {
             if (why) *why = "layers of over 2^32 / 2048 values a sample";

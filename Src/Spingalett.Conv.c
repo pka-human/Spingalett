@@ -53,6 +53,67 @@ static inline int scratch_threads(const SpingalettGemmScratch *gemm) {
     return spingalett_gemm_scratch_threads(gemm);
 }
 
+/* Floats of scratch one convolution's passes need over `capacity` samples: the forward pass, and
+   with training its weight gradient and (data_grad) its data gradient. */
+static size_t conv_need(const LayerShape *in, const LayerShape *out, uint32_t capacity, bool training, bool data_grad,
+                        int threads, ComputeMode mode) {
+    size_t need = 0;
+    if (spingalett_conv_direct(in, out, mode)) {            /* the indirect kernels (Spingalett.ConvGEMM.c) */
+        size_t d = spingalett_conv_direct_scratch(in, out, capacity, training || data_grad, threads);
+        if (d > need) need = d;
+    }
+    if (depthwise(in, out)) {               /* the filters transposed, tap-major */
+        size_t t = (size_t)out->kernel_h * out->kernel_w * out->channels;
+        return t > need ? t : need;
+    }
+    size_t fwd = (size_t)out->kernel_h * out->kernel_w * in->channels;     /* per output pixel */
+    if (implicit(mode)) {
+        /* implicit im2col: the regrouped weights (data gradient) or a transposed weight gradient
+           (narrow windows) */
+        size_t w = training || data_grad ? (size_t)out->channels * (fwd + 1) : 0;
+        return w > need ? w : need;
+    }
+    size_t total = fwd * out->height * out->width * capacity;
+    size_t chunk = total < CONV_CHUNK_FLOATS ? total : (fwd > CONV_CHUNK_FLOATS ? fwd : CONV_CHUNK_FLOATS);
+    if (chunk > need) need = chunk;
+    if (training && fwd < 32 && out->channels > fwd) {     /* transposed weight gradient */
+        size_t t = (fwd * out->channels + 15u) & ~(size_t)15u;
+        if (t + chunk > need) need = t + chunk;
+    }
+    if (data_grad) {
+        size_t bwd = (size_t)out->kernel_h * out->kernel_w * out->channels;     /* per input pixel */
+        total = bwd * in->height * in->width * capacity;
+        chunk = total < CONV_CHUNK_FLOATS ? total : (bwd > CONV_CHUNK_FLOATS ? bwd : CONV_CHUNK_FLOATS);
+        /* the regrouped weights of the data gradient come first */
+        size_t w = ((size_t)in->channels * bwd + 15u) & ~(size_t)15u;
+        if (w + chunk > need) need = w + chunk;
+    }
+    return need;
+}
+
+static inline size_t aligned16(size_t floats) { return (floats + 15u) & ~(size_t)15u; }
+
+/* The convolution whose data gradient a transposed convolution (in -> out) computes: from a tensor of
+   the transposed convolution's output shape to one of its input shape, with the same window and
+   groups; its filters, one per input channel of the transposed convolution, are the transposed
+   convolution's filters transposed. */
+static void transposed_shapes(const LayerShape *in, const LayerShape *out, LayerShape *vin, LayerShape *vout) {
+    *vin = (LayerShape){.type = LAYER_CONV2D, .height = out->height, .width = out->width, .channels = out->channels,
+                        .groups = 1};
+    *vout = *out;
+    vout->type = LAYER_CONV2D;
+    vout->height = in->height;
+    vout->width = in->width;
+    vout->channels = in->channels;
+}
+
+/* Scratch of a transposed convolution before the convolution's: its filters transposed and their
+   gradient, a bias of zeros and the convolution's bias gradient. */
+static size_t transposed_extra(const LayerShape *in, const LayerShape *out) {
+    const size_t weights = (size_t)out->channels * out->kernel_h * out->kernel_w * (in->channels / out->groups);
+    return 2u * aligned16(weights) + 2u * aligned16(in->channels);
+}
+
 size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacity, bool training, ComputeMode mode) {
     size_t need = 0;
     int threads = 1;
@@ -62,39 +123,16 @@ size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacit
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         const uint32_t src = spingalett_source(net, l + 1);
         const LayerShape *in = &net->shapes[src], *out = &net->shapes[l + 1];
-        if (out->type != LAYER_CONV2D) continue;
-        if (spingalett_conv_direct(in, out, mode)) {        /* the indirect kernels (Spingalett.ConvGEMM.c) */
-            size_t d = spingalett_conv_direct_scratch(in, out, capacity, training, threads);
-            if (d > need) need = d;
+        size_t d = 0;
+        if (out->type == LAYER_CONV2D) {
+            d = conv_need(in, out, capacity, training, training && src > 0, threads, mode);
+        } else if (out->type == LAYER_CONV_TRANSPOSE2D) {
+            /* its forward pass is the convolution's data gradient, its data gradient the forward pass */
+            LayerShape vin, vout;
+            transposed_shapes(in, out, &vin, &vout);
+            d = transposed_extra(in, out) + conv_need(&vin, &vout, capacity, training, true, threads, mode);
         }
-        if (depthwise(in, out)) {           /* the filters transposed, tap-major */
-            size_t t = (size_t)out->kernel_h * out->kernel_w * out->channels;
-            if (t > need) need = t;
-            continue;
-        }
-        size_t fwd = (size_t)out->kernel_h * out->kernel_w * in->channels;     /* per output pixel */
-        if (implicit(mode)) {
-            /* implicit im2col: the regrouped weights (data gradient) or a transposed weight
-               gradient (narrow windows) */
-            size_t w = training ? (size_t)out->channels * (fwd + 1) : 0;
-            if (w > need) need = w;
-            continue;
-        }
-        size_t total = fwd * out->height * out->width * capacity;
-        size_t chunk = total < CONV_CHUNK_FLOATS ? total : (fwd > CONV_CHUNK_FLOATS ? fwd : CONV_CHUNK_FLOATS);
-        if (chunk > need) need = chunk;
-        if (training && fwd < 32 && out->channels > fwd) {     /* transposed weight gradient */
-            size_t t = (fwd * out->channels + 15u) & ~(size_t)15u;
-            if (t + chunk > need) need = t + chunk;
-        }
-        if (training && src > 0) {
-            size_t bwd = (size_t)out->kernel_h * out->kernel_w * out->channels;     /* per input pixel */
-            total = bwd * in->height * in->width * capacity;
-            chunk = total < CONV_CHUNK_FLOATS ? total : (bwd > CONV_CHUNK_FLOATS ? bwd : CONV_CHUNK_FLOATS);
-            /* the regrouped weights of the data gradient come first */
-            size_t w = ((size_t)in->channels * bwd + 15u) & ~(size_t)15u;
-            if (w + chunk > need) need = w + chunk;
-        }
+        if (d > need) need = d;
     }
     return need;
 }
@@ -688,11 +726,20 @@ void spingalett_conv_forward_scaled(const LayerShape *in, const LayerShape *out,
     }
 }
 
+static void conv_backward_data_shapes(const LayerShape *in, const LayerShape *out, const float *Wt, const float *dy,
+                                      float *dx, uint32_t n, const float *x, ActivationFunction act, float *scratch,
+                                      SpingalettGemmScratch *gemm, ComputeMode mode);
+
 void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const float *dy, float *dx, uint32_t n,
                                    const float *x, ActivationFunction act, float *scratch,
                                    SpingalettGemmScratch *gemm, ComputeMode mode) {
-    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
-    const float *Wt = SPINGALETT_WEIGHT_MTX_PTR(net, l);
+    conv_backward_data_shapes(&net->shapes[spingalett_source(net, l + 1)], &net->shapes[l + 1],
+                              SPINGALETT_WEIGHT_MTX_PTR(net, l), dy, dx, n, x, act, scratch, gemm, mode);
+}
+
+static void conv_backward_data_shapes(const LayerShape *in, const LayerShape *out, const float *Wt, const float *dy,
+                                      float *dx, uint32_t n, const float *x, ActivationFunction act, float *scratch,
+                                      SpingalettGemmScratch *gemm, ComputeMode mode) {
     if (depthwise(in, out)) {
         depthwise_backward_data(in, out, Wt, dy, dx, n, x, act, scratch, mode);
         return;
@@ -761,14 +808,58 @@ void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const f
     }
 }
 
+static void conv_backward_weights_shapes(const LayerShape *in, const LayerShape *out, const float *x, const float *dy,
+                                         uint32_t n, float scale, float beta, float *gW, float *gB, float *scratch,
+                                         SpingalettGemmScratch *gemm, ComputeMode mode);
+
 void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
                                       float scale, float beta, float *scratch, SpingalettGemmScratch *gemm,
                                       ComputeMode mode) {
-    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
+    conv_backward_weights_shapes(&net->shapes[spingalett_source(net, l + 1)], &net->shapes[l + 1], x, dy, n, scale, beta,
+                                 SPINGALETT_GRAD_W_MTX_PTR(net, l), net->grad_biases + net->bias_offsets[l], scratch,
+                                 gemm, mode);
+}
+
+/* gB = scale * column sums of dy over `total` rows of OC (+ beta * gB): blocks of rows summed in float
+   in parallel, the block sums added in order in double, so the result does not depend on the thread
+   count. */
+static void bias_gradient(const float *dy, uint64_t total, uint32_t OC, float scale, float beta, float *gB,
+                          ComputeMode mode) {
+    const uint64_t block = 64, blocks = (total + block - 1) / block;
+    float *part = (float *)malloc((size_t)blocks * OC * sizeof(float));
+    double *sum = (double *)calloc(OC, sizeof(double));
+    if (!part || !sum) {
+        free(part); free(sum);
+        set_error(SPINGALETT_ERR_ALLOC, "conv: bias gradient allocation failed");
+        return;
+    }
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(use_omp(mode, total * OC))
+#endif
+    for (int64_t b = 0; b < (int64_t)blocks; b++) {
+        float *ps = part + (size_t)b * OC;
+        uint64_t p = (uint64_t)b * block, end = p + block < total ? p + block : total;
+        memcpy(ps, dy + (size_t)p * OC, OC * sizeof(float));
+        for (p++; p < end; p++) {
+            const float *row = dy + (size_t)p * OC;
+            for (uint32_t oc = 0; oc < OC; oc++) ps[oc] += row[oc];
+        }
+    }
+    for (uint64_t b = 0; b < blocks; b++)
+        for (uint32_t oc = 0; oc < OC; oc++) sum[oc] += part[(size_t)b * OC + oc];
+    for (uint32_t oc = 0; oc < OC; oc++)
+        gB[oc] = (float)(scale * sum[oc]) + (beta == 0.0f ? 0.0f : beta * gB[oc]);
+    free(part);
+    free(sum);
+    (void)mode;
+}
+
+static void conv_backward_weights_shapes(const LayerShape *in, const LayerShape *out, const float *x, const float *dy,
+                                         uint32_t n, float scale, float beta, float *gW, float *gB, float *scratch,
+                                         SpingalettGemmScratch *gemm, ComputeMode mode) {
     const uint32_t OC = out->channels;
     const size_t K = (size_t)out->kernel_h * out->kernel_w * in->channels;
     const uint64_t total = (uint64_t)n * out->height * out->width;
-    float *gW = SPINGALETT_GRAD_W_MTX_PTR(net, l), *gB = net->grad_biases + net->bias_offsets[l];
 
     if (depthwise(in, out)) {
         depthwise_backward_weights(in, out, x, dy, n, scale, beta, gW, gB, mode);
@@ -876,34 +967,93 @@ void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const floa
                             scratch, K, p0 == 0 ? beta : 1.0f, gW, K);
         }
     }
-    /* gB = scale * column sums of dy (+ beta * gB): blocks of rows summed in float in parallel, the
-       block sums added in order in double, so the result does not depend on the thread count */
-    const uint64_t block = 64, blocks = (total + block - 1) / block;
-    float *part = (float *)malloc((size_t)blocks * OC * sizeof(float));
-    double *sum = (double *)calloc(OC, sizeof(double));
-    if (!part || !sum) {
-        free(part); free(sum);
-        set_error(SPINGALETT_ERR_ALLOC, "conv: bias gradient allocation failed");
-        return;
-    }
+    bias_gradient(dy, total, OC, scale, beta, gB, mode);
+}
+
+/* ---- transposed convolutions: the passes of the convolution whose data gradient they are */
+
+/* Wc[i][tap][o] = W[o][tap][i] within each group: the transposed convolution's filters (one per
+   output channel, over its group's input channels) as the convolution's (one per input channel). */
+static void transpose_filters(const float *W, const LayerShape *in, const LayerShape *out, float *Wc) {
+    const uint32_t G = groups_of(out), IG = in->channels / G, OG = out->channels / G;
+    const uint32_t taps = out->kernel_h * out->kernel_w;
+    for (uint32_t g = 0; g < G; g++)
+        for (uint32_t o = 0; o < OG; o++)
+            for (uint32_t t = 0; t < taps; t++)
+                for (uint32_t i = 0; i < IG; i++)
+                    Wc[(((size_t)g * IG + i) * taps + t) * OG + o] = W[(((size_t)g * OG + o) * taps + t) * IG + i];
+}
+
+void spingalett_conv_transpose_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                                       ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm,
+                                       ComputeMode mode) {
+    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
+    LayerShape vin, vout;
+    transposed_shapes(in, out, &vin, &vout);
+    float *Wc = scratch, *rest = scratch + transposed_extra(in, out);
+    transpose_filters(SPINGALETT_WEIGHT_MTX_PTR(net, l), in, out, Wc);
+    /* y = the convolution's data gradient for dy = x, then the bias and the activation */
+    conv_backward_data_shapes(&vin, &vout, Wc, x, y, n, NULL, ACT_NONE, rest, gemm, mode);
+    const float *bias = net->biases + net->bias_offsets[l];
+    const uint32_t C = out->channels;
+    const uint64_t cells = (uint64_t)n * out->height * out->width;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(use_omp(mode, total * OC))
+#pragma omp parallel for schedule(static) if(use_omp(mode, cells * C))
 #endif
-    for (int64_t b = 0; b < (int64_t)blocks; b++) {
-        float *ps = part + (size_t)b * OC;
-        uint64_t p = (uint64_t)b * block, end = p + block < total ? p + block : total;
-        memcpy(ps, dy + (size_t)p * OC, OC * sizeof(float));
-        for (p++; p < end; p++) {
-            const float *row = dy + (size_t)p * OC;
-            for (uint32_t oc = 0; oc < OC; oc++) ps[oc] += row[oc];
-        }
+    for (int64_t p = 0; p < (int64_t)cells; p++) {
+        float *row = y + (uint64_t)p * C;
+        for (uint32_t c = 0; c < C; c++) row[c] += bias[c];
+        if (act != ACT_NONE && act != ACT_SOFTMAX) apply_activation_batch(row, C, act);
     }
-    for (uint64_t b = 0; b < blocks; b++)
-        for (uint32_t oc = 0; oc < OC; oc++) sum[oc] += part[(size_t)b * OC + oc];
-    for (uint32_t oc = 0; oc < OC; oc++)
-        gB[oc] = (float)(scale * sum[oc]) + (beta == 0.0f ? 0.0f : beta * gB[oc]);
-    free(part);
-    free(sum);
+    (void)mode;
+}
+
+void spingalett_conv_transpose_backward_data(const NeuralNetwork *net, uint32_t l, const float *dy, float *dx,
+                                             uint32_t n, const float *x, ActivationFunction act, float *scratch,
+                                             SpingalettGemmScratch *gemm, ComputeMode mode) {
+    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
+    LayerShape vin, vout;
+    transposed_shapes(in, out, &vin, &vout);
+    const size_t weights = aligned16((size_t)out->channels * out->kernel_h * out->kernel_w * (in->channels / out->groups));
+    float *Wc = scratch, *zeros = scratch + 2u * weights, *rest = scratch + transposed_extra(in, out);
+    transpose_filters(SPINGALETT_WEIGHT_MTX_PTR(net, l), in, out, Wc);
+    memset(zeros, 0, in->channels * sizeof(float));
+    /* dx = the convolution of dy, then times the derivative of the input's activation */
+    spingalett_conv_forward_shapes(&vin, &vout, Wc, zeros, dy, dx, n, ACT_NONE, rest, gemm, mode);
+    if (act == ACT_NONE) return;
+    const uint64_t per = (uint64_t)in->height * in->width * in->channels;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(use_omp(mode, (uint64_t)n * per) && n > 1)
+#endif
+    for (int64_t smp = 0; smp < (int64_t)n; smp++)
+        apply_derivative_batch(dx + (uint64_t)smp * per, x + (uint64_t)smp * per, per, act);
+    (void)mode;
+}
+
+void spingalett_conv_transpose_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy,
+                                                uint32_t n, float scale, float beta, float *scratch,
+                                                SpingalettGemmScratch *gemm, ComputeMode mode) {
+    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
+    LayerShape vin, vout;
+    transposed_shapes(in, out, &vin, &vout);
+    const size_t weights = aligned16((size_t)out->channels * out->kernel_h * out->kernel_w * (in->channels / out->groups));
+    float *gWc = scratch + weights, *gBc = scratch + 2u * weights + aligned16(in->channels);
+    float *rest = scratch + transposed_extra(in, out);
+    /* the convolution's weight gradient, its input being dy and its output's gradient x */
+    conv_backward_weights_shapes(&vin, &vout, dy, x, n, 1.0f, 0.0f, gWc, gBc, rest, gemm, mode);
+    const uint32_t G = groups_of(out), IG = in->channels / G, OG = out->channels / G;
+    const uint32_t taps = out->kernel_h * out->kernel_w;
+    float *gW = SPINGALETT_GRAD_W_MTX_PTR(net, l);
+    for (uint32_t g = 0; g < G; g++)
+        for (uint32_t o = 0; o < OG; o++)
+            for (uint32_t t = 0; t < taps; t++)
+                for (uint32_t i = 0; i < IG; i++) {
+                    float *w = &gW[(((size_t)g * OG + o) * taps + t) * IG + i];
+                    float v = scale * gWc[(((size_t)g * IG + i) * taps + t) * OG + o];
+                    *w = beta == 0.0f ? v : v + beta * *w;
+                }
+    bias_gradient(dy, (uint64_t)n * out->height * out->width, out->channels, scale, beta,
+                  net->grad_biases + net->bias_offsets[l], mode);
 }
 
 /* ---- pooling: windows are clipped to the image (padding cells are skipped) */
