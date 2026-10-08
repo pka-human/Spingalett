@@ -31,10 +31,9 @@ static const Tile fp32_tiles[] = {
 /* Tiles of gemm_mma.comp: rows x columns per workgroup, the k-step, accumulators of 16 x 16 per
    subgroup in rows x columns (the workgroup's subgroups tile it). */
 static const Tile mma_tiles[] = {
-    {128, 128, 32, 4, 2}, {128, 64, 32, 2, 2}, {64, 128, 32, 2, 2}, {128, 64, 32, 4, 2}, {64, 64, 32, 2, 2},
-    {128, 32, 32, 2, 2}, {128, 32, 32, 2, 1}, {32, 128, 32, 2, 2}, {64, 32, 32, 2, 2}, {32, 64, 32, 2, 2},
-    {32, 32, 32, 1, 1}, {128, 16, 32, 2, 1}, {256, 16, 32, 4, 1}, {64, 16, 32, 2, 1}, {16, 64, 32, 1, 2},
-    {16, 128, 32, 1, 2}, {16, 144, 32, 1, 3}, {32, 144, 32, 2, 3}, {64, 144, 32, 2, 3}, {64, 64, 16, 2, 2},
+    {128, 64, 32, 2, 1}, {64, 64, 32, 1, 1}, {128, 32, 32, 2, 1}, {64, 32, 32, 1, 1}, {32, 64, 32, 1, 1},
+    {64, 128, 32, 1, 2}, {128, 64, 32, 1, 1}, {32, 64, 32, 1, 2}, {32, 32, 32, 1, 1},
+    {64, 32, 32, 2, 1}, {128, 16, 32, 2, 1}, {64, 16, 32, 2, 1}, {32, 16, 32, 1, 1}, {16, 32, 32, 1, 1},
 };
 
 typedef struct { const Tile *list; uint32_t count; } Table;
@@ -262,7 +261,7 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, 
                 double ts = score[a]; score[a] = score[b]; score[b] = ts;
                 int to = order[a]; order[a] = order[b]; order[b] = to;
             }
-    if (count > 8) count = 8;
+    if (count > (mma ? 16u : 8u)) count = mma ? 16u : 8u;
     double best = 0.0;
     int chosen = -1;
     for (uint32_t c = 0; c < count; c++) {

@@ -500,7 +500,12 @@ static void kernel(Recorder *r, const Access *a, SpgKernel k, const uint32_t *sp
 
 static void product(Recorder *r, const Access *a, SpgGemmPush *p, const SpgGemmMode *m) {
     need(r, a);
-    spg_gemm(r->c, p, m);
+    /* the matrix units multiply blocks of 16 x 16 (32 values of k a step): products smaller than that in
+       a dimension would mostly multiply padding, and stay in single precision (a rule of the shape, so
+       that a product always runs the same way) */
+    SpgGemmMode mode = *m;
+    mode.bf16 = m->bf16 && p->K >= 32u && p->M >= 16u && p->N >= 16u;
+    spg_gemm(r->c, p, &mode);
 }
 
 /* The parameters of weight layer l: weights, biases, running statistics, and their gradients. */

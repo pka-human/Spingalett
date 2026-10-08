@@ -366,6 +366,28 @@ static void test_dense(uint32_t n, uint32_t in, uint32_t out) {
 
 /* ------------------------------------------------------------------------- benchmark */
 
+
+/* One line of the benchmark: the time of the tile chosen by timing and of the fastest; with
+   SPINGALETT_BENCH_TILES set, every tile's, fastest first. */
+static void bench_report(const char *name, bool mma, double flops, double chosen, const double *times, uint32_t count) {
+    uint32_t order[64], n = 0;
+    for (uint32_t t = 0; t < count && n < 64; t++)
+        if (times[t] > 0) order[n++] = t;
+    for (uint32_t a = 0; a < n; a++)
+        for (uint32_t b = a + 1; b < n; b++)
+            if (times[order[b]] < times[order[a]]) { uint32_t x = order[a]; order[a] = order[b]; order[b] = x; }
+    if (n == 0) return;
+    uint32_t bm, bn, bk, tm, tn;
+    spg_gemm_tile(mma, order[0], &bm, &bn, &bk, &tm, &tn);
+    printf("  %-8s chosen %7.1f us %5.2f TFLOPS   best %7.1f us %5.2f TFLOPS (%ux%u k%u, %ux%u a thread)\n", name,
+           chosen * 1e6, flops / chosen * 1e-12, times[order[0]] * 1e6, flops / times[order[0]] * 1e-12, bm, bn, bk, tm,
+           tn);
+    if (!getenv("SPINGALETT_BENCH_TILES")) return;
+    for (uint32_t k = 0; k < n; k++) {
+        spg_gemm_tile(mma, order[k], &bm, &bn, &bk, &tm, &tn);
+        printf("           %7.1f us  %3ux%-3u k%-2u %ux%u\n", times[order[k]] * 1e6, bm, bn, bk, tm, tn);
+    }
+}
 static void bench(void) {
     static const Conv shapes[] = {
         {128, 32, 32, 16, 16, 3, 3, 1, 1, 1, 1, 1}, {128, 32, 32, 16, 32, 3, 3, 2, 2, 1, 1, 1},
@@ -388,8 +410,7 @@ static void bench(void) {
         printf("conv %ux%ux%u -> %ux%ux%u, %ux%u window, stride %u (%.0f MFLOP a product)\n", v->h, v->w, v->c, OH, OW,
                v->out, v->kh, v->kw, v->sh, flops * 1e-6);
         for (int pass = 0; pass < 3; pass++) {
-            double best = 1e9, chosen = 0;
-            uint32_t best_tile = 0;
+            double chosen = 0, times[64] = {0};
             for (uint32_t tile = 0; tile <= spg_gemm_tiles(mma); tile++) {
                 SpgGemmPush p[SPG_MAX_PHASES];
                 SpgGemmMode m[SPG_MAX_PHASES];
@@ -402,13 +423,9 @@ static void bench(void) {
                 run_many(p, m, count, 2);
                 double t = run_many(p, m, count, 20);
                 if (tile == 0) chosen = t;
-                else if (t > 0 && t < best) { best = t; best_tile = tile; }
+                else if (tile <= 64) times[tile - 1] = t;
             }
-            uint32_t bm, bn, bk, tm, tn;
-            spg_gemm_tile(mma, best_tile - 1, &bm, &bn, &bk, &tm, &tn);
-            printf("  %-8s chosen %7.1f us %5.2f TFLOPS   best %7.1f us %5.2f TFLOPS (%ux%u k%u, %ux%u a thread)\n",
-                   names[pass], chosen * 1e6, flops / chosen * 1e-12, best * 1e6, flops / best * 1e-12, bm, bn, bk, tm,
-                   tn);
+            bench_report(names[pass], mma, flops, chosen, times, spg_gemm_tiles(mma));
         }
         conv_free(&b);
         free(x); free(w); free(dy);
@@ -428,8 +445,7 @@ static void bench(void) {
         printf("dense %u x %u -> %u (%.0f MFLOP a product)\n", n, in, out, flops * 1e-6);
         static const char *names[] = {"forward", "data", "weights"};
         for (int pass = 0; pass < 3; pass++) {
-            double best = 1e9, chosen = 0;
-            uint32_t best_tile = 0;
+            double chosen = 0, times[64] = {0};
             for (uint32_t tile = 0; tile <= spg_gemm_tiles(mma); tile++) {
                 SpgGemmPush p;
                 SpgGemmMode m;
@@ -452,13 +468,9 @@ static void bench(void) {
                 run(&p, &m, 2);
                 double t = run(&p, &m, 20);
                 if (tile == 0) chosen = t;
-                else if (t > 0 && t < best) { best = t; best_tile = tile; }
+                else if (tile <= 64) times[tile - 1] = t;
             }
-            uint32_t bm, bn, bk, tm, tn;
-            spg_gemm_tile(mma, best_tile - 1, &bm, &bn, &bk, &tm, &tn);
-            printf("  %-8s chosen %7.1f us %5.2f TFLOPS   best %7.1f us %5.2f TFLOPS (%ux%u k%u, %ux%u a thread)\n",
-                   names[pass], chosen * 1e6, flops / chosen * 1e-12, best * 1e6, flops / best * 1e-12, bm, bn, bk, tm,
-                   tn);
+            bench_report(names[pass], mma, flops, chosen, times, spg_gemm_tiles(mma));
         }
         SpgGpuBuffer *all[] = {&bx, &bw, &bd, &by};
         for (size_t j = 0; j < 4; j++) spg_gpu_buffer_free(all[j]);
