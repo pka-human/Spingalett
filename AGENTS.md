@@ -36,7 +36,7 @@ assumed (see [Performance work](#performance-work)).
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
-Bin/SpingalettTests model                           # one group: grad conv norm equiv cont optim
+Bin/SpingalettTests model                           # one group: grad conv norm graph equiv cont optim
                                                     # sched dropout gen predict valid step data io model xor
 ```
 

@@ -501,6 +501,73 @@ with tempfile.TemporaryDirectory() as d:
         p = m.predict(xg)
         check(np.array_equal(p[3], m(xg[3])) and np.abs(p - gnet.forward(xg)).max() < 0.1, "grouped INT8 model")
 
+# graphs: a residual block and branches that are concatenated, checked against numpy
+def np_graph(net, x):
+    out = []
+    for sample in x:
+        acts = [sample.reshape(net.layer(0).shape)]
+        for i in range(1, len(net)):
+            d = net.layer(i)
+            src = acts[d.inputs[0]]
+            if d.type == sg.LayerType.CONV2D:
+                w = net.get_weights(i - 1)
+                v = np_conv(src, w, net.get_biases(i - 1), d.stride[0], d.padding[0])
+            elif d.type == sg.LayerType.ADD:
+                v = sum(acts[j] for j in d.inputs)
+            elif d.type == sg.LayerType.CONCAT:
+                v = np.concatenate([acts[j] for j in d.inputs], axis=2)
+            elif d.type == sg.LayerType.GLOBAL_AVG_POOL:
+                v = src.mean(axis=(0, 1)).reshape(1, 1, -1)
+            else:
+                v = (net.get_weights(i - 1) @ src.reshape(-1) + net.get_biases(i - 1)).reshape(1, 1, -1)
+            if d.activation == sg.Activation.RELU: v = np.maximum(v, 0)
+            elif d.activation == sg.Activation.TANH: v = np.tanh(v)
+            elif d.activation == sg.Activation.SOFTMAX: v = np.exp(v - v.max()); v = v / v.sum()
+            acts.append(v)
+        out.append(acts[-1].reshape(-1))
+    return np.array(out)
+
+rnet = sg.Network(sg.Loss.CROSS_ENTROPY)
+rnet.add_input(6, 6, 2)
+stem = rnet.add_conv2d(4, 3, padding=1, activation=sg.Activation.RELU).last
+rnet.add_conv2d(4, 3, padding=1, activation=sg.Activation.TANH)
+rnet.add_conv2d(4, 3, padding=1, activation=sg.Activation.NONE)
+block = rnet.add_add([stem, -1], activation=sg.Activation.RELU).last
+rnet.add_conv2d(3, 1, activation=sg.Activation.TANH, inputs=stem)
+rnet.add_concat([block, -1])
+rnet.add_global_avg_pool()
+rnet.add_layer(3, sg.Activation.SOFTMAX, sg.Init.XAVIER)
+check(len(rnet) == 9 and rnet.layer(4).inputs == (1, 3) and rnet.layer(6).inputs == (4, 5) and
+      rnet.layer(5).inputs == (1,) and rnet.layer(6).shape == (6, 6, 7), f"graph layers: {rnet.layers}")
+xr = rng.normal(size=(6, 72)).astype(np.float32)
+check(np.allclose(rnet.forward(xr), np_graph(rnet, xr), atol=1e-5), "graph forward vs numpy")
+yr = np.eye(3, dtype=np.float32)[np.arange(6) % 3]
+before = rnet.evaluate(xr, yr).loss
+rnet.train(xr, yr, epochs=40, optimizer=sg.Optimizer.ADAM, learning_rate=0.02)
+check(rnet.evaluate(xr, yr).loss < before * 0.5, "graph network trains")
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "graph.slett")
+    rnet.save(path)
+    check(open(path, "rb").read()[6] == 6, "graphs are saved as format version 6")
+    with sg.Network.load(path) as back:
+        check(back.layers == rnet.layers and np.array_equal(back.forward(xr), rnet.forward(xr)), "graph save/load")
+    with rnet.to_model(sg.Precision.INT8) as m:
+        check(m.layers[3].type == sg.LayerType.ADD and m.layers[3].input_layers == (1, 3), f"graph model: {m.layers[3]}")
+        p = m.predict(xr)
+        check(np.array_equal(p[2], m(xr[2])) and np.abs(p - rnet.forward(xr)).max() < 0.1, "graph INT8 model")
+spec = sg.Network(sg.Loss.MSE, [sg.Input(4, 4, 1), sg.Conv2D(1, 3, padding=1, activation=sg.Activation.NONE),
+                                sg.Add([-1, 0]), sg.GlobalAvgPool(), sg.Layer(1, sg.Activation.NONE)])
+check(spec.layer(2).type == sg.LayerType.ADD and spec.layer(2).inputs == (1, 0), f"graph from specs: {spec.layer(2)}")
+for bad in ([50], [1, 2, 3] * 6):
+    try:
+        rnet.add_add(bad); check(False, f"inputs {bad} accepted")
+    except (IndexError, ValueError):
+        pass
+try:
+    sg.Network(sg.Loss.MSE, [sg.Input(4, 4, 2), sg.Conv2D(2, 3), sg.Add([0, 1])]); check(False, "mismatched add accepted")
+except sg.SpingalettError:
+    pass
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")

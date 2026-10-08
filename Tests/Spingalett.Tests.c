@@ -8,8 +8,8 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad conv norm equiv cont optim sched dropout gen predict valid step data io
- *                                model xor
+ *   Spingalett.Tests [group]     groups: grad conv norm graph equiv cont optim sched dropout gen predict valid step
+ *                                data io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -2407,7 +2407,7 @@ static void model_validation(void) {
     }
 
     memcpy(buf, img, size);
-    buf[6] = 6;                                                  /* a future format version */
+    buf[6] = 7;                                                  /* a future format version */
     reseal(buf, size);
     CHECK(spingalett_model_init(&m, buf, size) == SPINGALETT_ERR_FORMAT_VERSION, "validation: future version");
     CHECK(spingalett_model_init(NULL, img, size) == SPINGALETT_ERR_INVALID && spingalett_model_init(&m, NULL, size) == SPINGALETT_ERR_INVALID,
@@ -3289,6 +3289,399 @@ static void norm_learns(ComputeMode mode) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* ------------------------------------------------------------------------- graphs */
+
+/* Networks whose layers read other layers than the one before them. */
+static NeuralNetwork *graph_net(int which) {
+    NeuralNetwork *net;
+    uint32_t a, b, c, d;
+    switch (which) {
+        case 0:     /* a residual block of two convolutions, global pooling, softmax */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 6, .width = 6, .channels = 3);
+            a = conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_TANH);
+            conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+            add_layers(.net = net, .inputs = {a, a + 1}, .act_func = ACT_TANH);
+            global_avg_pool2d(.net = net);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            return net;
+        case 1:     /* normalized residual block with a strided 1 x 1 projection on the shortcut */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 6, .width = 6, .channels = 2);
+            conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+            a = batch_norm(.net = net, .act_func = ACT_TANH);
+            conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .stride = 2, .act_func = ACT_NONE);
+            b = batch_norm(.net = net);
+            conv2d(.net = net, .inputs = {a}, .filters = 4, .kernel = 1, .stride = 2, .act_func = ACT_NONE);
+            c = batch_norm(.net = net);
+            add_layers(.net = net, .inputs = {b, c}, .act_func = ACT_SIGMOID);
+            global_avg_pool2d(.net = net, .act_func = ACT_TANH);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            return net;
+        case 2:     /* branches concatenated: 1 x 1 conv, 3 x 3 conv and pooling of the input */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 5, .width = 5, .channels = 3);
+            a = conv2d(.net = net, .filters = 2, .kernel = 1, .act_func = ACT_TANH);
+            b = conv2d(.net = net, .inputs = {0}, .input_count = 1, .filters = 3, .kernel = 3, .padding = 1,
+                       .act_func = ACT_FOO52);
+            c = max_pool2d(.net = net, .inputs = {0}, .input_count = 1, .kernel = 3, .stride = 1, .padding = 1);
+            concat_layers(.net = net, .inputs = {a, b, c});
+            conv2d(.net = net, .filters = 2, .kernel = 3, .act_func = ACT_TANH);
+            layer(.net = net, .neurons_amount = 2, .act_func = ACT_SIGMOID);
+            return net;
+        case 3:     /* dense layers read several times, one input named twice, a concatenation */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .neurons_amount = 5);
+            a = layer(.net = net, .neurons_amount = 6, .act_func = ACT_TANH);
+            b = layer(.net = net, .neurons_amount = 6, .act_func = ACT_SIGMOID);
+            c = add_layers(.net = net, .inputs = {a, b, a}, .act_func = ACT_LEAKY_RELU);
+            d = layer(.net = net, .inputs = {a}, .neurons_amount = 4, .act_func = ACT_TANH);
+            concat_layers(.net = net, .inputs = {c, d, 0}, .input_count = 3, .act_func = ACT_TANH);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            return net;
+        default:    /* a normalization and a pooling of the same maps, an identity layer, pooled maps pooled */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 4, .width = 6, .channels = 2);
+            a = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_SIGMOID);
+            b = batch_norm(.net = net, .act_func = ACT_TANH);
+            b = add_layers(.net = net, .inputs = {b}, .act_func = ACT_NONE);
+            c = avg_pool2d(.net = net, .inputs = {a}, .kernel = 2);
+            d = global_avg_pool2d(.net = net, .inputs = {c});
+            global_avg_pool2d(.net = net, .inputs = {b});
+            concat_layers(.net = net, .inputs = {d, d + 1});
+            layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX);
+            return net;
+    }
+}
+
+/* Uniform weights, gamma around 1 and beta around 0. */
+static void graph_init(NeuralNetwork *net) {
+    for (uint32_t l = 1; l < net->layers; l++) {
+        uint64_t w = net->weight_offsets[l - 1], b = net->bias_offsets[l - 1];
+        uint64_t nw = (l + 1 < net->layers ? net->weight_offsets[l] : net->total_weights) - w;
+        uint64_t nb = (l + 1 < net->layers ? net->bias_offsets[l] : net->total_biases) - b;
+        bool norm = net->shapes[l].type == LAYER_BATCH_NORM;
+        for (uint64_t i = 0; i < nw; i++) net->weights[w + i] = norm ? 0.6f + frand() * 0.8f : frand() * 1.2f - 0.6f;
+        for (uint64_t i = 0; i < nb; i++) net->biases[b + i] = norm ? frand() * 0.4f - 0.2f : frand() * 0.2f - 0.1f;
+    }
+}
+
+static void graph_gradcheck(int which, ComputeMode mode, TrainingStrategy strat) {
+    lcg_state = 3000 + which;
+    NeuralNetwork *net = graph_net(which);
+    const uint32_t N = 6, in = net->topology[0], out = net->topology[net->layers - 1];
+    float *x, *y;
+    make_data(N, in, out, net->loss_func, net->act_func[net->layers - 2], &x, &y);
+    spingalett_set_compute_mode(mode);
+    graph_init(net);
+    uint64_t nw = net->total_weights, nb = net->total_biases;
+    float *w0 = malloc(nw * 4 + 4), *b0 = malloc(nb * 4 + 4);
+    memcpy(w0, net->weights, nw * 4); memcpy(b0, net->biases, nb * 4);
+    train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 1.0f,
+          .optimizer_type = OPTIMIZER_SGD, .training_strategy = strat, .batch_size = N);
+    float *ga = malloc((nw + nb) * 4);
+    for (uint64_t i = 0; i < nw; i++) ga[i] = w0[i] - net->weights[i];
+    for (uint64_t i = 0; i < nb; i++) ga[nw + i] = b0[i] - net->biases[i];
+    memcpy(net->weights, w0, nw * 4); memcpy(net->biases, b0, nb * 4);
+
+    int bad = 0, kinks = 0; double maxrel = 0;
+    for (uint64_t i = 0; i < nw + nb; i++) {
+        float *p = i < nw ? &net->weights[i] : &net->biases[i - nw];
+        float orig = *p, h = 1e-3f, h2 = 2.5e-4f;
+        *p = orig + h; double lp = norm_train_loss(net, x, y, N);
+        *p = orig - h; double lm = norm_train_loss(net, x, y, N);
+        *p = orig + h2; double lp2 = norm_train_loss(net, x, y, N);
+        *p = orig - h2; double lm2 = norm_train_loss(net, x, y, N);
+        *p = orig;
+        double gn = (lp - lm) / (2.0 * h), gn2 = (lp2 - lm2) / (2.0 * h2);
+        if (fabs(gn - gn2) > 0.1 * (fabs(gn) + fabs(gn2)) + 3e-4) { kinks++; continue; }
+        double rel = fmin(fabs(gn - ga[i]) / fmax(1e-2, fabs(gn) + fabs(ga[i])),
+                          fabs(gn2 - ga[i]) / fmax(1e-2, fabs(gn2) + fabs(ga[i])));
+        if (rel > maxrel) maxrel = rel;
+        if (rel > 3e-2) bad++;
+    }
+    printf("  graph gradcheck net %d mode=%d strat=%d  maxrel=%.2e  outliers=%d/%llu kinks=%d\n", which, mode, strat,
+           maxrel, bad, (unsigned long long)(nw + nb), kinks);
+    CHECK(bad == 0 && kinks * 10 < (int)(nw + nb), "graph gradcheck net %d mode %d strat %d: %d outliers", which, mode,
+          strat, bad);
+    free(ga); free(w0); free(b0); free(x); free(y);
+    free_network(net);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* A residual network of `blocks` blocks of two normalized 3 x 3 convolutions on 8 x 8 x c maps. */
+static NeuralNetwork *resnet(uint32_t blocks, uint32_t channels, float dropout) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = channels, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+    uint32_t x = batch_norm(.net = net, .act_func = ACT_RELU);
+    for (uint32_t k = 0; k < blocks; k++) {
+        conv2d(.net = net, .filters = channels, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+        batch_norm(.net = net, .act_func = ACT_RELU, .dropout_rate = dropout);
+        conv2d(.net = net, .filters = channels, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+        uint32_t y = batch_norm(.net = net);
+        x = add_layers(.net = net, .inputs = {x, y}, .act_func = ACT_RELU, .dropout_rate = dropout);
+    }
+    global_avg_pool2d(.net = net);
+    layer(.net = net, .neurons_amount = 4, .act_func = ACT_SOFTMAX);
+    return net;
+}
+
+/* Training a residual network (with dropout on layers read twice) gives the same bits on any
+   number of threads; a chain whose layers name their inputs trains exactly as the plain chain. */
+static void graph_determinism(void) {
+    static const ComputeMode modes[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENMP, COMPUTE_OPENMP};
+    static const unsigned threads[] = {1, 1, 3, 4};
+    float *ref = NULL;
+    bool same = true;
+    for (int v = 0; v < 4; v++) {
+        spingalett_set_num_threads(threads[v]);
+        spingalett_set_compute_mode(modes[v]);
+        lcg_state = 79;
+        spingalett_seed(7);
+        NeuralNetwork *net = resnet(2, 24, 0.2f);
+        const uint32_t n = 64, in = net->topology[0];
+        float *x = malloc((size_t)n * in * sizeof(float)), *y = calloc((size_t)n * 4, sizeof(float));
+        for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2 - 1;
+        for (uint32_t s = 0; s < n; s++) y[s * 4 + s % 4] = 1.0f;
+        train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
+              .optimizer_type = OPTIMIZER_ADAMW, .weight_decay = 1e-3f, .training_strategy = STRATEGY_SMALL_BATCH,
+              .batch_size = 32, .augment_shift = 1, .augment_flip = true);
+        if (!ref) {
+            ref = malloc(net->total_weights * sizeof(float));
+            memcpy(ref, net->weights, net->total_weights * sizeof(float));
+        } else if (memcmp(ref, net->weights, net->total_weights * sizeof(float))) {
+            same = false;
+        }
+        free(x); free(y); free_network(net);
+    }
+    CHECK(same, "residual training differs between thread counts or compute modes");
+    printf("  residual training: identical on 1, 3 and 4 threads and single-threaded%s\n", same ? "" : " -- NO");
+    free(ref);
+    spingalett_set_num_threads(4);
+
+    /* the same chain, implicitly and with every input named */
+    float *w[2] = {NULL, NULL};
+    for (int named = 0; named < 2; named++) {
+        lcg_state = 80;
+        spingalett_seed(8);
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 6, .width = 6, .channels = 2);
+        uint32_t a = conv2d(.net = net, .filters = 5, .kernel = 3, .act_func = ACT_RELU);
+        if (named) {
+            uint32_t b = max_pool2d(.net = net, .inputs = {a}, .kernel = 2);
+            layer(.net = net, .inputs = {b}, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+        } else {
+            max_pool2d(.net = net, .kernel = 2);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+        }
+        CHECK(!net->graph, "a chain whose layers name their inputs is still a chain");
+        const uint32_t n = 40;
+        float *x = malloc((size_t)n * 72 * sizeof(float)), *y = calloc((size_t)n * 3, sizeof(float));
+        for (size_t i = 0; i < (size_t)n * 72; i++) x[i] = frand() * 2 - 1;
+        for (uint32_t s = 0; s < n; s++) y[s * 3 + s % 3] = 1.0f;
+        train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 3, .learning_rate = 0.01f,
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8);
+        w[named] = malloc(net->total_weights * sizeof(float));
+        memcpy(w[named], net->weights, net->total_weights * sizeof(float));
+        size_t size = 0;
+        void *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, false, &size);
+        CHECK(img && rd16((const uint8_t *)img + 6) == 4, "a chain is written in format 4, not %u",
+              img ? rd16((const uint8_t *)img + 6) : 0);
+        spingalett_free(img);
+        free(x); free(y); free_network(net);
+    }
+    CHECK(!memcmp(w[0], w[1], (5 * 18 + 3 * 20) * sizeof(float)), "named inputs change the training of a chain");
+    free(w[0]); free(w[1]);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* predict(), forward(), models of every precision and files agree on graphs; batched model
+   prediction equals single runs bit for bit; outputs share memory. */
+static void graph_inference(ComputeMode mode) {
+    spingalett_set_compute_mode(mode);
+    for (int which = 0; which < 6; which++) {
+        lcg_state = 4000 + which;
+        spingalett_seed(10 + which);
+        NeuralNetwork *net = which < 5 ? graph_net(which) : resnet(3, 16, 0.0f);
+        graph_init(net);
+        const uint32_t n = 37, in = net->topology[0], out = net->topology[net->layers - 1];
+        float *x, *y;
+        make_data(n, in, out, net->loss_func, net->act_func[net->layers - 2], &x, &y);
+        /* a few steps, so that the running statistics are not the initial ones */
+        train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8);
+        float *p = malloc((size_t)n * out * sizeof(float)), *q = malloc((size_t)n * out * sizeof(float));
+        CHECK(predict(.net = net, .inputs = x, .sample_count = n, .outputs = p), "graph %d: predict failed", which);
+        float worst = 0.0f;
+        for (uint32_t s = 0; s < n; s++) {
+            const float *o = forward(.net = net, .input = x + (size_t)s * in);
+            for (uint32_t k = 0; k < out; k++) worst = fmaxf(worst, fabsf(o[k] - p[(size_t)s * out + k]));
+        }
+        CHECK(worst < 1e-5f, "graph %d mode %d: forward differs from predict by %g", which, mode, worst);
+
+        /* through a file: format 6, the same network and the same outputs */
+        size_t size = 0;
+        void *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &size);
+        CHECK(img && rd16((const uint8_t *)img + 6) == 6, "graph %d: written in format %u", which,
+              img ? rd16((const uint8_t *)img + 6) : 0);
+        NeuralNetwork *back = img ? load_spingalett_from_memory(img, size) : NULL;
+        CHECK(back && back->layers == net->layers && back->total_weights == net->total_weights,
+              "graph %d: does not load back", which);
+        if (back) {
+            for (uint32_t l = 1; l < net->layers; l++) {
+                SpingalettNetworkLayer u, v;
+                spingalett_network_layer(net, l, &u);
+                spingalett_network_layer(back, l, &v);
+                CHECK(!memcmp(&u, &v, sizeof u), "graph %d: layer %u differs after loading", which, l);
+            }
+            CHECK(predict(.net = back, .inputs = x, .sample_count = n, .outputs = q) &&
+                  !memcmp(p, q, (size_t)n * out * sizeof(float)), "graph %d: loaded network predicts otherwise", which);
+            free_network(back);
+        }
+        spingalett_free(img);
+
+        for (int pr = 0; pr < PRECISION_COUNT; pr++) {
+            SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)pr);
+            CHECK(m != NULL, "graph %d: no model in precision %d", which, pr);
+            if (!m) continue;
+            CHECK(spingalett_model_predict(m, x, n, q), "graph %d: model predict failed", which);
+            float *r = malloc(out * sizeof(float)), diff = 0.0f;
+            bool exact = true;
+            void *ws = malloc(m->workspace_size);
+            for (uint32_t s = 0; s < n; s++) {
+                CHECK(spingalett_model_run(m, x + (size_t)s * in, r, ws) == SPINGALETT_OK, "graph %d: run failed", which);
+                exact = exact && !memcmp(r, q + (size_t)s * out, out * sizeof(float));
+                for (uint32_t k = 0; k < out; k++) diff = fmaxf(diff, fabsf(q[(size_t)s * out + k] - p[(size_t)s * out + k]));
+            }
+            /* integer models compute exactly what single runs compute */
+            CHECK(exact || pr < PRECISION_INT8, "graph %d mode %d precision %d: batched prediction differs from single runs",
+                  which, mode, pr);
+            static const float tolerance[PRECISION_COUNT] = {1e-4f, 5e-3f, 3e-2f, 6e-2f, 0.3f, 1.0f};
+            CHECK(diff < tolerance[pr], "graph %d precision %d: the model differs from the network by %g", which, pr,
+                  diff);
+            free(ws); free(r);
+            spingalett_model_free(m);
+        }
+        free(p); free(q); free(x); free(y);
+        free_network(net);
+    }
+
+    /* a deep residual network's outputs share memory: a few of the widest, not all of them */
+    NeuralNetwork *deep = resnet(16, 32, 0.0f);
+    SpingalettModel *m = spingalett_model_from_network(deep, PRECISION_FLOAT32);
+    uint64_t all = 0;
+    for (uint32_t l = 1; l < deep->layers; l++) all += deep->topology[l] * 4u;
+    CHECK(m && m->activations_ <= 4u * 8 * 8 * 32 * 4 && m->activations_ * 10 < all,
+          "residual model: %zu bytes of activations for %llu of outputs", m ? m->activations_ : 0, (unsigned long long)all);
+    if (mode == COMPUTE_SINGLE_THREADED)
+        printf("  residual network of 16 blocks: %zu bytes of activations in the engine's workspace (outputs: %llu)\n",
+               m ? m->activations_ : 0, (unsigned long long)all);
+    spingalett_model_free(m);
+    free_network(deep);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Normalizations fold into products that feed nothing else; graphs keep the others. */
+static void graph_folding(void) {
+    lcg_state = 5000;
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 5, .width = 5, .channels = 2);
+    uint32_t a = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+    uint32_t b = batch_norm(.net = net, .act_func = ACT_RELU);          /* folds: a feeds only b */
+    uint32_t c = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+    uint32_t d = batch_norm(.net = net);                                 /* stays: c also feeds e */
+    uint32_t e = add_layers(.net = net, .inputs = {b, c, d}, .act_func = ACT_RELU);
+    (void)a; (void)e;
+    global_avg_pool2d(.net = net);
+    layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX);
+    graph_init(net);
+    for (uint64_t i = 0; i < net->total_biases; i++) {
+        net->running_mean[i] = frand() * 0.4f - 0.2f;
+        net->running_var[i] = 0.5f + frand();
+    }
+    SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+    CHECK(m && m->layer_count == net->layers - 2, "graph folding: %u layers, expected %u", m ? m->layer_count : 0,
+          net->layers - 2);
+    float x[50], p[2], q[2];
+    for (int i = 0; i < 50; i++) x[i] = frand() * 2 - 1;
+    predict(.net = net, .inputs = x, .sample_count = 1, .outputs = p);
+    if (m) {
+        spingalett_model_predict(m, x, 1, q);
+        CHECK(fabsf(p[0] - q[0]) < 1e-5f && fabsf(p[1] - q[1]) < 1e-5f, "graph folding: outputs %g %g vs %g %g",
+              q[0], q[1], p[0], p[1]);
+        SpingalettLayerInfo info;
+        spingalett_model_layer(m, 3, &info);    /* the addition, after conv, conv, normalization */
+        CHECK(info.type == LAYER_ADD && info.input_count == 3 && info.input_layers[0] == 1 && info.input_layers[1] == 2 &&
+              info.input_layers[2] == 3, "graph folding: the addition reads %u layers", info.input_count);
+    }
+    spingalett_model_free(m);
+    free_network(net);
+}
+
+/* Builders reject inputs that do not fit; unused layers fail training and prediction; corrupt
+   version 6 images are rejected. */
+static void graph_validation(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    CHECK(layer(.net = net, .neurons_amount = 4, .inputs = {1}) == SPINGALETT_NO_LAYER, "the input layer reads nothing");
+    CHECK(layer(.net = net, .height = 4, .width = 4, .channels = 2) == 0, "input layer index");
+    uint32_t a = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1);
+    uint32_t b = conv2d(.net = net, .filters = 2, .kernel = 3, .padding = 1);
+    uint32_t c = max_pool2d(.net = net, .inputs = {a}, .kernel = 2);
+    CHECK(a == 1 && b == 2 && c == 3, "layer indices %u %u %u", a, b, c);
+    CHECK(add_layers(.net = net, .inputs = {a, b}) == SPINGALETT_NO_LAYER, "adding layers of other shapes");
+    CHECK(concat_layers(.net = net, .inputs = {a, c}) == SPINGALETT_NO_LAYER, "concatenating other sizes");
+    CHECK(conv2d(.net = net, .inputs = {a, b}, .filters = 2, .kernel = 1) == SPINGALETT_NO_LAYER, "conv of two layers");
+    CHECK(layer(.net = net, .inputs = {9}, .neurons_amount = 2) == SPINGALETT_NO_LAYER, "a later layer as input");
+    CHECK(layer(.net = net, .inputs = {1, 2}, .input_count = 17, .neurons_amount = 2) == SPINGALETT_NO_LAYER,
+          "more than SPINGALETT_MAX_INPUTS inputs");
+    CHECK(net->layers == 4, "rejected layers left the network with %u layers", net->layers);
+    uint32_t d = concat_layers(.net = net, .inputs = {a, b, a}, .act_func = ACT_RELU);
+    SpingalettNetworkLayer info;
+    CHECK(d == 4 && spingalett_network_layer(net, d, &info) && info.channels == 8 && info.input_count == 3 &&
+          info.inputs[2] == a, "concatenation of 3 + 2 + 3 channels");
+    layer(.net = net, .neurons_amount = 2, .act_func = ACT_SIGMOID);      /* reads d; c is left unused */
+    float x[32] = {0}, y[2] = {0}, o[2];
+    spingalett_clear_error();
+    TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = 1, .epochs = 1);
+    CHECK(r.status == TRAIN_FAILED && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+          strstr(spingalett_last_error_message(), "layer 3"), "training with an unused layer: %s",
+          spingalett_last_error_message());
+    CHECK(!predict(.net = net, .inputs = x, .sample_count = 1, .outputs = o), "prediction with an unused layer");
+    CHECK(!forward(.net = net, .input = x), "forward with an unused layer");
+    free_network(net);
+
+    /* corrupt images: an input after the layer, an output over an input, channels that do not add up */
+    net = graph_net(2);
+    graph_init(net);
+    size_t size = 0;
+    uint8_t *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, false, &size);
+    uint8_t *buf = malloc(size);
+    SpingalettModel m;
+    CHECK(spingalett_model_init(&m, img, size) == SPINGALETT_OK, "graph image does not load");
+    const size_t entry = 112, concat = 64 + 3 * entry;       /* layer 4, the concatenation */
+    struct { size_t at; uint32_t value; const char *what; } bad[] = {
+        {64 + 2 * entry + 84, 3, "an entry reading itself"},
+        {64 + 1 * entry + 84, 5, "an entry reading a later layer"},
+        {concat + 80, 17, "17 inputs"},
+        {concat + 80, 2, "a concatenation of fewer channels"},
+        {64 + 4 * entry + 96, (uint32_t)rd64(img + 64 + 3 * entry + 96), "an output over its input"},
+        {64 + 4 * entry + 96, 3, "a misaligned output"},
+        {40, 16, "too few bytes of activations"},
+        {64 + 4 * entry + 10, 5, "a convolution marked as an addition"},
+    };
+    for (size_t t = 0; t < sizeof bad / sizeof bad[0]; t++) {
+        memcpy(buf, img, size);
+        wr32(buf + bad[t].at, bad[t].value);
+        if (bad[t].at == 64 + 4 * entry + 10) buf[bad[t].at + 1] = 0, buf[bad[t].at + 2] = 0, buf[bad[t].at + 3] = 0;
+        reseal(buf, size);
+        CHECK(spingalett_model_init(&m, buf, size) != SPINGALETT_OK, "graph validation: %s accepted", bad[t].what);
+    }
+    free(buf);
+    spingalett_free(img);
+    free_network(net);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "export-headers")) {
         spingalett_set_verbose(false);
@@ -3346,6 +3739,17 @@ int main(int argc, char **argv) {
         norm_validation();
         norm_determinism();
         for (int m = 0; m < 2; m++) norm_learns(cm[m]);
+    }
+    if (!*only || !strcmp(only, "graph")) {
+        printf("[graphs]\n");
+        ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+        TrainingStrategy strats[] = {STRATEGY_FULL_BATCH, STRATEGY_SMALL_BATCH};
+        for (int m = 0; m < 3; m++) for (int s = 0; s < 2; s++)
+            for (int k = 0; k < 5; k++) graph_gradcheck(k, cm[m], strats[s]);
+        graph_determinism();
+        for (int m = 0; m < 3; m++) graph_inference(cm[m]);
+        graph_folding();
+        graph_validation();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");

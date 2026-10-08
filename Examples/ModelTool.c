@@ -92,21 +92,28 @@ static int info(const char *path) {
     spingalett_network_layer(net, 0, &input);
     if (input.height > 1 || input.width > 1)
         printf("  input: %u x %u x %u\n", input.height, input.width, input.channels);
-    static const char *const kinds[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm"};
+    static const char *const kinds[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add", "concat",
+                                        "global_avg_pool2d"};
     for (uint32_t i = 0; i < m->layer_count; i++) {
         SpingalettLayerInfo l;
         spingalett_model_layer(m, i, &l);
-        char shape[128] = "", groups[24] = "";
+        char shape[128] = "", groups[24] = "", from[96] = "";
         if (l.type == LAYER_CONV2D && l.groups > 1)
             snprintf(groups, sizeof groups, ", %u groups", l.groups);
         if (l.type == LAYER_BATCH_NORM)
             snprintf(shape, sizeof shape, "  %u x %u x %u, epsilon %g", l.height, l.width, l.channels, (double)l.epsilon);
-        else if (l.type != LAYER_DENSE)
+        else if (l.type == LAYER_CONV2D || l.type == LAYER_MAX_POOL2D || l.type == LAYER_AVG_POOL2D)
             snprintf(shape, sizeof shape, "  %u x %u x %u, window %u x %u, stride %u x %u, padding %u x %u%s", l.height,
                      l.width, l.channels, l.kernel_h, l.kernel_w, l.stride_h, l.stride_w, l.padding_h, l.padding_w, groups);
-        printf("  layer %u: %-10s %7u -> %-7u %-10s %s%s\n", i + 1, kinds[l.type], l.inputs, l.outputs,
-               activation_name(l.activation),
-               l.type == LAYER_MAX_POOL2D || l.type == LAYER_AVG_POOL2D ? "-" : precision_name(l.precision), shape);
+        else if (l.type != LAYER_DENSE)
+            snprintf(shape, sizeof shape, "  %u x %u x %u", l.height, l.width, l.channels);
+        /* the layers it reads, unless it reads the one before it */
+        if (l.input_count != 1 || l.input_layers[0] != i)
+            for (uint32_t k = 0, used = 0; k < l.input_count && used + 12 < sizeof from; k++)
+                used += (uint32_t)snprintf(from + used, sizeof from - used, "%s%u", k ? ", " : "  reads ", l.input_layers[k]);
+        bool parameterless = l.type != LAYER_DENSE && l.type != LAYER_CONV2D && l.type != LAYER_BATCH_NORM;
+        printf("  layer %u: %-10s %7u -> %-7u %-10s %s%s%s\n", i + 1, kinds[l.type], l.inputs, l.outputs,
+               activation_name(l.activation), parameterless ? "-" : precision_name(l.precision), shape, from);
     }
     spingalett_model_free(m);
     free_network(net);

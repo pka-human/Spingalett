@@ -272,49 +272,90 @@ static void batch_output_deltas(NeuralNetwork *net, BatchWorkspace *ws, const fl
     }
 }
 
-/* Propagates the output deltas back through the hidden layers. */
-static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode) {
-    uint32_t last = net->layers - 1;
-    for (uint32_t l = last - 1; l > 0; l--) {
-        uint32_t cur_sz  = net->topology[l];
-        uint32_t next_sz = net->topology[l + 1];
-
-        /* the derivative of layer l's activation is applied by the convolution and pooling
-           kernels while their output is in cache; dropout masks hold it already */
-        ActivationFunction act = net->act_func[l - 1];
-        ActivationFunction fused = ws->dmask[l] ? ACT_NONE : act;
-        switch (net->shapes[l + 1].type) {
-            case LAYER_DENSE:       /* delta[l] = delta[l+1] * W, W stored [next x cur] */
-                spingalett_gemm(ws->gemm, mode, false, false, N, cur_sz, next_sz, 1.0f,
-                                ws->delta[l + 1], next_sz, SPINGALETT_WEIGHT_MTX_PTR(net, l), cur_sz,
-                                0.0f, ws->delta[l], cur_sz);
-                break;
-            case LAYER_CONV2D:
-                spingalett_conv_backward_data(net, l, ws->delta[l + 1], ws->delta[l], N, ws->act[l], fused, ws->conv,
-                                              ws->gemm, mode);
-                break;
-            case LAYER_BATCH_NORM:  /* the sums are also the parameters' gradients */
-                spingalett_bn_backward_sums(net, l, ws->act[l], ws->delta[l + 1], N, ws->bn_stats[l + 1],
-                                            ws->bn_sums[l + 1], ws->bn_scratch, mode);
-                spingalett_bn_backward_data(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, ws->bn_stats[l + 1],
-                                            ws->bn_sums[l + 1], fused, ws->bn_coef, mode);
-                break;
-            default:                /* pooling has no activation: delta[l+1] is dL/d(its output) */
-                spingalett_pool_backward(net, l, ws->act[l], ws->delta[l + 1], ws->delta[l], N, fused, mode);
-                break;
+/* The gradient that input k of layer c gets from it (delta[c] = dL/d(c's pre-activation)): written
+   to dst, or added to it with accumulate (dense, adding, concatenating and global pooling layers
+   only), times the derivative of the input's activation `fused` (ACT_NONE: none; never with
+   accumulate) when the kernel can apply it while the result is in cache. Returns whether it did. */
+static bool input_gradient(NeuralNetwork *net, BatchWorkspace *ws, uint32_t c, uint32_t k, float *dst, uint32_t N,
+                           ActivationFunction fused, bool accumulate, ComputeMode mode) {
+    const uint32_t *in = spingalett_inputs(net, c), i = in[k];
+    const uint32_t cur_sz = net->topology[i], next_sz = net->topology[c];
+    const LayerShape *s = &net->shapes[c];
+    switch (s->type) {
+        case LAYER_DENSE:           /* dst = delta[c] * W, W stored [next x cur] */
+            spingalett_gemm(ws->gemm, mode, false, false, N, cur_sz, next_sz, 1.0f, ws->delta[c], next_sz,
+                            SPINGALETT_WEIGHT_MTX_PTR(net, c - 1), cur_sz, accumulate ? 1.0f : 0.0f, dst, cur_sz);
+            return false;
+        case LAYER_CONV2D:
+            spingalett_conv_backward_data(net, c - 1, ws->delta[c], dst, N, ws->act[i], fused, ws->conv, ws->gemm, mode);
+            return true;
+        case LAYER_BATCH_NORM:      /* the sums are left by the backward pass */
+            spingalett_bn_backward_data(net, c - 1, ws->act[i], ws->delta[c], dst, N, ws->bn_stats[c], ws->bn_sums[c],
+                                        fused, ws->bn_coef, mode);
+            return true;
+        case LAYER_ADD:
+        case LAYER_CONCAT: {        /* the input's channels of delta[c] */
+            uint32_t c0 = 0;
+            for (uint32_t j = 0; s->type == LAYER_CONCAT && j < k; j++) c0 += net->shapes[in[j]].channels;
+            spingalett_slice_backward(ws->delta[c], s->channels, c0, net->shapes[i].channels, dst, ws->act[i], N,
+                                      (uint64_t)s->height * s->width, fused, accumulate, mode);
+            return true;
         }
-        if (net->shapes[l + 1].type != LAYER_DENSE && !ws->dmask[l])
-            continue;
+        case LAYER_GLOBAL_AVG_POOL: {
+            const LayerShape *x = &net->shapes[i];
+            spingalett_global_pool_backward(ws->delta[c], dst, ws->act[i], N, (uint64_t)x->height * x->width, x->channels,
+                                            fused, accumulate, mode);
+            return true;
+        }
+        default:                    /* pooling has no activation: delta[c] is dL/d(its output) */
+            spingalett_pool_backward(net, c - 1, ws->act[i], ws->delta[c], dst, N, fused, mode);
+            return true;
+    }
+}
+
+/* Propagates the output deltas back through the hidden layers, from the last layer down: a layer's
+   delta is complete once every later layer that reads it has run. A layer that feeds several gets
+   their gradients in that fixed order (the first written, the others added), so the sums do not
+   depend on the thread count, and the derivative of its activation after the last. */
+static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode) {
+    const uint32_t last = net->layers - 1;
+    memcpy(ws->pending, ws->uses, net->layers * sizeof(uint32_t));
+    for (uint32_t c = last; c > 0; c--) {
+        const uint32_t count = spingalett_input_count(net, c), *in = spingalett_inputs(net, c);
+        const LayerType type = net->shapes[c].type;
+        if (type == LAYER_BATCH_NORM)       /* also the parameters' gradients, whatever the input */
+            spingalett_bn_backward_sums(net, c - 1, ws->act[in[0]], ws->delta[c], N, ws->bn_stats[c], ws->bn_sums[c],
+                                        ws->bn_scratch, mode);
+        for (uint32_t k = 0; k < count; k++) {
+            const uint32_t l = in[k], cur_sz = net->topology[l];
+            if (l == 0) continue;           /* the network's inputs need no gradient */
+            ActivationFunction act = net->act_func[l - 1];
+            if (ws->uses[l] > 1) {
+                const bool first = ws->pending[l] == ws->uses[l], done = --ws->pending[l] == 0;
+                const bool direct = first || type == LAYER_DENSE || type == LAYER_ADD || type == LAYER_CONCAT ||
+                                    type == LAYER_GLOBAL_AVG_POOL;
+                input_gradient(net, ws, c, k, direct ? ws->delta[l] : ws->gtmp, N, ACT_NONE, !first, mode);
+                if (!direct || done)
+                    spingalett_gradient_sum(ws->delta[l], direct ? NULL : ws->gtmp, ws->act[l], ws->dmask[l], N, cur_sz,
+                                            act, done, mode);
+                continue;
+            }
+            /* the derivative of layer l's activation is applied by the convolution and pooling
+               kernels while their output is in cache; dropout masks hold it already */
+            if (input_gradient(net, ws, c, k, ws->delta[l], N, ws->dmask[l] ? ACT_NONE : act, false, mode) &&
+                !ws->dmask[l])
+                continue;
 
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * cur_sz))
 #endif
-        for (int64_t s = 0; s < (int64_t)N; s++) {
-            size_t off = (size_t)s * cur_sz;
-            if (ws->dmask[l])
-                spingalett_vec_mul(ws->delta[l] + off, ws->dmask[l] + off, cur_sz);
-            else
-                apply_derivative_batch(ws->delta[l] + off, ws->act[l] + off, cur_sz, act);
+            for (int64_t s = 0; s < (int64_t)N; s++) {
+                size_t off = (size_t)s * cur_sz;
+                if (ws->dmask[l])
+                    spingalett_vec_mul(ws->delta[l] + off, ws->dmask[l] + off, cur_sz);
+                else
+                    apply_derivative_batch(ws->delta[l] + off, ws->act[l] + off, cur_sz, act);
+            }
         }
     }
 }
@@ -325,14 +366,15 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
 static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                                        float scale, float beta, ComputeMode mode, const OptimizerStep *o) {
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
-        uint32_t in_sz  = net->topology[l];
+        const uint32_t src = spingalett_source(net, l + 1);
+        uint32_t in_sz  = net->topology[src];
         uint32_t out_sz = net->topology[l + 1];
         LayerType type = net->shapes[l + 1].type;
 
         if (type == LAYER_DENSE) {
             /* gW[out x in] = delta^T[out x N] * act[N x in] */
             spingalett_gemm(ws->gemm, mode, true, false, out_sz, in_sz, N, scale,
-                            ws->delta[l + 1], out_sz, ws->act[l], in_sz,
+                            ws->delta[l + 1], out_sz, ws->act[src], in_sz,
                             beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
 
             float *gB = net->grad_biases + net->bias_offsets[l];
@@ -341,13 +383,10 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
             for (uint32_t s = 0; s < N; s++)
                 spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
         } else if (type == LAYER_CONV2D) {
-            spingalett_conv_backward_weights(net, l, ws->act[l], ws->delta[l + 1], N, scale, beta, ws->conv,
+            spingalett_conv_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
                                              ws->gemm, mode);
         } else if (type == LAYER_BATCH_NORM) {
-            /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass, except after the input) */
-            if (l == 0)
-                spingalett_bn_backward_sums(net, l, ws->act[0], ws->delta[1], N, ws->bn_stats[1], ws->bn_sums[1],
-                                            ws->bn_scratch, mode);
+            /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass) */
             const double *sums = ws->bn_sums[l + 1];
             const uint32_t C = net->shapes[l + 1].channels;
             float *gW = net->grad_weights + net->weight_offsets[l], *gB = net->grad_biases + net->bias_offsets[l];
@@ -357,7 +396,7 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
                 gB[c] = beta == 0.0f ? db : db + beta * gB[c];
             }
         } else {
-            continue;               /* pooling has no parameters */
+            continue;               /* pooling, adding and concatenating layers have no parameters */
         }
 
         if (o) {
@@ -737,7 +776,7 @@ static bool check_trainable(const NeuralNetwork *net) {
             return false;
         }
     }
-    return true;
+    return spingalett_check_graph(net, "train");
 }
 
 static TrainReport train_failed(const char *message) {

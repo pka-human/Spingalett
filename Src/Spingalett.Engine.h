@@ -4,7 +4,7 @@
 */
 
 /* Internals of the inference engine (Spingalett.Inference.c) shared with the rest of the library:
-   the .slett format version 3, 4 and 5 layout (docs/ModelFormat.md), CRC-32, half and bfloat16
+   the .slett format version 3 to 6 layout (docs/ModelFormat.md), CRC-32, half and bfloat16
    conversion, and the kernels batched inference reuses so that it computes exactly what
    spingalett_model_run computes. */
 
@@ -19,6 +19,7 @@
 #define SLETT_LAYER_ENTRY_SIZE   48u          /* version 3 */
 #define SLETT_LAYER_ENTRY_SIZE_4 64u          /* version 4: shapes and windows added */
 #define SLETT_LAYER_ENTRY_SIZE_5 80u          /* version 5: groups and batch normalization added */
+#define SLETT_LAYER_ENTRY_SIZE_6 112u         /* version 6: inputs and the output's place added */
 #define SLETT_MAX_EXTENT         65535u       /* largest height, width, kernel, stride or padding */
 #define SLETT_SECTION_ALIGN      16u          /* every section starts at a multiple of this */
 #define SLETT_FLAG_OPTIMIZER     0x01u
@@ -29,7 +30,8 @@ static inline bool spingalett_precision_is_int(PrecisionMode p) {
     return p == PRECISION_INT8 || p == PRECISION_INT4 || p == PRECISION_INT2;
 }
 
-/* One entry of the layer table: weight layer i connects layer i-1 (inputs) to layer i (outputs). */
+/* One entry of the layer table: entry i describes layer i + 1 and what feeds it, the output of layer
+   i before version 6, of its inputs (the first gives the input shape) from version 6 on. */
 typedef struct {
     uint32_t inputs, outputs;
     ActivationFunction activation;
@@ -43,10 +45,14 @@ typedef struct {
     float eps, momentum;                            /* batch normalization */
     uint32_t rows, row_len;                         /* the weight matrix: 0 x 0 for pooling, channels
                                                        x 1 (gamma) for batch normalization */
+    uint32_t input_count, input0;                   /* the layers it reads (layer i before version 6) */
+    uint64_t input_list;                            /* version 6: offset of all of them (input_count > 1) */
+    uint64_t act_offset;                            /* version 6: byte offset of the output in the
+                                                       workspace's activations (0 for the last layer) */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3, 4 or 5 */
+    uint32_t version;           /* 3 to 6 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -55,6 +61,8 @@ typedef struct {
     uint32_t max_width;         /* widest hidden layer (0 without hidden layers) */
     uint32_t max_int_inputs;    /* widest input of an integer layer (0 without integer layers) */
     uint64_t conv_scratch;      /* bytes of scratch the largest convolution needs (slett_conv_scratch) */
+    uint64_t activations;       /* bytes of the layers' outputs in a workspace: two of the widest
+                                   before version 6, as the header records from version 6 on */
 } SlettInfo;
 
 /* Little-endian field access (format 3 is little-endian; the engine refuses big-endian hosts). */
@@ -71,10 +79,19 @@ bool spingalett_host_is_little_endian(void);
 /* Bytes of one stored weight row of `inputs` values. */
 uint64_t spingalett_slett_row_bytes(PrecisionMode precision, uint32_t inputs);
 
-/* Validates a format 3, 4 or 5 image (no alignment requirement: fields are read with memcpy). */
+/* Validates a format 3 to 6 image (no alignment requirement: fields are read with memcpy). */
 int spingalett_slett_validate(const uint8_t *image, size_t size, SlettInfo *info);
 /* Entry `index` (0-based) of the layer table of a validated image, with its input shape. */
 void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *layer);
+/* Input k of layer L (a layer index: 0 is the network's input). */
+static inline uint32_t spingalett_slett_input(const uint8_t *image, const SlettLayer *L, uint32_t k) {
+    return k == 0 ? L->input0 : slett_get32(image + L->input_list + 4u * k);
+}
+/* Byte offset of the output of layer j >= 1 among a version 6 image's activations. */
+uint64_t spingalett_slett_act_offset(const uint8_t *image, uint32_t j);
+/* Height, width and units of the output of layer j of a validated image (0: the input layer). */
+void spingalett_slett_output_shape(const uint8_t *image, uint32_t j, uint32_t *height, uint32_t *width,
+                                   uint32_t *units);
 
 /* A convolution or pooling layer's output extent along one axis: windows of `kernel` cells,
    `stride` apart, over `size` cells padded by `pad` on both sides (0 when none fits). */
@@ -126,6 +143,14 @@ static inline bool slett_conv_columns(const SlettLayer *L) {
 static inline bool slett_conv_depthwise(const SlettLayer *L) {
     return L->type == LAYER_CONV2D && L->groups > 1 && L->in_c == L->groups;
 }
+
+/* Forward passes of the layers that combine others, on one sample, in the order the batched ones
+   use: an addition's inputs in their order, a concatenation's side by side, the cells of a global
+   pooling one after the other (y[c] = (sum of x[p][c]) * (1 / cells)). */
+void spingalett_engine_add(const float *const *x, uint32_t count, float *y, uint32_t n);
+void spingalett_engine_concat(const float *const *x, const uint32_t *channels, uint32_t count, float *y,
+                              uint32_t cells);
+void spingalett_engine_global_pool(const float *x, float *y, uint32_t cells, uint32_t channels);
 
 /* Bytes of engine scratch layer L needs: a convolution its transposed filters and one pixel's sums,
    or a gathered window (of its group's channels; an INT8 convolution with one group four windows

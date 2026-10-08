@@ -50,9 +50,40 @@ static bool layer_error(const char *msg) {
     return false;
 }
 
-/* The shape of a new layer from its arguments and the previous layer; false (error set) when they
-   do not fit together. */
-static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerShape *shape, uint32_t *outputs) {
+/* The layers a new layer reads: those of args->inputs (input_count of them, or up to the last
+   nonzero entry), or the layer before it; false (error set) when they are not earlier layers or do
+   not suit the layer's kind. */
+static bool layer_inputs(const NeuralNetwork *net, const LayerArgs *args, uint32_t *inputs, uint32_t *count) {
+    uint32_t n = args->input_count;
+    if (n == 0)
+        for (uint32_t k = SPINGALETT_MAX_INPUTS; k > 0; k--)
+            if (args->inputs[k - 1] != 0) { n = k; break; }
+    if (net->layers == 0) {
+        *count = 0;
+        return n == 0 ? true : layer_error("The input layer reads no other layers");
+    }
+    if (n > SPINGALETT_MAX_INPUTS)
+        return layer_error("A layer reads at most SPINGALETT_MAX_INPUTS (16) layers");
+    if (n == 0) {
+        inputs[0] = net->layers - 1;
+        *count = 1;
+    } else {
+        for (uint32_t k = 0; k < n; k++) {
+            if (args->inputs[k] >= net->layers)
+                return layer_error("A layer can only read layers added before it");
+            inputs[k] = args->inputs[k];
+        }
+        *count = n;
+    }
+    if (*count > 1 && args->type != LAYER_ADD && args->type != LAYER_CONCAT)
+        return layer_error("Only add and concatenation layers read several layers");
+    return true;
+}
+
+/* The shape of a new layer from its arguments and its inputs; false (error set) when they do not
+   fit together. */
+static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const uint32_t *inputs, uint32_t count,
+                        LayerShape *shape, uint32_t *outputs) {
     *shape = (LayerShape){.type = args->type, .height = 1, .width = 1};
     uint64_t units;
     if (net->layers == 0) {
@@ -72,9 +103,31 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerSh
     } else if (args->type == LAYER_DENSE) {
         units = args->neurons_amount;
         shape->channels = args->neurons_amount;
+    } else if (args->type == LAYER_ADD || args->type == LAYER_CONCAT) {
+        /* adding: one shape for all; concatenating: one height and width, the channels summed */
+        const LayerShape *first = &net->shapes[inputs[0]];
+        uint64_t channels = 0;
+        for (uint32_t k = 0; k < count; k++) {
+            const LayerShape *in = &net->shapes[inputs[k]];
+            if (in->height != first->height || in->width != first->width ||
+                (args->type == LAYER_ADD && in->channels != first->channels))
+                return layer_error(args->type == LAYER_ADD ? "Added layers must have the same shape"
+                                                           : "Concatenated layers must have the same height and width");
+            channels += in->channels;
+        }
+        if (args->type == LAYER_ADD) channels = first->channels;
+        if (channels > UINT32_MAX)
+            return layer_error("Layers are limited to 2^32 - 1 outputs");
+        shape->height = first->height;
+        shape->width = first->width;
+        shape->channels = (uint32_t)channels;
+        units = (uint64_t)first->height * first->width * channels;
+    } else if (args->type == LAYER_GLOBAL_AVG_POOL) {
+        shape->channels = net->shapes[inputs[0]].channels;
+        units = shape->channels;
     } else if (args->type == LAYER_BATCH_NORM) {
-        /* the previous layer's shape, normalized per channel */
-        const LayerShape *in = &net->shapes[net->layers - 1];
+        /* the input's shape, normalized per channel */
+        const LayerShape *in = &net->shapes[inputs[0]];
         if (!(args->epsilon >= 0.0f && args->epsilon < 1.0f) || !(args->momentum >= 0.0f && args->momentum <= 1.0f))
             return layer_error("Batch normalization needs epsilon in [0, 1) and momentum in [0, 1]");
         shape->height = in->height;
@@ -82,9 +135,9 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, LayerSh
         shape->channels = in->channels;
         shape->eps = args->epsilon > 0.0f ? args->epsilon : 1e-5f;
         shape->momentum = args->momentum > 0.0f ? args->momentum : 0.1f;
-        units = net->topology[net->layers - 1];
+        units = net->topology[inputs[0]];
     } else {
-        const LayerShape *in = &net->shapes[net->layers - 1];
+        const LayerShape *in = &net->shapes[inputs[0]];
         bool conv = args->type == LAYER_CONV2D;
         uint32_t kh = args->kernel_h ? args->kernel_h : args->kernel;
         uint32_t kw = args->kernel_w ? args->kernel_w : args->kernel;
@@ -174,15 +227,18 @@ bool spingalett_add_layer(LayerArgs args) {
     if (!(dropout_rate >= 0.0f && dropout_rate < 1.0f))
         return layer_error("Dropout rate must be in [0, 1)");
 
+    uint32_t inputs[SPINGALETT_MAX_INPUTS], input_count;
     LayerShape shape;
     uint32_t neurons_amount;
-    if (!layer_shape(net, &args, &shape, &neurons_amount))
+    if (!layer_inputs(net, &args, inputs, &input_count) ||
+        !layer_shape(net, &args, inputs, input_count, &shape, &neurons_amount))
         return false;
     spingalett_batch_workspace_free(net->forward_ws);     /* made for the old layers */
     net->forward_ws = NULL;
     bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D;
     if (pooling) act_func = ACT_NONE;
-    static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm"};
+    static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add",
+                                             "concat", "global_avg_pool2d"};
 
     uint32_t nl = net->layers + 1;
 
@@ -197,18 +253,22 @@ bool spingalett_add_layer(LayerArgs args) {
             return layer_error("Invalid activation function");
         if ((unsigned)wi >= WEIGHT_INITIALIZATION_COUNT)
             return layer_error("Invalid weight initialization");
-        spingalett_log(LOG_INFO, "Layer #%u: %s, output %u x %u x %u, activation %s, dropout %g", nl - 1,
+        bool chained = input_count == 1 && inputs[0] == net->layers - 1;
+        char from[96] = "";
+        for (uint32_t k = 0, used = 0; !chained && k < input_count && used + 12 < sizeof from; k++)
+            used += (uint32_t)snprintf(from + used, sizeof from - used, "%s%u", k ? ", " : ", reads ", inputs[k]);
+        spingalett_log(LOG_INFO, "Layer #%u: %s, output %u x %u x %u, activation %s, dropout %g%s", nl - 1,
                        type_names[shape.type], shape.height, shape.width, shape.channels,
-                       act_func_names[act_func], (double)dropout_rate);
+                       act_func_names[act_func], (double)dropout_rate, from);
     }
 
     /* the new layer's parameters, as compute_offsets() will count them */
-    uint32_t prev_neurons = (net->layers > 0) ? net->topology[net->layers - 1] : 0;
+    uint32_t prev_neurons = (net->layers > 0) ? net->topology[inputs[0]] : 0;
     uint32_t rows = 0, row_len = 0;
     if (nl > 1 && shape.type == LAYER_DENSE) { rows = neurons_amount; row_len = prev_neurons; }
     if (nl > 1 && shape.type == LAYER_CONV2D) {
         rows = shape.channels;
-        row_len = shape.kernel_h * shape.kernel_w * (net->shapes[net->layers - 1].channels / shape.groups);
+        row_len = shape.kernel_h * shape.kernel_w * (net->shapes[inputs[0]].channels / shape.groups);
     }
     if (nl > 1 && shape.type == LAYER_BATCH_NORM) { rows = shape.channels; row_len = 1; }
     uint64_t add_w = (uint64_t)rows * row_len;
@@ -224,6 +284,9 @@ bool spingalett_add_layer(LayerArgs args) {
     uint64_t           *t_woff    = (uint64_t *)           calloc(nl, sizeof(uint64_t));
     uint64_t           *t_boff    = (uint64_t *)           calloc(nl, sizeof(uint64_t));
     float              *t_drop    = (float *)              malloc(nl * sizeof(float));
+    uint32_t           *t_ioff    = (uint32_t *)           malloc((nl + 1) * sizeof(uint32_t));
+    uint32_t old_inputs = net->layers ? net->input_offsets[net->layers] : 0u;
+    uint32_t           *t_ilist   = (uint32_t *)           malloc((old_inputs + input_count + 1) * sizeof(uint32_t));
 
     /* The big arrays stay where they are when they have room (a loader reserved the final sizes);
        otherwise they move to arrays of the new size: the old values copied, the rest zeroed. */
@@ -235,7 +298,7 @@ bool spingalett_add_layer(LayerArgs args) {
                              net->running_mean, net->running_var};
     float *t_neurons = grow_floats(net->neurons, net->total_neurons, new_tn, net->cap_neurons);
     float *t_wa[4] = {NULL, NULL, NULL, NULL}, *t_ba[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
-    bool ok = t_topo && t_shapes && t_noff && t_woff && t_boff && t_neurons && t_drop;
+    bool ok = t_topo && t_shapes && t_noff && t_woff && t_boff && t_neurons && t_drop && t_ioff && t_ilist;
     if (nl > 1) {
         t_act = (ActivationFunction *)malloc((nl - 1) * sizeof(ActivationFunction));
         ok = ok && t_act;
@@ -245,6 +308,7 @@ bool spingalett_add_layer(LayerArgs args) {
 
     if (!ok) {
         free(t_topo); free(t_shapes); free(t_noff); free(t_woff); free(t_boff); free(t_drop);
+        free(t_ioff); free(t_ilist);
         if (t_neurons != net->neurons) spingalett_aligned_free(t_neurons);
         free(t_act);
         for (int k = 0; k < 4; k++) if (t_wa[k] != old_w[k]) spingalett_aligned_free(t_wa[k]);
@@ -265,6 +329,17 @@ bool spingalett_add_layer(LayerArgs args) {
     if (net->layers > 0)
         memcpy(t_drop, net->dropout_rates, net->layers * sizeof(float));
     t_drop[net->layers] = dropout_rate;
+
+    if (net->layers > 0) {
+        memcpy(t_ioff, net->input_offsets, (net->layers + 1) * sizeof(uint32_t));
+        memcpy(t_ilist, net->input_list, old_inputs * sizeof(uint32_t));
+    } else {
+        t_ioff[0] = 0;
+    }
+    memcpy(t_ilist + old_inputs, inputs, input_count * sizeof(uint32_t));
+    t_ioff[nl] = old_inputs + input_count;
+    bool graph = net->graph || shape.type == LAYER_ADD || shape.type == LAYER_CONCAT ||
+                 shape.type == LAYER_GLOBAL_AVG_POOL || (nl > 1 && !(input_count == 1 && inputs[0] == nl - 2));
 
     if (nl > 1) {
         if (net->layers > 1)
@@ -306,6 +381,8 @@ bool spingalett_add_layer(LayerArgs args) {
     free(net->neuron_offsets);
     free(net->weight_offsets);
     free(net->bias_offsets);
+    free(net->input_offsets);
+    free(net->input_list);
     if (t_neurons != net->neurons) {
         spingalett_aligned_free(net->neurons);
         net->cap_neurons = new_tn;
@@ -321,6 +398,9 @@ bool spingalett_add_layer(LayerArgs args) {
     }
 
     net->layers         = nl;
+    net->input_offsets  = t_ioff;
+    net->input_list     = t_ilist;
+    net->graph          = graph;
     net->topology       = t_topo;
     net->shapes         = t_shapes;
     net->act_func       = t_act;
@@ -347,8 +427,31 @@ bool spingalett_add_layer(LayerArgs args) {
     return true;
 }
 
-void layer_struct_arguments(LayerArgs args) {
-    (void)spingalett_add_layer(args);
+uint32_t layer_struct_arguments(LayerArgs args) {
+    return spingalett_add_layer(args) ? args.net->layers - 1 : SPINGALETT_NO_LAYER;
+}
+
+bool spingalett_check_graph(const NeuralNetwork *net, const char *who) {
+    if (!net->graph) return true;
+    /* every layer but the last feeds a later one */
+    bool *used = (bool *)calloc(net->layers, sizeof(bool));
+    if (!used) {
+        set_error(SPINGALETT_ERR_ALLOC, "allocation failed");
+        return false;
+    }
+    for (uint32_t l = 1; l < net->layers; l++)
+        for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) used[spingalett_inputs(net, l)[k]] = true;
+    uint32_t unused = net->layers;
+    for (uint32_t l = 0; l + 1 < net->layers && unused == net->layers; l++)
+        if (!used[l]) unused = l;
+    free(used);
+    if (unused == net->layers) return true;
+    char msg[160];
+    snprintf(msg, sizeof msg, "%s: the output of layer %u is not used; every layer but the last must feed a later one",
+             who, unused);
+    set_error(SPINGALETT_ERR_INVALID, msg);
+    spingalett_log(LOG_ERROR, "%s", msg);
+    return false;
 }
 
 LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
@@ -366,6 +469,8 @@ LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
     }
     a.type = s->type;
     a.act_func = net->act_func[l - 1];
+    a.input_count = spingalett_input_count(net, l);
+    memcpy(a.inputs, spingalett_inputs(net, l), a.input_count * sizeof(uint32_t));
     switch (s->type) {
         case LAYER_DENSE:
             a.neurons_amount = net->topology[l];
@@ -373,6 +478,10 @@ LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
         case LAYER_BATCH_NORM:
             a.epsilon = s->eps;
             a.momentum = s->momentum;
+            break;
+        case LAYER_ADD:
+        case LAYER_CONCAT:
+        case LAYER_GLOBAL_AVG_POOL:
             break;
         default:
             a.filters = s->type == LAYER_CONV2D ? s->channels : 0u;
@@ -415,6 +524,8 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     if (index > 0) {
         layer->bias_count = spingalett_weight_rows(net, index - 1);
         layer->weight_count = layer->bias_count * spingalett_weight_row_len(net, index - 1);
+        layer->input_count = spingalett_input_count(net, index);
+        memcpy(layer->inputs, spingalett_inputs(net, index), layer->input_count * sizeof(uint32_t));
     }
     return true;
 }
@@ -552,6 +663,8 @@ float *forward_struct_arguments(ForwardArgs args) {
         net->forward_ws = NULL;
     }
     if (!net->forward_ws) {
+        if (!spingalett_check_graph(net, "forward"))
+            return NULL;
         net->forward_ws = spingalett_batch_workspace_create(net, 1, false, false, mode);
         net->forward_mode = mode;
         if (!net->forward_ws) {
@@ -576,8 +689,9 @@ void print_parameters(const NeuralNetwork *net) {
 
     for (uint32_t i = 0; i < net->layers - 1; i++) {
         uint32_t rows = spingalett_weight_rows(net, i), cols = spingalett_weight_row_len(net, i);
+        uint32_t src = spingalett_source(net, i + 1);
         spingalett_log(LOG_INFO, "[Connection: Layer %u (%u neurons) -> Layer %u (%u neurons), activation function: %s, dropout: %g]",
-            i, net->topology[i], i + 1, net->topology[i + 1],
+            src, net->topology[src], i + 1, net->topology[i + 1],
             act_func_names[net->act_func[i]], (double)net->dropout_rates[i + 1]);
         spingalett_log(LOG_INFO, "  Biases of layer %u:", i + 1);
         for (uint32_t k = 0; k < rows; k++)
@@ -613,6 +727,8 @@ void free_network(NeuralNetwork *net) {
     free(net->shapes);
     free(net->act_func);
     free(net->dropout_rates);
+    free(net->input_offsets);
+    free(net->input_list);
     free(net);
     spingalett_log(LOG_DEBUG, "Memory freed.");
 }

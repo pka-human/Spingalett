@@ -83,8 +83,15 @@ typedef struct SpingalettGemmScratch SpingalettGemmScratch;
 
 /* Activations (and, when training, deltas and dropout masks) for up to `capacity` samples. */
 typedef struct BatchWorkspace {
-    float **act;            /* act[0]: inputs of the chunk; act[l]: [capacity x topology[l]] */
+    float **act;            /* act[0]: inputs of the chunk; act[l]: [capacity x topology[l]]. For
+                               inference, outputs that are never alive at the same time share
+                               memory (spingalett_plan_outputs), and act[l] of a layer whose output
+                               is never stored (a product with its normalization fused) is NULL */
     float **delta;          /* training only: delta[l] for l >= 1 */
+    uint32_t *uses;         /* per layer: the inputs of later layers that name it */
+    uint32_t *pending;      /* training: uses whose gradient has not arrived yet (backward pass) */
+    float *gtmp;            /* training: a gradient contribution to a layer that feeds several
+                               (capacity x its outputs), added to its delta */
     float **dmask;          /* training only: dropout mask * f'(a) per hidden layer with dropout */
     float *flat;            /* storage of act[1..] (and delta[1..]) */
     float *dmask_flat;
@@ -115,6 +122,46 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws);
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
+/* Inference: whether layer l (dense or convolution, no activation) feeds only the batch
+   normalization l + 1, which then runs in its product's epilogue and l's output is never stored. */
+bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint32_t l);
+
+/* Graphs (Spingalett.Graph.c). Offsets of the outputs of an inference pass, per sample in floats
+   (multiples of 16), so that outputs alive at the same time do not overlap: an output lives from
+   the step that computes it to the last step that reads it. Layer 0 and the last layer (the
+   caller's buffers) and the products whose normalization is fused take none (UINT64_MAX). Returns
+   the floats per sample all outputs need. */
+uint64_t spingalett_plan_outputs(const NeuralNetwork *net, const uint32_t *uses, uint64_t *offsets);
+/* The same over `count` steps from a description of each: steps[s] is the output it computes,
+   reads[s] the outputs it reads (read_count[s] of them), sizes[t] the floats of output t (0: not
+   stored); output t is computed by step `producer[t]` or never. Generic so that deployment models
+   and model files share it. offsets of outputs that are not stored are UINT64_MAX. */
+uint64_t spingalett_plan_buffers(uint32_t outputs, const uint64_t *sizes, uint32_t count, const uint32_t *steps,
+                                 const uint32_t *const *reads, const uint32_t *read_count, uint64_t align,
+                                 uint64_t *offsets);
+/* y = act(x[0] + x[1] + ...) over n samples of `size` floats, the inputs added in their order. */
+void spingalett_add_forward(const float *const *x, uint32_t count, float *y, uint32_t n, uint64_t size,
+                            ActivationFunction act, ComputeMode mode);
+/* y = act(concatenation of x[k], channels[k] each) over n samples of `cells` cells. */
+void spingalett_concat_forward(const float *const *x, const uint32_t *channels, uint32_t count, float *y, uint32_t n,
+                               uint64_t cells, ActivationFunction act, ComputeMode mode);
+/* y[c] = act(mean over the cells of x[., c]) for n samples of `cells` x C. */
+void spingalett_global_pool_forward(const float *x, float *y, uint32_t n, uint64_t cells, uint32_t C,
+                                    ActivationFunction act, ComputeMode mode);
+/* dx (= dx + when accumulate) = the part of dy (rows of C channels) at channels [c0, c0 + ck), over
+   n samples of `cells` cells: the gradient of a concatenation's input; with act, times the
+   derivative read from x (that input's output; not with accumulate). An addition's input is the
+   whole of dy (c0 = 0, ck = C). */
+void spingalett_slice_backward(const float *dy, uint32_t C, uint32_t c0, uint32_t ck, float *dx, const float *x,
+                               uint32_t n, uint64_t cells, ActivationFunction act, bool accumulate, ComputeMode mode);
+/* dx (= dx + when accumulate) = dy[c] / cells at every cell, the gradient of a global pooling's
+   input; with act, times the derivative read from x (not with accumulate). */
+void spingalett_global_pool_backward(const float *dy, float *dx, const float *x, uint32_t n, uint64_t cells, uint32_t C,
+                                     ActivationFunction act, bool accumulate, ComputeMode mode);
+/* delta (rows of `size`) += add over n samples, then, with last, times dmask (when set) or the
+   derivative of act read from y. */
+void spingalett_gradient_sum(float *delta, const float *add, const float *y, const float *dmask, uint32_t n,
+                             uint64_t size, ActivationFunction act, bool last, ComputeMode mode);
 /* Summed loss and number of correctly classified samples (see EvalMetrics) over n samples, in
    chunks of ws->capacity. ws is an inference workspace; out_buf holds [capacity x output size]. */
 void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
@@ -181,6 +228,8 @@ void spingalett_bn_backward_data(const NeuralNetwork *net, uint32_t l, const flo
                                  float *coef, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
+/* Whether every layer of net but the last feeds a later one; sets the error (naming `who`) when not. */
+bool spingalett_check_graph(const NeuralNetwork *net, const char *who);
 /* Gives an empty network room for these totals (zeroed), so that adding its layers moves nothing. */
 bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t weights, uint64_t biases);
 /* The arguments that add layer l of net again (to another network: set .net), parameters aside. */

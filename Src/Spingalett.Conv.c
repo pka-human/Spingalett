@@ -51,7 +51,8 @@ static inline bool depthwise(const LayerShape *in, const LayerShape *out) {
 size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacity, bool training, ComputeMode mode) {
     size_t need = 0;
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
-        const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
+        const uint32_t src = spingalett_source(net, l + 1);
+        const LayerShape *in = &net->shapes[src], *out = &net->shapes[l + 1];
         if (out->type != LAYER_CONV2D) continue;
         if (depthwise(in, out)) {           /* the filters transposed, tap-major */
             size_t t = (size_t)out->kernel_h * out->kernel_w * out->channels;
@@ -73,7 +74,7 @@ size_t spingalett_conv_scratch_floats(const NeuralNetwork *net, uint32_t capacit
             size_t t = (fwd * out->channels + 15u) & ~(size_t)15u;
             if (t + chunk > need) need = t + chunk;
         }
-        if (training && l > 0) {
+        if (training && src > 0) {
             size_t bwd = (size_t)out->kernel_h * out->kernel_w * out->channels;     /* per input pixel */
             total = bwd * in->height * in->width * capacity;
             chunk = total < CONV_CHUNK_FLOATS ? total : (bwd > CONV_CHUNK_FLOATS ? bwd : CONV_CHUNK_FLOATS);
@@ -602,8 +603,9 @@ static void depthwise_backward_weights(const LayerShape *in, const LayerShape *o
 
 void spingalett_conv_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm, ComputeMode mode) {
-    spingalett_conv_forward_shapes(&net->shapes[l], &net->shapes[l + 1], SPINGALETT_WEIGHT_MTX_PTR(net, l),
-                                   net->biases + net->bias_offsets[l], x, y, n, act, scratch, gemm, mode);
+    spingalett_conv_forward_shapes(&net->shapes[spingalett_source(net, l + 1)], &net->shapes[l + 1],
+                                   SPINGALETT_WEIGHT_MTX_PTR(net, l), net->biases + net->bias_offsets[l], x, y, n, act,
+                                   scratch, gemm, mode);
 }
 
 size_t spingalett_conv_forward_scratch(const LayerShape *in, const LayerShape *out, uint32_t capacity,
@@ -663,7 +665,7 @@ void spingalett_conv_forward_scaled(const LayerShape *in, const LayerShape *out,
 void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const float *dy, float *dx, uint32_t n,
                                    const float *x, ActivationFunction act, float *scratch,
                                    SpingalettGemmScratch *gemm, ComputeMode mode) {
-    const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
+    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
     const float *Wt = SPINGALETT_WEIGHT_MTX_PTR(net, l);
     if (depthwise(in, out)) {
         depthwise_backward_data(in, out, Wt, dy, dx, n, x, act, scratch, mode);
@@ -725,7 +727,7 @@ void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const f
 void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
                                       float scale, float beta, float *scratch, SpingalettGemmScratch *gemm,
                                       ComputeMode mode) {
-    const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
+    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
     const uint32_t OC = out->channels;
     const size_t K = (size_t)out->kernel_h * out->kernel_w * in->channels;
     const uint64_t total = (uint64_t)n * out->height * out->width;
@@ -904,7 +906,7 @@ static inline void pool_block_forward(const float *restrict xs, float *restrict 
 
 void spingalett_pool_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ComputeMode mode) {
-    spingalett_pool_forward_shapes(&net->shapes[l], &net->shapes[l + 1], x, y, n, mode);
+    spingalett_pool_forward_shapes(&net->shapes[spingalett_source(net, l + 1)], &net->shapes[l + 1], x, y, n, mode);
 }
 
 void spingalett_pool_forward_shapes(const LayerShape *in, const LayerShape *out, const float *x, float *y, uint32_t n,
@@ -983,9 +985,9 @@ static inline void pool_block_backward(const float *restrict xs, float *restrict
 
 void spingalett_pool_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
                               uint32_t n, ActivationFunction act, ComputeMode mode) {
-    const LayerShape *in = &net->shapes[l], *out = &net->shapes[l + 1];
+    const LayerShape *in = &net->shapes[spingalett_source(net, l + 1)], *out = &net->shapes[l + 1];
     const uint32_t C = in->channels, W = in->width;
-    const size_t in_size = net->topology[l], out_size = net->topology[l + 1];
+    const size_t in_size = net->topology[spingalett_source(net, l + 1)], out_size = net->topology[l + 1];
     const bool max = out->type == LAYER_MAX_POOL2D;
     /* windows that tile the image exactly (2 x 2 with stride 2 over an even size, say) write
        every input cell once: dx is written directly, without clearing it first */

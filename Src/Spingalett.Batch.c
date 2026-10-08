@@ -4,7 +4,8 @@
 */
 
 /* Batch execution shared by training and predict(): every layer is one GEMM over a chunk of
-   samples, followed by a per-row pass for bias, activation and dropout. */
+   samples (or a kernel of its own), followed by a per-row pass for bias, activation and dropout.
+   Layers run in index order, which puts every layer after the layers it reads. */
 
 #include "Spingalett.Private.h"
 #include <stdlib.h>
@@ -26,7 +27,10 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->bn_sums_flat);
     spingalett_aligned_free(ws->bn_scratch);
     spingalett_aligned_free(ws->bn_coef);
+    spingalett_aligned_free(ws->gtmp);
     spingalett_gemm_scratch_free(ws->gemm);
+    free(ws->uses);
+    free(ws->pending);
     free(ws->act);
     free(ws->delta);
     free(ws->dmask);
@@ -54,27 +58,50 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
     ws->dmask = (float **)calloc(net->layers, sizeof(float *));
     ws->bn_stats = (float **)calloc(net->layers, sizeof(float *));
     ws->bn_sums = (double **)calloc(net->layers, sizeof(double *));
-    if (!ws->act || !ws->delta || !ws->dmask || !ws->bn_stats || !ws->bn_sums) goto fail;
+    ws->uses = (uint32_t *)calloc(net->layers, sizeof(uint32_t));
+    ws->pending = (uint32_t *)calloc(net->layers, sizeof(uint32_t));
+    if (!ws->act || !ws->delta || !ws->dmask || !ws->bn_stats || !ws->bn_sums || !ws->uses || !ws->pending) goto fail;
+    for (uint32_t l = 1; l < net->layers; l++)
+        for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) ws->uses[spingalett_inputs(net, l)[k]]++;
 
-    /* Inference writes the last layer straight into the caller's output buffer. */
-    uint32_t act_layers = training ? net->layers : net->layers - 1;
-    size_t act_total = 0, dropout_total = 0;
-    for (uint32_t l = 1; l < act_layers; l++)
-        act_total += (size_t)capacity * net->topology[l];
+    size_t dropout_total = 0;
     for (uint32_t l = 1; training && l + 1 < net->layers; l++)
         if (net->dropout_rates[l] > 0.0f)
             dropout_total += (size_t)capacity * net->topology[l];
 
-    size_t delta_total = training ? act_total : 0;
-    if (act_total + delta_total > 0) {
-        ws->flat = (float *)spingalett_aligned_alloc((act_total + delta_total) * sizeof(float));
+    if (training) {
+        /* every layer's output and delta, kept for the backward pass */
+        size_t act_total = 0, widest_shared = 0;
+        for (uint32_t l = 1; l < net->layers; l++) {
+            act_total += (size_t)capacity * net->topology[l];
+            if (ws->uses[l] > 1 && net->topology[l] > widest_shared) widest_shared = net->topology[l];
+        }
+        ws->flat = (float *)spingalett_aligned_alloc(2u * act_total * sizeof(float));
         if (!ws->flat) goto fail;
-    }
-    size_t off = 0;
-    for (uint32_t l = 1; l < act_layers; l++) {
-        ws->act[l] = ws->flat + off;
-        if (training) ws->delta[l] = ws->flat + act_total + off;
-        off += (size_t)capacity * net->topology[l];
+        size_t off = 0;
+        for (uint32_t l = 1; l < net->layers; l++) {
+            ws->act[l] = ws->flat + off;
+            ws->delta[l] = ws->flat + act_total + off;
+            off += (size_t)capacity * net->topology[l];
+        }
+        if (widest_shared > 0) {
+            ws->gtmp = (float *)spingalett_aligned_alloc((size_t)capacity * widest_shared * sizeof(float));
+            if (!ws->gtmp) goto fail;
+        }
+    } else if (net->layers > 2) {
+        /* Inference writes the last layer straight into the caller's output buffer; the others
+           share memory where their lives do not overlap. */
+        uint64_t *offsets = (uint64_t *)malloc((size_t)net->layers * sizeof(uint64_t));
+        uint64_t per_sample = offsets ? spingalett_plan_outputs(net, ws->uses, offsets) : UINT64_MAX;
+        if (per_sample != UINT64_MAX && per_sample > 0)
+            ws->flat = (float *)spingalett_aligned_alloc((size_t)(per_sample * capacity) * sizeof(float));
+        if (per_sample == UINT64_MAX || (per_sample > 0 && !ws->flat)) {
+            free(offsets);
+            goto fail;
+        }
+        for (uint32_t l = 1; l + 1 < net->layers; l++)
+            if (offsets[l] != UINT64_MAX) ws->act[l] = ws->flat + offsets[l] * capacity;
+        free(offsets);
     }
 
     if (dropout_total > 0) {
@@ -139,22 +166,45 @@ fail:
     return NULL;
 }
 
+/* The output of a layer that adds or concatenates others, or pools globally (act: applied, or
+   ACT_NONE). */
+static void combine_forward(const NeuralNetwork *net, const BatchWorkspace *ws, uint32_t l, float *y, uint32_t N,
+                            ActivationFunction act, ComputeMode mode) {
+    const uint32_t count = spingalett_input_count(net, l), *in = spingalett_inputs(net, l);
+    const LayerShape *s = &net->shapes[l];
+    const float *x[SPINGALETT_MAX_INPUTS];
+    uint32_t channels[SPINGALETT_MAX_INPUTS];
+    for (uint32_t k = 0; k < count; k++) {
+        x[k] = ws->act[in[k]];
+        channels[k] = net->shapes[in[k]].channels;
+    }
+    if (s->type == LAYER_ADD) {
+        spingalett_add_forward(x, count, y, N, net->topology[l], act, mode);
+    } else if (s->type == LAYER_CONCAT) {
+        spingalett_concat_forward(x, channels, count, y, N, (uint64_t)s->height * s->width, act, mode);
+    } else {
+        const LayerShape *i = &net->shapes[in[0]];
+        spingalett_global_pool_forward(x[0], y, N, (uint64_t)i->height * i->width, i->channels, act, mode);
+    }
+}
+
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode) {
     for (uint32_t l = 1; l < net->layers; l++) {
-        uint32_t prev_size = net->topology[l - 1];
+        const uint32_t src = spingalett_source(net, l);
+        uint32_t prev_size = net->topology[src];
         uint32_t curr_size = net->topology[l];
         const float *bias = net->biases + net->bias_offsets[l - 1];
         ActivationFunction act = net->act_func[l - 1];
         float *C = ws->act[l];
+        const float *X = ws->act[src];
         bool masked = dropout && ws->dmask[l];
         LayerType type = net->shapes[l].type;
         bool done = false;          /* bias and activation applied */
 
         /* inference: a batch normalization after a dense or convolution layer without activation
            scales its outputs per channel in the product's epilogue, straight into its own output */
-        if (!ws->training && (type == LAYER_DENSE || type == LAYER_CONV2D) && act == ACT_NONE && l + 1 < net->layers &&
-            net->shapes[l + 1].type == LAYER_BATCH_NORM && net->act_func[l] != ACT_SOFTMAX) {
+        if (!ws->training && spingalett_fused_norm(net, ws->uses, l)) {
             const uint64_t b0 = net->bias_offsets[l];
             uint32_t channels = net->shapes[l].channels;
             float *scale = ws->bn_coef, *shift = ws->bn_coef + channels;
@@ -164,12 +214,12 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
             if (type == LAYER_DENSE) {
                 SpingalettBiasActivation epilogue = {shift, net->act_func[l], scale};
                 SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
-                spingalett_gemm_ex(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f, ws->act[l - 1], prev_size,
+                spingalett_gemm_ex(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f, X, prev_size,
                                    SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size, 0.0f, ws->act[l + 1], curr_size,
                                    &hooks);
             } else {
-                spingalett_conv_forward_scaled(&net->shapes[l - 1], &net->shapes[l], SPINGALETT_WEIGHT_MTX_PTR(net, l - 1),
-                                               scale, shift, ws->act[l - 1], ws->act[l + 1], N, net->act_func[l], ws->conv,
+                spingalett_conv_forward_scaled(&net->shapes[src], &net->shapes[l], SPINGALETT_WEIGHT_MTX_PTR(net, l - 1),
+                                               scale, shift, X, ws->act[l + 1], N, net->act_func[l], ws->conv,
                                                ws->gemm, mode);
             }
             l++;
@@ -183,21 +233,24 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
             SpingalettBiasActivation epilogue = {bias, act};
             SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
             spingalett_gemm_ex(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f,
-                               ws->act[l - 1], prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
+                               X, prev_size, SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size,
                                0.0f, C, curr_size, done ? &hooks : NULL);
         } else if (type == LAYER_CONV2D) {
             /* the bias, and an element-wise activation, are applied as the product's tiles complete */
             done = act != ACT_SOFTMAX && !masked;
-            spingalett_conv_forward(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->conv, ws->gemm, mode);
+            spingalett_conv_forward(net, l - 1, X, C, N, done ? act : ACT_NONE, ws->conv, ws->gemm, mode);
         } else if (type == LAYER_BATCH_NORM) {
             done = act != ACT_SOFTMAX && !masked;
             if (ws->training)
-                spingalett_bn_forward_train(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->bn_stats[l],
+                spingalett_bn_forward_train(net, l - 1, X, C, N, done ? act : ACT_NONE, ws->bn_stats[l],
                                             ws->bn_scratch, mode);
             else
-                spingalett_bn_forward(net, l - 1, ws->act[l - 1], C, N, done ? act : ACT_NONE, ws->bn_coef, mode);
+                spingalett_bn_forward(net, l - 1, X, C, N, done ? act : ACT_NONE, ws->bn_coef, mode);
+        } else if (type == LAYER_ADD || type == LAYER_CONCAT || type == LAYER_GLOBAL_AVG_POOL) {
+            done = !masked;
+            combine_forward(net, ws, l, C, N, done ? act : ACT_NONE, mode);
         } else {
-            spingalett_pool_forward(net, l - 1, ws->act[l - 1], C, N, mode);
+            spingalett_pool_forward(net, l - 1, X, C, N, mode);
             done = act == ACT_NONE && !masked;
         }
         if (done)
@@ -228,6 +281,8 @@ bool predict_struct_arguments(PredictArgs args) {
         set_error(SPINGALETT_ERR_INVALID, "predict: network must have at least 2 layers");
         return false;
     }
+    if (!spingalett_check_graph(net, "predict"))
+        return false;
     if (args.sample_count == 0)
         return true;
 
@@ -295,6 +350,8 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
         set_error(SPINGALETT_ERR_INVALID, "evaluate: network must have at least 2 layers");
         return m;
     }
+    if (!spingalett_check_graph(net, "evaluate"))
+        return m;
 
     ComputeMode mode = resolve_compute_mode();
     uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
