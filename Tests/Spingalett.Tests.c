@@ -3852,6 +3852,34 @@ static void graph_folding(void) {
     }
     spingalett_model_free(m);
     free_network(net);
+
+    /* a normalization folds into a transposed convolution as into a convolution (rows per output
+       channel), in every precision */
+    net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 3, .width = 3, .channels = 2);
+    conv_transpose2d(.net = net, .filters = 3, .kernel = 3, .stride = 2, .act_func = ACT_NONE);
+    batch_norm(.net = net, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 2, .act_func = ACT_NONE);
+    graph_init(net);
+    for (uint64_t i = 0; i < net->total_biases; i++) {
+        net->running_mean[i] = frand() * 0.4f - 0.2f;
+        net->running_var[i] = 0.5f + frand();
+    }
+    float y[18];
+    for (int i = 0; i < 18; i++) y[i] = frand() * 2 - 1;
+    predict(.net = net, .inputs = y, .sample_count = 1, .outputs = p);
+    for (int pr = 0; pr < PRECISION_COUNT; pr++) {
+        m = spingalett_model_from_network(net, (PrecisionMode)pr);
+        CHECK(m && m->layer_count == 2, "graph folding: a transposed convolution keeps %u layers", m ? m->layer_count : 0);
+        if (m) {
+            spingalett_model_predict(m, y, 1, q);
+            static const float tolerance[PRECISION_COUNT] = {1e-5f, 5e-3f, 3e-2f, 6e-2f, 0.6f, 1.0f};
+            CHECK(fabsf(p[0] - q[0]) < tolerance[pr] && fabsf(p[1] - q[1]) < tolerance[pr],
+                  "graph folding: transposed convolution, precision %d: %g %g vs %g %g", pr, q[0], q[1], p[0], p[1]);
+        }
+        spingalett_model_free(m);
+    }
+    free_network(net);
 }
 
 /* Builders reject inputs that do not fit; unused layers fail training and prediction; corrupt
