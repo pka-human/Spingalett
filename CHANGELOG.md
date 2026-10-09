@@ -89,6 +89,10 @@ RTX 4050 Laptop GPU; README).
   registers and the loads of overlapping windows shared: MobileNet-style training in bfloat16 runs 8.7%
   faster (24,424 to 26,545 samples/s) and its inference 17% (81,941 to 95,869) on an RTX 4050 Laptop
   GPU; in single precision, where the kernel is bound by memory, inference gains 8.4%.
+- The GPU's single-precision matrix kernel writes its results four at a time where C (and what the
+  epilogue reads with it) is aligned for it: training in single precision 2 to 10% faster (the
+  convolutional network 103,116 to 108,934 samples/s, the U-Net 3,875 to 4,096, ResNet-20 10,232 to
+  10,475), inference 4 to 9% (ResNet-20 32,170 to 34,896).
 - The GPU trains in chunks of up to 4,096 samples (2,048 in networks with batch normalization, whose
   statistics are taken over each chunk as on the CPU): the fully connected network trains full
   batches 6 to 11% faster (bfloat16: 2,841,939 to 3,040,430 samples/s).

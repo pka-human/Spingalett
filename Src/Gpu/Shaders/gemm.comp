@@ -64,6 +64,34 @@ shared vec4 Bs[BK * SB];
 void put_a(uint k, uint m, float v) { As[k * SA + (m >> 2)][m & 3u] = v; }
 void put_b(uint k, uint n, float v) { Bs[k * SB + (n >> 2)][n & 3u] = v; }
 
+const bool VC = (VEC & 16u) != 0u;
+
+/* store_c() of results n .. n + 3 of row m, written at once (VC: C and what the epilogue reads with it
+   aligned for it) */
+vec4 activate4(vec4 v) { return vec4(activate(v.x, ACT), activate(v.y, ACT), activate(v.z, ACT), activate(v.w, ACT)); }
+void store_c4(uint z, uint coff, uint m, uint row, uint n, precise vec4 v) {
+    if (EPI == EPI_PARTIAL) {
+        F32x4(p.c).v[((z * p.M + m) * p.N + n) >> 2] = v;
+        return;
+    }
+    uint at = coff + row * p.ldc + n;
+    if (EPI == EPI_STORE) {
+        v *= p.alpha;
+        if (p.beta != 0.0) v += p.beta * F32x4(p.c).v[at >> 2];
+    } else if (EPI == EPI_BIAS_ACT) {
+        if ((p.flags & FLAG_BIAS) != 0u) v += F32x4(p.e0).v[(coff + n) >> 2];
+        v = activate4(v);
+    } else if (EPI == EPI_SCALE_ACT) {
+        v = activate4(v * F32x4(p.e0).v[(coff + n) >> 2] + F32x4(p.e1).v[(coff + n) >> 2]);
+    } else if (EPI == EPI_DERIV) {
+        v *= p.alpha;
+        if (p.beta != 0.0) v += p.beta * F32x4(p.c).v[at >> 2];
+        const vec4 e = F32x4(p.e0).v[at >> 2];
+        v *= vec4(derivative(e.x, ACT), derivative(e.y, ACT), derivative(e.z, ACT), derivative(e.w, ACT));
+    }
+    F32x4(p.c).v[at >> 2] = v;
+}
+
 void store_tiles() {
     [[unroll]] for (uint i = 0; i < LA; i++) {
         if (!a_live(i)) continue;
@@ -127,10 +155,14 @@ void main() {
         uint m = m0 + 4u * tr + RS * (i >> 2) + (i & 3u);
         if (m >= p.M) continue;
         const uint row = c_row(m);
-        [[unroll]] for (uint j = 0; j < TN; j++) {
-            uint n = n0 + 4u * tc + CS * (j >> 2) + (j & 3u);
-            if (n >= p.N) continue;
-            store_c(z, coff, m, row, n, acc[i * (TN / 4u) + (j >> 2)][j & 3u]);
+        [[unroll]] for (uint q = 0; q < TN / 4u; q++) {
+            uint n = n0 + 4u * tc + CS * q;
+            if (VC && n + 3u < p.N) {
+                store_c4(z, coff, m, row, n, acc[i * (TN / 4u) + q]);
+                continue;
+            }
+            [[unroll]] for (uint j = 0; j < 4u; j++)
+                if (n + j < p.N) store_c(z, coff, m, row, n + j, acc[i * (TN / 4u) + q][j]);
         }
     }
 }

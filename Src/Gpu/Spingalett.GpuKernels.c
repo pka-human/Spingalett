@@ -121,6 +121,17 @@ static bool aligned(uint64_t address, uint32_t group, uint32_t width) {
 /* Whether operand A (or B) may be read w values of its contiguous axis at a time: along k, every slice
    must start at a multiple of w and k end at one; along m (A_COL) or n (B_ROW, B_CONV), the dimension
    and the stride must be multiples of w (convolutions: the caller checks their channels). */
+/* Whether gemm.comp's epilogue may write four results of a row at once: C, and what the epilogue reads
+   with it, at 16 bytes, rows (and groups) of whole vectors. */
+static bool vector_c(const SpgGemmPush *p, const SpgGemmMode *m) {
+    if (m->epi == SPG_EPI_PARTIAL) return p->c % 16u == 0 && p->N % 4u == 0;
+    if (!aligned(p->c, p->c_group, 4u) || p->ldc % 4u != 0) return false;
+    if (m->epi == SPG_EPI_BIAS_ACT && (p->flags & SPG_GEMM_BIAS)) return p->e0 % 16u == 0;
+    if (m->epi == SPG_EPI_SCALE_ACT) return p->e0 % 16u == 0 && p->e1 % 16u == 0;
+    if (m->epi == SPG_EPI_DERIV) return p->e0 % 16u == 0;
+    return true;
+}
+
 static bool vectors(const SpgGemmPush *p, const SpgGemmMode *m, bool a, uint32_t w) {
     const bool k_ok = p->K % w == 0 && (p->slices == 1 || p->slice_k % w == 0);
     if (a) {
@@ -366,7 +377,8 @@ void spg_gemm(SpgGpuCommands *c, SpgGemmPush *p, const SpgGemmMode *mode) {
                wide_b = m.vec_b && (m.half & 2u) && m.wide_b && vectors(p, &m, false, 8u);
     const bool va = m.vec_a && (wide_a || vectors(p, &m, true, 4u)), vb = m.vec_b && (wide_b || vectors(p, &m, false, 4u));
     mode = &m;
-    const uint32_t vec = (va ? 1u : 0u) | (vb ? 2u : 0u) | (wide_a ? 4u : 0u) | (wide_b ? 8u : 0u);
+    const uint32_t vec = (va ? 1u : 0u) | (vb ? 2u : 0u) | (wide_a ? 4u : 0u) | (wide_b ? 8u : 0u) |
+                         (!mma && vector_c(p, &m) ? 16u : 0u);
     const Table tab = table(mma);
     int tuned = mode->tile ? -1 : tuned_tile(p, mode, vec, mma);
     Tile t = mode->tile && mode->tile <= tab.count && tile_fits(&tab.list[mode->tile - 1], mma, p->N) ? tab.list[mode->tile - 1]
