@@ -48,6 +48,11 @@ RTX 4050 Laptop GPU; README).
   registers and the loads of overlapping windows shared: MobileNet-style training in bfloat16 runs 8.7%
   faster (24,424 to 26,545 samples/s) and its inference 17% (81,941 to 95,869) on an RTX 4050 Laptop
   GPU; in single precision, where the kernel is bound by memory, inference gains 8.4%.
+- `train()` on the GPU starts faster: the memory of networks freed before is kept for the next (up to
+  an eighth of the device's memory, given back when an allocation fails), and the parameters' upload is
+  not waited for. The fully connected network trains full batches 7.3% faster in single precision
+  (1,095,058 to 1,174,516 samples/s) and 5.9% in bfloat16, where five epochs took some 2.4 ms more
+  than their GPU time to start.
 - The first training of a process on a machine whose GPU driver has not compiled the kernels yet
   makes the pipelines the tile choice times on several threads: 1.1 s instead of 2.75 s for the
   fully connected network, 2.7 s instead of 6.2 s for ResNet-20 in bfloat16.

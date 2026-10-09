@@ -103,6 +103,7 @@ typedef VkResult (VKAPI_PTR *CoopPropertiesFn)(VkPhysicalDevice, uint32_t *, Coo
 #define COMPONENT_BFLOAT16   1000141000
 #define SCOPE_SUBGROUP       3
 #define SPARE_COMMANDS       64      /* freed command buffers kept for reuse */
+#define SPARE_BLOCKS         16      /* freed blocks of arenas kept for reuse, of a heap's eighth at most */
 
 #define DECLARE(name) static PFN_##name name;
 VK_GLOBAL_FUNCTIONS(DECLARE)
@@ -144,6 +145,9 @@ static struct {
     SpgSignal *lock;                /* the pipelines, the queue and the spare command buffers */
     struct SpgGpuCommands *spare[SPARE_COMMANDS];   /* freed, for the next spg_gpu_commands_create() */
     uint32_t spare_count;
+    struct { SpgGpuBuffer block; SpgMemory kind; } spare_blocks[SPARE_BLOCKS];  /* for the next arenas */
+    uint32_t spare_block_count;
+    uint64_t spare_bytes;
     float tick_ns;                  /* timestamp period */
     uint32_t stamp_bits;            /* valid bits of the queue's timestamps (0: none) */
     bool profile;                   /* SPINGALETT_GPU_PROFILE: time every dispatch */
@@ -601,9 +605,55 @@ struct SpgGpuArena {
     ArenaAsk *asks;
     uint32_t count, cap;
     SpgGpuBuffer *blocks;
+    SpgMemory *kinds;                   /* of the blocks */
     uint32_t block_count;
     bool failed;                        /* an ask could not be kept */
 };
+
+/* Freed blocks are kept (SPARE_BLOCKS of them, an eighth of the device's memory at most) for the arenas
+   made after: networks made and freed one after another, as by train() and predict(), take a block of
+   the right kind as it is, mapped and with its address, rather than memory the driver allocates (and
+   NVIDIA's clears) anew, a millisecond for the MLP of Examples/Benchmark.c. A block of at least the bytes
+   and at most twice them is taken, the smallest such; memory that cannot be allocated frees the kept
+   blocks and is asked for again. */
+static bool block_create(SpgGpuBuffer *b, size_t bytes, SpgMemory kind) {
+    spg_lock(gpu.lock);
+    uint32_t best = UINT32_MAX;
+    for (uint32_t k = 0; k < gpu.spare_block_count; k++) {
+        const size_t size = gpu.spare_blocks[k].block.size;
+        if (gpu.spare_blocks[k].kind == kind && size >= bytes && size <= 2u * bytes &&
+            (best == UINT32_MAX || size < gpu.spare_blocks[best].block.size))
+            best = k;
+    }
+    if (best != UINT32_MAX) {
+        *b = gpu.spare_blocks[best].block;
+        gpu.spare_bytes -= b->size;
+        gpu.spare_blocks[best] = gpu.spare_blocks[--gpu.spare_block_count];
+    }
+    spg_unlock(gpu.lock);
+    if (best != UINT32_MAX) return true;
+    if (create_buffer(b, bytes, kind)) return true;
+    spg_lock(gpu.lock);
+    const uint32_t kept = gpu.spare_block_count;
+    for (uint32_t k = 0; k < kept; k++) spg_gpu_buffer_free(&gpu.spare_blocks[k].block);
+    gpu.spare_block_count = 0;
+    gpu.spare_bytes = 0;
+    spg_unlock(gpu.lock);
+    return kept && create_buffer(b, bytes, kind);
+}
+
+static void block_free(SpgGpuBuffer *b, SpgMemory kind) {
+    spg_lock(gpu.lock);
+    const bool kept = gpu.spare_block_count < SPARE_BLOCKS && gpu.spare_bytes + b->size <= gpu.heap / 8u;
+    if (kept) {
+        gpu.spare_blocks[gpu.spare_block_count].block = *b;
+        gpu.spare_blocks[gpu.spare_block_count++].kind = kind;
+        gpu.spare_bytes += b->size;
+    }
+    spg_unlock(gpu.lock);
+    if (!kept) spg_gpu_buffer_free(b);
+    memset(b, 0, sizeof *b);
+}
 
 SpgGpuArena *spg_gpu_arena_create(void) {
     return (SpgGpuArena *)calloc(1, sizeof(SpgGpuArena));
@@ -647,12 +697,12 @@ bool spg_gpu_arena_commit(SpgGpuArena *a) {
     }
     uint32_t made = 0;
     while (ok && made < a->block_count) {
-        ok = create_buffer(&a->blocks[made], need[made], kinds[made]);
+        ok = block_create(&a->blocks[made], need[made], kinds[made]);
         made += ok;
     }
     a->block_count = made;              /* the blocks to free */
+    a->kinds = kinds;
     free(need);
-    free(kinds);
     if (!ok) return false;
     for (uint32_t k = 0; k < a->count; k++) {
         const ArenaAsk *ask = &a->asks[k];
@@ -666,8 +716,9 @@ bool spg_gpu_arena_commit(SpgGpuArena *a) {
 
 void spg_gpu_arena_free(SpgGpuArena *a) {
     if (!a) return;
-    for (uint32_t b = 0; b < a->block_count; b++) spg_gpu_buffer_free(&a->blocks[b]);
+    for (uint32_t b = 0; b < a->block_count; b++) block_free(&a->blocks[b], a->kinds[b]);
     free(a->blocks);
+    free(a->kinds);
     free(a->asks);
     free(a);
 }

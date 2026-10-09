@@ -301,7 +301,8 @@ static void pack(const SpgGpuNet *g, float *host, float *image, bool weights, bo
             swap_filters(net, l, host + from, image + to, down);
         else if (down) memcpy(host + from, image + to, count * sizeof(float));
         else memcpy(image + to, host + from, count * sizeof(float));
-        for (uint64_t k = count; !down && k < align4(count); k++) image[to + k] = 0.0f;
+        /* the padding to the next layer's weights (biases), zeros in memory reused from other arenas too */
+        for (uint64_t k = count; !down && k < (weights ? align8(count) : align4(count)); k++) image[to + k] = 0.0f;
     }
 }
 
@@ -371,14 +372,20 @@ static size_t staged(const Item *it, bool down) {
 }
 
 /* Runs the items, after all chunks submitted so far (which the caller has waited for when it
-   uploads into memory the host writes). */
-static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down) {
-    bool commands = false, staging = false;
+   uploads into memory the host writes), then with half the weights' bfloat16 copy from those uploaded.
+   An upload is not waited for unless it copies from another network's buffers: the device runs what
+   comes after it behind a barrier, and the next transfer waits for it before the host writes what it
+   reads. */
+static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down, bool half) {
+    SpgGpuCommands *c = g->once;
+    if (!spg_gpu_wait(c)) return false;
+    bool commands = half, staging = false, copies = false;
     for (uint32_t k = 0; k < count; k++) {
         const Item *it = &items[k];
         if (direct(it, down)) image(g, it, it->device->mapped, false);
         else commands = true;
         staging = staging || staged(it, down) > 0;
+        copies = copies || it->kind == ITEM_COPY;
     }
     if (!commands) return true;
     /* the transfer buffer, made on first use where uploads need none */
@@ -392,7 +399,6 @@ static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down)
         size_t at = 0;
         for (uint32_t k = first; !down && k < last; at += staged(&items[k], down), k++)
             if (staged(&items[k], down)) image(g, &items[k], base + at, false);
-        SpgGpuCommands *c = g->once;
         if (!spg_gpu_record_begin(c)) return false;
         spg_gpu_barrier(c);
         at = 0;
@@ -405,7 +411,15 @@ static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down)
             else spg_gpu_copy(c, &g->transfer, at, it->device, 0, it->bytes);
         }
         spg_gpu_barrier(c);
-        if (!spg_gpu_record_end(c) || !spg_gpu_submit(c) || !spg_gpu_wait(c)) return false;
+        const bool final = last == count;
+        if (final && half) {
+            SpgEltwisePush p = {g->wh.address, g->params.address, 0, 0, 0, (uint32_t)g->Wp, 1, 0, 0, 0.0f, 0, 0};
+            const uint32_t spec[3] = {SPG_ELT_COPY, ACT_NONE, 1u};      /* y kept as bfloat16 */
+            spg_gpu_dispatch(c, SPG_KERNEL_eltwise_h, spec, 3, &p, sizeof p, groups(g->Wp, 256u), 1, 1);
+            spg_gpu_barrier(c);
+        }
+        if (!spg_gpu_record_end(c) || !spg_gpu_submit(c) || ((down || copies || !final) && !spg_gpu_wait(c)))
+            return false;
         at = 0;
         for (uint32_t k = first; down && k < last; at += staged(&items[k], down), k++)
             image(g, &items[k], base + at, true);
@@ -452,21 +466,8 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating, const SpgGpuNet *
             items[k].from = same;
         }
     }
-    bool ok = transfer(g, items, n, down);
+    const bool ok = transfer(g, items, n, down, !down && g->wh.buffer);
     free(items);
-    /* the weights' bfloat16 copy from those uploaded */
-    if (ok && !down && g->wh.buffer) {
-        SpgGpuCommands *c = g->once;
-        SpgEltwisePush p = {g->wh.address, g->params.address, 0, 0, 0, (uint32_t)g->Wp, 1, 0, 0, 0.0f, 0, 0};
-        uint32_t spec[3] = {SPG_ELT_COPY, ACT_NONE, 1u};          /* y kept as bfloat16 */
-        ok = spg_gpu_record_begin(c);
-        if (ok) {
-            spg_gpu_barrier(c);
-            spg_gpu_dispatch(c, SPG_KERNEL_eltwise_h, spec, 3, &p, sizeof p, groups(g->Wp, 256u), 1, 1);
-            spg_gpu_barrier(c);
-            ok = spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
-        }
-    }
     return ok;
 }
 
