@@ -25,7 +25,7 @@
  *
  *   Bin/Segmentation [epochs] [bilinear] [ln] [st|omp|gpu|bf16]
  *
- * "gpu" trains and predicts on the GPU (COMPUTE_VULKAN) when the library has the backend and finds a
+ * "gpu" trains and predicts on the GPU (SPINGALETT_COMPUTE_VULKAN) when the library has the backend and finds a
  * device; "bf16" too, with the matrix products in bfloat16 on its matrix units where it has them.
  * Every epoch draws 4,096 new images (a generator function); 256 fixed ones keep the weights of the
  * best epoch. The pixel accuracy and each class's intersection over union on 512 test images
@@ -126,7 +126,7 @@ static void draw(uint64_t *rng, float *image, float *labels) {
     }
 }
 
-/* DataGeneratorFn: new images every time */
+/* SpingalettDataGeneratorFn: new images every time */
 static uint32_t generate(float *inputs, float *targets, uint32_t requested, void *rng) {
     for (uint32_t i = 0; i < requested; i++)
         draw((uint64_t *)rng, inputs + (size_t)i * PIXELS * 3, targets + (size_t)i * PIXELS * CLASSES);
@@ -136,43 +136,45 @@ static uint32_t generate(float *inputs, float *targets, uint32_t requested, void
 /* ---- the network ---- */
 
 /* Two 3 x 3 convolutions of `filters` outputs, each normalized and rectified; the last layer's index. */
-static uint32_t double_conv(NeuralNetwork *net, uint32_t filters, bool ln) {
+static uint32_t double_conv(SpingalettNetwork *net, uint32_t filters, bool ln) {
     uint32_t last = 0;
     for (int k = 0; k < 2; k++) {
-        conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
-               .weight_initialization = WEIGHT_INITIALIZATION_HE);
-        last = ln ? layer_norm(.net = net, .act_func = ACT_RELU) : batch_norm(.net = net, .act_func = ACT_RELU);
+        spingalett_conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = SPINGALETT_ACT_NONE,
+                          .weight_initialization = SPINGALETT_INIT_HE);
+        last = ln ? spingalett_layer_norm(.net = net, .act_func = SPINGALETT_ACT_RELU)
+                  : spingalett_batch_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);
     }
     return last;
 }
 
 /* Twice the size, `filters` channels: a transposed convolution, or bilinear upsampling and a 3 x 3
    convolution. */
-static uint32_t up(NeuralNetwork *net, uint32_t filters, bool bilinear) {
+static uint32_t up(SpingalettNetwork *net, uint32_t filters, bool bilinear) {
     if (!bilinear)
-        return conv_transpose2d(.net = net, .filters = filters, .kernel = 2, .stride = 2, .act_func = ACT_RELU,
-                                .weight_initialization = WEIGHT_INITIALIZATION_HE);
-    upsample2d(.net = net, .stride = 2, .upsample = UPSAMPLE_BILINEAR);
-    return conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
-                  .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        return spingalett_conv_transpose2d(.net = net, .filters = filters, .kernel = 2, .stride = 2,
+                                           .act_func = SPINGALETT_ACT_RELU,
+                                           .weight_initialization = SPINGALETT_INIT_HE);
+    spingalett_upsample2d(.net = net, .stride = 2, .upsample = SPINGALETT_UPSAMPLE_BILINEAR);
+    return spingalett_conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = SPINGALETT_ACT_RELU,
+                             .weight_initialization = SPINGALETT_INIT_HE);
 }
 
-static NeuralNetwork *unet(bool bilinear, bool ln) {
-    NeuralNetwork *net = new_spingalett(LOSS_CROSS_ENTROPY);
-    layer(.net = net, .height = SIZE, .width = SIZE, .channels = 3);
+static SpingalettNetwork *unet(bool bilinear, bool ln) {
+    SpingalettNetwork *net = spingalett_network_new(SPINGALETT_LOSS_CROSS_ENTROPY);
+    spingalett_layer(.net = net, .height = SIZE, .width = SIZE, .channels = 3);
     uint32_t e1 = double_conv(net, 16, ln);
-    max_pool2d(.net = net, .kernel = 2);
+    spingalett_max_pool2d(.net = net, .kernel = 2);
     uint32_t e2 = double_conv(net, 32, ln);
-    max_pool2d(.net = net, .kernel = 2);
+    spingalett_max_pool2d(.net = net, .kernel = 2);
     double_conv(net, 64, ln);
     uint32_t u = up(net, 32, bilinear);
-    concat_layers(.net = net, .inputs = {e2, u}, .act_func = ACT_NONE);
+    spingalett_concat_layers(.net = net, .inputs = {e2, u}, .act_func = SPINGALETT_ACT_NONE);
     double_conv(net, 32, ln);
     u = up(net, 16, bilinear);
-    concat_layers(.net = net, .inputs = {e1, u}, .act_func = ACT_NONE);
+    spingalett_concat_layers(.net = net, .inputs = {e1, u}, .act_func = SPINGALETT_ACT_NONE);
     double_conv(net, 16, ln);
-    conv2d(.net = net, .filters = CLASSES, .kernel = 1, .act_func = ACT_SIGMOID,
-           .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+    spingalett_conv2d(.net = net, .filters = CLASSES, .kernel = 1, .act_func = SPINGALETT_ACT_SIGMOID,
+                      .weight_initialization = SPINGALETT_INIT_XAVIER);
     return net;
 }
 
@@ -209,7 +211,7 @@ static void report(const char *name, const float *outputs, const float *truth, u
            name, 100.0 * accuracy, iou[0], iou[1], iou[2], (iou[0] + iou[1] + iou[2]) / 3.0, count / seconds);
 }
 
-static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *started) {
+static bool on_epoch(SpingalettNetwork *net, const SpingalettTrainProgress *p, void *started) {
     (void)net;
     printf("epoch %2zu  lr %.5f  loss %.4f  validation loss %.4f%s  (%.0f s)\n", p->epoch, (double)p->learning_rate,
            (double)p->train_loss, (double)p->validation.loss, p->improved ? "  *" : "",
@@ -221,18 +223,19 @@ static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *started) 
 int main(int argc, char **argv) {
     size_t epochs = 12;
     bool bilinear = false, ln = false;
-    ComputeMode mode = COMPUTE_SINGLE_THREADED;
+    SpingalettComputeMode mode = SPINGALETT_COMPUTE_SINGLE_THREADED;
 #if defined(SPINGALETT_HAS_OPENMP)
-    mode = COMPUTE_OPENMP;
+    mode = SPINGALETT_COMPUTE_OPENMP;
 #endif
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] >= '0' && argv[i][0] <= '9') epochs = (size_t)strtoul(argv[i], NULL, 10);
         else if (!strcmp(argv[i], "bilinear")) bilinear = true;
         else if (!strcmp(argv[i], "ln")) ln = true;
-        else if (!strcmp(argv[i], "omp")) mode = COMPUTE_OPENMP;
-        else if (!strcmp(argv[i], "st")) mode = COMPUTE_SINGLE_THREADED;
-        else if (!strcmp(argv[i], "gpu")) mode = COMPUTE_VULKAN;
-        else if (!strcmp(argv[i], "bf16")) mode = COMPUTE_VULKAN, spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+        else if (!strcmp(argv[i], "omp")) mode = SPINGALETT_COMPUTE_OPENMP;
+        else if (!strcmp(argv[i], "st")) mode = SPINGALETT_COMPUTE_SINGLE_THREADED;
+        else if (!strcmp(argv[i], "gpu")) mode = SPINGALETT_COMPUTE_VULKAN;
+        else if (!strcmp(argv[i], "bf16"))
+            mode = SPINGALETT_COMPUTE_VULKAN, spingalett_set_gpu_precision(SPINGALETT_PRECISION_BFLOAT16);
         else {
             fprintf(stderr, "usage: %s [epochs] [bilinear] [ln] [st|omp|gpu|bf16]\n", argv[0]);
             return 1;
@@ -240,7 +243,8 @@ int main(int argc, char **argv) {
     }
     spingalett_set_verbose(false);
     spingalett_set_compute_mode(mode);
-    if (mode == COMPUTE_VULKAN) printf("GPU: %s\n", spingalett_gpu_device() ? spingalett_gpu_device() : "none (the CPU)");
+    if (mode == SPINGALETT_COMPUTE_VULKAN)
+        printf("GPU: %s\n", spingalett_gpu_device() ? spingalett_gpu_device() : "none (the CPU)");
 
     /* fixed validation and test images, from generators of their own */
     const uint32_t val_count = 256, test_count = 512;
@@ -258,23 +262,23 @@ int main(int argc, char **argv) {
     generate(test_x, test_t, test_count, &test_rng);
 
     spingalett_seed(42);
-    NeuralNetwork *net = unet(bilinear, ln);
+    SpingalettNetwork *net = unet(bilinear, ln);
     printf("U-Net (%s, %s): %u layers, %llu parameters\n", bilinear ? "bilinear upsampling" : "transposed convolutions",
            ln ? "layer normalization" : "batch normalization", spingalett_layer_count(net),
            (unsigned long long)spingalett_parameter_count(net));
 
-    LRScheduleParams schedule = {.warmup_epochs = 1, .min_lr = 1e-5f};
+    SpingalettLRScheduleParams schedule = {.warmup_epochs = 1, .min_lr = 1e-5f};
     double started = now();
-    TrainReport result = train(
+    SpingalettTrainReport result = spingalett_train(
         .net = net,
-        .training_mode = MODE_GENERATOR_FUNCTION,
+        .training_mode = SPINGALETT_MODE_GENERATOR_FUNCTION,
         .generator = generate,
         .generator_data = &train_rng,
         .sample_count = 4096,
         .epochs = epochs,
-        .training_strategy = STRATEGY_SMALL_BATCH,
+        .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH,
         .batch_size = 32,
-        .optimizer_type = OPTIMIZER_ADAMW,
+        .optimizer_type = SPINGALETT_OPTIMIZER_ADAMW,
         .learning_rate = 3e-3f,
         .weight_decay = 1e-4f,
         .lr_scheduler = spingalett_lr_warmup_cosine,
@@ -282,13 +286,13 @@ int main(int argc, char **argv) {
         .val_inputs = val_x,
         .val_targets = val_t,
         .val_count = val_count,
-        .monitor = MONITOR_VAL_LOSS,
+        .monitor = SPINGALETT_MONITOR_VAL_LOSS,
         .restore_best_weights = true,
         .callback = on_epoch,
         .callback_data = &started
     );
     const double wall = now() - started;
-    if (result.status == TRAIN_FAILED) {
+    if (result.status == SPINGALETT_TRAIN_FAILED) {
         fprintf(stderr, "training failed: %s\n", spingalett_last_error_message());
         return 1;
     }
@@ -296,13 +300,13 @@ int main(int argc, char **argv) {
            4096.0 * (double)result.epochs_run / wall, result.best_epoch);
 
     /* timed the second time: the first chooses the GPU's tiles for these shapes */
-    predict(.net = net, .inputs = test_x, .outputs = test_y, .sample_count = test_count);
+    spingalett_predict(.net = net, .inputs = test_x, .outputs = test_y, .sample_count = test_count);
     double t0 = now();
-    predict(.net = net, .inputs = test_x, .outputs = test_y, .sample_count = test_count);
+    spingalett_predict(.net = net, .inputs = test_x, .outputs = test_y, .sample_count = test_count);
     report("network", test_y, test_t, test_count, now() - t0);
 
     /* deployment models, on the CPU */
-    const PrecisionMode precisions[] = {PRECISION_FP16, PRECISION_INT8};
+    const SpingalettPrecisionMode precisions[] = {SPINGALETT_PRECISION_FP16, SPINGALETT_PRECISION_INT8};
     const char *names[] = {"FP16 model", "INT8 model"};
     float *model_y = (float *)malloc((size_t)test_count * PIXELS * CLASSES * sizeof(float));
     for (int q = 0; q < 2 && model_y; q++) {
@@ -330,8 +334,8 @@ int main(int argc, char **argv) {
         printf("%s\n", line);
     }
 
-    save_spingalett(.net = net, .filename = "segmentation.slett", .do_not_save_optimizer = true);
-    free_network(net);
+    spingalett_save(.net = net, .filename = "segmentation.slett", .do_not_save_optimizer = true);
+    spingalett_network_free(net);
     free(val_x); free(val_t); free(test_x); free(test_t); free(test_y);
     return 0;
 }

@@ -251,6 +251,34 @@ for mode in (sg.ComputeMode.OPENMP, sg.ComputeMode.VULKAN):
         results.append(gn.forward(gx))
 check(sg.get_compute_mode() == sg.ComputeMode.VULKAN, "compute mode VULKAN")
 check(np.allclose(results[0], results[1], rtol=1e-4, atol=1e-6), "GPU training == CPU training")
+
+# data sets in the GPU's memory: the same bits as arrays, on the GPU and on the CPU
+if sg.gpu_device() is not None:
+    with sg.DeviceData(gx) as dx, sg.DeviceData(gy) as dy:
+        check(len(dx) == 64 and dx.shape == (64, 6) and np.array_equal(dx.numpy(), gx)
+              and np.array_equal(dy.numpy(5, 2), gy[5:7]), f"device data {dx!r}")
+        for mode in (sg.ComputeMode.VULKAN, sg.ComputeMode.OPENMP):
+            sg.set_compute_mode(mode)
+            outs, metrics = [], []
+            for xs, ys in ((gx, gy), (dx, dy), (dx, gy)):
+                sg.seed(4)
+                with sg.Network(sg.Loss.CROSS_ENTROPY, [6, sg.Layer(8, sg.Activation.RELU),
+                                                       sg.Layer(3, sg.Activation.SOFTMAX)]) as gn:
+                    gn.train(xs, ys, epochs=3, strategy=sg.Strategy.MINI_BATCH, batch_size=16, label_smoothing=0.1,
+                             validation_data=(gx if ys is dy else dx, dy))
+                    outs.append(gn.forward(xs))
+                    metrics.append(gn.evaluate(xs, ys))
+            check(all(np.array_equal(outs[0], o) for o in outs) and metrics[0] == metrics[1] == metrics[2],
+                  f"{mode.name}: training on DeviceData == on arrays")
+        try:
+            with sg.Network(sg.Loss.MSE, [5, 3]) as gn:
+                gn.forward(dx); check(False, "DeviceData of another row size accepted")
+        except ValueError:
+            pass
+    check("closed" in repr(dx), "DeviceData closed by with")
+    with sg.DeviceData(np.array([[0, 51, 255]], dtype=np.uint8)) as du:
+        check(np.array_equal(du.numpy(), np.array([[0, 51, 255]], dtype=np.float32) / np.float32(255)) or
+              np.allclose(du.numpy(), [[0.0, 0.2, 1.0]], rtol=0, atol=1e-7), f"DeviceData of image bytes {du.numpy()}")
 sg.set_compute_mode(sg.ComputeMode.OPENMP)
 
 # generator mode

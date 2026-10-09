@@ -14,9 +14,9 @@
 #define FIELD(T, f) printf("%s.%s %zu\n", #T, #f, offsetof(T, f))
 
 int main(void) {
-    SIZE(NeuralNetworkArgs); FIELD(NeuralNetworkArgs, loss_func);
+    SIZE(NeuralNetworkArgs); FIELD(NeuralNetworkArgs, reserved); FIELD(NeuralNetworkArgs, loss_func);
 
-    SIZE(LayerArgs);
+    SIZE(LayerArgs); FIELD(LayerArgs, reserved);
     FIELD(LayerArgs, net); FIELD(LayerArgs, neurons_amount); FIELD(LayerArgs, act_func);
     FIELD(LayerArgs, weight_initialization); FIELD(LayerArgs, dropout_rate); FIELD(LayerArgs, type);
     FIELD(LayerArgs, height); FIELD(LayerArgs, width); FIELD(LayerArgs, channels); FIELD(LayerArgs, filters);
@@ -27,7 +27,7 @@ int main(void) {
     FIELD(LayerArgs, upsample); FIELD(LayerArgs, output_padding); FIELD(LayerArgs, output_padding_h);
     FIELD(LayerArgs, output_padding_w);
 
-    SIZE(SpingalettNetworkLayer);
+    SIZE(SpingalettNetworkLayer); FIELD(SpingalettNetworkLayer, reserved);
     FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
     FIELD(SpingalettNetworkLayer, channels); FIELD(SpingalettNetworkLayer, outputs); FIELD(SpingalettNetworkLayer, activation);
     FIELD(SpingalettNetworkLayer, dropout_rate); FIELD(SpingalettNetworkLayer, kernel_h); FIELD(SpingalettNetworkLayer, kernel_w);
@@ -37,11 +37,12 @@ int main(void) {
     FIELD(SpingalettNetworkLayer, input_count); FIELD(SpingalettNetworkLayer, inputs);
     FIELD(SpingalettNetworkLayer, upsample);
 
-    SIZE(ForwardArgs); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
+    SIZE(ForwardArgs); FIELD(ForwardArgs, reserved); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
-    SIZE(TrainArgs);
+    SIZE(TrainArgs); FIELD(TrainArgs, reserved);
     FIELD(TrainArgs, net); FIELD(TrainArgs, training_mode); FIELD(TrainArgs, training_strategy);
     FIELD(TrainArgs, optimizer_type); FIELD(TrainArgs, inputs); FIELD(TrainArgs, targets);
+    FIELD(TrainArgs, device_inputs); FIELD(TrainArgs, device_targets);
     FIELD(TrainArgs, generator); FIELD(TrainArgs, generator_data); FIELD(TrainArgs, sample_count);
     FIELD(TrainArgs, batch_size); FIELD(TrainArgs, do_not_shuffle); FIELD(TrainArgs, epochs);
     FIELD(TrainArgs, learning_rate); FIELD(TrainArgs, weight_decay); FIELD(TrainArgs, momentum);
@@ -51,48 +52,50 @@ int main(void) {
     FIELD(TrainArgs, autosave_do_not_save_optimizer); FIELD(TrainArgs, autosave_precision);
     FIELD(TrainArgs, callback); FIELD(TrainArgs, callback_interval); FIELD(TrainArgs, callback_data);
     FIELD(TrainArgs, lr_scheduler); FIELD(TrainArgs, lr_scheduler_data);
-    FIELD(TrainArgs, val_inputs); FIELD(TrainArgs, val_targets); FIELD(TrainArgs, val_count);
+    FIELD(TrainArgs, val_inputs); FIELD(TrainArgs, val_targets); FIELD(TrainArgs, device_val_inputs);
+    FIELD(TrainArgs, device_val_targets); FIELD(TrainArgs, val_count);
     FIELD(TrainArgs, monitor); FIELD(TrainArgs, early_stopping_patience); FIELD(TrainArgs, early_stopping_min_delta);
     FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads); FIELD(TrainArgs, augment_shift);
     FIELD(TrainArgs, augment_flip); FIELD(TrainArgs, label_smoothing);
     FIELD(TrainArgs, lr_plateau_factor); FIELD(TrainArgs, lr_plateau_patience); FIELD(TrainArgs, lr_plateau_min_lr);
 
-    SIZE(EvalMetrics); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
+    SIZE(EvalMetrics); FIELD(EvalMetrics, reserved); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
 
-    SIZE(TrainProgress);
+    SIZE(TrainProgress); FIELD(TrainProgress, reserved);
     FIELD(TrainProgress, epoch); FIELD(TrainProgress, epochs); FIELD(TrainProgress, train_loss);
     FIELD(TrainProgress, learning_rate); FIELD(TrainProgress, has_validation); FIELD(TrainProgress, validation);
     FIELD(TrainProgress, monitor); FIELD(TrainProgress, best_epoch); FIELD(TrainProgress, best_value);
     FIELD(TrainProgress, improved);
 
-    SIZE(TrainReport);
+    SIZE(TrainReport); FIELD(TrainReport, reserved);
     FIELD(TrainReport, status); FIELD(TrainReport, epochs_run); FIELD(TrainReport, train_loss);
     FIELD(TrainReport, has_validation); FIELD(TrainReport, validation); FIELD(TrainReport, monitor);
     FIELD(TrainReport, best_epoch); FIELD(TrainReport, best_value); FIELD(TrainReport, restored_best);
 
-    SIZE(EvaluateArgs);
-    FIELD(EvaluateArgs, net); FIELD(EvaluateArgs, inputs); FIELD(EvaluateArgs, targets); FIELD(EvaluateArgs, sample_count);
+    SIZE(EvaluateArgs); FIELD(EvaluateArgs, reserved);
+    FIELD(EvaluateArgs, net); FIELD(EvaluateArgs, inputs); FIELD(EvaluateArgs, targets);
+    FIELD(EvaluateArgs, device_inputs); FIELD(EvaluateArgs, device_targets); FIELD(EvaluateArgs, sample_count);
 
-    SIZE(OptimizerArgs);
+    SIZE(OptimizerArgs); FIELD(OptimizerArgs, reserved);
     FIELD(OptimizerArgs, type); FIELD(OptimizerArgs, learning_rate); FIELD(OptimizerArgs, weight_decay);
     FIELD(OptimizerArgs, momentum); FIELD(OptimizerArgs, beta1); FIELD(OptimizerArgs, beta2);
     FIELD(OptimizerArgs, epsilon); FIELD(OptimizerArgs, max_grad_norm);
 
-    SIZE(SpingalettDataset);
+    SIZE(SpingalettDataset); FIELD(SpingalettDataset, reserved);
     FIELD(SpingalettDataset, count); FIELD(SpingalettDataset, input_size); FIELD(SpingalettDataset, target_size);
     FIELD(SpingalettDataset, inputs); FIELD(SpingalettDataset, targets); FIELD(SpingalettDataset, height);
     FIELD(SpingalettDataset, width); FIELD(SpingalettDataset, channels); FIELD(SpingalettDataset, class_names);
 
-    SIZE(SpingalettTargetSet);
+    SIZE(SpingalettTargetSet); FIELD(SpingalettTargetSet, reserved);
     FIELD(SpingalettTargetSet, name); FIELD(SpingalettTargetSet, size); FIELD(SpingalettTargetSet, targets);
     FIELD(SpingalettTargetSet, class_names); FIELD(SpingalettTargetSet, encoding);
 
-    SIZE(DatasetSaveOptions);
+    SIZE(DatasetSaveOptions); FIELD(DatasetSaveOptions, reserved);
     FIELD(DatasetSaveOptions, input_encoding); FIELD(DatasetSaveOptions, target_encoding);
     FIELD(DatasetSaveOptions, no_compression); FIELD(DatasetSaveOptions, target_name);
     FIELD(DatasetSaveOptions, extra_targets); FIELD(DatasetSaveOptions, extra_target_count);
 
-    SIZE(SpingalettDatasetInfo);
+    SIZE(SpingalettDatasetInfo); FIELD(SpingalettDatasetInfo, reserved);
     FIELD(SpingalettDatasetInfo, count); FIELD(SpingalettDatasetInfo, input_size); FIELD(SpingalettDatasetInfo, target_size);
     FIELD(SpingalettDatasetInfo, input_encoding); FIELD(SpingalettDatasetInfo, target_encoding);
     FIELD(SpingalettDatasetInfo, chunk_count); FIELD(SpingalettDatasetInfo, file_size);
@@ -100,23 +103,24 @@ int main(void) {
     FIELD(SpingalettDatasetInfo, channels); FIELD(SpingalettDatasetInfo, target_set_count);
     FIELD(SpingalettDatasetInfo, target_set);
 
-    SIZE(DatasetReaderOptions);
+    SIZE(DatasetReaderOptions); FIELD(DatasetReaderOptions, reserved);
     FIELD(DatasetReaderOptions, shuffle); FIELD(DatasetReaderOptions, in_memory); FIELD(DatasetReaderOptions, no_prefetch);
     FIELD(DatasetReaderOptions, target_set);
 
-    SIZE(PredictArgs);
-    FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
+    SIZE(PredictArgs); FIELD(PredictArgs, reserved);
+    FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);
+    FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
 
-    SIZE(SaveArgs);
+    SIZE(SaveArgs); FIELD(SaveArgs, reserved);
     FIELD(SaveArgs, net); FIELD(SaveArgs, filename); FIELD(SaveArgs, do_not_save_optimizer); FIELD(SaveArgs, precision);
 
-    SIZE(SpingalettModel);
+    SIZE(SpingalettModel); FIELD(SpingalettModel, reserved);
     FIELD(SpingalettModel, input_size); FIELD(SpingalettModel, output_size); FIELD(SpingalettModel, layer_count);
     FIELD(SpingalettModel, loss); FIELD(SpingalettModel, workspace_size); FIELD(SpingalettModel, image);
     FIELD(SpingalettModel, image_size); FIELD(SpingalettModel, max_width_); FIELD(SpingalettModel, max_int_inputs_);
     FIELD(SpingalettModel, conv_scratch_); FIELD(SpingalettModel, owner_); FIELD(SpingalettModel, activations_);
 
-    SIZE(SpingalettLayerInfo);
+    SIZE(SpingalettLayerInfo); FIELD(SpingalettLayerInfo, reserved);
     FIELD(SpingalettLayerInfo, type); FIELD(SpingalettLayerInfo, inputs); FIELD(SpingalettLayerInfo, outputs);
     FIELD(SpingalettLayerInfo, activation); FIELD(SpingalettLayerInfo, precision);
     FIELD(SpingalettLayerInfo, in_height); FIELD(SpingalettLayerInfo, in_width); FIELD(SpingalettLayerInfo, in_channels);
@@ -126,7 +130,7 @@ int main(void) {
     FIELD(SpingalettLayerInfo, groups); FIELD(SpingalettLayerInfo, epsilon); FIELD(SpingalettLayerInfo, input_count);
     FIELD(SpingalettLayerInfo, input_layers); FIELD(SpingalettLayerInfo, upsample);
 
-    SIZE(LRScheduleParams);
+    SIZE(LRScheduleParams); FIELD(LRScheduleParams, reserved);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);
     FIELD(LRScheduleParams, gamma); FIELD(LRScheduleParams, min_lr);
     return 0;

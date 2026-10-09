@@ -6,7 +6,7 @@
 #include "Spingalett.Private.h"
 
 const char * const act_func_names[] = {
-    "SIGMOID", "RELU", "TANH", "LEAKY_RELU", "FOO52", "SOFTMAX", "NONE"
+    "NONE", "SIGMOID", "RELU", "TANH", "LEAKY_RELU", "FOO52", "SOFTMAX"
 };
 
 const char * const loss_func_names[] = {

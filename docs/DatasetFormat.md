@@ -8,6 +8,11 @@ independent reader.
 
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 
+**Stability.** Version 2 is the format of Spingalett 1.0. Later versions only add what version 2
+cannot express (encodings, coders, metadata fields), and leave what a version 2 file means
+unchanged; writers write the oldest version that holds the data set, and every 1.x reader loads
+every file whose encodings and coders it has.
+
 Version 2 adds a metadata block (the input shape, further sets of targets, names of sets and of
 classes) and a second coder (rANS over half-bytes). Writers write version 1 when a data set needs
 neither, so that older readers can still load it; readers load both versions.

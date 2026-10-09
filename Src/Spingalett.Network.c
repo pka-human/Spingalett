@@ -32,7 +32,7 @@ static void compute_offsets(NeuralNetwork *net) {
     net->total_biases = b;
 }
 
-NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs args) {
+NeuralNetwork *spingalett_network_new_args(NeuralNetworkArgs args) {
     LossFunction loss_func = args.loss_func;
     if ((unsigned)loss_func >= LOSS_COUNT) {
         set_error(SPINGALETT_ERR_INVALID, "Invalid loss function");
@@ -308,8 +308,10 @@ void spingalett_network_sync(const NeuralNetwork *cnet) {
     /* readers on several threads (predict() may run concurrently, on the kept copy too) bring them back
        once, and not while a predict() runs on it */
     spingalett_network_hold_gpu(net, true);
-    if (atomic_load(&net->gpu_newer) && net->gpu_trainer && !spingalett_gpu_download(net->gpu_trainer))
-        spingalett_log(LOG_ERROR, "The parameters could not be copied back from the GPU");
+    if (atomic_load(&net->gpu_newer) && net->gpu_trainer) {
+        if (spingalett_gpu_download(net->gpu_trainer)) atomic_fetch_add(&net->host_version, 1);
+        else spingalett_log(LOG_ERROR, "The parameters could not be copied back from the GPU");
+    }
     atomic_store(&net->gpu_newer, false);
     spingalett_network_let_go_gpu(net);
 }
@@ -326,7 +328,9 @@ void spingalett_network_release_gpu(NeuralNetwork *net) {
 }
 
 void spingalett_network_written(NeuralNetwork *net) {
-    if (net) net->param_version++;
+    if (!net) return;
+    net->param_version++;
+    atomic_fetch_add(&net->host_version, 1);
 }
 
 bool spingalett_training_state(NeuralNetwork *net) {
@@ -577,7 +581,7 @@ bool spingalett_add_layer(LayerArgs args) {
     return true;
 }
 
-uint32_t layer_struct_arguments(LayerArgs args) {
+uint32_t spingalett_append_layer(LayerArgs args) {
     return spingalett_add_layer(args) ? args.net->layers - 1 : SPINGALETT_NO_LAYER;
 }
 
@@ -604,7 +608,7 @@ bool spingalett_check_graph(const NeuralNetwork *net, const char *who) {
     return false;
 }
 
-LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
+LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
     const LayerShape *s = &net->shapes[l];
     LayerArgs a = {0};
     a.net = net;
@@ -814,7 +818,7 @@ float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMo
     return SPINGALETT_LAYER_PTR(net, net->layers - 1);
 }
 
-float *forward_struct_arguments(ForwardArgs args) {
+float *spingalett_forward_args(ForwardArgs args) {
     NeuralNetwork *net = args.net;
     const float *input = args.input;
 
@@ -855,7 +859,7 @@ float *forward_struct_arguments(ForwardArgs args) {
     return ws->act[net->layers - 1];
 }
 
-void print_parameters(const NeuralNetwork *net) {
+void spingalett_print_network(const NeuralNetwork *net) {
     spingalett_network_sync(net);
     if (!net || net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "print_parameters: network must have at least 2 layers");
@@ -883,7 +887,7 @@ void print_parameters(const NeuralNetwork *net) {
     spingalett_log(LOG_INFO, "================================================");
 }
 
-void free_network(NeuralNetwork *net) {
+void spingalett_network_free(NeuralNetwork *net) {
     if (!net) return;
     spingalett_batch_workspace_free(net->forward_ws);
     spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));

@@ -26,7 +26,7 @@
 #include "common.glsl"
 
 layout(constant_id = 0) const uint OP = 0;
-layout(constant_id = 1) const uint ACT = 6;
+layout(constant_id = 1) const uint ACT = ACT_NONE;
 layout(constant_id = 2) const uint HALF = 0;    /* words: y 0, x 1, a 2, b 3, z 8 (half.glsl) */
 layout(local_size_x = 256) in;
 #include "half.glsl"
@@ -54,27 +54,6 @@ layout(push_constant) uniform Push {
     F32 z;
 } p;
 
-/* 64-bit arithmetic on (low, high) pairs, for the dropout hash */
-uvec2 mul64(uvec2 a, uvec2 b) {
-    uint hi, lo;
-    umulExtended(a.x, b.x, hi, lo);
-    return uvec2(lo, hi + a.x * b.y + a.y * b.x);
-}
-uvec2 add64(uvec2 a, uvec2 b) {
-    uint carry;
-    uint lo = uaddCarry(a.x, b.x, carry);
-    return uvec2(lo, a.y + b.y + carry);
-}
-uvec2 shr64(uvec2 a, uint k) {          /* 0 < k < 32 */
-    return uvec2((a.x >> k) | (a.y << (32u - k)), a.y >> k);
-}
-uvec2 mix64(uvec2 z) {
-    z ^= shr64(z, 30u);
-    z = mul64(z, uvec2(0x1CE4E5B9u, 0xBF58476Du));
-    z ^= shr64(z, 27u);
-    z = mul64(z, uvec2(0x133111EBu, 0x94D049BBu));
-    return z ^ shr64(z, 31u);
-}
 uint hash32(uint x) {
     x ^= x >> 16; x *= 0x7FEB352Du;
     x ^= x >> 15; x *= 0x846CA68Bu;

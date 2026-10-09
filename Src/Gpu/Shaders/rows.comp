@@ -1,0 +1,98 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Rows of a data set kept in the GPU's memory (spingalett_device_data_new()) gathered into a chunk: row s
+ * of the chunk is row index[s] of the set, `size` floats each. The set's address comes from the step
+ * header (WHERE: STEP_INPUTS or STEP_TARGETS), so that a chunk's commands serve every set. Inputs are
+ * augmented as the host augments them (augment_image() in Spingalett.Training.c, the same hash of the
+ * run's seed, the step and the sample's position), targets smoothed as the host smooths them; with bit 1
+ * of HALF the chunk's rows are bfloat16 (the network's inputs kept as such), rounded as the host rounds.
+ * A thread moves VEC values of a row at a time (4 in 16-byte loads when rows hold a multiple of 4).
+ */
+
+#version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#extension GL_EXT_buffer_reference_uvec2 : require
+#include "common.glsl"
+
+layout(constant_id = 0) const uint WHERE = STEP_INPUTS;
+layout(constant_id = 1) const uint VEC = 1;
+layout(constant_id = 2) const uint HALF = 0;    /* word: dst 1 (half.glsl) */
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    U32 index;
+    F32 dst;
+    U32 header;
+    uint n, size;
+    uint height, width, channels;   /* the inputs' shape (augmentation) */
+} p;
+
+#include "half.glsl"
+
+/* The address of value j of row `row` of the set at base: its byte offset has 64 bits, as a set may hold
+   more than 2^32 floats. */
+uvec2 address(uvec2 base, uint row, uint j) {
+    uint hi, lo, carry;
+    umulExtended(row, p.size, hi, lo);
+    lo = uaddCarry(lo, j, carry);
+    hi += carry;
+    return add64(base, uvec2(lo << 2u, (hi << 2u) | (lo >> 30u)));
+}
+
+/* h mod m, for m < 2^24 */
+uint mod64(uvec2 h, uint m) {
+    uint r = h.y % m;
+    for (int b = 24; b >= 0; b -= 8) r = (r * 256u + ((h.x >> uint(b)) & 255u)) % m;
+    return r;
+}
+
+void main() {
+    const uvec2 base = uvec2(p.header.v[WHERE], p.header.v[WHERE + 1u]);
+    const bool targets = WHERE == STEP_TARGETS;
+    const float keep = uintBitsToFloat(p.header.v[STEP_KEEP]), share = uintBitsToFloat(p.header.v[STEP_SHARE]);
+    const uint augment = targets ? 0u : p.header.v[STEP_AUGMENT], k = augment & 0x7FFFFFFFu;
+    const uvec2 seed = uvec2(p.header.v[STEP_AUGMENT_LO], p.header.v[STEP_AUGMENT_HI]);
+    const uvec2 step = uvec2(p.header.v[STEP_STEP_LO], p.header.v[STEP_STEP_HI]);
+    const uint units = p.size / VEC, total = p.n * units, stride = gl_NumWorkGroups.x * 256u, WC = p.width * p.channels;
+    for (uint u = gl_GlobalInvocationID.x; u < total; u += stride) {
+        const uint s = u / units, j = (u - s * units) * VEC, row = p.index.v[s];
+        vec4 v = vec4(0.0);
+        if (augment == 0u) {
+            if (VEC == 4u) v = F32x4(address(base, row, j)).v[0];
+            else v.x = F32(address(base, row, j)).v[0];
+        } else {
+            /* the sample's shift and mirroring: mix64(seed ^ mix64(step * golden + position)) */
+            const uvec2 h = mix64(seed ^ mix64(add64(mul64(step, uvec2(0x7F4A7C15u, 0x9E3779B9u)),
+                                                     uvec2(p.header.v[STEP_POSITION] + s, 0u))));
+            const int dy = k != 0u ? int(mod64(h, 2u * k + 1u)) - int(k) : 0;
+            const int dx = k != 0u ? int(mod64(shr64(h, 21u), 2u * k + 1u)) - int(k) : 0;
+            const bool mirror = (augment >> 31) != 0u && ((h.y >> 10) & 1u) != 0u;
+            for (uint e = 0u; e < VEC; e++) {
+                const uint y = (j + e) / WC, x = (j + e - y * WC) / p.channels, c = j + e - y * WC - x * p.channels;
+                const int sy = int(y) + dy, sx = int(mirror ? p.width - 1u - x : x) + dx;
+                if (sy >= 0 && sy < int(p.height) && sx >= 0 && sx < int(p.width))
+                    v[e] = F32(address(base, row, (uint(sy) * p.width + uint(sx)) * p.channels + c)).v[0];
+            }
+        }
+        precise vec4 w = v;
+        if (targets && keep != 0.0) w = keep * v + share;
+        const uint i = s * p.size + j;
+        if (VEC == 1u) {
+            st(p.dst, i, 1u, w.x);
+            continue;
+        }
+#ifdef SPG_HALF
+        if ((HALF & 2u) != 0u) {
+            U32x2(p.dst).v[i >> 2] = uvec2(to_bf16(w.x) | to_bf16(w.y) << 16, to_bf16(w.z) | to_bf16(w.w) << 16);
+            continue;
+        }
+#endif
+        F32x4(p.dst).v[i >> 2] = w;
+    }
+}

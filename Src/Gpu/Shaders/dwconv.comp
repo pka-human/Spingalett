@@ -1,0 +1,358 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Depthwise convolutions (a group a channel: CG = 1 in Spingalett.Gpu.c's conv_view()), which the matrix
+ * kernels would multiply as products of k = taps: a thread an output value, over channels-last maps x
+ * (in_h x in_w x in_c) and y (out_h x out_w x out_c, out_c = in_c og), filters w [out_c][KH KW] of the
+ * convolution, stride and padding.
+ *
+ *   APPLY    y = conv(x): output channel o reads input channel o / og, taps in order (a convolution's
+ *            forward pass, a transposed convolution's data gradient)
+ *   SPREAD   its transpose: input channel c gathers its og output channels' taps, in order of channel
+ *            then tap, from the gradient at x into the result at y (a convolution's data gradient, a
+ *            transposed convolution's forward pass)
+ *   WEIGHTS  w[slice][o][tap] = the sum over output pixels slice rows .. + rows of y[pixel][o] times
+ *            x[the tap's input pixel][o / og]: partial sums the reduce kernel adds. A workgroup holds a
+ *            slice of up to 256 channels (four to a thread with VEC 4) in `lanes` lanes of threads, a lane
+ *            summing every lanes-th unit in order (a pixel, or a run of WRUN pixels of a row, in order),
+ *            then the lanes' sums added in a fixed tree
+ *
+ * with the epilogues of the products (gemm_common.glsl's store_c()): STORE (+ beta y), BIAS_ACT
+ * (act(v + bias[channel]), the biases in e0), DERIV ((v + beta y) act'(e0)). Every sum runs in a fixed
+ * order, so the results never depend on the dispatch. With VEC 4 (og 1, channels in fours) a thread
+ * computes four channels at once, in vector loads, of PX adjacent pixels of a row (APPLY: output
+ * pixels; SPREAD: input pixels, where PX is a multiple of the stride), which share the loads of their
+ * windows' overlap and the filters, kept in registers; each value's sum keeps the order above.
+ *
+ * PRO: x is the input of a batch normalization the convolution reads (APPLY, WEIGHTS; e0 of a SPREAD's
+ * DERIV, the normalization's input for its output), applied as it is read: act(x a[c] + b[c]) with the
+ * coefficients of bn.comp (bn: mean, 1 / std, a, b), so that the normalization's outputs are never
+ * stored (VEC 4 only). SUMS: such a SPREAD also sums what colsum.comp's DY sums for the normalization's
+ * backward pass, the gradient it stores (dy) and dy (e0 - mean), each thread over its values in order
+ * (a thread keeps one group of four channels: 256 is a multiple of in_c / 4), then the workgroup's
+ * threads of a channel in a fixed tree: part[workgroup][2][in_c].
+ */
+
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+
+#define APPLY   0u
+#define SPREAD  1u
+#define WEIGHTS 2u
+#define EPI_STORE    0u
+#define EPI_BIAS_ACT 1u
+#define EPI_DERIV    4u
+
+layout(constant_id = 0) const uint MODE = APPLY;
+layout(constant_id = 1) const uint EPI = EPI_STORE;
+layout(constant_id = 2) const uint ACT = ACT_NONE;
+layout(constant_id = 3) const uint KH = 3;      /* the window and the stride, constants: the divisions by */
+layout(constant_id = 4) const uint KW = 3;      /* the stride cost little then */
+layout(constant_id = 5) const uint SH = 1;
+layout(constant_id = 6) const uint SW = 1;
+layout(constant_id = 7) const uint VEC = 1;
+layout(constant_id = 8) const uint PW = 0;      /* the padding in x */
+layout(constant_id = 9) const uint PRO = 0;     /* 0, or 1 + the activation of the normalization applied to x */
+layout(constant_id = 10) const uint SUMS = 0;
+layout(constant_id = 11) const uint HALF = 0;   /* words: x 0, y 2, e0 3 (half.glsl) */
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    F32 x, w, y, e0, bn, part;
+    uint total;                     /* threads' work: values of the result (VEC 1), runs of PX pixels of
+                                       four channels (VEC 4; single pixels in a SPREAD whose stride does
+                                       not divide PX) */
+    uint in_h, in_w, in_c, out_h, out_w, out_c, og;
+    uint ph;
+    uint pixels, rows, lanes;       /* WEIGHTS: units (pixels, or runs of WRUN), of a slice, and threads a channel */
+    float beta;
+} p;
+
+#include "half.glsl"
+
+/* the coefficients of PRO's normalization for channels c .. c + 3, and x through it */
+vec4 norm_a(uint c) { return PRO != 0u ? F32x4(p.bn).v[(2u * p.in_c + c) >> 2] : vec4(1.0); }
+vec4 norm_b(uint c) { return PRO != 0u ? F32x4(p.bn).v[(3u * p.in_c + c) >> 2] : vec4(0.0); }
+
+vec4 dy_sum = vec4(0.0), dyx_sum = vec4(0.0);  /* SUMS: the thread's */
+vec4 normalized(vec4 v, vec4 a, vec4 b) {
+    if (PRO == 0u) return v;
+    const vec4 t = v * a + b;
+    return vec4(activate(t.x, PRO - 1u), activate(t.y, PRO - 1u), activate(t.z, PRO - 1u), activate(t.w, PRO - 1u));
+}
+
+/* the epilogue of value i of the result */
+void finish(uint i, uint channel, float v) {
+    if (EPI == EPI_BIAS_ACT) {
+        v = activate(v + p.e0.v[channel], ACT);
+    } else {
+        if (p.beta != 0.0) v += p.beta * ld(p.y, i, 2u);
+        if (EPI == EPI_DERIV) v *= derivative(ld(p.e0, i, 3u), ACT);
+    }
+    st(p.y, i, 2u, v);
+}
+
+/* and of values i .. i + 3, channels channel .. + 3 */
+void finish4(uint i, uint channel, vec4 v) {
+    if (EPI == EPI_BIAS_ACT) {
+        [[unroll]] for (uint k = 0u; k < 4u; k++) v[k] = activate(v[k] + p.e0.v[channel + k], ACT);
+    } else {
+        if (p.beta != 0.0) v += p.beta * ld4(p.y, i, 2u);
+        if (EPI == EPI_DERIV) {
+            const vec4 x = ld4(p.e0, i, 3u), e = normalized(x, norm_a(channel), norm_b(channel));
+            [[unroll]] for (uint k = 0u; k < 4u; k++) v[k] *= derivative(e[k], ACT);
+            if (SUMS != 0u) {
+                vec4 g = v;                                 /* the gradient as stored */
+#ifdef SPG_HALF
+                if (((HALF >> 2u) & 1u) != 0u)
+                    g = vec4(from_bf16(to_bf16(v.x)), from_bf16(to_bf16(v.y)), from_bf16(to_bf16(v.z)), from_bf16(to_bf16(v.w)));
+#endif
+                dy_sum += g;
+                dyx_sum = fma(g, x - F32x4(p.bn).v[channel >> 2], dyx_sum);
+            }
+        }
+    }
+    st4(p.y, i, 2u, v);
+}
+
+/* the filters of channels o .. o + 3 at tap t */
+vec4 w4(uint o, uint t) {
+    const uint taps = KH * KW;
+    return vec4(p.w.v[o * taps + t], p.w.v[(o + 1u) * taps + t], p.w.v[(o + 2u) * taps + t], p.w.v[(o + 3u) * taps + t]);
+}
+
+const uint PX = 4u;
+
+/* output pixels ox0 .. + PX - 1 of row `row` (n out_h + oy), channels o .. o + 3 */
+void apply4(uint row, uint ox0, uint o) {
+    const uint taps = KH * KW, NC = (PX - 1u) * SW + KW;   /* the input columns the windows cover */
+    const uint oy = row % p.out_h, n = row / p.out_h;
+    const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox0 * SW) - int(PW);
+    const vec4 na = norm_a(o), nb = norm_b(o);
+    vec4 w[KH * KW], sum[PX];
+    [[unroll]] for (uint t = 0u; t < taps; t++) w[t] = w4(o, t);
+    [[unroll]] for (uint j = 0u; j < PX; j++) sum[j] = vec4(0.0);
+    [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+        const int iy = y0 + int(ky);
+        if (iy < 0 || iy >= int(p.in_h)) continue;
+        const uint base = (n * p.in_h + uint(iy)) * p.in_w;
+        vec4 v[NC];
+        bool inside[NC];
+        [[unroll]] for (uint k = 0u; k < NC; k++) {
+            const int ix = x0 + int(k);
+            inside[k] = ix >= 0 && ix < int(p.in_w);
+            v[k] = inside[k] ? normalized(ld4(p.x, (base + uint(ix)) * p.in_c + o, 0u), na, nb) : vec4(0.0);
+        }
+        [[unroll]] for (uint j = 0u; j < PX; j++)
+            [[unroll]] for (uint kx = 0u; kx < KW; kx++)
+                if (inside[j * SW + kx]) sum[j] = fma(v[j * SW + kx], w[ky * KW + kx], sum[j]);
+    }
+    [[unroll]] for (uint j = 0u; j < PX; j++)
+        if (ox0 + j < p.out_w) finish4((row * p.out_w + ox0 + j) * p.out_c + o, o, sum[j]);
+}
+
+/* input pixels ix0 .. + PX - 1 of row `row` (n in_h + iy), channels c .. c + 3: pixel ix0 + j is tap kx of
+   output column (ix0 + j + PW - kx) / SW where that divides, which with ix0 a multiple of SW is output
+   column ix0 / SW + LO + k for k = (j + PW - kx) / SW - LO, a constant */
+void spread4(uint row, uint ix0, uint c) {
+    const uint taps = KH * KW, BIAS = 8u * SW;                 /* (BIAS keeps the operands of / and % positive) */
+    const int LO = -int((KW - 1u + SW - 1u) / SW), NC = int((PX - 1u + PW) / SW) - LO + 1;
+    const uint iy = row % p.in_h, n = row / p.in_h;
+    const int ox0 = int(ix0 / SW) + LO;
+    vec4 w[KH * KW], sum[PX];
+    [[unroll]] for (uint t = 0u; t < taps; t++) w[t] = w4(c, t);
+    [[unroll]] for (uint j = 0u; j < PX; j++) sum[j] = vec4(0.0);
+    [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+        const int ty = int(iy + p.ph) - int(ky);
+        if (ty < 0 || uint(ty) % SH != 0u || uint(ty) / SH >= p.out_h) continue;
+        const uint base = (n * p.out_h + uint(ty) / SH) * p.out_w;
+        vec4 v[NC];
+        bool inside[NC];
+        [[unroll]] for (int k = 0; k < NC; k++) {
+            const int ox = ox0 + k;
+            inside[k] = ox >= 0 && ox < int(p.out_w);
+            v[k] = inside[k] ? ld4(p.x, (base + uint(ox)) * p.out_c + c, 0u) : vec4(0.0);
+        }
+        [[unroll]] for (uint j = 0u; j < PX; j++)
+            [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                const uint t = j + PW + BIAS - kx;
+                const int k = int(t / SW) - int(BIAS / SW) - LO;
+                if (t % SW == 0u && inside[k]) sum[j] = fma(v[k], w[ky * KW + kx], sum[j]);
+            }
+    }
+    [[unroll]] for (uint j = 0u; j < PX; j++)
+        if (ix0 + j < p.in_w) finish4((row * p.in_w + ix0 + j) * p.in_c + c, c, sum[j]);
+}
+
+shared vec4 red[256], red2[256];
+
+/* SUMS: the workgroup's sums of each channel, its threads' (lanes of in_c / 4 threads) added pairwise, 1
+   apart, then 2, 4, ... */
+void spread_sums() {
+    const uint quads = p.in_c / 4u, tid = gl_LocalInvocationID.x, lanes = 256u / quads, lane = tid / quads;
+    red[tid] = dy_sum;
+    red2[tid] = dyx_sum;
+    barrier();
+    for (uint step = 1u; step < lanes; step *= 2u) {
+        if (lane % (2u * step) == 0u && lane + step < lanes) {
+            red[tid] += red[tid + step * quads];
+            red2[tid] += red2[tid + step * quads];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        const uint base = gl_WorkGroupID.x * 2u * p.in_c + tid * 4u;
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            p.part.v[base + k] = red[tid][k];
+            p.part.v[base + p.in_c + k] = red2[tid][k];
+        }
+    }
+}
+
+/* VEC 4: APPLY over runs of PX output pixels, SPREAD over runs of PX input pixels where PX is a multiple
+   of the stride (one pixel a thread otherwise) */
+void main4() {
+    const uint stride = gl_NumWorkGroups.x * 256u, taps = KH * KW;
+    const bool runs = MODE == APPLY || PX % SW == 0u;
+    const uint quads = (MODE == APPLY ? p.out_c : p.in_c) / 4u, width = MODE == APPLY ? p.out_w : p.in_w;
+    const uint per_row = runs ? (width + PX - 1u) / PX : width;
+    for (uint q = gl_GlobalInvocationID.x; q < p.total; q += stride) {
+        const uint c = q % quads * 4u, pixel = q / quads, row = pixel / per_row, run = pixel % per_row;
+        if (MODE == APPLY) {
+            apply4(row, run * PX, c);
+        } else if (runs) {
+            spread4(row, run * PX, c);
+        } else {
+            const uint i = (row * p.in_w + run) * p.in_c + c, ix = run, iy = row % p.in_h, n = row / p.in_h;
+            vec4 sum = vec4(0.0);
+            [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                const int ty = int(iy + p.ph) - int(ky);
+                if (ty < 0 || uint(ty) % SH != 0u || uint(ty) / SH >= p.out_h) continue;
+                const uint oy = uint(ty) / SH;
+                [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                    const int tx = int(ix + PW) - int(kx);
+                    if (tx < 0 || uint(tx) % SW != 0u || uint(tx) / SW >= p.out_w) continue;
+                    sum += ld4(p.x, ((n * p.out_h + oy) * p.out_w + uint(tx) / SW) * p.out_c + c, 0u) *
+                           w4(c, ky * KW + kx);
+                }
+            }
+            finish4(i, c, sum);
+        }
+    }
+    if (MODE == SPREAD && SUMS != 0u) spread_sums();
+}
+
+/* WEIGHTS takes runs of WRUN output pixels of a row where the taps' sums of four channels stay in registers:
+   with VEC 4 and windows of up to 9 taps (in the arithmetic of specialization constants, which the
+   optimizer of SPIR-V handles where it does not handle a selection) */
+const uint WRUN = 1u + (PX - 1u) * (VEC / 4u) * ((9u / (KH * KW) + 8u) / 9u);
+
+void weights() {
+    const uint taps = KH * KW, tid = gl_LocalInvocationID.x, quads = p.out_c / VEC, lanes = p.lanes;
+    const uint per = 256u / lanes;                  /* quads (channels) a workgroup */
+    const uint q = gl_WorkGroupID.y * per + tid % per, lane = tid / per;
+    const bool live = lane < lanes && q < quads;
+    const uint o = q * VEC, c = o / p.og, NC = (WRUN - 1u) * SW + KW, per_row = (p.out_w + WRUN - 1u) / WRUN;
+    const uint first = gl_WorkGroupID.x * p.rows, end = min(first + p.rows, p.pixels);
+    const vec4 na = live ? norm_a(c) : vec4(1.0), nb = live ? norm_b(c) : vec4(0.0);
+    vec4 acc[KH * KW];
+    [[unroll]] for (uint t = 0u; t < taps; t++) acc[t] = vec4(0.0);
+    for (uint unit = first + lane; live && unit < end; unit += lanes) {
+        const uint row = unit / per_row, ox0 = unit % per_row * WRUN, oy = row % p.out_h, n = row / p.out_h;
+        vec4 d[WRUN];
+        bool valid[WRUN];
+        [[unroll]] for (uint j = 0u; j < WRUN; j++) {
+            const uint at = (row * p.out_w + ox0 + j) * p.out_c + o;
+            valid[j] = ox0 + j < p.out_w;
+            d[j] = !valid[j] ? vec4(0.0) : VEC == 4u ? ld4(p.y, at, 2u) : vec4(ld(p.y, at, 2u));
+        }
+        const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox0 * SW) - int(PW);
+        [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+            const int iy = y0 + int(ky);
+            if (iy < 0 || iy >= int(p.in_h)) continue;
+            const uint base = (n * p.in_h + uint(iy)) * p.in_w;
+            vec4 v[NC];
+            bool inside[NC];
+            [[unroll]] for (uint k = 0u; k < NC; k++) {
+                const int ix = x0 + int(k);
+                const uint at = (base + uint(ix)) * p.in_c + c;
+                inside[k] = ix >= 0 && ix < int(p.in_w);
+                v[k] = !inside[k] ? vec4(0.0) : VEC == 4u ? normalized(ld4(p.x, at, 0u), na, nb) : vec4(ld(p.x, at, 0u));
+            }
+            [[unroll]] for (uint kx = 0u; kx < KW; kx++)
+                [[unroll]] for (uint j = 0u; j < WRUN; j++)
+                    if (valid[j] && inside[j * SW + kx]) acc[ky * KW + kx] = fma(d[j], v[j * SW + kx], acc[ky * KW + kx]);
+        }
+    }
+    /* each tap's lanes added pairwise, 1 apart, then 2, 4, ...: the same order on every device */
+    [[unroll]] for (uint t = 0u; t < taps; t++) {
+        red[tid] = acc[t];
+        barrier();
+        for (uint step = 1u; step < lanes; step *= 2u) {
+            if (lane % (2u * step) == 0u && lane + step < lanes) red[tid] += red[tid + step * per];
+            barrier();
+        }
+        if (lane == 0u && live)
+            [[unroll]] for (uint k = 0u; k < VEC; k++) p.w.v[(gl_WorkGroupID.x * p.out_c + o + k) * taps + t] = red[tid][k];
+        barrier();
+    }
+}
+
+void main() {
+    if (MODE == WEIGHTS) {
+        weights();
+        return;
+    }
+    if (VEC == 4u) {
+        main4();
+        return;
+    }
+    const uint stride = gl_NumWorkGroups.x * 256u, taps = KH * KW;
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        if (MODE == APPLY) {
+            const uint o = i % p.out_c, pixel = i / p.out_c, ox = pixel % p.out_w, oy = (pixel / p.out_w) % p.out_h;
+            const uint n = pixel / (p.out_w * p.out_h), c = o / p.og;
+            const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox * SW) - int(PW);
+            float sum = 0.0;
+            [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                const int iy = y0 + int(ky);
+                if (iy < 0 || iy >= int(p.in_h)) continue;
+                [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                    const int ix = x0 + int(kx);
+                    if (ix < 0 || ix >= int(p.in_w)) continue;
+                    sum += ld(p.x, ((n * p.in_h + uint(iy)) * p.in_w + uint(ix)) * p.in_c + c, 0u) *
+                           p.w.v[o * taps + ky * KW + kx];
+                }
+            }
+            finish(i, o, sum);
+        } else if (MODE == SPREAD) {
+            /* input pixel (iy, ix) is tap (ky, kx) of output pixel ((iy + ph - ky) / sh, ...) where that
+               divides */
+            const uint c = i % p.in_c, pixel = i / p.in_c, ix = pixel % p.in_w, iy = (pixel / p.in_w) % p.in_h;
+            const uint n = pixel / (p.in_w * p.in_h);
+            float sum = 0.0;
+            for (uint m = 0u; m < p.og; m++) {
+                const uint o = c * p.og + m;
+                [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                    const int ty = int(iy + p.ph) - int(ky);
+                    if (ty < 0 || uint(ty) % SH != 0u || uint(ty) / SH >= p.out_h) continue;
+                    const uint oy = uint(ty) / SH;
+                    [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                        const int tx = int(ix + PW) - int(kx);
+                        if (tx < 0 || uint(tx) % SW != 0u || uint(tx) / SW >= p.out_w) continue;
+                        sum += ld(p.x, ((n * p.out_h + oy) * p.out_w + uint(tx) / SW) * p.out_c + o, 0u) *
+                               p.w.v[o * taps + ky * KW + kx];
+                    }
+                }
+            }
+            finish(i, c, sum);
+        }
+    }
+}

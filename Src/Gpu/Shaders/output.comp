@@ -21,7 +21,7 @@
 #include "common.glsl"
 
 layout(constant_id = 0) const uint OP = 0;
-layout(constant_id = 1) const uint ACT = 6;     /* the output layer's activation */
+layout(constant_id = 1) const uint ACT = ACT_NONE;     /* the output layer's activation */
 layout(constant_id = 2) const uint LOSS = 0;    /* LossFunction */
 layout(constant_id = 3) const uint WIDE = 0;    /* a workgroup a row */
 layout(local_size_x = 64) in;

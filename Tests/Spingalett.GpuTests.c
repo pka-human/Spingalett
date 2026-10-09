@@ -19,6 +19,7 @@
  */
 
 #include "Spingalett.GpuKernels.h"
+#include <Spingalett/Spingalett.Inference.h>     /* the activations (ACT_NONE) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,7 +180,7 @@ static uint32_t conv_push(const Conv *v, const ConvBuffers *b, int pass, uint32_
         p[0] = (SpgGemmPush){.a = b->x.address, .b = b->w.address, .c = b->y.address, .geo = b->geo.address,
                              .M = v->n * OH * OW, .N = OG, .K = K, .ldb = K, .ldc = v->out, .a_group = CG,
                              .b_group = OG * K, .c_group = OG, .alpha = 1.0f};
-        m[0] = (SpgGemmMode){SPG_A_CONV, SPG_B_COL, SPG_EPI_STORE, 6, G, false, vec && CG % 4 == 0 && v->c % 4 == 0,
+        m[0] = (SpgGemmMode){SPG_A_CONV, SPG_B_COL, SPG_EPI_STORE, ACT_NONE, G, false, vec && CG % 4 == 0 && v->c % 4 == 0,
                              vec, 0, timed ? ny : 0, mma};
         return 1;
     }
@@ -190,7 +191,7 @@ static uint32_t conv_push(const Conv *v, const ConvBuffers *b, int pass, uint32_
                                   .M = v->n * b->info.phase[ph].rh * b->info.phase[ph].rw, .N = CG,
                                   .K = b->info.phase[ph].taps * OG, .ldb = CG, .ldc = v->c, .a_group = OG,
                                   .b_group = taps * OG * CG, .c_group = CG, .alpha = 1.0f};
-            m[ph] = (SpgGemmMode){SPG_A_CONV, SPG_B_ROW, SPG_EPI_STORE, 6, G, b->info.phases > 1,
+            m[ph] = (SpgGemmMode){SPG_A_CONV, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, G, b->info.phases > 1,
                                   vec && OG % 4 == 0 && v->out % 4 == 0, vec, 0, timed ? nx : 0, mma};
         }
         return b->info.phases;
@@ -200,7 +201,7 @@ static uint32_t conv_push(const Conv *v, const ConvBuffers *b, int pass, uint32_
                          .geo = b->geo.address, .M = OG, .N = K, .K = pixels, .lda = v->out, .ldc = K,
                          .a_group = OG, .b_group = CG, .c_group = OG * K, .alpha = 1.0f,
                          .slices = (pixels + slice_k - 1) / slice_k, .slice_k = slice_k};
-    m[0] = (SpgGemmMode){SPG_A_COL, SPG_B_CONV, p[0].slices > 1 ? SPG_EPI_PARTIAL : SPG_EPI_STORE, 6, G, false, vec,
+    m[0] = (SpgGemmMode){SPG_A_COL, SPG_B_CONV, p[0].slices > 1 ? SPG_EPI_PARTIAL : SPG_EPI_STORE, ACT_NONE, G, false, vec,
                          vec && CG % 4 == 0 && v->c % 4 == 0, 0, timed ? (uint64_t)v->out * K : 0, mma};
     return 1;
 }
@@ -341,19 +342,19 @@ static void test_dense(uint32_t n, uint32_t in, uint32_t out) {
         for (int vec = 0; vec < 2; vec++) {
             SpgGemmPush p = {.a = bx.address, .b = bw.address, .c = by.address, .M = n, .N = out, .K = in, .lda = in,
                              .ldb = in, .ldc = out, .alpha = 1.0f};
-            SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0, mma};
+            SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, ACT_NONE, 1, false, vec, vec, tile, 0, mma};
             run(&p, &m, 1);
             download(got, &by, (size_t)n * out * 4);
             worst[0] = fmax(worst[0], compare(got, y, (size_t)n * out));
             p = (SpgGemmPush){.a = bd.address, .b = bw.address, .c = bdx.address, .M = n, .N = in, .K = out,
                               .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
-            m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0, mma};
+            m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, 1, false, vec, vec, tile, 0, mma};
             run(&p, &m, 1);
             download(got, &bdx, (size_t)n * in * 4);
             worst[1] = fmax(worst[1], compare(got, dx, (size_t)n * in));
             p = (SpgGemmPush){.a = bd.address, .b = bx.address, .c = bdw.address, .M = out, .N = in, .K = n,
                               .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
-            m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, vec, vec, tile, 0, mma};
+            m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, 1, false, vec, vec, tile, 0, mma};
             run(&p, &m, 1);
             download(got, &bdw, (size_t)out * in * 4);
             worst[2] = fmax(worst[2], compare(got, dw, (size_t)out * in));
@@ -464,17 +465,17 @@ static void bench(bool dense_only) {
                 if (pass == 0) {
                     p = (SpgGemmPush){.a = bx.address, .b = bw.address, .c = by.address, .M = n, .N = out, .K = in,
                                       .lda = in, .ldb = in, .ldc = out, .alpha = 1.0f};
-                    m = (SpgGemmMode){SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, 6, 1, false, true, true, tile,
+                    m = (SpgGemmMode){SPG_A_ROW, SPG_B_COL, SPG_EPI_STORE, ACT_NONE, 1, false, true, true, tile,
                                       (uint64_t)n * out, mma};
                 } else if (pass == 1) {
                     p = (SpgGemmPush){.a = bd.address, .b = bw.address, .c = by.address, .M = n, .N = in, .K = out,
                                       .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
-                    m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, true, true, tile,
+                    m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, 1, false, true, true, tile,
                                       (uint64_t)n * in, mma};
                 } else {
                     p = (SpgGemmPush){.a = bd.address, .b = bx.address, .c = by.address, .M = out, .N = in, .K = n,
                                       .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f};
-                    m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, true, true, tile,
+                    m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, 1, false, true, true, tile,
                                       (uint64_t)out * in, mma};
                 }
                 /* kept as bfloat16: A and B, and C but the weight gradients' */

@@ -59,7 +59,8 @@ layout(push_constant) uniform Push {
 #define GEO_CS 15u              /* step_h | step_w << 16 */
 #define GEO_TAPS 16u
 
-/* VEC: A and B read as vectors (bits 0 and 1), of eight bfloat16 rather than four values (bits 2, 3) */
+/* VEC: A and B read as vectors (bits 0 and 1), of eight bfloat16 rather than four values (bits 2, 3); C
+   written four results at a time (bit 4, gemm.comp) */
 const bool VA = (VEC & 1u) != 0u, VB = (VEC & 2u) != 0u;
 const bool HA = (HALF & 1u) != 0u, HB = (HALF & 2u) != 0u, HC = (HALF & 4u) != 0u, HE = (HALF & 8u) != 0u;
 
@@ -242,7 +243,9 @@ uint c_row(uint m) {
 }
 
 /* Output (m, n) of workgroup z's product, v, through the epilogue (row: c_row(m)). */
-void store_c(uint z, uint coff, uint m, uint row, uint n, float v) {
+/* (precise: no multiply-add contracted, so that gemm.comp's four results at a time, store_c4(), give the
+   same bits) */
+void store_c(uint z, uint coff, uint m, uint row, uint n, precise float v) {
     if (EPI == EPI_PARTIAL) {
         p.c.v[(z * p.M + m) * p.N + n] = v;
         return;

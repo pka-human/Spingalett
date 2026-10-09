@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.13.1 LANGUAGES C)
+project(Spingalett VERSION 0.14.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -473,6 +473,45 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
+    # docs/Reference.md, which docs/make_reference.py writes from the public headers, kept up to date.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME docs.reference
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/docs/make_reference.py --check)
+    endif()
+
+    # A program of the prefixed names only (SPINGALETT_NO_SHORT_NAMES), the names of 0.x its own.
+    add_executable(SpingalettPrefixed ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Prefixed.c)
+    target_link_libraries(SpingalettPrefixed PRIVATE spingalett)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(SpingalettPrefixed PRIVATE m)
+        set_target_properties(SpingalettPrefixed PROPERTIES BUILD_RPATH "$ORIGIN")
+    endif()
+    add_test(NAME api.prefixed COMMAND SpingalettPrefixed)
+
+    # The C++ interface (Spingalett.hpp), where a C++23 compiler with <expected> is at hand.
+    include(CheckLanguage)
+    check_language(CXX)
+    if(CMAKE_CXX_COMPILER)
+        enable_language(CXX)
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_CXX_STANDARD 23)
+        check_cxx_source_compiles("#include <expected>
+            int main() { std::expected<int, int> e = 1; return *e - 1; }" SPINGALETT_HAS_CXX23_EXPECTED)
+        unset(CMAKE_CXX_STANDARD)
+        if(SPINGALETT_HAS_CXX23_EXPECTED)
+            add_executable(SpingalettCpp ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Cpp.cpp)
+            target_link_libraries(SpingalettCpp PRIVATE spingalett)
+            set_target_properties(SpingalettCpp PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
+            if(UNIX AND NOT APPLE)
+                set_target_properties(SpingalettCpp PROPERTIES BUILD_RPATH "$ORIGIN")
+            endif()
+            add_test(NAME api.cpp COMMAND SpingalettCpp)
+        else()
+            message(STATUS "Spingalett: no C++23 <expected>, skipping the C++ interface's test")
+        endif()
+    endif()
+
     foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model gpu xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
@@ -485,7 +524,7 @@ if(BUILD_TESTS)
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuKernels.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c)
         target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_BINARY_DIR}/Gpu
-                                   ${SPINGALETT_VULKAN_INCLUDE})
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/Include ${SPINGALETT_VULKAN_INCLUDE})
         add_dependencies(SpingalettGpuTests spingalett_shaders)
         target_link_libraries(SpingalettGpuTests PRIVATE ${CMAKE_DL_LIBS})
         if(NOT WIN32)

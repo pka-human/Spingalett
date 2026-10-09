@@ -31,7 +31,7 @@ typedef struct {
  * source, whose output shape is the layer's input shape. In a chain every layer reads the one
  * before it.
  */
-struct NeuralNetwork {
+struct SpingalettNetwork {
     uint32_t layers;
     uint32_t *input_offsets;        /* [layers + 1] */
     uint32_t *input_list;           /* [input_offsets[layers]] */
@@ -80,19 +80,22 @@ struct NeuralNetwork {
     ComputeMode forward_mode;
 
     /* predict() and evaluate() with COMPUTE_VULKAN: the network on the GPU, kept between calls (made
-       for the layers as they were, its parameters copied to it on every call); a call takes it and
-       puts it back, so that concurrent calls make their own */
+       for the layers as they were, its parameters copied to it when they changed); a call takes it
+       and puts it back, so that concurrent calls make their own */
     _Atomic(struct SpgGpuNet *) gpu_predict;
 
     /* the network's copy on the GPU: a trainer's of the step API, or (gpu_kept) the one train() left,
        which the network owns and the next train() takes again; newer than these arrays while
        gpu_newer (spingalett_network_sync() brings it back). param_version counts writes to the arrays
-       on the host, after which a copy takes them again; gpu_version is the one the kept copy has */
+       on the host, after which a copy takes them again; gpu_version is the one the kept copy has;
+       host_version counts every change of the arrays, the copies back from the GPU too (gpu_predict
+       holds the parameters of one, spingalett_gpu_net_version()) */
     struct SpgGpuNet *gpu_trainer;
     atomic_bool gpu_newer;
     bool gpu_kept;
     atomic_bool gpu_busy;           /* the kept copy in use (a predict(), a copy back, its release) */
     uint64_t param_version, gpu_version;
+    _Atomic(uint64_t) host_version;
 };
 
 /* The layers layer l (>= 1) reads, and the first of them (its source). */

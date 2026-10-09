@@ -248,7 +248,7 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
         uint8_t *e = img + SLETT_HEADER_SIZE + (size_t)l * entry_size;
         slett_put32(e, net->topology[spingalett_source(net, l + 1)]);
         slett_put32(e + 4, net->topology[l + 1]);
-        e[8] = (uint8_t)net->act_func[l];
+        e[8] = slett_act_code(net->act_func[l]);
         e[9] = (uint8_t)p;
         uint32_t bits;
         memcpy(&bits, &net->dropout_rates[l + 1], 4);
@@ -353,7 +353,7 @@ static NeuralNetwork *fold_batch_norm(const NeuralNetwork *net, bool *failed) {
             map[l] = map[spingalett_source(net, l)];
             continue;
         }
-        LayerArgs a = spingalett_layer_args(src, l);
+        LayerArgs a = spingalett_describe_layer(src, l);
         a.net = f;
         for (uint32_t k = 0; k < a.input_count; k++) a.inputs[k] = map[a.inputs[k]];
         if (into[l]) {
@@ -443,10 +443,10 @@ static const char *find_last_separator(const char *path) {
     return slash ? slash : backslash;
 }
 
-void save_spingalett_struct_arguments(SaveArgs args) {
+bool spingalett_save_args(SaveArgs args) {
     if (!args.net || !args.filename) {
         set_error(SPINGALETT_ERR_INVALID, "save: net or filename is NULL");
-        return;
+        return false;
     }
 
     char *allocated_filename = NULL;
@@ -458,7 +458,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
         allocated_filename = (char *)malloc(len + sizeof SPINGALETT_MODEL_EXTENSION);
         if (!allocated_filename) {
             set_error(SPINGALETT_ERR_ALLOC, "save: filename allocation failed");
-            return;
+            return false;
         }
         memcpy(allocated_filename, target_filename, len);
         memcpy(allocated_filename + len, SPINGALETT_MODEL_EXTENSION, sizeof SPINGALETT_MODEL_EXTENSION);
@@ -469,14 +469,15 @@ void save_spingalett_struct_arguments(SaveArgs args) {
     void *img = spingalett_save_to_memory(args.net, args.precision, !args.do_not_save_optimizer, &size);
     if (!img) {
         free(allocated_filename);
-        return;
+        return false;
     }
 
+    bool ok = false;
     FILE *fp = fopen(target_filename, "wb");
     if (!fp) {
         set_error(SPINGALETT_ERR_FILE_IO, "save: cannot open file for writing");
     } else {
-        bool ok = fwrite(img, 1, size, fp) == size;
+        ok = fwrite(img, 1, size, fp) == size;
         if (fclose(fp) != 0) ok = false;
         if (!ok) {
             set_error(SPINGALETT_ERR_FILE_IO, "save: write error (disk full?)");
@@ -491,6 +492,7 @@ void save_spingalett_struct_arguments(SaveArgs args) {
     }
     spingalett_free(img);
     free(allocated_filename);
+    return ok;
 }
 
 /* ------------------------------------------------------------------------- reading */
@@ -782,8 +784,12 @@ static NeuralNetwork *load_legacy(const uint8_t *data, size_t size, PrecisionMod
         if (topology[i] == 0) { set_error(SPINGALETT_ERR_INVALID, "load: invalid topology"); ok = false; }
     for (uint32_t i = 0; ok && i + 1 < layers; i++) {
         uint8_t a;
-        if (!take(&c, &a, 1) || a >= ACT_COUNT) { set_error(SPINGALETT_ERR_INVALID, "load: invalid activation function"); ok = false; }
-        else act[i] = (ActivationFunction)a;
+        if (!take(&c, &a, 1) || slett_act(a) == ACT_COUNT) {
+            set_error(SPINGALETT_ERR_INVALID, "load: invalid activation function");
+            ok = false;
+        } else {
+            act[i] = slett_act(a);
+        }
     }
     if (ok && version >= 2) {                         /* v2: dropout rate of every non-input layer */
         ok = take(&c, dropout + 1, (size_t)(layers - 1) * 4u);
@@ -847,11 +853,11 @@ NeuralNetwork *spingalett_load_from_memory_ex(const void *data, size_t size, Pre
     return load_legacy(p, size, precision);
 }
 
-NeuralNetwork *load_spingalett_from_memory(const void *data, size_t size) {
+NeuralNetwork *spingalett_load_from_memory(const void *data, size_t size) {
     return spingalett_load_from_memory_ex(data, size, NULL);
 }
 
-NeuralNetwork *load_spingalett(const char *filename) {
+NeuralNetwork *spingalett_load(const char *filename) {
     if (!filename) {
         set_error(SPINGALETT_ERR_INVALID, "load: filename is NULL");
         return NULL;

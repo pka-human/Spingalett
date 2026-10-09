@@ -38,14 +38,14 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.13.1"
+__version__ = "0.14.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
     "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample",
-    "Model", "LayerInfo",
+    "Model", "LayerInfo", "DeviceData",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
@@ -59,13 +59,13 @@ __all__ = [
 # Values mirror Include/Spingalett/Spingalett.h.
 
 class Activation(enum.IntEnum):
-    SIGMOID = 0
-    RELU = 1
-    TANH = 2
-    LEAKY_RELU = 3
-    FOO52 = 4
-    SOFTMAX = 5
-    NONE = 6
+    NONE = 0
+    SIGMOID = 1
+    RELU = 2
+    TANH = 3
+    LEAKY_RELU = 4
+    FOO52 = 5
+    SOFTMAX = 6
 
 
 class Loss(enum.IntEnum):
@@ -193,6 +193,10 @@ _MODE_GENERATOR = 1
 _NetPtr = c_void_p      # NeuralNetwork is opaque
 
 
+# SPINGALETT_RESERVED: the zeroed 64-bit words every public struct ends with (room for fields of 1.x).
+_RESERVED = 8
+
+
 class _NetworkLayer(Structure):
     _fields_ = [
         ("type", c_int),
@@ -216,11 +220,12 @@ class _NetworkLayer(Structure):
         ("input_count", c_uint32),
         ("inputs", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
 class _EvalMetrics(Structure):
-    _fields_ = [("loss", c_float), ("accuracy", c_float)]
+    _fields_ = [("loss", c_float), ("accuracy", c_float), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _TrainProgress(Structure):
@@ -235,6 +240,7 @@ class _TrainProgress(Structure):
         ("best_epoch", c_size_t),
         ("best_value", c_float),
         ("improved", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -249,6 +255,7 @@ class _TrainReport(Structure):
         ("best_epoch", c_size_t),
         ("best_value", c_float),
         ("restored_best", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -259,7 +266,7 @@ _DataGeneratorFn = CFUNCTYPE(c_uint32, POINTER(c_float), POINTER(c_float), c_uin
 
 
 class _NeuralNetworkArgs(Structure):
-    _fields_ = [("loss_func", c_int)]
+    _fields_ = [("loss_func", c_int), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _LayerArgs(Structure):
@@ -292,6 +299,7 @@ class _LayerArgs(Structure):
         ("output_padding", c_uint32),
         ("output_padding_h", c_uint32),
         ("output_padding_w", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -301,7 +309,7 @@ _FloatArray = c_void_p
 
 
 class _ForwardArgs(Structure):
-    _fields_ = [("net", _NetPtr), ("input", _FloatArray)]
+    _fields_ = [("net", _NetPtr), ("input", _FloatArray), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _TrainArgs(Structure):
@@ -312,6 +320,8 @@ class _TrainArgs(Structure):
         ("optimizer_type", c_int),
         ("inputs", POINTER(c_float)),
         ("targets", POINTER(c_float)),
+        ("device_inputs", c_void_p),
+        ("device_targets", c_void_p),
         ("generator", _DataGeneratorFn),
         ("generator_data", c_void_p),
         ("sample_count", c_uint32),
@@ -340,6 +350,8 @@ class _TrainArgs(Structure):
         ("lr_scheduler_data", c_void_p),
         ("val_inputs", POINTER(c_float)),
         ("val_targets", POINTER(c_float)),
+        ("device_val_inputs", c_void_p),
+        ("device_val_targets", c_void_p),
         ("val_count", c_uint32),
         ("monitor", c_int),
         ("early_stopping_patience", c_size_t),
@@ -352,6 +364,7 @@ class _TrainArgs(Structure):
         ("lr_plateau_factor", c_float),
         ("lr_plateau_patience", c_size_t),
         ("lr_plateau_min_lr", c_float),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -359,8 +372,10 @@ class _PredictArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
         ("inputs", _FloatArray),
+        ("device_inputs", c_void_p),
         ("sample_count", c_uint32),
         ("outputs", _FloatArray),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -369,7 +384,10 @@ class _EvaluateArgs(Structure):
         ("net", _NetPtr),
         ("inputs", _FloatArray),
         ("targets", _FloatArray),
+        ("device_inputs", c_void_p),
+        ("device_targets", c_void_p),
         ("sample_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -383,6 +401,7 @@ class _OptimizerArgs(Structure):
         ("beta2", c_float),
         ("epsilon", c_float),
         ("max_grad_norm", c_float),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -397,6 +416,7 @@ class _Dataset(Structure):
         ("width", c_uint32),
         ("channels", c_uint32),
         ("class_names", POINTER(c_char_p)),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -407,6 +427,7 @@ class _TargetSet(Structure):
         ("targets", POINTER(c_float)),
         ("class_names", POINTER(c_char_p)),
         ("encoding", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -418,6 +439,7 @@ class _DatasetSaveOptions(Structure):
         ("target_name", c_char_p),
         ("extra_targets", POINTER(_TargetSet)),
         ("extra_target_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -436,11 +458,12 @@ class _DatasetInfo(Structure):
         ("channels", c_uint32),
         ("target_set_count", c_uint32),
         ("target_set", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
 class _DatasetReaderOptions(Structure):
-    _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32)]
+    _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _SaveArgs(Structure):
@@ -449,6 +472,7 @@ class _SaveArgs(Structure):
         ("filename", c_char_p),
         ("do_not_save_optimizer", c_bool),
         ("precision", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -466,6 +490,7 @@ class _Model(Structure):
         ("conv_scratch_", c_size_t),
         ("owner_", c_void_p),
         ("activations_", c_size_t),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -496,6 +521,7 @@ class _LayerInfo(Structure):
         ("input_count", c_uint32),
         ("input_layers", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -505,6 +531,7 @@ class _LRScheduleParams(Structure):
         ("step_size", c_size_t),
         ("gamma", c_float),
         ("min_lr", c_float),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -569,8 +596,8 @@ def _bind(name, restype, argtypes):
     return fn
 
 
-_new = _bind("new_spingalett_struct_arguments", _NetPtr, [_NeuralNetworkArgs])
-_layer = _bind("layer_struct_arguments", c_uint32, [_LayerArgs])
+_new = _bind("spingalett_network_new_args", _NetPtr, [_NeuralNetworkArgs])
+_layer = _bind("spingalett_append_layer", c_uint32, [_LayerArgs])
 _layer_count = _bind("spingalett_layer_count", c_uint32, [_NetPtr])
 _input_size = _bind("spingalett_input_size", c_uint32, [_NetPtr])
 _output_size = _bind("spingalett_output_size", c_uint32, [_NetPtr])
@@ -582,10 +609,13 @@ _get_parameters = _bind("spingalett_get_parameters", c_bool, [_NetPtr, c_uint32,
 _set_parameters = _bind("spingalett_set_parameters", c_bool, [_NetPtr, c_uint32, c_int, POINTER(c_float), c_uint64])
 _PARAM_WEIGHTS, _PARAM_BIASES, _PARAM_WEIGHT_GRADIENTS, _PARAM_BIAS_GRADIENTS = 0, 1, 2, 3
 _PARAM_RUNNING_MEAN, _PARAM_RUNNING_VARIANCE = 4, 5
-_forward = _bind("forward_struct_arguments", c_void_p, [_ForwardArgs])
-_predict = _bind("predict_struct_arguments", c_bool, [_PredictArgs])
-_train = _bind("train_struct_arguments", _TrainReport, [_TrainArgs])
-_evaluate = _bind("evaluate_struct_arguments", _EvalMetrics, [_EvaluateArgs])
+_forward = _bind("spingalett_forward_args", c_void_p, [_ForwardArgs])
+_predict = _bind("spingalett_predict_args", c_bool, [_PredictArgs])
+_train = _bind("spingalett_train_args", _TrainReport, [_TrainArgs])
+_evaluate = _bind("spingalett_evaluate_args", _EvalMetrics, [_EvaluateArgs])
+_device_data_new = _bind("spingalett_device_data_new", c_void_p, [POINTER(c_float), c_uint32, c_uint32])
+_device_data_free = _bind("spingalett_device_data_free", None, [c_void_p])
+_device_data_read = _bind("spingalett_device_data_read", c_bool, [c_void_p, c_uint32, c_uint32, POINTER(c_float)])
 _TrainerPtr = c_void_p
 _trainer_new = _bind("spingalett_trainer_new", _TrainerPtr, [_NetPtr, c_uint32])
 _trainer_free = _bind("spingalett_trainer_free", None, [_TrainerPtr])
@@ -610,9 +640,9 @@ _dataset_target_set_size = _bind("spingalett_dataset_target_set_size", c_uint32,
 _dataset_close = _bind("spingalett_dataset_close", None, [c_void_p])
 _dataset_info = _bind("spingalett_dataset_info", _DatasetInfo, [c_void_p])
 _dataset_generator = _DataGeneratorFn(ctypes.cast(_lib.spingalett_dataset_generator, c_void_p).value)
-_save = _bind("save_spingalett_struct_arguments", None, [_SaveArgs])
+_save = _bind("spingalett_save_args", c_bool, [_SaveArgs])
 _save_to_memory = _bind("spingalett_save_to_memory", c_void_p, [_NetPtr, c_int, c_bool, POINTER(c_size_t)])
-_load_from_memory = _bind("load_spingalett_from_memory", _NetPtr, [c_char_p, c_size_t])
+_load_from_memory = _bind("spingalett_load_from_memory", _NetPtr, [c_char_p, c_size_t])
 _free_memory = _bind("spingalett_free", None, [c_void_p])
 _export_c_header = _bind("spingalett_export_c_header", c_bool, [_NetPtr, c_char_p, c_char_p, c_int])
 _model_from_network = _bind("spingalett_model_from_network", _ModelPtr, [_NetPtr, c_int])
@@ -622,21 +652,21 @@ _model_free = _bind("spingalett_model_free", None, [_ModelPtr])
 _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
 _model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, _FloatArray, c_uint32, _FloatArray])
 _model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _FloatArray, _FloatArray, c_uint32])
-_load = _bind("load_spingalett", _NetPtr, [c_char_p])
+_load = _bind("spingalett_load", _NetPtr, [c_char_p])
 _import_onnx = _bind("spingalett_import_onnx", _NetPtr, [c_char_p])
 _import_onnx_from_memory = _bind("spingalett_import_onnx_from_memory", _NetPtr, [c_char_p, c_size_t])
 _load_pytorch = _bind("spingalett_load_pytorch", c_bool, [_NetPtr, c_char_p, POINTER(c_char_p), c_uint32])
 _load_pytorch_from_memory = _bind("spingalett_load_pytorch_from_memory", c_bool,
                                   [_NetPtr, c_char_p, c_size_t, POINTER(c_char_p), c_uint32])
-_free = _bind("free_network", None, [_NetPtr])
-_print_parameters = _bind("print_parameters", None, [_NetPtr])
+_free = _bind("spingalett_network_free", None, [_NetPtr])
+_print_parameters = _bind("spingalett_print_network", None, [_NetPtr])
 
 _last_error_code = _bind("spingalett_last_error_code", c_int, [])
 _last_error_message = _bind("spingalett_last_error_message", c_char_p, [])
 _clear_error = _bind("spingalett_clear_error", None, [])
 
 _get_compute_mode = _bind("spingalett_get_compute_mode", c_int, [])
-_set_compute_mode = _bind("spingalett_set_compute_mode", None, [c_int])
+_set_compute_mode = _bind("spingalett_set_compute_mode", c_bool, [c_int])
 _get_num_threads = _bind("spingalett_get_num_threads", ctypes.c_uint, [])
 _cpu_kernels = _bind("spingalett_cpu_kernels", c_char_p, [])
 _gpu_device = _bind("spingalett_gpu_device", c_char_p, [])
@@ -832,7 +862,7 @@ _Inputs = Optional[Union[int, Sequence[int]]]
 class Layer:
     """Dense layer description. Activation, init and dropout are ignored for the input layer."""
     neurons: int
-    activation: Activation = Activation.SIGMOID
+    activation: Activation = Activation.NONE
     init: Init = Init.RANDOM
     dropout: float = 0.0
     inputs: _Inputs = None
@@ -1068,6 +1098,70 @@ def _float_ptr(arr: np.ndarray):
     return arr.ctypes.data_as(POINTER(c_float))
 
 
+class DeviceData:
+    """A data set in the GPU's memory: rows of float32 values copied to the device once, to pass to
+    :meth:`Network.train` (inputs, targets, ``validation_data``), :meth:`Network.forward` and
+    :meth:`Network.evaluate` in place of arrays. With ComputeMode.VULKAN those gather their batches on
+    the device (and training augments and smooths them there) instead of copying samples from the host
+    for every pass; on the CPU they copy the rows back first. Each sample is a row: an array (n, ...)
+    is flattened to (n, values per sample), a 1-D array is a column; uint8 arrays are image bytes, q
+    read as q / 255, as the network's inputs are everywhere. Needs a usable GPU; free it with
+    :meth:`close` or a ``with`` block."""
+
+    def __init__(self, values):
+        arr = _as_float(values)
+        arr = np.ascontiguousarray(arr.reshape(arr.shape[0], -1) if arr.ndim != 1 else arr.reshape(-1, 1))
+        if arr.shape[0] == 0 or arr.shape[1] == 0:
+            raise ValueError(f"DeviceData: no values in an array of shape {arr.shape}")
+        self._ptr = _call(_device_data_new, _float_ptr(arr), arr.shape[0], arr.shape[1])
+        self.shape = (int(arr.shape[0]), int(arr.shape[1]))
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def _handle(self):
+        if not self._ptr:
+            raise ValueError("DeviceData is closed")
+        return self._ptr
+
+    def numpy(self, first: int = 0, count: Optional[int] = None) -> np.ndarray:
+        """Copy of rows ``first`` .. ``first + count - 1`` (all from ``first`` by default)."""
+        count = self.shape[0] - first if count is None else count
+        out = np.empty((max(count, 0), self.shape[1]), dtype=np.float32)
+        _call(_device_data_read, self._handle(), first, count, _float_ptr(out))
+        return out
+
+    def close(self) -> None:
+        if getattr(self, "_ptr", None):
+            _device_data_free(self._ptr)
+            self._ptr = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def __repr__(self) -> str:
+        return f"DeviceData(shape={self.shape}{', closed' if not self._ptr else ''})"
+
+
+def _host(rows):
+    """The address of an array of rows (None for DeviceData or None)."""
+    return rows.ctypes.data if isinstance(rows, np.ndarray) else None
+
+
+def _host_ptr(rows):
+    return _float_ptr(rows) if isinstance(rows, np.ndarray) else None
+
+
+def _device(rows):
+    return rows._handle() if isinstance(rows, DeviceData) else None
+
+
 class Network:
     """A Spingalett network. Use as a context manager or call :meth:`close` to free it."""
 
@@ -1171,7 +1265,7 @@ class Network:
         ``inputs`` to read it."""
         return len(self) - 1
 
-    def add_layer(self, neurons: int, activation: Activation = Activation.SIGMOID,
+    def add_layer(self, neurons: int, activation: Activation = Activation.NONE,
                   init: Init = Init.RANDOM, dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
         """Append a dense layer; the first layer added is the input layer. Every layer reads the one
         before it unless ``inputs`` names another (an index, negative ones counting back from the new
@@ -1362,6 +1456,12 @@ class Network:
         """Run inference. A 1-D input returns one output vector; a 2-D batch returns one row per
         sample and runs as a single batched call (matrix-matrix products on every backend)."""
         n_in, n_out = self.input_size, self.output_size
+        if isinstance(inputs, DeviceData):
+            x = self._rows(inputs, n_in, "inputs")
+            out = np.empty((len(x), n_out), dtype=np.float32)
+            self._net  # raise if closed
+            _call(_predict, _PredictArgs(self._ptr, None, x._handle(), len(x), out.ctypes.data))
+            return out
         arr = _as_float(inputs)
         single = arr.ndim == 1 and arr.size == n_in
         batch = _as_matrix(arr, n_in, "inputs")
@@ -1372,7 +1472,7 @@ class Network:
             return out[0]
         if batch.shape[0]:
             self._net  # raise if closed
-            _call(_predict, _PredictArgs(self._ptr, batch.ctypes.data, batch.shape[0], out.ctypes.data))
+            _call(_predict, _PredictArgs(self._ptr, batch.ctypes.data, None, batch.shape[0], out.ctypes.data))
         return out
 
     __call__ = forward
@@ -1381,14 +1481,24 @@ class Network:
         """Mean loss (as reported by training) and accuracy over a data set. Accuracy compares
         the argmax of outputs and targets; with a single output, their side of 0.5."""
         x, y = self._pair(inputs, targets, "")
-        return _metrics(_call(_evaluate, _EvaluateArgs(self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0])))
+        return _metrics(_call(_evaluate, _EvaluateArgs(self._ptr, _host(x), _host(y), _device(x), _device(y), len(x))))
+
+    @staticmethod
+    def _rows(data: "DeviceData", width: int, name: str) -> "DeviceData":
+        if data.shape[1] != width:
+            raise ValueError(f"{name}: expected rows of {width} values, the DeviceData has {data.shape[1]}")
+        data._handle()
+        return data
 
     def _pair(self, inputs, targets, what: str):
-        x = _as_matrix(inputs, self.input_size, what + "inputs")
-        y = _as_matrix(targets, self.output_size, what + "targets", images=False)
-        if x.shape[0] != y.shape[0]:
-            raise ValueError(f"{what}inputs have {x.shape[0]} rows but {what}targets have {y.shape[0]}")
-        if x.shape[0] == 0:
+        """Inputs and targets as arrays of rows, or DeviceData (either or both)."""
+        x = (self._rows(inputs, self.input_size, what + "inputs") if isinstance(inputs, DeviceData)
+             else _as_matrix(inputs, self.input_size, what + "inputs"))
+        y = (self._rows(targets, self.output_size, what + "targets") if isinstance(targets, DeviceData)
+             else _as_matrix(targets, self.output_size, what + "targets", images=False))
+        if len(x) != len(y):
+            raise ValueError(f"{what}inputs have {len(x)} rows but {what}targets have {len(y)}")
+        if len(x) == 0:
             raise ValueError(f"no {what or 'training '}samples")
         return x, y
 
@@ -1412,8 +1522,8 @@ class Network:
         ``lr_scheduler`` is a built-in schedule or ``fn(epoch, total_epochs, initial_lr) -> lr``.
         """
         cfg = dataclasses.replace(config or TrainConfig(), **overrides)
-        raw = np.asarray(inputs)
-        if raw.dtype == np.uint8:
+        raw = None if isinstance(inputs, DeviceData) else np.asarray(inputs)
+        if raw is not None and raw.dtype == np.uint8:
             # image bytes stay bytes: a reader converts a batch at a time (a quarter of the memory)
             xb = np.ascontiguousarray(raw).reshape(-1, self.input_size) if raw.size % self.input_size == 0 else None
             y = _as_matrix(targets, self.output_size, "targets", images=False)
@@ -1427,7 +1537,7 @@ class Network:
             finally:
                 _dataset_close(reader)
         x, y = self._pair(inputs, targets, "")
-        return self._run(cfg, _MODE_ARRAY, x, y, x.shape[0], None, validation_data)
+        return self._run(cfg, _MODE_ARRAY, x, y, len(x), None, validation_data)
 
     def train_from_generator(self, generator: Callable[[np.ndarray, np.ndarray], int],
                              config: Optional[TrainConfig] = None, samples_per_epoch: int = 0,
@@ -1547,8 +1657,10 @@ class Network:
             training_mode=mode,
             training_strategy=int(cfg.strategy),
             optimizer_type=int(cfg.optimizer),
-            inputs=_float_ptr(x) if x is not None else None,
-            targets=_float_ptr(y) if y is not None else None,
+            inputs=_host_ptr(x),
+            targets=_host_ptr(y),
+            device_inputs=_device(x),
+            device_targets=_device(y),
             generator=c_gen,
             generator_data=c_gen_data,
             sample_count=sample_count,
@@ -1574,9 +1686,11 @@ class Network:
             callback_interval=int(cfg.callback_interval),
             lr_scheduler=c_sched,
             lr_scheduler_data=c_sched_data,
-            val_inputs=_float_ptr(xv) if xv is not None else None,
-            val_targets=_float_ptr(yv) if yv is not None else None,
-            val_count=xv.shape[0] if xv is not None else 0,
+            val_inputs=_host_ptr(xv),
+            val_targets=_host_ptr(yv),
+            device_val_inputs=_device(xv),
+            device_val_targets=_device(yv),
+            val_count=len(xv) if xv is not None else 0,
             monitor=int(cfg.monitor),
             early_stopping_patience=int(cfg.early_stopping_patience),
             early_stopping_min_delta=float(cfg.early_stopping_min_delta),

@@ -5,6 +5,137 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [Unreleased]
+
+## [0.14.0] - 2026-10-09
+
+"Release candidate": the last minor version of 0.x, with the API and the formats 1.0 is to keep.
+Every public name is under the library's prefix, structs end with reserved space, a layer without an
+activation has none, errors are reported one way, and `Spingalett.hpp` gives a C++23 interface;
+`docs/Reference.md` and `docs/Tutorial.md` document them. Programs written for 0.x compile unchanged
+through the short names (`Spingalett.Short.h`) but must be built again: the soname is 0.14, the
+exported symbols are the prefixed ones, and a layer that left out `.act_func` now has no activation
+where it had a sigmoid.
+
+Data sets can live in the GPU's memory, the setting PyTorch's GPU benchmark measures. On an RTX 4050
+Laptop GPU, Spingalett is ahead of PyTorch 2.14 with cuDNN in every workload of
+`Examples/Benchmark.c`, by 1.14 times at least, with the data in the GPU's memory or in the host's
+(README); against 0.13.1 it trains the MobileNet-style network 3.4 and 12 times as fast and infers it
+4 and 13 times as fast (single precision and bfloat16).
+
+### Added
+- **Documentation:** `docs/Reference.md`, every declaration of the public headers with its comment
+  (written by `docs/make_reference.py`; the `docs.reference` test fails when it falls behind the
+  headers), and `docs/Tutorial.md`, a path through the examples from XOR to a model on a
+  microcontroller. `docs/ModelFormat.md` and `docs/DatasetFormat.md` state that `.slett` version 7 and
+  `.slettd` version 2 are the formats of 1.0, which later versions only extend.
+- **A C++ interface**, header-only: `#include <Spingalett/Spingalett.hpp>` (C++23). The library's objects as
+  move-only owners (`spingalett::Network`, `Model`, `Dataset`, `DeviceData`), data as `std::span`,
+  errors as `std::expected<T, spingalett::Error>` (the library's code and message; nothing throws),
+  scoped enums, `TrainOptions` (and every other field of `SpingalettTrainArgs` through its `raw`), and
+  a fluent `Builder` that makes the network in `build()`, reporting the first layer the library
+  refuses. `raw()` gives the C object for what the wrapper does not cover.
+- Data sets in the GPU's memory: `spingalett_device_data_new(values, count, size)` copies rows of
+  floats to the device once (`spingalett_device_data_free()`, `_count()`, `_size()`, `_read()`), and the
+  new fields `device_inputs` and `device_targets` of `TrainArgs` (with `device_val_inputs` and
+  `device_val_targets`), `PredictArgs` and `EvaluateArgs` take them in place of arrays, either or
+  both. With `COMPUTE_VULKAN`, `train()` writes only the rows' indices of each chunk: the GPU gathers
+  the rows, and augments and smooths them as the host does (a kernel of its own, `rows.comp`), so
+  that training on a set gives the bits of training on the host's arrays. Rows that come in order
+  (`predict()`, `evaluate()`, full batches) are read where they are; with `PRECISION_BFLOAT16` a set
+  makes a copy of its rows as bfloat16 on first use (half its size again), which networks read as
+  the inputs they keep as such. On the CPU those calls copy the rows back first. Python:
+  `sg.DeviceData(array)`, which `train()`, `validation_data`, `forward()` and `evaluate()` take in
+  place of arrays. On an RTX 4050 Laptop GPU the fully connected network of `Examples/Benchmark.c`
+  infers 3.52 M samples per second from a set against 2.61 M from host arrays (bfloat16: 8.01 M
+  against 5.00 M).
+
+### Changed
+- **Public structs can grow:** every one ends with `uint64_t reserved[SPINGALETT_RESERVED]` (8 words,
+  zero), so that 1.x releases add fields without changing the layout: programs built before leave them
+  zero through the builders, and zero means a new field's default. Structs the library fills have them
+  zeroed. The Python bindings mirror them.
+- **One way of reporting errors:** a function that fails returns false, NULL, NaN, `SPINGALETT_NO_LAYER`
+  or `SPINGALETT_TRAIN_FAILED` and sets the thread's error code and message (stated in `Spingalett.h`).
+  `spingalett_save()` and `spingalett_set_compute_mode()` returned nothing and now return whether they
+  succeeded (the latter is false for a value of no mode, which it ignored).
+- **Every public name has the library's prefix.** Types are `Spingalett*` (`SpingalettNetwork`,
+  `SpingalettTrainArgs`, `SpingalettActivationFunction`, ...), enumerators `SPINGALETT_*`
+  (`SPINGALETT_ACT_RELU`, `SPINGALETT_LAYER_CONV2D`, ...; the weight initializations, shortened,
+  `SPINGALETT_INIT_HE` and the like), and the builders and functions `spingalett_*`:
+  `spingalett_network_new()`, `spingalett_layer()`, `spingalett_conv2d()` and the other layers,
+  `spingalett_train()`, `spingalett_predict()`, `spingalett_evaluate()`, `spingalett_forward()`,
+  `spingalett_save()`, `spingalett_load()`, `spingalett_load_from_memory()`, `spingalett_activate()`,
+  `spingalett_derivative()`, `spingalett_print_network()`, `spingalett_network_free()`; the functions the
+  builders call are `spingalett_network_new_args()`, `spingalett_append_layer()` and
+  `spingalett_*_args()`. The names of 0.x stay available from `Spingalett/Spingalett.Short.h` (and
+  `Spingalett.Inference.h` for the engine's), which `Spingalett.h` includes unless
+  `SPINGALETT_NO_SHORT_NAMES` is defined: programs written for 0.x compile unchanged, and programs
+  that define that macro may use `layer`, `train`, `LOG_INFO` or `NeuralNetwork` for their own. The
+  library's exported symbols are the prefixed ones (`train_struct_arguments` and the others are gone
+  from the binary).
+- **A layer without `.act_func` has no activation.** `ACT_NONE` is 0 in `ActivationFunction` (which now
+  reads none, sigmoid, ReLU, tanh, leaky ReLU, FOO52, softmax); before, an activation left out was
+  `ACT_SIGMOID`, so that an addition or concatenation written without `.act_func = ACT_NONE` applied a
+  sigmoid. Programs that relied on the implicit sigmoid give `.act_func = ACT_SIGMOID`. In Python,
+  `Layer` and `Network.add_layer()` default to `Activation.NONE` too, and `Activation`'s values follow
+  the C enum. `.slett` files keep their activation codes (0 is sigmoid there, 6 none): files of every
+  version load as before.
+- `TrainArgs`, `PredictArgs` and `EvaluateArgs` have new fields (above): programs built against 0.13
+  need to be built again (the soname carries the minor version).
+- Depthwise convolutions (a group a channel) run on the GPU on a kernel of their own, which the matrix
+  kernel ran as products of k = taps that mostly multiplied padding: a MobileNet-style network (the
+  new fifth workload of `Examples/Benchmark.c`) trains 2.9 times as fast in single precision and 10
+  times as fast in bfloat16 on an RTX 4050 Laptop GPU, ahead of PyTorch with cuDNN (1.2 and 1.08 times
+  as fast as it), and infers 2.8 and 8.6 times as fast.
+- On the GPU a batch normalization read only by a depthwise convolution (of channels in fours) is
+  applied by the convolution to the values it reads, in its forward pass, its weight gradient and the
+  derivative of its data gradient: the normalization's outputs are never written or read back.
+  MobileNet-style training runs 10.6% faster in single precision (12,052 to 13,335 samples/s) and 8%
+  in bfloat16 (26,395 to 28,516), inference 34% and 20% (58,693 to 78,612; 94,507 to 113,703), on an
+  RTX 4050 Laptop GPU. The convolution's data gradient also sums what the normalization's backward
+  pass needs, which then reads its gradient once less: training another 4% faster in single
+  precision (13,391 to 13,927) and 1.5% in bfloat16.
+- The GPU's depthwise kernel computes four adjacent pixels of a row a thread, with the filters in
+  registers and the loads of overlapping windows shared: MobileNet-style training in bfloat16 runs 8.7%
+  faster (24,424 to 26,545 samples/s) and its inference 17% (81,941 to 95,869) on an RTX 4050 Laptop
+  GPU; in single precision, where the kernel is bound by memory, inference gains 8.4%.
+- The GPU's single-precision matrix kernel writes its results four at a time where C (and what the
+  epilogue reads with it) is aligned for it: training in single precision 2 to 10% faster (the
+  convolutional network 103,116 to 108,934 samples/s, the U-Net 3,875 to 4,096, ResNet-20 10,232 to
+  10,475), inference 4 to 9% (ResNet-20 32,170 to 34,896).
+- The GPU trains in chunks of up to 4,096 samples (2,048 in networks with batch normalization, whose
+  statistics are taken over each chunk as on the CPU): the fully connected network trains full
+  batches 6 to 11% faster (bfloat16: 2,841,939 to 3,040,430 samples/s).
+- `train()` on the GPU starts faster: the memory of networks freed before is kept for the next (up to
+  an eighth of the device's memory, given back when an allocation fails), and the parameters' upload is
+  not waited for. The fully connected network trains full batches 7.3% faster in single precision
+  (1,095,058 to 1,174,516 samples/s) and 5.9% in bfloat16, where five epochs took some 2.4 ms more
+  than their GPU time to start.
+- The first training of a process on a machine whose GPU driver has not compiled the kernels yet
+  makes the pipelines the tile choice times on several threads: 1.1 s instead of 2.75 s for the
+  fully connected network, 2.7 s instead of 6.2 s for ResNet-20 in bfloat16.
+- `predict()` and `evaluate()` on the GPU keep the parameters their copy of the network has while the
+  network's do not change (they copied them on every call: 0.75 ms of a call of 3.2 for the fully
+  connected network), and command buffers freed are used again (making one took 0.3 ms on NVIDIA's
+  driver).
+- Inference on the GPU runs in chunks sized by the bytes their activations take as they are kept
+  (bfloat16 counted as two), no longer capped at 2,048 samples (inputs from host arrays still go in
+  chunks of at most 2,048): in bfloat16 the convolutional networks infer 1.12 and 1.14 times as fast.
+- `Examples/Benchmark.c` times inference on a second call, as PyTorch's is timed after its warm-up
+  (the first call makes the network's copy on the GPU, the counterpart of moving a PyTorch model
+  there), runs every GPU workload on the host's arrays and on data sets in the GPU's memory, and has
+  a fifth workload, a MobileNet-style network (`benchmark_pytorch.py` too).
+
+### Fixed
+- The GPU's chunks keep a layer's values within the signed 32-bit indices its kernels compute: chunks
+  of 2,048 samples of layers of 2^20 values or more read and wrote outside their buffers. Networks of
+  up to 2^25 values a sample run in smaller chunks.
+- A chunk filled ahead on the GPU for a step that did not come (early stopping, a callback) no longer
+  leaves its rows' flags to the next `train()` of the network's copy.
+- `Examples/XOR.c` seeds the generator: started from the clock, about one run in five hundred ended
+  in XOR's local minimum and failed the release workflow's check of the installed package.
+
 ## [0.13.1] - 2026-10-09
 
 "GPU": the GPU backend faster in every workload, ahead of PyTorch with cuDNN in all but the fully
@@ -834,6 +965,9 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/pka-human/Spingalett/compare/v0.13.1...v0.14.0
+[0.13.1]: https://github.com/pka-human/Spingalett/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/pka-human/Spingalett/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/pka-human/Spingalett/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/pka-human/Spingalett/compare/v0.10.0...v0.11.0

@@ -155,6 +155,23 @@ typedef struct {
 } SpgCombinePush;
 enum { SPG_COMBINE_ADD, SPG_COMBINE_SLICE, SPG_COMBINE_GAP };
 
+/* dwconv.comp */
+typedef struct {
+    uint64_t x, w, y, e0, bn, part;
+    uint32_t total, in_h, in_w, in_c, out_h, out_w, out_c, og;
+    uint32_t ph, pixels, rows, lanes;       /* (the padding in x is a constant of the kernel) */
+    float beta;
+} SpgDwconvPush;
+enum { SPG_DW_APPLY, SPG_DW_SPREAD, SPG_DW_WEIGHTS };
+#define SPG_DW_TAPS 49u             /* taps at most */
+
+/* rows.comp */
+typedef struct {
+    uint64_t index, dst, header;
+    uint32_t n, size;
+    uint32_t height, width, channels;
+} SpgRowsPush;
+
 /* wtrans.comp */
 typedef struct {
     uint64_t w, wt, order;
@@ -178,4 +195,4 @@ typedef struct {
 enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
 
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
-#define SPG_STEP_HEADER 16u         /* uints of the step header (common.glsl) */
+#define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */

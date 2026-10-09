@@ -109,13 +109,27 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   `spingalett_network_written()` after. A new reader or writer needs the call, or it sees stale
   values (the `gpu` group's `gpu_trainer`, `gpu_callback` and `gpu_kept` read and rewrite weights
   between steps and calls). Code that uses the kept copy holds it (`spingalett_network_hold_gpu()`),
-  as sync and its release do; a change of the network's layers releases it first.
+  as sync and its release do; a change of the network's layers releases it first. `predict()`'s own
+  copy takes the parameters again only when the network's `host_version` moved (every write, every
+  copy back): code that changes parameters or running statistics on the host without
+  `spingalett_network_written()` leaves it stale (`gpu_predict_cached`).
+- **Data sets on the GPU.** Training on `spingalett_device_data_new()` sets gives the bits of training
+  on the host's arrays: `rows.comp` gathers, augments and smooths as `gpu_fill()`, `augment_image()`
+  and `smooth_targets()` do, so a change to one is a change to the other (`gpu_device_data` compares
+  them, with inputs, targets or both on the GPU). Rows read where they are (inference, and training
+  chunks that repeat every epoch) are of the precision the network keeps its inputs in: the set's
+  floats, or its bfloat16 copy (`data_half()`), never floats in place of bfloat16.
 - **Activations as bfloat16.** With `PRECISION_BFLOAT16` the executor keeps layers' outputs and
   gradients as bfloat16 (`kept_half()`): products find which operands are such by address
   (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push
   constants' bfloat16 buffers. A kernel that reads or writes activations through anything but
   `ld()`/`st()` (`half.glsl`) or the products' loads reads garbage in bfloat16: every new kernel
   that touches activations needs a variant and an entry in `half_words[]`.
+- **Normalizations applied by their readers.** On the GPU a batch normalization read only by an
+  addition (`fold[]`) or by a depthwise convolution (`pro[]`, dwconv.comp's PRO) has no outputs: its
+  reader applies it to the normalization's input as it reads. Code that reads a layer's outputs goes
+  through `outputs_of()` and, for a `pro[]` layer, applies the normalization (the forward pass, the
+  weight gradient, the derivative in the data gradient), or it reads a buffer that was never written.
 - **Lazy training state.** Gradients and optimizer moments exist on the host once a network has
   trained on the CPU, made a trainer, or had its GPU copy's parameters brought back
   (`spingalett_training_state()`, which `spingalett_gpu_download()` calls); code that reads them
@@ -159,8 +173,11 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 ## Style
 
 - C23 for the library, C99 for `Inference.c`. Four-space indentation, lines up to about 120
-  columns, `snake_case` with the `spingalett_` prefix for public names, `slett_` for format
-  helpers, file-local names without a prefix.
+  columns, `snake_case` with the `spingalett_` prefix for public functions and builders,
+  `Spingalett` for public types, `SPINGALETT_` for enumerators and macros, `slett_` for format
+  helpers, file-local names without a prefix. A new public name gets its short alias of 0.x only if
+  it renames one (`Spingalett.Short.h`); the library's sources may use the short names, which
+  `Spingalett.h` includes, but its exported symbols are the prefixed ones.
 - Every file starts with the SPDX header (`MIT`, copyright pka_human).
 - Comments say what a block computes and why, in full sentences; match the density of the code
   around them. Documentation is formal English and states facts, not intentions.

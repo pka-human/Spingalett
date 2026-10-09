@@ -20,6 +20,7 @@
 
 #include "Spingalett.Gpu.h"
 #include "Spingalett.GpuKernels.h"
+#include "Spingalett.Thread.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,18 +28,23 @@
 #define MAX_GROUPS  65535u          /* workgroups in x of element-wise kernels, which loop beyond */
 #define COLSUM_ROWS 1024u           /* rows per slice of colsum.comp */
 #define SUMSQ_SLICE 4096u           /* sumsq.comp */
+#define DW_RUN      4u              /* adjacent pixels a thread of dwconv.comp computes (its PX) */
+#define DW_SUMS     128u            /* workgroups, at most, of a depthwise data gradient that sums (SUMS) */
 
 /* ------------------------------------------------------------------------- the network */
 
 typedef struct {
-    SpgGpuBuffer staging;           /* header | inputs | targets | losses | outputs, host-visible */
-    size_t inputs, targets, losses, outputs;    /* their byte offsets */
+    SpgGpuBuffer staging;           /* header | inputs | targets | losses | outputs | indices, host-visible */
+    size_t inputs, targets, losses, outputs, indices;   /* their byte offsets */
     /* the chunk's header, inputs (the outputs of layer 0) and targets on the device: a slot's own,
        so that they are copied while the other slot's chunk runs */
     SpgGpuBuffer header, input, target;
     float *host_inputs;             /* inputs kept as bfloat16: the host's floats, rounded on submission */
     bool staged;                    /* the chunk's inputs are on the device already (rounded or written) */
-    struct { uint64_t key; SpgGpuCommands *commands; } cache[8];
+    uint32_t gathered;              /* the chunk's inputs (1), targets (2) gathered from data sets on the GPU */
+    bool in_place;                  /* its inputs read where they are: rows first.. of the inputs' data set */
+    uint32_t first;
+    struct { uint64_t key, where; SpgGpuCommands *commands; } cache[16];  /* where: the inputs read in place */
     uint32_t used;                  /* entries of cache */
     SpgGpuCommands *pending;        /* submitted and not yet harvested */
     uint32_t n;                     /* samples of the pending chunk */
@@ -84,9 +90,15 @@ struct SpgGpuNet {
        which applies them as it adds (their own outputs are never stored, and their gradient is the
        addition's): fold[l] = that addition, or 0 */
     uint32_t *fold;
+    /* batch normalization layers (no dropout) read only by a depthwise convolution of channels in fours,
+       which applies them to the values it reads (dwconv.comp's PRO): their outputs are never stored, and
+       the readers read their inputs (outputs_of()); pro[l] = that convolution, or 0 */
+    uint32_t *pro;
 
     Slot slots[2];
     uint32_t next;                  /* the slot of the next chunk */
+    SpgGpuRows rows;                /* data sets on the GPU the training chunks' rows come from */
+    uint64_t version;               /* the network's host_version whose parameters it has (the caller's) */
     float step_loss, total_loss;    /* losses harvested so far: of the open step, of closed steps */
 };
 
@@ -120,6 +132,13 @@ typedef struct {
     uint32_t G, CG, OG, taps;                           /* groups, channels of a group in and out, taps */
 } ConvView;
 
+static ConvView conv_view(const NeuralNetwork *net, uint32_t l);
+
+/* Whether layer l's convolution is depthwise (a group a channel, of fewer filters than a block of the
+   matrix units), which dwconv.comp runs: products of a single channel (a group of all the filters, or
+   blocks of filters of one channel) run faster on the matrix kernel. */
+static bool depthwise(const NeuralNetwork *net, uint32_t l);
+
 static ConvView conv_view(const NeuralNetwork *net, uint32_t l) {
     const LayerShape *x = &net->shapes[spingalett_source(net, l)], *s = &net->shapes[l];
     const bool transposed = s->type == LAYER_CONV_TRANSPOSE2D;
@@ -129,6 +148,33 @@ static ConvView conv_view(const NeuralNetwork *net, uint32_t l) {
     v.CG = v.in_c / v.G;
     v.OG = v.out_c / v.G;
     return v;
+}
+
+static bool depthwise(const NeuralNetwork *net, uint32_t l) {
+    const ConvView v = conv_view(net, l);
+    return v.CG == 1u && v.G == v.in_c && v.G > 1u && v.OG < 16u && v.taps <= SPG_DW_TAPS;
+}
+
+/* The slices of a depthwise weight gradient (dwconv.comp's WEIGHTS) over the output pixels of n samples:
+   the channels (four a thread with vec 4) of a workgroup of 256 threads, the threads a channel (lanes),
+   and the units of a slice, some 32 pixels a thread (more when the slices would be more than a dispatch
+   has). A unit is a pixel, or with vec 4 and windows of up to 9 taps a run of DW_RUN pixels of a row. */
+typedef struct { uint32_t vec, per, lanes, units, rows, slices; } DwSlices;
+
+static DwSlices dw_slices(const ConvView *v, uint64_t n) {
+    DwSlices d;
+    d.vec = v->OG == 1u && v->in_c % 4u == 0 ? 4u : 1u;
+    const uint32_t run = d.vec == 4u && v->taps <= 9u ? DW_RUN : 1u;
+    const uint64_t units = n * v->out_h * ((v->out_w + run - 1u) / run);
+    const uint32_t quads = v->out_c / d.vec;
+    d.per = quads < 256u ? quads : 256u;
+    d.lanes = 256u / d.per;
+    uint64_t rows = 32u / run * d.lanes;
+    if ((units + rows - 1u) / rows > MAX_GROUPS) rows = (units + MAX_GROUPS - 1u) / MAX_GROUPS;
+    d.units = (uint32_t)units;
+    d.rows = (uint32_t)rows;
+    d.slices = (uint32_t)((units + rows - 1u) / rows);
+    return d;
 }
 
 bool spingalett_gpu_available(void) {
@@ -145,8 +191,8 @@ const char *spingalett_gpu_name(void) {
 
 bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
     for (uint32_t l = 0; l < net->layers; l++)
-        if ((uint64_t)net->topology[l] * SPINGALETT_BATCH_CHUNK > UINT32_MAX) {
-            if (why) *why = "layers of over 2^32 / 2048 values a sample";
+        if ((uint64_t)net->topology[l] * 64u > INT32_MAX) {
+            if (why) *why = "layers of over 2^25 values a sample";
             return false;
         }
     for (uint32_t l = 1; l < net->layers; l++) {
@@ -176,26 +222,57 @@ static uint64_t sample_floats(const NeuralNetwork *net, bool training) {
     return f + net->topology[net->layers - 1];      /* targets */
 }
 
+/* Samples of a training chunk, at most: products of 4,096 rows run closer to the matrix units' rate than
+   of 2,048, and a step takes half the submissions (full batches of the MLP of Examples/Benchmark.c train
+   5% faster in bfloat16 and 6 to 8% in single precision on an RTX 4050 Laptop GPU; 8,192 are no faster).
+   Batch normalization takes its statistics over each chunk: networks with it keep the CPU's chunks of
+   SPINGALETT_BATCH_CHUNK, and the same groups. */
+#define TRAINING_CHUNK 4096u
+
 /* Bytes of the activations of an inference chunk, at most: a chunk whose layers' outputs stay in the
    GPU's cache from one layer to the next runs faster than a larger one (the U-Net of
    Examples/Benchmark.c infers 1.57 times as fast in chunks of 32 MB as in chunks of 2,048 images on an
    RTX 4050 Laptop GPU) and takes less memory to make. */
 #define INFERENCE_BYTES (32ull << 20)
 
+/* Bytes of a sample's activations in inference: bfloat16 but the output layer's where products are in
+   bfloat16 (kept_half()). */
+static uint64_t inference_bytes(const NeuralNetwork *net) {
+    const bool half = spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16() && spg_gpu_bf16_storage();
+    uint64_t bytes = 0;
+    for (uint32_t l = 0; l < net->layers; l++) bytes += (uint64_t)net->topology[l] * (half && l + 1 < net->layers ? 2u : 4u);
+    return bytes ? bytes : 1u;
+}
+
 uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool training) {
     uint64_t memory = spg_gpu_memory();
     if (memory == 0 || want == 0) return 0;
     /* half the device's memory for the chunk's buffers (the parameters and scratch are smaller) */
     uint64_t per = sample_floats(net, training) * 4u, cap = memory / 2u / (per ? per : 1u);
-    if (cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
+    uint32_t chunk = TRAINING_CHUNK;
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_BATCH_NORM) chunk = SPINGALETT_BATCH_CHUNK;
+    if (training && cap > chunk) cap = chunk;
     /* inference in chunks that keep to the cache, of 64 samples at least */
-    const uint64_t cached = INFERENCE_BYTES / (per ? per : 1u) < 64u ? 64u : INFERENCE_BYTES / (per ? per : 1u);
-    if (!training && cap > cached) cap = cached;
+    const uint64_t cached = INFERENCE_BYTES / inference_bytes(net);
+    if (!training && cap > cached) cap = cached < 64u ? 64u : cached;
+    /* a layer's values of a chunk indexed by kernels with signed 32-bit integers, as SPIR-V indexes */
+    uint32_t widest = 1;
+    for (uint32_t l = 0; l < net->layers; l++) widest = net->topology[l] > widest ? net->topology[l] : widest;
+    if (cap > INT32_MAX / widest) cap = INT32_MAX / widest;
     return cap < want ? (uint32_t)cap : want;
 }
 
 uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) {
     return g->capacity;
+}
+
+uint64_t spingalett_gpu_net_version(const SpgGpuNet *g) {
+    return g->version;
+}
+
+void spingalett_gpu_net_set_version(SpgGpuNet *g, uint64_t version) {
+    g->version = version;
 }
 
 bool spingalett_gpu_net_current(const SpgGpuNet *g) {
@@ -234,7 +311,8 @@ static void pack(const SpgGpuNet *g, float *host, float *image, bool weights, bo
             swap_filters(net, l, host + from, image + to, down);
         else if (down) memcpy(host + from, image + to, count * sizeof(float));
         else memcpy(image + to, host + from, count * sizeof(float));
-        for (uint64_t k = count; !down && k < align4(count); k++) image[to + k] = 0.0f;
+        /* the padding to the next layer's weights (biases), zeros in memory reused from other arenas too */
+        for (uint64_t k = count; !down && k < (weights ? align8(count) : align4(count)); k++) image[to + k] = 0.0f;
     }
 }
 
@@ -304,14 +382,20 @@ static size_t staged(const Item *it, bool down) {
 }
 
 /* Runs the items, after all chunks submitted so far (which the caller has waited for when it
-   uploads into memory the host writes). */
-static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down) {
-    bool commands = false, staging = false;
+   uploads into memory the host writes), then with half the weights' bfloat16 copy from those uploaded.
+   An upload is not waited for unless it copies from another network's buffers: the device runs what
+   comes after it behind a barrier, and the next transfer waits for it before the host writes what it
+   reads. */
+static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down, bool half) {
+    SpgGpuCommands *c = g->once;
+    if (!spg_gpu_wait(c)) return false;
+    bool commands = half, staging = false, copies = false;
     for (uint32_t k = 0; k < count; k++) {
         const Item *it = &items[k];
         if (direct(it, down)) image(g, it, it->device->mapped, false);
         else commands = true;
         staging = staging || staged(it, down) > 0;
+        copies = copies || it->kind == ITEM_COPY;
     }
     if (!commands) return true;
     /* the transfer buffer, made on first use where uploads need none */
@@ -325,7 +409,6 @@ static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down)
         size_t at = 0;
         for (uint32_t k = first; !down && k < last; at += staged(&items[k], down), k++)
             if (staged(&items[k], down)) image(g, &items[k], base + at, false);
-        SpgGpuCommands *c = g->once;
         if (!spg_gpu_record_begin(c)) return false;
         spg_gpu_barrier(c);
         at = 0;
@@ -338,7 +421,15 @@ static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down)
             else spg_gpu_copy(c, &g->transfer, at, it->device, 0, it->bytes);
         }
         spg_gpu_barrier(c);
-        if (!spg_gpu_record_end(c) || !spg_gpu_submit(c) || !spg_gpu_wait(c)) return false;
+        const bool final = last == count;
+        if (final && half) {
+            SpgEltwisePush p = {g->wh.address, g->params.address, 0, 0, 0, (uint32_t)g->Wp, 1, 0, 0, 0.0f, 0, 0};
+            const uint32_t spec[3] = {SPG_ELT_COPY, ACT_NONE, 1u};      /* y kept as bfloat16 */
+            spg_gpu_dispatch(c, SPG_KERNEL_eltwise_h, spec, 3, &p, sizeof p, groups(g->Wp, 256u), 1, 1);
+            spg_gpu_barrier(c);
+        }
+        if (!spg_gpu_record_end(c) || !spg_gpu_submit(c) || ((down || copies || !final) && !spg_gpu_wait(c)))
+            return false;
         at = 0;
         for (uint32_t k = first; down && k < last; at += staged(&items[k], down), k++)
             image(g, &items[k], base + at, true);
@@ -385,21 +476,8 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating, const SpgGpuNet *
             items[k].from = same;
         }
     }
-    bool ok = transfer(g, items, n, down);
+    const bool ok = transfer(g, items, n, down, !down && g->wh.buffer);
     free(items);
-    /* the weights' bfloat16 copy from those uploaded */
-    if (ok && !down && g->wh.buffer) {
-        SpgGpuCommands *c = g->once;
-        SpgEltwisePush p = {g->wh.address, g->params.address, 0, 0, 0, (uint32_t)g->Wp, 1, 0, 0, 0.0f, 0, 0};
-        uint32_t spec[3] = {SPG_ELT_COPY, ACT_NONE, 1u};          /* y kept as bfloat16 */
-        ok = spg_gpu_record_begin(c);
-        if (ok) {
-            spg_gpu_barrier(c);
-            spg_gpu_dispatch(c, SPG_KERNEL_eltwise_h, spec, 3, &p, sizeof p, groups(g->Wp, 256u), 1, 1);
-            spg_gpu_barrier(c);
-            ok = spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
-        }
-    }
     return ok;
 }
 
@@ -439,6 +517,15 @@ static uint64_t part_floats(const NeuralNetwork *net, uint32_t capacity) {
         uint64_t rows = (uint64_t)capacity * s->height * s->width;
         uint64_t slices = (rows + COLSUM_ROWS - 1u) / COLSUM_ROWS;
         if (slices * 2u * s->channels > need) need = slices * 2u * s->channels;
+        if (s->type == LAYER_BATCH_NORM && 2u * DW_SUMS * s->channels > need)       /* (dw_sums()) */
+            need = 2u * DW_SUMS * s->channels;
+        if (spingalett_filters(s->type) && depthwise(net, l)) {
+            /* dwconv.comp's partial sums of the weight gradient, a slice of the output pixels each */
+            const ConvView v = conv_view(net, l);
+            const uint64_t floats = (uint64_t)dw_slices(&v, capacity).slices * v.out_c * v.taps;
+            if (floats > need) need = floats;
+            continue;
+        }
         if (s->type == LAYER_DENSE || spingalett_filters(s->type)) {
             /* the partial products of split weight gradients, summed over the pixels of the
                convolution's output (conv_view()) */
@@ -469,6 +556,42 @@ static bool kept_half(const SpgGpuNet *g, uint32_t l) {
     return l == 0 || net->act_func[l - 1] != ACT_SOFTMAX;
 }
 
+/* What the readers of layer l's outputs read: those outputs, or the input of a normalization that its
+   depthwise reader applies (pro[l]). */
+static const SpgGpuBuffer *outputs_of(const SpgGpuNet *g, uint32_t l) {
+    return g->pro[l] ? &g->act[spingalett_source(g->net, l)] : &g->act[l];
+}
+
+/* The normalization depthwise convolution l applies to what it reads, or 0. */
+static uint32_t applied_norm(const SpgGpuNet *g, uint32_t l) {
+    const uint32_t src = spingalett_source(g->net, l);
+    return g->pro[src] == l ? src : 0u;
+}
+
+/* The threads' work of dw_pass() in mode over n samples (vec: channels a thread): runs of DW_RUN pixels of
+   a row, of one where they do not apply. */
+static uint64_t dw_items(const SpgGpuNet *g, uint32_t l, uint32_t mode, uint32_t n, uint32_t vec) {
+    const ConvView v = conv_view(g->net, l);
+    const bool apply = mode == SPG_DW_APPLY;
+    const uint32_t rows = apply ? v.out_h : v.in_h, width = apply ? v.out_w : v.in_w, C = apply ? v.out_c : v.in_c;
+    const uint32_t run = vec == 4u && (apply || DW_RUN % g->net->shapes[l].stride_w == 0) ? DW_RUN : 1u;
+    return (uint64_t)n * rows * ((width + run - 1u) / run) * (C / vec);
+}
+
+/* The workgroups whose sums (dwconv.comp's SUMS) give normalization bn's backward pass over n samples
+   what colsum.comp would, or 0: the data gradient of the depthwise convolution that applies it (pro[]),
+   with its derivative, sums as it computes the normalization's gradient. The convolution follows the
+   normalization, so that nothing between that gradient and the normalization's backward pass uses part;
+   a thread keeps one group of four channels (256 a multiple of channels / 4). */
+static uint32_t dw_sums(const SpgGpuNet *g, uint32_t bn, uint32_t n) {
+    const NeuralNetwork *net = g->net;
+    if (!g->training || !g->pro[bn] || g->pro[bn] != bn + 1u || net->act_func[bn - 1] == ACT_NONE ||
+        256u % (net->shapes[bn].channels / 4u) != 0)
+        return 0;
+    const uint32_t wg = groups(dw_items(g, bn + 1u, SPG_DW_SPREAD, n, 4u), 256u);
+    return wg < DW_SUMS ? wg : DW_SUMS;
+}
+
 bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training) {
     const OptimizerType o = training->optimizer;
     if (!g->training || g->lost || g->capacity != capacity || !spingalett_gpu_net_current(g) ||
@@ -487,7 +610,10 @@ bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTrain
         }
     g->cfg = *training;
     g->step_loss = g->total_loss = 0.0f;
-    g->slots[0].staged = g->slots[1].staged = false;
+    for (uint32_t k = 0; k < 2; k++) {
+        g->slots[k].staged = g->slots[k].in_place = false;
+        g->slots[k].gathered = 0;
+    }
     return true;
 }
 
@@ -502,7 +628,7 @@ void spingalett_gpu_net_free(SpgGpuNet *g) {
     for (uint32_t k = 0; k < 2; k++) spingalett_aligned_free(g->slots[k].host_inputs);
     for (uint32_t l = 0; g->conv && l < g->layers; l++) free(g->conv[l]);
     free(g->act); free(g->delta); free(g->dmask); free(g->geo); free(g->conv); free(g->bn);
-    free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold); free(g->half); free(g->dhalf);
+    free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold); free(g->pro); free(g->half); free(g->dhalf);
     free(g);
     spg_gemm_release();
 }
@@ -521,6 +647,7 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
     g->capacity = capacity;
     g->layers = L;
     g->training = training != NULL;
+    g->version = UINT64_MAX;
     g->bf16 = spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16();
     if (training) g->cfg = *training;
     g->act = (SpgGpuBuffer *)calloc(L, sizeof(SpgGpuBuffer));
@@ -534,10 +661,11 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
     g->woff = (uint64_t *)calloc(L, sizeof(uint64_t));
     g->boff = (uint64_t *)calloc(L, sizeof(uint64_t));
     g->fold = (uint32_t *)calloc(L, sizeof(uint32_t));
+    g->pro = (uint32_t *)calloc(L, sizeof(uint32_t));
     g->half = (uint8_t *)calloc(L, 1);
     g->dhalf = (uint8_t *)calloc(L, 1);
     if (!g->act || !g->delta || !g->dmask || !g->geo || !g->conv || !g->bn || !g->uses || !g->pending ||
-        !g->woff || !g->boff || !g->fold || !g->half || !g->dhalf)
+        !g->woff || !g->boff || !g->fold || !g->pro || !g->half || !g->dhalf)
         goto fail;
     for (uint32_t l = 1; l < L; l++)
         for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) g->uses[spingalett_inputs(net, l)[k]]++;
@@ -553,9 +681,16 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
             }
         }
     }
-    for (uint32_t l = 0; l < L; l++) {
-        g->half[l] = kept_half(g, l);
-        g->dhalf[l] = training && l > 0 && g->half[l];
+    for (uint32_t c = 2; c < L; c++) {
+        const uint32_t l = spingalett_source(net, c);
+        if (net->shapes[c].type == LAYER_CONV2D && depthwise(net, c) && conv_view(net, c).OG == 1u &&
+            net->shapes[l].channels % 4u == 0 && net->shapes[l].type == LAYER_BATCH_NORM && g->uses[l] == 1 &&
+            net->dropout_rates[l] == 0.0f && net->act_func[l - 1] != ACT_SOFTMAX && !g->fold[l])
+            g->pro[l] = c;
+    }
+    for (uint32_t l = 0; l < L; l++) {     /* (a pro[] layer has no outputs, but a gradient as any other) */
+        g->half[l] = kept_half(g, l) && !g->pro[l];
+        g->dhalf[l] = training && l > 0 && kept_half(g, l);
     }
     /* every layer's weights at a multiple of eight floats (a bfloat16 copy's start at 16 bytes), its
        biases at one of four: the same layout in every copy of the network */
@@ -584,7 +719,8 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
     for (uint32_t l = 0; l < L; l++) {
         const LayerShape *s = &net->shapes[l];
         const uint64_t rows = (uint64_t)capacity * net->topology[l] * 4u;
-        if (l > 0 && !g->fold[l]) spg_gpu_arena_add(A, &g->act[l], g->half[l] ? rows / 2u : rows, SPG_MEMORY_DEVICE);
+        if (l > 0 && !g->fold[l] && !g->pro[l])
+            spg_gpu_arena_add(A, &g->act[l], g->half[l] ? rows / 2u : rows, SPG_MEMORY_DEVICE);
         if (training && l > 0 && !g->fold[l])
             spg_gpu_arena_add(A, &g->delta[l], g->dhalf[l] ? rows / 2u : rows, SPG_MEMORY_DEVICE);
         if (training && l > 0 && l + 1 < L && net->dropout_rates[l] > 0.0f)
@@ -644,7 +780,8 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
         s->targets = s->inputs + (written == SPG_MEMORY_DEVICE ? (input_bytes + 15u) & ~15ull : 0u);
         s->losses = s->targets + (((uint64_t)capacity * out * 4u + 15u) & ~15ull);
         s->outputs = s->losses + (((uint64_t)capacity * 4u + 15u) & ~15ull);
-        spg_gpu_arena_add(A, &s->staging, s->outputs + (uint64_t)capacity * out * 4u, SPG_MEMORY_HOST);
+        s->indices = s->outputs + (((uint64_t)capacity * out * 4u + 15u) & ~15ull);
+        spg_gpu_arena_add(A, &s->staging, s->indices + (uint64_t)capacity * 4u, SPG_MEMORY_HOST);
         spg_gpu_arena_add(A, &s->header, SPG_STEP_HEADER * 4u, written);
         spg_gpu_arena_add(A, &s->input, input_bytes, written);
         if (training) spg_gpu_arena_add(A, &s->target, (uint64_t)capacity * out * 4u, SPG_MEMORY_DEVICE);
@@ -738,7 +875,8 @@ static bool in_half(const SpgGpuNet *g, uint64_t address) {
 static const struct { uint16_t words; uint8_t id; } half_words[SPG_KERNEL_COUNT] = {
     [SPG_KERNEL_colsum] = {0x7, 2}, [SPG_KERNEL_bn] = {0x2, 1}, [SPG_KERNEL_eltwise] = {0x10F, 2},
     [SPG_KERNEL_pool] = {0xF, 3}, [SPG_KERNEL_combine] = {0x7, 3}, [SPG_KERNEL_upsample] = {0xF, 3},
-    [SPG_KERNEL_ln] = {0x7, 3}, [SPG_KERNEL_optim] = {0x100, 1},
+    [SPG_KERNEL_ln] = {0x7, 3}, [SPG_KERNEL_optim] = {0x100, 1}, [SPG_KERNEL_rows] = {0x2, 2},
+    [SPG_KERNEL_dwconv] = {0xD, 11},
 };
 
 /* Records a kernel after the barrier it needs; its bfloat16 variant, told which buffers are such, when
@@ -835,8 +973,42 @@ static void eltwise(SpgGpuNet *g, Recorder *r, const Access *a, uint32_t op, uin
    convolved, times act'(e0) with SPG_EPI_DERIV (e0 laid out like y). Over n samples, x and y the
    maps of the convolution's input and output: a convolution's forward pass, a transposed
    convolution's data gradient. The access lists what the caller reads and writes besides. */
+/* A depthwise convolution's pass of n samples on dwconv.comp (mode SPG_DW_APPLY or SPG_DW_SPREAD), with the
+   epilogues of conv_apply() and conv_spread(): from x (the gradient with SPREAD) into y. */
+static void dw_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t mode, const SpgGpuBuffer *x,
+                    const SpgGpuBuffer *y, uint32_t n, uint32_t epi, uint32_t act, uint64_t e0, float beta) {
+    const ConvView v = conv_view(g->net, l);
+    const LayerShape *s = &g->net->shapes[l];
+    const bool bias = epi == SPG_EPI_BIAS_ACT;
+    /* four channels a thread where they come in fours, each its own (og 1), of runs of DW_RUN pixels of a
+       row: output pixels (APPLY), or input pixels where the run is a multiple of the stride (SPREAD) */
+    const uint32_t vec = v.OG == 1u && v.in_c % 4u == 0 ? 4u : 1u;
+    const bool apply = mode == SPG_DW_APPLY;
+    /* the normalization the convolution applies: to x of its forward pass, to e0 of its data gradient's
+       derivative, which may also sum for the normalization's backward pass (over `sums` workgroups) */
+    const uint32_t bn = apply || epi == SPG_EPI_DERIV ? applied_norm(g, l) : 0u;
+    const uint32_t sums = !apply && bn ? dw_sums(g, bn, n) : 0u;
+    SpgDwconvPush p = {x->address, weights_at(g, l - 1), y->address, bias ? biases_at(g, l - 1) : e0,
+                       bn ? g->bn[bn].address : 0, sums ? g->part.address : 0, (uint32_t)dw_items(g, l, mode, n, vec),
+                       v.in_h, v.in_w, v.in_c, v.out_h, v.out_w, v.out_c, v.OG, s->pad_h, 0, 0, 0, beta};
+    const uint32_t spec[11] = {mode, epi, act, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, vec, s->pad_w,
+                               bn ? 1u + g->net->act_func[bn - 1] : 0u, sums ? 1u : 0u};
+    if (bn) reads(a, span(g->bn[bn].address, 4u * v.in_c));
+    if (sums) writes(a, span(g->part.address, 2ull * sums * v.in_c));
+    reads(a, whole(x));
+    reads(a, weights_of(g, l - 1));
+    if (bias) reads(a, biases_of(g, l - 1));
+    if (beta != 0.0f) reads(a, whole(y));
+    writes(a, whole(y));
+    kernel(r, a, SPG_KERNEL_dwconv, spec, 11, &p, sizeof p, sums ? sums : groups(p.total, 256u), 1, 1);
+}
+
 static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *x, const SpgGpuBuffer *y,
                        uint32_t n, uint32_t epi, uint32_t act, uint64_t e0, float beta) {
+    if (depthwise(g->net, l)) {
+        dw_pass(g, r, a, l, SPG_DW_APPLY, x, y, n, epi, act, e0, beta);
+        return;
+    }
     const ConvView v = conv_view(g->net, l);
     const uint32_t K = v.taps * v.CG;
     const bool bias = epi == SPG_EPI_BIAS_ACT;
@@ -865,6 +1037,10 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
    forward pass. */
 static void conv_spread(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *dy,
                         const SpgGpuBuffer *dx, uint32_t n, uint32_t epi, uint32_t act, uint64_t e0, float beta) {
+    if (depthwise(g->net, l)) {
+        dw_pass(g, r, a, l, SPG_DW_SPREAD, dy, dx, n, epi, act, e0, beta);
+        return;
+    }
     const ConvView v = conv_view(g->net, l);
     const SpgConvGeometry *info = g->conv[l];
     const bool bias = epi == SPG_EPI_BIAS_ACT;
@@ -903,7 +1079,7 @@ static void conv_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint
     const uint32_t src = spingalett_source(g->net, l);
     Access a = {0};
     if (g->net->shapes[l].type == LAYER_CONV2D)
-        conv_apply(g, r, &a, l, &g->act[src], &g->act[l], n, SPG_EPI_BIAS_ACT, act, 0, 0.0f);
+        conv_apply(g, r, &a, l, outputs_of(g, src), &g->act[l], n, SPG_EPI_BIAS_ACT, act, 0, 0.0f);
     else
         conv_spread(g, r, &a, l, &g->act[src], &g->act[l], n, SPG_EPI_BIAS_ACT, act, 0, 0.0f);
 }
@@ -1000,7 +1176,7 @@ static void bn_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32
         writes(&a, span(running_at(g, l - 1, 1), C));
     }
     kernel(r, &a, SPG_KERNEL_bn, &mode, 1, &bp, sizeof bp, (C + 63u) / 64u, 1, 1);
-    if (g->fold[l]) return;                     /* applied by the addition that reads it */
+    if (g->fold[l] || g->pro[l]) return;        /* applied by the addition or the convolution that reads it */
     Access b = {0};
     reads(&b, whole(&g->act[src]));
     reads(&b, span(stats, 4u * C));
@@ -1153,7 +1329,7 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
     Access a = {0};
     reads(&a, whole(&g->delta[cl]));
     if (derive || spingalett_normalization(s->type) || s->type == LAYER_MAX_POOL2D || s->type == LAYER_AVG_POOL2D)
-        reads(&a, whole(&g->act[i]));
+        reads(&a, whole(outputs_of(g, i)));
     if (accumulate) reads(&a, whole(dst));
     writes(&a, whole(dst));
     switch (s->type) {
@@ -1172,7 +1348,7 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
         }
         case LAYER_CONV2D:          /* through the convolution's data gradient (conv_spread()) */
             conv_spread(g, r, &a, cl, &g->delta[cl], dst, n, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused,
-                        g->act[i].address, accumulate ? 1.0f : 0.0f);
+                        outputs_of(g, i)->address, accumulate ? 1.0f : 0.0f);
             return derive;
         case LAYER_CONV_TRANSPOSE2D:    /* the forward pass of the convolution it transposes */
             conv_apply(g, r, &a, cl, &g->delta[cl], dst, n, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused,
@@ -1243,17 +1419,20 @@ static void bn_backward(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t n, floa
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, cl);
     const LayerShape *s = &net->shapes[cl];
-    const uint32_t C = s->channels, R = n * s->height * s->width, slices = (R + COLSUM_ROWS - 1u) / COLSUM_ROWS;
-    uint32_t cols = C <= 16u ? 16u : C <= 32u ? 32u : 64u;
-    SpgColsumPush cp = {g->act[src].address, g->delta[cl].address, g->bn[cl].address, g->part.address, R, C,
-                        COLSUM_ROWS, 0};
-    uint32_t spec[2] = {cols, SPG_COLSUM_DY};
-    Access a = {0};
-    reads(&a, whole(&g->act[src]));
-    reads(&a, whole(&g->delta[cl]));
-    reads(&a, span(g->bn[cl].address, C));
-    writes(&a, span(g->part.address, 2ull * slices * C));
-    kernel(r, &a, SPG_KERNEL_colsum, spec, 2, &cp, sizeof cp, (C + cols - 1) / cols, slices, 1);
+    const uint32_t C = s->channels, R = n * s->height * s->width, sums = dw_sums(g, cl, n);
+    const uint32_t slices = sums ? sums : (R + COLSUM_ROWS - 1u) / COLSUM_ROWS;
+    if (!sums) {    /* (otherwise the data gradient that made delta[cl] summed) */
+        uint32_t cols = C <= 16u ? 16u : C <= 32u ? 32u : 64u;
+        SpgColsumPush cp = {g->act[src].address, g->delta[cl].address, g->bn[cl].address, g->part.address, R, C,
+                            COLSUM_ROWS, 0};
+        uint32_t spec[2] = {cols, SPG_COLSUM_DY};
+        Access a = {0};
+        reads(&a, whole(&g->act[src]));
+        reads(&a, whole(&g->delta[cl]));
+        reads(&a, span(g->bn[cl].address, C));
+        writes(&a, span(g->part.address, 2ull * slices * C));
+        kernel(r, &a, SPG_KERNEL_colsum, spec, 2, &cp, sizeof cp, (C + cols - 1) / cols, slices, 1);
+    }
     SpgBnPush bp = {
         .part = g->part.address, .gamma = weights_at(g, cl - 1), .stats = g->bn[cl].address,
         .coef = g->bn[cl].address + 16u * C, .ggamma = grad_weights_at(g, cl - 1), .gbeta = grad_biases_at(g, cl - 1),
@@ -1314,7 +1493,36 @@ static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, f
     uint32_t rows, M, N, K;
     Access a = {0};
     reads(&a, whole(&g->delta[l + 1]));
-    reads(&a, whole(&g->act[src]));
+    reads(&a, whole(outputs_of(g, src)));
+    if (s->type != LAYER_DENSE && depthwise(net, l + 1)) {
+        /* depthwise: partial sums over slices of the output pixels (dwconv.comp), added in order */
+        const ConvView v = conv_view(net, l + 1);
+        const bool transposed = s->type == LAYER_CONV_TRANSPOSE2D;
+        const SpgGpuBuffer *x = transposed ? &g->delta[l + 1] : outputs_of(g, src);
+        const SpgGpuBuffer *dy = transposed ? &g->act[src] : &g->delta[l + 1];
+        const DwSlices d = dw_slices(&v, n);
+        const uint32_t slices = d.slices;
+        const uint32_t bn = transposed ? 0u : applied_norm(g, l + 1);
+        SpgDwconvPush p = {x->address, g->part.address, dy->address, 0, bn ? g->bn[bn].address : 0, 0, 0,
+                           v.in_h, v.in_w, v.in_c, v.out_h, v.out_w, v.out_c, v.OG, s->pad_h, d.units, d.rows, d.lanes,
+                           0.0f};
+        const uint32_t spec[11] = {SPG_DW_WEIGHTS, 0, ACT_NONE, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w,
+                                   d.vec, s->pad_w, bn ? 1u + net->act_func[bn - 1] : 0u, 0};
+        if (bn) reads(&a, span(g->bn[bn].address, 4u * v.in_c));
+        const Range part = span(g->part.address, (uint64_t)slices * v.out_c * v.taps);
+        writes(&a, part);
+        kernel(r, &a, SPG_KERNEL_dwconv, spec, 11, &p, sizeof p, slices, (v.out_c / d.vec + d.per - 1u) / d.per, 1);
+        const Range grad = span(grad_weights_at(g, l), weight_count(g, l));
+        SpgReducePush rp = {g->part.address, grad_weights_at(g, l), v.out_c * v.taps, v.out_c * v.taps, slices, scale,
+                            beta, 0};
+        Access b = {0};
+        reads(&b, part);
+        if (beta != 0.0f) reads(&b, grad);
+        writes(&b, grad);
+        kernel(r, &b, SPG_KERNEL_reduce, NULL, 0, &rp, sizeof rp, groups(rp.total, 256u), 1, 1);
+        column_sums(g, r, &g->delta[l + 1], n * s->height * s->width, s->channels, grad_biases_at(g, l), scale, beta);
+        return;
+    }
     if (s->type == LAYER_DENSE) {
         /* gW[out x in] = delta^T act */
         M = out_sz; N = net->topology[src]; K = n; rows = n;
@@ -1477,6 +1685,112 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
     }
 }
 
+/* ------------------------------------------------------------------------- data sets on the GPU */
+
+struct SpingalettDeviceData {
+    SpgGpuArena *arena;
+    SpgGpuBuffer buffer;            /* count rows of size floats */
+    uint32_t count, size;
+    /* the rows as bfloat16, rounded as the host rounds inputs kept as such (made on first use, under the
+       lock: a set may serve several networks and threads) */
+    SpgSignal *lock;
+    SpgGpuArena *half_arena;
+    SpgGpuBuffer half;
+    int half_state;                 /* 0: not made yet, 1: made, -1: could not be */
+};
+
+/* One copy between a device buffer and host memory, through a host-visible buffer of its own. */
+static bool data_copy(const SpgGpuBuffer *device, size_t offset, void *host, size_t bytes, bool down) {
+    SpgGpuBuffer stage;
+    if (!spg_gpu_buffer_create(&stage, bytes, true)) return false;
+    if (!down) memcpy(stage.mapped, host, bytes);
+    SpgGpuCommands *c = spg_gpu_commands_create();
+    bool ok = c && spg_gpu_record_begin(c);
+    if (ok) {
+        spg_gpu_barrier(c);
+        if (down) spg_gpu_copy(c, device, offset, &stage, 0, bytes);
+        else spg_gpu_copy(c, &stage, 0, device, offset, bytes);
+        spg_gpu_barrier(c);
+        ok = spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
+    }
+    if (ok && down) memcpy(host, stage.mapped, bytes);
+    spg_gpu_commands_free(c);
+    spg_gpu_buffer_free(&stage);
+    return ok;
+}
+
+SpingalettDeviceData *spingalett_gpu_data_create(const float *values, uint32_t count, uint32_t size) {
+    if (!spg_gpu_open() || count == 0 || size == 0) return NULL;
+    SpingalettDeviceData *d = (SpingalettDeviceData *)calloc(1, sizeof *d);
+    if (!d || !(d->lock = spg_signal_create()) || !(d->arena = spg_gpu_arena_create())) {
+        if (d) spg_signal_free(d->lock);
+        free(d);
+        return NULL;
+    }
+    d->count = count;
+    d->size = size;
+    const size_t bytes = (size_t)count * size * sizeof(float);
+    /* written by the host straight into the device's memory where it can */
+    spg_gpu_arena_add(d->arena, &d->buffer, bytes, spg_gpu_host_writes() ? SPG_MEMORY_HOST_WRITES : SPG_MEMORY_DEVICE);
+    bool ok = spg_gpu_arena_commit(d->arena);
+    if (ok && d->buffer.mapped) memcpy(d->buffer.mapped, values, bytes);
+    else if (ok) ok = data_copy(&d->buffer, 0, (void *)values, bytes, false);
+    if (!ok) {
+        spingalett_gpu_data_free(d);
+        return NULL;
+    }
+    return d;
+}
+
+uint32_t spingalett_gpu_data_count(const SpingalettDeviceData *d) { return d ? d->count : 0; }
+uint32_t spingalett_gpu_data_size(const SpingalettDeviceData *d) { return d ? d->size : 0; }
+
+void spingalett_gpu_data_free(SpingalettDeviceData *d) {
+    if (!d) return;
+    spg_gpu_arena_free(d->half_arena);
+    spg_gpu_arena_free(d->arena);
+    spg_signal_free(d->lock);
+    free(d);
+}
+
+/* The set's rows as bfloat16 (NULL when they cannot be made: no memory, or more values than the
+   conversion indexes), for networks that keep their inputs as such: read where they are, as the host's
+   rounded inputs would be, by every kind of layer. */
+static const SpgGpuBuffer *data_half(const SpingalettDeviceData *cd) {
+    SpingalettDeviceData *d = (SpingalettDeviceData *)cd;      /* a cache of the values it holds */
+    spg_lock(d->lock);
+    const uint64_t values = (uint64_t)d->count * d->size;
+    if (d->half_state == 0) {
+        d->half_state = -1;
+        /* (the conversion indexes the values with signed 32-bit integers, as SPIR-V does) */
+        if (values <= INT32_MAX && spg_gpu_bf16_storage() && (d->half_arena = spg_gpu_arena_create())) {
+            spg_gpu_arena_add(d->half_arena, &d->half, values * 2u, SPG_MEMORY_DEVICE);
+            SpgGpuCommands *c = spg_gpu_arena_commit(d->half_arena) ? spg_gpu_commands_create() : NULL;
+            SpgEltwisePush p = {d->half.address, d->buffer.address, 0, 0, 0, (uint32_t)values, 1, 0, 0, 0.0f, 0, 0};
+            const uint32_t spec[3] = {SPG_ELT_COPY, ACT_NONE, 1u};    /* y kept as bfloat16 */
+            if (c && spg_gpu_record_begin(c)) {
+                spg_gpu_barrier(c);
+                spg_gpu_dispatch(c, SPG_KERNEL_eltwise_h, spec, 3, &p, sizeof p, groups(values, 256u), 1, 1);
+                spg_gpu_barrier(c);
+                if (spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c)) d->half_state = 1;
+            }
+            spg_gpu_commands_free(c);
+        }
+        if (d->half_state < 0) {
+            spg_gpu_arena_free(d->half_arena);
+            d->half_arena = NULL;
+        }
+    }
+    spg_unlock(d->lock);
+    return d->half_state > 0 ? &d->half : NULL;
+}
+
+bool spingalett_gpu_data_read(const SpingalettDeviceData *d, uint32_t first, uint32_t count, float *dst) {
+    if (!d || (uint64_t)first + count > d->count) return false;
+    return count == 0 || data_copy(&d->buffer, (size_t)first * d->size * sizeof(float), dst,
+                                   (size_t)count * d->size * sizeof(float), true);
+}
+
 /* ------------------------------------------------------------------------- chunks */
 
 /* The losses of a finished chunk, added in the CPU's order. */
@@ -1569,6 +1883,30 @@ void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) {
     s->staged = s->host_inputs != NULL;
 }
 
+void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows) {
+    if (rows) g->rows = *rows;
+    else memset(&g->rows, 0, sizeof g->rows);
+    /* (a chunk filled ahead for a step that did not come takes nothing from them) */
+    for (uint32_t k = 0; k < 2; k++) {
+        g->slots[k].gathered = 0;
+        g->slots[k].in_place = false;
+    }
+}
+
+uint32_t *spingalett_gpu_chunk_rows(SpgGpuNet *g) {
+    Slot *s = next_slot(g);
+    s->gathered = (g->rows.inputs && !s->in_place ? 1u : 0u) | (g->rows.targets ? 2u : 0u);
+    return (uint32_t *)((char *)s->staging.mapped + s->indices);
+}
+
+bool spingalett_gpu_chunk_in_place(SpgGpuNet *g, uint32_t first) {
+    if (!g->rows.inputs || g->rows.shift || g->rows.flip || (g->half[0] && !data_half(g->rows.inputs))) return false;
+    Slot *s = next_slot(g);
+    s->in_place = true;
+    s->first = first;
+    return true;
+}
+
 /* Drops the slot's cache entry of commands whose recording failed; NULL. */
 static SpgGpuCommands *forget(Slot *s, SpgGpuCommands *c) {
     for (uint32_t e = 0; e < s->used; e++)
@@ -1581,33 +1919,56 @@ static SpgGpuCommands *forget(Slot *s, SpgGpuCommands *c) {
     return NULL;
 }
 
-/* The slot's command buffer of this key; *fresh when it is to be recorded (NULL: out of memory). */
-static SpgGpuCommands *cache_entry(Slot *s, uint64_t key, bool *fresh) {
+/* The slot's command buffer of this key (and address of the inputs read in place, or 0); *fresh when it
+   is to be recorded (NULL: out of memory). */
+static SpgGpuCommands *cache_entry(Slot *s, uint64_t key, uint64_t where, bool *fresh) {
     *fresh = false;
     for (uint32_t e = 0; e < s->used; e++)
-        if (s->cache[e].key == key) return s->cache[e].commands;
+        if (s->cache[e].key == key && s->cache[e].where == where) return s->cache[e].commands;
     *fresh = true;
     SpgGpuCommands *c = NULL;
     if (s->used < sizeof s->cache / sizeof s->cache[0]) {
         c = spg_gpu_commands_create();
         if (!c) return NULL;
-        s->cache[s->used].key = key;
-        s->cache[s->used++].commands = c;
+        s->used++;
     } else {
         /* a rare kind of chunk: the oldest entry is recorded again */
         c = s->cache[0].commands;
         memmove(s->cache, s->cache + 1, (s->used - 1) * sizeof s->cache[0]);
-        s->cache[s->used - 1].key = key;
-        s->cache[s->used - 1].commands = c;
     }
+    s->cache[s->used - 1].key = key;
+    s->cache[s->used - 1].where = where;
+    s->cache[s->used - 1].commands = c;
     return c;
 }
 
-/* The slot's command buffer for chunks of this kind, recorded on first use. */
+/* Rows of the data sets on the GPU (indices in the slot's staging, the sets' addresses in the step
+   header) gathered into the slot's inputs (gathered bit 1) and targets (bit 2). */
+static void gather_rows(SpgGpuNet *g, Recorder *r, Slot *s, uint32_t n, uint32_t gathered) {
+    const NeuralNetwork *net = g->net;
+    const LayerShape *shape = &net->shapes[0];
+    for (uint32_t k = 0; k < 2; k++) {
+        if (!(gathered >> k & 1u)) continue;
+        const SpgGpuBuffer *dst = k ? &s->target : &s->input;
+        const uint32_t size = net->topology[k ? net->layers - 1 : 0];
+        SpgRowsPush p = {s->staging.address + s->indices, dst->address, s->header.address, n, size,
+                         shape->height, shape->width, shape->channels};
+        /* STEP_TARGETS or STEP_INPUTS; four values a thread where rows hold a multiple of four */
+        const uint32_t spec[2] = {k ? 12u : 10u, size % 4u ? 1u : 4u};
+        Access a = {0};
+        reads(&a, span(s->staging.address + s->indices, n));
+        reads(&a, whole(&s->header));
+        writes(&a, whole(dst));
+        kernel(r, &a, SPG_KERNEL_rows, spec, 2, &p, sizeof p, groups((uint64_t)n * size / spec[1], 256u), 1, 1);
+    }
+}
+
+/* The slot's command buffer for chunks of this kind, recorded on first use; the network's inputs those
+   of `direct` (rows of a data set on the GPU, in single precision) instead of the slot's when given. */
 static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint32_t n, uint32_t count, bool first,
-                                      bool last, bool train) {
+                                      bool last, bool train, uint32_t gathered, const SpgGpuBuffer *direct) {
     bool fresh;
-    SpgGpuCommands *c = cache_entry(s, key, &fresh);
+    SpgGpuCommands *c = cache_entry(s, key, direct ? direct->address : 0, &fresh);
     if (!c || !fresh) return c;
     const NeuralNetwork *net = g->net;
     const uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
@@ -1617,11 +1978,19 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
     r->g = g;
     /* the chunk's header, inputs and targets from staging into the slot's buffers, which the chunk in
        the other slot does not use: copied while it still runs; then everything after it */
-    g->act[0] = s->input;
+    g->act[0] = direct ? *direct : s->input;
     g->header = s->header;
     g->targets = s->target;
-    copy_in(c, s, (size_t)n * in * (g->half[0] ? 2u : 4u));
-    if (train) spg_gpu_copy(c, &s->staging, s->targets, &s->target, 0, (size_t)n * out * 4u);
+    /* inputs and targets from staging, or gathered from the GPU's data sets after the header, or read
+       where they are */
+    copy_in(c, s, gathered & 1u || direct ? 0 : (size_t)n * in * (g->half[0] ? 2u : 4u));
+    if (train && !(gathered & 2u)) spg_gpu_copy(c, &s->staging, s->targets, &s->target, 0, (size_t)n * out * 4u);
+    /* the gather reads the indices and the header the host wrote, and writes the slot's buffers: while the
+       other slot's chunk still runs, unless the header is copied first */
+    if (gathered) {
+        if (!s->header.mapped) barrier(r);
+        gather_rows(g, r, s, n, gathered);
+    }
     barrier(r);
     record_forward(g, r, n, train);
     const uint32_t L = net->layers - 1;
@@ -1645,7 +2014,36 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
     /* everything visible to the host (losses, outputs); the next chunk's copies need not wait */
     spg_gpu_barrier_host(c);
     free(r);
+    g->act[0] = s->input;
     return spg_gpu_record_end(c) ? c : forget(s, c);
+}
+
+/* Rows first .. first + n - 1 of a data set on the GPU (of its bfloat16 copy with half), as a buffer of
+   their own. */
+static SpgGpuBuffer rows_view(const SpingalettDeviceData *d, uint32_t first, uint32_t n, bool half) {
+    SpgGpuBuffer view = half ? d->half : d->buffer;
+    const size_t value = half ? 2u : sizeof(float), at = (size_t)first * d->size * value;
+    view.address += at;
+    view.offset += at;
+    view.size = (size_t)n * d->size * value;
+    if (view.mapped) view.mapped = (char *)view.mapped + at;
+    return view;
+}
+
+/* The data sets on the GPU the chunks' rows come from and what is done to them (STEP_INPUTS to
+   STEP_SHARE). */
+static void rows_header(const SpgGpuRows *rows, uint32_t header[SPG_STEP_HEADER]) {
+    const uint64_t in = rows->inputs ? rows->inputs->buffer.address : 0;
+    const uint64_t out = rows->targets ? rows->targets->buffer.address : 0;
+    header[10] = (uint32_t)in;
+    header[11] = (uint32_t)(in >> 32);
+    header[12] = (uint32_t)out;
+    header[13] = (uint32_t)(out >> 32);
+    header[14] = (uint32_t)rows->seed;
+    header[15] = (uint32_t)(rows->seed >> 32);
+    header[16] = rows->shift | (rows->flip ? 1u << 31 : 0u);
+    memcpy(&header[17], &rows->keep, 4);
+    memcpy(&header[18], &rows->share, 4);
 }
 
 /* The step header (common.glsl's STEP_* entries). */
@@ -1661,6 +2059,7 @@ static void step_header(const SpgGpuNet *g, const SpgGpuStep *step, uint32_t pos
     header[6] = (uint32_t)(step->step >> 32);
     header[7] = position;
     memcpy(&header[9], &grad_scale, 4);
+    rows_header(&g->rows, header);
 }
 
 bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32_t position, bool first, bool last,
@@ -1671,11 +2070,15 @@ bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32
     step_header(g, step, position, 1.0f, header);
     /* the commands depend on n, on count (gradients scaled by 1 / count) and on where the chunk is in
        its step */
-    const uint64_t key = (uint64_t)n | (uint64_t)count << 24 | (first ? 1ull << 56 : 0) | (last ? 1ull << 57 : 0);
-    SpgGpuCommands *c = chunk_commands(g, s, key, n, count, first, last, true);
+    const uint64_t key = (uint64_t)n | (uint64_t)count << 24 | (first ? 1ull << 56 : 0) | (last ? 1ull << 57 : 0) |
+                         (uint64_t)s->gathered << 59;
+    const SpgGpuBuffer view = s->in_place ? rows_view(g->rows.inputs, s->first, n, g->half[0]) : (SpgGpuBuffer){0};
+    SpgGpuCommands *c = chunk_commands(g, s, key, n, count, first, last, true, s->gathered, s->in_place ? &view : NULL);
     if (!c) return false;
     memcpy(header_of(s), header, sizeof header);
-    stage_inputs(g, s, n);
+    if (!(s->gathered & 1u) && !s->in_place) stage_inputs(g, s, n);
+    s->gathered = 0;
+    s->in_place = false;
     if (!spg_gpu_submit(c)) return false;
     s->pending = c;
     s->n = n;
@@ -1693,21 +2096,44 @@ bool spingalett_gpu_take_loss(SpgGpuNet *g, float *loss) {
 }
 
 bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n) {
+    return spingalett_gpu_predict_rows(g, inputs, NULL, 0, outputs, n);
+}
+
+bool spingalett_gpu_predict_rows(SpgGpuNet *g, const float *inputs, const SpingalettDeviceData *rows, uint32_t first,
+                                 float *outputs, uint32_t n) {
     const NeuralNetwork *net = g->net;
     const uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
     /* chunk after chunk, each filled while the device runs the one before, its outputs taken when
-       its slot comes round again */
-    for (uint32_t start = 0; start < n; start += g->capacity) {
-        const uint32_t m = n - start < g->capacity ? n - start : g->capacity;
+       its slot comes round again: the caller's floats in chunks of at most 2,048 samples, so that their
+       copies overlap with the work on the chunk before (the MLP of Examples/Benchmark.c infers 1.1 times
+       as fast in bfloat16 from host arrays in chunks of 2,048 as of 7,168), a data set's rows in whole
+       chunks */
+    const uint32_t most = rows || g->capacity < SPINGALETT_BATCH_CHUNK ? g->capacity : SPINGALETT_BATCH_CHUNK;
+    for (uint32_t start = 0; start < n; start += most) {
+        const uint32_t m = n - start < most ? n - start : most;
         float *dst = spingalett_gpu_chunk_inputs(g, NULL);
         Slot *s = &g->slots[g->next];
         s->staged = false;
-        if (s->host_inputs)         /* rounded straight from the caller's floats */
+        /* the rows of a data set on the GPU read where they are (products round them to bfloat16 as they
+           load them), the commands recorded for them kept for the next call; or gathered (and rounded)
+           into the slot's inputs */
+        const bool gather = rows && g->half[0] && !data_half(rows);
+        const SpgGpuBuffer view = rows && !gather ? rows_view(rows, first + start, m, g->half[0]) : (SpgGpuBuffer){0};
+        if (gather) {
+            uint32_t *index = (uint32_t *)((char *)s->staging.mapped + s->indices), header[SPG_STEP_HEADER] = {0};
+            for (uint32_t k = 0; k < m; k++) index[k] = first + start + k;
+            rows_header(&(SpgGpuRows){.inputs = rows}, header);
+            memcpy(header_of(s), header, sizeof header);
+        } else if (rows) {
+            /* read where they are */
+        } else if (s->host_inputs) {    /* rounded straight from the caller's floats */
             spingalett_round_bf16((uint16_t *)(s->input.mapped ? s->input.mapped : (char *)s->staging.mapped + s->inputs),
                                   inputs + (size_t)start * in, (size_t)m * in);
-        else
+        } else {
             memcpy(dst, inputs + (size_t)start * in, (size_t)m * in * sizeof(float));
-        SpgGpuCommands *c = chunk_commands(g, s, (uint64_t)m | 1ull << 63, m, m, false, false, false);
+        }
+        SpgGpuCommands *c = chunk_commands(g, s, (uint64_t)m | 1ull << 63 | (gather ? 1ull << 59 : 0), m, m, false,
+                                           false, false, gather ? 1u : 0u, rows && !gather ? &view : NULL);
         if (!c || !spg_gpu_submit(c)) {
             drain(g);
             return false;
@@ -1736,7 +2162,7 @@ enum { PASS_FORWARD = 1, PASS_LOSS = 2, PASS_GRADS = 3, PASS_STEP = 4 };
 static SpgGpuCommands *pass_commands(SpgGpuNet *g, uint32_t n, uint32_t kind, bool add) {
     Slot *s = &g->slots[0];
     bool fresh;
-    SpgGpuCommands *c = cache_entry(s, (uint64_t)n | 1ull << 62 | (uint64_t)kind << 58 | (add ? 1ull << 57 : 0), &fresh);
+    SpgGpuCommands *c = cache_entry(s, (uint64_t)n | 1ull << 62 | (uint64_t)kind << 58 | (add ? 1ull << 57 : 0), 0, &fresh);
     if (!c || !fresh) return c;
     const NeuralNetwork *net = g->net;
     const uint32_t in = net->topology[0], out = net->topology[net->layers - 1], L = net->layers - 1;

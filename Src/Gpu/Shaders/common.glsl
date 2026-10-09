@@ -27,13 +27,13 @@ uint to_bf16(float f) {
 #endif
 
 /* ActivationFunction */
-#define ACT_SIGMOID     0u
-#define ACT_RELU        1u
-#define ACT_TANH        2u
-#define ACT_LEAKY_RELU  3u
-#define ACT_FOO52       4u
-#define ACT_SOFTMAX     5u
-#define ACT_NONE        6u
+#define ACT_NONE        0u
+#define ACT_SIGMOID     1u
+#define ACT_RELU        2u
+#define ACT_TANH        3u
+#define ACT_LEAKY_RELU  4u
+#define ACT_FOO52       5u
+#define ACT_SOFTMAX     6u
 
 float activate(float x, uint act) {
     switch (act) {
@@ -85,3 +85,32 @@ float derivative(float y, uint act) {
 #define STEP_POSITION   7u      /* uint: position of the chunk's first sample in its step */
 #define STEP_CLIP       8u      /* float: gradient scale of norm clipping (1: none) */
 #define STEP_GRAD_SCALE 9u      /* float: the step API's gradient scale (one over its samples) */
+#define STEP_INPUTS     10u     /* uvec2: the address of the data set on the GPU the inputs are gathered from */
+#define STEP_TARGETS    12u     /* uvec2: and the targets (rows.comp) */
+#define STEP_AUGMENT_LO 14u     /* uint: augmentation seed of the training run */
+#define STEP_AUGMENT_HI 15u
+#define STEP_AUGMENT    16u     /* uint: augment_shift, with bit 31 for augment_flip (0: none) */
+#define STEP_KEEP       17u     /* float: label smoothing, t' = keep t + share (0: none) */
+#define STEP_SHARE      18u
+
+/* 64-bit arithmetic on (low, high) pairs, for the hashes of dropout and augmentation */
+uvec2 mul64(uvec2 a, uvec2 b) {
+    uint hi, lo;
+    umulExtended(a.x, b.x, hi, lo);
+    return uvec2(lo, hi + a.x * b.y + a.y * b.x);
+}
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+uvec2 shr64(uvec2 a, uint k) {          /* 0 < k < 32 */
+    return uvec2((a.x >> k) | (a.y << (32u - k)), a.y >> k);
+}
+uvec2 mix64(uvec2 z) {
+    z ^= shr64(z, 30u);
+    z = mul64(z, uvec2(0x1CE4E5B9u, 0xBF58476Du));
+    z ^= shr64(z, 27u);
+    z = mul64(z, uvec2(0x133111EBu, 0x94D049BBu));
+    return z ^ shr64(z, 31u);
+}
