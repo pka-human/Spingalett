@@ -49,7 +49,7 @@ __all__ = [
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
-    "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device",
+    "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
 ]
@@ -99,8 +99,8 @@ class ComputeMode(enum.IntEnum):
     SINGLE_THREADED = 0
     OPENMP = 1
     OPENBLAS = 2
-    CUDA = 3        # reserved: falls back to the CPU
-    VULKAN = 4      # the GPU (gpu_device()); training's CPU parts run as with OPENMP
+    CUDA = 3        # an NVIDIA GPU through CUDA (cuda_device()); training's CPU parts run as with OPENMP
+    VULKAN = 4      # the GPU through Vulkan (gpu_device()); training's CPU parts run as with OPENMP
 
 
 class Precision(enum.IntEnum):
@@ -685,6 +685,7 @@ _set_compute_mode = _bind("spingalett_set_compute_mode", c_bool, [c_int])
 _get_num_threads = _bind("spingalett_get_num_threads", ctypes.c_uint, [])
 _cpu_kernels = _bind("spingalett_cpu_kernels", c_char_p, [])
 _gpu_device = _bind("spingalett_gpu_device", c_char_p, [])
+_cuda_device = _bind("spingalett_cuda_device", c_char_p, [])
 _set_gpu_precision = _bind("spingalett_set_gpu_precision", c_bool, [c_int])
 _get_gpu_precision = _bind("spingalett_get_gpu_precision", c_int, [])
 _set_num_threads = _bind("spingalett_set_num_threads", None, [ctypes.c_uint])
@@ -753,6 +754,15 @@ def gpu_device() -> Optional[str]:
     """Name of the GPU that ComputeMode.VULKAN uses, or None without a usable Vulkan device (or a
     library built without the Vulkan backend). SPINGALETT_GPU_DEVICE picks a device by its index."""
     name = _gpu_device()
+    return name.decode() if name else None
+
+
+def cuda_device() -> Optional[str]:
+    """Name of the GPU that ComputeMode.CUDA uses, or None without a usable CUDA device (an NVIDIA GPU of
+    compute capability 8.0 or later with a driver of CUDA 11.0 or later, which the library opens at run
+    time) or in a library built without the CUDA backend. SPINGALETT_CUDA_DEVICE picks a device by its
+    index."""
+    name = _cuda_device()
     return name.decode() if name else None
 
 
