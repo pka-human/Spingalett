@@ -36,6 +36,10 @@ RTX 4050 Laptop GPU; README).
   new fifth workload of `Examples/Benchmark.c`) trains 2.9 times as fast in single precision and 10
   times as fast in bfloat16 on an RTX 4050 Laptop GPU, ahead of PyTorch with cuDNN (1.2 and 1.08 times
   as fast as it), and infers 2.8 and 8.6 times as fast.
+- The GPU's depthwise kernel computes four adjacent pixels of a row a thread, with the filters in
+  registers and the loads of overlapping windows shared: MobileNet-style training in bfloat16 runs 8.7%
+  faster (24,424 to 26,545 samples/s) and its inference 17% (81,941 to 95,869) on an RTX 4050 Laptop
+  GPU; in single precision, where the kernel is bound by memory, inference gains 8.4%.
 - The first training of a process on a machine whose GPU driver has not compiled the kernels yet
   makes the pipelines the tile choice times on several threads: 1.1 s instead of 2.75 s for the
   fully connected network, 2.7 s instead of 6.2 s for ResNet-20 in bfloat16.

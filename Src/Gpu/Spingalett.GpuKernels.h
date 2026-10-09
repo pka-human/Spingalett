@@ -159,7 +159,7 @@ enum { SPG_COMBINE_ADD, SPG_COMBINE_SLICE, SPG_COMBINE_GAP };
 typedef struct {
     uint64_t x, w, y, e0;
     uint32_t total, in_h, in_w, in_c, out_h, out_w, out_c, og;
-    uint32_t ph, pw, pixels, rows, lanes;
+    uint32_t ph, pixels, rows, lanes;       /* (the padding in x is a constant of the kernel) */
     float beta;
 } SpgDwconvPush;
 enum { SPG_DW_APPLY, SPG_DW_SPREAD, SPG_DW_WEIGHTS };

@@ -28,6 +28,7 @@
 #define MAX_GROUPS  65535u          /* workgroups in x of element-wise kernels, which loop beyond */
 #define COLSUM_ROWS 1024u           /* rows per slice of colsum.comp */
 #define SUMSQ_SLICE 4096u           /* sumsq.comp */
+#define DW_RUN      4u              /* adjacent pixels a thread of dwconv.comp computes (its PX) */
 
 /* ------------------------------------------------------------------------- the network */
 
@@ -149,21 +150,25 @@ static bool depthwise(const NeuralNetwork *net, uint32_t l) {
     return v.CG == 1u && v.G == v.in_c && v.G > 1u && v.OG < 16u && v.taps <= SPG_DW_TAPS;
 }
 
-/* The slices of a depthwise weight gradient (dwconv.comp's WEIGHTS) over `pixels` output pixels: the
-   channels (four a thread with vec 4) of a workgroup of 256 threads, the threads a channel (lanes), and
-   the pixels of a slice, some 32 a thread (more when the slices would be more than a dispatch has). */
-typedef struct { uint32_t vec, per, lanes, rows, slices; } DwSlices;
+/* The slices of a depthwise weight gradient (dwconv.comp's WEIGHTS) over the output pixels of n samples:
+   the channels (four a thread with vec 4) of a workgroup of 256 threads, the threads a channel (lanes),
+   and the units of a slice, some 32 pixels a thread (more when the slices would be more than a dispatch
+   has). A unit is a pixel, or with vec 4 and windows of up to 9 taps a run of DW_RUN pixels of a row. */
+typedef struct { uint32_t vec, per, lanes, units, rows, slices; } DwSlices;
 
-static DwSlices dw_slices(const ConvView *v, uint64_t pixels) {
+static DwSlices dw_slices(const ConvView *v, uint64_t n) {
     DwSlices d;
     d.vec = v->OG == 1u && v->in_c % 4u == 0 ? 4u : 1u;
+    const uint32_t run = d.vec == 4u && v->taps <= 9u ? DW_RUN : 1u;
+    const uint64_t units = n * v->out_h * ((v->out_w + run - 1u) / run);
     const uint32_t quads = v->out_c / d.vec;
     d.per = quads < 256u ? quads : 256u;
     d.lanes = 256u / d.per;
-    uint64_t rows = 32u * d.lanes;
-    if ((pixels + rows - 1u) / rows > MAX_GROUPS) rows = (pixels + MAX_GROUPS - 1u) / MAX_GROUPS;
+    uint64_t rows = 32u / run * d.lanes;
+    if ((units + rows - 1u) / rows > MAX_GROUPS) rows = (units + MAX_GROUPS - 1u) / MAX_GROUPS;
+    d.units = (uint32_t)units;
     d.rows = (uint32_t)rows;
-    d.slices = (uint32_t)((pixels + rows - 1u) / rows);
+    d.slices = (uint32_t)((units + rows - 1u) / rows);
     return d;
 }
 
@@ -499,7 +504,7 @@ static uint64_t part_floats(const NeuralNetwork *net, uint32_t capacity) {
         if (spingalett_filters(s->type) && depthwise(net, l)) {
             /* dwconv.comp's partial sums of the weight gradient, a slice of the output pixels each */
             const ConvView v = conv_view(net, l);
-            const uint64_t floats = (uint64_t)dw_slices(&v, (uint64_t)capacity * v.out_h * v.out_w).slices * v.out_c * v.taps;
+            const uint64_t floats = (uint64_t)dw_slices(&v, capacity).slices * v.out_c * v.taps;
             if (floats > need) need = floats;
             continue;
         }
@@ -808,7 +813,7 @@ static const struct { uint16_t words; uint8_t id; } half_words[SPG_KERNEL_COUNT]
     [SPG_KERNEL_colsum] = {0x7, 2}, [SPG_KERNEL_bn] = {0x2, 1}, [SPG_KERNEL_eltwise] = {0x10F, 2},
     [SPG_KERNEL_pool] = {0xF, 3}, [SPG_KERNEL_combine] = {0x7, 3}, [SPG_KERNEL_upsample] = {0xF, 3},
     [SPG_KERNEL_ln] = {0x7, 3}, [SPG_KERNEL_optim] = {0x100, 1}, [SPG_KERNEL_rows] = {0x2, 2},
-    [SPG_KERNEL_dwconv] = {0xD, 8},
+    [SPG_KERNEL_dwconv] = {0xD, 9},
 };
 
 /* Records a kernel after the barrier it needs; its bfloat16 variant, told which buffers are such, when
@@ -912,18 +917,22 @@ static void dw_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t m
     const ConvView v = conv_view(g->net, l);
     const LayerShape *s = &g->net->shapes[l];
     const bool bias = epi == SPG_EPI_BIAS_ACT;
-    SpgDwconvPush p = {x->address, weights_at(g, l - 1), y->address, bias ? biases_at(g, l - 1) : e0,
-                       n * (mode == SPG_DW_APPLY ? v.out_h * v.out_w * v.out_c : v.in_h * v.in_w * v.in_c),
-                       v.in_h, v.in_w, v.in_c, v.out_h, v.out_w, v.out_c, v.OG, s->pad_h, s->pad_w, 0, 0, 0, beta};
-    /* four channels a thread where they come in fours, each its own (og 1) */
+    /* four channels a thread where they come in fours, each its own (og 1), of runs of DW_RUN pixels of a
+       row: output pixels (APPLY), or input pixels where the run is a multiple of the stride (SPREAD) */
     const uint32_t vec = v.OG == 1u && v.in_c % 4u == 0 ? 4u : 1u;
-    const uint32_t spec[8] = {mode, epi, act, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, vec};
+    const bool apply = mode == SPG_DW_APPLY;
+    const uint32_t rows = apply ? v.out_h : v.in_h, width = apply ? v.out_w : v.in_w, C = apply ? v.out_c : v.in_c;
+    const uint32_t run = vec == 4u && (apply || DW_RUN % s->stride_w == 0) ? DW_RUN : 1u;
+    SpgDwconvPush p = {x->address, weights_at(g, l - 1), y->address, bias ? biases_at(g, l - 1) : e0,
+                       n * rows * ((width + run - 1u) / run) * (C / vec), v.in_h, v.in_w, v.in_c, v.out_h, v.out_w,
+                       v.out_c, v.OG, s->pad_h, 0, 0, 0, beta};
+    const uint32_t spec[9] = {mode, epi, act, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, vec, s->pad_w};
     reads(a, whole(x));
     reads(a, weights_of(g, l - 1));
     if (bias) reads(a, biases_of(g, l - 1));
     if (beta != 0.0f) reads(a, whole(y));
     writes(a, whole(y));
-    kernel(r, a, SPG_KERNEL_dwconv, spec, 8, &p, sizeof p, groups(p.total / vec, 256u), 1, 1);
+    kernel(r, a, SPG_KERNEL_dwconv, spec, 9, &p, sizeof p, groups(p.total, 256u), 1, 1);
 }
 
 static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *x, const SpgGpuBuffer *y,
@@ -1420,15 +1429,15 @@ static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, f
         const bool transposed = s->type == LAYER_CONV_TRANSPOSE2D;
         const SpgGpuBuffer *x = transposed ? &g->delta[l + 1] : &g->act[src];
         const SpgGpuBuffer *dy = transposed ? &g->act[src] : &g->delta[l + 1];
-        const uint32_t pixels = n * v.out_h * v.out_w;
-        const DwSlices d = dw_slices(&v, pixels);
+        const DwSlices d = dw_slices(&v, n);
         const uint32_t slices = d.slices;
         SpgDwconvPush p = {x->address, g->part.address, dy->address, 0, 0, v.in_h, v.in_w, v.in_c, v.out_h, v.out_w,
-                           v.out_c, v.OG, s->pad_h, s->pad_w, pixels, d.rows, d.lanes, 0.0f};
-        const uint32_t spec[8] = {SPG_DW_WEIGHTS, 0, ACT_NONE, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, d.vec};
+                           v.out_c, v.OG, s->pad_h, d.units, d.rows, d.lanes, 0.0f};
+        const uint32_t spec[9] = {SPG_DW_WEIGHTS, 0, ACT_NONE, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, d.vec,
+                                  s->pad_w};
         const Range part = span(g->part.address, (uint64_t)slices * v.out_c * v.taps);
         writes(&a, part);
-        kernel(r, &a, SPG_KERNEL_dwconv, spec, 8, &p, sizeof p, slices, (v.out_c / d.vec + d.per - 1u) / d.per, 1);
+        kernel(r, &a, SPG_KERNEL_dwconv, spec, 9, &p, sizeof p, slices, (v.out_c / d.vec + d.per - 1u) / d.per, 1);
         const Range grad = span(grad_weights_at(g, l), weight_count(g, l));
         SpgReducePush rp = {g->part.address, grad_weights_at(g, l), v.out_c * v.taps, v.out_c * v.taps, slices, scale,
                             beta, 0};

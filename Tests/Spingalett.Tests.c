@@ -4287,6 +4287,18 @@ static NeuralNetwork *gpu_net(int which) {
         layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX);
         break;
     }
+    case 12: {  /* depthwise convolutions of channels in fours over rows that runs of four pixels do not
+                   divide: of stride 3 (whose data gradient takes a pixel a thread), then unpadded */
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 11, .width = 13, .channels = 4);
+        conv2d(.net = net, .filters = 8, .kernel = 1, .act_func = ACT_TANH);
+        conv2d(.net = net, .filters = 8, .kernel = 3, .stride = 3, .padding = 1, .groups = 8, .act_func = ACT_RELU);
+        conv2d(.net = net, .filters = 8, .kernel = 3, .groups = 8, .act_func = ACT_NONE);
+        batch_norm(.net = net, .act_func = ACT_LEAKY_RELU);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX);
+        break;
+    }
     default:
         net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
         layer(.net = net, .height = 16, .width = 16, .channels = 3);
@@ -4354,7 +4366,8 @@ static float *gpu_trained(int which, ComputeMode mode, const float *x, const flo
 static void gpu_equivalence(int which) {
     static const OptimizerType opts[] = {OPTIMIZER_SGD, OPTIMIZER_MOMENTUM, OPTIMIZER_MOMENTUM, OPTIMIZER_ADAMW,
                                          OPTIMIZER_RMSPROP, OPTIMIZER_MOMENTUM, OPTIMIZER_ADAM, OPTIMIZER_MOMENTUM,
-                                         OPTIMIZER_ADAMW, OPTIMIZER_ADAM, OPTIMIZER_ADAM, OPTIMIZER_MOMENTUM};
+                                         OPTIMIZER_ADAMW, OPTIMIZER_ADAM, OPTIMIZER_ADAM, OPTIMIZER_MOMENTUM,
+                                         OPTIMIZER_MOMENTUM};
     NeuralNetwork *probe = gpu_net(which);
     SpingalettNetworkLayer first, last;
     spingalett_network_layer(probe, 0, &first);
@@ -5415,6 +5428,7 @@ int main(int argc, char **argv) {
             printf("  device: %s\n", spingalett_gpu_device());
             for (int k = 0; k < 9; k++) gpu_equivalence(k);
             gpu_equivalence(11);
+            gpu_equivalence(12);
             gpu_saturated();
             gpu_training_options();
             gpu_threads();
