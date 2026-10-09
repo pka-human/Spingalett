@@ -12,6 +12,8 @@
  *   SUM       part[y][c] = sum of x
  *   SHIFTED   part[y][c] = sum of (x - k[c]), part[y][C + c] = sum of (x - k[c])^2
  *   DY        part[y][c] = sum of dy,         part[y][C + c] = sum of dy * (x - k[c])
+ *   LN        part[y][c] = sum of dy,         part[y][C + c] = sum of dy * (x - k[2r]) k[2r + 1]
+ *             (layer normalization: row r's mean and 1 / std in k)
  */
 
 #version 460
@@ -24,6 +26,7 @@ layout(local_size_x = 256) in;
 #define SUM     0u
 #define SHIFTED 1u
 #define DY      2u
+#define LN      3u
 
 layout(push_constant) uniform Push {
     F32 x, dy, k, part;
@@ -39,7 +42,7 @@ void main() {
     const uint r0 = slice * p.slice_rows, r1 = min(p.R, r0 + p.slice_rows);
     float t1 = 0.0, t2 = 0.0;
     if (c < p.C) {
-        float shift = MODE == SUM ? 0.0 : p.k.v[c];
+        float shift = MODE == SHIFTED || MODE == DY ? p.k.v[c] : 0.0;
         for (uint r = r0 + lr; r < r1; r += ROWS) {
             float v = p.x.v[r * p.C + c];
             if (MODE == SUM) {
@@ -48,10 +51,14 @@ void main() {
                 float d = v - shift;
                 t1 += d;
                 t2 = fma(d, d, t2);
-            } else {
+            } else if (MODE == DY) {
                 float g = p.dy.v[r * p.C + c];
                 t1 += g;
                 t2 = fma(g, v - shift, t2);
+            } else {
+                float g = p.dy.v[r * p.C + c];
+                t1 += g;
+                t2 = fma(g, (v - p.k.v[2u * r]) * p.k.v[2u * r + 1u], t2);
             }
         }
     }

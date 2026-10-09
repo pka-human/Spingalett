@@ -62,11 +62,12 @@ struct SpgGpuNet {
     SpgGpuBuffer gtmp;              /* gradients of layers that feed several, before they are added */
     SpgGpuBuffer targets, header;   /* the recording slot's targets and step header */
     SpgGpuBuffer scalars;           /* the gradient clipping scale */
-    SpgGpuBuffer *geo;              /* per conv layer: its geometries (spg_conv_geometry()) */
+    SpgGpuBuffer *geo;              /* per (transposed) conv layer: its geometries (spg_conv_geometry()) */
     SpgConvGeometry **conv;         /* and where they are */
-    SpgGpuBuffer *bn;               /* per batch normalization layer: stats (4C) | coefficients (3C) */
+    SpgGpuBuffer *bn;               /* per batch normalization layer: stats (4C) | coefficients (3C);
+                                       per layer normalization layer (training): mean, 1 / std per cell */
     SpgGpuBuffer part;              /* partial sums: colsum slices, split products, norm slices */
-    SpgGpuBuffer wt;                /* convolution weights regrouped for data gradients */
+    SpgGpuBuffer wt;                /* convolution weights regrouped for data gradients (conv_spread()) */
     SpgGpuBuffer transfer;          /* host-visible: parameters on their way in or out */
     uint32_t *uses, *pending;       /* consumers of each layer, and those not yet back-propagated */
     /* batch normalization layers (no activation, no dropout) read only by an addition of two layers,
@@ -96,6 +97,26 @@ static inline uint64_t align4(uint64_t n) {
     return (n + 3u) & ~(uint64_t)3u;
 }
 
+/* The convolution the products of layer l compute: a convolution layer's own, or for a transposed
+   convolution the one whose data gradient it is, from the transposed convolution's outputs to its
+   inputs (its forward pass is that convolution's data gradient, its data gradient that
+   convolution's forward pass, its weight gradient that convolution's with x and dy swapped). */
+typedef struct {
+    uint32_t in_h, in_w, in_c, out_h, out_w, out_c;     /* the convolution's input and output maps */
+    uint32_t G, CG, OG, taps;                           /* groups, channels of a group in and out, taps */
+} ConvView;
+
+static ConvView conv_view(const NeuralNetwork *net, uint32_t l) {
+    const LayerShape *x = &net->shapes[spingalett_source(net, l)], *s = &net->shapes[l];
+    const bool transposed = s->type == LAYER_CONV_TRANSPOSE2D;
+    const LayerShape *a = transposed ? s : x, *b = transposed ? x : s;
+    ConvView v = {a->height, a->width, a->channels, b->height, b->width, b->channels, layer_groups(s), 0, 0,
+                  s->kernel_h * s->kernel_w};
+    v.CG = v.in_c / v.G;
+    v.OG = v.out_c / v.G;
+    return v;
+}
+
 bool spingalett_gpu_available(void) {
     return spg_gpu_open();
 }
@@ -109,13 +130,6 @@ const char *spingalett_gpu_name(void) {
 }
 
 bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
-    for (uint32_t l = 1; l < net->layers; l++) {
-        const LayerType type = net->shapes[l].type;
-        if (type == LAYER_CONV_TRANSPOSE2D || type == LAYER_UPSAMPLE || type == LAYER_LAYER_NORM) {
-            if (why) *why = "transposed convolutions, upsampling and layer normalization run on the CPU only";
-            return false;
-        }
-    }
     for (uint32_t l = 0; l < net->layers; l++)
         if ((uint64_t)net->topology[l] * SPINGALETT_BATCH_CHUNK > UINT32_MAX) {
             if (why) *why = "layers of over 2^32 / 2048 values a sample";
@@ -123,13 +137,13 @@ bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
         }
     for (uint32_t l = 1; l < net->layers; l++) {
         const LayerShape *s = &net->shapes[l];
-        if (s->type == LAYER_CONV2D && (s->kernel_h > 255u || s->kernel_w > 255u ||
-                                        net->shapes[spingalett_source(net, l)].channels > 65535u ||
-                                        s->channels > 65535u)) {
+        if (!spingalett_filters(s->type)) continue;
+        if (s->kernel_h > 255u || s->kernel_w > 255u || net->shapes[spingalett_source(net, l)].channels > 65535u ||
+            s->channels > 65535u) {
             if (why) *why = "convolution windows over 255 cells or layers of over 65535 channels";
             return false;
         }
-        if (s->type == LAYER_CONV2D && s->stride_h * s->stride_w > SPG_MAX_PHASES) {
+        if (s->stride_h * s->stride_w > SPG_MAX_PHASES) {
             if (why) *why = "convolutions whose strides multiply to over 64";
             return false;
         }
@@ -206,18 +220,35 @@ static bool zero(SpgGpuNet *g, SpgGpuBuffer *b) {
     return run_once(g, record_fill, b);
 }
 
+/* The device keeps a transposed convolution's filters as those of the convolution whose data
+   gradient it computes (one per input channel, conv_view()): wv[g IG + i][tap][o] = w[g OG + o][tap][i]
+   for weight layer l, IG and OG its input and output channels a group. */
+static void swap_filters(const NeuralNetwork *net, uint32_t l, float *host, float *dev, bool down) {
+    const LayerShape *x = &net->shapes[spingalett_source(net, l + 1)], *s = &net->shapes[l + 1];
+    const uint32_t G = layer_groups(s), IG = x->channels / G, OG = s->channels / G, taps = s->kernel_h * s->kernel_w;
+    for (uint32_t k = 0; k < G; k++)
+        for (uint32_t o = 0; o < OG; o++)
+            for (uint32_t t = 0; t < taps; t++)
+                for (uint32_t i = 0; i < IG; i++) {
+                    const size_t h = (((size_t)k * OG + o) * taps + t) * IG + i, d = (((size_t)k * IG + i) * taps + t) * OG + o;
+                    if (down) host[h] = dev[d];
+                    else dev[d] = host[h];
+                }
+}
+
 /* A parameter array of the network (laid out by weight_offsets or bias_offsets) and its padded
    image in the transfer buffer at `base` floats, one way or the other. */
 static void pack(const SpgGpuNet *g, float *host, uint64_t base, bool weights, bool down) {
     const NeuralNetwork *net = g->net;
-    float *image = (float *)g->transfer.mapped + base;
+    float *image = (float *)g->transfer.mapped;
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         uint64_t rows = spingalett_weight_rows(net, l), count = weights ? rows * spingalett_weight_row_len(net, l) : rows;
         uint64_t from = weights ? net->weight_offsets[l] : net->bias_offsets[l];
         uint64_t to = base + (weights ? g->woff[l] : g->boff[l]);
         if (count == 0) continue;
-        if (down) memcpy(host + from, image - base + to, count * sizeof(float));
-        else memcpy(image - base + to, host + from, count * sizeof(float));
+        if (weights && net->shapes[l + 1].type == LAYER_CONV_TRANSPOSE2D) swap_filters(net, l, host + from, image + to, down);
+        else if (down) memcpy(host + from, image + to, count * sizeof(float));
+        else memcpy(image + to, host + from, count * sizeof(float));
     }
 }
 
@@ -271,17 +302,15 @@ bool spingalett_gpu_download(SpgGpuNet *g) {
 /* ------------------------------------------------------------------------- creation */
 
 static bool make_geometry(SpgGpuNet *g, uint32_t l) {
-    const NeuralNetwork *net = g->net;
-    const LayerShape *in = &net->shapes[spingalett_source(net, l)], *s = &net->shapes[l];
+    const LayerShape *s = &g->net->shapes[l];
+    const ConvView v = conv_view(g->net, l);
     SpgConvGeometry *info = g->conv[l] = (SpgConvGeometry *)malloc(sizeof *info);
-    if (!info || !spg_conv_geometry(NULL, info, in->height, in->width, in->channels, s->height, s->width, s->channels,
-                                    layer_groups(s), s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, s->pad_h,
-                                    s->pad_w) ||
+    if (!info || !spg_conv_geometry(NULL, info, v.in_h, v.in_w, v.in_c, v.out_h, v.out_w, v.out_c, v.G, s->kernel_h,
+                                    s->kernel_w, s->stride_h, s->stride_w, s->pad_h, s->pad_w) ||
         info->size * sizeof(uint32_t) > g->transfer.size)
         return false;
-    spg_conv_geometry((uint32_t *)g->transfer.mapped, info, in->height, in->width, in->channels, s->height, s->width,
-                      s->channels, layer_groups(s), s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, s->pad_h,
-                      s->pad_w);
+    spg_conv_geometry((uint32_t *)g->transfer.mapped, info, v.in_h, v.in_w, v.in_c, v.out_h, v.out_w, v.out_c, v.G,
+                      s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, s->pad_h, s->pad_w);
     return spg_gpu_buffer_create(&g->geo[l], info->size * sizeof(uint32_t), false) &&
            move(g, &g->geo[l], info->size * sizeof(uint32_t), false);
 }
@@ -296,10 +325,15 @@ static uint64_t part_floats(const NeuralNetwork *net, uint32_t capacity) {
         uint64_t rows = (uint64_t)capacity * s->height * s->width;
         uint64_t slices = (rows + COLSUM_ROWS - 1u) / COLSUM_ROWS;
         if (slices * 2u * s->channels > need) need = slices * 2u * s->channels;
-        if (s->type == LAYER_CONV2D || s->type == LAYER_DENSE) {
-            /* the partial products of split weight gradients */
+        if (s->type == LAYER_DENSE || spingalett_filters(s->type)) {
+            /* the partial products of split weight gradients, summed over the pixels of the
+               convolution's output (conv_view()) */
             uint64_t w = (uint64_t)spingalett_weight_rows(net, l - 1) * spingalett_weight_row_len(net, l - 1);
             if (w > SPG_SPLIT_FLOATS / 2u) continue;
+            if (s->type == LAYER_CONV_TRANSPOSE2D) {
+                const LayerShape *x = &net->shapes[spingalett_source(net, l)];
+                rows = (uint64_t)capacity * x->height * x->width;
+            }
             uint32_t slice_k, split = spg_gemm_split(1, 1, (uint32_t)rows, 1, &slice_k);
             uint64_t floats = split * w < SPG_SPLIT_FLOATS ? split * w : SPG_SPLIT_FLOATS;
             if (floats > need) need = floats;
@@ -402,16 +436,20 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
         if (ok && training && l > 0 && l + 1 < L && net->dropout_rates[l] > 0.0f)
             ok = spg_gpu_buffer_create(&g->dmask[l], (uint64_t)capacity * net->topology[l] * 4u, false);
         if (l > 0 && g->uses[l] > 1 && net->topology[l] > widest_shared) widest_shared = net->topology[l];
-        if (ok && s->type == LAYER_CONV2D) {
+        if (ok && spingalett_filters(s->type)) {
             ok = make_geometry(g, l);
+            /* filters regrouped for data gradients, and for the forward passes of transposed convolutions */
             uint64_t w = (uint64_t)spingalett_weight_rows(net, l - 1) * spingalett_weight_row_len(net, l - 1);
-            if (w > wt) wt = w;
+            if ((training || s->type == LAYER_CONV_TRANSPOSE2D) && w > wt) wt = w;
         }
         if (ok && s->type == LAYER_BATCH_NORM) ok = spg_gpu_buffer_create(&g->bn[l], 7u * s->channels * 4u, false);
+        /* layer normalization: each cell's mean and 1 / std for the backward pass */
+        if (ok && training && s->type == LAYER_LAYER_NORM)
+            ok = spg_gpu_buffer_create(&g->bn[l], 2ull * capacity * s->height * s->width * 4u, false);
     }
     for (uint32_t l = 1; ok && training && l < L; l++)
         if (g->fold[l]) g->delta[l] = g->delta[g->fold[l]];     /* the addition's gradient, shared */
-    if (ok && wt > 0 && training) ok = spg_gpu_buffer_create(&g->wt, wt * 4u, false);
+    if (ok && wt > 0) ok = spg_gpu_buffer_create(&g->wt, wt * 4u, false);
     if (ok && training) {
         /* gradients and moments start zeroed: their padding is never written */
         ok = spg_gpu_buffer_create(&g->grads, (g->Wp + g->Bp) * 4u, false) && zero(g, &g->grads);
@@ -559,28 +597,118 @@ static void eltwise(SpgGpuNet *g, Recorder *r, const Access *a, uint32_t op, uin
     kernel(r, a, SPG_KERNEL_eltwise, spec, 2, &p, sizeof p, groups(total, 256u), 1, 1);
 }
 
+/* ---- convolutions (conv_view()) ---- */
+
+/* y = act(x convolved + layer l's biases) with SPG_EPI_BIAS_ACT; otherwise y = (beta = 1: +=) x
+   convolved, times act'(e0) with SPG_EPI_DERIV (e0 laid out like y). Over n samples, x and y the
+   maps of the convolution's input and output: a convolution's forward pass, a transposed
+   convolution's data gradient. The access lists what the caller reads and writes besides. */
+static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *x, const SpgGpuBuffer *y,
+                       uint32_t n, uint32_t epi, uint32_t act, uint64_t e0, float beta) {
+    const ConvView v = conv_view(g->net, l);
+    const uint32_t K = v.taps * v.CG;
+    const bool bias = epi == SPG_EPI_BIAS_ACT;
+    SpgGemmPush p = {
+        .a = x->address, .b = weights_at(g, l - 1), .c = y->address, .e0 = bias ? biases_at(g, l - 1) : e0,
+        .geo = g->geo[l].address, .M = n * v.out_h * v.out_w, .N = v.OG, .K = K, .ldb = K, .ldc = v.out_c,
+        .a_group = v.CG, .b_group = v.OG * K, .c_group = v.OG, .alpha = 1.0f, .beta = beta,
+        .flags = bias ? SPG_GEMM_BIAS : 0u,
+    };
+    SpgGemmMode m = {SPG_A_CONV, SPG_B_COL, epi, act, v.G, false, v.CG % 4u == 0 && v.in_c % 4u == 0, true, 0,
+                     (uint64_t)n * v.out_h * v.out_w * v.out_c, g->bf16};
+    reads(a, whole(x));
+    reads(a, weights_of(g, l - 1));
+    if (bias) reads(a, biases_of(g, l - 1));
+    reads(a, whole(&g->geo[l]));
+    writes(a, whole(y));
+    product(r, a, &p, &m);
+}
+
+/* The transpose of conv_apply(), with its epilogues: dx (the convolution's input maps) from dy (its
+   output maps) through the filters regrouped by phase (wtrans.comp), a stride-1 product per phase of
+   the stride over the pixels it holds (one group: they write different pixels; a phase no tap
+   reaches gets its epilogue alone). A convolution's data gradient, a transposed convolution's
+   forward pass. */
+static void conv_spread(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *dy,
+                        const SpgGpuBuffer *dx, uint32_t n, uint32_t epi, uint32_t act, uint64_t e0, float beta) {
+    const ConvView v = conv_view(g->net, l);
+    const SpgConvGeometry *info = g->conv[l];
+    const bool bias = epi == SPG_EPI_BIAS_ACT;
+    SpgWtransPush wp = {weights_at(g, l - 1), g->wt.address, g->geo[l].address + 4u * info->order,
+                        v.G * v.OG * v.taps * v.CG, v.OG, v.CG, v.taps};
+    Access t = {0};
+    reads(&t, weights_of(g, l - 1));
+    reads(&t, whole(&g->geo[l]));
+    writes(&t, whole(&g->wt));
+    kernel(r, &t, SPG_KERNEL_wtrans, NULL, 0, &wp, sizeof wp, groups(wp.total, 256u), 1, 1);
+    reads(a, whole(dy));
+    reads(a, whole(&g->wt));
+    reads(a, whole(&g->geo[l]));
+    if (bias) reads(a, biases_of(g, l - 1));
+    writes(a, whole(dx));
+    a->group = group_of(l, GROUP_PHASES);
+    for (uint32_t ph = 0; ph < info->phases; ph++) {
+        SpgGemmPush p = {
+            .a = dy->address, .b = at(&g->wt, (uint64_t)info->phase[ph].first * v.OG * v.CG), .c = dx->address,
+            .e0 = bias ? biases_at(g, l - 1) : e0, .geo = g->geo[l].address + 4u * info->phase[ph].at,
+            .M = n * info->phase[ph].rh * info->phase[ph].rw, .N = v.CG, .K = info->phase[ph].taps * v.OG,
+            .ldb = v.CG, .ldc = v.in_c, .a_group = v.OG, .b_group = v.taps * v.OG * v.CG, .c_group = v.CG,
+            .alpha = 1.0f, .beta = beta, .flags = bias ? SPG_GEMM_BIAS : 0u,
+        };
+        SpgGemmMode m = {SPG_A_CONV, SPG_B_ROW, epi, act, v.G, info->phases > 1, v.OG % 4u == 0 && v.out_c % 4u == 0,
+                         true, 0, (uint64_t)n * v.in_h * v.in_w * v.in_c, g->bf16};
+        product(r, a, &p, &m);
+    }
+}
+
 /* ---- forward ---- */
 
 static void conv_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act) {
+    const uint32_t src = spingalett_source(g->net, l);
+    Access a = {0};
+    if (g->net->shapes[l].type == LAYER_CONV2D)
+        conv_apply(g, r, &a, l, &g->act[src], &g->act[l], n, SPG_EPI_BIAS_ACT, act, 0, 0.0f);
+    else
+        conv_spread(g, r, &a, l, &g->act[src], &g->act[l], n, SPG_EPI_BIAS_ACT, act, 0, 0.0f);
+}
+
+static void upsample_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act) {
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, l);
     const LayerShape *in = &net->shapes[src], *s = &net->shapes[l];
-    const uint32_t G = layer_groups(s), CG = in->channels / G, OG = s->channels / G;
-    const uint32_t K = s->kernel_h * s->kernel_w * CG;
-    SpgGemmPush p = {
-        .a = g->act[src].address, .b = weights_at(g, l - 1), .c = g->act[l].address, .e0 = biases_at(g, l - 1),
-        .geo = g->geo[l].address, .M = n * s->height * s->width, .N = OG, .K = K, .ldb = K, .ldc = s->channels,
-        .a_group = CG, .b_group = OG * K, .c_group = OG, .alpha = 1.0f, .flags = SPG_GEMM_BIAS,
-    };
-    SpgGemmMode m = {SPG_A_CONV, SPG_B_COL, SPG_EPI_BIAS_ACT, act, G, false, CG % 4u == 0 && in->channels % 4u == 0,
-                     true, 0, (uint64_t)n * net->topology[l], g->bf16};
+    SpgUpsamplePush p = {g->act[src].address, g->act[l].address, 0, 0, n, in->height, in->width, in->channels,
+                         s->stride_h, s->stride_w, 0, 0};
+    uint32_t spec[3] = {s->mode == UPSAMPLE_BILINEAR, 0, act};
+    Access a = {0};
+    reads(&a, whole(&g->act[src]));
+    writes(&a, whole(&g->act[l]));
+    kernel(r, &a, SPG_KERNEL_upsample, spec, 3, &p, sizeof p, groups((uint64_t)n * net->topology[l], 256u), 1, 1);
+}
+
+/* Threads of ln.comp that share a cell: about eight channels each, at most 64. */
+static uint32_t ln_threads(uint32_t C) {
+    uint32_t t = 1;
+    while (t < 64u && 16u * t <= C) t *= 2u;
+    return t;
+}
+
+/* train: each cell's statistics kept for the backward pass */
+static void ln_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act, bool train) {
+    const NeuralNetwork *net = g->net;
+    const uint32_t src = spingalett_source(net, l);
+    const LayerShape *s = &net->shapes[l];
+    const uint32_t cells = n * s->height * s->width, T = ln_threads(s->channels);
+    const bool stats = train && g->bn[l].buffer;
+    SpgLnPush p = {g->act[src].address, g->act[l].address, 0, weights_at(g, l - 1), biases_at(g, l - 1),
+                   stats ? g->bn[l].address : 0, cells, s->channels, stats ? 1u : 0u, s->eps};
+    uint32_t spec[3] = {T, 0, act};
     Access a = {0};
     reads(&a, whole(&g->act[src]));
     reads(&a, weights_of(g, l - 1));
     reads(&a, biases_of(g, l - 1));
-    reads(&a, whole(&g->geo[l]));
     writes(&a, whole(&g->act[l]));
-    product(r, &a, &p, &m);
+    if (stats) writes(&a, span(g->bn[l].address, 2ull * cells));
+    kernel(r, &a, SPG_KERNEL_ln, spec, 3, &p, sizeof p, groups(cells, 256u / T), 1, 1);
 }
 
 static void dense_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act) {
@@ -726,8 +854,10 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
         /* softmax runs over whole rows after the layer; every other activation in its kernel */
         const uint32_t fused = act == ACT_SOFTMAX ? ACT_NONE : act;
         if (type == LAYER_DENSE) dense_forward(g, r, l, n, fused);
-        else if (type == LAYER_CONV2D) conv_forward(g, r, l, n, fused);
+        else if (spingalett_filters(type)) conv_forward(g, r, l, n, fused);
         else if (type == LAYER_BATCH_NORM) bn_forward(g, r, l, n, fused, train);
+        else if (type == LAYER_LAYER_NORM) ln_forward(g, r, l, n, fused, train);
+        else if (type == LAYER_UPSAMPLE) upsample_forward(g, r, l, n, fused);
         else if (type == LAYER_ADD || type == LAYER_CONCAT || type == LAYER_GLOBAL_AVG_POOL)
             combine_forward(g, r, l, n, fused);
         else {
@@ -766,8 +896,9 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
 /* ---- backward ---- */
 
 /* The gradient input k of layer cl gets from it, into dst (added to it with accumulate: dense,
-   convolution, adding, concatenating and global pooling layers), then times act'(the input's
-   outputs) when fused is not ACT_NONE. Returns whether the derivative was applied. */
+   convolution, transposed convolution, adding, concatenating, global pooling and upsampling layers),
+   then times act'(the input's outputs) when fused is not ACT_NONE. Returns whether the derivative
+   was applied. */
 static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, const SpgGpuBuffer *dst, uint32_t n,
                            uint32_t fused, bool accumulate) {
     const NeuralNetwork *net = g->net;
@@ -776,7 +907,7 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
     const bool derive = fused != ACT_NONE;
     Access a = {0};
     reads(&a, whole(&g->delta[cl]));
-    if (derive || s->type == LAYER_BATCH_NORM || s->type == LAYER_MAX_POOL2D || s->type == LAYER_AVG_POOL2D)
+    if (derive || spingalett_normalization(s->type) || s->type == LAYER_MAX_POOL2D || s->type == LAYER_AVG_POOL2D)
         reads(&a, whole(&g->act[i]));
     if (accumulate) reads(&a, whole(dst));
     writes(&a, whole(dst));
@@ -794,36 +925,30 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
             product(r, &a, &p, &m);
             return derive;
         }
-        case LAYER_CONV2D: {
-            /* the weights regrouped by phase, then a stride-1 product per phase of the stride over the
-               input pixels it holds (one group: they write different pixels) */
-            const uint32_t G = layer_groups(s), CG = x->channels / G, OG = s->channels / G;
-            const uint32_t taps = s->kernel_h * s->kernel_w;
-            const SpgConvGeometry *info = g->conv[cl];
-            SpgWtransPush wp = {weights_at(g, cl - 1), g->wt.address, g->geo[cl].address + 4u * info->order,
-                                G * OG * taps * CG, OG, CG, taps};
-            Access t = {0};
-            reads(&t, weights_of(g, cl - 1));
-            reads(&t, whole(&g->geo[cl]));
-            writes(&t, whole(&g->wt));
-            kernel(r, &t, SPG_KERNEL_wtrans, NULL, 0, &wp, sizeof wp, groups(wp.total, 256u), 1, 1);
-            reads(&a, whole(&g->wt));
-            reads(&a, whole(&g->geo[cl]));
-            a.group = group_of(cl, GROUP_PHASES);
-            for (uint32_t ph = 0; ph < info->phases; ph++) {
-                SpgGemmPush p = {
-                    .a = g->delta[cl].address, .b = at(&g->wt, (uint64_t)info->phase[ph].first * OG * CG),
-                    .c = dst->address, .e0 = g->act[i].address, .geo = g->geo[cl].address + 4u * info->phase[ph].at,
-                    .M = n * info->phase[ph].rh * info->phase[ph].rw, .N = CG, .K = info->phase[ph].taps * OG,
-                    .ldb = CG, .ldc = x->channels, .a_group = OG, .b_group = taps * OG * CG, .c_group = CG,
-                    .alpha = 1.0f, .beta = accumulate ? 1.0f : 0.0f,
-                };
-                SpgGemmMode m = {SPG_A_CONV, SPG_B_ROW, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused, G,
-                                 info->phases > 1, OG % 4u == 0 && s->channels % 4u == 0, true, 0,
-                                 (uint64_t)n * net->topology[i], g->bf16};
-                product(r, &a, &p, &m);
-            }
+        case LAYER_CONV2D:          /* through the convolution's data gradient (conv_spread()) */
+            conv_spread(g, r, &a, cl, &g->delta[cl], dst, n, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused,
+                        g->act[i].address, accumulate ? 1.0f : 0.0f);
             return derive;
+        case LAYER_CONV_TRANSPOSE2D:    /* the forward pass of the convolution it transposes */
+            conv_apply(g, r, &a, cl, &g->delta[cl], dst, n, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused,
+                       g->act[i].address, accumulate ? 1.0f : 0.0f);
+            return derive;
+        case LAYER_LAYER_NORM: {
+            const uint32_t cells = n * s->height * s->width;
+            SpgLnPush p = {g->act[i].address, dst->address, g->delta[cl].address, weights_at(g, cl - 1), 0,
+                           g->bn[cl].address, cells, s->channels, 0, 0.0f};
+            uint32_t spec[3] = {ln_threads(s->channels), 1, fused};
+            reads(&a, weights_of(g, cl - 1));
+            reads(&a, span(g->bn[cl].address, 2ull * cells));
+            kernel(r, &a, SPG_KERNEL_ln, spec, 3, &p, sizeof p, groups(cells, 256u / spec[0]), 1, 1);
+            return true;
+        }
+        case LAYER_UPSAMPLE: {
+            SpgUpsamplePush p = {g->act[i].address, 0, g->delta[cl].address, dst->address, n, x->height, x->width,
+                                 x->channels, s->stride_h, s->stride_w, accumulate ? 1u : 0u, 0};
+            uint32_t spec[3] = {s->mode == UPSAMPLE_BILINEAR, 1, fused};
+            kernel(r, &a, SPG_KERNEL_upsample, spec, 3, &p, sizeof p, groups((uint64_t)n * net->topology[i], 256u), 1, 1);
+            return true;
         }
         case LAYER_BATCH_NORM: {    /* the coefficients were left by the backward sums */
             const uint32_t C = s->channels;
@@ -899,12 +1024,41 @@ static void bn_backward(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t n, floa
     kernel(r, &b, SPG_KERNEL_bn, &mode, 1, &bp, sizeof bp, (C + 63u) / 64u, 1, 1);
 }
 
-/* grad = scale * (the chunk's gradient) + beta grad for dense or convolution layer l + 1, whose
-   gradient delta[l + 1] is complete. */
+/* The parameter gradients of layer normalization layer cl: gamma's the column sums of dy xhat, beta's
+   of dy (scaled and added to the step's). */
+static void ln_backward(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t n, float scale, float beta) {
+    const NeuralNetwork *net = g->net;
+    const uint32_t src = spingalett_source(net, cl);
+    const LayerShape *s = &net->shapes[cl];
+    const uint32_t C = s->channels, R = n * s->height * s->width, slices = (R + COLSUM_ROWS - 1u) / COLSUM_ROWS;
+    const uint32_t cols = C <= 16u ? 16u : C <= 32u ? 32u : 64u;
+    SpgColsumPush cp = {g->act[src].address, g->delta[cl].address, g->bn[cl].address, g->part.address, R, C,
+                        COLSUM_ROWS, 0};
+    uint32_t spec[2] = {cols, SPG_COLSUM_LN};
+    Access a = {0};
+    reads(&a, whole(&g->act[src]));
+    reads(&a, whole(&g->delta[cl]));
+    reads(&a, span(g->bn[cl].address, 2ull * R));
+    writes(&a, span(g->part.address, 2ull * slices * C));
+    kernel(r, &a, SPG_KERNEL_colsum, spec, 2, &cp, sizeof cp, (C + cols - 1) / cols, slices, 1);
+    /* the slices added in order: their first C sums to beta's gradient, their last C to gamma's */
+    for (uint32_t k = 0; k < 2; k++) {
+        const uint64_t out = k ? grad_weights_at(g, cl - 1) : grad_biases_at(g, cl - 1);
+        SpgReducePush rp = {g->part.address + (k ? 4u * C : 0u), out, C, 2u * C, slices, scale, beta, 0};
+        Access b = {0};
+        reads(&b, span(g->part.address, 2ull * slices * C));
+        if (beta != 0.0f) reads(&b, span(out, C));
+        writes(&b, span(out, C));
+        kernel(r, &b, SPG_KERNEL_reduce, NULL, 0, &rp, sizeof rp, (C + 255u) / 256u, 1, 1);
+    }
+}
+
+/* grad = scale * (the chunk's gradient) + beta grad for dense or (transposed) convolution layer l + 1,
+   whose gradient delta[l + 1] is complete. */
 static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, float scale, float beta) {
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, l + 1), out_sz = net->topology[l + 1];
-    const LayerShape *s = &net->shapes[l + 1], *in = &net->shapes[src];
+    const LayerShape *s = &net->shapes[l + 1];
     SpgGemmPush p = {.c = grad_weights_at(g, l), .alpha = scale, .beta = beta};
     SpgGemmMode m = {SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, ACT_NONE, 1, false, true, true, 0, 0, g->bf16};
     uint32_t rows, M, N, K;
@@ -917,14 +1071,19 @@ static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, f
         p.a = g->delta[l + 1].address; p.lda = out_sz;
         p.b = g->act[src].address; p.ldb = N;
     } else {
-        /* gW[g OG + f][window] = sum over output pixels of dy[pixel][g OG + f] x window[pixel] */
-        m.groups = layer_groups(s);
-        const uint32_t CG = in->channels / m.groups, OG = s->channels / m.groups;
-        M = OG; N = s->kernel_h * s->kernel_w * CG; K = n * s->height * s->width; rows = K;
-        p.a = g->delta[l + 1].address; p.lda = s->channels; p.a_group = OG;
-        p.b = g->act[src].address; p.b_group = CG; p.geo = g->geo[l + 1].address;
+        /* gW[g OG + f][window] = sum over the convolution's output pixels of dy[pixel][g OG + f] x
+           window[pixel] (conv_view(): for a transposed convolution, x is its output gradient and dy
+           its input) */
+        const ConvView v = conv_view(net, l + 1);
+        const bool transposed = s->type == LAYER_CONV_TRANSPOSE2D;
+        const SpgGpuBuffer *x = transposed ? &g->delta[l + 1] : &g->act[src];
+        const SpgGpuBuffer *dy = transposed ? &g->act[src] : &g->delta[l + 1];
+        m.groups = v.G;
+        M = v.OG; N = v.taps * v.CG; K = n * v.out_h * v.out_w; rows = n * s->height * s->width;
+        p.a = dy->address; p.lda = v.out_c; p.a_group = v.OG;
+        p.b = x->address; p.b_group = v.CG; p.geo = g->geo[l + 1].address;
         m.bmode = SPG_B_CONV;
-        m.vec_b = CG % 4u == 0 && in->channels % 4u == 0;
+        m.vec_b = v.CG % 4u == 0 && v.in_c % 4u == 0;
         reads(&a, whole(&g->geo[l + 1]));
     }
     p.M = M; p.N = N; p.K = K; p.ldc = N; p.c_group = M * N;
@@ -962,8 +1121,9 @@ static void record_backward(SpgGpuNet *g, Recorder *r, uint32_t n, float scale, 
     for (uint32_t cl = last; cl > 0; cl--) {
         const uint32_t count = spingalett_input_count(net, cl), *in = spingalett_inputs(net, cl);
         const LayerType type = net->shapes[cl].type;
-        if (type == LAYER_DENSE || type == LAYER_CONV2D) weight_gradient(g, r, cl - 1, n, scale, beta);
+        if (type == LAYER_DENSE || spingalett_filters(type)) weight_gradient(g, r, cl - 1, n, scale, beta);
         if (type == LAYER_BATCH_NORM) bn_backward(g, r, cl, n, scale, beta);
+        if (type == LAYER_LAYER_NORM) ln_backward(g, r, cl, n, scale, beta);
         for (uint32_t k = 0; k < count; k++) {
             const uint32_t l = in[k];
             if (l == 0 || g->fold[l] == cl) continue;   /* its gradient is the addition's own */
@@ -979,8 +1139,8 @@ static void record_backward(SpgGpuNet *g, Recorder *r, uint32_t n, float scale, 
                 /* the first gradient is written, later ones added (in the kernel's last step: products
                    add in their epilogue, as the sums of the CPU run; batch normalization and pooling
                    through gtmp), the derivative applied with the last one where the kernel can */
-                const bool direct = first || type == LAYER_DENSE || type == LAYER_CONV2D || type == LAYER_ADD ||
-                                    type == LAYER_CONCAT || type == LAYER_GLOBAL_AVG_POOL;
+                const bool direct = first || type == LAYER_DENSE || spingalett_filters(type) || type == LAYER_ADD ||
+                                    type == LAYER_CONCAT || type == LAYER_GLOBAL_AVG_POOL || type == LAYER_UPSAMPLE;
                 const uint32_t fused = direct && done && !masked ? act : ACT_NONE;
                 bool applied = input_gradient(g, r, cl, k, direct ? &g->delta[l] : &g->gtmp, n, fused,
                                               direct && !first) && fused != ACT_NONE;
@@ -1039,17 +1199,17 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
     writes(&a, whole(&g->params));
     if (g->moment1.buffer) writes(&a, whole(&g->moment1));
     if (g->moment2.buffer) writes(&a, whole(&g->moment2));
-    /* weights, with no decay for batch normalization's gamma; biases without decay */
+    /* weights, with no decay for the normalizations' gamma; biases without decay */
     bool per_layer = false;
     for (uint32_t l = 1; o->decay != 0.0f && l < net->layers; l++)
-        if (net->shapes[l].type == LAYER_BATCH_NORM) per_layer = true;
+        if (spingalett_normalization(net->shapes[l].type)) per_layer = true;
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         uint64_t w0 = per_layer ? g->woff[l] : 0, count = per_layer ? weight_count(g, l) : W;
         if (count > 0) {
             p.w = at(&g->params, w0); p.g = at(&g->grads, w0); p.n = (uint32_t)count;
             p.m = g->moment1.buffer ? at(&g->moment1, w0) : 0;
             p.v = g->moment2.buffer ? at(&g->moment2, w0) : 0;
-            p.decay = per_layer && net->shapes[l + 1].type == LAYER_BATCH_NORM ? 0.0f : o->decay;
+            p.decay = per_layer && spingalett_normalization(net->shapes[l + 1].type) ? 0.0f : o->decay;
             kernel(r, &a, SPG_KERNEL_optim, &spec, 1, &p, sizeof p, groups(count, 256u), 1, 1);
         }
         if (!per_layer) break;

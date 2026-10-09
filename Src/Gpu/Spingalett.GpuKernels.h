@@ -87,7 +87,7 @@ typedef struct {
     uint64_t x, dy, k, part;
     uint32_t R, C, slice_rows, pad;
 } SpgColsumPush;
-enum { SPG_COLSUM_SUM, SPG_COLSUM_SHIFTED, SPG_COLSUM_DY };
+enum { SPG_COLSUM_SUM, SPG_COLSUM_SHIFTED, SPG_COLSUM_DY, SPG_COLSUM_LN };
 
 /* reduce.comp */
 typedef struct {
@@ -129,6 +129,19 @@ typedef struct {
     uint64_t x, y, dy, dx;
     uint32_t n, H, W, C, OH, OW, KH, KW, SH, SW, PH, PW;
 } SpgPoolPush;
+
+/* upsample.comp */
+typedef struct {
+    uint64_t x, y, dy, dx;
+    uint32_t n, H, W, C, SH, SW, flags, pad;
+} SpgUpsamplePush;
+
+/* ln.comp */
+typedef struct {
+    uint64_t x, y, dy, gamma, beta, stats;
+    uint32_t cells, C, flags;
+    float eps;
+} SpgLnPush;
 
 /* combine.comp */
 typedef struct {

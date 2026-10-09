@@ -4108,7 +4108,8 @@ static void pytorch_weights(void) {
 
 /* Networks covering every kind of layer the GPU runs: dense layers, convolutions (strided, grouped,
    depthwise), pooling, batch normalization (of convolutions and of dense layers), residual additions,
-   concatenations, global pooling, dropout, layers feeding several others. */
+   concatenations, global pooling, dropout, layers feeding several others, transposed convolutions,
+   upsampling and layer normalization. */
 static NeuralNetwork *gpu_net(int which) {
     spingalett_seed(1234 + (uint64_t)which);
     NeuralNetwork *net = NULL;
@@ -4164,6 +4165,53 @@ static NeuralNetwork *gpu_net(int which) {
         uint32_t d = batch_norm(.net = net, .act_func = ACT_SIGMOID);
         add_layers(.net = net, .inputs = {a, b, d}, .act_func = ACT_LEAKY_RELU);
         layer(.net = net, .neurons_amount = 4, .act_func = ACT_SOFTMAX);
+        break;
+    }
+    case 6: {   /* a small U-Net: down by a strided convolution, up by a transposed one (whose input a
+                   pooling layer reads too) and by nearest upsampling, concatenated */
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 12, .width = 12, .channels = 4);
+        uint32_t a = conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_RELU);
+        uint32_t b = conv2d(.net = net, .filters = 16, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_RELU);
+        uint32_t c = conv_transpose2d(.net = net, .filters = 8, .kernel = 2, .stride = 2, .act_func = ACT_RELU);
+        uint32_t d = max_pool2d(.net = net, .inputs = {b}, .kernel = 2);
+        d = upsample2d(.net = net, .inputs = {d}, .stride = 4);
+        concat_layers(.net = net, .inputs = {a, c, d}, .act_func = ACT_NONE);
+        conv2d(.net = net, .filters = 8, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_TANH);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX);
+        break;
+    }
+    case 7: {   /* a grouped transposed convolution with padding and output padding, layer normalization
+                   of maps read by bilinear and nearest upsampling; maps out (wide rows of outputs) */
+        net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = net, .height = 5, .width = 6, .channels = 4);
+        conv_transpose2d(.net = net, .filters = 6, .kernel = 3, .stride = 2, .padding = 1, .output_padding = 1,
+                         .groups = 2, .act_func = ACT_NONE);
+        uint32_t b = layer_norm(.net = net, .act_func = ACT_TANH);
+        uint32_t c = upsample2d(.net = net, .stride_h = 2, .stride_w = 3, .upsample = UPSAMPLE_BILINEAR);
+        uint32_t d = upsample2d(.net = net, .inputs = {b}, .stride_h = 2, .stride_w = 3);
+        add_layers(.net = net, .inputs = {c, d}, .act_func = ACT_NONE);
+        conv2d(.net = net, .filters = 4, .kernel = 3, .stride = 3, .act_func = ACT_TANH);
+        conv2d(.net = net, .filters = 2, .kernel = 1, .act_func = ACT_SIGMOID);
+        break;
+    }
+    case 8: {   /* transposed convolutions of stride 1 and of a kernel smaller than the stride (output
+                   pixels no tap reaches), dropout, layer normalization of vectors read twice, a wide
+                   softmax */
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 4, .width = 4, .channels = 3);
+        conv_transpose2d(.net = net, .filters = 4, .kernel = 3, .act_func = ACT_LEAKY_RELU);
+        conv_transpose2d(.net = net, .filters = 4, .kernel = 1, .stride = 2, .output_padding = 1, .act_func = ACT_RELU,
+                         .dropout_rate = 0.2f);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 24, .act_func = ACT_NONE);
+        uint32_t b = layer_norm(.net = net, .act_func = ACT_TANH);
+        uint32_t c = layer(.net = net, .neurons_amount = 16, .act_func = ACT_SIGMOID);
+        uint32_t d = layer(.net = net, .inputs = {b}, .neurons_amount = 16, .act_func = ACT_TANH);
+        add_layers(.net = net, .inputs = {c, d}, .act_func = ACT_NONE);
+        layer_norm(.net = net, .act_func = ACT_RELU);
+        layer(.net = net, .neurons_amount = 100, .act_func = ACT_SOFTMAX);
         break;
     }
     default:
@@ -4232,7 +4280,8 @@ static float *gpu_trained(int which, ComputeMode mode, const float *x, const flo
    Adam turns into steps; momentum keeps it still), and the same bits from two GPU runs. */
 static void gpu_equivalence(int which) {
     static const OptimizerType opts[] = {OPTIMIZER_SGD, OPTIMIZER_MOMENTUM, OPTIMIZER_MOMENTUM, OPTIMIZER_ADAMW,
-                                         OPTIMIZER_RMSPROP, OPTIMIZER_MOMENTUM};
+                                         OPTIMIZER_RMSPROP, OPTIMIZER_MOMENTUM, OPTIMIZER_ADAM, OPTIMIZER_MOMENTUM,
+                                         OPTIMIZER_ADAMW};
     NeuralNetwork *probe = gpu_net(which);
     SpingalettNetworkLayer first, last;
     spingalett_network_layer(probe, 0, &first);
@@ -4536,15 +4585,20 @@ static void gpu_trainer_run(int which, ComputeMode mode, float *params, size_t c
 }
 
 static void gpu_trainer(void) {
-    for (int which = 0; which <= 3; which++) {
+    /* nets 7 and 8 read and write the weights of a transposed convolution, which the device keeps
+       reordered (net 6's first Adam step, about lr times the sign of each gradient, turns the rounding
+       of builds without reassociation into differences of 1e-2) */
+    static const int nets[] = {0, 1, 2, 3, 7, 8};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
         NeuralNetwork *probe = gpu_net(which);
         const size_t count = spingalett_parameter_count(probe);
-        free_network(probe);
         float *p[3], loss[3][6], *y[3];
         for (int k = 0; k < 3; k++) {
             p[k] = (float *)malloc(count * sizeof(float));
-            y[k] = (float *)malloc(24 * 64 * sizeof(float));
+            y[k] = (float *)malloc((size_t)16 * spingalett_output_size(probe) * sizeof(float));
         }
+        free_network(probe);
         gpu_trainer_run(which, COMPUTE_OPENMP, p[0], count, loss[0], y[0]);
         gpu_trainer_run(which, COMPUTE_VULKAN, p[1], count, loss[1], y[1]);
         gpu_trainer_run(which, COMPUTE_VULKAN, p[2], count, loss[2], y[2]);
@@ -4566,7 +4620,9 @@ static void gpu_trainer(void) {
    per cent of single precision (8 bits of mantissa in the operands), training as far along (its
    loss), and repeating bit for bit. */
 static void gpu_bf16(void) {
-    for (int which = 0; which <= 2; which++) {
+    static const int nets[] = {0, 1, 2, 6};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
         NeuralNetwork *probe = gpu_net(which);
         SpingalettNetworkLayer first, last;
         spingalett_network_layer(probe, 0, &first);
@@ -4808,7 +4864,7 @@ int main(int argc, char **argv) {
             printf("  skipped: no usable Vulkan device\n");
         } else {
             printf("  device: %s\n", spingalett_gpu_device());
-            for (int k = 0; k < 6; k++) gpu_equivalence(k);
+            for (int k = 0; k < 9; k++) gpu_equivalence(k);
             gpu_saturated();
             gpu_training_options();
             gpu_threads();
