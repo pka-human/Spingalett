@@ -187,6 +187,15 @@ void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const f
 void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
                                       float scale, float beta, float *scratch, SpingalettGemmScratch *gemm,
                                       ComputeMode mode);
+/* Transposed convolutions over explicit shapes (deployment models): Wc the filters of the convolution
+   whose data gradient they compute, as spingalett_transposed_conv_filters() turns a transposed
+   convolution's into them, scratch spingalett_conv_transpose_scratch() floats; softmax is not applied. */
+void spingalett_transposed_conv_filters(const float *W, const LayerShape *in, const LayerShape *out, float *Wc);
+size_t spingalett_conv_transpose_scratch(const LayerShape *in, const LayerShape *out, uint32_t capacity,
+                                         ComputeMode mode);
+void spingalett_conv_transpose_shapes(const LayerShape *in, const LayerShape *out, const float *Wc, const float *bias,
+                                      const float *x, float *y, uint32_t n, ActivationFunction act, float *scratch,
+                                      SpingalettGemmScratch *gemm, ComputeMode mode);
 /* Transposed convolutions (weight layer l, LAYER_CONV_TRANSPOSE2D), as the passes above. */
 void spingalett_conv_transpose_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                                        ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm,
