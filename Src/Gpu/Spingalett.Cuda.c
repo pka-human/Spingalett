@@ -390,17 +390,56 @@ static void cub_prepare(SpgKernel kernel, const uint32_t *specs, uint32_t count,
 
 /* A buffer of its own: device memory, or pinned host memory the device reads and writes in place. Its
    `buffer` says which (1: device, 2: host); its `memory` is the allocation. */
+/* Page-locked host memory takes 0.18 ms a megabyte to allocate (an RTX 4050's driver): what host-visible
+   buffers free is kept, a few blocks at most, for buffers of between half and all of a block's size (a
+   network's staging, made again for every train()). */
+#define HOST_CACHE 8
+#define HOST_CACHE_BYTES (256u << 20)
+static struct { void *host; size_t bytes; } host_cache[HOST_CACHE];
+
+static void *host_alloc(size_t *bytes) {
+    void *host = NULL;
+    spg_lock(cu.lock);
+    int best = -1;
+    for (int k = 0; k < HOST_CACHE; k++)
+        if (host_cache[k].host && host_cache[k].bytes >= *bytes && host_cache[k].bytes <= 2u * *bytes &&
+            (best < 0 || host_cache[k].bytes < host_cache[best].bytes))
+            best = k;
+    if (best >= 0) {
+        host = host_cache[best].host;
+        *bytes = host_cache[best].bytes;
+        host_cache[best].host = NULL;
+    }
+    spg_unlock(cu.lock);
+    if (!host && cuMemHostAlloc(&host, *bytes, CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP) != 0) return NULL;
+    return host;
+}
+
+static void host_free(void *host, size_t bytes) {
+    spg_lock(cu.lock);
+    size_t cached = bytes;
+    int free_slot = -1;
+    for (int k = 0; k < HOST_CACHE; k++) {
+        if (host_cache[k].host) cached += host_cache[k].bytes;
+        else if (free_slot < 0) free_slot = k;
+    }
+    const bool keep = free_slot >= 0 && cached <= HOST_CACHE_BYTES;
+    if (keep) host_cache[free_slot].host = host, host_cache[free_slot].bytes = bytes;
+    spg_unlock(cu.lock);
+    if (!keep) cuMemFreeHost(host);
+}
+
 static bool cub_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) {
     memset(b, 0, sizeof *b);
     if (!cub_open()) return false;
     if (bytes == 0) bytes = 16;
     bytes = (bytes + 255u) & ~(size_t)255u;
     if (host_visible) {
-        void *host = NULL;
         CUdeviceptr address = 0;
-        if (cuMemHostAlloc(&host, bytes, CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP) != 0) return false;
+        void *host = host_alloc(&bytes);
+        if (!host) return false;
         if (cuMemHostGetDevicePointer(&address, host, 0) != 0) {
-            cuMemFreeHost(host);
+            host_free(host, bytes);
             return false;
         }
         *b = (SpgGpuBuffer){(void *)2, host, address, host, bytes, 0, SPG_BACKEND_CUDA};
@@ -416,7 +455,7 @@ static void cub_buffer_free(SpgGpuBuffer *b) {
     if (!b || !b->buffer) return;
     if (b->memory) {                                    /* an arena's buffers leave their memory to it */
         bind();
-        if (b->buffer == (void *)2) cuMemFreeHost(b->memory);
+        if (b->buffer == (void *)2) host_free(b->memory, b->size);
         else cuMemFree((CUdeviceptr)(uintptr_t)b->memory);
     }
     memset(b, 0, sizeof *b);

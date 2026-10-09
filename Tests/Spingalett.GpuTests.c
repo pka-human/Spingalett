@@ -16,7 +16,8 @@
  *   SpingalettGpuTests bench      times every tile on the products of ResNet-20 at 128 samples
  *   SpingalettGpuTests bench bf16 the same on the matrix units ("dense" after either: the MLP's
  *                                 products only; "half" with bf16: their operands and results kept
- *                                 as bfloat16, as training in bfloat16 keeps them)
+ *                                 as bfloat16, as training in bfloat16 keeps them; "fw" with half: the
+ *                                 MLP's weights as floats, as training keeps them)
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -30,6 +31,7 @@ static int failures;
 static uint32_t tile_step = 3;      /* every tile_step-th tile is tried */
 static bool mma;                    /* the products in bfloat16 on the matrix units (gemm_mma.comp) */
 static bool half;                   /* bench: operands and results kept as bfloat16 */
+static bool float_weights;          /* and with "fw" the MLP's weights as floats, as in training */
 
 /* x rounded to bfloat16, to the nearest (ties to even), as the matrix kernel converts its operands */
 static float bf16(float x) {
@@ -476,7 +478,8 @@ static void bench(bool dense_only) {
         }
         const void *src = half ? (const void *)h16 : (const void *)host;
         upload(&bx, src, (size_t)n * in * size);
-        upload(&bw, src, (size_t)out * in * size);
+        if (float_weights) upload(&bw, host, (size_t)out * in * 4u);
+        else upload(&bw, src, (size_t)out * in * size);
         upload(&bd, src, (size_t)n * out * size);
         spg_gpu_buffer_create(&by, (size_t)(n > out ? n : out) * (in > out ? in : out) * 4, false);
         printf("dense %u x %u -> %u (%.0f MFLOP a product)\n", n, in, out, flops * 1e-6);
@@ -503,7 +506,7 @@ static void bench(bool dense_only) {
                                       (uint64_t)out * in, mma};
                 }
                 /* kept as bfloat16: A and B, and C but the weight gradients' */
-                m.half = half ? (pass == 2 ? 3u : 7u) : 0u;
+                m.half = half ? (pass == 2 ? 3u : float_weights ? 5u : 7u) : 0u;
                 m.wide_a = m.wide_b = true;
                 run(&p, &m, 2);
                 double t = run(&p, &m, 20);
@@ -535,6 +538,7 @@ int main(int argc, char **argv) {
             if (!strcmp(argv[k], "bf16")) mma = spg_gpu_mma_bf16();
             if (!strcmp(argv[k], "dense")) dense = true;
             if (!strcmp(argv[k], "half")) half = spg_gpu_mma_bf16() && spg_gpu_bf16_storage();
+            if (!strcmp(argv[k], "fw")) float_weights = true;
         }
         bench(dense);
         return 0;
