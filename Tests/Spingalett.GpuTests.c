@@ -411,6 +411,21 @@ static void bench(bool dense_only) {
         for (size_t i = 0; i < ny; i++) dy[i] = uniform();
         ConvBuffers b = {0};
         conv_setup(v, &b, x, w, dy);
+        /* with "half": the maps kept as bfloat16 (the floats' high halves), the filters as floats, as in training */
+        for (int map = 0; half && map < 2; map++) {
+            const float *src = map ? dy : x;
+            const size_t count = map ? ny : nx;
+            uint16_t *h16 = malloc(count * 2);
+            for (size_t i = 0; i < count; i++) {
+                uint32_t u;
+                memcpy(&u, &src[i], 4);
+                h16[i] = (uint16_t)(u >> 16);
+            }
+            SpgGpuBuffer *dst = map ? &b.dy : &b.x;
+            spg_gpu_buffer_free(dst);
+            upload(dst, h16, count * 2);
+            free(h16);
+        }
         const double flops = 2.0 * (double)ny * K;
         printf("conv %ux%ux%u -> %ux%ux%u, %ux%u window, stride %u (%.0f MFLOP a product)\n", v->h, v->w, v->c, OH, OW,
                v->out, v->kh, v->kw, v->sh, flops * 1e-6);
@@ -424,7 +439,15 @@ static void bench(bool dense_only) {
                     slices = spg_gemm_split(v->out / v->groups, K, v->n * OH * OW, v->groups, &slice_k);
                 /* tile 0: chosen by timing (as in training); the others forced */
                 uint32_t count = conv_push(v, &b, pass, slices, p, m, true, tile == 0);
-                for (uint32_t j = 0; j < count; j++) m[j].tile = tile;
+                const uint32_t CG = v->c / v->groups, OG = v->out / v->groups;
+                for (uint32_t j = 0; j < count; j++) {
+                    m[j].tile = tile;
+                    if (!half) continue;
+                    /* A, and C of the forward pass and data gradient, as bfloat16; with the weight gradient's B */
+                    m[j].half = pass == 2 ? 3u : 5u;
+                    m[j].wide_a = pass == 0 ? CG % 8u == 0 && v->c % 8u == 0 : pass == 1 ? OG % 8u == 0 && v->out % 8u == 0 : true;
+                    m[j].wide_b = pass == 2 ? CG % 8u == 0 && v->c % 8u == 0 : true;
+                }
                 run_many(p, m, count, 2);
                 double t = run_many(p, m, count, 20);
                 if (tile == 0) chosen = t;

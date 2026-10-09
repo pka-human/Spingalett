@@ -77,10 +77,11 @@ DEVICE void element(const SpgEltwisePush &p, uint32_t ACT, uint32_t HALF, uint32
     }
 }
 
-/* Values i .. i + 3 (i a multiple of four): the operands indexed by i read and written four at a time,
+/* Values i .. i + 3 (i a multiple of four): the operands indexed by i read and written four at a time, and
+   with rows of a multiple of four (n) those indexed by the column too (the four columns then consecutive);
    each value computed as element() computes it. */
 template <uint32_t OP>
-DEVICE void four(const SpgEltwisePush &p, uint32_t ACT, uint32_t HALF, uint32_t i) {
+DEVICE void four(const SpgEltwisePush &p, uint32_t ACT, float slope, uint32_t HALF, uint32_t i) {
     float4_ y = {0.0f, 0.0f, 0.0f, 0.0f}, x = y, b = y, z = y;
     const bool reads_y = OP == BIAS_ACT || OP == DERIV || OP == MUL || OP == ADD || OP == DROPOUT || OP == SCALE;
     const bool reads_x = OP == DERIV || OP == MUL || OP == ADD || OP == AFFINE || OP == BDATA || OP == AFFINE_ADD || OP == COPY;
@@ -88,44 +89,67 @@ DEVICE void four(const SpgEltwisePush &p, uint32_t ACT, uint32_t HALF, uint32_t 
     if (reads_x) x = ld4(p.x, i, 1u, HALF);
     if (OP == BDATA) b = ld4(p.b, i, 3u, HALF);
     if (OP == AFFINE_ADD) z = ld4(p.z, i, 8u, HALF);
-    float4_ out, out_x = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-    for (uint32_t k = 0; k < 4u; k++) {
-        const uint32_t e = i + k;
-        float v = 0.0f;
-        if (OP == BIAS_ACT) {
-            v = get4(y, k);
-            if (p.flags & FLAG_A) v += ld(p.a, e % p.n, 2u, HALF);
-            v = activate(v, ACT);
-        } else if (OP == DERIV) {
-            v = get4(y, k) * derivative(get4(x, k), ACT);
-        } else if (OP == MUL) {
-            v = get4(y, k) * get4(x, k);
-        } else if (OP == ADD) {
-            v = get4(y, k) + get4(x, k);
-        } else if (OP == DROPOUT) {
-            const uint32_t s = e / p.n, j = e % p.n;
-            const uint32_t base = dropout_base(p, U(p.header)[STEP_POSITION] + s);
-            const float m = hash32(base + j * 0x9E3779B9u) >= p.threshold ? p.keep_scale : 0.0f;
-            set4(out_x, k, m * derivative(get4(y, k), ACT));
-            v = get4(y, k) * m;
-        } else if (OP == AFFINE) {
-            const uint32_t c = e % p.n;
-            v = activate(get4(x, k) * ld(p.a, c, 2u, HALF) + ld(p.b, c, 3u, HALF), ACT);
-        } else if (OP == BDATA) {
-            const uint32_t c = e % p.n;
-            const float xin = get4(b, k);
-            v = ld(p.a, c, 2u, HALF) * get4(x, k) + (ld(p.a, p.n + c, 2u, HALF) * xin + ld(p.a, 2u * p.n + c, 2u, HALF));
-            if (ACT != ACT_NONE) v *= derivative(xin, ACT);
-        } else if (OP == SCALE) {
-            v = get4(y, k) * ld(p.a, 0u, 2u, HALF);
-        } else if (OP == AFFINE_ADD) {
-            const uint32_t c = e % p.n;
-            v = activate(get4(z, k) + (get4(x, k) * ld(p.a, c, 2u, HALF) + ld(p.b, c, 3u, HALF)), ACT);
-        } else {
-            v = get4(x, k);
+    /* the columns' parameters (AFFINE, AFFINE_ADD: scale a and shift b; BDATA: three rows of a; BIAS_ACT: a) */
+    const bool columns = OP == BIAS_ACT || OP == AFFINE || OP == BDATA || OP == AFFINE_ADD;
+    float4_ pa = {0.0f, 0.0f, 0.0f, 0.0f}, pb = pa, pc = pa;
+    const uint32_t c0 = columns ? i % p.n : 0u;
+    const bool whole = columns && p.n % 4u == 0u && (p.a & 15u) == 0u && (OP == BDATA || OP == BIAS_ACT || (p.b & 15u) == 0u);
+    if (whole) {
+        if (OP != BIAS_ACT || (p.flags & FLAG_A)) pa = ld4(p.a, c0, 2u, HALF);
+        if (OP == AFFINE || OP == AFFINE_ADD) pb = ld4(p.b, c0, 3u, HALF);
+        if (OP == BDATA) {
+            pb = ld4(p.a, p.n + c0, 2u, HALF);
+            pc = ld4(p.a, 2u * p.n + c0, 2u, HALF);
         }
-        set4(out, k, v);
+    } else if (columns) {
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++) {
+            uint32_t c = c0 + k;
+            if (c >= p.n) c -= p.n;             /* (rows shorter than four: n at least one) */
+            c %= p.n;
+            if (OP != BIAS_ACT || (p.flags & FLAG_A)) set4(pa, k, ld(p.a, c, 2u, HALF));
+            if (OP == AFFINE || OP == AFFINE_ADD) set4(pb, k, ld(p.b, c, 3u, HALF));
+            if (OP == BDATA) {
+                set4(pb, k, ld(p.a, p.n + c, 2u, HALF));
+                set4(pc, k, ld(p.a, 2u * p.n + c, 2u, HALF));
+            }
+        }
+    }
+    float4_ out = {0.0f, 0.0f, 0.0f, 0.0f}, out_x = out;
+    if (OP == BIAS_ACT) {
+        out = activate4s((p.flags & FLAG_A) ? add4(y, pa) : y, ACT, slope);
+    } else if (OP == AFFINE) {
+        out = activate4s(add4(mul4(x, pa), pb), ACT, slope);
+    } else if (OP == AFFINE_ADD) {
+        out = activate4s(add4(z, add4(mul4(x, pa), pb)), ACT, slope);
+    } else {
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++) {
+            const uint32_t e = i + k;
+            float v = 0.0f;
+            if (OP == DERIV) {
+                v = get4(y, k) * derivative_s(get4(x, k), ACT, slope);
+            } else if (OP == MUL) {
+                v = get4(y, k) * get4(x, k);
+            } else if (OP == ADD) {
+                v = get4(y, k) + get4(x, k);
+            } else if (OP == DROPOUT) {
+                const uint32_t s = e / p.n, j = e % p.n;
+                const uint32_t base = dropout_base(p, U(p.header)[STEP_POSITION] + s);
+                const float m = hash32(base + j * 0x9E3779B9u) >= p.threshold ? p.keep_scale : 0.0f;
+                set4(out_x, k, m * derivative(get4(y, k), ACT));
+                v = get4(y, k) * m;
+            } else if (OP == BDATA) {
+                const float xin = get4(b, k);
+                v = get4(pa, k) * get4(x, k) + (get4(pb, k) * xin + get4(pc, k));
+                if (ACT != ACT_NONE) v *= derivative_s(xin, ACT, slope);
+            } else if (OP == SCALE) {
+                v = get4(y, k) * ld(p.a, 0u, 2u, HALF);
+            } else {
+                v = get4(x, k);
+            }
+            set4(out, k, v);
+        }
     }
     if (OP == DROPOUT) st4(p.x, i, 1u, HALF, out_x);
     st4(p.y, i, 0u, HALF, out);
@@ -137,7 +161,8 @@ template <uint32_t OP>
 DEVICE void pass(const SpgEltwisePush &p, uint32_t ACT, uint32_t HALF) {
     const uint32_t stride = blocks_x() * 256u;
     if (p.total % 4u == 0u && ((p.y | p.x | p.b | p.z) & 15u) == 0u) {
-        for (uint32_t q = global_x(); q < p.total / 4u; q += stride) four<OP>(p, ACT, HALF, 4u * q);
+        const float slope = act_slope(ACT);
+        for (uint32_t q = global_x(); q < p.total / 4u; q += stride) four<OP>(p, ACT, slope, HALF, 4u * q);
         return;
     }
     for (uint32_t i = global_x(); i < p.total; i += stride) element<OP>(p, ACT, HALF, i);
