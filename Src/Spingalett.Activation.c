@@ -6,7 +6,7 @@
 #include "Spingalett.Private.h"
 #include <math.h>
 
-float activate(float x, ActivationFunction act_func) {
+float spingalett_activate(float x, ActivationFunction act_func) {
     switch (act_func) {
         case ACT_RELU:
             return x > 0.0f ? x : 0.0f;
@@ -23,7 +23,7 @@ float activate(float x, ActivationFunction act_func) {
     }
 }
 
-float derivative(float x, ActivationFunction act_func) {
+float spingalett_derivative(float x, ActivationFunction act_func) {
     switch (act_func) {
         case ACT_RELU:
             return x > 0.0f ? 1.0f : 0.0f;

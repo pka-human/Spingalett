@@ -371,7 +371,7 @@ float *spingalett_device_rows(const SpingalettDeviceData *data, uint32_t count, 
     return NULL;
 }
 
-bool predict_struct_arguments(PredictArgs args) {
+bool spingalett_predict_args(PredictArgs args) {
     NeuralNetwork *net = args.net;
     if (!net || !args.outputs) {
         set_error(SPINGALETT_ERR_INVALID, "predict: net or outputs is NULL");
@@ -540,7 +540,7 @@ bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, const float *in
     return ok;
 }
 
-EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
+EvalMetrics spingalett_evaluate_args(EvaluateArgs args) {
     EvalMetrics m = {NAN, NAN};
     NeuralNetwork *net = args.net;
     if (!net || args.sample_count == 0) {

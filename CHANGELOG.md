@@ -29,6 +29,20 @@ RTX 4050 Laptop GPU; README).
   against 5.00 M).
 
 ### Changed
+- **Every public name has the library's prefix.** Types are `Spingalett*` (`SpingalettNetwork`,
+  `SpingalettTrainArgs`, `SpingalettActivationFunction`, ...), enumerators `SPINGALETT_*`
+  (`SPINGALETT_ACT_RELU`, `SPINGALETT_LAYER_CONV2D`, ...), and the builders and functions `spingalett_*`:
+  `spingalett_network_new()`, `spingalett_layer()`, `spingalett_conv2d()` and the other layers,
+  `spingalett_train()`, `spingalett_predict()`, `spingalett_evaluate()`, `spingalett_forward()`,
+  `spingalett_save()`, `spingalett_load()`, `spingalett_load_from_memory()`, `spingalett_activate()`,
+  `spingalett_derivative()`, `spingalett_print_network()`, `spingalett_network_free()`; the functions the
+  builders call are `spingalett_network_new_args()`, `spingalett_append_layer()` and
+  `spingalett_*_args()`. The names of 0.x stay available from `Spingalett/Spingalett.Short.h` (and
+  `Spingalett.Inference.h` for the engine's), which `Spingalett.h` includes unless
+  `SPINGALETT_NO_SHORT_NAMES` is defined: programs written for 0.x compile unchanged, and programs
+  that define that macro may use `layer`, `train`, `LOG_INFO` or `NeuralNetwork` for their own. The
+  library's exported symbols are the prefixed ones (`train_struct_arguments` and the others are gone
+  from the binary).
 - **A layer without `.act_func` has no activation.** `ACT_NONE` is 0 in `ActivationFunction` (which now
   reads none, sigmoid, ReLU, tanh, leaky ReLU, FOO52, softmax); before, an activation left out was
   `ACT_SIGMOID`, so that an addition or concatenation written without `.act_func = ACT_NONE` applied a

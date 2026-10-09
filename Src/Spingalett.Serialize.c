@@ -353,7 +353,7 @@ static NeuralNetwork *fold_batch_norm(const NeuralNetwork *net, bool *failed) {
             map[l] = map[spingalett_source(net, l)];
             continue;
         }
-        LayerArgs a = spingalett_layer_args(src, l);
+        LayerArgs a = spingalett_describe_layer(src, l);
         a.net = f;
         for (uint32_t k = 0; k < a.input_count; k++) a.inputs[k] = map[a.inputs[k]];
         if (into[l]) {
@@ -443,7 +443,7 @@ static const char *find_last_separator(const char *path) {
     return slash ? slash : backslash;
 }
 
-void save_spingalett_struct_arguments(SaveArgs args) {
+void spingalett_save_args(SaveArgs args) {
     if (!args.net || !args.filename) {
         set_error(SPINGALETT_ERR_INVALID, "save: net or filename is NULL");
         return;
@@ -851,11 +851,11 @@ NeuralNetwork *spingalett_load_from_memory_ex(const void *data, size_t size, Pre
     return load_legacy(p, size, precision);
 }
 
-NeuralNetwork *load_spingalett_from_memory(const void *data, size_t size) {
+NeuralNetwork *spingalett_load_from_memory(const void *data, size_t size) {
     return spingalett_load_from_memory_ex(data, size, NULL);
 }
 
-NeuralNetwork *load_spingalett(const char *filename) {
+NeuralNetwork *spingalett_load(const char *filename) {
     if (!filename) {
         set_error(SPINGALETT_ERR_INVALID, "load: filename is NULL");
         return NULL;

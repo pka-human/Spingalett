@@ -473,6 +473,15 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
+    # A program of the prefixed names only (SPINGALETT_NO_SHORT_NAMES), the names of 0.x its own.
+    add_executable(SpingalettPrefixed ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Prefixed.c)
+    target_link_libraries(SpingalettPrefixed PRIVATE spingalett)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(SpingalettPrefixed PRIVATE m)
+        set_target_properties(SpingalettPrefixed PROPERTIES BUILD_RPATH "$ORIGIN")
+    endif()
+    add_test(NAME api.prefixed COMMAND SpingalettPrefixed)
+
     foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model gpu xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

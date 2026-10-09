@@ -32,7 +32,7 @@ static void compute_offsets(NeuralNetwork *net) {
     net->total_biases = b;
 }
 
-NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs args) {
+NeuralNetwork *spingalett_network_new_args(NeuralNetworkArgs args) {
     LossFunction loss_func = args.loss_func;
     if ((unsigned)loss_func >= LOSS_COUNT) {
         set_error(SPINGALETT_ERR_INVALID, "Invalid loss function");
@@ -581,7 +581,7 @@ bool spingalett_add_layer(LayerArgs args) {
     return true;
 }
 
-uint32_t layer_struct_arguments(LayerArgs args) {
+uint32_t spingalett_append_layer(LayerArgs args) {
     return spingalett_add_layer(args) ? args.net->layers - 1 : SPINGALETT_NO_LAYER;
 }
 
@@ -608,7 +608,7 @@ bool spingalett_check_graph(const NeuralNetwork *net, const char *who) {
     return false;
 }
 
-LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l) {
+LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
     const LayerShape *s = &net->shapes[l];
     LayerArgs a = {0};
     a.net = net;
@@ -818,7 +818,7 @@ float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMo
     return SPINGALETT_LAYER_PTR(net, net->layers - 1);
 }
 
-float *forward_struct_arguments(ForwardArgs args) {
+float *spingalett_forward_args(ForwardArgs args) {
     NeuralNetwork *net = args.net;
     const float *input = args.input;
 
@@ -859,7 +859,7 @@ float *forward_struct_arguments(ForwardArgs args) {
     return ws->act[net->layers - 1];
 }
 
-void print_parameters(const NeuralNetwork *net) {
+void spingalett_print_network(const NeuralNetwork *net) {
     spingalett_network_sync(net);
     if (!net || net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "print_parameters: network must have at least 2 layers");
@@ -887,7 +887,7 @@ void print_parameters(const NeuralNetwork *net) {
     spingalett_log(LOG_INFO, "================================================");
 }
 
-void free_network(NeuralNetwork *net) {
+void spingalett_network_free(NeuralNetwork *net) {
     if (!net) return;
     spingalett_batch_workspace_free(net->forward_ws);
     spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));

@@ -15,78 +15,78 @@ extern "C" {
 #endif
 
 typedef enum {
-    LOG_DEBUG,
-    LOG_INFO,
-    LOG_WARNING,
-    LOG_ERROR,
-    LOG_NONE
-} LogLevel;
+    SPINGALETT_LOG_DEBUG,
+    SPINGALETT_LOG_INFO,
+    SPINGALETT_LOG_WARNING,
+    SPINGALETT_LOG_ERROR,
+    SPINGALETT_LOG_NONE
+} SpingalettLogLevel;
 
-typedef void (*LogCallback)(LogLevel level, const char *message);
-
-typedef enum {
-    WEIGHT_INITIALIZATION_RANDOM,   /* uniform in [-1, 1] */
-    WEIGHT_INITIALIZATION_XAVIER,   /* Glorot normal: variance 2 / (fan_in + fan_out) */
-    WEIGHT_INITIALIZATION_HE,       /* He normal: variance 2 / fan_in */
-    WEIGHT_INITIALIZATION_NONE,     /* zeros */
-    WEIGHT_INITIALIZATION_LECUN,    /* LeCun normal: variance 1 / fan_in */
-    WEIGHT_INITIALIZATION_COUNT
-} WeightInitialization;
+typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *message);
 
 typedef enum {
-    MODE_ARRAY,
-    MODE_GENERATOR_FUNCTION,
-    MODE_COUNT
-} TrainingMode;
+    SPINGALETT_WEIGHT_INITIALIZATION_RANDOM,   /* uniform in [-1, 1] */
+    SPINGALETT_WEIGHT_INITIALIZATION_XAVIER,   /* Glorot normal: variance 2 / (fan_in + fan_out) */
+    SPINGALETT_WEIGHT_INITIALIZATION_HE,       /* He normal: variance 2 / fan_in */
+    SPINGALETT_WEIGHT_INITIALIZATION_NONE,     /* zeros */
+    SPINGALETT_WEIGHT_INITIALIZATION_LECUN,    /* LeCun normal: variance 1 / fan_in */
+    SPINGALETT_WEIGHT_INITIALIZATION_COUNT
+} SpingalettWeightInitialization;
 
 typedef enum {
-    STRATEGY_SAMPLE,
-    STRATEGY_FULL_BATCH,
-    STRATEGY_SMALL_BATCH,
-    STRATEGY_COUNT
-} TrainingStrategy;
+    SPINGALETT_MODE_ARRAY,
+    SPINGALETT_MODE_GENERATOR_FUNCTION,
+    SPINGALETT_MODE_COUNT
+} SpingalettTrainingMode;
 
 typedef enum {
-    OPTIMIZER_SGD,
-    OPTIMIZER_MOMENTUM,
-    OPTIMIZER_RMSPROP,
-    OPTIMIZER_ADAM,
-    OPTIMIZER_ADAMW,
-    OPTIMIZER_COUNT
-} OptimizerType;
+    SPINGALETT_STRATEGY_SAMPLE,
+    SPINGALETT_STRATEGY_FULL_BATCH,
+    SPINGALETT_STRATEGY_SMALL_BATCH,
+    SPINGALETT_STRATEGY_COUNT
+} SpingalettTrainingStrategy;
 
 typedef enum {
-    COMPUTE_SINGLE_THREADED,
-    COMPUTE_OPENMP,
-    COMPUTE_OPENBLAS,
-    COMPUTE_CUDA,                   /* reserved: falls back to the CPU */
-    COMPUTE_VULKAN,                 /* the GPU through Vulkan compute (spingalett_gpu_device()); the CPU
-                                       parts of training run as with COMPUTE_OPENMP */
-    COMPUTE_COUNT
-} ComputeMode;
+    SPINGALETT_OPTIMIZER_SGD,
+    SPINGALETT_OPTIMIZER_MOMENTUM,
+    SPINGALETT_OPTIMIZER_RMSPROP,
+    SPINGALETT_OPTIMIZER_ADAM,
+    SPINGALETT_OPTIMIZER_ADAMW,
+    SPINGALETT_OPTIMIZER_COUNT
+} SpingalettOptimizerType;
 
 typedef enum {
-    AUTOSAVE_OFF,
-    AUTOSAVE_OVERWRITE,
-    AUTOSAVE_NEW_FILES
-} AutoSaveMode;
+    SPINGALETT_COMPUTE_SINGLE_THREADED,
+    SPINGALETT_COMPUTE_OPENMP,
+    SPINGALETT_COMPUTE_OPENBLAS,
+    SPINGALETT_COMPUTE_CUDA,                   /* reserved: falls back to the CPU */
+    SPINGALETT_COMPUTE_VULKAN,                 /* the GPU through Vulkan compute (spingalett_gpu_device()); the CPU
+                                       parts of training run as with SPINGALETT_COMPUTE_OPENMP */
+    SPINGALETT_COMPUTE_COUNT
+} SpingalettComputeMode;
+
+typedef enum {
+    SPINGALETT_AUTOSAVE_OFF,
+    SPINGALETT_AUTOSAVE_OVERWRITE,
+    SPINGALETT_AUTOSAVE_NEW_FILES
+} SpingalettAutoSaveMode;
 
 /* A network being built or trained. Its contents are private: describe it with
    spingalett_network_layer() and friends, and read or write its parameters with
    spingalett_get_parameters() / spingalett_set_parameters(). */
-typedef struct NeuralNetwork NeuralNetwork;
+typedef struct SpingalettNetwork SpingalettNetwork;
 
 /* A data set in the GPU's memory (spingalett_device_data_new()). */
 typedef struct SpingalettDeviceData SpingalettDeviceData;
 
-/* Kinds of layers: LayerType, in Spingalett.Inference.h (the inference engine runs them all). */
+/* Kinds of layers: SpingalettLayerType, in Spingalett.Inference.h (the inference engine runs them all). */
 
 /* Layer `index` of a network (0 is the input layer), see spingalett_network_layer(). */
 typedef struct {
-    LayerType type;                 /* the input layer is LAYER_DENSE */
+    SpingalettLayerType type;                 /* the input layer is SPINGALETT_LAYER_DENSE */
     uint32_t height, width, channels;   /* output shape; a dense layer is 1 x 1 x outputs */
     uint32_t outputs;               /* height * width * channels */
-    ActivationFunction activation;  /* ACT_NONE for the input layer and pooling layers */
+    SpingalettActivationFunction activation;  /* SPINGALETT_ACT_NONE for the input layer and pooling layers */
     float dropout_rate;
     uint32_t kernel_h, kernel_w;    /* conv and pooling: window over the previous layer */
     uint32_t stride_h, stride_w;
@@ -102,91 +102,91 @@ typedef struct {
                                        statistics */
     uint32_t input_count;           /* layers it reads (0 for the input layer) */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* their indices, all below `index` */
-    UpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
+    SpingalettUpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
 typedef enum {
-    PARAM_WEIGHTS,
-    PARAM_BIASES,
-    PARAM_WEIGHT_GRADIENTS,         /* the gradient left by the last training step or backward pass */
-    PARAM_BIAS_GRADIENTS,
-    PARAM_RUNNING_MEAN,             /* batch normalization: the statistics inference uses, one per */
-    PARAM_RUNNING_VARIANCE,         /* channel (count: the layer's bias_count) */
-    PARAM_KIND_COUNT
-} ParameterKind;
+    SPINGALETT_PARAM_WEIGHTS,
+    SPINGALETT_PARAM_BIASES,
+    SPINGALETT_PARAM_WEIGHT_GRADIENTS,         /* the gradient left by the last training step or backward pass */
+    SPINGALETT_PARAM_BIAS_GRADIENTS,
+    SPINGALETT_PARAM_RUNNING_MEAN,             /* batch normalization: the statistics inference uses, one per */
+    SPINGALETT_PARAM_RUNNING_VARIANCE,         /* channel (count: the layer's bias_count) */
+    SPINGALETT_PARAM_KIND_COUNT
+} SpingalettParameterKind;
 
 /* Quantity watched for early stopping and best-epoch selection. */
 typedef enum {
-    MONITOR_AUTO,                   /* validation loss when validation data is given, else training loss */
-    MONITOR_TRAIN_LOSS,
-    MONITOR_VAL_LOSS,
-    MONITOR_VAL_ACCURACY,
-    MONITOR_COUNT
-} MonitorMetric;
+    SPINGALETT_MONITOR_AUTO,                   /* validation loss when validation data is given, else training loss */
+    SPINGALETT_MONITOR_TRAIN_LOSS,
+    SPINGALETT_MONITOR_VAL_LOSS,
+    SPINGALETT_MONITOR_VAL_ACCURACY,
+    SPINGALETT_MONITOR_COUNT
+} SpingalettMonitorMetric;
 
-/* Result of evaluate() and of the per-epoch validation pass. */
+/* Result of spingalett_evaluate() and of the per-epoch validation pass. */
 typedef struct {
-    float loss;                     /* mean over samples of the network's loss (see evaluate()) */
+    float loss;                     /* mean over samples of the network's loss (see spingalett_evaluate()) */
     float accuracy;                 /* fraction of samples whose output argmax matches the target's
                                        argmax; with a single output, both on the same side of 0.5 */
-} EvalMetrics;
+} SpingalettEvalMetrics;
 
-/* State of a train() call, passed to the epoch callback. */
+/* State of a spingalett_train() call, passed to the epoch callback. */
 typedef struct {
     size_t epoch;                   /* epochs completed in this call (1-based) */
-    size_t epochs;                  /* TrainArgs.epochs */
+    size_t epochs;                  /* SpingalettTrainArgs.epochs */
     float train_loss;               /* mean training loss of this epoch */
     float learning_rate;            /* learning rate used in this epoch */
     bool has_validation;
-    EvalMetrics validation;         /* after this epoch, when has_validation */
-    MonitorMetric monitor;          /* the monitored quantity (MONITOR_AUTO resolved) */
+    SpingalettEvalMetrics validation;         /* after this epoch, when has_validation */
+    SpingalettMonitorMetric monitor;          /* the monitored quantity (SPINGALETT_MONITOR_AUTO resolved) */
     size_t best_epoch;              /* epoch with the best monitored value so far */
     float best_value;
     bool improved;                  /* this epoch is the new best */
-} TrainProgress;
+} SpingalettTrainProgress;
 
 /* Called after every callback_interval epochs (and the last one); returning true stops training. */
-typedef bool (*TrainCallback)(NeuralNetwork *net, const TrainProgress *progress, void *user_data);
+typedef bool (*SpingalettTrainCallback)(SpingalettNetwork *net, const SpingalettTrainProgress *progress, void *user_data);
 
 typedef enum {
-    TRAIN_FAILED,                   /* invalid arguments, out of memory or a misbehaving generator */
-    TRAIN_COMPLETED,                /* all epochs ran */
-    TRAIN_EARLY_STOPPED,            /* no improvement for early_stopping_patience epochs */
-    TRAIN_INTERRUPTED,              /* the callback returned true */
-    TRAIN_DIVERGED,                 /* NaN or Inf parameters found (nan_check_interval) */
-    TRAIN_NO_DATA                   /* the generator produced no samples in an epoch */
-} TrainStatus;
+    SPINGALETT_TRAIN_FAILED,                   /* invalid arguments, out of memory or a misbehaving generator */
+    SPINGALETT_TRAIN_COMPLETED,                /* all epochs ran */
+    SPINGALETT_TRAIN_EARLY_STOPPED,            /* no improvement for early_stopping_patience epochs */
+    SPINGALETT_TRAIN_INTERRUPTED,              /* the callback returned true */
+    SPINGALETT_TRAIN_DIVERGED,                 /* NaN or Inf parameters found (nan_check_interval) */
+    SPINGALETT_TRAIN_NO_DATA                   /* the generator produced no samples in an epoch */
+} SpingalettTrainStatus;
 
-/* Result of train(). */
+/* Result of spingalett_train(). */
 typedef struct {
-    TrainStatus status;
+    SpingalettTrainStatus status;
     size_t epochs_run;
     float train_loss;               /* mean training loss of the last epoch */
     bool has_validation;
-    EvalMetrics validation;         /* validation metrics of the last epoch */
-    MonitorMetric monitor;
+    SpingalettEvalMetrics validation;         /* validation metrics of the last epoch */
+    SpingalettMonitorMetric monitor;
     size_t best_epoch;              /* 0 when no epoch was monitored */
     float best_value;
     bool restored_best;             /* parameters were reset to those of best_epoch */
-} TrainReport;
+} SpingalettTrainReport;
 
 /*
- * Data source for MODE_GENERATOR_FUNCTION. Write up to `requested` samples into `inputs`
+ * Data source for SPINGALETT_MODE_GENERATOR_FUNCTION. Write up to `requested` samples into `inputs`
  * ([requested x input size], row-major) and `targets` ([requested x output size]) and return
  * how many were written; returning 0 ends the epoch (a 0 in answer to the first request of an
  * epoch is retried once before training stops). Shuffling and augmentation are up to the
  * generator. It is called once per mini-batch, once per epoch for full batch (requested =
  * sample_count), and in chunks for per-sample training.
  */
-typedef uint32_t (*DataGeneratorFn)(float *inputs, float *targets, uint32_t requested, void *user_data);
+typedef uint32_t (*SpingalettDataGeneratorFn)(float *inputs, float *targets, uint32_t requested, void *user_data);
 
 /*
  * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
- * completed in this train() call (0 for the first), `initial_lr` is TrainArgs.learning_rate.
+ * completed in this spingalett_train() call (0 for the first), `initial_lr` is SpingalettTrainArgs.learning_rate.
  * Returns the learning rate for the coming epoch; negative or NaN results are ignored.
  */
-typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
+typedef float (*SpingalettLRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
 
 /* Parameters of the built-in schedulers, passed as lr_scheduler_data (NULL = defaults). */
 typedef struct {
@@ -194,24 +194,24 @@ typedef struct {
     size_t step_size;       /* step_decay: epochs between decays; 0 = a third of the run */
     float  gamma;           /* step_decay: decay factor; 0 = 0.1 */
     float  min_lr;          /* cosine_decay, warmup_cosine: final learning rate; default 0 */
-} LRScheduleParams;
+} SpingalettLRScheduleParams;
 
 typedef struct {
-    LossFunction loss_func;
-} NeuralNetworkArgs;
+    SpingalettLossFunction loss_func;
+} SpingalettNetworkArgs;
 
 typedef struct {
-    NeuralNetwork *net;
+    SpingalettNetwork *net;
     uint32_t neurons_amount;        /* dense: outputs; input layer: its size (or give its shape) */
-    ActivationFunction act_func;    /* dense, conv, batch normalization, add and concatenation layers
-                                       (pooling layers have none); 0 is ACT_NONE */
-    WeightInitialization weight_initialization;
+    SpingalettActivationFunction act_func;    /* dense, conv, batch normalization, add and concatenation layers
+                                       (pooling layers have none); 0 is SPINGALETT_ACT_NONE */
+    SpingalettWeightInitialization weight_initialization;
     float dropout_rate;             /* [0, 1): inverted dropout on this layer's outputs during
                                        training; ignored on the input and output layers */
-    LayerType type;                 /* LAYER_DENSE unless set; see conv2d(), max_pool2d(),
-                                       avg_pool2d(), batch_norm(), add_layers(), concat_layers(),
-                                       global_avg_pool2d(), conv_transpose2d(), upsample2d(),
-                                       layer_norm() */
+    SpingalettLayerType type;                 /* SPINGALETT_LAYER_DENSE unless set; see spingalett_conv2d(), spingalett_max_pool2d(),
+                                       spingalett_avg_pool2d(), spingalett_batch_norm(), spingalett_add_layers(), spingalett_concat_layers(),
+                                       spingalett_global_avg_pool2d(), spingalett_conv_transpose2d(), spingalett_upsample2d(),
+                                       spingalett_layer_norm() */
     uint32_t height, width, channels;   /* input layer: the shape of a sample (channels-last), e.g.
                                        28 x 28 x 1 for MNIST; omitted: 1 x 1 x neurons_amount */
     uint32_t filters;               /* conv and transposed conv: output channels */
@@ -230,38 +230,38 @@ typedef struct {
     float momentum;                 /* batch normalization: running statistics move this far towards
                                        each training batch's; 0 = 0.1 */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* the earlier layers this one reads, by index (as
-                                       layer() returns it; 0 is the input layer); none: the layer
+                                       spingalett_layer() returns it; 0 is the input layer); none: the layer
                                        added just before. Dense, convolution, pooling and batch
-                                       normalization layers read one, add_layers() and
-                                       concat_layers() one or more. */
+                                       normalization layers read one, spingalett_add_layers() and
+                                       spingalett_concat_layers() one or more. */
     uint32_t input_count;           /* entries of inputs; 0 counts them up to the last nonzero one,
                                        so give it when the last input is the input layer */
-    UpsampleMode upsample;          /* upsampling: copies (UPSAMPLE_NEAREST, the default) or bilinear */
+    SpingalettUpsampleMode upsample;          /* upsampling: copies (SPINGALETT_UPSAMPLE_NEAREST, the default) or bilinear */
     uint32_t output_padding;        /* transposed convolution: cells added to the output's bottom and
                                        right (less than the stride), to reach sizes the stride skips */
     uint32_t output_padding_h, output_padding_w;    /* per-axis overrides (0 = unset) */
-} LayerArgs;
+} SpingalettLayerArgs;
 
 typedef struct {
-    NeuralNetwork *net;
+    SpingalettNetwork *net;
     const float *input;
-} ForwardArgs;
+} SpingalettForwardArgs;
 
 typedef struct {
-    NeuralNetwork *net;
-    TrainingMode training_mode;
-    TrainingStrategy training_strategy;
-    OptimizerType optimizer_type;
+    SpingalettNetwork *net;
+    SpingalettTrainingMode training_mode;
+    SpingalettTrainingStrategy training_strategy;
+    SpingalettOptimizerType optimizer_type;
 
-    const float *inputs;            /* MODE_ARRAY: [sample_count x input size] */
-    const float *targets;           /* MODE_ARRAY: [sample_count x output size] */
-    /* MODE_ARRAY: the inputs or the targets (or both) in the GPU's memory instead (their first
-       sample_count rows), gathered and augmented there with COMPUTE_VULKAN */
+    const float *inputs;            /* SPINGALETT_MODE_ARRAY: [sample_count x input size] */
+    const float *targets;           /* SPINGALETT_MODE_ARRAY: [sample_count x output size] */
+    /* SPINGALETT_MODE_ARRAY: the inputs or the targets (or both) in the GPU's memory instead (their first
+       sample_count rows), gathered and augmented there with SPINGALETT_COMPUTE_VULKAN */
     const SpingalettDeviceData *device_inputs;
     const SpingalettDeviceData *device_targets;
-    DataGeneratorFn generator;      /* MODE_GENERATOR_FUNCTION */
+    SpingalettDataGeneratorFn generator;      /* SPINGALETT_MODE_GENERATOR_FUNCTION */
     void *generator_data;
-    uint32_t sample_count;          /* MODE_ARRAY: number of samples. Generator: samples per epoch
+    uint32_t sample_count;          /* SPINGALETT_MODE_ARRAY: number of samples. Generator: samples per epoch
                                        (0 = until the generator returns 0; required for full batch) */
     uint32_t batch_size;
     bool do_not_shuffle;            /* keep sample order (per-sample and mini-batch training) */
@@ -280,17 +280,17 @@ typedef struct {
 
     size_t report_interval;
 
-    AutoSaveMode autosave_mode;
+    SpingalettAutoSaveMode autosave_mode;
     size_t autosave_interval;
     const char *autosave_path;
     bool autosave_do_not_save_optimizer;
-    PrecisionMode autosave_precision;
+    SpingalettPrecisionMode autosave_precision;
 
-    TrainCallback callback;
+    SpingalettTrainCallback callback;
     size_t callback_interval;
     void *callback_data;            /* passed to the callback as user_data */
 
-    LRSchedulerFn lr_scheduler;     /* NULL = constant learning_rate */
+    SpingalettLRSchedulerFn lr_scheduler;     /* NULL = constant learning_rate */
     void *lr_scheduler_data;
 
     /* Validation set, evaluated after every epoch (val_count = 0: none). */
@@ -301,7 +301,7 @@ typedef struct {
     uint32_t val_count;
 
     /* Best-epoch tracking, active with validation data, early stopping or restore_best_weights. */
-    MonitorMetric monitor;
+    SpingalettMonitorMetric monitor;
     size_t early_stopping_patience; /* stop after this many epochs without improvement; 0 = never */
     float early_stopping_min_delta; /* smallest change of the monitored value that counts as one */
     bool restore_best_weights;      /* when training ends, for whatever reason, reset weights and
@@ -334,35 +334,35 @@ typedef struct {
     float lr_plateau_factor;
     size_t lr_plateau_patience;
     float lr_plateau_min_lr;
-} TrainArgs;
+} SpingalettTrainArgs;
 
 typedef struct {
-    NeuralNetwork *net;
+    SpingalettNetwork *net;
     const float *inputs;            /* [sample_count x input size] */
     const SpingalettDeviceData *device_inputs;       /* or in the GPU's memory (its first rows) */
     uint32_t sample_count;
     float *outputs;                 /* [sample_count x output size] */
-} PredictArgs;
+} SpingalettPredictArgs;
 
 typedef struct {
-    NeuralNetwork *net;
+    SpingalettNetwork *net;
     const float *inputs;            /* [sample_count x input size] */
     const float *targets;           /* [sample_count x output size] */
     const SpingalettDeviceData *device_inputs;       /* either or both in the GPU's memory instead */
     const SpingalettDeviceData *device_targets;
     uint32_t sample_count;
-} EvaluateArgs;
+} SpingalettEvaluateArgs;
 
 typedef struct {
-    NeuralNetwork *net;
+    SpingalettNetwork *net;
     const char *filename;
     bool do_not_save_optimizer;
-    PrecisionMode precision;
-} SaveArgs;
+    SpingalettPrecisionMode precision;
+} SpingalettSaveArgs;
 
-/* Optimizer settings for the low-level training API; zero fields take the train() defaults. */
+/* Optimizer settings for the low-level training API; zero fields take the spingalett_train() defaults. */
 typedef struct {
-    OptimizerType type;
+    SpingalettOptimizerType type;
     float learning_rate;            /* 0 = 0.01 */
     float weight_decay;
     float momentum;                 /* 0 = 0.9 */
@@ -370,7 +370,7 @@ typedef struct {
     float beta2;                    /* 0 = 0.999 */
     float epsilon;                  /* 0 = 1e-8 */
     float max_grad_norm;            /* clip the global L2 norm of the step's gradient; 0 = off */
-} OptimizerArgs;
+} SpingalettOptimizerArgs;
 
 /* Holds the activations of one batch between the calls of the low-level training API. */
 typedef struct SpingalettTrainer SpingalettTrainer;
@@ -401,31 +401,31 @@ SPINGALETT_API void spingalett_clear_error(void);
    when the processor has them. */
 SPINGALETT_API const char *spingalett_cpu_kernels(void);
 
-SPINGALETT_API ComputeMode spingalett_get_compute_mode(void);
-SPINGALETT_API void spingalett_set_compute_mode(ComputeMode mode);
-/* The name of the GPU that COMPUTE_VULKAN uses (opening the device on first call), or NULL when the
+SPINGALETT_API SpingalettComputeMode spingalett_get_compute_mode(void);
+SPINGALETT_API void spingalett_set_compute_mode(SpingalettComputeMode mode);
+/* The name of the GPU that SPINGALETT_COMPUTE_VULKAN uses (opening the device on first call), or NULL when the
    library was built without the Vulkan backend or no device is usable: Vulkan 1.2 with buffer device
    addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
    SPINGALETT_GPU_DEVICE picks one by its index in the Vulkan device list. */
 SPINGALETT_API const char *spingalett_gpu_device(void);
-/* Precision of the GPU's matrix products: PRECISION_FLOAT32 (the default: single precision, as on
-   the CPU) or PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
+/* Precision of the GPU's matrix products: SPINGALETT_PRECISION_FLOAT32 (the default: single precision, as on
+   the CPU) or SPINGALETT_PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
    multiplied on the GPU's matrix units with the products added in single precision: faster; the
    layers' outputs but the output layer's, the network's inputs among them, and their gradients are
    kept in memory as bfloat16, the passes between products compute in single precision, and the
    parameters, their gradients and the optimizer stay in single precision, as with PyTorch's
    autocast). Devices without bfloat16
-   cooperative matrices keep single precision. Applies from the next train(), predict() or
-   evaluate() call, or the next trainer; results stay deterministic. Returns whether the GPU
+   cooperative matrices keep single precision. Applies from the next spingalett_train(), spingalett_predict() or
+   spingalett_evaluate() call, or the next trainer; results stay deterministic. Returns whether the GPU
    multiplies in that precision (false without a device, or for bfloat16 without its matrix units);
    other values are ignored and return false. */
-SPINGALETT_API bool spingalett_set_gpu_precision(PrecisionMode precision);
-SPINGALETT_API PrecisionMode spingalett_get_gpu_precision(void);
+SPINGALETT_API bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
+SPINGALETT_API SpingalettPrecisionMode spingalett_get_gpu_precision(void);
 SPINGALETT_API unsigned spingalett_get_num_threads(void);
 SPINGALETT_API void spingalett_set_num_threads(unsigned n);
 
-SPINGALETT_API void spingalett_set_log_callback(LogCallback cb);
-SPINGALETT_API void spingalett_set_log_level(LogLevel level);
+SPINGALETT_API void spingalett_set_log_callback(SpingalettLogCallback cb);
+SPINGALETT_API void spingalett_set_log_level(SpingalettLogLevel level);
 
 /* Seeds the calling thread's generator (weight init, shuffling, dropout) for reproducible runs. */
 SPINGALETT_API void spingalett_seed(uint64_t seed);
@@ -433,8 +433,8 @@ SPINGALETT_API void spingalett_seed(uint64_t seed);
 SPINGALETT_API void spingalett_set_verbose(bool enabled);
 SPINGALETT_API bool spingalett_get_verbose(void);
 
-#define new_spingalett(...) new_spingalett_struct_arguments((NeuralNetworkArgs){__VA_ARGS__})
-SPINGALETT_API NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs args);
+#define spingalett_network_new(...) spingalett_network_new_args((SpingalettNetworkArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkArgs args);
 
 /* Appends a layer and returns its index; the first one is the input layer (index 0). A layer reads
    the one before it unless .inputs names others, so that networks can be graphs: residual blocks,
@@ -442,78 +442,78 @@ SPINGALETT_API NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs 
    must feed, directly or through later ones, before it trains or predicts. Errors leave the network
    unchanged, set the error (spingalett_last_error_code()) and return SPINGALETT_NO_LAYER. */
 #define SPINGALETT_NO_LAYER UINT32_MAX
-#define layer(...) layer_struct_arguments((LayerArgs){__VA_ARGS__})
-#define conv2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONV2D, __VA_ARGS__})
-#define max_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_MAX_POOL2D, __VA_ARGS__})
-#define avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_AVG_POOL2D, __VA_ARGS__})
-#define batch_norm(...) layer_struct_arguments((LayerArgs){.type = LAYER_BATCH_NORM, __VA_ARGS__})
-/* The sum of .inputs (layers of one shape), then .act_func (ACT_NONE for the sum alone):
-   add_layers(.net = net, .inputs = {x, y}, .act_func = ACT_RELU) closes a residual block. */
-#define add_layers(...) layer_struct_arguments((LayerArgs){.type = LAYER_ADD, __VA_ARGS__})
-/* .inputs side by side along the channels (layers of one height and width), then .act_func (ACT_NONE
+#define spingalett_layer(...) spingalett_append_layer((SpingalettLayerArgs){__VA_ARGS__})
+#define spingalett_conv2d(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_CONV2D, __VA_ARGS__})
+#define spingalett_max_pool2d(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_MAX_POOL2D, __VA_ARGS__})
+#define spingalett_avg_pool2d(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_AVG_POOL2D, __VA_ARGS__})
+#define spingalett_batch_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_BATCH_NORM, __VA_ARGS__})
+/* The sum of .inputs (layers of one shape), then .act_func (SPINGALETT_ACT_NONE for the sum alone):
+   spingalett_add_layers(.net = net, .inputs = {x, y}, .act_func = SPINGALETT_ACT_RELU) closes a residual block. */
+#define spingalett_add_layers(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_ADD, __VA_ARGS__})
+/* .inputs side by side along the channels (layers of one height and width), then .act_func (SPINGALETT_ACT_NONE
    for none). */
-#define concat_layers(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONCAT, __VA_ARGS__})
+#define spingalett_concat_layers(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_CONCAT, __VA_ARGS__})
 /* The mean of each channel over its cells (1 x 1 x channels); a pooling layer, without activation. */
-#define global_avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_GLOBAL_AVG_POOL, __VA_ARGS__})
+#define spingalett_global_avg_pool2d(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_GLOBAL_AVG_POOL, __VA_ARGS__})
 /* A transposed convolution (upsamples with learned weights: kernel 2, stride 2 doubles the size). */
-#define conv_transpose2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONV_TRANSPOSE2D, __VA_ARGS__})
-/* Upsampling by .stride (default 2), nearest or (.upsample = UPSAMPLE_BILINEAR) bilinear. */
-#define upsample2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_UPSAMPLE, __VA_ARGS__})
+#define spingalett_conv_transpose2d(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_CONV_TRANSPOSE2D, __VA_ARGS__})
+/* Upsampling by .stride (default 2), nearest or (.upsample = SPINGALETT_UPSAMPLE_BILINEAR) bilinear. */
+#define spingalett_upsample2d(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_UPSAMPLE, __VA_ARGS__})
 /* Layer normalization over each cell's channels (a dense layer's outputs). */
-#define layer_norm(...) layer_struct_arguments((LayerArgs){.type = LAYER_LAYER_NORM, __VA_ARGS__})
-SPINGALETT_API uint32_t layer_struct_arguments(LayerArgs args);
+#define spingalett_layer_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_LAYER_NORM, __VA_ARGS__})
+SPINGALETT_API uint32_t spingalett_append_layer(SpingalettLayerArgs args);
 
 /* Describing a network. Layers are numbered in the order they were added, every layer after its
    inputs. */
-SPINGALETT_API uint32_t spingalett_layer_count(const NeuralNetwork *net);      /* input layer included */
-SPINGALETT_API bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, SpingalettNetworkLayer *layer);
-SPINGALETT_API uint32_t spingalett_input_size(const NeuralNetwork *net);
-SPINGALETT_API uint32_t spingalett_output_size(const NeuralNetwork *net);
-SPINGALETT_API uint64_t spingalett_parameter_count(const NeuralNetwork *net);   /* weights and biases */
-SPINGALETT_API LossFunction spingalett_network_loss(const NeuralNetwork *net);
-SPINGALETT_API uint64_t spingalett_optimizer_steps(const NeuralNetwork *net);   /* steps taken (Adam's t) */
+SPINGALETT_API uint32_t spingalett_layer_count(const SpingalettNetwork *net);      /* input layer included */
+SPINGALETT_API bool spingalett_network_layer(const SpingalettNetwork *net, uint32_t index, SpingalettNetworkLayer *layer);
+SPINGALETT_API uint32_t spingalett_input_size(const SpingalettNetwork *net);
+SPINGALETT_API uint32_t spingalett_output_size(const SpingalettNetwork *net);
+SPINGALETT_API uint64_t spingalett_parameter_count(const SpingalettNetwork *net);   /* weights and biases */
+SPINGALETT_API SpingalettLossFunction spingalett_network_loss(const SpingalettNetwork *net);
+SPINGALETT_API uint64_t spingalett_optimizer_steps(const SpingalettNetwork *net);   /* steps taken (Adam's t) */
 
 /* Copies the parameters feeding layer `index` (1 to layers - 1) out of or into the network: count
    must be the layer's weight_count, or its bias_count for biases and the running statistics of
    batch normalization layers. Dense weights are [outputs][inputs], conv weights
    [filters][kernel_h][kernel_w][input channels / groups], batch normalization's weights and biases
    its gamma and beta. Return false (with the error set) otherwise. */
-SPINGALETT_API bool spingalett_get_parameters(const NeuralNetwork *net, uint32_t index, ParameterKind kind,
+SPINGALETT_API bool spingalett_get_parameters(const SpingalettNetwork *net, uint32_t index, SpingalettParameterKind kind,
                                               float *values, uint64_t count);
-SPINGALETT_API bool spingalett_set_parameters(NeuralNetwork *net, uint32_t index, ParameterKind kind,
+SPINGALETT_API bool spingalett_set_parameters(SpingalettNetwork *net, uint32_t index, SpingalettParameterKind kind,
                                               const float *values, uint64_t count);
 
-SPINGALETT_API float activate(float x, ActivationFunction act_func);
-SPINGALETT_API float derivative(float x, ActivationFunction act_func);
+SPINGALETT_API float spingalett_activate(float x, SpingalettActivationFunction act_func);
+SPINGALETT_API float spingalett_derivative(float x, SpingalettActivationFunction act_func);
 
-#define forward(...) forward_struct_arguments((ForwardArgs){__VA_ARGS__})
-SPINGALETT_API float *forward_struct_arguments(ForwardArgs args);
+#define spingalett_forward(...) spingalett_forward_args((SpingalettForwardArgs){__VA_ARGS__})
+SPINGALETT_API float *spingalett_forward_args(SpingalettForwardArgs args);
 
-/* Built-in learning-rate schedules (see LRScheduleParams). */
+/* Built-in learning-rate schedules (see SpingalettLRScheduleParams). */
 SPINGALETT_API float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 
 /* Batched inference: writes the outputs of all samples. Uses matrix-matrix products on every
-   backend, so it is much faster than calling forward() per sample. Returns false on error. */
-#define predict(...) predict_struct_arguments((PredictArgs){__VA_ARGS__})
-SPINGALETT_API bool predict_struct_arguments(PredictArgs args);
+   backend, so it is much faster than calling spingalett_forward() per sample. Returns false on error. */
+#define spingalett_predict(...) spingalett_predict_args((SpingalettPredictArgs){__VA_ARGS__})
+SPINGALETT_API bool spingalett_predict_args(SpingalettPredictArgs args);
 
-/* Mean loss and accuracy over a data set. The loss is the one train() reports: the sum over the
-   outputs of the squared error for LOSS_MSE (whose gradient train() follows up to a factor of 2),
-   the cross-entropy for LOSS_CROSS_ENTROPY. On error both metrics are NaN. */
-#define evaluate(...) evaluate_struct_arguments((EvaluateArgs){__VA_ARGS__})
-SPINGALETT_API EvalMetrics evaluate_struct_arguments(EvaluateArgs args);
+/* Mean loss and accuracy over a data set. The loss is the one spingalett_train() reports: the sum over the
+   outputs of the squared error for SPINGALETT_LOSS_MSE (whose gradient spingalett_train() follows up to a factor of 2),
+   the cross-entropy for SPINGALETT_LOSS_CROSS_ENTROPY. On error both metrics are NaN. */
+#define spingalett_evaluate(...) spingalett_evaluate_args((SpingalettEvaluateArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettEvalMetrics spingalett_evaluate_args(SpingalettEvaluateArgs args);
 
-#define train(...) train_struct_arguments((TrainArgs){__VA_ARGS__})
-SPINGALETT_API TrainReport train_struct_arguments(TrainArgs args);
+#define spingalett_train(...) spingalett_train_args((SpingalettTrainArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettTrainReport spingalett_train_args(SpingalettTrainArgs args);
 
 /*
  * Data sets in the GPU's memory: count rows of size floats copied to the device once, for the
- * device_* fields of train(), predict() and evaluate(). With COMPUTE_VULKAN those calls read their
- * chunks on the device, where train() gathers, augments and smooths them, instead of copying samples
- * from the host for every pass; on the CPU they copy the rows back first. With PRECISION_BFLOAT16 a set
+ * device_* fields of spingalett_train(), spingalett_predict() and spingalett_evaluate(). With SPINGALETT_COMPUTE_VULKAN those calls read their
+ * chunks on the device, where spingalett_train() gathers, augments and smooths them, instead of copying samples
+ * from the host for every pass; on the CPU they copy the rows back first. With SPINGALETT_PRECISION_BFLOAT16 a set
  * makes a copy of its rows as bfloat16 on first use (half its size again), which networks read as the
  * inputs they keep as such. A set's row size is the network's input (or output) size, and it holds at
  * least the call's samples. NULL without a usable GPU, or when its memory runs out. A set may serve
@@ -532,15 +532,15 @@ SPINGALETT_API bool spingalett_device_data_read(const SpingalettDeviceData *data
  * batches of up to max_batch samples; backward passes add to the network's gradient (grad_weights,
  * grad_biases hold the sum over the samples since the last step) and a step applies the mean of
  * that sum with the given optimizer, so a step's batch can be split into several backward passes.
- * Optimizer state and the step count live in the network and are shared with train().
+ * Optimizer state and the step count live in the network and are shared with spingalett_train().
  *
- * With COMPUTE_VULKAN (when spingalett_trainer_new() is called) the passes run on the GPU, which keeps
+ * With SPINGALETT_COMPUTE_VULKAN (when spingalett_trainer_new() is called) the passes run on the GPU, which keeps
  * the parameters, gradients and optimizer state between them: functions that read the network
- * (predict(), save_spingalett(), spingalett_get_parameters() and the others) copy them back first,
+ * (spingalett_predict(), spingalett_save(), spingalett_get_parameters() and the others) copy them back first,
  * and parameters set on the host go to the GPU before the next forward pass. A trainer is used from
  * one thread at a time, and the network is not read from another thread while it runs a pass.
  */
-SPINGALETT_API SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch);
+SPINGALETT_API SpingalettTrainer *spingalett_trainer_new(SpingalettNetwork *net, uint32_t max_batch);
 SPINGALETT_API void spingalett_trainer_free(SpingalettTrainer *trainer);
 /* Training-mode forward pass (dropout active) over count samples; returns their outputs
    [count x output size], valid until the next forward pass. NULL on error. */
@@ -553,32 +553,32 @@ SPINGALETT_API float spingalett_trainer_backward(SpingalettTrainer *trainer, con
 SPINGALETT_API bool spingalett_trainer_backward_output_grads(SpingalettTrainer *trainer, const float *output_grads);
 /* Optimizer step with the mean gradient accumulated since the last step, which is then cleared.
    Fails when nothing was accumulated. */
-SPINGALETT_API bool spingalett_trainer_step(SpingalettTrainer *trainer, const OptimizerArgs *optimizer);
+SPINGALETT_API bool spingalett_trainer_step(SpingalettTrainer *trainer, const SpingalettOptimizerArgs *optimizer);
 /* Discards the gradient accumulated since the last step. */
 SPINGALETT_API void spingalett_trainer_zero_grad(SpingalettTrainer *trainer);
 /* Label smoothing for spingalett_trainer_backward() and spingalett_train_on_batch(), as
-   TrainArgs.label_smoothing (0, the default, uses the targets as given). False when out of [0, 1). */
+   SpingalettTrainArgs.label_smoothing (0, the default, uses the targets as given). False when out of [0, 1). */
 SPINGALETT_API bool spingalett_trainer_set_label_smoothing(SpingalettTrainer *trainer, float label_smoothing);
 /* Forward, backward with the network's loss and a step on one batch; returns its mean loss
    (NaN on error). */
 SPINGALETT_API float spingalett_train_on_batch(SpingalettTrainer *trainer, const float *inputs, const float *targets,
-                                              uint32_t count, const OptimizerArgs *optimizer);
+                                              uint32_t count, const SpingalettOptimizerArgs *optimizer);
 
-#define save_spingalett(...) save_spingalett_struct_arguments((SaveArgs){__VA_ARGS__})
-SPINGALETT_API void save_spingalett_struct_arguments(SaveArgs args);
+#define spingalett_save(...) spingalett_save_args((SpingalettSaveArgs){__VA_ARGS__})
+SPINGALETT_API void spingalett_save_args(SpingalettSaveArgs args);
 
 /* Reads a .slett file of any format version (1 to SPINGALETT_FORMAT_VERSION). Quantized weights are
    expanded to float. */
-SPINGALETT_API NeuralNetwork *load_spingalett(const char *filename);
+SPINGALETT_API SpingalettNetwork *spingalett_load(const char *filename);
 
 /* The bytes save_spingalett writes, in memory (aligned to 64 bytes, so they also serve as a model
    image for spingalett_model_init). *size receives their count. Release with spingalett_free.
    Returns NULL on error. */
-SPINGALETT_API void *spingalett_save_to_memory(const NeuralNetwork *net, PrecisionMode precision,
+SPINGALETT_API void *spingalett_save_to_memory(const SpingalettNetwork *net, SpingalettPrecisionMode precision,
                                                bool save_optimizer, size_t *size);
 /* Reads a .slett file image of any format version from memory; data is not modified and need not
    be aligned. */
-SPINGALETT_API NeuralNetwork *load_spingalett_from_memory(const void *data, size_t size);
+SPINGALETT_API SpingalettNetwork *spingalett_load_from_memory(const void *data, size_t size);
 /* Releases memory the library returned (spingalett_save_to_memory). */
 SPINGALETT_API void spingalett_free(void *ptr);
 
@@ -597,8 +597,8 @@ SPINGALETT_API void spingalett_free(void *ptr);
  * or node that cannot be imported. Weights in external data files are read when the model comes
  * from a path (the files in its folder), not from memory.
  */
-SPINGALETT_API NeuralNetwork *spingalett_import_onnx(const char *path);
-SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
+SPINGALETT_API SpingalettNetwork *spingalett_import_onnx(const char *path);
+SPINGALETT_API SpingalettNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
 
 /*
  * PyTorch weights into a network of the same architecture: a state dict saved with torch.save
@@ -616,9 +616,9 @@ SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *dat
  * Weights are reordered for channels-last data as spingalett_import_onnx() does. On error (a shape
  * that does not fit, names the file does not have) the network is unchanged.
  */
-SPINGALETT_API bool spingalett_load_pytorch(NeuralNetwork *net, const char *path, const char *const *modules,
+SPINGALETT_API bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const char *const *modules,
                                             uint32_t module_count);
-SPINGALETT_API bool spingalett_load_pytorch_from_memory(NeuralNetwork *net, const void *data, size_t size,
+SPINGALETT_API bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size,
                                                         const char *const *modules, uint32_t module_count);
 
 /*
@@ -629,7 +629,7 @@ SPINGALETT_API bool spingalett_load_pytorch_from_memory(NeuralNetwork *net, cons
  */
 
 /* A network quantized (or converted) to precision for inference. */
-SPINGALETT_API SpingalettModel *spingalett_model_from_network(const NeuralNetwork *net, PrecisionMode precision);
+SPINGALETT_API SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
 /* Reads a .slett file. Images of format version 3 are used as stored; older ones are converted
    in the precision they were saved in. */
 SPINGALETT_API SpingalettModel *spingalett_model_load(const char *path);
@@ -637,11 +637,11 @@ SPINGALETT_API SpingalettModel *spingalett_model_load(const char *path);
 SPINGALETT_API SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
 SPINGALETT_API void spingalett_model_free(SpingalettModel *model);
 /* Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all
-   threads in COMPUTE_OPENMP mode. Returns false on error. */
+   threads in SPINGALETT_COMPUTE_OPENMP mode. Returns false on error. */
 SPINGALETT_API bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count,
                                              float *outputs);
-/* Mean loss (the model's loss function, as evaluate() computes it) and accuracy over a data set. */
-SPINGALETT_API EvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs,
+/* Mean loss (the model's loss function, as spingalett_evaluate() computes it) and accuracy over a data set. */
+SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs,
                                                      const float *targets, uint32_t count);
 
 /*
@@ -650,8 +650,8 @@ SPINGALETT_API EvalMetrics spingalett_model_evaluate(const SpingalettModel *mode
  * and macros NAME_SIZE, NAME_INPUTS, NAME_OUTPUTS and NAME_WORKSPACE (bytes for
  * spingalett_model_run), where NAME is name in upper case. name must be a C identifier.
  */
-SPINGALETT_API bool spingalett_export_c_header(const NeuralNetwork *net, const char *path, const char *name,
-                                               PrecisionMode precision);
+SPINGALETT_API bool spingalett_export_c_header(const SpingalettNetwork *net, const char *path, const char *name,
+                                               SpingalettPrecisionMode precision);
 
 /* Data sets. The readers fill *dataset (free it with spingalett_dataset_free) and return false
    on error, leaving it empty. */
@@ -689,20 +689,20 @@ SPINGALETT_API void spingalett_dataset_free(SpingalettDataset *dataset);
  * half-bytes for dense data such as photographs), in independently decodable chunks with CRC-32
  * checksums. Files can also record the input shape, class names and further sets of targets for
  * the same samples (e.g. CIFAR-100's fine and coarse labels). They load whole (chunks decode in
- * parallel with OpenMP), stream into train() through a reader that holds a few chunks at a time,
+ * parallel with OpenMP), stream into spingalett_train() through a reader that holds a few chunks at a time,
  * or stay in memory in their compact form. See docs/DatasetFormat.md for the layout.
  */
 typedef enum {
-    DATASET_ENCODING_AUTO,          /* the smallest lossless one of U8_UNIT, FP16 and FLOAT32;
+    SPINGALETT_DATASET_ENCODING_AUTO,          /* the smallest lossless one of U8_UNIT, FP16 and FLOAT32;
                                        one-hot target rows are stored as CLASS */
-    DATASET_ENCODING_FLOAT32,
-    DATASET_ENCODING_FP16,          /* IEEE half; lossy unless every value is a half */
-    DATASET_ENCODING_BFLOAT16,      /* lossy: 8 mantissa bits */
-    DATASET_ENCODING_U8_UNIT,       /* q / 255 for q in 0..255, exact for 8-bit data in [0, 1] */
-    DATASET_ENCODING_U8_AFFINE,     /* per feature min + q * (max - min) / 255: lossy 8-bit quantization */
-    DATASET_ENCODING_CLASS,         /* targets only: the argmax of each row, stored as a class index */
-    DATASET_ENCODING_COUNT
-} DatasetEncoding;
+    SPINGALETT_DATASET_ENCODING_FLOAT32,
+    SPINGALETT_DATASET_ENCODING_FP16,          /* IEEE half; lossy unless every value is a half */
+    SPINGALETT_DATASET_ENCODING_BFLOAT16,      /* lossy: 8 mantissa bits */
+    SPINGALETT_DATASET_ENCODING_U8_UNIT,       /* q / 255 for q in 0..255, exact for 8-bit data in [0, 1] */
+    SPINGALETT_DATASET_ENCODING_U8_AFFINE,     /* per feature min + q * (max - min) / 255: lossy 8-bit quantization */
+    SPINGALETT_DATASET_ENCODING_CLASS,         /* targets only: the argmax of each row, stored as a class index */
+    SPINGALETT_DATASET_ENCODING_COUNT
+} SpingalettDatasetEncoding;
 
 /* A further set of targets for the samples of a data set, saved next to its own targets. */
 typedef struct {
@@ -710,21 +710,21 @@ typedef struct {
     uint32_t size;                  /* targets per sample (classes, for one-hot rows) */
     const float *targets;           /* [count x size] */
     const char *const *class_names; /* size names, or NULL */
-    DatasetEncoding encoding;       /* AUTO: the smallest lossless one */
+    SpingalettDatasetEncoding encoding;       /* AUTO: the smallest lossless one */
 } SpingalettTargetSet;
 
 typedef struct {
-    DatasetEncoding input_encoding;
-    DatasetEncoding target_encoding;
+    SpingalettDatasetEncoding input_encoding;
+    SpingalettDatasetEncoding target_encoding;
     bool no_compression;            /* store the encoded bytes as they are (fastest to read) */
     const char *target_name;        /* name of the data set's own targets (e.g. "fine"), or NULL */
     const SpingalettTargetSet *extra_targets;   /* further sets of targets, or NULL */
     uint32_t extra_target_count;
-} DatasetSaveOptions;
+} SpingalettDatasetSaveOptions;
 
 typedef struct {
     uint32_t count, input_size, target_size;
-    DatasetEncoding input_encoding, target_encoding;
+    SpingalettDatasetEncoding input_encoding, target_encoding;
     uint32_t chunk_count;
     uint64_t file_size;
     uint32_t format_version;
@@ -747,7 +747,7 @@ typedef struct {
                                        set, chunks decode when they are needed, several at a time on
                                        the OpenMP threads. The samples come in the same order. */
     uint32_t target_set;            /* which set of targets to serve (0: the data set's own) */
-} DatasetReaderOptions;
+} SpingalettDatasetReaderOptions;
 
 /* Streams the samples of a .slettd file chunk by chunk. */
 typedef struct SpingalettDatasetReader SpingalettDatasetReader;
@@ -755,7 +755,7 @@ typedef struct SpingalettDatasetReader SpingalettDatasetReader;
 /* Writes dataset to path (SPINGALETT_DATASET_EXTENSION is appended when the name has none);
    options NULL = all defaults. */
 SPINGALETT_API bool spingalett_save_dataset(const SpingalettDataset *dataset, const char *path,
-                                            const DatasetSaveOptions *options);
+                                            const SpingalettDatasetSaveOptions *options);
 SPINGALETT_API bool spingalett_load_dataset(const char *path, SpingalettDataset *dataset);
 /* Same, from a file image in memory (e.g. a const array in flash); data is not modified. */
 SPINGALETT_API bool spingalett_load_dataset_from_memory(const void *data, size_t size, SpingalettDataset *dataset);
@@ -770,7 +770,7 @@ SPINGALETT_API bool spingalett_load_dataset_from_memory_targets(const void *data
    shuffle set. */
 SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open(const char *path, bool shuffle);
 /* options NULL = defaults (in file order, streaming, the first set of targets). */
-SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open_ex(const char *path, const DatasetReaderOptions *options);
+SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open_ex(const char *path, const SpingalettDatasetReaderOptions *options);
 /* A reader over 8-bit inputs in memory (value q stands for q / 255, as U8_UNIT) and float
    targets: both are copied, the inputs as bytes, and converted to float a batch at a time. */
 SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open_u8(const uint8_t *inputs, const float *targets,
@@ -789,12 +789,18 @@ SPINGALETT_API SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDat
    error, which is sticky); the next call starts a new pass. */
 SPINGALETT_API uint32_t spingalett_dataset_read(SpingalettDatasetReader *reader, float *inputs, float *targets,
                                                 uint32_t max_samples);
-/* A DataGeneratorFn over a reader, for .generator = spingalett_dataset_generator, .generator_data = reader. */
+/* A SpingalettDataGeneratorFn over a reader, for .generator = spingalett_dataset_generator, .generator_data = reader. */
 SPINGALETT_API uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader);
 
-SPINGALETT_API void print_parameters(const NeuralNetwork *net);
-SPINGALETT_API void free_network(NeuralNetwork *net);
+SPINGALETT_API void spingalett_print_network(const SpingalettNetwork *net);
+SPINGALETT_API void spingalett_network_free(SpingalettNetwork *net);
 
 #ifdef __cplusplus
 }
+#endif
+
+/* The names of 0.x, without the prefix (layer(), train(), NeuralNetwork, ACT_RELU, ...), for programs
+   written for them; define SPINGALETT_NO_SHORT_NAMES before including this header to leave them out. */
+#if !defined(SPINGALETT_NO_SHORT_NAMES)
+#include "Spingalett.Short.h"
 #endif

@@ -934,7 +934,7 @@ static void restore_params(NeuralNetwork *net, const float *src) {
     memcpy(net->running_var, src + w + 2u * b, b * sizeof(float));
 }
 
-TrainReport train_struct_arguments(TrainArgs args) {
+TrainReport spingalett_train_args(TrainArgs args) {
     NeuralNetwork *net = args.net;
     TrainingMode training_mode = args.training_mode;
     TrainingStrategy training_strategy = args.training_strategy;

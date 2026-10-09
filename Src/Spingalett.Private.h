@@ -289,7 +289,7 @@ void spingalett_network_let_go_gpu(NeuralNetwork *net);
    first train, so that those used for inference only hold their parameters once. Sets the error. */
 bool spingalett_training_state(NeuralNetwork *net);
 /* The arguments that add layer l of net again (to another network: set .net), parameters aside. */
-LayerArgs spingalett_layer_args(NeuralNetwork *net, uint32_t l);
+LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l);
 /* The image of a deployment model: net with every batch normalization that directly follows a dense
    or convolution layer without activation folded into that layer, without optimizer state. */
 void *spingalett_save_deployment(const NeuralNetwork *net, PrecisionMode precision, size_t *size);

@@ -31,7 +31,7 @@ typedef struct {
  * source, whose output shape is the layer's input shape. In a chain every layer reads the one
  * before it.
  */
-struct NeuralNetwork {
+struct SpingalettNetwork {
     uint32_t layers;
     uint32_t *input_offsets;        /* [layers + 1] */
     uint32_t *input_list;           /* [input_offsets[layers]] */

@@ -59,7 +59,7 @@ extern "C" {
    versions 1 and 2 still load. */
 #define SPINGALETT_FORMAT_VERSION 7
 
-/* Most inputs a layer can have (LAYER_ADD and LAYER_CONCAT read several). */
+/* Most inputs a layer can have (SPINGALETT_LAYER_ADD and SPINGALETT_LAYER_CONCAT read several). */
 #define SPINGALETT_MAX_INPUTS 16
 
 /* File name extensions: models (save_spingalett appends it when the name has none) and data sets. */
@@ -74,21 +74,21 @@ extern "C" {
 
 /* Activations (0 is none). .slett files keep codes of their own (docs/ModelFormat.md). */
 typedef enum {
-    ACT_NONE,
-    ACT_SIGMOID,
-    ACT_RELU,
-    ACT_TANH,
-    ACT_LEAKY_RELU,                 /* slope 0.01 below zero */
-    ACT_FOO52,                      /* slope 0.01 below 0 and above 1, identity between */
-    ACT_SOFTMAX,                    /* over the layer's outputs */
-    ACT_COUNT
-} ActivationFunction;
+    SPINGALETT_ACT_NONE,
+    SPINGALETT_ACT_SIGMOID,
+    SPINGALETT_ACT_RELU,
+    SPINGALETT_ACT_TANH,
+    SPINGALETT_ACT_LEAKY_RELU,                 /* slope 0.01 below zero */
+    SPINGALETT_ACT_FOO52,                      /* slope 0.01 below 0 and above 1, identity between */
+    SPINGALETT_ACT_SOFTMAX,                    /* over the layer's outputs */
+    SPINGALETT_ACT_COUNT
+} SpingalettActivationFunction;
 
 typedef enum {
-    LOSS_MSE,
-    LOSS_CROSS_ENTROPY,
-    LOSS_COUNT
-} LossFunction;
+    SPINGALETT_LOSS_MSE,
+    SPINGALETT_LOSS_CROSS_ENTROPY,
+    SPINGALETT_LOSS_COUNT
+} SpingalettLossFunction;
 
 /*
  * Kinds of layers. Data flows through a network as one tensor per sample, height x width x channels
@@ -98,53 +98,53 @@ typedef enum {
  * acyclic graph whose last layer is the output.
  */
 typedef enum {
-    LAYER_DENSE,                    /* fully connected: neurons_amount outputs */
-    LAYER_CONV2D,                   /* 2D convolution: `filters` output channels, kernel windows */
-    LAYER_MAX_POOL2D,               /* maximum over each window, per channel */
-    LAYER_AVG_POOL2D,               /* mean over each window (padded cells not counted), per channel */
-    LAYER_BATCH_NORM,               /* per channel: gamma (x - mean) / sqrt(variance + epsilon) + beta,
+    SPINGALETT_LAYER_DENSE,                    /* fully connected: neurons_amount outputs */
+    SPINGALETT_LAYER_CONV2D,                   /* 2D convolution: `filters` output channels, kernel windows */
+    SPINGALETT_LAYER_MAX_POOL2D,               /* maximum over each window, per channel */
+    SPINGALETT_LAYER_AVG_POOL2D,               /* mean over each window (padded cells not counted), per channel */
+    SPINGALETT_LAYER_BATCH_NORM,               /* per channel: gamma (x - mean) / sqrt(variance + epsilon) + beta,
                                        with the batch's statistics while training and running
                                        averages of them otherwise */
-    LAYER_ADD,                      /* the sum of its inputs, which share one shape (residual
+    SPINGALETT_LAYER_ADD,                      /* the sum of its inputs, which share one shape (residual
                                        connections); with one input, the input itself */
-    LAYER_CONCAT,                   /* its inputs side by side along the channels, in the order
+    SPINGALETT_LAYER_CONCAT,                   /* its inputs side by side along the channels, in the order
                                        given; they share height and width */
-    LAYER_GLOBAL_AVG_POOL,          /* the mean of each channel over all cells: 1 x 1 x channels (no
+    SPINGALETT_LAYER_GLOBAL_AVG_POOL,          /* the mean of each channel over all cells: 1 x 1 x channels (no
                                        activation, like the other pooling layers) */
-    LAYER_CONV_TRANSPOSE2D,         /* transposed 2D convolution, a convolution's data gradient run
+    SPINGALETT_LAYER_CONV_TRANSPOSE2D,         /* transposed 2D convolution, a convolution's data gradient run
                                        forward: `filters` output channels; each input cell adds its
                                        window of weights to the output cells (in - 1) stride - padding
                                        on, so that the output has (in - 1) stride - 2 padding + kernel +
                                        output_padding cells along each axis */
-    LAYER_UPSAMPLE,                 /* each cell repeated (nearest) or interpolated (bilinear) into
+    SPINGALETT_LAYER_UPSAMPLE,                 /* each cell repeated (nearest) or interpolated (bilinear) into
                                        stride_h x stride_w cells, per channel (no parameters, no
                                        activation) */
-    LAYER_LAYER_NORM,               /* per cell: gamma (x - mean) / sqrt(variance + epsilon) + beta over
+    SPINGALETT_LAYER_LAYER_NORM,               /* per cell: gamma (x - mean) / sqrt(variance + epsilon) + beta over
                                        its channels, with the cell's own statistics (a dense layer is
                                        one cell): parameters per channel, no running statistics */
-    LAYER_TYPE_COUNT
-} LayerType;
+    SPINGALETT_LAYER_TYPE_COUNT
+} SpingalettLayerType;
 
-/* How LAYER_UPSAMPLE fills its cells: copies of the input cell, or bilinear interpolation of the
+/* How SPINGALETT_LAYER_UPSAMPLE fills its cells: copies of the input cell, or bilinear interpolation of the
    four nearest input cells with their centres aligned (PyTorch's align_corners=False, ONNX Resize
    with half_pixel), the edges repeated. */
 typedef enum {
-    UPSAMPLE_NEAREST,
-    UPSAMPLE_BILINEAR,
-    UPSAMPLE_MODE_COUNT
-} UpsampleMode;
+    SPINGALETT_UPSAMPLE_NEAREST,
+    SPINGALETT_UPSAMPLE_BILINEAR,
+    SPINGALETT_UPSAMPLE_MODE_COUNT
+} SpingalettUpsampleMode;
 
 /* How parameters are stored: in .slett files, and as the weights a model computes with. The
    integer precisions keep one scale per weight row (output unit). */
 typedef enum {
-    PRECISION_FLOAT32,
-    PRECISION_FP16,                 /* IEEE half */
-    PRECISION_BFLOAT16,             /* upper 16 bits of a float */
-    PRECISION_INT8,                 /* q * scale, q in -127..127 */
-    PRECISION_INT4,                 /* q * scale, q in -7..7 */
-    PRECISION_INT2,                 /* ternary: q * scale, q in {-1, 0, 1} */
+    SPINGALETT_PRECISION_FLOAT32,
+    SPINGALETT_PRECISION_FP16,                 /* IEEE half */
+    SPINGALETT_PRECISION_BFLOAT16,             /* upper 16 bits of a float */
+    SPINGALETT_PRECISION_INT8,                 /* q * scale, q in -127..127 */
+    SPINGALETT_PRECISION_INT4,                 /* q * scale, q in -7..7 */
+    SPINGALETT_PRECISION_INT2,                 /* ternary: q * scale, q in {-1, 0, 1} */
     PRECISION_COUNT
-} PrecisionMode;
+} SpingalettPrecisionMode;
 
 /*
  * A network over a .slett image, filled in by spingalett_model_init. Treat the fields as read-only;
@@ -155,7 +155,7 @@ typedef struct {
     uint32_t input_size;            /* inputs per sample */
     uint32_t output_size;           /* outputs per sample */
     uint32_t layer_count;           /* weight layers: the network's layers minus the input layer */
-    LossFunction loss;              /* loss the network was trained with */
+    SpingalettLossFunction loss;              /* loss the network was trained with */
     size_t workspace_size;          /* bytes of workspace spingalett_model_run needs */
     const void *image;              /* the .slett image */
     size_t image_size;              /* its size as recorded in its header */
@@ -167,21 +167,21 @@ typedef struct {
 } SpingalettModel;
 
 typedef struct {
-    LayerType type;
+    SpingalettLayerType type;
     uint32_t inputs;                /* units of the layer's input: height x width x channels */
     uint32_t outputs;               /* units of its output */
-    ActivationFunction activation;
-    PrecisionMode precision;        /* how this layer's weights are stored and computed with */
+    SpingalettActivationFunction activation;
+    SpingalettPrecisionMode precision;        /* how this layer's weights are stored and computed with */
     uint32_t in_height, in_width, in_channels;      /* the input's shape */
     uint32_t height, width, channels;               /* the output's shape (1 x 1 x outputs for dense) */
     uint32_t kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w;  /* conv and pooling, else 0 */
     uint32_t groups;                /* conv: channel groups (1: every filter sees every input channel) */
     float epsilon;                  /* batch normalization: added to the variance */
-    uint32_t input_count;           /* layers it reads (several for LAYER_ADD and LAYER_CONCAT) */
+    uint32_t input_count;           /* layers it reads (several for SPINGALETT_LAYER_ADD and SPINGALETT_LAYER_CONCAT) */
     uint32_t input_layers[SPINGALETT_MAX_INPUTS];   /* their indices in the network: 0 is the input,
                                        i + 1 the output of weight layer i; in_height, in_width and
                                        in_channels describe the first */
-    UpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
+    SpingalettUpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
 } SpingalettLayerInfo;
 
 /*
@@ -206,6 +206,48 @@ SPINGALETT_API int spingalett_model_run(const SpingalettModel *model, const floa
 /* Describes weight layer `index` (0 is the first hidden layer). Returns false when index is out of
    range. */
 SPINGALETT_API bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, SpingalettLayerInfo *info);
+
+/* The engine's names of 0.x, without the prefix, unless SPINGALETT_NO_SHORT_NAMES is defined
+   (Spingalett.Short.h has the rest of the library's). */
+#if !defined(SPINGALETT_NO_SHORT_NAMES)
+typedef SpingalettActivationFunction ActivationFunction;
+typedef SpingalettLossFunction LossFunction;
+typedef SpingalettLayerType LayerType;
+typedef SpingalettUpsampleMode UpsampleMode;
+typedef SpingalettPrecisionMode PrecisionMode;
+#define ACT_NONE SPINGALETT_ACT_NONE
+#define ACT_SIGMOID SPINGALETT_ACT_SIGMOID
+#define ACT_RELU SPINGALETT_ACT_RELU
+#define ACT_TANH SPINGALETT_ACT_TANH
+#define ACT_LEAKY_RELU SPINGALETT_ACT_LEAKY_RELU
+#define ACT_FOO52 SPINGALETT_ACT_FOO52
+#define ACT_SOFTMAX SPINGALETT_ACT_SOFTMAX
+#define ACT_COUNT SPINGALETT_ACT_COUNT
+#define LOSS_MSE SPINGALETT_LOSS_MSE
+#define LOSS_CROSS_ENTROPY SPINGALETT_LOSS_CROSS_ENTROPY
+#define LOSS_COUNT SPINGALETT_LOSS_COUNT
+#define LAYER_DENSE SPINGALETT_LAYER_DENSE
+#define LAYER_CONV2D SPINGALETT_LAYER_CONV2D
+#define LAYER_MAX_POOL2D SPINGALETT_LAYER_MAX_POOL2D
+#define LAYER_AVG_POOL2D SPINGALETT_LAYER_AVG_POOL2D
+#define LAYER_BATCH_NORM SPINGALETT_LAYER_BATCH_NORM
+#define LAYER_ADD SPINGALETT_LAYER_ADD
+#define LAYER_CONCAT SPINGALETT_LAYER_CONCAT
+#define LAYER_GLOBAL_AVG_POOL SPINGALETT_LAYER_GLOBAL_AVG_POOL
+#define LAYER_CONV_TRANSPOSE2D SPINGALETT_LAYER_CONV_TRANSPOSE2D
+#define LAYER_UPSAMPLE SPINGALETT_LAYER_UPSAMPLE
+#define LAYER_LAYER_NORM SPINGALETT_LAYER_LAYER_NORM
+#define LAYER_TYPE_COUNT SPINGALETT_LAYER_TYPE_COUNT
+#define UPSAMPLE_NEAREST SPINGALETT_UPSAMPLE_NEAREST
+#define UPSAMPLE_BILINEAR SPINGALETT_UPSAMPLE_BILINEAR
+#define UPSAMPLE_MODE_COUNT SPINGALETT_UPSAMPLE_MODE_COUNT
+#define PRECISION_FLOAT32 SPINGALETT_PRECISION_FLOAT32
+#define PRECISION_FP16 SPINGALETT_PRECISION_FP16
+#define PRECISION_BFLOAT16 SPINGALETT_PRECISION_BFLOAT16
+#define PRECISION_INT8 SPINGALETT_PRECISION_INT8
+#define PRECISION_INT4 SPINGALETT_PRECISION_INT4
+#define PRECISION_INT2 SPINGALETT_PRECISION_INT2
+#endif
 
 #ifdef __cplusplus
 }
