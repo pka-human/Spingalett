@@ -5,6 +5,71 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [0.13.0] - 2026-10-09
+
+"Layers": transposed convolutions, upsampling and layer normalization, for U-Nets and more of ONNX,
+on the CPU, the GPU, in files, the engine and deployment models, imported from ONNX and PyTorch.
+
+### Added
+- Transposed 2D convolutions: `conv_transpose2d()` (`LAYER_CONV_TRANSPOSE2D`; Python
+  `ConvTranspose2D`, `add_conv_transpose2d()`) with strides, padding, output padding
+  (`LayerArgs.output_padding`, `output_padding_h`, `output_padding_w`) and groups; the output has
+  `(in - 1) stride - 2 padding + kernel + output_padding` cells an axis. A filter per output
+  channel, as a convolution's. The passes are those of the convolution transposed, swapped: the
+  forward pass is its data gradient, the data gradient its forward pass, the weight gradient its
+  weight gradient with input and output gradient exchanged, on the CPU's kernels and the GPU's.
+- Upsampling: `upsample2d()` (`LAYER_UPSAMPLE`, `UpsampleMode`; Python `Upsample2D`,
+  `add_upsample()`) by integer factors (`stride_h`, `stride_w`, default 2), `UPSAMPLE_NEAREST` or
+  `UPSAMPLE_BILINEAR` (the cells' centres aligned and the edges repeated, PyTorch's
+  `align_corners=False`; weights from integers, the same on every platform).
+- Layer normalization: `layer_norm()` (`LAYER_LAYER_NORM`; Python `LayerNorm`, `add_layer_norm()`)
+  over each cell's channels (a dense layer's outputs are one cell), gamma and beta per channel, no
+  running statistics, no weight decay on gamma.
+- All three train on the CPU and the GPU (deterministic, the GPU's results within rounding of the
+  CPU's), save in `.slett` format version 7 (`docs/ModelFormat.md`; networks without them keep
+  their versions), and run in the engine and in deployment models in every precision, batch
+  normalization folded into a transposed convolution before it. Float deployment models run
+  transposed convolutions through the convolution kernels in batches, integer ones through the
+  engine's pass, which they reproduce exactly.
+- ONNX import: `ConvTranspose` (groups, strides, padding, output padding), `Resize` and `Upsample`
+  by constant integer factors (nearest where it reads cell floor(o / factor): asymmetric
+  coordinates rounded down or half-pixel ones rounded; linear with half-pixel coordinates), and
+  `LayerNormalization` over a vector or over a map's channels between a `Transpose` to channels last
+  and one back (LayerNorm2d). A U-Net exported by both PyTorch exporters and a network with both
+  kinds of layer normalization import within 6e-8 of PyTorch's outputs.
+- PyTorch weights: `ConvTranspose2d` (weight `[in, out / groups, kh, kw]`) and `LayerNorm` modules.
+- `Examples/Segmentation.c`: a U-Net segments synthetic 64 x 64 images of circles, squares and
+  triangles (a sigmoid a pixel and class, new images every epoch from a generator; `bilinear`,
+  `ln`, `gpu`, `bf16`). 12 epochs on an RTX 4050 Laptop GPU: 15 s, mean IoU 0.882, pixel accuracy
+  98.5%; the INT8 model keeps 0.878.
+- `Bin/Benchmark` and `benchmark_pytorch.py` time that U-Net.
+
+### Changed
+- `LayerType` has three new values before `LAYER_TYPE_COUNT`; `LayerArgs`, `SpingalettNetworkLayer`
+  and `SpingalettLayerInfo` have new fields (output padding, the upsampling mode), mirrored in the
+  Python structures. `SPINGALETT_FORMAT_VERSION` is 7.
+- GPU: the output layer's kernel takes rows of more than 64 outputs a workgroup each (sums in a fixed
+  tree): the U-Net's loss kernel takes 45 us instead of 2,548 us a batch; narrower rows keep their
+  thread a row and their results.
+- Float deployment models run transposed convolutions in batches through the convolution kernels
+  (they ran sample by sample through the engine): the U-Net's FP32 model predicts 3,150 images a
+  second instead of 2,440, its FP16 model 3,190 instead of 2,140 (i7-12650H, 16 threads).
+- Nothing slower: interleaved runs of `Bin/Benchmark` on the i7-12650H and its RTX 4050 Laptop GPU,
+  0.12.0 against 0.13.0 (three each, one and eight threads), agree within 4% on every CPU workload
+  and 5% on every GPU one, either way.
+- The U-Net, images per second, training and inference (medians of three interleaved runs): one
+  thread 146 and 511 (PyTorch 2.14: 134 and 292), eight threads 598 and 2,467 (365 and 754); on the
+  GPU 3,279 and 6,552 (PyTorch with TF32: 3,283 and 6,329; in single precision 3,059 and 6,564),
+  with bfloat16 products 3,707 and 6,880 (PyTorch's autocast, which keeps activations in bfloat16:
+  4,950 and 11,918).
+
+### Fixed
+- The cross-entropy of sigmoid outputs saturated at 1 was NaN (a target of 1) or infinite (a target
+  of 0), on the CPU and the GPU: the reported losses, validation and anything monitoring them went
+  NaN once per-pixel sigmoids saturated. The bound on 1 - o is now taken through `fmaxf()`, which
+  reassociation cannot fold back into a comparison of o.
+- The header's comment on ONNX import said external data files were not read (0.12 reads them).
+
 ## [0.12.0] - 2026-10-09
 
 "Tensor cores": the GPU's matrix units in bfloat16, the custom-loop API on the GPU, fixes from a
@@ -703,6 +768,7 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[0.13.0]: https://github.com/pka-human/Spingalett/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/pka-human/Spingalett/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/pka-human/Spingalett/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/pka-human/Spingalett/compare/v0.9.0...v0.10.0

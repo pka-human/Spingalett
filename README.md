@@ -129,7 +129,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.12 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.13 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -1209,16 +1209,14 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.12; the C API may still change between minor versions (see
+Spingalett is at version 0.13; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.12`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.13`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
-engine and model format versions 3 to 6 are meant to stay stable from here on.
+engine and model format versions 3 to 7 are meant to stay stable from here on.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.13: transposed convolutions, upsampling and layer normalization (U-Net-style networks, more of
-  ONNX)
 - 0.14, the release candidate: every public name under the library's prefix, structs that can
   grow, the formats frozen, a C++ wrapper
 - 1.0: the API and ABI frozen
