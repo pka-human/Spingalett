@@ -85,6 +85,13 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.
+- **ABI.** From 1.0 a release keeps the ABI of the one before (semantic versioning): `api.abi`
+  compares the public structs' layouts, the enumerators, the integer constants and the functions'
+  declarations with `Tests/Data/abi.txt` (`Tests/check_abi.py`). A new field takes reserved space
+  (the `reserved` array shrinks by what it uses), a new function goes into a new node of
+  `Src/Spingalett.map` (the symbol versions; the test checks that it lists the headers' functions and
+  that the library exports them), and the baseline is recorded again at each release
+  (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`).
 - **ABI with Python.** `Tests/Spingalett.Layout.c` and `test_python_layout.py` check that the
   ctypes structures match the C ones; a new field in a public struct needs both sides.
 - **Engine scratch.** The engine's workspace size comes from `slett_conv_scratch()`; kernels may

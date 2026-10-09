@@ -177,6 +177,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     if(NOT WIN32)
         target_compile_options(spingalett PRIVATE -fvisibility=hidden)
     endif()
+    # ELF: the exported functions carry the symbol versions of Src/Spingalett.map
+    if(UNIX AND NOT APPLE)
+        target_link_options(spingalett PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.map)
+        set_property(TARGET spingalett APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.map)
+    endif()
 
     target_compile_options(spingalett PRIVATE
         $<$<CONFIG:Release>:
@@ -478,6 +483,28 @@ if(BUILD_TESTS)
     if(Python3_Interpreter_FOUND)
         add_test(NAME docs.reference
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/docs/make_reference.py --check)
+    endif()
+
+    # The ABI of the last release (Tests/Data/abi.txt): layouts, values and declarations kept, the
+    # exported functions those of Src/Spingalett.map (Tests/check_abi.py).
+    if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
+        set(abi_headers ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.h
+                        ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Inference.h)
+        add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/abi_dump.c
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/check_abi.py source
+                    ${CMAKE_CURRENT_BINARY_DIR}/abi_dump.c
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/Tests/check_abi.py ${CMAKE_CURRENT_SOURCE_DIR}/docs/make_reference.py
+                    ${abi_headers}
+            COMMENT "Writing the ABI dump program")
+        add_executable(SpingalettAbi ${CMAKE_CURRENT_BINARY_DIR}/abi_dump.c)
+        target_include_directories(SpingalettAbi PRIVATE $<TARGET_PROPERTY:spingalett,INTERFACE_INCLUDE_DIRECTORIES>)
+        set(abi_symbols)
+        if(UNIX AND NOT APPLE AND CMAKE_NM)
+            set(abi_symbols ${CMAKE_NM} $<TARGET_FILE:spingalett>)
+        endif()
+        add_test(NAME api.abi
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/check_abi.py check
+                         $<TARGET_FILE:SpingalettAbi> ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Data/abi.txt ${abi_symbols})
     endif()
 
     # A program of the prefixed names only, the names of 0.x (and <syslog.h>'s) its own.
