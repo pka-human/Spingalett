@@ -30,6 +30,15 @@ changes, which are listed under **Changed**.
   512 -> 1000 forward pass 415 us against 331), and timing takes half as long (the 255 products of
   `Bin/Benchmark gpu`: 10.7 to 5.4 s, once per process).
 
+- With `PRECISION_BFLOAT16`, the outputs of layers that only matrix products read (dense and
+  convolution layers feeding dense and convolution layers, and the network's inputs) are kept on the
+  GPU as bfloat16, the values the products round them to: half the memory, read eight values to a
+  load and moved to the matrix units' shared memory as they are; the host rounds the inputs as it
+  writes them, halving the bytes it sends. Products that read or write such outputs run on the
+  matrix units whatever their size. The MLP of `Examples/Benchmark.c` trains full batches 9% faster
+  in bfloat16 and infers 60% faster (1,840,000 to 2,940,000 samples per second, interleaved runs).
+  `SPINGALETT_GPU_NO_BF16_STORAGE=1` keeps them in single precision.
+
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
   the epochs after it: they now go to the device before the next epoch.

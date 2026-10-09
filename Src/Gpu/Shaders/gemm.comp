@@ -51,6 +51,7 @@ layout(constant_id = 9) const uint THREADS = 256;     /* (BM / TM) * (BN / TN) *
 layout(constant_id = 10) const uint PHASED = 0;       /* rows are a phase of the C grid */
 layout(constant_id = 11) const uint VEC = 0;
 layout(local_size_x_id = 9) in;
+const uint HALF = 0u;                                 /* everything in single precision */
 
 #include "gemm_common.glsl"
 

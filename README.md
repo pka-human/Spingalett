@@ -807,8 +807,11 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
   go to the GPU before the next forward pass.
 - `spingalett_set_gpu_precision(PRECISION_BFLOAT16)` multiplies matrices in bfloat16 on the GPU's
   matrix units (tensor cores; `VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16`), the
-  products added in single precision; the parameters, the optimizer and batch normalization stay in
-  single precision, and so do products smaller than a block of the matrix units. Runs stay
+  products added in single precision; the parameters, the gradients, the optimizer and batch
+  normalization stay in single precision, and so do products smaller than a block of the matrix
+  units unless they read or write bfloat16. The outputs of layers that only products read (dense and
+  convolution layers feeding such layers, and the network's inputs) are kept on the GPU as bfloat16,
+  the values the products round them to: half the memory and the bytes read. Runs stay
   deterministic. On an RTX 4050 Laptop GPU ResNet-20 trains 17 to 18% faster than in single
   precision, and reaches the same CIFAR-10 test accuracy (91.61% against 91.55%). Devices without
   the extensions keep single precision.

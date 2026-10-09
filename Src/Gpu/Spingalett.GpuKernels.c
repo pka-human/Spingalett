@@ -108,8 +108,23 @@ uint32_t spg_gemm_split(uint32_t M, uint32_t N, uint32_t K, uint32_t G, uint32_t
     return (K + *slice_k - 1) / *slice_k;
 }
 
-static bool aligned(uint64_t address, uint32_t group) {
-    return address % 16u == 0 && group % 4u == 0;
+static bool aligned(uint64_t address, uint32_t group, uint32_t width) {
+    return address % 16u == 0 && group % width == 0;
+}
+
+/* Whether operand A (or B) may be read w values of its contiguous axis at a time: along k, every slice
+   must start at a multiple of w and k end at one; along m (A_COL) or n (B_ROW, B_CONV), the dimension
+   and the stride must be multiples of w (convolutions: the caller checks their channels). */
+static bool vectors(const SpgGemmPush *p, const SpgGemmMode *m, bool a, uint32_t w) {
+    const bool k_ok = p->K % w == 0 && (p->slices == 1 || p->slice_k % w == 0);
+    if (a) {
+        if (!aligned(p->a, p->a_group, w)) return false;
+        if (m->amode == SPG_A_COL) return p->M % w == 0 && p->lda % w == 0;
+        return k_ok && (m->amode != SPG_A_ROW || p->lda % w == 0);
+    }
+    if (!aligned(p->b, p->b_group, w)) return false;
+    if (m->bmode == SPG_B_COL) return k_ok && p->ldb % w == 0;
+    return p->N % w == 0 && (m->bmode != SPG_B_ROW || p->ldb % w == 0);
 }
 
 /* ------------------------------------------------------------------------- tile choice by timing */
@@ -127,7 +142,7 @@ static bool aligned(uint64_t address, uint32_t group) {
  * tile in particular. A device idle for a while is first kept busy for 25 ms, to raise its clocks.
  */
 typedef struct {
-    uint32_t key[15];
+    uint32_t key[16];
     uint32_t tile;                  /* index of the fastest in its table */
 } Choice;
 
@@ -161,21 +176,21 @@ void spg_gemm_release(void) {
 }
 
 static void make_key(uint32_t *key, const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, bool mma) {
-    const uint32_t values[15] = {m->amode, m->bmode, m->epi, vec, m->phased, m->groups, p->M, p->N, p->K, p->slices,
-                                 p->slice_k, p->lda, p->ldb, p->ldc, mma};
+    const uint32_t values[16] = {m->amode, m->bmode, m->epi, vec, m->phased, m->groups, p->M, p->N, p->K, p->slices,
+                                 p->slice_k, p->lda, p->ldb, p->ldc, mma, mma ? m->half : 0u};
     memcpy(key, values, sizeof values);
 }
 
 /* Records the product with tile t (gemm_mma.comp with mma). */
 static void dispatch_tile(SpgGpuCommands *c, const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, const Tile *t,
                           bool mma) {
-    uint32_t spec[13] = {t->bm, t->bn, t->bk, t->tm, t->tn, m->amode, m->bmode, m->epi, m->act, tile_threads(t, mma),
-                         m->phased ? 1u : 0u, vec, spg_gpu_subgroup_size()};
+    uint32_t spec[14] = {t->bm, t->bn, t->bk, t->tm, t->tn, m->amode, m->bmode, m->epi, m->act, tile_threads(t, mma),
+                         m->phased ? 1u : 0u, vec, spg_gpu_subgroup_size(), m->half};
     /* tiles of rows in parts of at most what a dispatch may have in x */
     const uint32_t tiles = (p->M + t->bm - 1) / t->bm, most = spg_gpu_max_workgroups(0);
     SpgGemmPush q = *p;
     for (q.m_tile0 = 0; q.m_tile0 < tiles; q.m_tile0 += most)
-        spg_gpu_dispatch(c, mma ? SPG_KERNEL_gemm_mma : SPG_KERNEL_gemm, spec, mma ? 13u : 12u, &q, sizeof q,
+        spg_gpu_dispatch(c, mma ? SPG_KERNEL_gemm_mma : SPG_KERNEL_gemm, spec, mma ? 14u : 12u, &q, sizeof q,
                          tiles - q.m_tile0 < most ? tiles - q.m_tile0 : most, (p->N + t->bn - 1) / t->bn,
                          m->groups * p->slices);
 }
@@ -232,7 +247,7 @@ static bool time_tiles(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec,
 static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, bool mma) {
     if (m->c_floats == 0 || !tuner_ready()) return -1;
     const Table tab = table(mma);
-    uint32_t key[15];
+    uint32_t key[16];
     make_key(key, p, m, vec, mma);
     int found = -1;
     spg_lock(tuner.lock);
@@ -243,7 +258,7 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, 
         spg_unlock(tuner.lock);
         return found;
     }
-    /* the outputs go to scratch memory, so that timing changes nothing */
+    /* the outputs go to scratch memory, so that timing changes nothing (as floats: room for bfloat16) */
     const uint64_t bytes = (m->epi == SPG_EPI_PARTIAL ? (uint64_t)m->groups * p->slices * p->M * p->N : m->c_floats) * 4u;
     if (tuner.scratch.size < bytes) {
         spg_gpu_buffer_free(&tuner.scratch);
@@ -319,17 +334,15 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, 
 void spg_gemm(SpgGpuCommands *c, SpgGemmPush *p, const SpgGemmMode *mode) {
     if (p->slices == 0) { p->slices = 1; p->slice_k = p->K; }
     if (p->M == 0 || p->N == 0) return;
-    /* vectors along k need every slice to start at a multiple of four and k to end at one; along m
-       (A_COL) or n (B_ROW, B_CONV), the dimension a multiple of four */
-    const bool k_ok = p->K % 4u == 0 && (p->slices == 1 || p->slice_k % 4u == 0);
-    bool va = mode->vec_a && aligned(p->a, p->a_group);
-    if (mode->amode == SPG_A_COL) va = va && p->M % 4u == 0 && p->lda % 4u == 0;
-    else va = va && k_ok && (mode->amode != SPG_A_ROW || p->lda % 4u == 0);
-    bool vb = mode->vec_b && aligned(p->b, p->b_group);
-    if (mode->bmode == SPG_B_COL) vb = vb && k_ok && p->ldb % 4u == 0;
-    else vb = vb && p->N % 4u == 0 && (mode->bmode != SPG_B_ROW || p->ldb % 4u == 0);
-    const uint32_t vec = (va ? 1u : 0u) | (vb ? 2u : 0u);
     const bool mma = mode->bf16 && spg_gpu_mma_bf16();
+    SpgGemmMode m = *mode;
+    if (!mma) m.half = 0;
+    /* vectors of four floats, four bfloat16 or (wide) eight bfloat16 of the operands kept as such */
+    const bool wide_a = m.vec_a && (m.half & 1u) && m.wide_a && vectors(p, &m, true, 8u),
+               wide_b = m.vec_b && (m.half & 2u) && m.wide_b && vectors(p, &m, false, 8u);
+    const bool va = m.vec_a && (wide_a || vectors(p, &m, true, 4u)), vb = m.vec_b && (wide_b || vectors(p, &m, false, 4u));
+    mode = &m;
+    const uint32_t vec = (va ? 1u : 0u) | (vb ? 2u : 0u) | (wide_a ? 4u : 0u) | (wide_b ? 8u : 0u);
     const Table tab = table(mma);
     int tuned = mode->tile ? -1 : tuned_tile(p, mode, vec, mma);
     Tile t = mode->tile && mode->tile <= tab.count && tile_fits(&tab.list[mode->tile - 1], mma, p->N) ? tab.list[mode->tile - 1]

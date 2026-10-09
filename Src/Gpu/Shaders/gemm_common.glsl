@@ -7,7 +7,11 @@
  * What the matrix kernels (gemm.comp in single precision, gemm_mma.comp on matrix units) share: the
  * operand modes and their loads into registers, the geometry of convolutions and the epilogues.
  * The kernel declares the specialization constants BM, BN, BK, AMODE, BMODE, EPI, ACT, THREADS,
- * PHASED and VEC before including this file. See gemm.comp for the modes.
+ * PHASED, VEC and HALF before including this file. See gemm.comp for the modes.
+ *
+ * HALF: what is kept in memory as bfloat16 (bit 0: A, 1: B, 2: C, 3: e0 of EPI_DERIV), for kernels
+ * that define SPG_HALF (and enable 16-bit storage). Values are rounded to bfloat16 to the nearest,
+ * ties to even, by to_bf16(), as the host rounds its inputs.
  */
 
 #define A_ROW   0u
@@ -55,10 +59,29 @@ layout(push_constant) uniform Push {
 #define GEO_CS 15u              /* step_h | step_w << 16 */
 #define GEO_TAPS 16u
 
+/* VEC: A and B read as vectors (bits 0 and 1), of eight bfloat16 rather than four values (bits 2, 3) */
 const bool VA = (VEC & 1u) != 0u, VB = (VEC & 2u) != 0u;
+const bool HA = (HALF & 1u) != 0u, HB = (HALF & 2u) != 0u, HC = (HALF & 4u) != 0u, HE = (HALF & 8u) != 0u;
+
+#ifdef SPG_HALF
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BF16 { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BF16x4 { u16vec4 v[]; };
+struct Raw8 { u16vec4 lo, hi; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer BF16x8 { Raw8 v[]; };
+
+float from_bf16(uint h) { return uintBitsToFloat(h << 16); }
+/* to the nearest bfloat16, ties to even (NaN stays NaN) */
+uint to_bf16(float f) {
+    uint u = floatBitsToUint(f);
+    if (isnan(f)) return (u >> 16) | 0x40u;
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+#endif
 /* the axis a thread's loads run along: k (true) or the other one */
 const bool A_KFAST = AMODE != A_COL, B_KFAST = BMODE == B_COL;
-const uint WA = VA ? 4u : 1u, WB = VB ? 4u : 1u;            /* values per load */
+/* values per load: four floats, or eight values kept as bfloat16 (16 bytes either way), or one */
+const uint WA = VA ? ((VEC & 4u) != 0u ? 8u : 4u) : 1u, WB = VB ? ((VEC & 8u) != 0u ? 8u : 4u) : 1u;
+const bool RA = WA == 8u, RB = WB == 8u;                     /* loads of raw bfloat16 (ra, rb) */
 const uint LA = (BM * BK / WA + THREADS - 1u) / THREADS;    /* loads per thread and step */
 const uint LB = (BN * BK / WB + THREADS - 1u) / THREADS;
 uint tid, m0, n0, kend, aoff, boff;
@@ -66,7 +89,10 @@ uint RH, RW, GH, GW, GC, SH, SW, PH, PW;
 int abase[LA], ah[LA], aw[LA];              /* A_CONV: each loaded row's sample and window */
 int btap_h[LB], btap_w[LB], btap_c[LB];     /* B_CONV: each loaded column's tap, */
 uint bsample[LB], by[LB], bx[LB];           /* and the output pixel (sample offset, y, x) of its k */
-vec4 fa[LA], fb[LB];
+vec4 fa[RA ? 1u : LA], fb[RB ? 1u : LB];
+#ifdef SPG_HALF
+u16vec4 ra[RA ? 2u * LA : 1u], rb[RB ? 2u * LB : 1u];       /* eight bfloat16 a load, as they are in memory */
+#endif
 
 /* the row (column) and k of the i-th load of A (B): the first of WA (WB) consecutive ones along the
    contiguous axis */
@@ -121,47 +147,89 @@ void prepare(uint kbeg) {
     }
 }
 
-/* WA (or WB) consecutive floats from x at index at (a multiple of four with vectors) */
-vec4 load(F32 x, uint at, bool vec) {
+/* WA (or WB) consecutive values from x at index at (a multiple of four with vectors), floats or (h16)
+   bfloat16 */
+vec4 load(F32 x, uint at, bool vec, bool h16) {
+#ifdef SPG_HALF
+    if (h16 && vec) {
+        uvec4 h = uvec4(BF16x4(x).v[at >> 2]);
+        return vec4(from_bf16(h.x), from_bf16(h.y), from_bf16(h.z), from_bf16(h.w));
+    }
+    if (h16) return vec4(from_bf16(uint(BF16(x).v[at])), 0.0, 0.0, 0.0);
+#endif
     if (vec) return F32x4(x).v[at >> 2];
     return vec4(x.v[at], 0.0, 0.0, 0.0);
 }
 
+/* Element at of x, a float or (h16) a bfloat16, and its store. */
+float get(F32 x, uint at, bool h16) {
+#ifdef SPG_HALF
+    if (h16) return from_bf16(uint(BF16(x).v[at]));
+#endif
+    return x.v[at];
+}
+void put(F32 x, uint at, bool h16, float v) {
+#ifdef SPG_HALF
+    if (h16) {
+        BF16(x).v[at] = uint16_t(to_bf16(v));
+        return;
+    }
+#endif
+    x.v[at] = v;
+}
+
 void fetch(uint k0) {
     [[unroll]] for (uint i = 0; i < LA; i++) {
-        uint m = m0 + a_row(i), k = k0 + a_k(i);
-        vec4 v = vec4(0.0);
-        /* vectors need all four inside: m or k a multiple of four below a multiple-of-four bound */
-        if (a_live(i) && m < p.M && k < kend) {
+        uint m = m0 + a_row(i), k = k0 + a_k(i), at = 0u;
+        /* vectors need all their values inside: m or k a multiple of the width below such a bound */
+        bool inside = a_live(i) && m < p.M && k < kend;
+        if (inside) {
             if (AMODE == A_ROW) {
-                v = load(p.a, aoff + m * p.lda + k, VA);
+                at = aoff + m * p.lda + k;
             } else if (AMODE == A_COL) {
-                v = load(p.a, aoff + k * p.lda + m, VA);
+                at = aoff + k * p.lda + m;
             } else {
                 uint t = p.geo.v[GEO_TAPS + k];
                 int y = ah[i] + int(t & 255u), x = aw[i] + int((t >> 8) & 255u);
-                if (uint(y) < GH && uint(x) < GW)
-                    v = load(p.a, uint(abase[i]) + (uint(y) * GW + uint(x)) * GC + (t >> 16) + aoff, VA);
+                inside = uint(y) < GH && uint(x) < GW;
+                at = uint(abase[i]) + (uint(y) * GW + uint(x)) * GC + (t >> 16) + aoff;
             }
         }
-        fa[i] = v;
+#ifdef SPG_HALF
+        if (RA) {
+            Raw8 v = Raw8(u16vec4(0us), u16vec4(0us));
+            if (inside) v = BF16x8(p.a).v[at >> 3];
+            ra[2u * i] = v.lo;
+            ra[2u * i + 1u] = v.hi;
+            continue;
+        }
+#endif
+        fa[i] = inside ? load(p.a, at, VA, HA) : vec4(0.0);
     }
     [[unroll]] for (uint i = 0; i < LB; i++) {
-        uint n = n0 + b_col(i), k = k0 + b_k(i);
-        vec4 v = vec4(0.0);
-        if (b_live(i) && n < p.N && k < kend) {
+        uint n = n0 + b_col(i), k = k0 + b_k(i), at = 0u;
+        bool inside = b_live(i) && n < p.N && k < kend;
+        if (inside) {
             if (BMODE == B_ROW) {
-                v = load(p.b, boff + k * p.ldb + n, VB);
+                at = boff + k * p.ldb + n;
             } else if (BMODE == B_COL) {
-                v = load(p.b, boff + n * p.ldb + k, VB);
+                at = boff + n * p.ldb + k;
             } else {
                 /* k: an output pixel (sample, y, x) of the RH x RW grid; n: a tap of its window */
                 int y = int(by[i] * SH) - int(PH) + btap_h[i], x = int(bx[i] * SW) - int(PW) + btap_w[i];
-                if (uint(y) < GH && uint(x) < GW)
-                    v = load(p.b, bsample[i] + (uint(y) * GW + uint(x)) * GC + uint(btap_c[i]) + boff, VB);
+                inside = uint(y) < GH && uint(x) < GW;
+                at = bsample[i] + (uint(y) * GW + uint(x)) * GC + uint(btap_c[i]) + boff;
             }
         }
-        fb[i] = v;
+#ifdef SPG_HALF
+        if (RB) {
+            Raw8 v = Raw8(u16vec4(0us), u16vec4(0us));
+            if (inside) v = BF16x8(p.b).v[at >> 3];
+            rb[2u * i] = v.lo;
+            rb[2u * i + 1u] = v.hi;
+        } else
+#endif
+        fb[i] = inside ? load(p.b, at, VB, HB) : vec4(0.0);
         if (BMODE == B_CONV) {
             bx[i] += BK;
             while (bx[i] >= RW) {
@@ -191,7 +259,7 @@ void store_c(uint z, uint coff, uint m, uint row, uint n, float v) {
     uint at = coff + row * p.ldc + n;
     if (EPI == EPI_STORE) {
         v *= p.alpha;
-        if (p.beta != 0.0) v += p.beta * p.c.v[at];
+        if (p.beta != 0.0) v += p.beta * get(p.c, at, HC);
     } else if (EPI == EPI_BIAS_ACT) {
         if ((p.flags & FLAG_BIAS) != 0u) v += p.e0.v[coff + n];
         v = activate(v, ACT);
@@ -199,8 +267,8 @@ void store_c(uint z, uint coff, uint m, uint row, uint n, float v) {
         v = activate(v * p.e0.v[coff + n] + p.e1.v[coff + n], ACT);
     } else if (EPI == EPI_DERIV) {
         v *= p.alpha;
-        if (p.beta != 0.0) v += p.beta * p.c.v[at];
-        v *= derivative(p.e0.v[at], ACT);
+        if (p.beta != 0.0) v += p.beta * get(p.c, at, HC);
+        v *= derivative(get(p.e0, at, HE), ACT);
     }
-    p.c.v[at] = v;
+    put(p.c, at, HC, v);
 }

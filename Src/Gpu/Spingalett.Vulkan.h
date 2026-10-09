@@ -69,6 +69,8 @@ uint32_t spg_gpu_subgroup_size(void);
 uint32_t spg_gpu_max_workgroups(uint32_t axis);
 /* Whether the device multiplies bfloat16 cooperative matrices (16 x 16 x 16, sums in float). */
 bool spg_gpu_mma_bf16(void);
+/* Whether kernels may keep bfloat16 values in memory (the matrix units, and 16-bit storage). */
+bool spg_gpu_bf16_storage(void);
 /* Whether the host can write into all of the device's memory (resizable BAR, unified memory), for
    SPG_MEMORY_HOST_WRITES: the largest device-local heap's memory is host-visible too. */
 bool spg_gpu_host_writes(void);

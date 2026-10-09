@@ -132,6 +132,7 @@ static struct {
     uint32_t max_groups[3];         /* workgroups a dispatch may have in x, y and z */
     uint32_t subgroup;              /* the subgroup size */
     bool mma_bf16;                  /* cooperative matrices of bfloat16, 16 x 16 x 16, sums in float */
+    bool storage16;                 /* 16-bit values in storage buffers (bfloat16 activations) */
     bool full_subgroups;            /* the matrix units' kernel can ask for subgroups without inactive lanes */
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     VkPipelineLayout layout;
@@ -291,15 +292,20 @@ static bool open_device(void) {
     CoopFeatures coop = {.sType = COOP_FEATURES_TYPE};
     Bf16Features bf16 = {.sType = BF16_FEATURES_TYPE};
     VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkBool32 int16 = VK_FALSE;
     /* (a build whose glslc could not compile the kernel holds an empty module for it) */
     if (spg_kernel_spirv_size[SPG_KERNEL_gemm_mma] > 20u &&
         has_extension(extensions, extension_count, "VK_KHR_cooperative_matrix") &&
         has_extension(extensions, extension_count, "VK_KHR_shader_bfloat16")) {
         coop.pNext = &bf16;
         bf16.pNext = &have12;
+        have12.pNext = &have11;
         VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &coop};
         vkGetPhysicalDeviceFeatures2(gpu.physical, &f);
         bf16.pNext = NULL;
+        have12.pNext = NULL;
+        int16 = f.features.shaderInt16;
         CoopPropertiesFn properties = (CoopPropertiesFn)vkGetInstanceProcAddr(gpu.instance,
                                                                               "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
         uint32_t count = 0;
@@ -316,6 +322,10 @@ static bool open_device(void) {
                         gpu.mma_bf16 = true;
             free(list);
         }
+        /* the kernel keeps bfloat16 values in memory too, and moves their bits as 16-bit integers (16-bit
+           storage and integers, which every device with such matrix units has) */
+        gpu.mma_bf16 = gpu.mma_bf16 && have11.storageBuffer16BitAccess && int16;
+        gpu.storage16 = gpu.mma_bf16;
     }
     /* subgroups of the matrix units' kernel complete, as cooperative matrices need them
        (VK_EXT_subgroup_size_control, core in Vulkan 1.3) */
@@ -345,11 +355,15 @@ static bool open_device(void) {
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gpu.family, 1, &priority};
+    VkPhysicalDeviceVulkan11Features enable11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                                 .storageBuffer16BitAccess = gpu.storage16,
+                                                 .pNext = gpu.mma_bf16 ? (void *)&coop : NULL};
     VkPhysicalDeviceVulkan12Features enable12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                                  .bufferDeviceAddress = VK_TRUE,
                                                  .shaderFloat16 = gpu.mma_bf16, .vulkanMemoryModel = gpu.mma_bf16,
-                                                 .pNext = gpu.mma_bf16 ? (void *)&coop : NULL};
+                                                 .pNext = &enable11};
     VkPhysicalDeviceFeatures2 enable = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &enable12};
+    enable.features.shaderInt16 = gpu.storage16;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable, 0, 1, &qci, 0, NULL, enabled,
                               device_extensions, NULL};
     if (vkCreateDevice(gpu.physical, &dci, NULL, &gpu.device) != VK_SUCCESS) return false;
@@ -405,6 +419,12 @@ uint32_t spg_gpu_subgroup_size(void) {
 
 bool spg_gpu_mma_bf16(void) {
     return spg_gpu_open() && gpu.mma_bf16;
+}
+
+bool spg_gpu_bf16_storage(void) {
+    static int off = -1;                /* SPINGALETT_GPU_NO_BF16_STORAGE=1: single precision in memory */
+    if (off < 0) off = getenv("SPINGALETT_GPU_NO_BF16_STORAGE") != NULL;
+    return spg_gpu_open() && gpu.storage16 && !off;
 }
 
 bool spg_gpu_host_writes(void) {

@@ -400,11 +400,13 @@ SPINGALETT_API const char *spingalett_gpu_device(void);
 /* Precision of the GPU's matrix products: PRECISION_FLOAT32 (the default: single precision, as on
    the CPU) or PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
    multiplied on the GPU's matrix units with the products added in single precision: faster; the
-   rest of training, the parameters among it, stays in single precision). Devices without bfloat16
-   cooperative matrices keep single precision. Applies from the next train(), predict() or
-   evaluate() call, or the next trainer; results stay deterministic. Returns whether the GPU
-   multiplies in that precision (false without a device, or for bfloat16 without its matrix
-   units); other values are ignored and return false. */
+   parameters, gradients and the passes between products stay in single precision, but the outputs
+   of layers that only products read, the network's inputs among them, are kept in memory as
+   bfloat16, the values the products round them to). Devices without bfloat16 cooperative matrices
+   keep single precision. Applies from the next train(), predict() or evaluate() call, or the next
+   trainer; results stay deterministic. Returns whether the GPU multiplies in that precision (false
+   without a device, or for bfloat16 without its matrix units); other values are ignored and return
+   false. */
 SPINGALETT_API bool spingalett_set_gpu_precision(PrecisionMode precision);
 SPINGALETT_API PrecisionMode spingalett_get_gpu_precision(void);
 SPINGALETT_API unsigned spingalett_get_num_threads(void);

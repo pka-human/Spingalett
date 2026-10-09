@@ -20,6 +20,9 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#define SPG_HALF
 #include "common.glsl"
 
 layout(constant_id = 0) const uint BM = 64;
@@ -35,6 +38,7 @@ layout(constant_id = 9) const uint THREADS = 128;     /* subgroups x SG */
 layout(constant_id = 10) const uint PHASED = 0;
 layout(constant_id = 11) const uint VEC = 0;
 layout(constant_id = 12) const uint SG = 32;          /* the subgroup size */
+layout(constant_id = 13) const uint HALF = 0;         /* operands and results kept as bfloat16 (gemm_common.glsl) */
 layout(local_size_x_id = 9) in;
 
 #include "gemm_common.glsl"
@@ -61,16 +65,25 @@ void put_a(uint k, uint m, float v) { uint i = at_a(k, m); As[i >> 2][i & 3u] = 
 void put_b(uint k, uint n, float v) { uint i = at_b(k, n); Bs[i >> 2][i & 3u] = bfloat16_t(v); }
 
 void store_tiles() {
-    /* a vector load runs along the shared rows, at an index that is a multiple of four */
+    /* a vector load runs along the shared rows, at an index that is a multiple of four (eight raw
+       bfloat16: two vectors, the second four further along the axis the load ran along) */
     [[unroll]] for (uint i = 0; i < LA; i++) {
         if (!a_live(i)) continue;
-        if (VA) As[at_a(a_k(i), a_row(i)) >> 2] = bf16vec4(fa[i]);
-        else put_a(a_k(i), a_row(i), fa[i].x);
+        const uint k = a_k(i), m = a_row(i);
+        if (RA) {
+            As[at_a(k, m) >> 2] = uintBitsToBFloat16EXT(ra[2u * i]);
+            As[(A_KFAST ? at_a(k + 4u, m) : at_a(k, m + 4u)) >> 2] = uintBitsToBFloat16EXT(ra[2u * i + 1u]);
+        } else if (VA) As[at_a(k, m) >> 2] = bf16vec4(fa[i]);
+        else put_a(k, m, fa[i].x);
     }
     [[unroll]] for (uint i = 0; i < LB; i++) {
         if (!b_live(i)) continue;
-        if (VB) Bs[at_b(b_k(i), b_col(i)) >> 2] = bf16vec4(fb[i]);
-        else put_b(b_k(i), b_col(i), fb[i].x);
+        const uint k = b_k(i), n = b_col(i);
+        if (RB) {
+            Bs[at_b(k, n) >> 2] = uintBitsToBFloat16EXT(rb[2u * i]);
+            Bs[(B_KFAST ? at_b(k + 4u, n) : at_b(k, n + 4u)) >> 2] = uintBitsToBFloat16EXT(rb[2u * i + 1u]);
+        } else if (VB) Bs[at_b(k, n) >> 2] = bf16vec4(fb[i]);
+        else put_b(k, n, fb[i].x);
     }
 }
 
