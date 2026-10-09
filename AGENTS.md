@@ -185,8 +185,11 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   columns, `snake_case` with the `spingalett_` prefix for public functions and builders,
   `Spingalett` for public types, `SPINGALETT_` for enumerators and macros, `slett_` for format
   helpers, file-local names without a prefix. A new public name gets its short alias of 0.x only if
-  it renames one (`Spingalett.Short.h`); the library's sources use the short names (the internal
-  headers define `SPINGALETT_SHORT_NAMES`), but its exported symbols are the prefixed ones.
+  it renames one (`Spingalett.Short.h`: other aliases would take names from the programs that
+  include it). The library's sources (the internal headers define `SPINGALETT_SHORT_NAMES`), the
+  examples, the apps and the README's code use the short names, which read more easily; the
+  descriptions, the headers' comments and `docs/Reference.md` use the prefixed ones, which are also
+  the exported symbols.
 - Every file starts with the SPDX header (`MIT`, copyright pka_human).
 - Comments say what a block computes and why, in full sentences; match the density of the code
   around them. Documentation is formal English and states facts, not intentions.

@@ -11,6 +11,7 @@
  * place and spingalett_model_run evaluates it there.
  */
 
+#define SPINGALETT_SHORT_NAMES              /* the engine's short names: PrecisionMode, LAYER_DENSE, ... */
 #include <Spingalett/Spingalett.Inference.h>
 #include <stdio.h>
 #include "mnist_model.h"
@@ -20,9 +21,9 @@ static float workspace[MNIST_MODEL_WORKSPACE / sizeof(float)];
 static float input[MNIST_MODEL_INPUTS];
 static float output[MNIST_MODEL_OUTPUTS];
 
-static const char *precision_name(SpingalettPrecisionMode p) {
+static const char *precision_name(PrecisionMode p) {
     static const char *names[] = {"FP32", "FP16", "BF16", "INT8", "INT4", "INT2"};
-    return (unsigned)p < SPINGALETT_PRECISION_COUNT ? names[p] : "?";
+    return (unsigned)p < PRECISION_COUNT ? names[p] : "?";
 }
 
 int main(void) {
@@ -38,21 +39,21 @@ int main(void) {
     for (uint32_t i = 0; i < model.layer_count; i++) {
         SpingalettLayerInfo layer;
         spingalett_model_layer(&model, i, &layer);
-        if (layer.type == SPINGALETT_LAYER_DENSE) {
+        if (layer.type == LAYER_DENSE) {
             printf("  layer %u: dense %u -> %u, %s weights\n", (unsigned)i + 1, (unsigned)layer.inputs,
                    (unsigned)layer.outputs, precision_name(layer.precision));
             macs += (unsigned long)layer.inputs * layer.outputs;
-        } else if (layer.type == SPINGALETT_LAYER_CONV2D) {
+        } else if (layer.type == LAYER_CONV2D) {
             /* each output: a window of kernel_h x kernel_w x the input channels of its group */
             macs += (unsigned long)layer.outputs * layer.kernel_h * layer.kernel_w * (layer.in_channels / layer.groups);
             printf("  layer %u: convolution %ux%u, %u filters, output %ux%u, %s weights\n", (unsigned)i + 1,
                    (unsigned)layer.kernel_h, (unsigned)layer.kernel_w, (unsigned)layer.channels,
                    (unsigned)layer.height, (unsigned)layer.width, precision_name(layer.precision));
-        } else if (layer.type == SPINGALETT_LAYER_BATCH_NORM) {
+        } else if (layer.type == LAYER_BATCH_NORM) {
             printf("  layer %u: batch normalization of %u channels\n", (unsigned)i + 1, (unsigned)layer.channels);
         } else {
             printf("  layer %u: %s pooling %ux%u, output %ux%ux%u\n", (unsigned)i + 1,
-                   layer.type == SPINGALETT_LAYER_MAX_POOL2D ? "max" : "average", (unsigned)layer.kernel_h,
+                   layer.type == LAYER_MAX_POOL2D ? "max" : "average", (unsigned)layer.kernel_h,
                    (unsigned)layer.kernel_w, (unsigned)layer.height, (unsigned)layer.width, (unsigned)layer.channels);
         }
     }

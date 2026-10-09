@@ -159,52 +159,56 @@ The headers define `SPINGALETT_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `_STRING`;
 ## Quick start
 
 ```c
-#include <Spingalett/Spingalett.h>
+#include <Spingalett/Spingalett.Short.h>
 #include <stdio.h>
 
 int main(void) {
     float inputs[4][2]  = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
     float targets[4][1] = {{0}, {1}, {1}, {0}};
 
-    SpingalettNetwork *net = spingalett_network_new(SPINGALETT_LOSS_MSE);
-    spingalett_layer(net, 2);                                   /* input layer */
-    spingalett_layer(net, 8, SPINGALETT_ACT_TANH, SPINGALETT_INIT_XAVIER);
-    spingalett_layer(net, 1, SPINGALETT_ACT_SIGMOID, SPINGALETT_INIT_XAVIER);
+    NeuralNetwork *net = new_spingalett(LOSS_MSE);
+    layer(net, 2);                                              /* input layer */
+    layer(net, 8, ACT_TANH, WEIGHT_INITIALIZATION_XAVIER);
+    layer(net, 1, ACT_SIGMOID, WEIGHT_INITIALIZATION_XAVIER);
 
-    spingalett_train(
+    train(
         .net = net,
         .inputs = &inputs[0][0],
         .targets = &targets[0][0],
         .sample_count = 4,
         .epochs = 5000,
-        .training_strategy = SPINGALETT_STRATEGY_FULL_BATCH,
-        .optimizer_type = SPINGALETT_OPTIMIZER_ADAM,
+        .training_strategy = STRATEGY_FULL_BATCH,
+        .optimizer_type = OPTIMIZER_ADAM,
         .learning_rate = 0.02f,
         .report_interval = 1000
     );
 
     for (int i = 0; i < 4; i++) {
-        float *out = spingalett_forward(net, inputs[i]);
+        float *out = forward(net, inputs[i]);
         printf("%.0f XOR %.0f = %.4f\n", inputs[i][0], inputs[i][1], out[0]);
     }
 
-    spingalett_save(.net = net, .filename = "xor");             /* writes xor.slett */
-    spingalett_network_free(net);
+    save_spingalett(.net = net, .filename = "xor");             /* writes xor.slett */
+    free_network(net);
     return 0;
 }
 ```
 
 Every function that takes many parameters is a macro over a struct, so arguments can be given
-positionally (`spingalett_layer(net, 8, SPINGALETT_ACT_TANH)`) or by name
-(`spingalett_layer(.net = net, .neurons_amount = 8)`). Fields that are not mentioned are zero, which
-selects the documented default.
+positionally (`layer(net, 8, ACT_TANH)`) or by name (`layer(.net = net, .neurons_amount = 8)`).
+Fields that are not mentioned are zero, which selects the documented default.
 
-Every public name carries the library's prefix: `spingalett_` for functions and builders,
-`Spingalett` for types, `SPINGALETT_` for constants. The names of 0.x without it (`layer()`,
-`train()`, `NeuralNetwork`, `ACT_RELU`, `WEIGHT_INITIALIZATION_HE`, ...) stay available from
-`Spingalett/Spingalett.Short.h`: a program written for them includes it in place of `Spingalett.h` (or
-defines `SPINGALETT_SHORT_NAMES` before including that) and compiles unchanged. `Spingalett.h` leaves
-them out, so that names such as `train()` and `LOG_DEBUG` (also `<syslog.h>`'s) stay the program's.
+**Names.** The examples here and in `Examples/` use the short names of
+`Spingalett/Spingalett.Short.h` (`NeuralNetwork`, `layer()`, `train()`, `ACT_RELU`, ...), which read
+more easily. The library declares every name with its prefix (`spingalett_` for functions and
+builders, `Spingalett` for types, `SPINGALETT_` for constants), and so do the descriptions in this
+document and [docs/Reference.md](docs/Reference.md): C has one namespace for everything a program
+includes, and names such as `train()`, `layer()` or `LOG_DEBUG` (also `<syslog.h>`'s) would collide
+with the program's own and with other libraries'. The short names are macros and typedefs over the
+prefixed ones, so a program compiles to the same calls either way: it includes `Spingalett.Short.h`
+in place of `Spingalett.h` (or defines `SPINGALETT_SHORT_NAMES` before including that) to use them,
+and `Spingalett.h` alone leaves them out. Functions whose names had the prefix in 0.x keep it
+(`spingalett_model_load()`, `spingalett_load_idx()`, `spingalett_set_compute_mode()`).
 
 The `Examples/` directory contains this XOR program, an MNIST classifier
 (`Examples/download_mnist.sh data/mnist && Bin/MNIST data/mnist`), a convolutional one
@@ -244,16 +248,16 @@ with `spingalett_conv2d()`, `spingalett_max_pool2d()` and `spingalett_avg_pool2d
 reads whatever precedes it as a flat vector, so no flattening layer is needed:
 
 ```c
-SpingalettNetwork *net = spingalett_network_new(SPINGALETT_LOSS_CROSS_ENTROPY);
-spingalett_layer(.net = net, .height = 28, .width = 28, .channels = 1);         /* input */
-spingalett_conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,         /* 28 x 28 x 32 */
-                  .act_func = SPINGALETT_ACT_RELU, .weight_initialization = SPINGALETT_INIT_HE);
-spingalett_max_pool2d(.net = net, .kernel = 2);                                 /* 14 x 14 x 32 */
-spingalett_conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,         /* 14 x 14 x 64 */
-                  .act_func = SPINGALETT_ACT_RELU, .weight_initialization = SPINGALETT_INIT_HE);
-spingalett_max_pool2d(.net = net, .kernel = 2);                                 /* 7 x 7 x 64 */
-spingalett_layer(net, 128, SPINGALETT_ACT_RELU, SPINGALETT_INIT_HE, .dropout_rate = 0.3f);
-spingalett_layer(net, 10, SPINGALETT_ACT_SOFTMAX, SPINGALETT_INIT_XAVIER);
+NeuralNetwork *net = new_spingalett(LOSS_CROSS_ENTROPY);
+layer(.net = net, .height = 28, .width = 28, .channels = 1);                    /* input */
+conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,                    /* 28 x 28 x 32 */
+       .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+max_pool2d(.net = net, .kernel = 2);                                            /* 14 x 14 x 32 */
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,                    /* 14 x 14 x 64 */
+       .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+max_pool2d(.net = net, .kernel = 2);                                            /* 7 x 7 x 64 */
+layer(net, 128, ACT_RELU, WEIGHT_INITIALIZATION_HE, .dropout_rate = 0.3f);
+layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
 ```
 
 | Field | Meaning |
@@ -295,9 +299,9 @@ weight decay leaves them alone. The convolution or dense layer before a normaliz
 no activation:
 
 ```c
-spingalett_conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
-                  .weight_initialization = SPINGALETT_INIT_HE);                 /* no activation */
-spingalett_batch_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);   /* .epsilon 1e-5, .momentum 0.1 */
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
+       .weight_initialization = WEIGHT_INITIALIZATION_HE);                      /* no activation */
+batch_norm(.net = net, .act_func = ACT_RELU);                         /* .epsilon 1e-5, .momentum 0.1 */
 ```
 
 Such a pair costs no more than the convolution alone at inference: `spingalett_predict()` and
@@ -317,33 +321,33 @@ the channels, each followed by its `.act_func` (none when left out).
 `spingalett_global_avg_pool2d()` averages each channel over all cells. A residual block of ResNet:
 
 ```c
-uint32_t block(SpingalettNetwork *net, uint32_t x, uint32_t filters, uint32_t stride) {
-    spingalett_conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 3, .padding = 1,
-                      .stride = stride, .weight_initialization = SPINGALETT_INIT_HE);
-    spingalett_batch_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);
-    spingalett_conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1,
-                      .weight_initialization = SPINGALETT_INIT_HE);
-    uint32_t y = spingalett_batch_norm(.net = net);
+uint32_t block(NeuralNetwork *net, uint32_t x, uint32_t filters, uint32_t stride) {
+    conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 3, .padding = 1,
+           .stride = stride, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    uint32_t y = batch_norm(.net = net);
     uint32_t shortcut = x;
     if (stride != 1) {                      /* the shortcut changes shape too: a 1 x 1 projection */
-        spingalett_conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride,
-                          .weight_initialization = SPINGALETT_INIT_HE);
-        shortcut = spingalett_batch_norm(.net = net);
+        conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride,
+               .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        shortcut = batch_norm(.net = net);
     }
-    return spingalett_add_layers(.net = net, .inputs = {shortcut, y}, .act_func = SPINGALETT_ACT_RELU);
+    return add_layers(.net = net, .inputs = {shortcut, y}, .act_func = ACT_RELU);
 }
 ```
 
 and Inception-style branches, concatenated:
 
 ```c
-uint32_t x = spingalett_layer(.net = net, .height = 32, .width = 32, .channels = 16);
-uint32_t a = spingalett_conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 1,
-                               .act_func = SPINGALETT_ACT_RELU);
-uint32_t b = spingalett_conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 3, .padding = 1,
-                               .act_func = SPINGALETT_ACT_RELU);
-uint32_t c = spingalett_max_pool2d(.net = net, .inputs = {x}, .kernel = 3, .stride = 1, .padding = 1);
-spingalett_concat_layers(.net = net, .inputs = {a, b, c});                      /* 32 x 32 x 32 */
+uint32_t x = layer(.net = net, .height = 32, .width = 32, .channels = 16);
+uint32_t a = conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 1,
+                    .act_func = ACT_RELU);
+uint32_t b = conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 3, .padding = 1,
+                    .act_func = ACT_RELU);
+uint32_t c = max_pool2d(.net = net, .inputs = {x}, .kernel = 3, .stride = 1, .padding = 1);
+concat_layers(.net = net, .inputs = {a, b, c});                                 /* 32 x 32 x 32 */
 ```
 
 `.input_count` gives the number of inputs; left 0 it counts `.inputs` up to the last nonzero entry,
@@ -370,17 +374,17 @@ concatenations they make U-Nets, the expanding path joined to the maps of the sa
 down:
 
 ```c
-uint32_t e = spingalett_conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,
-                               .act_func = SPINGALETT_ACT_RELU);                /* 64 x 64 x 32 */
-spingalett_max_pool2d(.net = net, .kernel = 2);                                 /* 32 x 32 x 32 */
-spingalett_conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
-                  .act_func = SPINGALETT_ACT_RELU);                             /* 32 x 32 x 64 */
-uint32_t u = spingalett_conv_transpose2d(.net = net, .filters = 32, .kernel = 2, .stride = 2,
-                                         .act_func = SPINGALETT_ACT_RELU);      /* 64 x 64 x 32 */
-spingalett_concat_layers(.net = net, .inputs = {e, u});                         /* 64 x 64 x 64 */
-spingalett_upsample2d(.net = net, .stride = 2,                                  /* 128 x 128 x 64 */
-                      .upsample = SPINGALETT_UPSAMPLE_BILINEAR);
-spingalett_layer_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);             /* 128 x 128 x 64 */
+uint32_t e = conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,
+                    .act_func = ACT_RELU);                                      /* 64 x 64 x 32 */
+max_pool2d(.net = net, .kernel = 2);                                            /* 32 x 32 x 32 */
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
+       .act_func = ACT_RELU);                                                   /* 32 x 32 x 64 */
+uint32_t u = conv_transpose2d(.net = net, .filters = 32, .kernel = 2, .stride = 2,
+                              .act_func = ACT_RELU);                            /* 64 x 64 x 32 */
+concat_layers(.net = net, .inputs = {e, u});                                    /* 64 x 64 x 64 */
+upsample2d(.net = net, .stride = 2,                                             /* 128 x 128 x 64 */
+           .upsample = UPSAMPLE_BILINEAR);
+layer_norm(.net = net, .act_func = ACT_RELU);                                   /* 128 x 128 x 64 */
 ```
 
 | Builder | Arguments | Output, along each axis |
@@ -449,9 +453,9 @@ any of it: only dictionaries of tensors are understood (tensors that are views, 
 transposed weight, load as well).
 
 ```c
-SpingalettNetwork *net = spingalett_import_onnx("resnet.onnx");  /* NULL on error */
+NeuralNetwork *net = spingalett_import_onnx("resnet.onnx");      /* NULL on error */
 float out[10];
-spingalett_predict(.net = net, .inputs = image_hwc, .sample_count = 1, .outputs = out);
+predict(.net = net, .inputs = image_hwc, .sample_count = 1, .outputs = out);
 ```
 
 ### Inspecting a network
@@ -464,8 +468,8 @@ SpingalettNetworkLayer d;
 spingalett_network_layer(net, 1, &d);   /* type, shape, outputs, activation, dropout, window, counts */
 
 float *w = malloc(d.weight_count * sizeof(float));
-spingalett_get_parameters(net, 1, SPINGALETT_PARAM_WEIGHTS, w, d.weight_count);    /* feeding layer 1 */
-spingalett_set_parameters(net, 1, SPINGALETT_PARAM_WEIGHTS, w, d.weight_count);
+spingalett_get_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count);               /* feeding layer 1 */
+spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count);
 ```
 
 Parameters come as `SPINGALETT_PARAM_WEIGHTS`, `SPINGALETT_PARAM_BIASES`,
@@ -533,17 +537,17 @@ best epoch however training ended (completion, early stopping, the callback or d
 parameters are kept in memory, which costs one copy of the weights and biases.
 
 ```c
-static bool on_epoch(SpingalettNetwork *net, const SpingalettTrainProgress *p, void *log) {
+static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *log) {
     fprintf(log, "epoch %zu: loss %.4f, val accuracy %.2f%%%s\n", p->epoch, p->train_loss,
             100 * p->validation.accuracy, p->improved ? " (best)" : "");
     return false;
 }
 
-SpingalettTrainReport r = spingalett_train(
+TrainReport r = train(
     .net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 100,
-    .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH, .optimizer_type = SPINGALETT_OPTIMIZER_ADAMW,
+    .training_strategy = STRATEGY_SMALL_BATCH, .optimizer_type = OPTIMIZER_ADAMW,
     .val_inputs = xv, .val_targets = yv, .val_count = nv,
-    .monitor = SPINGALETT_MONITOR_VAL_ACCURACY, .early_stopping_patience = 5,
+    .monitor = MONITOR_VAL_ACCURACY, .early_stopping_patience = 5,
     .restore_best_weights = true, .callback = on_epoch, .callback_data = stdout);
 printf("stopped after %zu epochs, kept epoch %zu\n", r.epochs_run, r.best_epoch);
 ```
@@ -555,7 +559,7 @@ the same side of 0.5.
 ### Learning-rate schedules
 
 ```c
-typedef float (*SpingalettLRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr,
+typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr,
                                         void *user_data);
 ```
 
@@ -564,9 +568,9 @@ first). Four schedules are built in and take an optional `SpingalettLRSchedulePa
 `user_data`:
 
 ```c
-SpingalettLRScheduleParams schedule = {.warmup_epochs = 10, .min_lr = 1e-5f};
-spingalett_train(.net = net, /* ... */ .learning_rate = 1e-3f,
-                 .lr_scheduler = spingalett_lr_warmup_cosine, .lr_scheduler_data = &schedule);
+LRScheduleParams schedule = {.warmup_epochs = 10, .min_lr = 1e-5f};
+train(.net = net, /* ... */ .learning_rate = 1e-3f,
+      .lr_scheduler = spingalett_lr_warmup_cosine, .lr_scheduler_data = &schedule);
 ```
 
 | Function | Parameters used |
@@ -589,8 +593,8 @@ For datasets that do not fit in memory, or data produced on the fly, set
 `.training_mode = SPINGALETT_MODE_GENERATOR_FUNCTION` and supply a generator:
 
 ```c
-typedef uint32_t (*SpingalettDataGeneratorFn)(float *inputs, float *targets, uint32_t requested,
-                                              void *user_data);
+typedef uint32_t (*DataGeneratorFn)(float *inputs, float *targets, uint32_t requested,
+                                    void *user_data);
 ```
 
 The generator writes up to `requested` samples (row-major) and returns how many it wrote;
@@ -612,7 +616,7 @@ several backward passes:
 
 ```c
 SpingalettTrainer *tr = spingalett_trainer_new(net, 64);          /* up to 64 samples per pass */
-SpingalettOptimizerArgs adam = {.type = SPINGALETT_OPTIMIZER_ADAM, .learning_rate = 1e-3f};
+OptimizerArgs adam = {.type = OPTIMIZER_ADAM, .learning_rate = 1e-3f};
 for (size_t s = 0; s < n; s += 64) {
     const float *out = spingalett_trainer_forward(tr, x + s * in_size, 64);
     for (size_t i = 0; i < 64 * out_size; i++)                    /* e.g. a weighted MSE */
@@ -635,7 +639,7 @@ SpingalettDataset train_set, val_set;
 spingalett_load_idx("train-images-idx3-ubyte", "train-labels-idx1-ubyte", 10, &train_set);
 spingalett_dataset_shuffle(&train_set);                 /* optional, uses spingalett_seed() */
 spingalett_dataset_split(&train_set, 5000, &val_set);   /* last 5,000 samples -> val_set */
-/* ... spingalett_train(.inputs = train_set.inputs, .targets = train_set.targets,
+/* ... train(.inputs = train_set.inputs, .targets = train_set.targets,
                         .sample_count = train_set.count, ...) */
 spingalett_dataset_free(&train_set);
 spingalett_dataset_free(&val_set);
@@ -668,9 +672,9 @@ SpingalettDataset d = {0};
 spingalett_load_dataset("mnist-train.slettd", &d);                 /* bit-identical to train_set */
 
 SpingalettDatasetReader *r = spingalett_dataset_open("mnist-train.slettd", true);   /* shuffled */
-spingalett_train(.net = net, .training_mode = SPINGALETT_MODE_GENERATOR_FUNCTION,
-                 .generator = spingalett_dataset_generator, .generator_data = r, .epochs = 10,
-                 .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH, .batch_size = 128);
+train(.net = net, .training_mode = MODE_GENERATOR_FUNCTION,
+      .generator = spingalett_dataset_generator, .generator_data = r, .epochs = 10,
+      .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);
 spingalett_dataset_close(r);
 ```
 
@@ -739,16 +743,16 @@ inputs:
 
 ```c
 float *outputs = malloc(count * output_size * sizeof(float));
-spingalett_predict(.net = net, .inputs = inputs, .sample_count = count,          /* false on error */
-                   .outputs = outputs);
+predict(.net = net, .inputs = inputs, .sample_count = count,                     /* false on error */
+        .outputs = outputs);
 ```
 
 `spingalett_evaluate()` returns the mean loss (as reported by training) and the accuracy over a data
 set:
 
 ```c
-SpingalettEvalMetrics m = spingalett_evaluate(.net = net, .inputs = x, .targets = y,
-                                              .sample_count = n);
+EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y,
+                         .sample_count = n);
 ```
 
 Both take data sets in the GPU's memory (`device_inputs`, and `device_targets` for
@@ -758,9 +762,9 @@ inference.
 ### Saving and loading
 
 ```c
-spingalett_save(.net = net, .filename = "model.slett", .precision = SPINGALETT_PRECISION_FP16,
+save_spingalett(.net = net, .filename = "model.slett", .precision = PRECISION_FP16,
                 .do_not_save_optimizer = true);
-SpingalettNetwork *net = spingalett_load("model.slett");
+NeuralNetwork *net = load_spingalett("model.slett");
 ```
 
 Models are stored in `.slett` files; the extension is appended when the filename has none, and
@@ -778,9 +782,9 @@ The same bytes can be produced and read in memory:
 
 ```c
 size_t size;
-void *image = spingalett_save_to_memory(net, SPINGALETT_PRECISION_INT8, false, &size);
+void *image = spingalett_save_to_memory(net, PRECISION_INT8, false, &size);
                                                               /* released by spingalett_free() */
-SpingalettNetwork *copy = spingalett_load_from_memory(image, size);
+NeuralNetwork *copy = load_spingalett_from_memory(image, size);
 ```
 
 The file format is versioned and specified in [docs/ModelFormat.md](docs/ModelFormat.md):
@@ -794,7 +798,7 @@ or corrupt files and for files with an invalid header.
 ### Backends and threading
 
 ```c
-spingalett_set_compute_mode(SPINGALETT_COMPUTE_OPENBLAS);  /* or SINGLE_THREADED, OPENMP, VULKAN */
+spingalett_set_compute_mode(COMPUTE_OPENBLAS);             /* or SINGLE_THREADED, OPENMP, VULKAN */
 spingalett_set_num_threads(8);                             /* 0 = runtime default */
 ```
 
@@ -839,11 +843,11 @@ Vulkan loader when the mode is first used, so it needs no Vulkan to load or to r
 Vulkan 1.2 with buffer device addresses); the mode then falls back to the CPU with a warning.
 
 ```c
-spingalett_set_compute_mode(SPINGALETT_COMPUTE_VULKAN);
+spingalett_set_compute_mode(COMPUTE_VULKAN);
 const char *gpu = spingalett_gpu_device();
 printf("training on %s\n", gpu ? gpu : "the CPU");
-spingalett_train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,  /* as on the CPU */
-                 .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH, .batch_size = 128);
+train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,             /* as on the CPU */
+      .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);
 ```
 
 -  Parameters, their gradients and the optimizer's moments stay in GPU memory, and so does the
@@ -938,7 +942,7 @@ whose status is `SPINGALETT_TRAIN_FAILED`, and sets the calling thread's error c
 
 ```c
 spingalett_clear_error();
-SpingalettNetwork *net = spingalett_load("model.slett");
+NeuralNetwork *net = load_spingalett("model.slett");
 if (!net)
     fprintf(stderr, "%s (code %d)\n", spingalett_last_error_message(),
             spingalett_last_error_code());
@@ -967,10 +971,10 @@ parameters once). To run a trained network, turn it into a model, a read-only ne
 they are stored in and computes with them:
 
 ```c
-SpingalettModel *model = spingalett_model_from_network(net, SPINGALETT_PRECISION_INT8);
+SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);
                                                   /* or spingalett_model_load("model.slett") */
 spingalett_model_predict(model, inputs, count, outputs);         /* batched, multi-threaded */
-SpingalettEvalMetrics m = spingalett_model_evaluate(model, inputs, targets, count);
+EvalMetrics m = spingalett_model_evaluate(model, inputs, targets, count);
 spingalett_model_free(model);
 ```
 
