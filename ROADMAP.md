@@ -20,7 +20,7 @@ against PyTorch on the same machine.
 | 0.12 | "Tensor cores": matrix products in bfloat16 on the GPU's matrix units (opt-in, faster than single precision), the custom-loop API on the GPU, fixes from a review of the GPU backend; ONNX import and PyTorch weights ten to a hundred times as fast (mapped files, one pass per tensor, external data files); gradients and optimizer state allocated when a network first trains; the first wheels on PyPI |
 | 0.13 | "Layers": transposed convolutions, upsampling and layer normalization on the CPU and the GPU, in `.slett` format 7, the engine and deployment models in every precision; their import from ONNX (ConvTranspose, Resize, LayerNormalization) and PyTorch; a U-Net segmentation example; the GPU's loss kernel for wide outputs |
 | 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling, weight gradients split only where it pays: ahead of PyTorch with cuDNN in every workload but the MLP's inference with PyTorch's data already in GPU memory |
-| 0.14 (in progress) | Data sets in the GPU's memory (`spingalett_device_data_new()`): ahead of PyTorch with cuDNN in every workload, its data in GPU memory or not |
+| 0.14 (in progress) | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.15 times at least in every workload, its data in GPU memory or not |
 
 ## 0.14: the release candidate
 
@@ -66,35 +66,50 @@ next, before or after 1.0.
 On an RTX 4050 Laptop GPU against PyTorch 2.14 with cuDNN (`Bin/Benchmark gpu` against
 `benchmark_pytorch.py --cuda`, `--cuda-fp32`, `--cuda-bf16` and `--host-data`, README), Spingalett
 0.14 is ahead in every workload, with the data in GPU memory (its data sets) or in host memory:
-ResNet-20, the MNIST CNN (with and without batch normalization) and the U-Net train 1.2 to 1.8 times
-as fast as PyTorch and run 1.8 to 2.4 times as fast in single precision, 1.4 to 1.7 and 1.8 to 2.1
-times as fast as its autocast in bfloat16; the 784-512-1000-10 MLP trains mini-batches 3.2 to 5.8
-times as fast and infers 1.19 and 1.3 times as fast. The margins left thin are the MLP's full
-batches: 1.1 times in single precision (both at the device's 6.3 to 6.5 TFLOPS), 1.04 times in
-bfloat16, where the products on the matrix units reach 15 to 17 TFLOPS on its shapes and cuBLAS 17.4
-to 19.5.
+the MNIST CNN (with and without batch normalization) trains 1.5 to 1.9 times as fast as PyTorch and
+runs 2.1 to 2.4 times as fast in single precision, 1.5 to 1.7 and 1.8 to 2.15 times as fast as its
+autocast in bfloat16; ResNet-20 and the U-Net run 1.7 to 2 times as fast in either precision and
+train 1.4 to 1.5 times as fast in bfloat16; the MobileNet-style network 1.4 and 4 times, 1.3 and 3.2
+times; the 784-512-1000-10 MLP trains mini-batches 3.7 to 6.2 times as fast and infers 1.18 and 1.3
+times as fast. The margins left thin, 1.15 to 1.25 times, are the MLP's full batches (single precision at the
+device's 6.3 to 6.5 TFLOPS, as cuBLAS; bfloat16 at 15 to 18 TFLOPS against cuBLAS's 17 to 19.5) and
+the single-precision training of ResNet-20 and the U-Net against PyTorch's TF32 convolutions.
 
 Done in 0.13.1: the tile choice, activations and gradients in bfloat16, the pooling backward pass
-(part of 2), larger tiles on the matrix units (part of 1). Done in 0.14: data sets on the GPU, a
-kernel of its own for depthwise convolutions (part of 2: a MobileNet-style network trains 2.9 and 10
-times as fast, ahead of PyTorch). The
-next steps, each measured against the release before and against PyTorch:
+(part of 3), larger tiles on the matrix units (part of 1). Done in 0.14: data sets on the GPU; a
+kernel of its own for depthwise convolutions, four pixels a thread with the filters in registers,
+which applies the batch normalization it reads and sums that normalization's backward pass in its
+data gradient (part of 3: the MobileNet-style network trains 3.4 and 12 times as fast as in 0.13.1);
+training chunks of 4,096 samples where no batch normalization groups them; networks made on the GPU
+in freed memory, their parameters' upload not waited for. The next steps, each measured against the
+release before and against PyTorch:
 
 1. **The matrix units' kernel:** stores to shared memory without bank conflicts (a swizzled
    layout), the epilogue writing four results a thread at once, split sums of weight gradients
    chosen by the tile the timing picked rather than by a single-precision estimate; target: cuBLAS's
    17 to 19.5 TFLOPS on the MLP's products, the weight gradients' among them.
-2. **Fewer passes:** batch normalization's sums gathered in the epilogue of the convolution before
-   it, its normalization and activation applied as the next layer reads its input (most of a
-   MobileNet-style network's time after its depthwise convolutions); concatenated layers writing
-   straight into their channels of the concatenation; the first layer's three channels padded to four
-   for vector loads.
-3. **Gathered rows in the products:** the first layer's products reading a shuffled mini-batch's
+2. **The single-precision kernel for convolutions of few channels.** ResNet-20's and the U-Net's
+   convolutions (16 to 64 filters, k = 144 to 576 values of the window) reach 3.3 to 4.5 TFLOPS, the
+   MLP's products 5.6 to 6.4, and they take 70% of those networks' training time in single
+   precision. With so short a k a tile runs 9 to 36 steps, and what it does once (the windows'
+   geometry of its rows, its first loads, whose latency nothing hides, the epilogue) and the address
+   arithmetic of the gathered windows take some 40% of its instructions. The plan: workgroups that
+   take tile after tile (a persistent loop), the next tile's first loads issued under the current
+   tile's sums; the offsets of a step's taps computed once a workgroup into shared memory rather
+   than per load; per-thread tiles wider in m where n is 16 or 32, the filters' values read once a
+   step and broadcast. Target: 5.5 TFLOPS on those shapes, ResNet-20 and the U-Net trained 1.4 times
+   as fast as PyTorch with TF32. The same loop pays in bfloat16, where n = 16 tiles reach 3.3 to 5
+   TFLOPS on the matrix units.
+3. **Fewer passes:** batch normalization's sums gathered in the epilogue of the convolution before
+   it, its normalization and activation applied by the products that read its outputs (done for
+   depthwise readers); concatenated layers writing straight into their channels of the
+   concatenation; the first layer's three channels padded to four for vector loads.
+4. **Gathered rows in the products:** the first layer's products reading a shuffled mini-batch's
    rows of a data set through their indices, rather than after a gather (mini-batches of the MLP:
    two small dispatches a step).
-4. **Products in FP16** with single-precision sums as a precision of their own (Vulkan has no
+5. **Products in FP16** with single-precision sums as a precision of their own (Vulkan has no
    TF32, which PyTorch's convolutions use by default).
-5. **Winograd convolutions** (F(2x2, 3x3)) for 3 x 3 convolutions of stride 1, on the GPU and the
+6. **Winograd convolutions** (F(2x2, 3x3)) for 3 x 3 convolutions of stride 1, on the GPU and the
    CPU: 2.25 times fewer multiplications, fixed transforms (deterministic), their rounding measured
    against the direct products, used for the shapes where they are measured to pay.
 
@@ -116,8 +131,13 @@ next steps, each measured against the release before and against PyTorch:
 **Measured before:** keeping training sets in GPU memory and gathering (and augmenting) batches
 there, done for every training run. With an i7-12650H feeding an RTX 4050 it won 5 to 11% for
 full-batch training over many epochs and lost 2 to 3% for mini-batches, where the host's copies
-already overlap the GPU's work: step 3 above makes it the caller's choice, for data used again and
-again.
+already overlap the GPU's work: data sets on the GPU (0.14) make it the caller's choice, for data used
+again and again. In 0.14, on the RTX 4050: column sums (batch normalization's statistics and backward
+sums) read four channels at a time and over more workgroups gained nothing, bound by memory;
+inference chunks larger than 32 MB of activations slowed even the MLP, whose layers' outputs stay in
+cache between products; training chunks of 8,192 samples were no faster than of 4,096; the next
+epoch's first chunk submitted before the last one's losses come back would win 2 to 4% of full-batch
+epochs of 6 ms, and is left for now (it runs before early stopping and callbacks decide).
 
 ## 1.1: a CUDA backend
 
@@ -143,7 +163,7 @@ Apple GPUs, and for NVIDIA ones where CUDA is not built.
   with the CPU up to rounding.
 - **Kernels:** matrix products on `mma.sync` (TF32, bfloat16, FP16) fed by multi-stage `cp.async`
   pipelines and `ldmatrix`, tiles chosen by timing; convolutions as implicit products over the tap
-  tables the Vulkan kernels use; activations in bfloat16 (step 2 above); deployment models on the
+  tables the Vulkan kernels use; activations in bfloat16, as the Vulkan executor keeps them; deployment models on the
   GPU.
 - **Targets on the RTX 4050:** PyTorch's speed with cuDNN in each precision on ResNet-20, the MNIST
   CNN and the U-Net, and within 10% of it on the MLP's full batches.
