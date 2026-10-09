@@ -21,6 +21,7 @@
 #define __device__ __attribute__((device))
 #define __shared__ __attribute__((shared))
 #define DEVICE static __device__ __attribute__((always_inline)) inline
+#define MEMBER __device__ __attribute__((always_inline)) inline     /* (methods: kept in registers) */
 #define __launch_bounds__(threads) __attribute__((launch_bounds(threads)))
 
 typedef unsigned char uint8_t;

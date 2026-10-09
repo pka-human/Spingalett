@@ -39,12 +39,11 @@ static const Tile mma_tiles[] = {
 };
 
 /* The tiles of the CUDA backend's product in single precision (Src/Gpu/Cuda/gemm.cu): those of
-   Src/Gpu/Cuda/Kernels.def, which compiles each. */
+   Src/Gpu/Cuda/Kernels.def, which compiles each for every pair of operand modes the executor uses. */
 static const Tile cuda_fp32_tiles[] = {
     {128, 128, 16, 8, 8}, {128, 64, 16, 8, 4}, {64, 128, 16, 4, 8}, {64, 64, 16, 4, 4}, {128, 32, 16, 4, 4},
-    {32, 128, 16, 4, 4}, {256, 32, 16, 8, 4}, {256, 16, 16, 8, 4}, {64, 32, 16, 4, 4}, {32, 64, 16, 4, 4},
-    {128, 16, 16, 4, 4}, {32, 32, 16, 4, 4}, {64, 16, 16, 4, 4}, {16, 64, 16, 4, 4}, {16, 144, 16, 4, 4},
-    {32, 144, 16, 8, 4}, {64, 144, 16, 8, 8},
+    {32, 128, 16, 4, 4}, {64, 32, 16, 4, 4}, {32, 64, 16, 4, 4}, {128, 16, 16, 4, 4}, {64, 16, 16, 4, 4},
+    {32, 32, 16, 4, 4}, {16, 64, 16, 4, 4},
 };
 
 typedef struct { const Tile *list; uint32_t count; } Table;
@@ -65,6 +64,7 @@ static uint32_t tile_threads(const Tile *t, bool mma) {
 /* Bytes of shared memory a tile takes: gemm.comp's BK rows of BM / 4 + 1 and BN / 4 + 1 vec4;
    gemm_mma.comp's BK rows of BM + 8 and BN + 8 bfloat16, and a 16 x 16 block of floats a subgroup. */
 static uint32_t tile_shared(const Tile *t, bool mma) {
+    if (spg_gpu_using() == SPG_BACKEND_CUDA) return SPG_CUDA_GEMM_SHARED(t->bm, t->bn, t->bk);
     if (mma) return ((t->bk + 8u) * (t->bm + t->bn) + 8u * 2u * t->bk + t->bk * 16u) * 2u +
                     tile_threads(t, true) / spg_gpu_subgroup_size() * 1024u;       /* the larger of the layouts */
     return t->bk * (t->bm / 4u + 1u + t->bn / 4u + 1u) * 16u;

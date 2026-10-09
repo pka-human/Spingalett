@@ -29,17 +29,19 @@
  * filters, each normalized) on 4,096 synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with
  * SGD and momentum (lr 0.05), and inference.
  *
- * With a usable GPU (spingalett_gpu_device()), every workload also runs with COMPUTE_VULKAN, after a
- * first run that is not timed (it makes the GPU's pipelines and times the matrix products' tiles,
- * once per process), and again with the products in bfloat16 when the GPU has matrix units for them
+ * With a usable GPU, every workload also runs on it: with COMPUTE_VULKAN (spingalett_gpu_device()) and
+ * with COMPUTE_CUDA (spingalett_cuda_device()), each after a first run that is not timed (it makes the
+ * GPU's pipelines or modules and times the matrix products' tiles, once per process), and again with
+ * the products in bfloat16 when the GPU has matrix units for them
  * (spingalett_set_gpu_precision()); each on the host's arrays, and on data sets in the GPU's memory
  * (spingalett_device_data_new(), made before the clock starts: the rows marked "data on GPU"). Inference
  * is timed on a second call, as PyTorch's after its warm-up: the first makes the network's copy on the
  * GPU (which predict() keeps while the parameters do not change), the step that moving a PyTorch model
  * to the GPU is.
  *
- * Usage: Benchmark [threads] [gpu] ("gpu": the GPU's rows only, as Examples/benchmark_pytorch.py --cuda
- * runs them). Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
+ * Usage: Benchmark [threads] [gpu] [vulkan | cuda] ("gpu": the GPU's rows only, as
+ * Examples/benchmark_pytorch.py --cuda runs them; "vulkan" or "cuda": that backend's only).
+ * Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
 
 #include <Spingalett/Spingalett.Short.h>
@@ -94,6 +96,31 @@ static void generate_synthetic_data(float **inputs, float **targets) {
 
 /* The GPU's rows "data on GPU": samples in data sets in its memory, as PyTorch's --cuda keeps them. */
 static bool on_device;
+
+/* The GPU's rows: a backend's compute mode, in single precision or with the products in bfloat16. */
+typedef struct { const char *name; ComputeMode mode; bool bf16; } GpuRow;
+static GpuRow gpu_rows[4];
+static int gpu_row_count;
+
+static bool is_gpu(ComputeMode mode) { return mode == COMPUTE_VULKAN || mode == COMPUTE_CUDA; }
+
+/* Every GPU row of a workload, on the host's arrays and then on data sets in the GPU's memory: `run` is
+   called with `label` and `row` set. */
+#define GPU_ROWS(run) \
+    for (int dev = 0; dev < 2; dev++) { \
+        on_device = dev; \
+        for (int r = 0; r < gpu_row_count; r++) { \
+            const GpuRow *row = &gpu_rows[r]; \
+            char label[48]; \
+            snprintf(label, sizeof label, "%s %s%s", row->name, row->bf16 ? "bf16" : "GPU", \
+                     dev ? ", data on GPU" : ""); \
+            spingalett_set_compute_mode(row->mode); \
+            spingalett_set_gpu_precision(row->bf16 ? PRECISION_BFLOAT16 : PRECISION_FLOAT32); \
+            run; \
+        } \
+    } \
+    spingalett_set_gpu_precision(PRECISION_FLOAT32); \
+    on_device = false
 
 typedef struct { SpingalettDeviceData *x, *t; } Sets;
 
@@ -182,7 +209,7 @@ static NeuralNetwork *create_cnn(bool normalized) {
 static void cnn_benchmark(const char *name, ComputeMode mode, bool normalized, const float *images,
                           const float *labels) {
     spingalett_set_compute_mode(mode);
-    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) { /* the GPU's first run */
+    for (int untimed = is_gpu(mode); untimed >= 0; untimed--) { /* the GPU's first run */
     NeuralNetwork *net = create_cnn(normalized);
     Sets d = sets_of(images, INPUT_SIZE, labels, OUTPUT_SIZE, CNN_SAMPLES);
     double start = now();
@@ -242,7 +269,7 @@ static NeuralNetwork *create_resnet20(void) {
 
 static void resnet_benchmark(const char *name, ComputeMode mode, const float *images, const float *labels) {
     spingalett_set_compute_mode(mode);
-    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) { /* the GPU's first run */
+    for (int untimed = is_gpu(mode); untimed >= 0; untimed--) { /* the GPU's first run */
     NeuralNetwork *net = create_resnet20();
     Sets d = sets_of(images, 3072u, labels, OUTPUT_SIZE, RESNET_SAMPLES);
     double start = now();
@@ -304,7 +331,7 @@ static NeuralNetwork *create_unet(void) {
 
 static void unet_benchmark(const char *name, ComputeMode mode, const float *images, const float *masks) {
     spingalett_set_compute_mode(mode);
-    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) { /* the GPU's first run */
+    for (int untimed = is_gpu(mode); untimed >= 0; untimed--) { /* the GPU's first run */
     NeuralNetwork *net = create_unet();
     Sets d = sets_of(images, UNET_SIZE * UNET_SIZE * 3u, masks, UNET_SIZE * UNET_SIZE * 3u, UNET_SAMPLES);
     double start = now();
@@ -356,7 +383,7 @@ static NeuralNetwork *create_mobilenet(void) {
 static void mobilenet_benchmark(const char *name, ComputeMode mode, const float *images,
                                 const float *labels) {
     spingalett_set_compute_mode(mode);
-    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) { /* the GPU's first run */
+    for (int untimed = is_gpu(mode); untimed >= 0; untimed--) { /* the GPU's first run */
     NeuralNetwork *net = create_mobilenet();
     Sets d = sets_of(images, 3072u, labels, OUTPUT_SIZE, MOBILE_SAMPLES);
     double start = now();
@@ -381,7 +408,7 @@ static void mobilenet_benchmark(const char *name, ComputeMode mode, const float 
 
 static void run_benchmark(const char *name, ComputeMode mode, const float *inputs, const float *targets) {
     spingalett_set_compute_mode(mode);
-    if (mode == COMPUTE_VULKAN) { /* the GPU's first use, not timed */
+    if (is_gpu(mode)) { /* the GPU's first use, not timed */
         train_throughput(inputs, targets, STRATEGY_FULL_BATCH, 1);
         train_throughput(inputs, targets, STRATEGY_SMALL_BATCH, 1);
         inference_throughput(inputs);
@@ -453,11 +480,24 @@ int main(int argc, char **argv) {
     generate_synthetic_data(&inputs, &targets);
 
     /* More threads than cores oversubscribes the CPU and slows training down. */
-    bool cpu = true;
+    bool cpu = true, vulkan = true, cuda = true;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "gpu")) cpu = false;
+        else if (!strcmp(argv[i], "vulkan")) cuda = false;
+        else if (!strcmp(argv[i], "cuda")) vulkan = false;
         else spingalett_set_num_threads((unsigned)strtoul(argv[i], NULL, 10));
     }
+    /* the GPU's rows: each backend with a device, in single precision and (with matrix units) bfloat16 */
+    for (int b = 0; b < 2; b++) {
+        const ComputeMode mode = b ? COMPUTE_CUDA : COMPUTE_VULKAN;
+        if (!(b ? cuda : vulkan) || !(b ? spingalett_cuda_device() : spingalett_gpu_device())) continue;
+        spingalett_set_compute_mode(mode);
+        const bool bf16 = spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        gpu_rows[gpu_row_count++] = (GpuRow){b ? "CUDA" : "Vulkan", mode, false};
+        if (bf16) gpu_rows[gpu_row_count++] = (GpuRow){b ? "CUDA" : "Vulkan", mode, true};
+    }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 
     NeuralNetwork *probe = create_network();
     printf("Spingalett %s (%s kernels): %d-%d-%d-%d (%" PRIu64 " parameters), %d samples, threads: ",
@@ -466,7 +506,8 @@ int main(int argc, char **argv) {
     free_network(probe);
     if (spingalett_get_num_threads() > 0) printf("%u", spingalett_get_num_threads());
     else printf("runtime default");
-    printf(spingalett_gpu_device() ? ", GPU: %s\n\n" : "\n\n", spingalett_gpu_device());
+    const char *gpu = spingalett_cuda_device() ? spingalett_cuda_device() : spingalett_gpu_device();
+    printf(gpu ? ", GPU: %s\n\n" : "\n\n", gpu);
 
     printf("%-24s %14s %14s %14s\n", "samples/s", "full batch", "mini-batch 64", "inference");
     if (cpu) {
@@ -478,21 +519,7 @@ int main(int argc, char **argv) {
         run_benchmark("OpenBLAS", COMPUTE_OPENBLAS, inputs, targets);
 #endif
     }
-    const char *gpu = spingalett_gpu_device();
-    /* and with the matrix products in bfloat16 on its matrix units, where it has them */
-    const bool bf16 = gpu && spingalett_set_gpu_precision(PRECISION_BFLOAT16);
-    spingalett_set_gpu_precision(PRECISION_FLOAT32);
-    for (int dev = 0; gpu && dev < 2; dev++) {      /* the host's arrays, then data sets on the GPU */
-        on_device = dev;
-        run_benchmark(dev ? "Vulkan GPU, data on GPU" : "Vulkan GPU", COMPUTE_VULKAN, inputs, targets);
-        if (bf16) {
-            spingalett_set_gpu_precision(PRECISION_BFLOAT16);
-            run_benchmark(dev ? "Vulkan bf16, data on GPU" : "Vulkan GPU bf16", COMPUTE_VULKAN, inputs,
-                          targets);
-            spingalett_set_gpu_precision(PRECISION_FLOAT32);
-        }
-    }
-    on_device = false;
+    GPU_ROWS(run_benchmark(label, row->mode, inputs, targets));
     if (cpu) deployment_benchmark(inputs);
 
     /* the convolutional network: random images, one-hot labels */
@@ -519,18 +546,7 @@ int main(int argc, char **argv) {
             cnn_benchmark("OpenBLAS", COMPUTE_OPENBLAS, normalized, images, labels);
 #endif
         }
-        for (int dev = 0; gpu && dev < 2; dev++) {      /* the host's arrays, then data sets on the GPU */
-            on_device = dev;
-            cnn_benchmark(dev ? "Vulkan GPU, data on GPU" : "Vulkan GPU", COMPUTE_VULKAN, normalized, images,
-                          labels);
-            if (bf16) {
-                spingalett_set_gpu_precision(PRECISION_BFLOAT16);
-                cnn_benchmark(dev ? "Vulkan bf16, data on GPU" : "Vulkan GPU bf16", COMPUTE_VULKAN,
-                              normalized, images, labels);
-                spingalett_set_gpu_precision(PRECISION_FLOAT32);
-            }
-        }
-        on_device = false;
+        GPU_ROWS(cnn_benchmark(label, row->mode, normalized, images, labels));
     }
 
     free(images);
@@ -556,17 +572,7 @@ int main(int argc, char **argv) {
         resnet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
 #endif
     }
-    for (int dev = 0; gpu && dev < 2; dev++) {      /* the host's arrays, then data sets on the GPU */
-        on_device = dev;
-        resnet_benchmark(dev ? "Vulkan GPU, data on GPU" : "Vulkan GPU", COMPUTE_VULKAN, images, labels);
-        if (bf16) {
-            spingalett_set_gpu_precision(PRECISION_BFLOAT16);
-            resnet_benchmark(dev ? "Vulkan bf16, data on GPU" : "Vulkan GPU bf16", COMPUTE_VULKAN, images,
-                             labels);
-            spingalett_set_gpu_precision(PRECISION_FLOAT32);
-        }
-    }
-    on_device = false;
+    GPU_ROWS(resnet_benchmark(label, row->mode, images, labels));
     free(images);
     free(labels);
 
@@ -591,17 +597,7 @@ int main(int argc, char **argv) {
         unet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
 #endif
     }
-    for (int dev = 0; gpu && dev < 2; dev++) {      /* the host's arrays, then data sets on the GPU */
-        on_device = dev;
-        unet_benchmark(dev ? "Vulkan GPU, data on GPU" : "Vulkan GPU", COMPUTE_VULKAN, images, labels);
-        if (bf16) {
-            spingalett_set_gpu_precision(PRECISION_BFLOAT16);
-            unet_benchmark(dev ? "Vulkan bf16, data on GPU" : "Vulkan GPU bf16", COMPUTE_VULKAN, images,
-                           labels);
-            spingalett_set_gpu_precision(PRECISION_FLOAT32);
-        }
-    }
-    on_device = false;
+    GPU_ROWS(unet_benchmark(label, row->mode, images, labels));
     free(images);
     free(labels);
 
@@ -625,17 +621,7 @@ int main(int argc, char **argv) {
         mobilenet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
 #endif
     }
-    for (int dev = 0; gpu && dev < 2; dev++) {      /* the host's arrays, then data sets on the GPU */
-        on_device = dev;
-        mobilenet_benchmark(dev ? "Vulkan GPU, data on GPU" : "Vulkan GPU", COMPUTE_VULKAN, images, labels);
-        if (bf16) {
-            spingalett_set_gpu_precision(PRECISION_BFLOAT16);
-            mobilenet_benchmark(dev ? "Vulkan bf16, data on GPU" : "Vulkan GPU bf16", COMPUTE_VULKAN, images,
-                                labels);
-            spingalett_set_gpu_precision(PRECISION_FLOAT32);
-        }
-    }
-    on_device = false;
+    GPU_ROWS(mobilenet_benchmark(label, row->mode, images, labels));
     free(images);
     free(labels);
     free(inputs);

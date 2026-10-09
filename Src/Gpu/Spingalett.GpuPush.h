@@ -135,3 +135,8 @@ enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
 
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
 #define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */
+
+/* The CUDA backend's product in single precision (Src/Gpu/Cuda/gemm.cu): the steps of the sum in shared
+   memory at once, and the bytes of shared memory a tile of BM x BN, BK a step, takes. */
+#define SPG_CUDA_GEMM_STAGES 2u     /* (two buffers) */
+#define SPG_CUDA_GEMM_SHARED(bm, bn, bk) (SPG_CUDA_GEMM_STAGES * (bk) * ((bm) + 4u + (bn) + 4u) * 4u)

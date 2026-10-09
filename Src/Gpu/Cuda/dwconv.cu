@@ -30,7 +30,7 @@ struct Dw {
     uint32_t MODE, EPI, ACT, VEC, PW, PRO, SUMS, HALF;
     float4_ dy_sum, dyx_sum;
 
-    __device__ Dw(const SpgDwconvPush &push, const Spec &s) : p(push) {
+    MEMBER Dw(const SpgDwconvPush &push, const Spec &s) : p(push) {
         MODE = s.v[0]; EPI = s.v[1]; ACT = s.v[2]; VEC = s.v[7]; PW = s.v[8]; PRO = s.v[9]; SUMS = s.v[10];
         HALF = s.v[11];
         dy_sum = dyx_sum = float4_{0.0f, 0.0f, 0.0f, 0.0f};
@@ -42,13 +42,13 @@ struct Dw {
     DEVICE float4_ norm_b(const SpgDwconvPush &p, uint32_t pro, uint32_t c) {
         return pro != 0u ? ((const float4_ *)p.bn)[(3u * p.in_c + c) >> 2] : float4_{0.0f, 0.0f, 0.0f, 0.0f};
     }
-    __device__ float4_ normalized(float4_ v, float4_ a, float4_ b) const {
+    MEMBER float4_ normalized(float4_ v, float4_ a, float4_ b) const {
         if (PRO == 0u) return v;
         return activate4(add4(mul4(v, a), b), PRO - 1u);
     }
 
     /* the epilogue of value i of the result */
-    __device__ void finish(uint32_t i, uint32_t channel, float v) const {
+    MEMBER void finish(uint32_t i, uint32_t channel, float v) const {
         if (EPI == EPI_BIAS_ACT) {
             v = activate(v + F(p.e0)[channel], ACT);
         } else {
@@ -59,7 +59,7 @@ struct Dw {
     }
 
     /* and of values i .. i + 3, channels channel .. + 3 */
-    __device__ void finish4(uint32_t i, uint32_t channel, float4_ v) {
+    MEMBER void finish4(uint32_t i, uint32_t channel, float4_ v) {
         if (EPI == EPI_BIAS_ACT) {
             for (uint32_t k = 0u; k < 4u; k++) set4(v, k, activate(get4(v, k) + F(p.e0)[channel + k], ACT));
         } else {
@@ -82,7 +82,7 @@ struct Dw {
     }
 
     /* the filters of channels o .. o + 3 at tap t */
-    __device__ float4_ w4(uint32_t o, uint32_t t, uint32_t taps) const {
+    MEMBER float4_ w4(uint32_t o, uint32_t t, uint32_t taps) const {
         const float *w = F(p.w);
         return float4_{w[o * taps + t], w[(o + 1u) * taps + t], w[(o + 2u) * taps + t], w[(o + 3u) * taps + t]};
     }

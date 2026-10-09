@@ -64,6 +64,7 @@ typedef unsigned long long CUdeviceptr;
 #define CU_ATTRIBUTE_SHARED_PER_BLOCK_OPTIN   97
 #define CU_FUNC_MAX_DYNAMIC_SHARED            8
 #define CU_FUNC_NUM_REGS                      4
+#define CU_FUNC_SHARED_BYTES                  1
 #define CU_FUNC_LOCAL_BYTES                   3
 #define CU_STREAM_NON_BLOCKING                1
 #define CU_CAPTURE_MODE_RELAXED               2
@@ -243,8 +244,8 @@ static bool cub_open(void) {
 
 static const char *cub_device_name(void) { return cub_open() ? cu.name : NULL; }
 static uint64_t cub_memory(void) { return cub_open() ? cu.memory : 0; }
-/* the kernels' static shared memory (no more without asking for it) */
-static uint32_t cub_shared_memory(void) { return 48u * 1024u; }
+/* what a block may ask for (the product's tiles: dynamic shared memory, beyond the 48 KB of static) */
+static uint32_t cub_shared_memory(void) { return cub_open() ? cu.shared_optin : 48u * 1024u; }
 static uint32_t cub_subgroup_size(void) { return 32u; }
 static uint32_t cub_max_workgroups(uint32_t axis) { return axis == 0 ? 0x7FFFFFFFu : 65535u; }
 static bool cub_mma_bf16(void) { return false; }
@@ -252,6 +253,11 @@ static bool cub_bf16_storage(void) { return false; }
 static bool cub_host_writes(void) { return false; }
 
 /* ------------------------------------------------------------------------- kernels */
+
+/* Bytes of dynamic shared memory a kernel takes (the product's stages). */
+static uint32_t dynamic_shared(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
+    return kernel == SPG_KERNEL_gemm && count >= 3 ? SPG_CUDA_GEMM_SHARED(spec[0], spec[1], spec[2]) : 0u;
+}
 
 /* Threads a block of each kernel (gemm: its spec's THREADS). */
 static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
@@ -271,7 +277,10 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     snprintf(name, sizeof name, "%.*s", (int)len, base);
     if (kernel == SPG_KERNEL_gemm) {
         if (count < 12) return -1;
-        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u", spec[0], spec[1], spec[2], spec[3], spec[4]);
+        /* the convolution modes read four channels at once in instances of their own (A 3, B 3) */
+        const uint32_t a = spec[5] == SPG_A_CONV && (spec[11] & 1u) ? 3u : spec[5];
+        const uint32_t b = spec[6] == SPG_B_CONV && (spec[11] & 2u) ? 3u : spec[6];
+        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u", spec[0], spec[1], spec[2], spec[3], spec[4], a, b);
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 7) {
             char window[64];
@@ -300,6 +309,9 @@ static CUfunction unit_function(int u) {
         snprintf(entry, sizeof entry, "spg_%s", spg_cuda_units[u].name);
         bool ok = cuModuleLoadDataEx(&unit->module, spg_cuda_units[u].ptx, 2, options, values) == 0 &&
                   cuModuleGetFunction(&unit->function, unit->module, entry) == 0;
+        int fixed = 0;              /* (dynamic shared memory up to what the device allows a block) */
+        if (ok && cuFuncGetAttribute(&fixed, CU_FUNC_SHARED_BYTES, unit->function) == 0)
+            cuFuncSetAttribute(unit->function, CU_FUNC_MAX_DYNAMIC_SHARED, (int)cu.shared_optin - fixed);
         if (!ok) fprintf(stderr, "Spingalett: CUDA kernel %s: %s\n", spg_cuda_units[u].name, log);
         atomic_store(&unit->state, ok ? 1 : 2);
     }
@@ -430,7 +442,7 @@ typedef enum { OP_LAUNCH, OP_COPY, OP_FILL, OP_STAMP } OpKind;
 typedef struct {
     OpKind kind;
     CUfunction function;
-    uint32_t grid[3], block;
+    uint32_t grid[3], block, shared;
     uint64_t push[SPG_PUSH_BYTES / 8];
     uint32_t spec[SPG_SPEC_MAX];
     uint64_t src, dst, bytes;
@@ -557,13 +569,14 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
     op->function = f;
     op->grid[0] = gx; op->grid[1] = gy; op->grid[2] = gz;
     op->block = threads;
+    op->shared = dynamic_shared(kernel, spec, spec_count);
     memcpy(op->push, push, push_size);
     memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
     if (cu.profile) {
         int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
         if (kernel == SPG_KERNEL_gemm && spec_count >= 8)
-            snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7], spec[0],
-                     spec[1]);
+            snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7],
+                     spec[0], spec[1]);
         else
             for (uint32_t k = 0; k < spec_count && k < 2 && len < 40; k++)
                 len += snprintf(op->label + len, sizeof op->label - (size_t)len, " %u", spec[k]);
@@ -600,8 +613,8 @@ static bool run_op(CuCommands *c, uint32_t k, CUstream s) {
     switch (op->kind) {
         case OP_LAUNCH: {
             void *args[2] = {op->push, op->spec};
-            return cuLaunchKernel(op->function, op->grid[0], op->grid[1], op->grid[2], op->block, 1, 1, 0, s, args,
-                                  NULL) == 0;
+            return cuLaunchKernel(op->function, op->grid[0], op->grid[1], op->grid[2], op->block, 1, 1, op->shared, s,
+                                  args, NULL) == 0;
         }
         case OP_COPY: return cuMemcpyAsync(op->dst, op->src, op->bytes, s) == 0;
         case OP_FILL: return cuMemsetD32Async(op->dst, op->value, op->bytes / 4u, s) == 0;
