@@ -20,9 +20,9 @@ against PyTorch on the same machine.
 | 0.12 | "Tensor cores": matrix products in bfloat16 on the GPU's matrix units (opt-in, faster than single precision), the custom-loop API on the GPU, fixes from a review of the GPU backend; ONNX import and PyTorch weights ten to a hundred times as fast (mapped files, one pass per tensor, external data files); gradients and optimizer state allocated when a network first trains; the first wheels on PyPI |
 | 0.13 | "Layers": transposed convolutions, upsampling and layer normalization on the CPU and the GPU, in `.slett` format 7, the engine and deployment models in every precision; their import from ONNX (ConvTranspose, Resize, LayerNormalization) and PyTorch; a U-Net segmentation example; the GPU's loss kernel for wide outputs |
 | 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling, weight gradients split only where it pays: ahead of PyTorch with cuDNN in every workload but the MLP's inference with PyTorch's data already in GPU memory |
-| 0.14 (in progress) | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.15 times at least in every workload, its data in GPU memory or not |
+| 0.14 | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.14 times at least in every workload, its data in GPU memory or not |
 
-## 0.14: the release candidate
+## 0.14: the release candidate (released)
 
 The last minor version of 0.x: whatever would break programs after 1.0 happens here, and nothing
 else.
@@ -68,14 +68,15 @@ next, before or after 1.0.
 On an RTX 4050 Laptop GPU against PyTorch 2.14 with cuDNN (`Bin/Benchmark gpu` against
 `benchmark_pytorch.py --cuda`, `--cuda-fp32`, `--cuda-bf16` and `--host-data`, README), Spingalett
 0.14 is ahead in every workload, with the data in GPU memory (its data sets) or in host memory:
-the MNIST CNN (with and without batch normalization) trains 1.5 to 1.9 times as fast as PyTorch and
-runs 2.1 to 2.4 times as fast in single precision, 1.5 to 1.7 and 1.8 to 2.15 times as fast as its
-autocast in bfloat16; ResNet-20 and the U-Net run 1.7 to 2 times as fast in either precision and
-train 1.4 to 1.5 times as fast in bfloat16; the MobileNet-style network 1.4 and 4 times, 1.3 and 3.2
-times; the 784-512-1000-10 MLP trains mini-batches 3.7 to 6.2 times as fast and infers 1.18 and 1.3
-times as fast. The margins left thin, 1.15 to 1.25 times, are the MLP's full batches (single precision at the
-device's 6.3 to 6.5 TFLOPS, as cuBLAS; bfloat16 at 15 to 18 TFLOPS against cuBLAS's 17 to 19.5) and
-the single-precision training of ResNet-20 and the U-Net against PyTorch's TF32 convolutions.
+the MNIST CNN (with and without batch normalization) trains 1.6 to 1.9 times as fast as PyTorch and
+runs 2.1 to 2.4 times as fast in single precision, 1.5 to 1.6 and 1.8 to 2.1 times as fast as its
+autocast in bfloat16; ResNet-20 and the U-Net run 1.75 to 1.9 times as fast in either precision and
+train 1.3 to 1.45 times as fast in bfloat16; the MobileNet-style network 1.45 and 4.5 times, 1.26 and
+3 times; the 784-512-1000-10 MLP trains mini-batches 3.7 to 6.2 times as fast and infers 1.23 and 1.3
+times as fast. The margins left thin, 1.14 to 1.25 times, are the MLP's full batches (single
+precision at the device's 6.3 to 6.5 TFLOPS, as cuBLAS; bfloat16 at 15 to 18 TFLOPS against
+cuBLAS's 17 to 19.5) and the single-precision training of ResNet-20 and the U-Net against PyTorch's
+TF32 convolutions.
 
 Done in 0.13.1: the tile choice, activations and gradients in bfloat16, the pooling backward pass
 (part of 3), larger tiles on the matrix units (part of 1). Done in 0.14: data sets on the GPU; a
@@ -93,15 +94,15 @@ release before and against PyTorch:
 2. **The single-precision kernel for convolutions of few channels.** ResNet-20's and the U-Net's
    convolutions (16 to 64 filters, k = 144 to 576 values of the window) reach 3.3 to 4.5 TFLOPS, the
    MLP's products 5.6 to 6.4, and they take 70% of those networks' training time in single
-   precision. With so short a k a tile runs 9 to 36 steps, and what it does once (the windows'
-   geometry of its rows, its first loads, whose latency nothing hides, the epilogue) and the address
-   arithmetic of the gathered windows take some 40% of its instructions. The plan: workgroups that
-   take tile after tile (a persistent loop), the next tile's first loads issued under the current
-   tile's sums; the offsets of a step's taps computed once a workgroup into shared memory rather
-   than per load; per-thread tiles wider in m where n is 16 or 32, the filters' values read once a
-   step and broadcast. Target: 5.5 TFLOPS on those shapes, ResNet-20 and the U-Net trained 1.4 times
-   as fast as PyTorch with TF32. The same loop pays in bfloat16, where n = 16 tiles reach 3.3 to 5
-   TFLOPS on the matrix units.
+   precision. Measured in 0.14 by taking parts of gemm.comp out: the epilogue cost 9 to 11% of the
+   16-filter products (now four results a store), the windows' address arithmetic about 5%, and a
+   variant reading each thread's rows of A straight into registers, B alone through shared memory,
+   ran slower than the tiles it would replace: with 16 filters each value of A loaded serves 16
+   multiply-adds, and on Ada the integer work around it shares the units of half the FP32 lanes.
+   What is left to try: A in shared memory as rows of k (one vector store per load, where it is four
+   scalar ones), loops that take tile after tile (the next tile's first loads under the current
+   tile's sums), and Winograd convolutions (step 6), which cut the multiplications themselves.
+   Target: ResNet-20 and the U-Net trained 1.4 times as fast as PyTorch with TF32.
 3. **Fewer passes:** batch normalization's sums gathered in the epilogue of the convolution before
    it, its normalization and activation applied by the products that read its outputs (done for
    depthwise readers); concatenated layers writing straight into their channels of the

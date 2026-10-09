@@ -7,10 +7,21 @@ changes, which are listed under **Changed**.
 
 ## [Unreleased]
 
-Data sets in the GPU's memory, the setting PyTorch's GPU benchmark measures: with them Spingalett is
-ahead of PyTorch with cuDNN in every workload of `Examples/Benchmark.c`, the fully connected
-network's inference included (1.19 times as fast in single precision, 1.3 times in bfloat16, on an
-RTX 4050 Laptop GPU; README).
+## [0.14.0] - 2026-10-09
+
+"Release candidate": the last minor version of 0.x, with the API and the formats 1.0 is to keep.
+Every public name is under the library's prefix, structs end with reserved space, a layer without an
+activation has none, errors are reported one way, and `Spingalett.hpp` gives a C++23 interface;
+`docs/Reference.md` and `docs/Tutorial.md` document them. Programs written for 0.x compile unchanged
+through the short names (`Spingalett.Short.h`) but must be built again: the soname is 0.14, the
+exported symbols are the prefixed ones, and a layer that left out `.act_func` now has no activation
+where it had a sigmoid.
+
+Data sets can live in the GPU's memory, the setting PyTorch's GPU benchmark measures. On an RTX 4050
+Laptop GPU, Spingalett is ahead of PyTorch 2.14 with cuDNN in every workload of
+`Examples/Benchmark.c`, by 1.14 times at least, with the data in the GPU's memory or in the host's
+(README); against 0.13.1 it trains the MobileNet-style network 3.4 and 12 times as fast and infers it
+4 and 13 times as fast (single precision and bfloat16).
 
 ### Added
 - **Documentation:** `docs/Reference.md`, every declaration of the public headers with its comment
@@ -954,6 +965,9 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/pka-human/Spingalett/compare/v0.13.1...v0.14.0
+[0.13.1]: https://github.com/pka-human/Spingalett/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/pka-human/Spingalett/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/pka-human/Spingalett/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/pka-human/Spingalett/compare/v0.10.0...v0.11.0

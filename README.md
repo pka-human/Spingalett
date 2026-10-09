@@ -130,7 +130,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.13 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.14 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -1241,34 +1241,34 @@ timed after a first call (Spingalett) or a warm-up step (PyTorch):
 
 | On the GPU, samples/s | Spingalett, data on GPU (FP32 / bf16) | PyTorch, data on GPU (TF32 / FP32 / bf16) | Spingalett, host data (FP32 / bf16) | PyTorch, host data (TF32 / bf16) |
 |---|---:|---:|---:|---:|
-| ResNet-20, training | 10,470 / 18,520 | 8,493 / 7,557 / 12,320 | 10,500 / 18,670 | 8,429 / 12,080 |
-| ResNet-20, inference | 34,220 / 61,810 | 19,780 / 19,650 / 31,600 | 34,970 / 62,530 | 19,440 / 30,390 |
-| Convolutional network, training | 104,700 / 167,700 | 56,370 / 59,910 / 99,490 | 105,400 / 168,400 | 54,220 / 77,100 |
-| Convolutional network, inference | 313,800 / 509,100 | 131,700 / 143,200 / 237,000 | 315,500 / 504,400 | 127,400 / 225,800 |
-| With batch normalization, training | 74,110 / 122,400 | 48,070 / 48,650 / 82,030 | 73,710 / 122,400 | 48,020 / 80,070 |
-| With batch normalization, inference | 223,200 / 359,900 | 107,300 / 114,200 / 198,100 | 219,900 / 356,500 | 104,000 / 187,700 |
-| Fully connected network, mini-batch 64 | 291,300 / 433,800 | 76,420 / 78,680 / 70,200 | 301,400 / 455,200 | 63,360 / 57,970 |
-| Fully connected network, full batch | 1,213,000 / 2,919,000 | 1,050,000 / 1,037,000 / 2,546,000 | 1,176,000 / 3,039,000 | 845,600 / 1,572,000 |
-| Fully connected network, inference | 3,514,000 / 8,024,000 | 2,967,000 / 2,952,000 / 6,170,000 | 2,640,000 / 5,215,000 | 1,703,000 / 2,434,000 |
-| U-Net, training | 4,074 / 6,863 | 3,329 / 3,114 / 5,020 | 4,050 / 6,704 | 3,241 / 4,314 |
-| U-Net, inference | 12,130 / 21,680 | 6,424 / 6,654 / 11,910 | 12,070 / 21,550 | 6,098 / 11,050 |
-| MobileNet-style network, training | 14,060 / 29,770 | 9,887 / 8,691 / 23,040 | 14,040 / 30,040 | 9,807 / 22,070 |
-| MobileNet-style network, inference | 77,340 / 120,800 | 19,570 / 17,880 / 38,220 | 78,400 / 118,900 | 19,200 / 36,580 |
+| ResNet-20, training | 10,320 / 17,710 | 8,423 / 7,112 / 12,220 | 10,450 / 17,600 | 8,380 / 12,110 |
+| ResNet-20, inference | 34,220 / 58,940 | 19,600 / 19,350 / 31,400 | 34,580 / 59,640 | 19,260 / 30,020 |
+| Convolutional network, training | 108,100 / 163,200 | 56,680 / 59,620 / 99,440 | 108,600 / 164,500 | 55,480 / 74,420 |
+| Convolutional network, inference | 309,900 / 504,500 | 130,900 / 142,000 / 236,900 | 307,700 / 486,300 | 127,500 / 225,400 |
+| With batch normalization, training | 74,960 / 119,300 | 47,730 / 47,860 / 81,050 | 75,100 / 119,800 | 48,010 / 77,500 |
+| With batch normalization, inference | 221,000 / 354,400 | 106,500 / 113,900 / 198,000 | 228,200 / 349,800 | 104,300 / 187,700 |
+| Fully connected network, mini-batch 64 | 324,100 / 433,200 | 83,570 / 87,640 / 69,840 | 306,600 / 435,100 | 65,970 / 76,320 |
+| Fully connected network, full batch | 1,201,000 / 2,950,000 | 1,055,000 / 1,048,000 / 2,541,000 | 1,149,000 / 3,024,000 | 846,100 / 1,572,000 |
+| Fully connected network, inference | 3,612,000 / 8,002,000 | 2,939,000 / 2,957,000 / 6,189,000 | 2,640,000 / 5,117,000 | 1,709,000 / 2,457,000 |
+| U-Net, training | 3,910 / 6,690 | 3,203 / 2,994 / 5,001 | 3,935 / 6,484 | 3,234 / 4,783 |
+| U-Net, inference | 11,650 / 20,980 | 6,219 / 6,389 / 11,900 | 12,210 / 21,000 | 6,075 / 11,000 |
+| MobileNet-style network, training | 14,260 / 28,870 | 9,837 / 8,635 / 22,960 | 14,090 / 28,730 | 9,810 / 22,250 |
+| MobileNet-style network, inference | 88,160 / 116,000 | 19,470 / 17,790 / 38,500 | 85,940 / 117,500 | 19,210 / 37,070 |
 
 Spingalett is ahead of PyTorch in every workload, in either setting. With the data in GPU memory, in
-single precision, it trains ResNet-20 1.23 times as fast as PyTorch with TF32 (1.4 times as fast as
-PyTorch in single precision) and runs it 1.7 times as fast, trains the convolutional networks 1.5 to
-1.9 times as fast and runs them 2.1 to 2.4 times as fast, the U-Net 1.2 to 1.3 and 1.9 times, the
-MobileNet-style network (PyTorch in channels-last, its faster layout for it) 1.4 and 4 times, and the
-fully connected network 1.16 times as fast in full batches, 3.7 to 3.8 times in mini-batches, and
-infers 1.18 times as fast. In bfloat16, against PyTorch's autocast: ResNet-20 1.5 and 2 times, the
-convolutional networks 1.5 to 1.7 and 1.8 to 2.15 times, the U-Net 1.4 and 1.8 times, the
-MobileNet-style network 1.3 and 3.2 times, the fully connected network 1.15 times in full batches,
-6.2 times in mini-batches and 1.3 times in inference.
+single precision, it trains ResNet-20 1.23 times as fast as PyTorch with TF32 (1.45 times as fast as
+PyTorch in single precision) and runs it 1.75 times as fast, trains the convolutional networks 1.6
+to 1.9 times as fast and runs them 2.1 to 2.4 times as fast, the U-Net 1.2 to 1.3 and 1.8 to 1.9
+times, the MobileNet-style network (PyTorch in channels-last, its faster layout for it) 1.45 and 4.5
+times, and the fully connected network 1.14 times as fast in full batches, 3.7 to 3.9 times in
+mini-batches, and infers 1.23 times as fast. In bfloat16, against PyTorch's autocast: ResNet-20 1.45
+and 1.9 times, the convolutional networks 1.5 to 1.6 and 1.8 to 2.1 times, the U-Net 1.3 and 1.8
+times, the MobileNet-style network 1.26 and 3 times, the fully connected network 1.16 times in full
+batches, 6.2 times in mini-batches and 1.3 times in inference.
 In single precision Spingalett trains ResNet-20 on the GPU 6.6 times as fast as on the eight threads
 of the CPU. Data sets on the GPU pay most for the fully connected network's inference, which host
-arrays bind to the bus (63 MB of samples, 31 MB as bfloat16): 1.33 times as fast in single precision
-and 1.54 times in bfloat16. Against 0.13.1 on the same machine (see the [CHANGELOG](CHANGELOG.md)),
+arrays bind to the bus (63 MB of samples, 31 MB as bfloat16): 1.37 times as fast in single precision
+and 1.56 times in bfloat16. Against 0.13.1 on the same machine (see the [CHANGELOG](CHANGELOG.md)),
 Spingalett infers the convolutional networks 1.12 to 1.14 times as fast in bfloat16, trains the
 MobileNet-style network 3.4 and 12 times as fast and infers it 4 and 13 times as fast (its depthwise
 convolutions on a kernel of their own, which applies the batch normalization before it), and
@@ -1349,19 +1349,18 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.13.1; the C API may still change between minor versions (see
-[CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.13`). Since 0.7 the network is an opaque handle, so its internal layout can
-change without breaking programs. Saved models are versioned and remain loadable; the inference
-engine and model format versions 3 to 7 are meant to stay stable from here on.
+Spingalett is at version 0.14.0, the release candidate for 1.0: its API (prefixed names, structs
+that can grow, zero as every field's default) and its formats (`.slett` 7, `.slettd` 2) are those
+1.0 is to keep, unless testing it shows otherwise. Until 1.0 the shared library's soname carries the
+minor version (`libspingalett.so.0.14`). Since 0.7 the network is an opaque handle, so its internal
+layout can change without breaking programs. Saved models are versioned and remain loadable.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.14, the release candidate: every public name under the library's prefix, structs that can
-  grow, the formats frozen, a C++ wrapper
-- 1.0: the API and ABI frozen
+- 1.0: the API and ABI of 0.14 frozen
 - Before and after 1.0, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
-  products in FP16, Winograd convolutions; data sets kept on the GPU (0.14)
+  the single-precision kernel for convolutions of few channels, products in FP16, Winograd
+  convolutions
 - 1.1: a CUDA backend of its own kernels (no cuDNN), next to Vulkan
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 
