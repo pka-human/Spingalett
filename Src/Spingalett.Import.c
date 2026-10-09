@@ -145,6 +145,27 @@ void spingalett_import_filters(float *dst, const uint8_t *src, int dtype, uint32
     }
 }
 
+size_t spingalett_transposed_filters_scratch(uint32_t OG, uint32_t KH, uint32_t KW) {
+    return (size_t)OG * KH * KW;
+}
+
+void spingalett_import_transposed_filters(float *dst, const uint8_t *src, int dtype, uint32_t IC, uint32_t OG,
+                                          uint32_t G, uint32_t KH, uint32_t KW, float *scratch) {
+    const size_t taps = (size_t)KH * KW, row = (size_t)OG * taps, esize = spingalett_dtype_size(dtype);
+    const uint32_t IG = IC / G;
+    if (IG == 1) {                          /* one input channel a group: the orders agree */
+        spingalett_decode(dst, src, dtype, (size_t)IC * row);
+        return;
+    }
+    /* input channel g IG + i holds its group's OG filters' taps: each goes to row g OG + o, column (t, i) */
+    for (uint32_t ic = 0; ic < IC; ic++) {
+        const uint32_t g = ic / IG, i = ic % IG;
+        spingalett_decode(scratch, src + (size_t)ic * row * esize, dtype, row);
+        float *d = dst + (size_t)g * OG * taps * IG + i;
+        for (size_t k = 0; k < row; k++) d[k * IG] = scratch[k];
+    }
+}
+
 /* Source rows k of a transposed product taken at once: a block of at most 1 MB. */
 static size_t dense_block(uint32_t out) {
     size_t rows = (size_t)(262144u / (out ? out : 1u));

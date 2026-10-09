@@ -817,6 +817,24 @@ static bool put_filters(Weights *w, Pass *p, const Weight *t, uint32_t OC, uint3
     return true;
 }
 
+/* ConvTranspose2d weights [IC][OG][KH][KW] (each input channel's filters to its group's outputs). */
+static bool put_transposed_filters(Weights *w, Pass *p, const Weight *t, uint32_t IC, uint32_t OG, uint32_t G,
+                                   uint32_t KH, uint32_t KW, float *dst, Name module) {
+    const int64_t shape[4] = {IC, OG, KH, KW};
+    const uint8_t *at;
+    if (!check_tensor(w, t, shape, 4, module, "weight", &at)) return false;
+    const size_t count = (size_t)IC * OG * KH * KW, filters = spingalett_transposed_filters_scratch(OG, KH, KW);
+    if (!p->write) { need(p, at ? filters : count + filters); return true; }
+    int dtype = t->dtype;
+    if (!at) {                              /* strided: gathered first */
+        gather(t, p->scratch + filters);
+        at = (const uint8_t *)(p->scratch + filters);
+        dtype = SPG_DTYPE_F32;
+    }
+    spingalett_import_transposed_filters(dst, at, dtype, IC, OG, G, KH, KW, p->scratch);
+    return true;
+}
+
 static bool put_dense(Weights *w, Pass *p, const Weight *t, uint32_t rows, uint32_t cols, uint32_t C, uint32_t HW,
                       float *dst, Name module) {
     const int64_t shape[2] = {rows, cols};
@@ -838,7 +856,8 @@ static bool put_dense(Weights *w, Pass *p, const Weight *t, uint32_t rows, uint3
     return true;
 }
 
-/* Copies module `mod` into layer l (a dense, convolution or batch normalization layer). */
+/* Copies module `mod` into layer l (a dense, convolution, transposed convolution, batch or layer
+   normalization layer). */
 static bool put_module(NeuralNetwork *net, Weights *w, Pass *p, uint32_t l, Name mod) {
     char msg[200];
     const LayerShape *s = &net->shapes[l];
@@ -858,6 +877,11 @@ static bool put_module(NeuralNetwork *net, Weights *w, Pass *p, uint32_t l, Name
                put_vector(w, p, mean, rows, net->running_mean + o, mod, "running_mean") &&
                put_vector(w, p, var, rows, net->running_var + o, mod, "running_var");
     }
+    if (s->type == LAYER_LAYER_NORM && tensor_of(w, mod, "running_mean")) {
+        snprintf(msg, sizeof msg, "module '%.*s' is a batch normalization, layer %u a layer normalization", (int)mod.n,
+                 mod.s, l);
+        return werr(w, msg);
+    }
     if (!tw) {
         snprintf(msg, sizeof msg, "module '%.*s' has no weight for layer %u", (int)mod.n, mod.s, l);
         return werr(w, msg);
@@ -865,9 +889,16 @@ static bool put_module(NeuralNetwork *net, Weights *w, Pass *p, uint32_t l, Name
     if (p->write)
         for (uint32_t r = 0; r < rows; r++) b[r] = 0.0f;
     const LayerShape *in = &net->shapes[src];
-    bool ok = s->type == LAYER_CONV2D
-            ? put_filters(w, p, tw, rows, in->channels / s->groups, s->kernel_h, s->kernel_w, W, mod)
-            : put_dense(w, p, tw, rows, net->topology[src], in->channels, in->height * in->width, W, mod);
+    const uint32_t groups = s->groups ? s->groups : 1u;
+    bool ok;
+    if (s->type == LAYER_CONV2D)
+        ok = put_filters(w, p, tw, rows, in->channels / groups, s->kernel_h, s->kernel_w, W, mod);
+    else if (s->type == LAYER_CONV_TRANSPOSE2D)
+        ok = put_transposed_filters(w, p, tw, in->channels, rows / groups, groups, s->kernel_h, s->kernel_w, W, mod);
+    else if (s->type == LAYER_LAYER_NORM)
+        ok = put_vector(w, p, tw, rows, W, mod, "weight");
+    else
+        ok = put_dense(w, p, tw, rows, net->topology[src], in->channels, in->height * in->width, W, mod);
     return ok && (!tb || put_vector(w, p, tb, rows, b, mod, "bias"));
 }
 
@@ -904,7 +935,7 @@ static bool assign(NeuralNetwork *net, Weights *w, const char *const *names, uin
         size_t next = 0;
         for (uint32_t l = 1; ok && l < net->layers; l++) {
             const LayerType type = net->shapes[l].type;
-            if (type != LAYER_DENSE && type != LAYER_CONV2D && type != LAYER_BATCH_NORM) continue;
+            if (type != LAYER_DENSE && !spingalett_filters(type) && !spingalett_normalization(type)) continue;
             if (next == m) {
                 char msg[200];
                 snprintf(msg, sizeof msg, "the file has weights for %zu layers; the network has more (layer %u is the "

@@ -4,12 +4,17 @@
 */
 
 /*
- * The output layer, one thread per sample (rows of n outputs):
+ * The output layer over rows of n outputs (one per sample):
  *
  *   SOFTMAX   y = softmax(y), as apply_softmax() computes it
  *   LOSS      loss[s] = the sample's loss (compute_sample_loss()) and delta = dL/dz of the output
  *             layer (output_delta() in Spingalett.Training.c), from targets t
  *   GRADS     delta = dL/dz from t = dL/dy of a loss of the caller's (output_delta_from_grad())
+ *
+ * A thread takes a row; with WIDE (rows of many outputs, such as a segmentation's maps), a
+ * workgroup does, thread j outputs j, j + 64, ... in order, and what the row sums or maximizes over
+ * its outputs is combined across the threads in a fixed tree, so the results do not depend on
+ * scheduling.
  */
 
 #version 460
@@ -18,7 +23,10 @@
 layout(constant_id = 0) const uint OP = 0;
 layout(constant_id = 1) const uint ACT = 6;     /* the output layer's activation */
 layout(constant_id = 2) const uint LOSS = 0;    /* LossFunction */
+layout(constant_id = 3) const uint WIDE = 0;    /* a workgroup a row */
 layout(local_size_x = 64) in;
+
+const uint STEP = WIDE != 0u ? 64u : 1u;        /* outputs between those of a thread */
 
 #define SOFTMAX 0u
 #define LOSS_OP 1u
@@ -32,59 +40,84 @@ layout(push_constant) uniform Push {
     uint rows, n;
 } p;
 
+shared float red[64];
+
+/* WIDE: the sum (or the maximum) of every thread's v, in a fixed tree (uniform control flow). */
+float combine(uint tid, float v, bool maximum) {
+    if (WIDE == 0u) return v;
+    red[tid] = v;
+    barrier();
+    for (uint h = 32u; h > 0u; h /= 2u) {
+        if (tid < h) red[tid] = maximum ? max(red[tid], red[tid + h]) : red[tid] + red[tid + h];
+        barrier();
+    }
+    const float r = red[0];
+    barrier();                          /* read before the next combine() writes */
+    return r;
+}
+
 void main() {
-    const uint s = gl_GlobalInvocationID.x;
-    if (s >= p.rows) return;
-    const uint base = s * p.n, n = p.n;
-    if (OP == SOFTMAX) {
-        float top = -3.402823466e38;
-        for (uint k = 0; k < n; k++) top = max(top, p.y.v[base + k]);
-        float sum = 0.0;
-        for (uint k = 0; k < n; k++) {
-            float e = exp(p.y.v[base + k] - top);
-            p.y.v[base + k] = e;
-            sum += e;
+    const uint tid = WIDE != 0u ? gl_LocalInvocationID.x : 0u, n = p.n;
+    const uint first = WIDE != 0u ? gl_WorkGroupID.x : gl_GlobalInvocationID.x;
+    const uint stride = WIDE != 0u ? gl_NumWorkGroups.x : gl_NumWorkGroups.x * 64u;
+    for (uint s = first; s < p.rows; s += stride) {
+        const uint base = s * n;
+        if (OP == SOFTMAX) {
+            float top = -3.402823466e38;
+            for (uint k = tid; k < n; k += STEP) top = max(top, p.y.v[base + k]);
+            top = combine(tid, top, true);
+            float sum = 0.0;
+            for (uint k = tid; k < n; k += STEP) {
+                float e = exp(p.y.v[base + k] - top);
+                p.y.v[base + k] = e;
+                sum += e;
+            }
+            sum = combine(tid, sum, false);
+            if (sum > 0.0) {
+                float inv = 1.0 / sum;
+                for (uint k = tid; k < n; k += STEP) p.y.v[base + k] *= inv;
+            }
+            continue;
         }
-        if (sum > 0.0) {
-            float inv = 1.0 / sum;
-            for (uint k = 0; k < n; k++) p.y.v[base + k] *= inv;
-        }
-        return;
-    }
 
-    if (OP == GRADS) {
-        if (ACT == ACT_SOFTMAX) {
-            float dot = 0.0;
-            for (uint k = 0; k < n; k++) dot += p.t.v[base + k] * p.y.v[base + k];
-            for (uint k = 0; k < n; k++) p.delta.v[base + k] = p.y.v[base + k] * (p.t.v[base + k] - dot);
-        } else {
-            for (uint k = 0; k < n; k++) p.delta.v[base + k] = p.t.v[base + k] * derivative(p.y.v[base + k], ACT);
+        if (OP == GRADS) {
+            if (ACT == ACT_SOFTMAX) {
+                float dot = 0.0;
+                for (uint k = tid; k < n; k += STEP) dot += p.t.v[base + k] * p.y.v[base + k];
+                dot = combine(tid, dot, false);
+                for (uint k = tid; k < n; k += STEP) p.delta.v[base + k] = p.y.v[base + k] * (p.t.v[base + k] - dot);
+            } else {
+                for (uint k = tid; k < n; k += STEP)
+                    p.delta.v[base + k] = p.t.v[base + k] * derivative(p.y.v[base + k], ACT);
+            }
+            continue;
         }
-        return;
-    }
 
-    const float eps = 1e-9;
-    float loss = 0.0, dot = 0.0;
-    for (uint k = 0; k < n; k++) {
-        float o = p.y.v[base + k], t = p.t.v[base + k];
-        if (LOSS == LOSS_MSE) {
-            float d = o - t;
-            loss += d * d;
-            dot += d * o;
-        } else if (ACT == ACT_SIGMOID) {
-            float c = clamp(o, eps, 1.0 - eps);
-            loss -= t * log(c) + (1.0 - t) * log(1.0 - c);
-        } else {
-            loss -= t * log(max(o, eps));
+        const float eps = 1e-9;
+        float loss = 0.0, dot = 0.0;
+        for (uint k = tid; k < n; k += STEP) {
+            float o = p.y.v[base + k], t = p.t.v[base + k];
+            if (LOSS == LOSS_MSE) {
+                float d = o - t;
+                loss += d * d;
+                dot += d * o;
+            } else if (ACT == ACT_SIGMOID) {
+                /* 1 - o bounded below (1 - 1e-9 is 1 in float): a saturated output gives no 0 log 0 */
+                loss -= t * log(max(o, eps)) + (1.0 - t) * log(max(1.0 - o, eps));
+            } else {
+                loss -= t * log(max(o, eps));
+            }
         }
-    }
-    p.loss.v[s] = loss;
-    for (uint k = 0; k < n; k++) {
-        float o = p.y.v[base + k], d = o - p.t.v[base + k];
-        if (LOSS == LOSS_MSE && ACT == ACT_SOFTMAX)
-            d = o * (d - dot);
-        else if (LOSS == LOSS_MSE || (ACT != ACT_SOFTMAX && ACT != ACT_SIGMOID))
-            d *= derivative(o, ACT);    /* cross-entropy cancels the derivative of a softmax or sigmoid */
-        p.delta.v[base + k] = d;
+        loss = combine(tid, loss, false);
+        if (LOSS == LOSS_MSE && ACT == ACT_SOFTMAX) dot = combine(tid, dot, false);
+        if (tid == 0u) p.loss.v[s] = loss;
+        for (uint k = tid; k < n; k += STEP) {
+            float o = p.y.v[base + k], d = o - p.t.v[base + k];
+            if (LOSS == LOSS_MSE && ACT == ACT_SOFTMAX)
+                d = o * (d - dot);
+            else if (LOSS == LOSS_MSE || (ACT != ACT_SOFTMAX && ACT != ACT_SIGMOID))
+                d *= derivative(o, ACT);    /* cross-entropy cancels the derivative of a softmax or sigmoid */
+            p.delta.v[base + k] = d;
+        }
     }
 }

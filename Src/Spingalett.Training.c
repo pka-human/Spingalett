@@ -70,13 +70,13 @@ static void optimizer_update_array(const OptimizerStep *o, float *W, float *mW, 
 
 static bool has_batch_norm(const NeuralNetwork *net) {
     for (uint32_t l = 1; l < net->layers; l++)
-        if (net->shapes[l].type == LAYER_BATCH_NORM) return true;
+        if (spingalett_normalization(net->shapes[l].type)) return true;
     return false;
 }
 
-/* Weight decay of weight layer l: none for batch normalization's gamma (nor for any bias). */
+/* Weight decay of weight layer l: none for a normalization's gamma (nor for any bias). */
 static inline float layer_decay(const NeuralNetwork *net, uint32_t l, float decay) {
-    return net->shapes[l + 1].type == LAYER_BATCH_NORM ? 0.0f : decay;
+    return spingalett_normalization(net->shapes[l + 1].type) ? 0.0f : decay;
 }
 
 /* Apply the accumulated (already averaged) gradients of all layers. */
@@ -320,6 +320,19 @@ static bool input_gradient(NeuralNetwork *net, BatchWorkspace *ws, uint32_t c, u
                                             fused, accumulate, mode);
             return true;
         }
+        case LAYER_LAYER_NORM:
+            spingalett_ln_backward_data(net, c - 1, ws->act[i], ws->delta[c], dst, N, ws->bn_stats[c], fused, mode);
+            return true;
+        case LAYER_CONV_TRANSPOSE2D:
+            spingalett_conv_transpose_backward_data(net, c - 1, ws->delta[c], dst, N, ws->act[i], fused, ws->conv,
+                                                    ws->gemm, mode);
+            return true;
+        case LAYER_UPSAMPLE: {          /* no activation: delta[c] is dL/d(its output) */
+            const LayerShape *x = &net->shapes[i];
+            spingalett_upsample_backward(ws->delta[c], dst, ws->act[i], N, x->height, x->width, x->channels, s->stride_h,
+                                         s->stride_w, s->mode, fused, accumulate, mode);
+            return true;
+        }
         default:                    /* pooling has no activation: delta[c] is dL/d(its output) */
             spingalett_pool_backward(net, c - 1, ws->act[i], ws->delta[c], dst, N, fused, mode);
             return true;
@@ -346,7 +359,7 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
             if (ws->uses[l] > 1) {
                 const bool first = ws->pending[l] == ws->uses[l], done = --ws->pending[l] == 0;
                 const bool direct = first || type == LAYER_DENSE || type == LAYER_ADD || type == LAYER_CONCAT ||
-                                    type == LAYER_GLOBAL_AVG_POOL;
+                                    type == LAYER_GLOBAL_AVG_POOL || type == LAYER_UPSAMPLE;
                 input_gradient(net, ws, c, k, direct ? ws->delta[l] : ws->gtmp, N, ACT_NONE, !first, mode);
                 if (!direct || done)
                     spingalett_gradient_sum(ws->delta[l], direct ? NULL : ws->gtmp, ws->act[l], ws->dmask[l], N, cur_sz,
@@ -398,6 +411,12 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
         } else if (type == LAYER_CONV2D) {
             spingalett_conv_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
                                              ws->gemm, mode);
+        } else if (type == LAYER_CONV_TRANSPOSE2D) {
+            spingalett_conv_transpose_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
+                                                       ws->gemm, mode);
+        } else if (type == LAYER_LAYER_NORM) {
+            spingalett_ln_backward_params(net, l, ws->act[src], ws->delta[l + 1], N, ws->bn_stats[l + 1], scale, beta,
+                                          ws->ln_scratch, mode);
         } else if (type == LAYER_BATCH_NORM) {
             /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass) */
             const double *sums = ws->bn_sums[l + 1];

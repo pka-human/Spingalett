@@ -38,12 +38,13 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
+    "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample",
     "Model", "LayerInfo",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
@@ -120,6 +121,15 @@ class LayerType(enum.IntEnum):
     ADD = 5
     CONCAT = 6
     GLOBAL_AVG_POOL = 7
+    CONV_TRANSPOSE2D = 8
+    UPSAMPLE = 9
+    LAYER_NORM = 10
+
+
+class Upsample(enum.IntEnum):
+    """How an upsampling layer fills its cells (UpsampleMode)."""
+    NEAREST = 0
+    BILINEAR = 1
 
 
 MAX_INPUTS = 16     # inputs of a layer, at most (SPINGALETT_MAX_INPUTS)
@@ -205,6 +215,7 @@ class _NetworkLayer(Structure):
         ("momentum", c_float),
         ("input_count", c_uint32),
         ("inputs", c_uint32 * MAX_INPUTS),
+        ("upsample", c_int),
     ]
 
 
@@ -277,6 +288,10 @@ class _LayerArgs(Structure):
         ("momentum", c_float),
         ("inputs", c_uint32 * MAX_INPUTS),
         ("input_count", c_uint32),
+        ("upsample", c_int),
+        ("output_padding", c_uint32),
+        ("output_padding_h", c_uint32),
+        ("output_padding_w", c_uint32),
     ]
 
 
@@ -480,6 +495,7 @@ class _LayerInfo(Structure):
         ("epsilon", c_float),
         ("input_count", c_uint32),
         ("input_layers", c_uint32 * MAX_INPUTS),
+        ("upsample", c_int),
     ]
 
 
@@ -896,6 +912,40 @@ class GlobalAvgPool:
 
 
 @dataclasses.dataclass(frozen=True)
+class ConvTranspose2D:
+    """Transposed 2D convolution with ``filters`` output channels (kernel 2, stride 2 doubles the size):
+    the output has (in - 1) stride - 2 padding + kernel + output_padding cells along each axis."""
+    filters: int
+    kernel: int
+    stride: int = 1
+    padding: int = 0
+    output_padding: int = 0
+    activation: Activation = Activation.RELU
+    init: Init = Init.HE
+    dropout: float = 0.0
+    groups: int = 1
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Upsample2D:
+    """Upsampling by ``factor`` along both axes: copies (``Upsample.NEAREST``) or bilinear."""
+    factor: int = 2
+    mode: "Upsample" = Upsample.NEAREST
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class LayerNorm:
+    """Layer normalization over each cell's channels (a dense layer's outputs), then ``activation``."""
+    activation: Activation = Activation.NONE
+    epsilon: float = 1e-5
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
 class LayerDescription:
     """Layer ``index`` of a :class:`Network` (0 is the input layer)."""
     type: LayerType
@@ -1044,6 +1094,13 @@ class Network:
                 self.add_concat(spec.inputs, spec.activation, spec.dropout)
             elif isinstance(spec, GlobalAvgPool):
                 self.add_global_avg_pool(spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, ConvTranspose2D):
+                self.add_conv_transpose2d(spec.filters, spec.kernel, spec.stride, spec.padding, spec.output_padding,
+                                          spec.activation, spec.init, spec.dropout, spec.groups, inputs=spec.inputs)
+            elif isinstance(spec, Upsample2D):
+                self.add_upsample(spec.factor, spec.mode, spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, LayerNorm):
+                self.add_layer_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
             else:
                 self.add_layer(int(spec))
 
@@ -1169,6 +1226,31 @@ class Network:
         without activation."""
         return self._add(inputs, type=int(LayerType.GLOBAL_AVG_POOL), dropout_rate=float(dropout))
 
+    def add_conv_transpose2d(self, filters: int, kernel: int, stride: int = 1, padding: int = 0,
+                             output_padding: int = 0, activation: Activation = Activation.RELU, init: Init = Init.HE,
+                             dropout: float = 0.0, groups: int = 1, inputs: _Inputs = None) -> "Network":
+        """Append a transposed 2D convolution (PyTorch's ``ConvTranspose2d``): each input cell adds its
+        ``kernel`` x ``kernel`` window of weights to the output, ``stride`` cells apart, so that the output
+        has (in - 1) stride - 2 padding + kernel + output_padding cells along each axis."""
+        return self._add(inputs, type=int(LayerType.CONV_TRANSPOSE2D), filters=int(filters), kernel=int(kernel),
+                         stride=int(stride), padding=int(padding), output_padding=int(output_padding),
+                         act_func=int(activation), weight_initialization=int(init), dropout_rate=float(dropout),
+                         groups=int(groups))
+
+    def add_upsample(self, factor: int = 2, mode: "Upsample" = Upsample.NEAREST, dropout: float = 0.0,
+                     inputs: _Inputs = None) -> "Network":
+        """Append upsampling by ``factor`` along both axes: copies of each cell (``Upsample.NEAREST``) or
+        bilinear interpolation with the cells' centres aligned (PyTorch's ``align_corners=False``)."""
+        return self._add(inputs, type=int(LayerType.UPSAMPLE), stride=int(factor), upsample=int(mode),
+                         dropout_rate=float(dropout))
+
+    def add_layer_norm(self, activation: Activation = Activation.NONE, epsilon: float = 1e-5, dropout: float = 0.0,
+                       inputs: _Inputs = None) -> "Network":
+        """Append layer normalization over each cell's channels (a dense layer's outputs), with a gamma
+        and beta per channel, then ``activation``."""
+        return self._add(inputs, type=int(LayerType.LAYER_NORM), act_func=int(activation), epsilon=float(epsilon),
+                         dropout_rate=float(dropout))
+
     def layer(self, index: int) -> LayerDescription:
         """Layer ``index`` (0 is the input layer)."""
         info = _NetworkLayer()
@@ -1227,9 +1309,9 @@ class Network:
             raise IndexError(f"connection index {index} out of range for {count} weight sets")
         i = index % count + 1
         info = self.layer(i)
-        if info.type == LayerType.CONV2D:
+        if info.type in (LayerType.CONV2D, LayerType.CONV_TRANSPOSE2D):
             shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(info.inputs[0]).shape[2] // info.groups)
-        elif info.type == LayerType.BATCH_NORM:
+        elif info.type in (LayerType.BATCH_NORM, LayerType.LAYER_NORM):
             shape = (info.bias_count,)
         else:
             shape = (info.bias_count, info.weight_count // info.bias_count if info.bias_count else 0)
@@ -1250,8 +1332,9 @@ class Network:
 
     def get_weights(self, index: int) -> np.ndarray:
         """Copy of the weights feeding layer ``index + 1``: shape (outputs, inputs) for a dense layer,
-        (filters, kernel_h, kernel_w, input channels / groups) for a convolution, gamma (channels,)
-        for batch normalization, empty for pooling."""
+        (filters, kernel_h, kernel_w, input channels / groups) for a convolution or a transposed one
+        (filter j's weights by which each input channel reaches output channel j), gamma (channels,)
+        for batch and layer normalization, empty for pooling and upsampling."""
         return self._get(index, _PARAM_WEIGHTS, True)
 
     def set_weights(self, index: int, values) -> None:

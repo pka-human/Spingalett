@@ -26,11 +26,11 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Int8Tiles.c` | Batched INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product) |
 | `Src/Spingalett.GEMM.c` | Float matrix kernels, including implicit im2col and epilogues |
 | `Src/Spingalett.ConvGEMM.c` | Convolutions as indirect products: windows read through per-tap pointers (forward, data and weight gradients) |
-| `Src/Spingalett.Graph.c` | Adding, concatenating and global pooling layers; the plan by which inference outputs share memory |
+| `Src/Spingalett.Graph.c` | Adding, concatenating and global pooling layers, upsampling; the plan by which inference outputs share memory |
 | `Src/Spingalett.Onnx.c`, `Src/Spingalett.Torch.c` | ONNX import (own protocol buffer reader, external data files); PyTorch state dicts (zip, a pickle interpreter that runs nothing) and safetensors |
 | `Src/Spingalett.Import.c` | What the importers share: files mapped into memory, tensors decoded and reordered to channels-last in one pass |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
-| `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution and normalization layers |
+| `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer) layers |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
 | `Src/Gpu/` | The GPU backend: `Spingalett.Vulkan.c` (device, buffers, pipelines; the loader opened at run time), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use; convolution geometries), `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as command buffers), `Shaders/*.comp` (GLSL, listed in `Spingalett.Kernels.def`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
@@ -79,9 +79,9 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   produce the same 32-bit sums; tests compare with `== 0`, not with a tolerance.
 - **IEEE order in inference.** `Inference.c` and `Model.c` are compiled without reassociation or
   contraction; epilogues use `spingalett_int_output()` so every path rounds alike.
-- **Formats.** `.slett` versions 3 to 6 stay loadable; the writer picks the lowest version that
-  can hold the network (chains 3 to 5, graphs 6). Any change to the format updates
-  `docs/ModelFormat.md` and adds a version.
+- **Formats.** `.slett` versions 3 to 7 stay loadable; the writer picks the lowest version that
+  can hold the network (chains 3 to 5, graphs 6, transposed convolutions, upsampling and layer
+  normalization 7). Any change to the format updates `docs/ModelFormat.md` and adds a version.
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.

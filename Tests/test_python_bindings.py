@@ -631,6 +631,24 @@ if torch is not None:
                                               sg.BatchNorm(sg.Activation.RELU), sg.Layer(5, sg.Activation.SOFTMAX)])
     check(np.abs(same.load_pytorch(tm.state_dict()).forward(hwc) - ty).max() < 1e-5, "load_pytorch(state_dict)")
 
+# transposed convolutions, upsampling and layer normalization: shapes, weights, a state dict
+up = sg.Network(sg.Loss.MSE, [sg.Input(8, 8, 3), sg.Conv2D(8, 3, stride=2, padding=1),
+                              sg.ConvTranspose2D(6, 3, stride=2, padding=1, output_padding=1, groups=2,
+                                                 activation=sg.Activation.NONE),
+                              sg.LayerNorm(sg.Activation.TANH), sg.GlobalAvgPool(), sg.Layer(4, sg.Activation.NONE)])
+check([l.shape for l in up.layers][1:4] == [(4, 4, 8), (8, 8, 6), (8, 8, 6)], "transposed convolution shapes")
+check(up.get_weights(1).shape == (6, 3, 3, 4) and up.get_weights(2).shape == (6,), "transposed and layer norm weights")
+with open(os.path.join(data_dir, "torch_transposed.bin"), "rb") as f:
+    head = np.frombuffer(f.read(16), dtype="<u4")
+    count, n_in, n_out = int(head[1]), int(head[2]), int(head[3])
+    xt = np.frombuffer(f.read(count * n_in * 4), dtype="<f4").reshape(count, n_in)
+    yt = np.frombuffer(f.read(count * n_out * 4), dtype="<f4").reshape(count, n_out)
+up.load_pytorch(os.path.join(data_dir, "torch_transposed.pt"))
+check(np.abs(up.forward(xt) - yt).max() < 1e-5, "PyTorch weights of a ConvTranspose2d and a LayerNorm")
+w = up.get_weights(1); up.set_weights(1, w); check(np.array_equal(up.get_weights(1), w), "transposed weights round trip")
+ups = sg.Network(sg.Loss.MSE, [sg.Input(2, 3, 1), sg.Upsample2D(2), sg.Upsample2D(3, sg.Upsample.BILINEAR)])
+check(ups.layers[-1].shape == (12, 18, 1) and ups.forward(np.ones(6)).shape == (216,), "upsampling shapes")
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")

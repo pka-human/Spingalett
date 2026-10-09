@@ -24,6 +24,8 @@ int main(void) {
     FIELD(LayerArgs, kernel_h); FIELD(LayerArgs, kernel_w); FIELD(LayerArgs, stride_h); FIELD(LayerArgs, stride_w);
     FIELD(LayerArgs, padding_h); FIELD(LayerArgs, padding_w); FIELD(LayerArgs, groups); FIELD(LayerArgs, epsilon);
     FIELD(LayerArgs, momentum); FIELD(LayerArgs, inputs); FIELD(LayerArgs, input_count);
+    FIELD(LayerArgs, upsample); FIELD(LayerArgs, output_padding); FIELD(LayerArgs, output_padding_h);
+    FIELD(LayerArgs, output_padding_w);
 
     SIZE(SpingalettNetworkLayer);
     FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
@@ -33,6 +35,7 @@ int main(void) {
     FIELD(SpingalettNetworkLayer, padding_w); FIELD(SpingalettNetworkLayer, weight_count); FIELD(SpingalettNetworkLayer, bias_count);
     FIELD(SpingalettNetworkLayer, groups); FIELD(SpingalettNetworkLayer, epsilon); FIELD(SpingalettNetworkLayer, momentum);
     FIELD(SpingalettNetworkLayer, input_count); FIELD(SpingalettNetworkLayer, inputs);
+    FIELD(SpingalettNetworkLayer, upsample);
 
     SIZE(ForwardArgs); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
@@ -121,7 +124,7 @@ int main(void) {
     FIELD(SpingalettLayerInfo, kernel_h); FIELD(SpingalettLayerInfo, kernel_w); FIELD(SpingalettLayerInfo, stride_h);
     FIELD(SpingalettLayerInfo, stride_w); FIELD(SpingalettLayerInfo, padding_h); FIELD(SpingalettLayerInfo, padding_w);
     FIELD(SpingalettLayerInfo, groups); FIELD(SpingalettLayerInfo, epsilon); FIELD(SpingalettLayerInfo, input_count);
-    FIELD(SpingalettLayerInfo, input_layers);
+    FIELD(SpingalettLayerInfo, input_layers); FIELD(SpingalettLayerInfo, upsample);
 
     SIZE(LRScheduleParams);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);

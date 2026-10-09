@@ -299,7 +299,7 @@ static void conv_api(void) {
         {{.type = LAYER_CONV2D, .filters = 2, .kernel = 3, .padding = 3}, "padding >= kernel"},
         {{.type = LAYER_CONV2D, .filters = 2, .kernel = 6}, "kernel larger than the input"},
         {{.type = LAYER_MAX_POOL2D, .kernel = 5, .padding = 5}, "pool padding >= kernel"},
-        {{.type = (LayerType)9, .neurons_amount = 3}, "unknown layer type"},
+        {{.type = LAYER_TYPE_COUNT, .neurons_amount = 3}, "unknown layer type"},
     };
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         bad[i].a.net = net;
@@ -1306,7 +1306,13 @@ static void evaluate_matches_manual(void) {
     float bx[] = {0, 0, 1, 0, 0, 0, 1, 0}, by[] = {0, 1, 1, 0};   /* outputs: <0.5, >0.5, <0.5, >0.5 */
     EvalMetrics mb = evaluate(.net = b, .inputs = bx, .targets = by, .sample_count = 4);
     CHECK(fabsf(mb.accuracy - 0.5f) < 1e-6f, "binary accuracy %.3f, expected 0.5", (double)mb.accuracy);
-    free_network(b); free_network(net); free(x); free(y);
+
+    /* a sigmoid saturated at 1 (in float): -log(1e-9) for a target of 0, nothing for a target of 1 */
+    NeuralNetwork *sat = build(LOSS_CROSS_ENTROPY, lb, 2, (const float[]){0.0f, 0.0f}, (const float[]){100.0f});
+    EvalMetrics ms = evaluate(.net = sat, .inputs = bx, .targets = (const float[]){1, 0, 1, 0}, .sample_count = 4);
+    CHECK(fabs(ms.loss + log(1e-9) / 2.0) < 1e-3, "saturated sigmoid: loss %g, expected %g", (double)ms.loss,
+          -log(1e-9) / 2.0);
+    free_network(sat); free_network(b); free_network(net); free(x); free(y);
 }
 
 typedef struct {
@@ -2513,7 +2519,7 @@ static void model_validation(void) {
     }
 
     memcpy(buf, img, size);
-    buf[6] = 7;                                                  /* a future format version */
+    buf[6] = 8;                                                  /* a future format version */
     reseal(buf, size);
     CHECK(spingalett_model_init(&m, buf, size) == SPINGALETT_ERR_FORMAT_VERSION, "validation: future version");
     CHECK(spingalett_model_init(NULL, img, size) == SPINGALETT_ERR_INVALID && spingalett_model_init(&m, NULL, size) == SPINGALETT_ERR_INVALID,
@@ -3532,6 +3538,45 @@ static NeuralNetwork *graph_net(int which) {
             concat_layers(.net = net, .inputs = {c, d, 0}, .input_count = 3, .act_func = ACT_TANH);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
             return net;
+        case 5:     /* a small U-Net: a strided convolution, a transposed one back up, concatenated with the
+                       full-size maps, nearest upsampling of pooled maps */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 6, .width = 6, .channels = 2);
+            a = conv2d(.net = net, .filters = 3, .kernel = 3, .padding = 1, .act_func = ACT_TANH);
+            b = conv2d(.net = net, .filters = 4, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_TANH);
+            c = conv_transpose2d(.net = net, .filters = 3, .kernel = 2, .stride = 2, .act_func = ACT_TANH);
+            d = avg_pool2d(.net = net, .inputs = {b}, .kernel = 3);
+            d = upsample2d(.net = net, .inputs = {d}, .stride = 6);
+            concat_layers(.net = net, .inputs = {a, c, d}, .act_func = ACT_NONE);
+            conv2d(.net = net, .filters = 2, .kernel = 3, .stride = 2, .act_func = ACT_SIGMOID);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            return net;
+        case 6:     /* a grouped transposed convolution with padding and output padding, bilinear
+                       upsampling, layer normalization of maps */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 3, .width = 4, .channels = 4);
+            conv_transpose2d(.net = net, .filters = 6, .kernel = 3, .stride = 2, .padding = 1, .output_padding = 1,
+                             .groups = 2, .act_func = ACT_NONE);
+            layer_norm(.net = net, .act_func = ACT_TANH);
+            upsample2d(.net = net, .stride_h = 2, .stride_w = 3, .upsample = UPSAMPLE_BILINEAR);
+            conv2d(.net = net, .filters = 2, .kernel = 3, .stride = 3, .act_func = ACT_TANH);
+            layer(.net = net, .neurons_amount = 2, .act_func = ACT_SIGMOID);
+            return net;
+        case 7:     /* layer normalization of vectors, read by two layers; a transposed convolution of
+                       stride 1 (a convolution with the window turned around) */
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 4, .width = 4, .channels = 2);
+            conv_transpose2d(.net = net, .filters = 3, .kernel = 3, .act_func = ACT_LEAKY_RELU);
+            global_avg_pool2d(.net = net);
+            a = layer(.net = net, .neurons_amount = 7, .act_func = ACT_NONE);
+            b = layer_norm(.net = net, .act_func = ACT_TANH);
+            c = layer(.net = net, .neurons_amount = 5, .act_func = ACT_SIGMOID);
+            d = layer(.net = net, .inputs = {b}, .neurons_amount = 5, .act_func = ACT_TANH);
+            add_layers(.net = net, .inputs = {c, d}, .act_func = ACT_NONE);
+            layer_norm(.net = net, .act_func = ACT_NONE);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+            (void)a;
+            return net;
         default:    /* a normalization and a pooling of the same maps, an identity layer, pooled maps pooled */
             net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
             layer(.net = net, .height = 4, .width = 6, .channels = 2);
@@ -3553,7 +3598,7 @@ static void graph_init(NeuralNetwork *net) {
         uint64_t w = net->weight_offsets[l - 1], b = net->bias_offsets[l - 1];
         uint64_t nw = (l + 1 < net->layers ? net->weight_offsets[l] : net->total_weights) - w;
         uint64_t nb = (l + 1 < net->layers ? net->bias_offsets[l] : net->total_biases) - b;
-        bool norm = net->shapes[l].type == LAYER_BATCH_NORM;
+        bool norm = net->shapes[l].type == LAYER_BATCH_NORM || net->shapes[l].type == LAYER_LAYER_NORM;
         for (uint64_t i = 0; i < nw; i++) net->weights[w + i] = norm ? 0.6f + frand() * 0.8f : frand() * 1.2f - 0.6f;
         for (uint64_t i = 0; i < nb; i++) net->biases[b + i] = norm ? frand() * 0.4f - 0.2f : frand() * 0.2f - 0.1f;
     }
@@ -3693,10 +3738,13 @@ static void graph_determinism(void) {
    prediction equals single runs bit for bit; outputs share memory. */
 static void graph_inference(ComputeMode mode) {
     spingalett_set_compute_mode(mode);
-    for (int which = 0; which < 6; which++) {
+    for (int which = 0; which < 9; which++) {
         lcg_state = 4000 + which;
         spingalett_seed(10 + which);
-        NeuralNetwork *net = which < 5 ? graph_net(which) : resnet(3, 16, 0.0f);
+        /* graphs 0 to 4, a residual network, then the graphs of transposed convolutions, upsampling and
+           layer normalization (format 7) */
+        NeuralNetwork *net = which < 5 ? graph_net(which) : which == 5 ? resnet(3, 16, 0.0f) : graph_net(which - 1);
+        const uint16_t format = which >= 6 ? 7 : 6;
         graph_init(net);
         const uint32_t n = 37, in = net->topology[0], out = net->topology[net->layers - 1];
         float *x, *y;
@@ -3713,10 +3761,10 @@ static void graph_inference(ComputeMode mode) {
         }
         CHECK(worst < 1e-5f, "graph %d mode %d: forward differs from predict by %g", which, mode, worst);
 
-        /* through a file: format 6, the same network and the same outputs */
+        /* through a file: format 6 (7), the same network and the same outputs */
         size_t size = 0;
         void *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &size);
-        CHECK(img && rd16((const uint8_t *)img + 6) == 6, "graph %d: written in format %u", which,
+        CHECK(img && rd16((const uint8_t *)img + 6) == format, "graph %d: written in format %u", which,
               img ? rd16((const uint8_t *)img + 6) : 0);
         NeuralNetwork *back = img ? load_spingalett_from_memory(img, size) : NULL;
         CHECK(back && back->layers == net->layers && back->total_weights == net->total_weights,
@@ -3810,6 +3858,34 @@ static void graph_folding(void) {
     }
     spingalett_model_free(m);
     free_network(net);
+
+    /* a normalization folds into a transposed convolution as into a convolution (rows per output
+       channel), in every precision */
+    net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 3, .width = 3, .channels = 2);
+    conv_transpose2d(.net = net, .filters = 3, .kernel = 3, .stride = 2, .act_func = ACT_NONE);
+    batch_norm(.net = net, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 2, .act_func = ACT_NONE);
+    graph_init(net);
+    for (uint64_t i = 0; i < net->total_biases; i++) {
+        net->running_mean[i] = frand() * 0.4f - 0.2f;
+        net->running_var[i] = 0.5f + frand();
+    }
+    float y[18];
+    for (int i = 0; i < 18; i++) y[i] = frand() * 2 - 1;
+    predict(.net = net, .inputs = y, .sample_count = 1, .outputs = p);
+    for (int pr = 0; pr < PRECISION_COUNT; pr++) {
+        m = spingalett_model_from_network(net, (PrecisionMode)pr);
+        CHECK(m && m->layer_count == 2, "graph folding: a transposed convolution keeps %u layers", m ? m->layer_count : 0);
+        if (m) {
+            spingalett_model_predict(m, y, 1, q);
+            static const float tolerance[PRECISION_COUNT] = {1e-5f, 5e-3f, 3e-2f, 6e-2f, 0.6f, 1.0f};
+            CHECK(fabsf(p[0] - q[0]) < tolerance[pr] && fabsf(p[1] - q[1]) < tolerance[pr],
+                  "graph folding: transposed convolution, precision %d: %g %g vs %g %g", pr, q[0], q[1], p[0], p[1]);
+        }
+        spingalett_model_free(m);
+    }
+    free_network(net);
 }
 
 /* Builders reject inputs that do not fit; unused layers fail training and prediction; corrupt
@@ -3882,6 +3958,8 @@ static void onnx_models(void) {
     static const struct { const char *name; uint32_t layers; LossFunction loss; } cases[] = {
         {"onnx_mlp", 4, LOSS_CROSS_ENTROPY}, {"onnx_cnn", 6, LOSS_MSE}, {"onnx_resnet", 15, LOSS_CROSS_ENTROPY},
         {"onnx_resnet_dynamo", 0, LOSS_CROSS_ENTROPY}, {"onnx_matmul", 2, LOSS_CROSS_ENTROPY},
+        {"onnx_unet", 14, LOSS_CROSS_ENTROPY}, {"onnx_unet_dynamo", 14, LOSS_CROSS_ENTROPY},
+        {"onnx_layernorm", 6, LOSS_CROSS_ENTROPY}, {"onnx_layernorm_dynamo", 6, LOSS_CROSS_ENTROPY},
     };
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         char path[512];
@@ -3949,7 +4027,7 @@ static void onnx_models(void) {
     snprintf(path, sizeof path, "%s/onnx_unsupported.onnx", SPINGALETT_TEST_DATA_DIR);
     spingalett_clear_error();
     CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Resize"),
-          "an unsupported operator: %s", spingalett_last_error_message());
+          "an unsupported Resize: %s", spingalett_last_error_message());
     static const unsigned char junk[] = {0x0a, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x12};
     CHECK(!spingalett_import_onnx_from_memory(junk, sizeof junk) && !spingalett_import_onnx_from_memory(junk, 0) &&
           !spingalett_import_onnx_from_memory(NULL, 4), "junk accepted as an ONNX model");
@@ -4028,11 +4106,53 @@ static void pytorch_weights(void) {
     free(data);
 }
 
+/* A grouped transposed convolution and layer normalization over the channels from a state dict. */
+static void pytorch_transposed(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/torch_transposed.bin", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *data = read_file(path, &size);
+    CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+    if (!data) return;
+    uint32_t n = rd32(data + 4), in = rd32(data + 8), out = rd32(data + 12);
+    const float *x = (const float *)(const void *)(data + 16), *expected = x + (size_t)n * in;
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_RELU);
+    conv_transpose2d(.net = net, .filters = 6, .kernel = 3, .stride = 2, .padding = 1, .output_padding = 1, .groups = 2,
+                     .act_func = ACT_NONE);
+    layer_norm(.net = net, .act_func = ACT_TANH);
+    global_avg_pool2d(.net = net);
+    layer(.net = net, .neurons_amount = 4, .act_func = ACT_NONE);
+    snprintf(path, sizeof path, "%s/torch_transposed.pt", SPINGALETT_TEST_DATA_DIR);
+    CHECK(spingalett_load_pytorch(net, path, NULL, 0), "torch_transposed.pt: %s", spingalett_last_error_message());
+    float *y = malloc((size_t)n * out * sizeof(float)), worst = 0.0f;
+    predict(.net = net, .inputs = x, .sample_count = n, .outputs = y);
+    for (size_t i = 0; i < (size_t)n * out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
+    CHECK(worst < 1e-5f && in == spingalett_input_size(net) && out == spingalett_output_size(net),
+          "torch_transposed.pt: outputs differ from PyTorch's by %g", worst);
+    printf("  %-22s |outputs - PyTorch| %.1e\n", "torch_transposed.pt", worst);
+    free_network(net);
+    /* a batch normalization where the network has a layer normalization: refused */
+    net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+    layer_norm(.net = net, .act_func = ACT_RELU);
+    snprintf(path, sizeof path, "%s/torch_cnn.pt", SPINGALETT_TEST_DATA_DIR);
+    static const char *const two[] = {"body.0", "body.1"};
+    CHECK(!spingalett_load_pytorch(net, path, two, 2) && strstr(spingalett_last_error_message(), "batch normalization"),
+          "a batch normalization for a layer normalization: %s", spingalett_last_error_message());
+    free_network(net);
+    free(y);
+    free(data);
+}
+
 /* ---- the GPU (COMPUTE_VULKAN) against the CPU ---- */
 
 /* Networks covering every kind of layer the GPU runs: dense layers, convolutions (strided, grouped,
    depthwise), pooling, batch normalization (of convolutions and of dense layers), residual additions,
-   concatenations, global pooling, dropout, layers feeding several others. */
+   concatenations, global pooling, dropout, layers feeding several others, transposed convolutions,
+   upsampling and layer normalization. */
 static NeuralNetwork *gpu_net(int which) {
     spingalett_seed(1234 + (uint64_t)which);
     NeuralNetwork *net = NULL;
@@ -4088,6 +4208,53 @@ static NeuralNetwork *gpu_net(int which) {
         uint32_t d = batch_norm(.net = net, .act_func = ACT_SIGMOID);
         add_layers(.net = net, .inputs = {a, b, d}, .act_func = ACT_LEAKY_RELU);
         layer(.net = net, .neurons_amount = 4, .act_func = ACT_SOFTMAX);
+        break;
+    }
+    case 6: {   /* a small U-Net: down by a strided convolution, up by a transposed one (whose input a
+                   pooling layer reads too) and by nearest upsampling, concatenated */
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 12, .width = 12, .channels = 4);
+        uint32_t a = conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_RELU);
+        uint32_t b = conv2d(.net = net, .filters = 16, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_RELU);
+        uint32_t c = conv_transpose2d(.net = net, .filters = 8, .kernel = 2, .stride = 2, .act_func = ACT_RELU);
+        uint32_t d = max_pool2d(.net = net, .inputs = {b}, .kernel = 2);
+        d = upsample2d(.net = net, .inputs = {d}, .stride = 4);
+        concat_layers(.net = net, .inputs = {a, c, d}, .act_func = ACT_NONE);
+        conv2d(.net = net, .filters = 8, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_TANH);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX);
+        break;
+    }
+    case 7: {   /* a grouped transposed convolution with padding and output padding, layer normalization
+                   of maps read by bilinear and nearest upsampling; maps out (wide rows of outputs) */
+        net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = net, .height = 5, .width = 6, .channels = 4);
+        conv_transpose2d(.net = net, .filters = 6, .kernel = 3, .stride = 2, .padding = 1, .output_padding = 1,
+                         .groups = 2, .act_func = ACT_NONE);
+        uint32_t b = layer_norm(.net = net, .act_func = ACT_TANH);
+        uint32_t c = upsample2d(.net = net, .stride_h = 2, .stride_w = 3, .upsample = UPSAMPLE_BILINEAR);
+        uint32_t d = upsample2d(.net = net, .inputs = {b}, .stride_h = 2, .stride_w = 3);
+        add_layers(.net = net, .inputs = {c, d}, .act_func = ACT_NONE);
+        conv2d(.net = net, .filters = 4, .kernel = 3, .stride = 3, .act_func = ACT_TANH);
+        conv2d(.net = net, .filters = 2, .kernel = 1, .act_func = ACT_SIGMOID);
+        break;
+    }
+    case 8: {   /* transposed convolutions of stride 1 and of a kernel smaller than the stride (output
+                   pixels no tap reaches), dropout, layer normalization of vectors read twice, a wide
+                   softmax */
+        net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 4, .width = 4, .channels = 3);
+        conv_transpose2d(.net = net, .filters = 4, .kernel = 3, .act_func = ACT_LEAKY_RELU);
+        conv_transpose2d(.net = net, .filters = 4, .kernel = 1, .stride = 2, .output_padding = 1, .act_func = ACT_RELU,
+                         .dropout_rate = 0.2f);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 24, .act_func = ACT_NONE);
+        uint32_t b = layer_norm(.net = net, .act_func = ACT_TANH);
+        uint32_t c = layer(.net = net, .neurons_amount = 16, .act_func = ACT_SIGMOID);
+        uint32_t d = layer(.net = net, .inputs = {b}, .neurons_amount = 16, .act_func = ACT_TANH);
+        add_layers(.net = net, .inputs = {c, d}, .act_func = ACT_NONE);
+        layer_norm(.net = net, .act_func = ACT_RELU);
+        layer(.net = net, .neurons_amount = 100, .act_func = ACT_SOFTMAX);
         break;
     }
     default:
@@ -4156,7 +4323,8 @@ static float *gpu_trained(int which, ComputeMode mode, const float *x, const flo
    Adam turns into steps; momentum keeps it still), and the same bits from two GPU runs. */
 static void gpu_equivalence(int which) {
     static const OptimizerType opts[] = {OPTIMIZER_SGD, OPTIMIZER_MOMENTUM, OPTIMIZER_MOMENTUM, OPTIMIZER_ADAMW,
-                                         OPTIMIZER_RMSPROP, OPTIMIZER_MOMENTUM};
+                                         OPTIMIZER_RMSPROP, OPTIMIZER_MOMENTUM, OPTIMIZER_ADAM, OPTIMIZER_MOMENTUM,
+                                         OPTIMIZER_ADAMW};
     NeuralNetwork *probe = gpu_net(which);
     SpingalettNetworkLayer first, last;
     spingalett_network_layer(probe, 0, &first);
@@ -4206,6 +4374,24 @@ static void gpu_equivalence(int which) {
            trained, full, same ? "yes" : "no");
     free(oc); free(og); free(og2); free(ofc); free(ofg); free(wc); free(wg); free(wg2); free(fc); free(fg);
     free(pc); free(pg); free(x); free(t);
+}
+
+/* The training loss of a sigmoid output saturated at 1, on the CPU and the GPU: finite, the same. */
+static void gpu_saturated(void) {
+    L ls[] = {{2, ACT_NONE}, {1, ACT_SIGMOID}};
+    const float x[] = {0, 0, 1, 0, 0, 0, 1, 0}, t[] = {1, 0, 1, 0};
+    float loss[2];
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = build(LOSS_CROSS_ENTROPY, ls, 2, (const float[]){0.0f, 0.0f}, (const float[]){100.0f});
+        spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+        TrainReport r = train(.net = net, .inputs = x, .targets = t, .sample_count = 4, .epochs = 1, .batch_size = 4,
+                              .training_strategy = STRATEGY_SMALL_BATCH, .learning_rate = 1e-6f, .report_interval = 0);
+        loss[k] = r.train_loss;
+        free_network(net);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    CHECK(isfinite(loss[0]) && fabsf(loss[0] - loss[1]) <= 1e-4f * loss[0],
+          "gpu: saturated sigmoid losses %g (CPU) / %g (GPU)", (double)loss[0], (double)loss[1]);
 }
 
 typedef struct { const float *x, *t; uint32_t n, in, out, at; } GpuServe;
@@ -4442,15 +4628,20 @@ static void gpu_trainer_run(int which, ComputeMode mode, float *params, size_t c
 }
 
 static void gpu_trainer(void) {
-    for (int which = 0; which <= 3; which++) {
+    /* nets 7 and 8 read and write the weights of a transposed convolution, which the device keeps
+       reordered (net 6's first Adam step, about lr times the sign of each gradient, turns the rounding
+       of builds without reassociation into differences of 1e-2) */
+    static const int nets[] = {0, 1, 2, 3, 7, 8};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
         NeuralNetwork *probe = gpu_net(which);
         const size_t count = spingalett_parameter_count(probe);
-        free_network(probe);
         float *p[3], loss[3][6], *y[3];
         for (int k = 0; k < 3; k++) {
             p[k] = (float *)malloc(count * sizeof(float));
-            y[k] = (float *)malloc(24 * 64 * sizeof(float));
+            y[k] = (float *)malloc((size_t)16 * spingalett_output_size(probe) * sizeof(float));
         }
+        free_network(probe);
         gpu_trainer_run(which, COMPUTE_OPENMP, p[0], count, loss[0], y[0]);
         gpu_trainer_run(which, COMPUTE_VULKAN, p[1], count, loss[1], y[1]);
         gpu_trainer_run(which, COMPUTE_VULKAN, p[2], count, loss[2], y[2]);
@@ -4472,7 +4663,9 @@ static void gpu_trainer(void) {
    per cent of single precision (8 bits of mantissa in the operands), training as far along (its
    loss), and repeating bit for bit. */
 static void gpu_bf16(void) {
-    for (int which = 0; which <= 2; which++) {
+    static const int nets[] = {0, 1, 2, 6};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
         NeuralNetwork *probe = gpu_net(which);
         SpingalettNetworkLayer first, last;
         spingalett_network_layer(probe, 0, &first);
@@ -4579,7 +4772,7 @@ int main(int argc, char **argv) {
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         TrainingStrategy strats[] = {STRATEGY_FULL_BATCH, STRATEGY_SMALL_BATCH};
         for (int m = 0; m < 3; m++) for (int s = 0; s < 2; s++)
-            for (int k = 0; k < 5; k++) graph_gradcheck(k, cm[m], strats[s]);
+            for (int k = 0; k < 8; k++) graph_gradcheck(k, cm[m], strats[s]);
         graph_determinism();
         for (int m = 0; m < 3; m++) graph_inference(cm[m]);
         graph_folding();
@@ -4589,6 +4782,7 @@ int main(int argc, char **argv) {
         printf("[ONNX import, PyTorch weights]\n");
         onnx_models();
         pytorch_weights();
+        pytorch_transposed();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");
@@ -4714,7 +4908,8 @@ int main(int argc, char **argv) {
             printf("  skipped: no usable Vulkan device\n");
         } else {
             printf("  device: %s\n", spingalett_gpu_device());
-            for (int k = 0; k < 6; k++) gpu_equivalence(k);
+            for (int k = 0; k < 9; k++) gpu_equivalence(k);
+            gpu_saturated();
             gpu_training_options();
             gpu_threads();
             gpu_trainer();

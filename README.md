@@ -45,8 +45,8 @@ the library inside) are included.
 
 | Area | Supported |
 |---|---|
-| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), max, average and global average pooling, batch normalization, addition and concatenation of layers; channels-last tensors; optional dropout per layer |
-| Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches), trained and run with outputs sharing memory at inference |
+| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), transposed 2D convolution (strides, padding, output padding, groups), max, average and global average pooling, nearest and bilinear upsampling, batch and layer normalization, addition and concatenation of layers; channels-last tensors; optional dropout per layer |
+| Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs) |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
@@ -129,7 +129,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.12 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 0.13 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -330,15 +330,71 @@ of its widest outputs, not for all of them. `spingalett_network_layer()` reports
 `inputs`, and `ModelTool info` lists them. `Examples/CIFAR10.c` builds ResNet-20 to ResNet-56
 (`resnet20`, `resnet32`, ...).
 
+### Transposed convolutions, upsampling and layer normalization
+
+`conv_transpose2d()` is the transpose of a convolution: each input cell spreads its channels over a
+window of the output through the filters, its windows `stride` cells apart, so a 2 x 2 kernel of
+stride 2 doubles the height and width. `upsample2d()` repeats or interpolates cells by integer
+factors, and `layer_norm()` normalizes each cell over its channels. With concatenations they make
+U-Nets, the expanding path joined to the maps of the same size on the way down:
+
+```c
+uint32_t e = conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1, .act_func = ACT_RELU);    /* 64 x 64 x 32 */
+max_pool2d(.net = net, .kernel = 2);                                                                /* 32 x 32 x 32 */
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1, .act_func = ACT_RELU);                  /* 32 x 32 x 64 */
+uint32_t u = conv_transpose2d(.net = net, .filters = 32, .kernel = 2, .stride = 2,
+                              .act_func = ACT_RELU);                                                 /* 64 x 64 x 32 */
+concat_layers(.net = net, .inputs = {e, u}, .act_func = ACT_NONE);                                   /* 64 x 64 x 64 */
+upsample2d(.net = net, .stride = 2, .upsample = UPSAMPLE_BILINEAR);                                  /* 128 x 128 x 64 */
+layer_norm(.net = net, .act_func = ACT_RELU);                                                        /* 128 x 128 x 64 */
+```
+
+| Builder | Arguments | Output, along each axis |
+|---|---|---|
+| `conv_transpose2d()` | `filters`, `kernel`, `stride`, `padding`, `output_padding` (each with `_h` and `_w` forms), `groups`, `act_func` | `(size - 1) stride - 2 padding + kernel + output_padding` cells |
+| `upsample2d()` | `stride` (or `stride_h`, `stride_w`): the factors, 2 by default; `upsample`: `UPSAMPLE_NEAREST` (default) or `UPSAMPLE_BILINEAR` | `size x factor` cells |
+| `layer_norm()` | `epsilon` (1e-5), `act_func` | the input's shape |
+
+- A transposed convolution's output padding (less than the stride) adds cells at the end of each
+  axis, so that the output can match the input of the convolution it transposes: a 3 x 3
+  convolution of stride 2 and padding 1 halves 64 cells to 32, and its transpose with
+  `.output_padding = 1` makes 64 again. Its filter `j` holds, at `(kh, kw, c)`, the weight by which
+  input channel `c` of its group reaches output channel `j` at offset `(kh, kw)` of the input
+  cell's window: `kernel_h x kernel_w x (input channels / groups)` weights an output channel, as a
+  convolution's filters have. It runs on the convolution kernels with the passes swapped: its
+  forward pass is the data gradient of the convolution it transposes (a phase of the stride at a
+  time, over the taps that reach it), its data gradient that convolution's forward pass.
+- Bilinear upsampling interpolates between the cells' centres, repeating the cells at the edges
+  (PyTorch's `align_corners=False`); its weights come from integers, so every platform computes
+  the same ones. Upsampling has no parameters and no activation.
+- Layer normalization computes the mean and variance of each cell's channels (a dense layer's
+  outputs are a single cell): `y = act(gamma (x - mean) / sqrt(var + epsilon) + beta)`, gamma and
+  beta per channel. It has no running statistics, so training and inference compute the same at any
+  batch size; weight decay leaves gamma alone. Unlike batch normalization it is not folded into the
+  layer before it: deployment models and the engine run it as a layer of its own.
+- All three train on the CPU and the GPU, save in `.slett` format version 7, and run in deployment
+  models in every precision and in the engine; batch normalization after a transposed convolution
+  is folded into it. Float deployment models run transposed convolutions through the same kernels
+  as training, integer ones through the engine's pass.
+
+`Examples/Segmentation.c` segments synthetic images of circles, squares and triangles with a U-Net
+of transposed convolutions (or bilinear upsampling, or layer normalization): 12 epochs take 15 s on
+an RTX 4050 Laptop GPU and reach a mean intersection over union of 0.88, which its INT8 model keeps
+(see [Performance](#performance)).
+
 ### Importing models: ONNX and PyTorch
 
 `spingalett_import_onnx(path)` (or `_from_memory`) turns an ONNX model into a network that trains,
-saves and deploys like any other: convolutions with groups, Gemm and MatMul, max, average and
-global average pooling, batch normalization, Add, Concat along the channels, Relu, Sigmoid, Tanh,
-LeakyRelu, Softmax, Flatten and flattening Reshape, Identity and Dropout. The reader of the protocol
-buffer format is the library's own; an operator it does not have is named in the error. Spingalett
-works channels-last, so an ONNX input of shape `[N, C, H, W]` becomes an input layer of
-`H x W x C`: transpose NCHW images before feeding them (`x.transpose(0, 2, 3, 1)` in NumPy).
+saves and deploys like any other: convolutions and transposed convolutions with groups, Gemm and
+MatMul, max, average and global average pooling, batch normalization, layer normalization (over a
+vector, or over a map's channels between Transposes to channels last and back, as LayerNorm2d
+modules export it), Resize and Upsample by integer factors (nearest, or linear between the cells'
+centres), Add, Concat along the channels, Relu, Sigmoid, Tanh, LeakyRelu, Softmax, Flatten and
+flattening Reshape, Identity and Dropout. The reader of the protocol buffer format is the library's
+own; an operator it does not have, or a mode of one that it does not compute (a Resize with aligned
+corners, say), is named in the error. Spingalett works channels-last, so an ONNX input of shape
+`[N, C, H, W]` becomes an input layer of `H x W x C`: transpose NCHW images before feeding them
+(`x.transpose(0, 2, 3, 1)` in NumPy), and maps come out channels last too.
 Weights are reordered on import, including the columns of a dense layer after a flattened map, so
 the network computes what the model does. `ModelTool import model.onnx model.slett` converts a
 file; models exported from PyTorch with either exporter agree with PyTorch within 1e-7. Weights kept
@@ -352,9 +408,11 @@ PyTorch weights load into a network built with the same layers:
 (or a checkpoint dictionary holding one) or a `.safetensors` file. Modules are matched to layers
 with parameters in order (the state dict's order, or the natural order of the names in
 safetensors files, which sort them; a list of module names gives any order), shapes are checked
-and the network is left unchanged when anything does not fit. The pickle inside `.pt` files is
-interpreted without running any of it: only dictionaries of tensors are understood (tensors that
-are views, such as a transposed weight, load as well).
+and the network is left unchanged when anything does not fit. `ConvTranspose2d` modules (weight
+`[in, out / groups, kh, kw]`) load into transposed convolutions, `LayerNorm` modules over the
+channels into layer normalizations. The pickle inside `.pt` files is interpreted without running
+any of it: only dictionaries of tensors are understood (tensors that are views, such as a
+transposed weight, load as well).
 
 ```c
 NeuralNetwork *net = spingalett_import_onnx("resnet.onnx");      /* NULL on error */
@@ -881,7 +939,8 @@ Sapphire Rapids), one sample at a time and batched:
 
 ### Running in place
 
-A model is a view of a `.slett` image (format version 3, or 4 with convolutions).
+A model is a view of a `.slett` image (format version 3 or later: 4 with convolutions, 6 for graphs, 7 with
+transposed convolutions, upsampling or layer normalization).
 `spingalett_model_init()` checks an image (header, shapes, bounds, CRC-32) and copies nothing; `spingalett_model_run()` evaluates one sample with a
 workspace from the caller and allocates nothing either:
 
@@ -981,16 +1040,19 @@ training (batches of 64, one epoch) and batched inference; then the convolutiona
 128 with AdamW, and inference, without and with batch normalization after each convolution and the
 hidden dense layer; and ResNet-20 (`Examples/CIFAR10.c resnet20`, 273K parameters, 54 layers) on
 4,096 synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with SGD and momentum, and
-inference. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch. Run them with
-`Bin/Benchmark [threads]` and `python Examples/benchmark_pytorch.py [threads]`.
+inference; and the U-Net of `Examples/Segmentation.c` (118K parameters, 28 layers: transposed
+convolutions, concatenations, three sigmoid outputs a pixel) on 1,024 synthetic 64 x 64 x 3 images:
+one epoch of mini-batches of 32 with AdamW, and inference. `Examples/benchmark_pytorch.py` runs the
+same workloads in PyTorch. Run them with `Bin/Benchmark [threads]` and
+`python Examples/benchmark_pytorch.py [threads]`.
 
 Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 efficiency cores, AVX2
 and AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16
 and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel
 MKL and oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13
 to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was;
-0.11 and 0.12 leave all of them as they were on the CPU (within 3% of the release before in
-interleaved runs):
+0.11 to 0.13 leave all of them as they were on the CPU (within 4% of the release before, either
+way, in interleaved runs). The U-Net, new in 0.13, is measured with 0.13:
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
@@ -1018,17 +1080,25 @@ interleaved runs):
 | Spingalett (OpenMP) | 8 | 1,584 | 6,402 |
 | PyTorch | 8 | 896 | 2,323 |
 
+| U-Net, 64 x 64 | Threads | Training | Inference |
+|---|---:|---:|---:|
+| Spingalett | 1 | 146 | 511 |
+| PyTorch | 1 | 134 | 292 |
+| Spingalett (OpenMP) | 8 | 598 | 2,467 |
+| PyTorch | 8 | 365 | 754 |
+
 Spingalett trains the convolutional network 1.4 to 2.3 times as fast as PyTorch and runs it 2.6 to
 3.9 times as fast; with batch normalization 1.5 to 2.4 times and 3.4 to 5.5 times, since the
 normalization runs in the convolution's epilogue at inference. ResNet-20 trains 1.1 to 1.8 times as
-fast and runs 1.5 to 2.8 times as fast. For the fully connected network Spingalett trains
-mini-batches 1.9 to 2 times as fast, full batches 1.1 to 1.6 times and infers 1.1 to 1.7 times as
-fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: built without them
+fast and runs 1.5 to 2.8 times as fast, the U-Net 1.1 to 1.6 times and 1.7 to 3.3 times. For the
+fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast, full batches 1.1 to
+1.6 times and infers 1.1 to 1.7 times as fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: built without them
 (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
 and 4,798.
 
 On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 0.12 runs
-the same workloads with `COMPUTE_VULKAN` (`Bin/Benchmark gpu`), in single precision and with its
+the same workloads (0.13 the U-Net; it runs the others within 5% of 0.12, either way) with
+`COMPUTE_VULKAN` (`Bin/Benchmark gpu`), in single precision and with its
 matrix products in bfloat16 (`spingalett_set_gpu_precision()`), against PyTorch 2.14.1 with CUDA
 13.0 and cuDNN (`python Examples/benchmark_pytorch.py --cuda`, with PyTorch's default TF32
 convolutions, `--cuda-fp32`, and `--cuda-bf16`: autocast to bfloat16), medians of three
@@ -1046,6 +1116,8 @@ and copies every batch to the GPU, overlapped with the work on the batch before:
 | Fully connected network, mini-batch 64 | 225,500 | 264,100 | 98,290 | 97,520 | 77,320 |
 | Fully connected network, full batch | 599,600 | 809,000 | 1,032,600 | 1,035,900 | 2,538,500 |
 | Fully connected network, inference | 1,144,000 | 1,329,000 | 2,947,600 | 2,948,200 | 6,187,600 |
+| U-Net, training | 3,279 | 3,707 | 3,283 | 3,059 | 4,950 |
+| U-Net, inference | 6,552 | 6,880 | 6,329 | 6,564 | 11,918 |
 
 In single precision Spingalett trains ResNet-20 on the GPU 5.5 times as fast as on the eight
 threads of the CPU, 1.08 times as fast as PyTorch with TF32 and 1.27 times as fast as PyTorch in
@@ -1058,6 +1130,10 @@ times as fast, while Spingalett runs the plain convolutional network 1.1 times a
 mini-batches 3.4 times as fast. PyTorch leads on large dense products:
 full batches of the fully connected network train at 60% of its speed in single precision, and
 inference runs at 40%, most of that time spent copying the 20,000 samples (63 MB) from host memory.
+The U-Net trains and runs as fast as in PyTorch in single precision (5.5 and 2.7 times as fast as
+on the CPU), its 64 x 64 maps of 16 to 64 channels bound by memory more than by arithmetic: there
+autocast, which keeps activations in bfloat16, trains 1.3 times and infers 1.7 times as fast as
+Spingalett's bfloat16 products, which read and write single precision.
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
@@ -1109,6 +1185,10 @@ Sapphire Rapids VM (760 images per second with augmentation); its INT8 model kee
 `resnet20` it reaches 91.55% after 100 epochs (12 threads of the i7-12650H, before the indirect
 kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB), and the same 91.55% trained on the
 RTX 4050 Laptop GPU (`gpu`) in 9 minutes; with `resnet32`, 92.39% (INT8 model 92.43% in 480 KB).
+`Examples/Segmentation.c` reaches a mean intersection over union of 0.882 on its test images
+(circles 0.925, squares 0.866, triangles 0.855; 98.5% of the pixels right) after 12 epochs of 4,096
+new images, 15 s on the RTX 4050 and 80 s on the i7-12650H's CPU; its INT8 model keeps 0.878, and
+predicts 3,400 images a second on the CPU against 3,100 for the FP32 model.
 
 ## Project layout
 
@@ -1117,8 +1197,8 @@ Include/Spingalett/   Public headers (Spingalett.h, the inference engine's Sping
                       and the CMake-generated configuration header template
 Src/                  Library sources (network, training, kernels, serialization, inference engine, ...)
 Src/Gpu/              The Vulkan GPU backend: device layer, network executor and compute shaders
-Examples/             XOR, MNIST (dense and convolutional), throughput benchmark (C and PyTorch
-                      counterpart), DatasetTool, ModelTool
+Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, throughput
+                      benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets)
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
@@ -1129,17 +1209,17 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.12; the C API may still change between minor versions (see
+Spingalett is at version 0.13; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
-(`libspingalett.so.0.12`). Since 0.7 the network is an opaque handle, so its internal layout can
+(`libspingalett.so.0.13`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
-engine and model format versions 3 to 6 are meant to stay stable from here on.
+engine and model format versions 3 to 7 are meant to stay stable from here on.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 0.13: transposed convolutions, upsampling and layer normalization (U-Net-style networks, more of
-  ONNX), deployment models on the GPU, fewer GPU passes
-- 1.0: API freeze, C++ wrapper
+- 0.14, the release candidate: every public name under the library's prefix, structs that can
+  grow, the formats frozen, a C++ wrapper
+- 1.0: the API and ABI frozen
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 
 ## Contributing

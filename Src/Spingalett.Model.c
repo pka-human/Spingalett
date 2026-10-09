@@ -33,6 +33,8 @@ typedef struct {
     int8_t *interleaved;                        /* rows interleaved for tiles of samples or pixels
                                                    (spingalett_i8_interleaved_tile) */
     int32_t *tile_sums;                         /* the sums of the interleaved rows */
+    float *filters;                             /* a float transposed convolution's filters as those of the
+                                                   convolution whose data gradient it is */
     bool ready;                                 /* all but a dense layer's interleaved rows are built */
 } PreparedLayer;
 
@@ -178,6 +180,7 @@ static void prepared_free(PreparedLayer *layers, uint32_t count) {
         spingalett_aligned_free(p->sums);
         spingalett_aligned_free(p->interleaved);
         spingalett_aligned_free(p->tile_sums);
+        spingalett_aligned_free(p->filters);
     }
     free(layers);
 }
@@ -257,9 +260,33 @@ static bool prepare_tiles(const uint8_t *image, const SlettLayer *L, const int8_
 /* Builds what layer L runs on in every call (pieces already there are kept, so a failed attempt
    can be resumed). */
 static bool prepare_layer(const uint8_t *image, const SlettLayer *L, PreparedLayer *p) {
-    if (L->rows == 0 || L->type == LAYER_BATCH_NORM) return true;      /* pooling, normalization */
+    /* pooling, normalizations, and integer transposed convolutions, which read the image as the engine does */
+    const bool transposed = L->type == LAYER_CONV_TRANSPOSE2D;
+    if (L->rows == 0 || L->type == LAYER_BATCH_NORM || L->type == LAYER_LAYER_NORM ||
+        (transposed && spingalett_precision_is_int(L->precision)))
+        return true;
     const size_t n = (size_t)L->rows * L->row_len;
     const uint8_t *src = image + L->weights;
+    if (transposed) {
+        /* float filters as the convolution's whose data gradient the layer is (batched like training) */
+        if (p->filters) return true;
+        float *wc = (float *)spingalett_aligned_alloc(n * sizeof(float));
+        float *w = L->precision == PRECISION_FLOAT32 ? NULL : (float *)spingalett_aligned_alloc(n * sizeof(float));
+        if (!wc || (L->precision != PRECISION_FLOAT32 && !w)) {
+            spingalett_aligned_free(wc);
+            spingalett_aligned_free(w);
+            return false;
+        }
+        for (size_t k = 0; w && k < n; k++) {
+            uint16_t h = slett_get16(src + 2u * k);
+            w[k] = L->precision == PRECISION_FP16 ? spingalett_fp16_to_float(h) : spingalett_bf16_to_float(h);
+        }
+        LayerShape in = input_shape(L), out = output_shape(L);
+        spingalett_transposed_conv_filters(w ? w : (const float *)(const void *)src, &in, &out, wc);
+        spingalett_aligned_free(w);
+        p->filters = wc;
+        return true;
+    }
     if ((L->precision == PRECISION_FP16 || L->precision == PRECISION_BFLOAT16) && !p->dequant) {
         float *d = (float *)spingalett_aligned_alloc(n * sizeof(float));
         if (!d) return false;
@@ -325,14 +352,27 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
     w->chunk = chunk;
     w->mode = mode;
     w->dense_tiles = dense_tiles;
-    uint32_t int_inputs = 0, int_window = 0, norm_channels = 0;
+    uint32_t int_inputs = 0, int_window = 0, norm_channels = 0, transposed_window = 0;
     size_t conv_floats = 0, tile_x = 0, tile_acc = 0;
     bool has_float = false, ok = true;
     for (uint32_t i = 0; i < model->layer_count; i++) {
         SlettLayer L;
         spingalett_slett_layer(image, i, &L);
         if (L.type == LAYER_BATCH_NORM && L.out_c > norm_channels) norm_channels = L.out_c;
-        if (L.rows == 0 || L.type == LAYER_BATCH_NORM) continue;      /* pooling, normalization */
+        if (L.type == LAYER_CONV_TRANSPOSE2D && spingalett_precision_is_int(L.precision)) {
+            /* the engine's pass, sample by sample: a window per thread, the quantized input */
+            if (slett_conv_scratch(&L) > transposed_window) transposed_window = (uint32_t)slett_conv_scratch(&L);
+            if (L.inputs > int_inputs) int_inputs = L.inputs;
+            continue;
+        }
+        if (L.type == LAYER_CONV_TRANSPOSE2D) {
+            LayerShape in = input_shape(&L), out = output_shape(&L);
+            size_t need = spingalett_conv_transpose_scratch(&in, &out, chunk, mode);
+            if (need > conv_floats) conv_floats = need;
+            has_float = true;
+            continue;
+        }
+        if (L.rows == 0 || L.type == LAYER_BATCH_NORM || L.type == LAYER_LAYER_NORM) continue;      /* pooling, normalizations */
         bool conv = L.type == LAYER_CONV2D;
         if (spingalett_precision_is_int(L.precision)) {
             if (L.inputs > int_inputs) int_inputs = L.inputs;
@@ -364,15 +404,16 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
         w->act[1] = (float *)workspace_alloc(w, width * sizeof(float));
         ok = w->act[0] && w->act[1];
     }
+    if (ok && (int_window || transposed_window)) {
+        size_t window = int_window > transposed_window ? int_window : transposed_window;
+        w->window_stride = (window + 63u) & ~(size_t)63u;      /* threads on their own cache lines */
+        w->window = (int8_t *)workspace_alloc(w, (size_t)w->threads * w->window_stride);
+        ok = w->window != NULL;
+    }
     if (ok && int_inputs) {
         w->xq = (int8_t *)workspace_alloc(w, (size_t)chunk * int_inputs);
         w->xs = (float *)workspace_alloc(w, (size_t)chunk * sizeof(float));
         ok = w->xq && w->xs;
-        if (ok && int_window) {
-            w->window_stride = ((size_t)int_window + 63u) & ~(size_t)63u;    /* threads on their own cache lines */
-            w->window = (int8_t *)workspace_alloc(w, (size_t)w->threads * w->window_stride);
-            ok = w->window != NULL;
-        }
         if (ok && tile_x) {
             w->tile_sums = (tile_x + 63u) & ~(size_t)63u;
             w->tile_stride = (w->tile_sums + tile_acc + 63u) & ~(size_t)63u;
@@ -586,6 +627,40 @@ static void predict_layer(const uint8_t *image, const SlettLayer *L, const Prepa
     const float *dequant = prep->dequant;
     const float *bias = (const float *)(const void *)(image + L->biases);
 
+    if (L->type == LAYER_LAYER_NORM || L->type == LAYER_UPSAMPLE) {
+        /* sample by sample, as the engine computes them */
+        const float *gamma = (const float *)(const void *)(image + L->weights);
+        SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, (uint64_t)n * out),
+            for (int64_t s = 0; s < (int64_t)n; s++) {
+                const float *xs = x + (size_t)s * in;
+                float *ys = y + (size_t)s * out;
+                if (L->type == LAYER_UPSAMPLE)
+                    spingalett_engine_upsample(xs, L->in_h, L->in_w, L->in_c, L->stride_h, L->stride_w, L->mode, ys);
+                else
+                    spingalett_engine_layer_norm(xs, L->out_h * L->out_w, L->out_c, gamma, bias, L->eps, ys, NULL);
+                spingalett_engine_activate(ys, out, L->activation);
+            }
+        );
+        return;
+    }
+    if (L->type == LAYER_CONV_TRANSPOSE2D && !spingalett_precision_is_int(L->precision)) {
+        /* the batch through the convolution kernels, as training computes it */
+        LayerShape is = input_shape(L), os = output_shape(L);
+        spingalett_conv_transpose_shapes(&is, &os, prep->filters, bias, x, y, n, L->activation, w->conv, w->gemm, mode);
+        if (L->activation == ACT_SOFTMAX) activate_samples(y, n, out, ACT_SOFTMAX, mode);
+        return;
+    }
+    if (L->type == LAYER_CONV_TRANSPOSE2D) {
+        /* the engine's pass on each sample, which integer models must compute exactly */
+        SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, (uint64_t)n * out * L->row_len),
+            for (int64_t s = 0; s < (int64_t)n; s++) {
+                int8_t *window = w->window + (size_t)spingalett_thread_num() * w->window_stride;
+                spingalett_engine_conv_transpose(image, L, x + (size_t)s * in, y + (size_t)s * out,
+                                                 w->xq + (size_t)s * in, window);
+            }
+        );
+        return;
+    }
     if (L->type == LAYER_BATCH_NORM) {
         /* as the engine computes it: y = x a + b per channel, then the activation */
         const uint32_t C = L->out_c;

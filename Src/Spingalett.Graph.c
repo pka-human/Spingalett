@@ -241,3 +241,63 @@ void spingalett_gradient_sum(float *delta, const float *add, const float *y, con
     );
     (void)mode;
 }
+
+/* ---- upsampling ---- */
+
+void spingalett_upsample_forward(const float *x, float *y, uint32_t n, uint32_t in_h, uint32_t in_w, uint32_t C,
+                                 uint32_t sh, uint32_t sw, uint32_t upsample, ComputeMode mode) {
+    const uint64_t in = (uint64_t)in_h * in_w * C, out = in * sh * sw;
+    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * out),
+        for (int64_t s = 0; s < (int64_t)n; s++)
+            spingalett_engine_upsample(x + (uint64_t)s * in, in_h, in_w, C, sh, sw, upsample, y + (uint64_t)s * out);
+    );
+    (void)mode;
+}
+
+/* dx = the gradient of each input cell: the sum of its block (nearest), or what the bilinear weights
+   send back to it, the output cells taken in order (deterministic: one sample at a time per thread) */
+void spingalett_upsample_backward(const float *dy, float *dx, const float *x, uint32_t n, uint32_t in_h, uint32_t in_w,
+                                  uint32_t C, uint32_t sh, uint32_t sw, uint32_t upsample, ActivationFunction act,
+                                  bool accumulate, ComputeMode mode) {
+    const uint32_t H = in_h * sh, W = in_w * sw;
+    const uint64_t in = (uint64_t)in_h * in_w * C, out = (uint64_t)H * W * C;
+    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * out),
+        for (int64_t s = 0; s < (int64_t)n; s++) {
+            const float *g = dy + (uint64_t)s * out;
+            float *d = dx + (uint64_t)s * in;
+            if (!accumulate) memset(d, 0, in * sizeof(float));
+            if (upsample == UPSAMPLE_NEAREST) {
+                for (uint32_t oy = 0; oy < H; oy++)
+                    for (uint32_t ox = 0; ox < W; ox++) {
+                        float *restrict cell = d + ((uint64_t)(oy / sh) * in_w + ox / sw) * C;
+                        const float *restrict v = g + ((uint64_t)oy * W + ox) * C;
+                        for (uint32_t c = 0; c < C; c++) cell[c] += v[c];
+                    }
+            } else {
+                for (uint32_t oy = 0; oy < H; oy++) {
+                    uint32_t y0, y1, x0, x1;
+                    float ly, lx;
+                    spingalett_engine_bilinear(oy, sh, in_h, &y0, &y1, &ly);
+                    const float hy = 1.0f - ly;
+                    for (uint32_t ox = 0; ox < W; ox++) {
+                        spingalett_engine_bilinear(ox, sw, in_w, &x0, &x1, &lx);
+                        const float hx = 1.0f - lx;
+                        const float w00 = hy * hx, w01 = hy * lx, w10 = ly * hx, w11 = ly * lx;
+                        /* the four cells coincide at the edges: no restrict */
+                        float *a = d + ((uint64_t)y0 * in_w + x0) * C, *b = d + ((uint64_t)y0 * in_w + x1) * C;
+                        float *cc = d + ((uint64_t)y1 * in_w + x0) * C, *e = d + ((uint64_t)y1 * in_w + x1) * C;
+                        const float *restrict v = g + ((uint64_t)oy * W + ox) * C;
+                        for (uint32_t c = 0; c < C; c++) {
+                            a[c] += w00 * v[c];
+                            b[c] += w01 * v[c];
+                            cc[c] += w10 * v[c];
+                            e[c] += w11 * v[c];
+                        }
+                    }
+                }
+            }
+            if (act != ACT_NONE) apply_derivative_batch(d, x + (uint64_t)s * in, in, act);
+        }
+    );
+    (void)mode;
+}

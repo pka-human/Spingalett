@@ -1,0 +1,102 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Layer normalization of channels-last cells, as Spingalett.Norm.c computes it: each of `cells`
+ * cells normalized over its C channels, y = act(gamma (x - mean) rstd + beta), rstd =
+ * 1 / sqrt(var + eps), the variance the mean of the squared differences from the mean.
+ *
+ * T threads (a power of two) share a cell: thread j takes channels j, j + T, ... in order, and the
+ * threads' sums are added in a fixed tree, so the results do not depend on scheduling.
+ *
+ * Forward: with STATS (training), each cell's mean and rstd are kept in stats[2 cell], [2 cell + 1].
+ * Backward: dx = rstd (gamma dy - (a + xhat b) / C), a and b the cell's sums of gamma dy and of
+ * gamma dy xhat, xhat = (x - mean) rstd; times the derivative of the input layer's activation.
+ * The parameters' gradients are column sums (colsum.comp, mode LN).
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint T = 8;
+layout(constant_id = 1) const uint BACKWARD = 0;
+layout(constant_id = 2) const uint ACT = 6;     /* forward: the layer's activation; backward: its input's */
+layout(local_size_x = 256) in;
+
+#define FLAG_STATS 1u
+
+layout(push_constant) uniform Push {
+    F32 x, y, dy, gamma, beta, stats;   /* backward: y is dx */
+    uint cells, C, flags;
+    float eps;
+} p;
+
+shared float s1[256], s2[256];
+
+/* s[the cell's first thread] = the sum of its T threads' values (uniform control flow) */
+void tree(uint tid, uint lane, bool both) {
+    barrier();
+    for (uint h = T / 2u; h > 0u; h /= 2u) {
+        if (lane < h) {
+            s1[tid] += s1[tid + h];
+            if (both) s2[tid] += s2[tid + h];
+        }
+        barrier();
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = tid % T, first = tid - lane, per = 256u / T, C = p.C;
+    const float inv = 1.0 / float(C);
+    for (uint base = gl_WorkGroupID.x * per; base < p.cells; base += gl_NumWorkGroups.x * per) {
+        const uint cell = base + tid / T, at = cell * C;
+        const bool live = cell < p.cells;
+        if (BACKWARD == 0u) {
+            float sum = 0.0;
+            if (live) for (uint c = lane; c < C; c += T) sum += p.x.v[at + c];
+            s1[tid] = sum;
+            tree(tid, lane, false);
+            const float mean = s1[first] * inv;
+            float var = 0.0;
+            if (live)
+                for (uint c = lane; c < C; c += T) {
+                    float d = p.x.v[at + c] - mean;
+                    var = fma(d, d, var);
+                }
+            barrier();                  /* every thread has read the mean */
+            s1[tid] = var;
+            tree(tid, lane, false);
+            const float rstd = 1.0 / sqrt(s1[first] * inv + p.eps);
+            if (live) {
+                for (uint c = lane; c < C; c += T)
+                    p.y.v[at + c] = activate((p.x.v[at + c] - mean) * rstd * p.gamma.v[c] + p.beta.v[c], ACT);
+                if ((p.flags & FLAG_STATS) != 0u && lane == 0u) {
+                    p.stats.v[2u * cell] = mean;
+                    p.stats.v[2u * cell + 1u] = rstd;
+                }
+            }
+        } else {
+            const float mean = live ? p.stats.v[2u * cell] : 0.0, rstd = live ? p.stats.v[2u * cell + 1u] : 0.0;
+            float a = 0.0, b = 0.0;
+            if (live)
+                for (uint c = lane; c < C; c += T) {
+                    float gc = p.gamma.v[c] * p.dy.v[at + c];
+                    a += gc;
+                    b = fma(gc, (p.x.v[at + c] - mean) * rstd, b);
+                }
+            s1[tid] = a;
+            s2[tid] = b;
+            tree(tid, lane, true);
+            const float sa = s1[first], sb = s2[first];
+            if (live)
+                for (uint c = lane; c < C; c += T) {
+                    const float v = p.x.v[at + c], xhat = (v - mean) * rstd;
+                    float d = rstd * (p.gamma.v[c] * p.dy.v[at + c] - (sa + xhat * sb) * inv);
+                    p.y.v[at + c] = ACT == ACT_NONE ? d : d * derivative(v, ACT);
+                }
+        }
+        barrier();                      /* the sums are read before the next cells write them */
+    }
+}

@@ -1,0 +1,114 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Upsampling of channels-last samples by integer factors, as Spingalett.Graph.c and the engine
+ * compute it: nearest repeats each input cell over a block of SH x SW, bilinear interpolates between
+ * the cells' centres (PyTorch's align_corners=False) with the edges repeated, its weights derived
+ * from integers.
+ *
+ * Forward: one thread per output, then act(). Backward: one thread per input cell, which adds what
+ * the output cells reading it send back, in row order as the CPU adds them, to zero or (ACCUMULATE)
+ * to what dx holds, then multiplies by the derivative of the input layer's activation: no cell is
+ * written twice.
+ */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint BILINEAR = 0;
+layout(constant_id = 1) const uint BACKWARD = 0;
+layout(constant_id = 2) const uint ACT = 6;     /* forward: the layer's activation; backward: its input's */
+layout(local_size_x = 256) in;
+
+#define FLAG_ACCUMULATE 1u
+
+layout(push_constant) uniform Push {
+    F32 x, y, dy, dx;
+    uint n, H, W, C, SH, SW;
+    uint flags;
+} p;
+
+/* spingalett_engine_bilinear(): output row o of factor f over `size` rows reads rows r0 and r1, the
+   second weighted w (source coordinate (2 o + 1 - f) / 2 f, clamped at 0) */
+void bilinear(uint o, uint f, uint size, out uint r0, out uint r1, out float w) {
+    const int num = 2 * int(o) + 1 - int(f), den = 2 * int(f);
+    if (num <= 0) {
+        r0 = 0u; r1 = 0u; w = 0.0;
+        return;
+    }
+    r0 = uint(num / den);
+    r1 = r0 + 1u < size ? r0 + 1u : r0;
+    w = float(num % den) / float(den);
+}
+
+/* The output rows (or columns) of factor f that read input row i: r0 is i - 1 or i, so the source
+   coordinate lies in [i - 1, i + 1) */
+void readers(uint i, uint f, uint out_size, out uint o0, out uint o1) {
+    o0 = i == 0u ? 0u : (2u * f * (i - 1u) + f) / 2u;
+    o1 = min((2u * f * (i + 1u) + f) / 2u, out_size);
+}
+
+void main() {
+    const uint C = p.C, OH = p.H * p.SH, OW = p.W * p.SW, stride = gl_NumWorkGroups.x * 256u;
+    if (BACKWARD == 0u) {
+        const uint total = p.n * OH * OW * C;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            uint c = i % C, q = i / C, ox = q % OW, oy = (q / OW) % OH, s = q / (OW * OH);
+            const uint base = s * p.H * p.W * C + c;
+            float v;
+            if (BILINEAR == 0u) {
+                v = p.x.v[base + ((oy / p.SH) * p.W + ox / p.SW) * C];
+            } else {
+                uint y0, y1, x0, x1;
+                float ly, lx;
+                bilinear(oy, p.SH, p.H, y0, y1, ly);
+                bilinear(ox, p.SW, p.W, x0, x1, lx);
+                const float hy = 1.0 - ly, hx = 1.0 - lx;
+                float top = hx * p.x.v[base + (y0 * p.W + x0) * C] + lx * p.x.v[base + (y0 * p.W + x1) * C];
+                float bottom = hx * p.x.v[base + (y1 * p.W + x0) * C] + lx * p.x.v[base + (y1 * p.W + x1) * C];
+                v = hy * top + ly * bottom;
+            }
+            p.y.v[i] = activate(v, ACT);
+        }
+        return;
+    }
+
+    const uint total = p.n * p.H * p.W * C;
+    const bool accumulate = (p.flags & FLAG_ACCUMULATE) != 0u;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        uint c = i % C, q = i / C, ix = q % p.W, iy = (q / p.W) % p.H, s = q / (p.W * p.H);
+        const uint obase = s * OH * OW * C + c;
+        float g = accumulate ? p.dx.v[i] : 0.0;
+        if (BILINEAR == 0u) {
+            for (uint oy = iy * p.SH; oy < (iy + 1u) * p.SH; oy++)
+                for (uint ox = ix * p.SW; ox < (ix + 1u) * p.SW; ox++) g += p.dy.v[obase + (oy * OW + ox) * C];
+        } else {
+            uint oy0, oy1, ox0, ox1;
+            readers(iy, p.SH, OH, oy0, oy1);
+            readers(ix, p.SW, OW, ox0, ox1);
+            for (uint oy = oy0; oy < oy1; oy++) {
+                uint y0, y1;
+                float ly;
+                bilinear(oy, p.SH, p.H, y0, y1, ly);
+                if (y0 != iy && y1 != iy) continue;
+                const float hy = 1.0 - ly;
+                for (uint ox = ox0; ox < ox1; ox++) {
+                    uint x0, x1;
+                    float lx;
+                    bilinear(ox, p.SW, p.W, x0, x1, lx);
+                    if (x0 != ix && x1 != ix) continue;
+                    const float hx = 1.0 - lx, d = p.dy.v[obase + (oy * OW + ox) * C];
+                    /* the four cells it reads, in the CPU's order (they coincide at the edges) */
+                    if (y0 == iy && x0 == ix) g += hy * hx * d;
+                    if (y0 == iy && x1 == ix) g += hy * lx * d;
+                    if (y1 == iy && x0 == ix) g += ly * hx * d;
+                    if (y1 == iy && x1 == ix) g += ly * lx * d;
+                }
+            }
+        }
+        p.dx.v[i] = ACT == ACT_NONE ? g : g * derivative(p.x.v[i], ACT);
+    }
+}

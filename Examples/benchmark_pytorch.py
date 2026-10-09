@@ -9,7 +9,9 @@ convolutional network of Examples/MNIST_CNN.c (channels first, as PyTorch prefer
 synthetic 28 x 28 images: one epoch of mini-batches of 128 with AdamW, and inference in batches of
 1,000; and the same network with batch normalization after each convolution and the hidden dense
 layer. Then ResNet-20 (Examples/CIFAR10.c resnet20) on 4,096 synthetic 32 x 32 images: one epoch
-of mini-batches of 128 with SGD and momentum, and inference in batches of 1,000. Each measurement
+of mini-batches of 128 with SGD and momentum, and inference in batches of 1,000. Then the U-Net of
+Examples/Segmentation.c on 1,024 synthetic 64 x 64 images with three sigmoid outputs a pixel (binary
+cross-entropy): one epoch of mini-batches of 32 with AdamW, and inference in batches of 256. Each measurement
 runs on a fresh model after one untimed warm-up step, so lazy initialization inside PyTorch is not
 counted.
 
@@ -175,6 +177,63 @@ def resnet_throughput(x, y):
     return train, infer
 
 
+UNET_SAMPLES, UNET_BATCH = 1024, 32
+
+
+class UNet(nn.Module):
+    """Examples/Segmentation.c's U-Net: two normalized 3 x 3 convolutions a level, transposed
+    convolutions up, the maps of the way down concatenated."""
+
+    @staticmethod
+    def double(cin, cout):
+        return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(),
+                             nn.Conv2d(cout, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU())
+
+    def __init__(self):
+        super().__init__()
+        self.e1, self.e2, self.mid = self.double(3, 16), self.double(16, 32), self.double(32, 64)
+        self.u2, self.d2 = nn.ConvTranspose2d(64, 32, 2, 2), self.double(64, 32)
+        self.u1, self.d1 = nn.ConvTranspose2d(32, 16, 2, 2), self.double(32, 16)
+        self.out = nn.Conv2d(16, 3, 1)
+
+    def forward(self, x):
+        e1 = self.e1(x)
+        e2 = self.e2(nn.functional.max_pool2d(e1, 2))
+        m = self.mid(nn.functional.max_pool2d(e2, 2))
+        d2 = self.d2(torch.cat([e2, torch.relu(self.u2(m))], dim=1))
+        d1 = self.d1(torch.cat([e1, torch.relu(self.u1(d2))], dim=1))
+        return self.out(d1)                 # logits: the loss applies the sigmoid
+
+
+def unet_throughput(x, y):
+    model = UNet().to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    def step(xb, yb):
+        opt.zero_grad(set_to_none=True)
+        with amp():
+            loss = loss_fn(model(xb), yb)
+        loss.backward()
+        opt.step()
+
+    step(x[:UNET_BATCH], y[:UNET_BATCH])     # warm-up
+    start = clock()
+    perm = torch.randperm(UNET_SAMPLES, device=DEVICE)
+    for i in range(0, UNET_SAMPLES, UNET_BATCH):
+        idx = perm[i:i + UNET_BATCH]
+        step(x[idx], y[idx])
+    train = UNET_SAMPLES / (clock() - start)
+    model.eval()
+    with torch.inference_mode(), amp():
+        torch.sigmoid(model(x[:32]))         # warm-up
+        start = clock()
+        for i in range(0, UNET_SAMPLES, 256):
+            torch.sigmoid(model(x[i:i + 256]))
+        infer = UNET_SAMPLES / (clock() - start)
+    return train, infer
+
+
 def main():
     global DEVICE, BF16
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -215,6 +274,12 @@ def main():
     print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
     train, infer = resnet_throughput(torch.rand(RESNET_SAMPLES, 3, 32, 32, device=DEVICE),
                                      torch.randint(0, 10, (RESNET_SAMPLES,), device=DEVICE))
+    print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
+
+    print(f"\nU-Net (Examples/Segmentation.c), {UNET_SAMPLES} images of 64 x 64")
+    print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
+    train, infer = unet_throughput(torch.rand(UNET_SAMPLES, 3, 64, 64, device=DEVICE),
+                                   torch.randint(0, 2, (UNET_SAMPLES, 3, 64, 64), device=DEVICE).float())
     print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
 
 

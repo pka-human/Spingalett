@@ -28,6 +28,8 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->bn_sums_flat);
     spingalett_aligned_free(ws->bn_scratch);
     spingalett_aligned_free(ws->bn_coef);
+    spingalett_aligned_free(ws->ln_flat);
+    spingalett_aligned_free(ws->ln_scratch);
     spingalett_aligned_free(ws->gtmp);
     spingalett_gemm_scratch_free(ws->gemm);
     free(ws->uses);
@@ -152,6 +154,21 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
         }
     }
 
+    /* layer normalization: each cell's statistics, for the backward pass */
+    size_t ln_floats = 0;
+    for (uint32_t l = 1; training && l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_LAYER_NORM) ln_floats += 2u * (size_t)capacity * net->shapes[l].height * net->shapes[l].width;
+    if (ln_floats > 0) {
+        ws->ln_flat = (float *)spingalett_aligned_alloc(ln_floats * sizeof(float));
+        ws->ln_scratch = (double *)spingalett_aligned_alloc((spingalett_ln_scratch_doubles(net, capacity) + 1) * sizeof(double));
+        if (!ws->ln_flat || !ws->ln_scratch) goto fail;
+        for (uint32_t l = 1, off = 0; l < net->layers; l++)
+            if (net->shapes[l].type == LAYER_LAYER_NORM) {
+                ws->bn_stats[l] = ws->ln_flat + off;
+                off += 2u * capacity * net->shapes[l].height * net->shapes[l].width;
+            }
+    }
+
     if (mode != COMPUTE_OPENBLAS) {
         int threads = 1;
 #if defined(_OPENMP)
@@ -250,6 +267,17 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         } else if (type == LAYER_ADD || type == LAYER_CONCAT || type == LAYER_GLOBAL_AVG_POOL) {
             done = !masked;
             combine_forward(net, ws, l, C, N, done ? act : ACT_NONE, mode);
+        } else if (type == LAYER_LAYER_NORM) {
+            done = act != ACT_SOFTMAX && !masked;
+            spingalett_ln_forward(net, l - 1, X, C, N, done ? act : ACT_NONE, ws->training ? ws->bn_stats[l] : NULL, mode);
+        } else if (type == LAYER_CONV_TRANSPOSE2D) {
+            done = act != ACT_SOFTMAX && !masked;
+            spingalett_conv_transpose_forward(net, l - 1, X, C, N, done ? act : ACT_NONE, ws->conv, ws->gemm, mode);
+        } else if (type == LAYER_UPSAMPLE) {
+            const LayerShape *i = &net->shapes[src], *o = &net->shapes[l];
+            spingalett_upsample_forward(X, C, N, i->height, i->width, i->channels, o->stride_h, o->stride_w, o->mode,
+                                        mode);
+            done = act == ACT_NONE && !masked;
         } else {
             spingalett_pool_forward(net, l - 1, X, C, N, mode);
             done = act == ACT_NONE && !masked;

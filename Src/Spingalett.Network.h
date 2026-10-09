@@ -10,13 +10,15 @@
 #include "Spingalett/Spingalett.h"
 #include <stdatomic.h>
 
-/* Layer l's output shape and, for conv and pooling layers, its window over its input. */
+/* Layer l's output shape and, for conv and pooling layers, its window over its input (transposed
+   convolutions: the window each input cell adds; upsampling: the factors in stride_h, stride_w). */
 typedef struct {
     LayerType type;
     uint32_t height, width, channels;
     uint32_t kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w;
-    uint32_t groups;                /* conv: channel groups (1 otherwise) */
-    float eps, momentum;            /* batch normalization (0 otherwise) */
+    uint32_t groups;                /* conv and transposed conv: channel groups (1 otherwise) */
+    float eps, momentum;            /* batch normalization (0 otherwise); layer normalization: eps */
+    uint32_t mode;                  /* upsampling: UpsampleMode */
 } LayerShape;
 
 /*
@@ -103,22 +105,29 @@ static inline uint32_t spingalett_source(const NeuralNetwork *net, uint32_t l) {
     return net->input_list[net->input_offsets[l]];
 }
 
-/* Weight layer l as a matrix: rows (dense outputs, conv filters, batch normalization channels) of
-   row_len weights (dense inputs, conv kernel_h x kernel_w x input channels of the filter's group,
-   batch normalization's gamma), one bias per row; pooling, adding and concatenating layers have
-   none. */
+/* Weight layer l as a matrix: rows (dense outputs, conv and transposed conv filters, normalization
+   channels) of row_len weights (dense inputs, kernel_h x kernel_w x input channels of the filter's
+   group, the normalization's gamma), one bias per row; pooling, adding, concatenating and
+   upsampling layers have none. A transposed convolution's filter j holds, at (kh, kw, c), the weight
+   by which input channel c of its group reaches output channel j at offset (kh, kw) of the input
+   cell's window. */
+static inline bool spingalett_filters(LayerType type) { return type == LAYER_CONV2D || type == LAYER_CONV_TRANSPOSE2D; }
+static inline bool spingalett_normalization(LayerType type) {
+    return type == LAYER_BATCH_NORM || type == LAYER_LAYER_NORM;
+}
+
 static inline uint32_t spingalett_weight_rows(const NeuralNetwork *net, uint32_t l) {
     const LayerShape *s = &net->shapes[l + 1];
     return s->type == LAYER_DENSE ? net->topology[l + 1]
-         : s->type == LAYER_CONV2D || s->type == LAYER_BATCH_NORM ? s->channels : 0u;
+         : spingalett_filters(s->type) || spingalett_normalization(s->type) ? s->channels : 0u;
 }
 
 static inline uint32_t spingalett_weight_row_len(const NeuralNetwork *net, uint32_t l) {
     const LayerShape *s = &net->shapes[l + 1];
     const uint32_t src = spingalett_source(net, l + 1);
     return s->type == LAYER_DENSE ? net->topology[src]
-         : s->type == LAYER_CONV2D ? s->kernel_h * s->kernel_w * (net->shapes[src].channels / s->groups)
-         : s->type == LAYER_BATCH_NORM ? 1u : 0u;
+         : spingalett_filters(s->type) ? s->kernel_h * s->kernel_w * (net->shapes[src].channels / s->groups)
+         : spingalett_normalization(s->type) ? 1u : 0u;
 }
 
 /* Whether every weight layer is dense and reads the one before it (the network of earlier versions). */

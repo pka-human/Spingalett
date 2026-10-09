@@ -49,10 +49,11 @@ typedef struct {
     uint64_t input_list;                            /* version 6: offset of all of them (input_count > 1) */
     uint64_t act_offset;                            /* version 6: byte offset of the output in the
                                                        workspace's activations (0 for the last layer) */
+    uint32_t mode;                                  /* version 7: upsampling: UpsampleMode */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3 to 6 */
+    uint32_t version;           /* 3 to 7 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -151,12 +152,26 @@ void spingalett_engine_add(const float *const *x, uint32_t count, float *y, uint
 void spingalett_engine_concat(const float *const *x, const uint32_t *channels, uint32_t count, float *y,
                               uint32_t cells);
 void spingalett_engine_global_pool(const float *x, float *y, uint32_t cells, uint32_t channels);
+/* x (in_h x in_w x channels) upsampled by sh x sw into y: copies (UPSAMPLE_NEAREST) or bilinear with
+   the cells' centres aligned and the edges repeated; the same everywhere it runs (training, batched
+   models, the engine). */
+void spingalett_engine_upsample(const float *x, uint32_t in_h, uint32_t in_w, uint32_t channels, uint32_t sh,
+                                uint32_t sw, uint32_t mode, float *y);
+/* The rows and weight of the input row (or column) that output row o reads from below, bilinearly:
+   o reads rows r0 and r0 + 1 (or r0 alone at the edges), the second weighted w. */
+void spingalett_engine_bilinear(uint32_t o, uint32_t factor, uint32_t in, uint32_t *r0, uint32_t *r1, float *w);
+/* Layer normalization of `cells` cells of `channels` values: y = gamma (x - mean) / sqrt(var + eps)
+   + beta per cell, mean and variance over its channels (float sums in channel order); stats, when
+   not NULL, gets each cell's mean and 1 / sqrt(var + eps). */
+void spingalett_engine_layer_norm(const float *x, uint32_t cells, uint32_t channels, const float *gamma,
+                                  const float *beta, float eps, float *y, float *stats);
 
 /* Bytes of engine scratch layer L needs: a convolution its transposed filters and one pixel's sums,
    or a gathered window (of its group's channels; an INT8 convolution with one group four windows
    and the sums of its filters); batch normalization its coefficients (0 for other layers). */
 static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
     if (L->type == LAYER_BATCH_NORM) return (uint64_t)L->out_c * 8u;
+    if (L->type == LAYER_CONV_TRANSPOSE2D) return (uint64_t)L->row_len * 4u;     /* a window of its group */
     if (L->type != LAYER_CONV2D) return 0;
     if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) {
         uint64_t window = (uint64_t)L->row_len * 4u;
@@ -187,6 +202,11 @@ void spingalett_conv_columns_i8(const int8_t *xq, const SlettLayer *L, uint32_t 
    (floats or quantized bytes): kernel_h runs of kernel_w x channels values, zeros where the window
    leaves the input. */
 void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, void *window, size_t elem);
+/* A transposed convolution on one sample, as the engine runs it (a window of each output pixel's
+   inputs, zero where no input cell reaches it, dotted with the filters of its group); activation
+   included. window: slett_conv_scratch() bytes, xq: the quantized input of integer precisions. */
+void spingalett_engine_conv_transpose(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
+                                      void *window);
 
 /* y[j] = bias[j] + scale[j] * x_scale * acc[j], the output of an integer layer before activation. */
 static inline float spingalett_int_output(float bias, float row_scale, float x_scale, int32_t acc) {

@@ -108,6 +108,10 @@ typedef struct BatchWorkspace {
     float *bn_coef;         /* 3 x the most channels */
     float *bn_flat;
     double *bn_sums_flat;
+    /* layer normalization, training only: bn_stats[l] of a normalizing layer l holds each cell's mean
+       and 1 / std (2 x capacity x cells, in ln_flat), ln_scratch its parameter gradients' partial sums */
+    float *ln_flat;
+    double *ln_scratch;
     bool training;          /* normalize with batch statistics */
     uint32_t capacity;
 } BatchWorkspace;
@@ -183,6 +187,25 @@ void spingalett_conv_backward_data(const NeuralNetwork *net, uint32_t l, const f
 void spingalett_conv_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
                                       float scale, float beta, float *scratch, SpingalettGemmScratch *gemm,
                                       ComputeMode mode);
+/* Transposed convolutions over explicit shapes (deployment models): Wc the filters of the convolution
+   whose data gradient they compute, as spingalett_transposed_conv_filters() turns a transposed
+   convolution's into them, scratch spingalett_conv_transpose_scratch() floats; softmax is not applied. */
+void spingalett_transposed_conv_filters(const float *W, const LayerShape *in, const LayerShape *out, float *Wc);
+size_t spingalett_conv_transpose_scratch(const LayerShape *in, const LayerShape *out, uint32_t capacity,
+                                         ComputeMode mode);
+void spingalett_conv_transpose_shapes(const LayerShape *in, const LayerShape *out, const float *Wc, const float *bias,
+                                      const float *x, float *y, uint32_t n, ActivationFunction act, float *scratch,
+                                      SpingalettGemmScratch *gemm, ComputeMode mode);
+/* Transposed convolutions (weight layer l, LAYER_CONV_TRANSPOSE2D), as the passes above. */
+void spingalett_conv_transpose_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                                       ActivationFunction act, float *scratch, SpingalettGemmScratch *gemm,
+                                       ComputeMode mode);
+void spingalett_conv_transpose_backward_data(const NeuralNetwork *net, uint32_t l, const float *dy, float *dx,
+                                             uint32_t n, const float *x, ActivationFunction act, float *scratch,
+                                             SpingalettGemmScratch *gemm, ComputeMode mode);
+void spingalett_conv_transpose_backward_weights(NeuralNetwork *net, uint32_t l, const float *x, const float *dy,
+                                                uint32_t n, float scale, float beta, float *scratch,
+                                                SpingalettGemmScratch *gemm, ComputeMode mode);
 void spingalett_pool_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                              ComputeMode mode);
 /* The forward passes from shapes and parameters alone (batched inference of models): W holds
@@ -226,6 +249,24 @@ void spingalett_bn_backward_sums(const NeuralNetwork *net, uint32_t l, const flo
 void spingalett_bn_backward_data(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
                                  uint32_t n, const float *stats, const double *sums, ActivationFunction act,
                                  float *coef, ComputeMode mode);
+/* Layer normalization (Spingalett.Norm.c) of weight layer l: the forward pass (act applied unless
+   softmax; stats, when training, gets each cell's mean and 1 / std), the data gradient (times the
+   input's activation derivative act), the parameters' gradients (g = scale * sum + beta * g) with
+   spingalett_ln_scratch_doubles() doubles of scratch. */
+size_t spingalett_ln_scratch_doubles(const NeuralNetwork *net, uint32_t capacity);
+void spingalett_ln_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                           ActivationFunction act, float *stats, ComputeMode mode);
+void spingalett_ln_backward_data(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
+                                 uint32_t n, const float *stats, ActivationFunction act, ComputeMode mode);
+void spingalett_ln_backward_params(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
+                                   const float *stats, float scale, float beta, double *partial, ComputeMode mode);
+/* Upsampling (Spingalett.Graph.c): n samples of in_h x in_w x C by sh x sw (UpsampleMode upsample);
+   the backward pass writes dx (or adds to it with accumulate, then without act) times act'(x). */
+void spingalett_upsample_forward(const float *x, float *y, uint32_t n, uint32_t in_h, uint32_t in_w, uint32_t C,
+                                 uint32_t sh, uint32_t sw, uint32_t upsample, ComputeMode mode);
+void spingalett_upsample_backward(const float *dy, float *dx, const float *x, uint32_t n, uint32_t in_h, uint32_t in_w,
+                                  uint32_t C, uint32_t sh, uint32_t sw, uint32_t upsample, ActivationFunction act,
+                                  bool accumulate, ComputeMode mode);
 
 bool spingalett_add_layer(LayerArgs args);
 /* Whether every layer of net but the last feeds a later one; sets the error (naming `who`) when not. */
@@ -281,6 +322,12 @@ void spingalett_decode(float *dst, const uint8_t *src, int dtype, size_t n);
 size_t spingalett_filters_scratch(uint32_t CG, uint32_t KH, uint32_t KW);
 void spingalett_import_filters(float *dst, const uint8_t *src, int dtype, uint32_t OC, uint32_t CG, uint32_t KH,
                                uint32_t KW, float *scratch);
+/* Transposed convolution filters [IC][OG][KH][KW] at src (PyTorch's and ONNX's layout: each input
+   channel's weights to the OG outputs of its group, of G) as rows per output channel, [G OG][KH][KW][IG],
+   with spingalett_transposed_filters_scratch() floats of scratch. */
+size_t spingalett_transposed_filters_scratch(uint32_t OG, uint32_t KH, uint32_t KW);
+void spingalett_import_transposed_filters(float *dst, const uint8_t *src, int dtype, uint32_t IC, uint32_t OG,
+                                          uint32_t G, uint32_t KH, uint32_t KW, float *scratch);
 /* Dense weights [out][in] (transposed: [in][out] at src) times alpha, the columns of a map of C
    channels and HW cells read flat reordered from (c, p) to (p, c); spingalett_dense_scratch() floats
    of scratch. */

@@ -99,6 +99,7 @@ typedef struct {
                                        statistics */
     uint32_t input_count;           /* layers it reads (0 for the input layer) */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* their indices, all below `index` */
+    UpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -207,12 +208,14 @@ typedef struct {
                                        training; ignored on the input and output layers */
     LayerType type;                 /* LAYER_DENSE unless set; see conv2d(), max_pool2d(),
                                        avg_pool2d(), batch_norm(), add_layers(), concat_layers(),
-                                       global_avg_pool2d() */
+                                       global_avg_pool2d(), conv_transpose2d(), upsample2d(),
+                                       layer_norm() */
     uint32_t height, width, channels;   /* input layer: the shape of a sample (channels-last), e.g.
                                        28 x 28 x 1 for MNIST; omitted: 1 x 1 x neurons_amount */
-    uint32_t filters;               /* conv: output channels */
+    uint32_t filters;               /* conv and transposed conv: output channels */
     uint32_t kernel;                /* conv and pooling: square window size */
-    uint32_t stride;                /* 0 = 1 for conv, the window size for pooling */
+    uint32_t stride;                /* 0 = 1 for conv, the window size for pooling; upsampling: the
+                                       factor (cells per input cell along an axis), 0 = 2 */
     uint32_t padding;               /* cells added on each side: zeros for conv, ignored by pooling;
                                        kernel / 2 keeps the size of odd windows with stride 1 */
     uint32_t kernel_h, kernel_w;    /* per-axis overrides of kernel, stride and padding (0 = unset) */
@@ -221,7 +224,7 @@ typedef struct {
     uint32_t groups;                /* conv: split input and output channels into this many groups,
                                        each filter seeing the input channels of its group (0 = 1;
                                        the input channels give depthwise convolution) */
-    float epsilon;                  /* batch normalization: added to the variance; 0 = 1e-5 */
+    float epsilon;                  /* batch and layer normalization: added to the variance; 0 = 1e-5 */
     float momentum;                 /* batch normalization: running statistics move this far towards
                                        each training batch's; 0 = 0.1 */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* the earlier layers this one reads, by index (as
@@ -231,6 +234,10 @@ typedef struct {
                                        concat_layers() one or more. */
     uint32_t input_count;           /* entries of inputs; 0 counts them up to the last nonzero one,
                                        so give it when the last input is the input layer */
+    UpsampleMode upsample;          /* upsampling: copies (UPSAMPLE_NEAREST, the default) or bilinear */
+    uint32_t output_padding;        /* transposed convolution: cells added to the output's bottom and
+                                       right (less than the stride), to reach sizes the stride skips */
+    uint32_t output_padding_h, output_padding_w;    /* per-axis overrides (0 = unset) */
 } LayerArgs;
 
 typedef struct {
@@ -434,6 +441,12 @@ SPINGALETT_API NeuralNetwork *new_spingalett_struct_arguments(NeuralNetworkArgs 
 #define concat_layers(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONCAT, __VA_ARGS__})
 /* The mean of each channel over its cells (1 x 1 x channels); a pooling layer, without activation. */
 #define global_avg_pool2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_GLOBAL_AVG_POOL, __VA_ARGS__})
+/* A transposed convolution (upsamples with learned weights: kernel 2, stride 2 doubles the size). */
+#define conv_transpose2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_CONV_TRANSPOSE2D, __VA_ARGS__})
+/* Upsampling by .stride (default 2), nearest or (.upsample = UPSAMPLE_BILINEAR) bilinear. */
+#define upsample2d(...) layer_struct_arguments((LayerArgs){.type = LAYER_UPSAMPLE, __VA_ARGS__})
+/* Layer normalization over each cell's channels (a dense layer's outputs). */
+#define layer_norm(...) layer_struct_arguments((LayerArgs){.type = LAYER_LAYER_NORM, __VA_ARGS__})
 SPINGALETT_API uint32_t layer_struct_arguments(LayerArgs args);
 
 /* Describing a network. Layers are numbered in the order they were added, every layer after its
@@ -538,16 +551,19 @@ SPINGALETT_API NeuralNetwork *load_spingalett_from_memory(const void *data, size
 SPINGALETT_API void spingalett_free(void *ptr);
 
 /*
- * ONNX import: a model of the operators Spingalett has (Conv with groups, Gemm, MatMul with a
- * constant right operand, MaxPool, AveragePool, GlobalAveragePool (or ReduceMean over the height and
- * width), BatchNormalization, Add, Concat along the channels, Relu, Sigmoid, Tanh, LeakyRelu with
- * slope 0.01, Softmax over vectors,
- * Flatten, Reshape that flattens, Identity, Dropout, Constant), as a network to train further, save
- * or deploy. The network takes channels-last samples: an input of shape [N, C, H, W] becomes an
- * input layer of H x W x C, so images in NCHW order must be transposed to H, W, C; a dense layer
- * after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy when
- * the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator or
- * node that cannot be imported; the model's weights must be inside the file (no external data).
+ * ONNX import: a model of the operators Spingalett has (Conv and ConvTranspose with groups, Gemm,
+ * MatMul with a constant right operand, MaxPool, AveragePool, GlobalAveragePool (or ReduceMean over
+ * the height and width), BatchNormalization, LayerNormalization over a vector or over a map's
+ * channels (between Transposes to channels last and back), Resize and Upsample by integer factors
+ * (nearest, or linear between the cells' centres), Add, Concat along the channels, Relu, Sigmoid,
+ * Tanh, LeakyRelu with slope 0.01, Softmax over vectors, Flatten, Reshape that flattens, Identity,
+ * Dropout, Constant), as a network to train further, save or deploy. The network takes
+ * channels-last samples: an input of shape [N, C, H, W] becomes an input layer of H x W x C, so
+ * images in NCHW order must be transposed to H, W, C, and maps come out channels last too; a dense
+ * layer after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy
+ * when the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator
+ * or node that cannot be imported. Weights in external data files are read when the model comes
+ * from a path (the files in its folder), not from memory.
  */
 SPINGALETT_API NeuralNetwork *spingalett_import_onnx(const char *path);
 SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
@@ -559,8 +575,10 @@ SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *dat
  * of it: only dictionaries of tensors are recognized. The tensors of each module (the name up to
  * its last dot: "features.0" for "features.0.weight") go, module by module, to the layers with
  * parameters in their order: dense layers take weight [out, in] and bias, convolutions weight
- * [out, in / groups, kh, kw] and bias, batch normalizations weight, bias, running_mean and
- * running_var. The modules come in the order of the state dict (torch.save files keep it) or, in
+ * [out, in / groups, kh, kw] and bias, transposed convolutions (ConvTranspose2d) weight
+ * [in, out / groups, kh, kw] and bias, batch normalizations weight, bias, running_mean and
+ * running_var, layer normalizations (LayerNorm over the channels) weight and bias. The modules come
+ * in the order of the state dict (torch.save files keep it) or, in
  * safetensors files, which sort names, in natural order of their names ("2" before "10", as
  * nn.Sequential numbers them); `modules` (module_count names, or NULL) gives the order explicitly.
  * Weights are reordered for channels-last data as spingalett_import_onnx() does. On error (a shape

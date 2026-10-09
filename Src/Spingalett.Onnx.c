@@ -347,6 +347,9 @@ typedef struct {
     uint32_t layer;
     uint32_t c, h, w;
     bool flat;
+    bool vector;                /* [N, F] in the file (not flat: a vector of its own, such as a dense output) */
+    bool nhwc;                  /* a map transposed to [N, H, W, C]: what layer normalization over its
+                                   channels reads, and elementwise operators keep */
     bool alias;                 /* another name of a layer's output (made by a node that read one) */
     TensorRef tensor;           /* constants: where their data is (in the file) */
     float *data;                /* constants: their values as floats, once something needed them */
@@ -483,11 +486,25 @@ static uint32_t layer_readers(const Importer *im, uint32_t layer) {
     return total - aliases;
 }
 
+/* Operators that may read a map transposed to channels last: elementwise ones, layer normalization
+   (over its channels) and the transposition back. */
+static bool reads_nhwc(const Node *n) {
+    static const char *const ops[] = {"LayerNormalization", "Transpose", "Relu", "Sigmoid", "Tanh", "LeakyRelu"};
+    for (size_t k = 0; k < sizeof ops / sizeof ops[0]; k++)
+        if (str_is(n->op, ops[k])) return true;
+    return false;
+}
+
 static const Value *layer_input(Importer *im, const Node *n, int k) {
     if (k >= n->ninputs) { fail(im, "ONNX import: %.*s node '%.*s' lacks an input", n->op, n->name); return NULL; }
     const Value *v = find(im, n->inputs[k]);
     if (!v) { fail(im, "ONNX import: input '%.*s' of %.*s is not produced by an earlier node", n->inputs[k], n->op); return NULL; }
     if (v->constant) { fail(im, "ONNX import: %.*s reads the constant '%.*s' where a layer output is expected", n->op, n->inputs[k]); return NULL; }
+    if (v->nhwc && !reads_nhwc(n)) {
+        fail(im, "ONNX import: %.*s reads '%.*s', a map transposed to channels last (which only layer normalization "
+             "and elementwise operators may)", n->op, n->inputs[k]);
+        return NULL;
+    }
     return v;
 }
 
@@ -584,14 +601,14 @@ static bool convert_activation(Importer *im, const Node *n, ActivationFunction a
     NeuralNetwork *net = im->net;
     if (act == ACT_SOFTMAX) {
         int64_t axis = attr_int(n, "axis", -1);
-        if (!(x->h == 1 && x->w == 1) && !x->flat)
+        if ((!(x->h == 1 && x->w == 1) && !x->flat) || x->nhwc)
             return fail(im, "ONNX import: Softmax node '%.*s' over a map%.*s is not supported (only over vectors)",
                         n->name, (Str){"", 0});
         (void)axis;
     }
     LayerType type = x->layer ? net->shapes[x->layer].type : LAYER_DENSE;
     bool fusable = x->layer > 0 && net->act_func[x->layer - 1] == ACT_NONE && layer_readers(im, x->layer) == 1 &&
-                   type != LAYER_MAX_POOL2D && type != LAYER_AVG_POOL2D;
+                   type != LAYER_MAX_POOL2D && type != LAYER_AVG_POOL2D && type != LAYER_UPSAMPLE;
     Value copy = *x;
     copy.alias = fusable;
     if (fusable) {
@@ -671,6 +688,7 @@ static bool dense_layer(Importer *im, const Node *n, const Value *x, Value *W, b
     for (uint32_t o = 0; o < out; o++) b[o] = bias ? beta * bias[o] : 0.0f;
     im->bias_open = bias == NULL;
     Value *y = layer_output(im, n, l);
+    if (y) y->vector = true;
     return y != NULL;
 }
 
@@ -719,7 +737,7 @@ static bool convert_add(Importer *im, const Node *n) {
         NeuralNetwork *net = im->net;
         LayerType type = x->layer ? net->shapes[x->layer].type : LAYER_DENSE;
         uint32_t rows = x->layer ? spingalett_weight_rows(net, x->layer - 1) : 0;
-        if (!im->bias_open || x->layer + 1 != net->layers || (type != LAYER_DENSE && type != LAYER_CONV2D) ||
+        if (!im->bias_open || x->layer + 1 != net->layers || (type != LAYER_DENSE && !spingalett_filters(type)) ||
             net->act_func[x->layer - 1] != ACT_NONE || layer_readers(im, x->layer) != 1 ||
             (c->count != rows && c->count != 1))
             return fail(im, "ONNX import: Add node '%.*s' adds a constant that is not the bias of a product%.*s", n->name,
@@ -738,15 +756,15 @@ static bool convert_add(Importer *im, const Node *n) {
         y->name = name;
         return true;
     }
-    if (a->flat != b->flat || a->c != b->c || a->h != b->h || a->w != b->w)
+    if (a->flat != b->flat || a->nhwc != b->nhwc || a->c != b->c || a->h != b->h || a->w != b->w)
         return fail(im, "ONNX import: Add node '%.*s' adds tensors of different shapes (broadcasting is not supported)%.*s",
                     n->name, (Str){"", 0});
-    const bool flat = a->flat;
+    const bool flat = a->flat, vector = a->vector && b->vector, nhwc = a->nhwc;
     uint32_t l = add_layers(.net = im->net, .inputs = {a->layer, b->layer}, .input_count = 2, .act_func = ACT_NONE);
     if (!added(im, l, n)) return false;
     im->bias_open = false;
     Value *y = layer_output(im, n, l);
-    if (y) y->flat = flat;
+    if (y) y->flat = flat, y->vector = vector, y->nhwc = nhwc;
     return y != NULL;
 }
 
@@ -754,13 +772,14 @@ static bool convert_concat(Importer *im, const Node *n) {
     if (n->ninputs < 1 || n->ninputs > SPINGALETT_MAX_INPUTS)
         return fail(im, "ONNX import: Concat node '%.*s' joins 1 to 16 inputs%.*s", n->name, (Str){"", 0});
     LayerArgs args = {.net = im->net, .type = LAYER_CONCAT, .input_count = (uint32_t)n->ninputs, .act_func = ACT_NONE};
-    bool flat = false, maps = false;
+    bool flat = false, maps = false, vector = true;
     for (int k = 0; k < n->ninputs; k++) {
         const Value *v = layer_input(im, n, k);
         if (!v) return false;
         args.inputs[k] = v->layer;
         flat |= v->flat;
         maps |= v->h * v->w > 1;
+        vector &= v->vector;
     }
     int64_t axis = attr_int(n, "axis", 1);
     if (flat || (maps ? axis != 1 && axis != -3 : axis != 1 && axis != -1))
@@ -769,7 +788,9 @@ static bool convert_concat(Importer *im, const Node *n) {
     uint32_t l = layer_struct_arguments(args);
     if (!added(im, l, n)) return false;
     im->bias_open = false;
-    return layer_output(im, n, l) != NULL;
+    Value *y = layer_output(im, n, l);
+    if (y) y->vector = vector;
+    return y != NULL;
 }
 
 static bool convert_pool(Importer *im, const Node *n, bool max) {
@@ -810,14 +831,14 @@ static bool convert_batch_norm(Importer *im, const Node *n) {
     NeuralNetwork *net = im->net;
     const uint64_t b = net->bias_offsets[l - 1];
     const uint32_t C = x->c;
-    const bool flat = x->flat;
+    const bool flat = x->flat, vector = x->vector;
     memcpy(layer_weights(net, l), p[0]->data, C * sizeof(float));
     memcpy(layer_biases(net, l), p[1]->data, C * sizeof(float));
     memcpy(net->running_mean + b, p[2]->data, C * sizeof(float));
     memcpy(net->running_var + b, p[3]->data, C * sizeof(float));
     im->bias_open = false;
     Value *y = layer_output(im, n, l);
-    if (y) y->flat = flat;
+    if (y) y->flat = flat, y->vector = vector;
     return y != NULL;
 }
 
@@ -826,8 +847,10 @@ static bool convert_batch_norm(Importer *im, const Node *n) {
 static bool alias(Importer *im, const Node *n, bool flatten) {
     const Value *x = find(im, n->inputs[0]);
     if (!x) return fail(im, "ONNX import: input '%.*s' of %.*s is unknown", n->inputs[0], n->op);
+    if (flatten && x->nhwc)
+        return fail(im, "ONNX import: %.*s flattens '%.*s', a map transposed to channels last", n->op, n->inputs[0]);
     Value copy = *x;
-    if (flatten && !x->constant) copy.flat = true;
+    if (flatten && !x->constant) copy.flat = true, copy.vector = true;
     copy.alias = !x->constant;
     copy.owned = false;             /* a renamed constant shares the data (freed with the values) */
     Value *y = add_value(im, n->outputs[0]);
@@ -841,7 +864,7 @@ static bool alias(Importer *im, const Node *n, bool flatten) {
 static bool convert_reshape(Importer *im, const Node *n) {
     const Value *x = find(im, n->inputs[0]);
     Value *shape = n->ninputs > 1 ? find(im, n->inputs[1]) : NULL;
-    if (!x || x->constant || !shape || !shape->constant)
+    if (!x || x->constant || !shape || !shape->constant || x->nhwc)
         return fail(im, "ONNX import: Reshape node '%.*s' needs a layer output and a constant shape%.*s", n->name, (Str){"", 0});
     const float *dims = constant_floats(im, shape);
     if (!dims) return false;
@@ -894,6 +917,204 @@ static bool convert_constant(Importer *im, const Node *n) {
     return true;
 }
 
+/* The same layer's output under a new name: another view of it (a transposition). */
+static bool view(Importer *im, const Node *n, const Value *x, bool nhwc) {
+    Value copy = *x;
+    copy.alias = true;
+    copy.nhwc = nhwc;
+    Value *y = add_value(im, n->outputs[0]);
+    if (!y) return false;
+    Str name = y->name;
+    *y = copy;
+    y->name = name;
+    return true;
+}
+
+/* A map to channels last and back: around layer normalization over its channels (LayerNorm2d). */
+static bool convert_transpose(Importer *im, const Node *n) {
+    const Value *x = layer_input(im, n, 0);
+    if (!x) return false;
+    const Attr *p = attr(n, "perm");
+    const bool to_last = p && p->nints == 4 && p->ints[0] == 0 && p->ints[1] == 2 && p->ints[2] == 3 && p->ints[3] == 1;
+    const bool to_first = p && p->nints == 4 && p->ints[0] == 0 && p->ints[1] == 3 && p->ints[2] == 1 && p->ints[3] == 2;
+    if (x->flat || x->vector || !(x->nhwc ? to_first : to_last))
+        return fail(im, "ONNX import: Transpose node '%.*s' permutes other axes than a map's channels to the last "
+                    "place and back%.*s", n->name, (Str){"", 0});
+    return view(im, n, x, to_last);
+}
+
+/* ConvTranspose: weights [C_in][C_out / group][KH][KW]. */
+static bool convert_conv_transpose(Importer *im, const Node *n) {
+    const Value *x = layer_input(im, n, 0);
+    if (!x) return false;
+    if (x->flat || x->vector)
+        return fail(im, "ONNX import: ConvTranspose node '%.*s' reads no map%.*s", n->name, (Str){"", 0});
+    Value *W = find(im, n->inputs[1]);
+    if (!W || !W->constant || W->ndims != 4)
+        return fail(im, "ONNX import: ConvTranspose node '%.*s' needs constant 4-D weights%.*s", n->name, (Str){"", 0});
+    const uint32_t IC = (uint32_t)W->dims[0], OG = (uint32_t)W->dims[1], kh = (uint32_t)W->dims[2];
+    const uint32_t kw = (uint32_t)W->dims[3], groups = (uint32_t)attr_int(n, "group", 1);
+    const Attr *ks = attr(n, "kernel_shape"), *st = attr(n, "strides"), *pd = attr(n, "pads");
+    const Attr *dl = attr(n, "dilations"), *op = attr(n, "output_padding"), *os = attr(n, "output_shape");
+    const Attr *ap = attr(n, "auto_pad");
+    if (groups == 0 || IC != x->c || IC % groups != 0 || OG == 0 ||
+        (ks && (ks->nints != 2 || ks->ints[0] != kh || ks->ints[1] != kw)))
+        return fail(im, "ONNX import: ConvTranspose node '%.*s' has weights that do not fit its input%.*s", n->name,
+                    (Str){"", 0});
+    if (dl && (dl->nints != 2 || dl->ints[0] != 1 || dl->ints[1] != 1))
+        return fail(im, "ONNX import: ConvTranspose node '%.*s' has dilations, which are not supported%.*s", n->name,
+                    (Str){"", 0});
+    if (ap && ap->s.n && !str_is(ap->s, "NOTSET") && !str_is(ap->s, "VALID"))
+        return fail(im, "ONNX import: ConvTranspose node '%.*s' pads by auto_pad, which is not supported%.*s", n->name,
+                    (Str){"", 0});
+    const bool strided = st && st->nints == 2, padded_out = op && op->nints == 2;
+    const uint32_t sh = strided ? (uint32_t)st->ints[0] : 1u, sw = strided ? (uint32_t)st->ints[1] : 1u;
+    uint32_t ph = 0, pw = 0;
+    if (pd && pd->nints == 4) {
+        if (pd->ints[0] != pd->ints[2] || pd->ints[1] != pd->ints[3])
+            return fail(im, "ONNX import: ConvTranspose node '%.*s' pads asymmetrically, which is not supported%.*s",
+                        n->name, (Str){"", 0});
+        ph = (uint32_t)pd->ints[0];
+        pw = (uint32_t)pd->ints[1];
+    }
+    const uint32_t oph = padded_out ? (uint32_t)op->ints[0] : 0u, opw = padded_out ? (uint32_t)op->ints[1] : 0u;
+    /* an output shape: only the one the strides, padding and output padding give */
+    const int64_t oh = ((int64_t)x->h - 1) * sh - 2 * (int64_t)ph + kh + oph;
+    const int64_t ow = ((int64_t)x->w - 1) * sw - 2 * (int64_t)pw + kw + opw;
+    if (os && !(os->nints >= 2 && os->ints[os->nints - 2] == oh && os->ints[os->nints - 1] == ow))
+        return fail(im, "ONNX import: ConvTranspose node '%.*s' asks for an output shape (output_shape) its padding "
+                    "does not give%.*s", n->name, (Str){"", 0});
+    const uint32_t OC = OG * groups;
+    const Value *B = n->ninputs > 2 && n->inputs[2].n ? constant_input(im, n, 2, OC) : NULL;
+    if (n->ninputs > 2 && n->inputs[2].n && !B) return false;
+    int dtype;
+    const uint8_t *src = constant_bytes(im, W, &dtype);
+    float *scratch = (float *)malloc(spingalett_transposed_filters_scratch(OG, kh, kw) * sizeof(float));
+    if (!src || !scratch) {
+        free(scratch);
+        return fail(im, "ONNX import: the weights of ConvTranspose node '%.*s' cannot be read%.*s", n->name,
+                    (Str){"", 0});
+    }
+    uint32_t l = conv_transpose2d(.net = im->net, .inputs = {x->layer}, .input_count = 1, .filters = OC, .kernel_h = kh,
+                                  .kernel_w = kw, .stride_h = sh, .stride_w = sw, .padding_h = ph, .padding_w = pw,
+                                  .output_padding_h = oph, .output_padding_w = opw, .groups = groups,
+                                  .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_NONE);
+    if (!added(im, l, n)) { free(scratch); return false; }
+    spingalett_import_transposed_filters(layer_weights(im->net, l), src, dtype, IC, OG, groups, kh, kw, scratch);
+    free(scratch);
+    if (B) memcpy(layer_biases(im->net, l), B->data, OC * sizeof(float));
+    im->bias_open = B == NULL;
+    return layer_output(im, n, l) != NULL;
+}
+
+/* Upsampling by integer factors: Resize (scales or sizes; nearest, or linear between the cells'
+   centres), and Upsample (opsets 7 to 9, and Resize of opset 10, two inputs: nearest). Nearest
+   reads input cell floor(o / factor): asymmetric coordinates rounded down, or the cells' centres
+   rounded to the nearest. */
+static bool convert_resize(Importer *im, const Node *n) {
+    const Value *x = layer_input(im, n, 0);
+    if (!x) return false;
+    if (x->flat || x->vector)
+        return fail(im, "ONNX import: %.*s node '%.*s' resizes no map", n->op, n->name);
+    const bool old = str_is(n->op, "Upsample") || n->ninputs == 2;     /* the operators before opset 11 */
+    const Attr *ma = attr(n, "mode");
+    const Str mode = ma && ma->s.n ? ma->s : (Str){"nearest", 7};
+    const bool linear = str_is(mode, "linear") || str_is(mode, "bilinear");
+    if (!linear && !str_is(mode, "nearest"))
+        return fail(im, "ONNX import: %.*s node '%.*s' interpolates other than by nearest or linear", n->op, n->name);
+    /* the factors of the four axes: scales (an attribute of Upsample-7, an input), or sizes over the input's */
+    float scale[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+    const float in[4] = {1.0f, (float)x->c, (float)x->h, (float)x->w};
+    int64_t axes[4] = {0, 1, 2, 3};
+    int naxes = 4;
+    const Attr *aa = attr(n, "axes");
+    if (aa && aa->nints >= 1 && aa->nints <= 4) {
+        naxes = aa->nints;
+        for (int k = 0; k < naxes; k++) axes[k] = aa->ints[k] < 0 ? aa->ints[k] + 4 : aa->ints[k];
+    }
+    bool have = false;
+    const Attr *sa = attr(n, "scales");
+    if (sa && sa->nfloats == 4) {
+        for (int k = 0; k < 4; k++) scale[k] = sa->floats[k];
+        have = true;
+    }
+    const int si = old ? 1 : 2;
+    Value *sv = !have && si < n->ninputs && n->inputs[si].n ? find(im, n->inputs[si]) : NULL;
+    Value *zv = !old && n->ninputs > 3 && n->inputs[3].n ? find(im, n->inputs[3]) : NULL;
+    if (sv && sv->constant && sv->count == (uint64_t)naxes) {
+        const float *f = constant_floats(im, sv);
+        if (!f) return false;
+        for (int k = 0; k < naxes; k++)
+            if (axes[k] >= 0 && axes[k] < 4) scale[axes[k]] = f[k];
+        have = true;
+    } else if (zv && zv->constant && zv->count == (uint64_t)naxes) {
+        const float *f = constant_floats(im, zv);
+        if (!f) return false;
+        for (int k = 0; k < naxes; k++)
+            if (axes[k] >= 1 && axes[k] < 4) scale[axes[k]] = f[k] / in[axes[k]];
+        have = true;
+    }
+    const float sh = scale[2], sw = scale[3];
+    if (!have || scale[0] != 1.0f || scale[1] != 1.0f || sh < 1.0f || sw < 1.0f || sh > 65535.0f || sw > 65535.0f ||
+        sh != floorf(sh) || sw != floorf(sw))
+        return fail(im, "ONNX import: %.*s node '%.*s' resizes other than by constant integer factors of a map's height "
+                    "and width", n->op, n->name);
+    const uint32_t fh = (uint32_t)sh, fw = (uint32_t)sw, most = fh > fw ? fh : fw;
+    /* the coordinates: what gives floor(o / factor) for nearest, the cells' centres for linear */
+    const Attr *ca = attr(n, "coordinate_transformation_mode"), *na = attr(n, "nearest_mode");
+    const Str ctm = old ? (Str){"asymmetric", 10} : ca && ca->s.n ? ca->s : (Str){"half_pixel", 10};
+    const Str nm = old ? (Str){"floor", 5} : na && na->s.n ? na->s : (Str){"round_prefer_floor", 18};
+    const bool centres = str_is(ctm, "half_pixel") || str_is(ctm, "pytorch_half_pixel") ||
+                         str_is(ctm, "half_pixel_symmetric");
+    bool fits;
+    if (linear) fits = centres;
+    else if (centres) fits = str_is(nm, "round_prefer_floor") || str_is(nm, "round_prefer_ceil") || most == 1;
+    else if (str_is(ctm, "asymmetric"))
+        fits = str_is(nm, "floor") || (str_is(nm, "round_prefer_floor") && most <= 2) || most == 1;
+    else fits = most == 1;
+    if (!fits)
+        return fail(im, "ONNX import: %.*s node '%.*s' maps coordinates other than as the upsampling layer does "
+                    "(nearest: floor of asymmetric or rounded half-pixel coordinates; linear: half-pixel)", n->op,
+                    n->name);
+    if (fh == 1 && fw == 1) return view(im, n, x, false);
+    uint32_t l = upsample2d(.net = im->net, .inputs = {x->layer}, .input_count = 1, .stride_h = fh, .stride_w = fw,
+                            .upsample = linear ? UPSAMPLE_BILINEAR : UPSAMPLE_NEAREST);
+    if (!added(im, l, n)) return false;
+    im->bias_open = false;
+    return layer_output(im, n, l) != NULL;
+}
+
+/* LayerNormalization over a vector, or over the channels of a map transposed to channels last. */
+static bool convert_layer_norm(Importer *im, const Node *n) {
+    const Value *x = layer_input(im, n, 0);
+    if (!x) return false;
+    const int64_t axis = attr_int(n, "axis", -1);
+    bool channels;
+    if (x->nhwc) channels = axis == -1 || axis == 3;
+    else if (x->vector || x->flat) channels = x->h * x->w == 1 && (axis == -1 || axis == 1);
+    else channels = x->h * x->w == 1 && (axis == 1 || axis == -3);    /* [N, C, 1, 1] */
+    if (!channels)
+        return fail(im, "ONNX import: LayerNormalization node '%.*s' normalizes other axes than a vector or a map's "
+                    "channels (transposed to the last place)%.*s", n->name, (Str){"", 0});
+    const Value *gamma = constant_input(im, n, 1, x->c);
+    if (!gamma) return false;
+    const Value *beta = n->ninputs > 2 && n->inputs[2].n ? constant_input(im, n, 2, x->c) : NULL;
+    if (n->ninputs > 2 && n->inputs[2].n && !beta) return false;
+    const float eps = attr_float(n, "epsilon", 1e-5f);
+    const bool flat = x->flat, vector = x->vector, nhwc = x->nhwc;
+    const uint32_t C = x->c;
+    uint32_t l = layer_norm(.net = im->net, .inputs = {x->layer}, .input_count = 1, .act_func = ACT_NONE,
+                            .epsilon = eps > 0.0f && eps < 1.0f ? eps : 1e-5f);
+    if (!added(im, l, n)) return false;
+    memcpy(layer_weights(im->net, l), gamma->data, C * sizeof(float));
+    if (beta) memcpy(layer_biases(im->net, l), beta->data, C * sizeof(float));
+    else memset(layer_biases(im->net, l), 0, C * sizeof(float));
+    im->bias_open = false;
+    Value *y = layer_output(im, n, l);
+    if (y) y->flat = flat, y->vector = vector, y->nhwc = nhwc;
+    return y != NULL;
+}
+
 static bool convert_node(Importer *im, const Node *n) {
     ActivationFunction act = activation_of(n, im);
     if (im->error[0]) return false;
@@ -906,6 +1127,10 @@ static bool convert_node(Importer *im, const Node *n) {
     if (str_is(n->op, "MaxPool")) return convert_pool(im, n, true);
     if (str_is(n->op, "AveragePool")) return convert_pool(im, n, false);
     if (str_is(n->op, "BatchNormalization")) return convert_batch_norm(im, n);
+    if (str_is(n->op, "ConvTranspose")) return convert_conv_transpose(im, n);
+    if (str_is(n->op, "Resize") || str_is(n->op, "Upsample")) return convert_resize(im, n);
+    if (str_is(n->op, "LayerNormalization")) return convert_layer_norm(im, n);
+    if (str_is(n->op, "Transpose")) return convert_transpose(im, n);
     if (str_is(n->op, "Identity") || str_is(n->op, "Dropout")) return alias(im, n, false);
     if (str_is(n->op, "Flatten")) {
         if (attr_int(n, "axis", 1) != 1)
@@ -931,7 +1156,9 @@ static bool convert_node(Importer *im, const Node *n) {
         uint32_t l = global_avg_pool2d(.net = im->net, .inputs = {x->layer}, .input_count = 1);
         if (!added(im, l, n)) return false;
         im->bias_open = false;
-        return layer_output(im, n, l) != NULL;
+        Value *y = layer_output(im, n, l);
+        if (y) y->vector = attr_int(n, "keepdims", 1) == 0;       /* [N, C] */
+        return y != NULL;
     }
     if (str_is(n->op, "GlobalAveragePool")) {
         const Value *x = layer_input(im, n, 0);
@@ -1122,6 +1349,7 @@ static NeuralNetwork *import_onnx(const void *data, size_t size, const char *dir
         v->c = (uint32_t)dims[1];
         v->h = nd == 4 ? (uint32_t)dims[2] : 1u;
         v->w = nd == 4 ? (uint32_t)dims[3] : 1u;
+        v->vector = nd == 2;
     }
     if (ok && !have_input) ok = fail(&im, "ONNX import: the model has no input%.*s%.*s", (Str){"", 0}, (Str){"", 0});
 
