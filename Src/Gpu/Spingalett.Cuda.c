@@ -107,6 +107,7 @@ typedef unsigned long long CUdeviceptr;
     X(cuEventRecord, "cuEventRecord", (CUevent, CUstream)) \
     X(cuEventSynchronize, "cuEventSynchronize", (CUevent)) \
     X(cuEventElapsedTime, "cuEventElapsedTime", (float *, CUevent, CUevent)) \
+    X(cuStreamWaitEvent, "cuStreamWaitEvent", (CUstream, CUevent, unsigned)) \
     X(cuStreamBeginCapture, "cuStreamBeginCapture_v2", (CUstream, int)) \
     X(cuStreamEndCapture, "cuStreamEndCapture", (CUstream, CUgraph *)) \
     X(cuGraphInstantiate, "cuGraphInstantiateWithFlags", (CUgraphExec *, CUgraph, unsigned long long)) \
@@ -135,6 +136,7 @@ static struct {
     CUdevice device;
     CUcontext context;
     CUstream stream, capture;       /* the work's stream; the one commands are captured on */
+    CUstream side;                  /* the heads of submissions (cub_record_end()) */
     char name[256];
     uint64_t memory;
     uint32_t sms, shared_optin;
@@ -223,7 +225,8 @@ static bool open_device(void) {
         cu.shared_optin = (uint32_t)shared;
         bind();
         if (cuStreamCreate(&cu.stream, CU_STREAM_NON_BLOCKING) != 0 ||
-            cuStreamCreate(&cu.capture, CU_STREAM_NON_BLOCKING) != 0)
+            cuStreamCreate(&cu.capture, CU_STREAM_NON_BLOCKING) != 0 ||
+            cuStreamCreate(&cu.side, CU_STREAM_NON_BLOCKING) != 0)
             return false;
         cu.lock = spg_signal_create();
         const char *prof = getenv("SPINGALETT_GPU_PROFILE");
@@ -450,7 +453,7 @@ static void cub_arena_free(void *arena) {
 
 /* ------------------------------------------------------------------------- commands */
 
-typedef enum { OP_LAUNCH, OP_COPY, OP_FILL, OP_STAMP } OpKind;
+typedef enum { OP_LAUNCH, OP_COPY, OP_FILL, OP_STAMP, OP_BARRIER } OpKind;
 
 typedef struct {
     OpKind kind;
@@ -468,6 +471,9 @@ typedef struct {
     uint32_t count, cap;
     bool ok, pending, untimed;
     CUevent done;
+    uint32_t head;                  /* the copies and fills before the first barrier, which as with Vulkan may
+                                       run while earlier submissions still do: on the side stream */
+    CUevent headed;                 /* their end, which the rest waits for */
     CUevent *stamps;                /* spg_gpu_commands_stamps() */
     uint32_t stamp_count;
     CUgraphExec exec;               /* the list as a graph (NULL: run on the stream) */
@@ -480,6 +486,11 @@ static void *cub_commands_create(void) {
     if (!cub_open()) return NULL;
     CuCommands *c = (CuCommands *)calloc(1, sizeof *c);
     if (c && cuEventCreate(&c->done, CU_EVENT_DISABLE_TIMING) != 0) {
+        free(c);
+        return NULL;
+    }
+    if (c && cuEventCreate(&c->headed, CU_EVENT_DISABLE_TIMING) != 0) {
+        cuEventDestroy(c->done);
         free(c);
         return NULL;
     }
@@ -502,6 +513,7 @@ static void cub_commands_free(void *commands) {
     for (uint32_t k = 0; k < c->stamp_count; k++) cuEventDestroy(c->stamps[k]);
     for (uint32_t k = 0; k < 2u * c->timed_count; k++) cuEventDestroy(c->timed[k]);
     cuEventDestroy(c->done);
+    cuEventDestroy(c->headed);
     free(c->stamps);
     free(c->timed);
     free(c->labels);
@@ -596,7 +608,11 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
     }
 }
 
-static void cub_barrier(void *commands) { (void)commands; }        /* one stream: everything is in order */
+/* One stream runs everything in order; the first barrier ends the head (cub_record_end()). */
+static void cub_barrier(void *commands) {
+    CuCommands *c = (CuCommands *)commands;
+    if (c->count && c->ops[c->count - 1u].kind != OP_BARRIER) add_op(c, OP_BARRIER);
+}
 static void cub_barrier_host(void *commands) { (void)commands; }
 
 static void cub_copy(void *commands, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
@@ -632,6 +648,7 @@ static bool run_op(CuCommands *c, uint32_t k, CUstream s) {
         case OP_COPY: return cuMemcpyAsync(op->dst, op->src, op->bytes, s) == 0;
         case OP_FILL: return cuMemsetD32Async(op->dst, op->value, op->bytes / 4u, s) == 0;
         case OP_STAMP: return cuEventRecord(c->stamps[op->value], s) == 0;
+        case OP_BARRIER: return true;
     }
     return false;
 }
@@ -643,11 +660,16 @@ static bool cub_record_end(void *commands) {
     /* a graph of the list, unless it has timestamps or is profiled */
     bool stamped = false;
     for (uint32_t k = 0; k < c->count && !stamped; k++) stamped = c->ops[k].kind == OP_STAMP;
+    /* the head: copies and fills before the first barrier (the uploads of a slot's chunk, which the other
+       slot's chunk does not use: Spingalett.Gpu.c), when something follows it */
+    c->head = 0;
+    while (c->head < c->count && (c->ops[c->head].kind == OP_COPY || c->ops[c->head].kind == OP_FILL)) c->head++;
+    if (stamped || c->head == c->count || c->ops[c->head].kind != OP_BARRIER) c->head = 0;
     if (stamped || (cu.profile && !c->untimed) || c->count == 0) return true;
     spg_lock(cu.lock);
     CUgraph graph = NULL;
     bool ok = cuStreamBeginCapture(cu.capture, CU_CAPTURE_MODE_RELAXED) == 0;
-    for (uint32_t k = 0; ok && k < c->count; k++) ok = run_op(c, k, cu.capture);
+    for (uint32_t k = c->head; ok && k < c->count; k++) ok = run_op(c, k, cu.capture);
     ok = cuStreamEndCapture(cu.capture, &graph) == 0 && ok;
     ok = ok && cuGraphInstantiate(&c->exec, graph, 0) == 0;
     if (graph) cuGraphDestroy(graph);
@@ -662,6 +684,8 @@ static bool cub_submit(void *commands) {
     bind();
     spg_lock(cu.lock);
     bool ok = true;
+    for (uint32_t k = 0; ok && k < c->head; k++) ok = run_op(c, k, cu.side);
+    if (c->head) ok = ok && cuEventRecord(c->headed, cu.side) == 0 && cuStreamWaitEvent(cu.stream, c->headed, 0) == 0;
     if (c->exec) {
         ok = cuGraphLaunch(c->exec, cu.stream) == 0;
     } else if (cu.profile && !c->untimed) {
@@ -674,14 +698,14 @@ static bool cub_submit(void *commands) {
             for (uint32_t k = 2u * c->timed_count; grown && labels && k < 2u * c->count; k++) cuEventCreate(&c->timed[k], 0);
             if (grown && labels) c->timed_count = c->count;
         }
-        for (uint32_t k = 0; ok && k < c->count; k++) {
+        for (uint32_t k = c->head; ok && k < c->count; k++) {
             const bool timed = k < c->timed_count && k < PROFILE_OPS && c->ops[k].kind != OP_STAMP;
             if (timed) cuEventRecord(c->timed[2u * k], cu.stream);
             ok = run_op(c, k, cu.stream);
             if (timed) cuEventRecord(c->timed[2u * k + 1u], cu.stream);
         }
     } else {
-        for (uint32_t k = 0; ok && k < c->count; k++) ok = run_op(c, k, cu.stream);
+        for (uint32_t k = c->head; ok && k < c->count; k++) ok = run_op(c, k, cu.stream);
     }
     ok = ok && cuEventRecord(c->done, cu.stream) == 0;
     spg_unlock(cu.lock);
@@ -698,11 +722,11 @@ static bool cub_wait(void *commands) {
     if (ok && cu.profile && !c->untimed && !c->exec && c->timed_count) {
         spg_lock(cu.lock);
         float first = 0.0f, last = 0.0f;
-        for (uint32_t k = 0; k < c->count && k < c->timed_count && k < PROFILE_OPS; k++) {
-            if (c->ops[k].kind == OP_STAMP) continue;
+        for (uint32_t k = c->head; k < c->count && k < c->timed_count && k < PROFILE_OPS; k++) {
+            if (c->ops[k].kind == OP_STAMP || c->ops[k].kind == OP_BARRIER) continue;
             float ms = 0.0f;
             if (cuEventElapsedTime(&ms, c->timed[2u * k], c->timed[2u * k + 1u]) == 0) profile_add(c->ops[k].label, ms);
-            if (cuEventElapsedTime(&ms, c->timed[0], c->timed[2u * k + 1u]) == 0 && ms > last) last = ms;
+            if (cuEventElapsedTime(&ms, c->timed[2u * c->head], c->timed[2u * k + 1u]) == 0 && ms > last) last = ms;
         }
         cu.busy_ms += (double)(last - first);
         cu.submissions++;
