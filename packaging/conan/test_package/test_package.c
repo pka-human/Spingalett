@@ -3,7 +3,8 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
-/* A package's library loads, trains a little XOR network and predicts with it, and names its GPU. */
+/* A package's library loads, trains a little XOR network, predicts with it and saves it (xor.slett,
+   for test_runtime), and names its GPU. */
 
 #include <Spingalett/Spingalett.h>
 #include <stdio.h>
@@ -23,7 +24,8 @@ int main(void) {
                                                     .optimizer_type = SPINGALETT_OPTIMIZER_ADAM, .epochs = 2000,
                                                     .learning_rate = 0.05f);
     bool ok = report.status == SPINGALETT_TRAIN_COMPLETED &&
-              spingalett_predict(.net = net, .inputs = inputs, .sample_count = 4, .outputs = outputs);
+              spingalett_predict(.net = net, .inputs = inputs, .sample_count = 4, .outputs = outputs) &&
+              spingalett_save(.net = net, .filename = "xor.slett", .precision = SPINGALETT_PRECISION_INT8);
     const char *gpu = spingalett_gpu_device();
     printf("Spingalett %s (%s kernels, GPU: %s): XOR %.2f %.2f %.2f %.2f\n", spingalett_version(),
            spingalett_cpu_kernels(), gpu ? gpu : "none", outputs[0], outputs[1], outputs[2], outputs[3]);

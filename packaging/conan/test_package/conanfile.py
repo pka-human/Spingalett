@@ -24,4 +24,9 @@ class TestPackageConan(ConanFile):
 
     def test(self):
         if can_run(self):
-            self.run(os.path.join(self.cpp.build.bindir, "test_package"), env="conanrun")
+            # the library writes xor.slett, which the runtime then runs
+            model = []
+            if not self.dependencies["spingalett"].options.runtime_only:
+                self.run(os.path.join(self.cpp.build.bindir, "test_package"), env="conanrun")
+                model = ["xor.slett"]
+            self.run(" ".join([os.path.join(self.cpp.build.bindir, "test_runtime")] + model), env="conanrun")

@@ -78,6 +78,7 @@ jobs:
         shell: ${{ startsWith(matrix.os, 'windows') && 'msys2 {0}' || 'bash' }}
     env:
       ARCHIVE: spingalett-${{ needs.version.outputs.version }}-${{ matrix.name }}
+      RUNTIME_ARCHIVE: spingalett-runtime-${{ needs.version.outputs.version }}-${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,57 +149,79 @@ jobs:
           lipo -info libomp/lib/libomp.dylib
           otool -l libomp/lib/libomp.dylib | grep -A4 LC_BUILD_VERSION | head -8
 
+      # The library (with the runtime next to it), and the runtime alone for its own archive: the same
+      # flags, without the GPU backend
       - name: Configure
         run: |
           root=$PWD; [ "$RUNNER_OS" = Windows ] && root=$(cygpath -m "$PWD")    # native CMake, MSYS shell
-          args=(-DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF "-DCMAKE_C_FLAGS=${{ matrix.flags }}"
-                -DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE" -DSPINGALETT_VULKAN=ON -DSPINGALETT_SPIRV_DIR="$root/spirv")
+          args=(-DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF "-DCMAKE_C_FLAGS=${{ matrix.flags }}")
+          library=(-DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE" -DSPINGALETT_VULKAN=ON -DSPINGALETT_SPIRV_DIR="$root/spirv")
+          runtime=(-DCMAKE_INSTALL_PREFIX="$root/$RUNTIME_ARCHIVE" -DSPINGALETT_RUNTIME_ONLY=ON
+                   -DSPINGALETT_BIN_DIR="$root/BuildRuntime/Bin" -DSPINGALETT_LIB_DIR="$root/BuildRuntime/Lib")
           case "${{ matrix.name }}" in
             macos-*)   omp="$PWD/libomp"
-                       args+=("-DSPINGALETT_VULKAN_INCLUDE=$(brew --prefix vulkan-headers)/include")
+                       library+=("-DSPINGALETT_VULKAN_INCLUDE=$(brew --prefix vulkan-headers)/include")
                        args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
                               -DBUILD_WITH_OPENMP=ON "-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$omp/include"
                               -DOpenMP_C_LIB_NAMES=omp "-DOpenMP_omp_LIBRARY=$omp/lib/libomp.dylib") ;;
             windows-*) args+=(-G Ninja -DBUILD_WITH_OPENMP=ON) ;;
             *)         args+=(-DBUILD_WITH_OPENMP=ON) ;;
           esac
-          cmake -S . -B Build "${args[@]}"
+          cmake -S . -B Build "${args[@]}" "${library[@]}"
+          cmake -S . -B BuildRuntime "${args[@]}" "${runtime[@]}"
           # OpenMP is requested everywhere: a build without it must not be published
-          if ! grep -q "define SPINGALETT_HAS_OPENMP" Build/Spingalett/Spingalett.Config.h; then
-            grep -n -i -B2 -A25 "openmp" Build/CMakeFiles/CMakeConfigureLog.yaml | tail -120 || true
-            echo "::error::OpenMP was requested but not found"
-            exit 1
-          fi
+          for build in Build BuildRuntime; do
+            if ! grep -q "define SPINGALETT_HAS_OPENMP" $build/Spingalett/Spingalett.Config.h; then
+              grep -n -i -B2 -A25 "openmp" $build/CMakeFiles/CMakeConfigureLog.yaml | tail -120 || true
+              echo "::error::OpenMP was requested but not found ($build)"
+              exit 1
+            fi
+          done
 
       - name: Build
-        run: cmake --build Build --parallel
+        run: |
+          cmake --build Build --parallel
+          cmake --build BuildRuntime --parallel
 
       - name: Test
-        run: ctest --test-dir Build --output-on-failure
+        run: |
+          ctest --test-dir Build --output-on-failure
+          ctest --test-dir BuildRuntime --output-on-failure
 
       - name: Install
         run: |
           cmake --install Build
-          cp LICENSE CHANGELOG.md README.md "$ARCHIVE/"
+          cmake --install BuildRuntime
+          for dir in "$ARCHIVE" "$RUNTIME_ARCHIVE"; do cp LICENSE CHANGELOG.md README.md "$dir/"; done
           if [ "$RUNNER_OS" = Windows ]; then
-            # the MinGW runtime DLLs the library and the tools load (libgomp, libwinpthread, ...)
-            ldd "$ARCHIVE/bin/libspingalett.dll" "$ARCHIVE/bin/DatasetTool.exe" "$ARCHIVE/bin/ModelTool.exe" |
+            # the MinGW runtime DLLs the libraries and the tools load (libgomp, libwinpthread, ...)
+            ldd "$ARCHIVE/bin/libspingalett.dll" "$ARCHIVE/bin/libspingalett-runtime.dll" \
+                "$ARCHIVE/bin/DatasetTool.exe" "$ARCHIVE/bin/ModelTool.exe" |
               awk '$3 ~ /^\/ucrt64\// { print $3 }' | sort -u | xargs -r cp -t "$ARCHIVE/bin/"
-            ls "$ARCHIVE/bin"
-            (cd "$ARCHIVE/lib" && gendef ../bin/libspingalett.dll && mv libspingalett.def spingalett.def)
+            ldd "$RUNTIME_ARCHIVE/bin/libspingalett-runtime.dll" "$RUNTIME_ARCHIVE/bin/RunModel.exe" |
+              awk '$3 ~ /^\/ucrt64\// { print $3 }' | sort -u | xargs -r cp -t "$RUNTIME_ARCHIVE/bin/"
+            ls "$ARCHIVE/bin" "$RUNTIME_ARCHIVE/bin"
+            (cd "$ARCHIVE/lib" && gendef ../bin/libspingalett.dll && mv libspingalett.def spingalett.def &&
+             gendef ../bin/libspingalett-runtime.dll && mv libspingalett-runtime.def spingalett-runtime.def)
+            (cd "$RUNTIME_ARCHIVE/lib" && gendef ../bin/libspingalett-runtime.dll &&
+             mv libspingalett-runtime.def spingalett-runtime.def)
           fi
           if [ "$RUNNER_OS" = macOS ]; then
-            # the OpenMP runtime next to the library, which finds it through @loader_path
-            cp libomp/lib/libomp.dylib "$ARCHIVE/lib/"
-            cp libomp/LICENSE-libomp.txt "$ARCHIVE/"
-            otool -L "$ARCHIVE"/lib/libspingalett.*.dylib
+            # the OpenMP runtime next to the libraries, which find it through @loader_path
+            for dir in "$ARCHIVE" "$RUNTIME_ARCHIVE"; do
+              cp libomp/lib/libomp.dylib "$dir/lib/"
+              cp libomp/LICENSE-libomp.txt "$dir/"
+            done
+            otool -L "$ARCHIVE"/lib/libspingalett.*.dylib "$RUNTIME_ARCHIVE"/lib/libspingalett-runtime.*.dylib
             otool -l "$ARCHIVE"/lib/libspingalett.*.dylib | grep -A2 LC_RPATH
-            out=$("$ARCHIVE/bin/ModelTool" 2>&1 || true)            # usage: the tool and its libraries load
-            echo "$out" | head -3
-            if echo "$out" | grep -q "Library not loaded"; then
-              echo "::error::the installed tools cannot load their libraries"
-              exit 1
-            fi
+            for tool in "$ARCHIVE/bin/ModelTool" "$RUNTIME_ARCHIVE/bin/RunModel"; do
+              out=$("$tool" 2>&1 || true)                           # usage: the tool and its libraries load
+              echo "$out" | head -3
+              if echo "$out" | grep -q "Library not loaded"; then
+                echo "::error::$tool cannot load its libraries"
+                exit 1
+              fi
+            done
           fi
 
       - name: MSVC import library
@@ -210,25 +233,34 @@ jobs:
         shell: pwsh
         run: |
           lib /nologo /def:$env:ARCHIVE\lib\spingalett.def /name:libspingalett.dll /machine:x64 /out:$env:ARCHIVE\lib\spingalett.lib
-          Remove-Item $env:ARCHIVE\lib\spingalett.exp -ErrorAction SilentlyContinue
+          foreach ($dir in $env:ARCHIVE, $env:RUNTIME_ARCHIVE) {
+            lib /nologo /def:$dir\lib\spingalett-runtime.def /name:libspingalett-runtime.dll /machine:x64 /out:$dir\lib\spingalett-runtime.lib
+            Remove-Item $dir\lib\*.exp -ErrorAction SilentlyContinue
+          }
           # an MSVC program links against the MinGW-built DLL through the import library
           cl /nologo /std:c11 /I $env:ARCHIVE\include Examples\XOR.c /Fe:xor_msvc.exe /link $env:ARCHIVE\lib\spingalett.lib
+          cl /nologo /std:c11 /I $env:RUNTIME_ARCHIVE\include packaging\conan\test_package\test_runtime.c /Fe:runtime_msvc.exe /link $env:RUNTIME_ARCHIVE\lib\spingalett-runtime.lib
           $env:PATH = "$PWD\$env:ARCHIVE\bin;$env:PATH"
           .\xor_msvc.exe | Select-String "Passed"
+          $env:PATH = "$PWD\$env:RUNTIME_ARCHIVE\bin;$env:PATH"
+          .\runtime_msvc.exe | Select-String "Spingalett runtime"
 
       - name: Consumer (find_package)
         run: |
           mkdir consumer
           cp Examples/XOR.c consumer/xor.c
+          cp Examples/Runtime/RunModel.c consumer/run.c
           printf '%s\n' 'cmake_minimum_required(VERSION 3.21)' 'project(consumer C)' \
             'find_package(Spingalett ${{ needs.version.outputs.version }} REQUIRED)' \
-            'add_executable(xor xor.c)' 'target_link_libraries(xor PRIVATE Spingalett::spingalett)' > consumer/CMakeLists.txt
+            'add_executable(xor xor.c)' 'target_link_libraries(xor PRIVATE Spingalett::spingalett)' \
+            'add_executable(run run.c)' 'target_link_libraries(run PRIVATE Spingalett::runtime)' > consumer/CMakeLists.txt
           root=$PWD; gen=()
           if [ "$RUNNER_OS" = Windows ]; then root=$(cygpath -m "$PWD"); gen=(-G Ninja); fi
           cmake -S consumer -B consumer/build "${gen[@]}" -DCMAKE_PREFIX_PATH="$root/$ARCHIVE"
           cmake --build consumer/build
           export PATH="$PWD/$ARCHIVE/bin:$PATH"
           (cd consumer/build && ./xor | grep "Passed: 4/4")
+          consumer/build/run Tests/Data/runtime/graph5_fp32.slett | tail -1     # the runtime next to the library
           if [ "$RUNNER_OS" != Windows ] && command -v pkg-config > /dev/null; then   # spingalett.pc, relocated
             export PKG_CONFIG_PATH="$PWD/$ARCHIVE/lib/pkgconfig"
             test "$(pkg-config --modversion spingalett)" = "${{ needs.version.outputs.version }}"
@@ -239,15 +271,45 @@ jobs:
           { "$ARCHIVE/bin/DatasetTool" || true; } 2>&1 | grep -q usage      # no arguments: usage, exit 2
           { "$ARCHIVE/bin/ModelTool" || true; } 2>&1 | grep -q usage
 
+      - name: Consumer of the runtime (find_package, pkg-config)
+        run: |
+          mkdir runtime-consumer
+          cp Examples/Runtime/RunModel.c runtime-consumer/
+          printf '%s\n' 'cmake_minimum_required(VERSION 3.21)' 'project(consumer C)' \
+            'find_package(Spingalett ${{ needs.version.outputs.version }} REQUIRED)' \
+            'add_executable(run RunModel.c)' 'target_link_libraries(run PRIVATE Spingalett::runtime)' \
+            > runtime-consumer/CMakeLists.txt
+          root=$PWD; gen=()
+          if [ "$RUNNER_OS" = Windows ]; then root=$(cygpath -m "$PWD"); gen=(-G Ninja); fi
+          # only the runtime: the archive has neither the library nor its header
+          test ! -e "$RUNTIME_ARCHIVE/include/Spingalett/Spingalett.h"
+          cmake -S runtime-consumer -B runtime-consumer/build "${gen[@]}" -DCMAKE_PREFIX_PATH="$root/$RUNTIME_ARCHIVE"
+          cmake --build runtime-consumer/build
+          export PATH="$PWD/$RUNTIME_ARCHIVE/bin:$PATH"
+          runtime-consumer/build/run Tests/Data/runtime/resnet_int8.slett
+          "$RUNTIME_ARCHIVE/bin/RunModel" Tests/Data/runtime/cnn_fp32.slett | tail -1
+          if [ "$RUNNER_OS" != Windows ] && command -v pkg-config > /dev/null; then   # spingalett-runtime.pc
+            export PKG_CONFIG_PATH="$PWD/$RUNTIME_ARCHIVE/lib/pkgconfig"
+            test "$(pkg-config --modversion spingalett-runtime)" = "${{ needs.version.outputs.version }}"
+            cc -std=c99 -Wall -Wextra -Wpedantic -Werror -o runtime-consumer/pc \
+               packaging/conan/test_package/test_runtime.c $(pkg-config --cflags --libs spingalett-runtime) \
+               -Wl,-rpath,"$PWD/$RUNTIME_ARCHIVE/lib"
+            runtime-consumer/pc
+          fi
+
       - name: Archive
         run: |
-          if [ "$RUNNER_OS" = Windows ]; then zip -qr "$ARCHIVE.zip" "$ARCHIVE"; else tar -czf "$ARCHIVE.tar.gz" "$ARCHIVE"; fi
-          ls -l "$ARCHIVE".*
+          for dir in "$ARCHIVE" "$RUNTIME_ARCHIVE"; do
+            if [ "$RUNNER_OS" = Windows ]; then zip -qr "$dir.zip" "$dir"; else tar -czf "$dir.tar.gz" "$dir"; fi
+          done
+          ls -l "$ARCHIVE".* "$RUNTIME_ARCHIVE".*
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
-          path: ${{ env.ARCHIVE }}.*
+          path: |
+            ${{ env.ARCHIVE }}.*
+            ${{ env.RUNTIME_ARCHIVE }}.*
           if-no-files-found: error
 
       # Python wheels from the baseline macOS and Windows builds (Linux wheels: the wheels job)

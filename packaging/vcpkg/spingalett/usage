@@ -2,8 +2,11 @@ spingalett provides CMake targets:
 
     find_package(Spingalett CONFIG REQUIRED)
     target_link_libraries(main PRIVATE Spingalett::spingalett)
+    # or, for programs that only run models: Spingalett::runtime
 
 spingalett provides pkg-config modules:
 
     # Neural networks in C: training on the CPU and on GPUs, deployment down to INT2
     spingalett
+    # Spingalett's deployment models without training
+    spingalett-runtime
