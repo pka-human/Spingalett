@@ -5,6 +5,43 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [Unreleased]
+
+Data sets in the GPU's memory, the setting PyTorch's GPU benchmark measures: with them Spingalett is
+ahead of PyTorch with cuDNN in every workload of `Examples/Benchmark.c`, the fully connected
+network's inference included (1.19 times as fast in single precision, 1.3 times in bfloat16, on an
+RTX 4050 Laptop GPU; README).
+
+### Added
+- Data sets in the GPU's memory: `spingalett_device_data_new(values, count, size)` copies rows of
+  floats to the device once (`spingalett_device_data_free()`, `_count()`, `_size()`, `_read()`), and the
+  new fields `device_inputs` and `device_targets` of `TrainArgs` (with `device_val_inputs` and
+  `device_val_targets`), `PredictArgs` and `EvaluateArgs` take them in place of arrays, either or
+  both. With `COMPUTE_VULKAN`, `train()` writes only the rows' indices of each chunk: the GPU gathers
+  the rows, and augments and smooths them as the host does (a kernel of its own, `rows.comp`), so
+  that training on a set gives the bits of training on the host's arrays. Rows that come in order
+  (`predict()`, `evaluate()`, full batches) are read where they are; with `PRECISION_BFLOAT16` a set
+  makes a copy of its rows as bfloat16 on first use (half its size again), which networks read as
+  the inputs they keep as such. On the CPU those calls copy the rows back first. Python:
+  `sg.DeviceData(array)`, which `train()`, `validation_data`, `forward()` and `evaluate()` take in
+  place of arrays. On an RTX 4050 Laptop GPU the fully connected network of `Examples/Benchmark.c`
+  infers 3.52 M samples per second from a set against 2.61 M from host arrays (bfloat16: 8.01 M
+  against 5.00 M).
+
+### Changed
+- `TrainArgs`, `PredictArgs` and `EvaluateArgs` have new fields (above): programs built against 0.13
+  need to be built again (the soname carries the minor version).
+- `predict()` and `evaluate()` on the GPU keep the parameters their copy of the network has while the
+  network's do not change (they copied them on every call: 0.75 ms of a call of 3.2 for the fully
+  connected network), and command buffers freed are used again (making one took 0.3 ms on NVIDIA's
+  driver).
+- Inference on the GPU runs in chunks sized by the bytes their activations take as they are kept
+  (bfloat16 counted as two), no longer capped at 2,048 samples (inputs from host arrays still go in
+  chunks of at most 2,048): in bfloat16 the convolutional networks infer 1.12 and 1.14 times as fast.
+- `Examples/Benchmark.c` times inference on a second call, as PyTorch's is timed after its warm-up
+  (the first call makes the network's copy on the GPU, the counterpart of moving a PyTorch model
+  there), and runs every GPU workload on the host's arrays and on data sets in the GPU's memory.
+
 ## [0.13.1] - 2026-10-09
 
 "GPU": the GPU backend faster in every workload, ahead of PyTorch with cuDNN in all but the fully

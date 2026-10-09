@@ -20,11 +20,15 @@ against PyTorch on the same machine.
 | 0.12 | "Tensor cores": matrix products in bfloat16 on the GPU's matrix units (opt-in, faster than single precision), the custom-loop API on the GPU, fixes from a review of the GPU backend; ONNX import and PyTorch weights ten to a hundred times as fast (mapped files, one pass per tensor, external data files); gradients and optimizer state allocated when a network first trains; the first wheels on PyPI |
 | 0.13 | "Layers": transposed convolutions, upsampling and layer normalization on the CPU and the GPU, in `.slett` format 7, the engine and deployment models in every precision; their import from ONNX (ConvTranspose, Resize, LayerNormalization) and PyTorch; a U-Net segmentation example; the GPU's loss kernel for wide outputs |
 | 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling, weight gradients split only where it pays: ahead of PyTorch with cuDNN in every workload but the MLP's inference with PyTorch's data already in GPU memory |
+| 0.14 (in progress) | Data sets in the GPU's memory (`spingalett_device_data_new()`): ahead of PyTorch with cuDNN in every workload, its data in GPU memory or not |
 
 ## 0.14: the release candidate
 
 The last minor version of 0.x: whatever would break programs after 1.0 happens here, and nothing
 else.
+
+- **Data sets on the GPU** (done): `SpingalettDeviceData` and the `device_*` fields of the
+  argument structs, which change their layout.
 
 - **Names:** every public name under the library's prefix (`spingalett_`, `Spingalett`,
   `SPINGALETT_`): today the network type, the argument structs, the enumerations (`LAYER_DENSE`,
@@ -59,36 +63,32 @@ next, before or after 1.0.
 
 ### The GPU against PyTorch
 
-0.13.1 on an RTX 4050 Laptop GPU against PyTorch 2.14 with cuDNN (`Bin/Benchmark gpu` against
-`benchmark_pytorch.py --cuda`, `--cuda-fp32`, `--cuda-bf16` and `--host-data`, README): Spingalett
-trains and runs ResNet-20, the MNIST CNN (with and without batch normalization) and the U-Net 1.2
-to 2.1 times as fast as PyTorch in single precision and 1.3 to 1.8 times as fast as its autocast in
-bfloat16, trains the 784-512-1000-10 MLP's full batches 1.05 to 1.09 times as fast and its
-mini-batches 2.9 to 5.9 times. Given the same task, data in host memory, it is ahead everywhere.
-With PyTorch's data in GPU memory from the start, one place remains, and the margins are thin:
+On an RTX 4050 Laptop GPU against PyTorch 2.14 with cuDNN (`Bin/Benchmark gpu` against
+`benchmark_pytorch.py --cuda`, `--cuda-fp32`, `--cuda-bf16` and `--host-data`, README), Spingalett
+0.14 is ahead in every workload, with the data in GPU memory (its data sets) or in host memory:
+ResNet-20, the MNIST CNN (with and without batch normalization) and the U-Net train 1.2 to 1.8 times
+as fast as PyTorch and run 1.8 to 2.4 times as fast in single precision, 1.4 to 1.7 and 1.8 to 2.1
+times as fast as its autocast in bfloat16; the 784-512-1000-10 MLP trains mini-batches 3.2 to 5.8
+times as fast and infers 1.19 and 1.3 times as fast. The margins left thin are the MLP's full
+batches: 1.1 times in single precision (both at the device's 6.3 to 6.5 TFLOPS), 1.04 times in
+bfloat16, where the products on the matrix units reach 15 to 17 TFLOPS on its shapes and cuBLAS 17.4
+to 19.5.
 
-- **The MLP's inference** runs at 60% (46% in bfloat16), bound by the bus: Spingalett copies the
-  20,000 samples (63 MB, 31 MB as bfloat16) from host memory at 9.5 GB/s, which PyTorch's data
-  skips.
-- **The products on the matrix units** reach 15 to 17 TFLOPS on the MLP's shapes where cuBLAS
-  reaches 17.4 to 19.5 (single precision: both 6.3 to 6.5, the device's limit), and a full-batch
-  epoch spends 0.7 ms between its last chunk and the next epoch's first.
-
-Done in 0.13.1: the tile choice (steps of the old list's 1), activations and gradients in bfloat16
-(2), the pooling backward pass (part of 3), larger tiles on the matrix units (part of 4). The next
-steps, each measured against the release before and against PyTorch:
+Done in 0.13.1: the tile choice, activations and gradients in bfloat16, the pooling backward pass
+(part of 2), larger tiles on the matrix units (part of 1). Done in 0.14: data sets on the GPU. The
+next steps, each measured against the release before and against PyTorch:
 
 1. **The matrix units' kernel:** stores to shared memory without bank conflicts (a swizzled
    layout), the epilogue writing four results a thread at once, split sums of weight gradients
    chosen by the tile the timing picked rather than by a single-precision estimate; target: cuBLAS's
-   17 to 19.5 TFLOPS on the MLP's products.
+   17 to 19.5 TFLOPS on the MLP's products, the weight gradients' among them.
 2. **Fewer passes:** batch normalization's sums gathered in the epilogue of the convolution before
    it, its normalization and activation applied as the next layer reads its input; concatenated
    layers writing straight into their channels of the concatenation; a kernel of its own for
    depthwise convolutions; the first layer's three channels padded to four for vector loads.
-3. **Data sets on the GPU:** an API that keeps a training or inference set in device memory
-   (written once), for repeated predictions and many epochs of the same data, the setting the
-   PyTorch benchmark measures (0.14, as it adds API).
+3. **Gathered rows in the products:** the first layer's products reading a shuffled mini-batch's
+   rows of a data set through their indices, rather than after a gather (mini-batches of the MLP:
+   two small dispatches a step).
 4. **Products in FP16** with single-precision sums as a precision of their own (Vulkan has no
    TF32, which PyTorch's convolutions use by default).
 5. **Winograd convolutions** (F(2x2, 3x3)) for 3 x 3 convolutions of stride 1, on the GPU and the

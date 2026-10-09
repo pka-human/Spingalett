@@ -109,7 +109,16 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   `spingalett_network_written()` after. A new reader or writer needs the call, or it sees stale
   values (the `gpu` group's `gpu_trainer`, `gpu_callback` and `gpu_kept` read and rewrite weights
   between steps and calls). Code that uses the kept copy holds it (`spingalett_network_hold_gpu()`),
-  as sync and its release do; a change of the network's layers releases it first.
+  as sync and its release do; a change of the network's layers releases it first. `predict()`'s own
+  copy takes the parameters again only when the network's `host_version` moved (every write, every
+  copy back): code that changes parameters or running statistics on the host without
+  `spingalett_network_written()` leaves it stale (`gpu_predict_cached`).
+- **Data sets on the GPU.** Training on `spingalett_device_data_new()` sets gives the bits of training
+  on the host's arrays: `rows.comp` gathers, augments and smooths as `gpu_fill()`, `augment_image()`
+  and `smooth_targets()` do, so a change to one is a change to the other (`gpu_device_data` compares
+  them, with inputs, targets or both on the GPU). Rows read where they are (inference, and training
+  chunks that repeat every epoch) are of the precision the network keeps its inputs in: the set's
+  floats, or its bfloat16 copy (`data_half()`), never floats in place of bfloat16.
 - **Activations as bfloat16.** With `PRECISION_BFLOAT16` the executor keeps layers' outputs and
   gradients as bfloat16 (`kept_half()`): products find which operands are such by address
   (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push
