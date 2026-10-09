@@ -1531,6 +1531,7 @@ const float *spingalett_trainer_forward(SpingalettTrainer *tr, const float *inpu
     flush_denormals_begin(tr->mode);
     spingalett_batch_forward(net, ws, count, tr->use_dropout ? &tr->dropout : NULL, tr->accumulated, tr->mode);
     flush_denormals_end(tr->mode);
+    spingalett_network_written(net);    /* the running statistics of batch normalization moved */
     tr->pending = count;
     return ws->act[net->layers - 1];
 }

@@ -87,6 +87,7 @@ struct SpgGpuNet {
 
     Slot slots[2];
     uint32_t next;                  /* the slot of the next chunk */
+    uint64_t version;               /* the network's host_version whose parameters it has (the caller's) */
     float step_loss, total_loss;    /* losses harvested so far: of the open step, of closed steps */
 };
 
@@ -196,6 +197,14 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
 
 uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) {
     return g->capacity;
+}
+
+uint64_t spingalett_gpu_net_version(const SpgGpuNet *g) {
+    return g->version;
+}
+
+void spingalett_gpu_net_set_version(SpgGpuNet *g, uint64_t version) {
+    g->version = version;
 }
 
 bool spingalett_gpu_net_current(const SpgGpuNet *g) {
@@ -521,6 +530,7 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
     g->capacity = capacity;
     g->layers = L;
     g->training = training != NULL;
+    g->version = UINT64_MAX;
     g->bf16 = spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16();
     if (training) g->cfg = *training;
     g->act = (SpgGpuBuffer *)calloc(L, sizeof(SpgGpuBuffer));

@@ -4660,6 +4660,71 @@ static void gpu_kept_copy(void) {
     spingalett_set_compute_mode(COMPUTE_OPENMP);
 }
 
+/* predict() on the GPU keeps its copy of the network between calls and takes the parameters again only
+   when they changed: after spingalett_set_parameters(), a forward pass of a trainer on the CPU (the running
+   statistics), steps of a trainer on the GPU and train() on the CPU it predicts what the CPU predicts. */
+static void gpu_predict_cached(void) {
+    NeuralNetwork *net = gpu_net(1);
+    const uint32_t n = 40, in = net->topology[0], out = net->topology[net->layers - 1];
+    float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+    float *yc = (float *)malloc((size_t)n * out * sizeof(float)), *yg = (float *)malloc((size_t)n * out * sizeof(float));
+    float *before = (float *)malloc((size_t)n * out * sizeof(float));
+    lcg_state = 99;
+    for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+    for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+    bool ok = true;
+    const char *failed = NULL;
+    for (int stage = 0; stage < 5 && ok; stage++) {
+        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        predict(.net = net, .inputs = x, .outputs = yg, .sample_count = n);
+        if (stage) memcpy(before, yg, (size_t)n * out * sizeof(float));
+        /* the change of this stage, then the GPU's predictions against the CPU's */
+        if (stage == 1) {
+            SpingalettNetworkLayer info;
+            spingalett_network_layer(net, 1, &info);
+            float *w = (float *)malloc(info.weight_count * sizeof(float));
+            spingalett_get_parameters(net, 1, PARAM_WEIGHTS, w, info.weight_count);
+            for (uint64_t i = 0; i < info.weight_count; i++) w[i] *= 1.5f;
+            spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, info.weight_count);
+            free(w);
+        } else if (stage == 2 || stage == 3) {
+            spingalett_set_compute_mode(stage == 2 ? COMPUTE_OPENMP : COMPUTE_VULKAN);
+            SpingalettTrainer *tr = spingalett_trainer_new(net, n);
+            spingalett_trainer_forward(tr, x, n);
+            if (stage == 3) {
+                spingalett_trainer_backward(tr, t);
+                spingalett_trainer_step(tr, &(OptimizerArgs){.type = OPTIMIZER_SGD, .learning_rate = 0.1f});
+            }
+            /* predictions while the trainer has the network (on the GPU: its copy brought back) */
+            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            predict(.net = net, .inputs = x, .outputs = yg, .sample_count = n);
+            spingalett_set_compute_mode(COMPUTE_OPENMP);
+            predict(.net = net, .inputs = x, .outputs = yc, .sample_count = n);
+            ok = gpu_max_rel(yc, yg, (size_t)n * out) < 1e-4;
+            spingalett_trainer_free(tr);
+        } else if (stage == 4) {
+            spingalett_set_compute_mode(COMPUTE_OPENMP);
+            train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .batch_size = 8,
+                  .training_strategy = STRATEGY_SMALL_BATCH, .report_interval = 0);
+        }
+        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        predict(.net = net, .inputs = x, .outputs = yg, .sample_count = n);
+        spingalett_set_compute_mode(COMPUTE_OPENMP);
+        predict(.net = net, .inputs = x, .outputs = yc, .sample_count = n);
+        ok = ok && gpu_max_rel(yc, yg, (size_t)n * out) < 1e-4 &&
+             (stage == 0 || memcmp(before, yg, (size_t)n * out * sizeof(float)) != 0);
+        if (!ok) {
+            static const char *names[] = {"twice", "set parameters", "CPU trainer", "GPU trainer", "CPU train()"};
+            failed = names[stage];
+        }
+    }
+    CHECK(ok, "gpu predict cached: stale parameters after %s", failed ? failed : "?");
+    printf("  gpu predict cached: parameters taken again when they changed %s\n", ok ? "ok" : "FAILED");
+    free(x); free(t); free(yc); free(yg); free(before);
+    free_network(net);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+}
+
 /* The step API on the GPU: the same steps as on the CPU (built-in loss with label smoothing, a loss
    of the caller's, two backward passes a step, two optimizers), up to rounding (compared by the
    trained networks' outputs in training: biases before a normalization have no gradient but its
@@ -5166,6 +5231,7 @@ int main(int argc, char **argv) {
             gpu_kept();
             gpu_kept_threads();
             gpu_kept_copy();
+            gpu_predict_cached();
             gpu_bf16();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);

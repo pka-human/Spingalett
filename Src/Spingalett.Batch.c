@@ -408,15 +408,20 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
     while (want < count && want < SPINGALETT_BATCH_CHUNK) want *= 2;
     uint32_t capacity = spingalett_gpu_capacity(net, want, false);
     SpgGpuNet *gpu = atomic_exchange(&net->gpu_predict, NULL);
+    /* the parameters as they are now: those it has when the arrays have not changed since (nor the
+       kept copy, which changes in train() only, whose end writes them) */
+    const uint64_t version = atomic_load(&net->host_version);
     if (gpu && spingalett_gpu_net_capacity(gpu) >= capacity && spingalett_gpu_net_current(gpu)) {
-        /* the parameters as they are now */
-        if (source ? spingalett_gpu_take_parameters(gpu, source) : spingalett_gpu_upload(gpu)) {
+        if (spingalett_gpu_net_version(gpu) == version ||
+            (source ? spingalett_gpu_take_parameters(gpu, source) : spingalett_gpu_upload(gpu))) {
+            spingalett_gpu_net_set_version(gpu, version);
             if (source) spingalett_network_let_go_gpu(net);
             return gpu;
         }
     }
     spingalett_gpu_net_free(gpu);
     gpu = capacity ? spingalett_gpu_net_create_from(net, capacity, NULL, source) : NULL;
+    if (gpu) spingalett_gpu_net_set_version(gpu, version);
     if (source) spingalett_network_let_go_gpu(net);
     if (!gpu) spingalett_log(LOG_WARNING, "Not enough GPU memory for the network; running it on the CPU");
     return gpu;

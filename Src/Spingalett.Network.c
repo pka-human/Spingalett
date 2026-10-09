@@ -308,8 +308,10 @@ void spingalett_network_sync(const NeuralNetwork *cnet) {
     /* readers on several threads (predict() may run concurrently, on the kept copy too) bring them back
        once, and not while a predict() runs on it */
     spingalett_network_hold_gpu(net, true);
-    if (atomic_load(&net->gpu_newer) && net->gpu_trainer && !spingalett_gpu_download(net->gpu_trainer))
-        spingalett_log(LOG_ERROR, "The parameters could not be copied back from the GPU");
+    if (atomic_load(&net->gpu_newer) && net->gpu_trainer) {
+        if (spingalett_gpu_download(net->gpu_trainer)) atomic_fetch_add(&net->host_version, 1);
+        else spingalett_log(LOG_ERROR, "The parameters could not be copied back from the GPU");
+    }
     atomic_store(&net->gpu_newer, false);
     spingalett_network_let_go_gpu(net);
 }
@@ -326,7 +328,9 @@ void spingalett_network_release_gpu(NeuralNetwork *net) {
 }
 
 void spingalett_network_written(NeuralNetwork *net) {
-    if (net) net->param_version++;
+    if (!net) return;
+    net->param_version++;
+    atomic_fetch_add(&net->host_version, 1);
 }
 
 bool spingalett_training_state(NeuralNetwork *net) {

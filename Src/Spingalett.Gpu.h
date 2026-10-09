@@ -63,6 +63,9 @@ void spingalett_gpu_net_free(SpgGpuNet *g);
 uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g);
 /* Whether it was made for the current GPU precision (spingalett_set_gpu_precision()). */
 bool spingalett_gpu_net_current(const SpgGpuNet *g);
+/* A version of the network's parameters the copy holds, which the caller keeps (UINT64_MAX when made). */
+uint64_t spingalett_gpu_net_version(const SpgGpuNet *g);
+void spingalett_gpu_net_set_version(SpgGpuNet *g, uint64_t version);
 /* Whether a network made for training can train again with chunks of `capacity` samples and these
    settings (then taken for them: the commands that record the optimizer are recorded again when
    they changed); false leaves it as it was. */
@@ -139,6 +142,8 @@ static inline bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from)
 }
 static inline uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) { (void)g; return 0; }
 static inline bool spingalett_gpu_net_current(const SpgGpuNet *g) { (void)g; return false; }
+static inline uint64_t spingalett_gpu_net_version(const SpgGpuNet *g) { (void)g; return UINT64_MAX; }
+static inline void spingalett_gpu_net_set_version(SpgGpuNet *g, uint64_t version) { (void)g; (void)version; }
 static inline bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *t) {
     (void)g; (void)capacity; (void)t;
     return false;
