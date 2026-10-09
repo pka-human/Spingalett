@@ -42,6 +42,7 @@ int main(void) {
     SIZE(TrainArgs);
     FIELD(TrainArgs, net); FIELD(TrainArgs, training_mode); FIELD(TrainArgs, training_strategy);
     FIELD(TrainArgs, optimizer_type); FIELD(TrainArgs, inputs); FIELD(TrainArgs, targets);
+    FIELD(TrainArgs, device_inputs); FIELD(TrainArgs, device_targets);
     FIELD(TrainArgs, generator); FIELD(TrainArgs, generator_data); FIELD(TrainArgs, sample_count);
     FIELD(TrainArgs, batch_size); FIELD(TrainArgs, do_not_shuffle); FIELD(TrainArgs, epochs);
     FIELD(TrainArgs, learning_rate); FIELD(TrainArgs, weight_decay); FIELD(TrainArgs, momentum);
@@ -51,7 +52,8 @@ int main(void) {
     FIELD(TrainArgs, autosave_do_not_save_optimizer); FIELD(TrainArgs, autosave_precision);
     FIELD(TrainArgs, callback); FIELD(TrainArgs, callback_interval); FIELD(TrainArgs, callback_data);
     FIELD(TrainArgs, lr_scheduler); FIELD(TrainArgs, lr_scheduler_data);
-    FIELD(TrainArgs, val_inputs); FIELD(TrainArgs, val_targets); FIELD(TrainArgs, val_count);
+    FIELD(TrainArgs, val_inputs); FIELD(TrainArgs, val_targets); FIELD(TrainArgs, device_val_inputs);
+    FIELD(TrainArgs, device_val_targets); FIELD(TrainArgs, val_count);
     FIELD(TrainArgs, monitor); FIELD(TrainArgs, early_stopping_patience); FIELD(TrainArgs, early_stopping_min_delta);
     FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads); FIELD(TrainArgs, augment_shift);
     FIELD(TrainArgs, augment_flip); FIELD(TrainArgs, label_smoothing);
@@ -71,7 +73,8 @@ int main(void) {
     FIELD(TrainReport, best_epoch); FIELD(TrainReport, best_value); FIELD(TrainReport, restored_best);
 
     SIZE(EvaluateArgs);
-    FIELD(EvaluateArgs, net); FIELD(EvaluateArgs, inputs); FIELD(EvaluateArgs, targets); FIELD(EvaluateArgs, sample_count);
+    FIELD(EvaluateArgs, net); FIELD(EvaluateArgs, inputs); FIELD(EvaluateArgs, targets);
+    FIELD(EvaluateArgs, device_inputs); FIELD(EvaluateArgs, device_targets); FIELD(EvaluateArgs, sample_count);
 
     SIZE(OptimizerArgs);
     FIELD(OptimizerArgs, type); FIELD(OptimizerArgs, learning_rate); FIELD(OptimizerArgs, weight_decay);
@@ -105,7 +108,8 @@ int main(void) {
     FIELD(DatasetReaderOptions, target_set);
 
     SIZE(PredictArgs);
-    FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
+    FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);
+    FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
 
     SIZE(SaveArgs);
     FIELD(SaveArgs, net); FIELD(SaveArgs, filename); FIELD(SaveArgs, do_not_save_optimizer); FIELD(SaveArgs, precision);

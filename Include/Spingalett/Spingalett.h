@@ -76,6 +76,9 @@ typedef enum {
    spingalett_get_parameters() / spingalett_set_parameters(). */
 typedef struct NeuralNetwork NeuralNetwork;
 
+/* A data set in the GPU's memory (spingalett_device_data_new()). */
+typedef struct SpingalettDeviceData SpingalettDeviceData;
+
 /* Kinds of layers: LayerType, in Spingalett.Inference.h (the inference engine runs them all). */
 
 /* Layer `index` of a network (0 is the input layer), see spingalett_network_layer(). */
@@ -253,6 +256,10 @@ typedef struct {
 
     const float *inputs;            /* MODE_ARRAY: [sample_count x input size] */
     const float *targets;           /* MODE_ARRAY: [sample_count x output size] */
+    /* MODE_ARRAY: the inputs or the targets (or both) in the GPU's memory instead (their first
+       sample_count rows), gathered and augmented there with COMPUTE_VULKAN */
+    const SpingalettDeviceData *device_inputs;
+    const SpingalettDeviceData *device_targets;
     DataGeneratorFn generator;      /* MODE_GENERATOR_FUNCTION */
     void *generator_data;
     uint32_t sample_count;          /* MODE_ARRAY: number of samples. Generator: samples per epoch
@@ -290,6 +297,8 @@ typedef struct {
     /* Validation set, evaluated after every epoch (val_count = 0: none). */
     const float *val_inputs;        /* [val_count x input size] */
     const float *val_targets;       /* [val_count x output size] */
+    const SpingalettDeviceData *device_val_inputs;   /* or in the GPU's memory */
+    const SpingalettDeviceData *device_val_targets;
     uint32_t val_count;
 
     /* Best-epoch tracking, active with validation data, early stopping or restore_best_weights. */
@@ -331,6 +340,7 @@ typedef struct {
 typedef struct {
     NeuralNetwork *net;
     const float *inputs;            /* [sample_count x input size] */
+    const SpingalettDeviceData *device_inputs;       /* or in the GPU's memory (its first rows) */
     uint32_t sample_count;
     float *outputs;                 /* [sample_count x output size] */
 } PredictArgs;
@@ -339,6 +349,8 @@ typedef struct {
     NeuralNetwork *net;
     const float *inputs;            /* [sample_count x input size] */
     const float *targets;           /* [sample_count x output size] */
+    const SpingalettDeviceData *device_inputs;       /* either or both in the GPU's memory instead */
+    const SpingalettDeviceData *device_targets;
     uint32_t sample_count;
 } EvaluateArgs;
 
@@ -497,6 +509,23 @@ SPINGALETT_API EvalMetrics evaluate_struct_arguments(EvaluateArgs args);
 
 #define train(...) train_struct_arguments((TrainArgs){__VA_ARGS__})
 SPINGALETT_API TrainReport train_struct_arguments(TrainArgs args);
+
+/*
+ * Data sets in the GPU's memory: count rows of size floats copied to the device once, for the
+ * device_* fields of train(), predict() and evaluate(). With COMPUTE_VULKAN those calls gather their
+ * chunks on the device, and train() augments and smooths them there, instead of copying samples from
+ * the host for every pass; on the CPU they copy the rows back first. A set's row size is the network's
+ * input (or output) size, and it holds at least the call's samples. NULL without a usable GPU, or
+ * when its memory runs out. A set may serve several networks and threads at once, and is freed once
+ * no call uses it.
+ */
+SPINGALETT_API SpingalettDeviceData *spingalett_device_data_new(const float *values, uint32_t count, uint32_t size);
+SPINGALETT_API void spingalett_device_data_free(SpingalettDeviceData *data);
+SPINGALETT_API uint32_t spingalett_device_data_count(const SpingalettDeviceData *data);
+SPINGALETT_API uint32_t spingalett_device_data_size(const SpingalettDeviceData *data);
+/* Copies rows first .. first + count - 1 to values [count x size]. */
+SPINGALETT_API bool spingalett_device_data_read(const SpingalettDeviceData *data, uint32_t first, uint32_t count,
+                                               float *values);
 
 /*
  * Low-level training, for custom loops and losses. A trainer runs forward and backward passes on

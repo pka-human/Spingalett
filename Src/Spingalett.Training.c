@@ -257,9 +257,15 @@ static void output_delta_from_grad(ActivationFunction act, const float *out, con
 
 /* Smoothed targets of n samples: dst = (1 - eps) t + eps / k, k the outputs (2 for sigmoid outputs,
    each its own pair of classes). */
+static void smoothing(uint32_t outputs, ActivationFunction act, float eps, float *keep, float *share) {
+    *keep = 1.0f - eps;
+    *share = eps / (act == ACT_SIGMOID ? 2.0f : (float)outputs);
+}
+
 static void smooth_targets(const float *t, float *dst, uint32_t n, uint32_t outputs, ActivationFunction act, float eps,
                            ComputeMode mode) {
-    const float keep = 1.0f - eps, share = eps / (act == ACT_SIGMOID ? 2.0f : (float)outputs);
+    float keep, share;
+    smoothing(outputs, act, eps, &keep, &share);
     const uint64_t total = (uint64_t)n * outputs;
     SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, total) && n > 1,
         for (int64_t i = 0; i < (int64_t)total; i++) dst[i] = keep * t[i] + share;
@@ -583,6 +589,8 @@ typedef struct {
     float *best_params;         /* restore_best_weights: weights then biases of the best epoch */
 
     SpgGpuNet *gpu;             /* COMPUTE_VULKAN: the network on the GPU (no CPU workspaces then) */
+    bool gpu_rows_in, gpu_rows_out;     /* the GPU gathers the inputs, the targets from data sets there */
+    float *copies[4];           /* data sets on the GPU copied to the host: inputs, targets, validation's */
     bool gpu_failed;
     bool gpu_ahead;             /* fill the next step's first chunk at the end of this one (it is known) */
     bool gpu_filled;            /* the first chunk of this step was filled ahead */
@@ -590,6 +598,7 @@ typedef struct {
 
 static void trainer_free(Trainer *t) {
     spingalett_gpu_net_free(t->gpu);
+    for (int k = 0; k < 4; k++) spingalett_aligned_free(t->copies[k]);
     spingalett_aligned_free(t->augmented);
     spingalett_aligned_free(t->smoothed);
     spingalett_aligned_free(t->gen_inputs);
@@ -716,30 +725,41 @@ static void augment_image(const Trainer *t, const float *src, float *dst, uint64
 
 /* Fills the GPU's next chunk with rows order[start + c0 ..] (start + c0.. when order is NULL) of
    n samples: gathered (augmented) and, where the device keeps its inputs as bfloat16 in memory the host
-   writes, rounded straight into it; the targets smoothed. */
+   writes, rounded straight into it; the targets smoothed. Inputs or targets in data sets on the GPU are
+   gathered, augmented and smoothed there, the host writing the rows' indices only. */
 static void gpu_fill(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order, uint32_t start,
                      uint32_t c0, uint32_t n, uint64_t step) {
     const NeuralNetwork *net = t->net;
     const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
+    if (t->gpu_rows_in || t->gpu_rows_out) {
+        uint32_t *index = spingalett_gpu_chunk_rows(t->gpu);
+        for (uint32_t s = 0; s < n; s++) index[s] = order ? order[start + c0 + s] : start + c0 + s;
+        if (t->gpu_rows_in && t->gpu_rows_out) return;
+    }
+    const bool host_in = !t->gpu_rows_in, host_out = !t->gpu_rows_out;
     float *targets;
-    uint16_t *x16 = t->augment ? NULL : spingalett_gpu_chunk_inputs_bf16(t->gpu, &targets);
+    uint16_t *x16 = t->augment || !host_in ? NULL : spingalett_gpu_chunk_inputs_bf16(t->gpu, &targets);
     float *x = x16 ? NULL : spingalett_gpu_chunk_inputs(t->gpu, &targets);
-    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, (uint64_t)n * in_sz * (t->augment ? 4u : 1u)) && n > 1,
+    const uint64_t work = (uint64_t)n * ((host_in ? in_sz * (t->augment ? 4u : 1u) : 0u) + (host_out ? out_sz : 0u));
+    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, work) && n > 1,
         for (int64_t s = 0; s < (int64_t)n; s++) {
             uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
             const float *src = inputs + (size_t)idx * in_sz;
-            if (x16)
+            if (!host_in)
+                ;
+            else if (x16)
                 spingalett_round_bf16(x16 + (size_t)s * in_sz, src, in_sz);
             else if (t->augment)
                 augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
             else
                 memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
-            memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
+            if (host_out)
+                memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
         }
     );
-    if (t->args->label_smoothing > 0.0f)
+    if (host_out && t->args->label_smoothing > 0.0f)
         smooth_targets(targets, targets, n, out_sz, net->act_func[net->layers - 2], t->args->label_smoothing, t->mode);
-    if (!x16) spingalett_gpu_chunk_ready(t->gpu, n);
+    if (host_in && !x16) spingalett_gpu_chunk_ready(t->gpu, n);
 }
 
 /* Trains on rows order[start .. start+count) of inputs/targets (rows start.. directly when order
@@ -942,12 +962,14 @@ TrainReport train_struct_arguments(TrainArgs args) {
     if (use_generator) {
         if (!args.generator || (training_strategy == STRATEGY_FULL_BATCH && sample_count == 0))
             return train_failed("Generator mode needs a generator (and sample_count for full batch)");
-    } else if (sample_count == 0 || !args.inputs || !args.targets) {
+    } else if (sample_count == 0 || !(args.inputs || args.device_inputs) || !(args.targets || args.device_targets)) {
         return train_failed("Invalid training arguments (NULL inputs/targets or zero sample count)");
     }
+    if (use_generator && (args.device_inputs || args.device_targets))
+        return train_failed("Data sets on the GPU (device_inputs, device_targets) need MODE_ARRAY");
 
     bool has_validation = args.val_count > 0;
-    if (has_validation && (!args.val_inputs || !args.val_targets))
+    if (has_validation && (!(args.val_inputs || args.device_val_inputs) || !(args.val_targets || args.device_val_targets)))
         return train_failed("val_count is set but val_inputs or val_targets is NULL");
 
     MonitorMetric monitor = args.monitor;
@@ -963,6 +985,17 @@ TrainReport train_struct_arguments(TrainArgs args) {
     float min_delta = fabsf(args.early_stopping_min_delta);
 
     if (!check_trainable(net))
+        return (TrainReport){.status = TRAIN_FAILED};
+    const uint32_t in_size = net->topology[0], out_size = net->topology[net->layers - 1];
+    if (!use_generator &&
+        (!spingalett_device_check(args.inputs, args.device_inputs, sample_count, in_size, "train", "inputs") ||
+         !spingalett_device_check(args.targets, args.device_targets, sample_count, out_size, "train", "targets")))
+        return (TrainReport){.status = TRAIN_FAILED};
+    if (has_validation &&
+        (!spingalett_device_check(args.val_inputs, args.device_val_inputs, args.val_count, in_size, "train",
+                                  "val_inputs") ||
+         !spingalett_device_check(args.val_targets, args.device_val_targets, args.val_count, out_size, "train",
+                                  "val_targets")))
         return (TrainReport){.status = TRAIN_FAILED};
 
     /* Per-sample training of networks with convolution or pooling layers runs as mini-batches of
@@ -1131,6 +1164,41 @@ TrainReport train_struct_arguments(TrainArgs args) {
         return (TrainReport){.status = TRAIN_FAILED};
     }
 
+    /* Data sets on the GPU: gathered there when the network trains there (augmentation shifts of up to
+       2^23 cells, rows.comp's), copied to the host otherwise; the validation's targets to the host
+       always, where the losses are added up. */
+    t.gpu_rows_in = t.gpu && args.device_inputs && args.augment_shift < (1u << 23);
+    t.gpu_rows_out = t.gpu && args.device_targets;
+    const SpingalettDeviceData *sets[4] = {
+        t.gpu_rows_in ? NULL : args.device_inputs, t.gpu_rows_out ? NULL : args.device_targets,
+        t.gpu ? NULL : args.device_val_inputs, has_validation ? args.device_val_targets : NULL,
+    };
+    const float **hosts[4] = {&args.inputs, &args.targets, &args.val_inputs, &args.val_targets};
+    for (int k = 0; k < 4; k++) {
+        if (!sets[k]) continue;
+        t.copies[k] = spingalett_device_rows(sets[k], k < 2 ? sample_count : args.val_count, "train");
+        if (!t.copies[k]) {
+            if (t.gpu && net->gpu_trainer == t.gpu) {
+                spingalett_network_sync(net);
+                net->gpu_trainer = NULL;
+                atomic_store(&net->gpu_newer, false);
+            }
+            trainer_free(&t);
+            spingalett_log(LOG_ERROR, "Failed to copy a data set from the GPU");
+            return (TrainReport){.status = TRAIN_FAILED};
+        }
+        *hosts[k] = t.copies[k];
+    }
+    if (t.gpu_rows_in || t.gpu_rows_out) {
+        SpgGpuRows rows = {
+            .inputs = t.gpu_rows_in ? args.device_inputs : NULL, .targets = t.gpu_rows_out ? args.device_targets : NULL,
+            .seed = t.augment_seed, .shift = args.augment_shift, .flip = args.augment_flip,
+        };
+        if (args.label_smoothing > 0.0f)
+            smoothing(out_size, net->act_func[net->layers - 2], args.label_smoothing, &rows.keep, &rows.share);
+        spingalett_gpu_set_rows(t.gpu, &rows);
+    }
+
     /* The CPU's accumulating paths add into grad_* and expect it to start at zero; a previous run on
        another backend may have left the last batch's gradients there. On the GPU the network's
        gradients and moments need not exist on the host until they are brought back (a fresh
@@ -1273,8 +1341,8 @@ TrainReport train_struct_arguments(TrainArgs args) {
             double loss;
             uint32_t correct;
             if (t.gpu) {
-                if (!spingalett_gpu_evaluate(t.gpu, net, args.val_inputs, args.val_targets, args.val_count, &loss,
-                                             &correct)) {
+                if (!spingalett_gpu_evaluate(t.gpu, net, args.val_inputs, args.device_val_inputs, args.val_targets,
+                                             args.val_count, &loss, &correct)) {
                     set_error(SPINGALETT_ERR_INVALID, "The GPU failed during validation");
                     spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
                     report.status = TRAIN_FAILED;
@@ -1365,6 +1433,7 @@ TrainReport train_struct_arguments(TrainArgs args) {
 
     bool kept = false;
     if (t.gpu) {
+        spingalett_gpu_set_rows(t.gpu, NULL);
         if (!outer_gpu && report.status != TRAIN_FAILED) {
             /* the network keeps the copy, newer than its arrays until they are read */
             kept = net->gpu_kept = true;

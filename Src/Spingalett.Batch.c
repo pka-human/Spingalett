@@ -9,6 +9,7 @@
 
 #include "Spingalett.Private.h"
 #include "Spingalett.Gpu.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -300,24 +301,96 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
     }
 }
 
+/* ---- data sets in the GPU's memory ---- */
+
+SpingalettDeviceData *spingalett_device_data_new(const float *values, uint32_t count, uint32_t size) {
+    if (!values || count == 0 || size == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_device_data_new: values is NULL, or count or size is 0");
+        return NULL;
+    }
+    if (!spingalett_gpu_available()) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_device_data_new: no usable GPU");
+        return NULL;
+    }
+    SpingalettDeviceData *data = spingalett_gpu_data_create(values, count, size);
+    if (!data) set_error(SPINGALETT_ERR_ALLOC, "spingalett_device_data_new: not enough GPU memory");
+    return data;
+}
+
+void spingalett_device_data_free(SpingalettDeviceData *data) {
+    spingalett_gpu_data_free(data);
+}
+
+uint32_t spingalett_device_data_count(const SpingalettDeviceData *data) {
+    return spingalett_gpu_data_count(data);
+}
+
+uint32_t spingalett_device_data_size(const SpingalettDeviceData *data) {
+    return spingalett_gpu_data_size(data);
+}
+
+bool spingalett_device_data_read(const SpingalettDeviceData *data, uint32_t first, uint32_t count, float *values) {
+    if (!data || (!values && count) || (uint64_t)first + count > spingalett_gpu_data_count(data)) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_device_data_read: no data or values, or rows out of range");
+        return false;
+    }
+    if (!spingalett_gpu_data_read(data, first, count, values)) {
+        set_error(SPINGALETT_ERR_ALLOC, "spingalett_device_data_read: the copy from the GPU failed");
+        return false;
+    }
+    return true;
+}
+
+bool spingalett_device_check(const float *host, const SpingalettDeviceData *data, uint32_t count, uint32_t size,
+                             const char *who, const char *what) {
+    char msg[192];
+    if (host && data)
+        snprintf(msg, sizeof msg, "%s: %s given both on the host and in the GPU's memory", who, what);
+    else if (!host && !data)
+        snprintf(msg, sizeof msg, "%s: %s is NULL", who, what);
+    else if (data && spingalett_gpu_data_size(data) != size)
+        snprintf(msg, sizeof msg, "%s: the rows of device %s hold %u values, the network's layer %u", who, what,
+                 spingalett_gpu_data_size(data), size);
+    else if (data && spingalett_gpu_data_count(data) < count)
+        snprintf(msg, sizeof msg, "%s: device %s has %u rows, fewer than the %u samples", who, what,
+                 spingalett_gpu_data_count(data), count);
+    else
+        return true;
+    set_error(SPINGALETT_ERR_INVALID, msg);
+    spingalett_log(LOG_ERROR, "%s", msg);
+    return false;
+}
+
+float *spingalett_device_rows(const SpingalettDeviceData *data, uint32_t count, const char *who) {
+    float *rows = (float *)spingalett_aligned_alloc((size_t)count * spingalett_gpu_data_size(data) * sizeof(float));
+    if (rows && spingalett_gpu_data_read(data, 0, count, rows)) return rows;
+    spingalett_aligned_free(rows);
+    char msg[160];
+    snprintf(msg, sizeof msg, "%s: the copy of a data set from the GPU failed", who);
+    set_error(SPINGALETT_ERR_ALLOC, msg);
+    return NULL;
+}
+
 bool predict_struct_arguments(PredictArgs args) {
     NeuralNetwork *net = args.net;
-    if (!net || !args.inputs || !args.outputs) {
-        set_error(SPINGALETT_ERR_INVALID, "predict: net, inputs or outputs is NULL");
+    if (!net || !args.outputs) {
+        set_error(SPINGALETT_ERR_INVALID, "predict: net or outputs is NULL");
         return false;
     }
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "predict: network must have at least 2 layers");
         return false;
     }
-    if (!spingalett_check_graph(net, "predict"))
+    if (!spingalett_check_graph(net, "predict") ||
+        !spingalett_device_check(args.inputs, args.device_inputs, args.sample_count, net->topology[0], "predict",
+                                 "inputs"))
         return false;
     if (args.sample_count == 0)
         return true;
 
     SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
     if (gpu) {
-        bool ok = spingalett_gpu_predict(gpu, args.inputs, args.outputs, args.sample_count);
+        bool ok = spingalett_gpu_predict_rows(gpu, args.inputs, args.device_inputs, 0, args.outputs, args.sample_count);
         spingalett_gpu_done(net, gpu);
         if (ok) return true;
         spingalett_log(LOG_WARNING, "predict: the GPU failed; predicting on the CPU");
@@ -326,8 +399,12 @@ bool predict_struct_arguments(PredictArgs args) {
     spingalett_network_sync(net);       /* (the GPU's spingalett_gpu_for() runs on its copy or syncs) */
     ComputeMode mode = resolve_compute_mode();
     uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
+    float *rows = args.device_inputs ? spingalett_device_rows(args.device_inputs, args.sample_count, "predict") : NULL;
+    if (args.device_inputs && !rows) return false;
+    if (rows) args.inputs = rows;
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
     if (!ws) {
+        spingalett_aligned_free(rows);
         set_error(SPINGALETT_ERR_ALLOC, "predict: workspace allocation failed");
         return false;
     }
@@ -341,6 +418,7 @@ bool predict_struct_arguments(PredictArgs args) {
     }
 
     spingalett_batch_workspace_free(ws);
+    spingalett_aligned_free(rows);
     return true;
 }
 
@@ -437,8 +515,8 @@ void spingalett_gpu_done(NeuralNetwork *net, SpgGpuNet *gpu) {
         spingalett_gpu_net_free(gpu);                   /* another call put one back first */
 }
 
-bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, const float *inputs, const float *targets,
-                             uint32_t n, double *loss_sum, uint32_t *correct) {
+bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, const float *inputs, const SpingalettDeviceData *rows,
+                             const float *targets, uint32_t n, double *loss_sum, uint32_t *correct) {
     const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
     /* blocks of up to eight chunks, predicted in one go so that they overlap with the copies */
     const uint32_t block = 8u * spingalett_gpu_net_capacity(gpu) < n ? 8u * spingalett_gpu_net_capacity(gpu) : n;
@@ -449,7 +527,7 @@ bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, const float *in
     bool ok = out_buf != NULL;
     for (uint32_t start = 0; ok && start < n; start += block) {
         uint32_t count = n - start < block ? n - start : block;
-        ok = spingalett_gpu_predict(gpu, inputs + (size_t)start * in_sz, out_buf, count);
+        ok = spingalett_gpu_predict_rows(gpu, rows ? NULL : inputs + (size_t)start * in_sz, rows, start, out_buf, count);
         for (uint32_t s = 0; ok && s < count; s++) {
             const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * out_sz;
             loss += compute_sample_loss(o, t, out_sz, net->loss_func, out_act);
@@ -465,24 +543,36 @@ bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, const float *in
 EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
     EvalMetrics m = {NAN, NAN};
     NeuralNetwork *net = args.net;
-    if (!net || !args.inputs || !args.targets || args.sample_count == 0) {
-        set_error(SPINGALETT_ERR_INVALID, "evaluate: net, inputs or targets is NULL, or sample_count is 0");
+    if (!net || args.sample_count == 0) {
+        set_error(SPINGALETT_ERR_INVALID, "evaluate: net is NULL or sample_count is 0");
         return m;
     }
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "evaluate: network must have at least 2 layers");
         return m;
     }
-    if (!spingalett_check_graph(net, "evaluate"))
+    if (!spingalett_check_graph(net, "evaluate") ||
+        !spingalett_device_check(args.inputs, args.device_inputs, args.sample_count, net->topology[0], "evaluate",
+                                 "inputs") ||
+        !spingalett_device_check(args.targets, args.device_targets, args.sample_count,
+                                 net->topology[net->layers - 1], "evaluate", "targets"))
         return m;
+
+    /* the targets on the host, where the losses are added up */
+    float *targets = args.device_targets ? spingalett_device_rows(args.device_targets, args.sample_count, "evaluate")
+                                         : NULL;
+    if (args.device_targets && !targets) return m;
+    if (targets) args.targets = targets;
 
     SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
     if (gpu) {
         double loss;
         uint32_t correct;
-        bool ok = spingalett_gpu_evaluate(gpu, net, args.inputs, args.targets, args.sample_count, &loss, &correct);
+        bool ok = spingalett_gpu_evaluate(gpu, net, args.inputs, args.device_inputs, args.targets, args.sample_count,
+                                          &loss, &correct);
         spingalett_gpu_done(net, gpu);
         if (ok) {
+            spingalett_aligned_free(targets);
             m.loss = (float)(loss / args.sample_count);
             m.accuracy = (float)correct / (float)args.sample_count;
             return m;
@@ -491,6 +581,13 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
     }
 
     spingalett_network_sync(net);
+    float *inputs = args.device_inputs ? spingalett_device_rows(args.device_inputs, args.sample_count, "evaluate")
+                                       : NULL;
+    if (args.device_inputs && !inputs) {
+        spingalett_aligned_free(targets);
+        return m;
+    }
+    if (inputs) args.inputs = inputs;
     ComputeMode mode = resolve_compute_mode();
     uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
@@ -506,5 +603,7 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
     }
     spingalett_aligned_free(out);
     spingalett_batch_workspace_free(ws);
+    spingalett_aligned_free(inputs);
+    spingalett_aligned_free(targets);
     return m;
 }

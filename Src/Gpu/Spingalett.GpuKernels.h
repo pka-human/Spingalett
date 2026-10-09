@@ -155,6 +155,13 @@ typedef struct {
 } SpgCombinePush;
 enum { SPG_COMBINE_ADD, SPG_COMBINE_SLICE, SPG_COMBINE_GAP };
 
+/* rows.comp */
+typedef struct {
+    uint64_t index, dst, header;
+    uint32_t n, size;
+    uint32_t height, width, channels;
+} SpgRowsPush;
+
 /* wtrans.comp */
 typedef struct {
     uint64_t w, wt, order;
@@ -178,4 +185,4 @@ typedef struct {
 enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
 
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
-#define SPG_STEP_HEADER 16u         /* uints of the step header (common.glsl) */
+#define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */
