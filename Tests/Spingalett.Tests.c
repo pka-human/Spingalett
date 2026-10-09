@@ -4182,6 +4182,7 @@ static NeuralNetwork *gpu_net(int which) {
         conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
         uint32_t d = batch_norm(.net = net, .act_func = ACT_NONE);
         add_layers(.net = net, .inputs = {b, d}, .act_func = ACT_RELU);
+        avg_pool2d(.net = net, .kernel = 2);   /* windows that tile the input (pool.comp's BACKWARD 2) */
         global_avg_pool2d(.net = net);
         layer(.net = net, .neurons_amount = 7, .act_func = ACT_SOFTMAX);
         break;

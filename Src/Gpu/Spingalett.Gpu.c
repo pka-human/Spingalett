@@ -1108,8 +1108,13 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
             SpgPoolPush p = {g->act[i].address, 0, g->delta[cl].address, dst->address, n, x->height, x->width,
                              x->channels, s->height, s->width, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w,
                              s->pad_h, s->pad_w};
-            uint32_t spec[3] = {s->type == LAYER_MAX_POOL2D, 1, fused};
-            kernel(r, &a, SPG_KERNEL_pool, spec, 3, &p, sizeof p, groups((uint64_t)n * net->topology[i], 256u), 1, 1);
+            /* windows that tile the input: a thread per window */
+            const bool tiled = s->stride_h == s->kernel_h && s->stride_w == s->kernel_w && s->pad_h == 0 &&
+                               s->pad_w == 0 && s->height * s->kernel_h == x->height &&
+                               s->width * s->kernel_w == x->width;
+            uint32_t spec[3] = {s->type == LAYER_MAX_POOL2D, tiled ? 2u : 1u, fused};
+            kernel(r, &a, SPG_KERNEL_pool, spec, 3, &p, sizeof p,
+                   groups((uint64_t)n * net->topology[tiled ? cl : i], 256u), 1, 1);
             return true;
         }
     }

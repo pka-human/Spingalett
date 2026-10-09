@@ -44,6 +44,12 @@ changes, which are listed under **Changed**.
   accuracy after 10 epochs (85.10% against 85.04%), 24% faster. `SPINGALETT_GPU_NO_BF16_STORAGE=1`
   keeps them in single precision.
 
+- The GPU's pooling backward pass takes windows that tile the input (stride the window, no padding,
+  as 2 x 2 max pooling of stride 2) a thread per window: it finds the maximum once and writes the
+  window's cells, instead of every cell searching its window again. 5.3 times as fast on the MNIST
+  CNN (322 to 60 us a pass), which trains 12% faster in single precision (81,900 to 91,600 samples
+  per second) and 26% faster in bfloat16 (95,000 to 120,000); with batch normalization 10% and 16%.
+
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
   the epochs after it: they now go to the device before the next epoch.
