@@ -9,9 +9,9 @@ documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; 
 Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch
 normalization, adding and concatenating layers, as chains or graphs), deployment models in FP32 down
 to INT2, the runtime (a library of the deployment models alone), a standalone inference engine for
-microcontrollers (one C file, no heap), ONNX and PyTorch
-import, a GPU backend through Vulkan compute, Python bindings over ctypes (wheels with the library
-inside), and the DigitPad demo app.
+microcontrollers (one C file, no heap), ONNX and PyTorch import, GPU backends through CUDA (its own
+kernels) and Vulkan compute, Python bindings over ctypes (wheels with the library inside), and the
+DigitPad demo app.
 Its promise is speed: **a change must not make anything slower**, and kernels are measured, not
 assumed (see [Performance work](#performance-work)).
 
@@ -35,7 +35,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer) layers |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
-| `Src/Gpu/` | The GPU backend: `Spingalett.Vulkan.c` (device, buffers, pipelines; the loader opened at run time), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use; convolution geometries), `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as command buffers), `Shaders/*.comp` (GLSL, listed in `Spingalett.Kernels.def`; `SPG_KERNEL_H` ones are built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
+| `Src/Gpu/` | The GPU backends under one executor: `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as commands), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use, a table a backend; convolution geometries), `Spingalett.Device.h`/`.c` (the device interface: `SpgGpuOps` a backend, the calling thread's backend), `Spingalett.Vulkan.c` (the loader opened at run time; `Shaders/*.comp`, GLSL listed in `Spingalett.Kernels.def`, `SPG_KERNEL_H` ones built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`), `Spingalett.Cuda.c` (the driver opened at run time; commands captured as CUDA graphs; `Cuda/*.cu` compiled to PTX by Clang, units listed in `Cuda/Kernels.def`, gzip-compressed into the library and expanded by `Spingalett.Gunzip.c`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
 | `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), `RuntimeTests.c` (the runtime alone, C99), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
 | `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools (`Examples/Runtime/`: programs of the runtime), the demo app, the bindings (a package; `setup.py` builds wheels) |
 
@@ -46,7 +46,7 @@ cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
 Bin/SpingalettTests model                           # one group: grad conv norm graph onnx equiv cont optim
-                                                    # sched dropout gen predict valid step data io model gpu xor
+                                                    # sched dropout gen predict valid step data io model gpu cuda xor
 ```
 
 Executables go to `Bin/` and static libraries to `Lib/` in the source tree. Point extra build
@@ -72,7 +72,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - for GPU changes, `Bin/SpingalettGpuTests all` and `Bin/SpingalettTests gpu` on a GPU (both skip
   without a Vulkan device), and a build with `-DSPINGALETT_VULKAN=OFF`. CI runs the GPU tests on
   Mesa's lavapipe, a CPU device with 32 KB of shared memory a workgroup and another subgroup size:
-  kernels must not assume either.
+  kernels must not assume either. For the CUDA backend, `SPINGALETT_GPU_BACKEND=cuda
+  Bin/SpingalettGpuTests all` and `Bin/SpingalettTests cuda` (the `gpu` group on CUDA) on an NVIDIA GPU,
+  and a build with `-DSPINGALETT_CUDA=OFF`; CI has no NVIDIA GPU, so these run on the developer's
+  machine only, while CI compiles every unit (Clang with the NVPTX target).
 
 ## Invariants the tests hold you to
 
@@ -119,9 +122,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - **The GPU repeats itself.** A GPU run gives the same bits every time on one device: sums run in
   fixed orders (fixed slices, fixed trees), never through atomics or subgroup operations whose order
   the driver chooses. Every tile of the matrix kernel adds an output's products in the order of k,
-  which is what lets tiles be chosen by timing; a kernel change must keep that (`SpingalettGpuTests`
-  compares the tiles bit for bit). GPU results match the CPU's up to rounding only (the `gpu` group
-  compares trained networks by their outputs).
+  (on the matrix units 16 values of k at a time, in that order), which is what lets tiles be chosen
+  by timing; a kernel change must keep that (`SpingalettGpuTests` compares the tiles bit for bit, on
+  either backend). GPU results match the CPU's up to rounding only (the `gpu` group compares trained
+  networks by their outputs), and the two backends match each other the same way.
 - **GPU dispatches state their memory.** The executor records a barrier only where a dispatch reads
   or writes what an earlier one wrote or read (`Recorder` in `Spingalett.Gpu.c`): every dispatch
   lists every range it reads and writes, or it will race with its neighbours.
@@ -185,10 +189,23 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   watch the temperature and frequency (`/proc/cpuinfo`) and let a long run finish before measuring.
 - `-DSPINGALETT_NO_DIRECT_CONV` builds the library without the indirect convolution kernels, for
   comparisons with the products of gathered windows.
+- CUDA kernels take their modes as template parameters wherever a loop's arrays or loads depend on
+  them (the products' tiles, operand modes and ways of reading each operand; the depthwise
+  convolutions' windows, modes, padding and maps kept as bfloat16): a mode read from the spec at run
+  time left arrays in local memory and branches between loads, 2 to 15 times slower. Each instance
+  is a unit of PTX (Kernels.def, expanded by cmake/Cuda.cmake); check a new kernel's registers, spills
+  and stack frame with `ptxas -v` (from NVIDIA's `nvidia-cuda-nvcc` wheel) before timing it. Calls
+  (`noinline`) pass structs through the stack and cost the caller registers: keep them off every
+  output's path (the products hold the sloped epilogues only; `Spingalett.Cuda.c` runs the others as
+  a pass of `epi.cu`). Kernels whose threads loop with the grid's stride get a wave of blocks
+  (`grid_stride()`).
 - GPU: `SPINGALETT_GPU_PROFILE=1` prints the time of every kernel and mode at exit (timestamps
-  around each dispatch; trial runs of the tile choice excluded); `Bin/SpingalettGpuTests bench`
-  times every tile on the products of ResNet-20 and the benchmark's MLP (`SPINGALETT_BENCH_TILES=1`
-  lists each tile's time, `bench bf16` the matrix units' tiles). Compare against
+  around each dispatch; trial runs of the tile choice excluded; with CUDA events around every
+  launch, which inflate the times of small kernels: compare backends by wall time);
+  `Bin/SpingalettGpuTests bench` times every tile on the products of ResNet-20 and the benchmark's
+  MLP (`SPINGALETT_BENCH_TILES=1` lists each tile's time, `bench bf16` the matrix units' tiles,
+  `SPINGALETT_GPU_BACKEND=cuda` the CUDA backend's, `SPINGALETT_BENCH_CONV="n h w c out kh kw sh sw
+  ph pw groups"` any convolution's). Compare against
   `python Examples/benchmark_pytorch.py --cuda` (and `--cuda-fp32`, `--cuda-bf16`) on the same GPU. Laptop GPUs
   throttle hard when warm (`nvidia-smi --query-gpu=temperature.gpu,clocks.sm --format=csv`): with
   the CPU busy, an RTX 4050 fell to 57% of its clock.
