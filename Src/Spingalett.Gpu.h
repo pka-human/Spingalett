@@ -150,6 +150,9 @@ static inline uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **t
     return NULL;
 }
 static inline void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) { (void)g; (void)n; }
+static inline void spingalett_round_bf16(uint16_t *dst, const float *src, size_t n) {
+    (void)dst; (void)src; (void)n;
+}
 static inline float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets) {
     (void)g; (void)targets;
     return NULL;
