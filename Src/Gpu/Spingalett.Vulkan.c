@@ -101,6 +101,7 @@ typedef VkResult (VKAPI_PTR *CoopPropertiesFn)(VkPhysicalDevice, uint32_t *, Coo
 #define COMPONENT_FLOAT32    1
 #define COMPONENT_BFLOAT16   1000141000
 #define SCOPE_SUBGROUP       3
+#define SPARE_COMMANDS       64      /* freed command buffers kept for reuse */
 
 #define DECLARE(name) static PFN_##name name;
 VK_GLOBAL_FUNCTIONS(DECLARE)
@@ -139,7 +140,9 @@ static struct {
     VkShaderModule modules[SPG_KERNEL_COUNT];
     Pipeline *pipelines;            /* made so far, in the order they were */
     size_t pipeline_count, pipeline_cap;
-    SpgSignal *lock;                /* the pipelines and the queue */
+    SpgSignal *lock;                /* the pipelines, the queue and the spare command buffers */
+    struct SpgGpuCommands *spare[SPARE_COMMANDS];   /* freed, for the next spg_gpu_commands_create() */
+    uint32_t spare_count;
     float tick_ns;                  /* timestamp period */
     uint32_t stamp_bits;            /* valid bits of the queue's timestamps (0: none) */
     bool profile;                   /* SPINGALETT_GPU_PROFILE: time every dispatch */
@@ -645,7 +648,13 @@ struct SpgGpuCommands {
 
 SpgGpuCommands *spg_gpu_commands_create(void) {
     if (!spg_gpu_open()) return NULL;
-    SpgGpuCommands *c = (SpgGpuCommands *)calloc(1, sizeof *c);
+    /* a command buffer freed before, which a fresh one would take a third of a millisecond to make (its
+       pool, buffer and fence, on NVIDIA's driver): recorded again from the start, as a fresh one */
+    spg_lock(gpu.lock);
+    SpgGpuCommands *c = gpu.spare_count ? gpu.spare[--gpu.spare_count] : NULL;
+    spg_unlock(gpu.lock);
+    if (c) return c;
+    c = (SpgGpuCommands *)calloc(1, sizeof *c);
     if (!c) return NULL;
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
                                    VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, gpu.family};
@@ -702,9 +711,19 @@ bool spg_gpu_timestamps(SpgGpuCommands *c, double *ns, uint32_t count) {
 void spg_gpu_commands_free(SpgGpuCommands *c) {
     if (!c) return;
     if (c->pending) spg_gpu_wait(c);
+    if (c->stamps) vkDestroyQueryPool(gpu.device, c->stamps, NULL);
+    c->stamps = VK_NULL_HANDLE;
+    c->stamp_count = 0;
+    /* kept for the next spg_gpu_commands_create() while there is room (with its profiling queries) */
+    if (c->cb && c->fence && (c->queries || !gpu.profile)) {
+        spg_lock(gpu.lock);
+        const bool kept = gpu.spare_count < SPARE_COMMANDS;
+        if (kept) gpu.spare[gpu.spare_count++] = c;
+        spg_unlock(gpu.lock);
+        if (kept) return;
+    }
     if (c->fence) vkDestroyFence(gpu.device, c->fence, NULL);
     if (c->queries) vkDestroyQueryPool(gpu.device, c->queries, NULL);
-    if (c->stamps) vkDestroyQueryPool(gpu.device, c->stamps, NULL);
     free(c->labels);
     if (c->pool) vkDestroyCommandPool(gpu.device, c->pool, NULL);       /* its buffer with it */
     free(c);
