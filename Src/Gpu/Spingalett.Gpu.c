@@ -844,6 +844,14 @@ static void pool_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n) {
     kernel(r, &a, SPG_KERNEL_pool, spec, 3, &p, sizeof p, groups((uint64_t)n * net->topology[l], 256u), 1, 1);
 }
 
+/* The output kernel's dispatch over n rows of `width` outputs: a thread a row, or for rows of more
+   than 64 outputs a workgroup (spec[3]). */
+static void output_kernel(Recorder *r, const Access *a, uint32_t spec[4], const SpgOutputPush *p) {
+    spec[3] = p->n > 64u;
+    kernel(r, a, SPG_KERNEL_output, spec, 4, p, sizeof *p, spec[3] ? groups(p->rows, 1u) : (p->rows + 63u) / 64u, 1,
+           1);
+}
+
 static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
     const NeuralNetwork *net = g->net;
     for (uint32_t l = 1; l < net->layers; l++) {
@@ -871,11 +879,11 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
         }
         if (act == ACT_SOFTMAX) {
             SpgOutputPush p = {g->act[l].address, 0, 0, 0, n, net->topology[l]};
-            uint32_t spec[3] = {SPG_OUT_SOFTMAX, ACT_SOFTMAX, 0};
+            uint32_t spec[4] = {SPG_OUT_SOFTMAX, ACT_SOFTMAX, 0, 0};
             Access a = {0};
             reads(&a, whole(&g->act[l]));
             writes(&a, whole(&g->act[l]));
-            kernel(r, &a, SPG_KERNEL_output, spec, 3, &p, sizeof p, (n + 63u) / 64u, 1, 1);
+            output_kernel(r, &a, spec, &p);
         }
         if (masked) {
             const float rate = net->dropout_rates[l];
@@ -1323,13 +1331,13 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
         const float scale = 1.0f / (float)count, beta = first ? 0.0f : 1.0f;
         SpgOutputPush p = {g->act[L].address, g->targets.address, g->delta[L].address, s->staging.address + s->losses,
                            n, out};
-        uint32_t spec[3] = {SPG_OUT_LOSS, net->act_func[L - 1], net->loss_func};
+        uint32_t spec[4] = {SPG_OUT_LOSS, net->act_func[L - 1], net->loss_func, 0};
         Access a = {0};
         reads(&a, whole(&g->act[L]));
         reads(&a, whole(&g->targets));
         writes(&a, whole(&g->delta[L]));
         writes(&a, span(s->staging.address + s->losses, n));
-        kernel(r, &a, SPG_KERNEL_output, spec, 3, &p, sizeof p, (n + 63u) / 64u, 1, 1);
+        output_kernel(r, &a, spec, &p);
         record_backward(g, r, n, scale, beta);
         if (last) optimizer(g, r);
     } else {
@@ -1457,13 +1465,14 @@ static SpgGpuCommands *pass_commands(SpgGpuNet *g, uint32_t n, uint32_t kind, bo
         barrier(r);
         SpgOutputPush p = {g->act[L].address, g->targets.address, g->delta[L].address, s->staging.address + s->losses,
                            n, out};
-        uint32_t spec[3] = {kind == PASS_GRADS ? SPG_OUT_GRADS : SPG_OUT_LOSS, net->act_func[L - 1], net->loss_func};
+        uint32_t spec[4] = {kind == PASS_GRADS ? SPG_OUT_GRADS : SPG_OUT_LOSS, net->act_func[L - 1], net->loss_func,
+                            0};
         Access a = {0};
         reads(&a, whole(&g->act[L]));
         reads(&a, whole(&g->targets));
         writes(&a, whole(&g->delta[L]));
         writes(&a, span(s->staging.address + s->losses, n));
-        kernel(r, &a, SPG_KERNEL_output, spec, 3, &p, sizeof p, (n + 63u) / 64u, 1, 1);
+        output_kernel(r, &a, spec, &p);
         record_backward(g, r, n, 1.0f, add ? 1.0f : 0.0f);
     }
     spg_gpu_barrier_host(c);
