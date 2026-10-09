@@ -50,9 +50,9 @@
 #  include <sys/stat.h>
 #endif
 
-static const char *encoding_name(DatasetEncoding e) {
+static const char *encoding_name(SpingalettDatasetEncoding e) {
     static const char *names[] = {"auto", "float32", "fp16", "bfloat16", "u8 (q/255)", "u8 (per-feature affine)", "class index"};
-    return (unsigned)e < DATASET_ENCODING_COUNT ? names[e] : "?";
+    return (unsigned)e < SPINGALETT_DATASET_ENCODING_COUNT ? names[e] : "?";
 }
 
 static double now(void) {
@@ -71,7 +71,7 @@ static double now(void) {
 }
 
 static int info(const char *path) {
-    DatasetReaderOptions o = {.no_prefetch = true};
+    SpingalettDatasetReaderOptions o = {.no_prefetch = true};
     SpingalettDatasetReader *r = spingalett_dataset_open_ex(path, &o);
     if (!r) {
         fprintf(stderr, "%s: %s\n", path, spingalett_last_error_message());
@@ -327,7 +327,7 @@ static int images(int argc, char **argv, const char **out, SpingalettDataset *d,
 
 int main(int argc, char **argv) {
     spingalett_set_verbose(false);
-    spingalett_set_compute_mode(COMPUTE_OPENMP);        /* chunks encode and decode in parallel */
+    spingalett_set_compute_mode(SPINGALETT_COMPUTE_OPENMP); /* chunks encode and decode in parallel */
     if (argc >= 3 && !strcmp(argv[1], "info")) return info(argv[2]);
     if (argc >= 3 && !strcmp(argv[1], "verify")) {
         SpingalettDataset d;
@@ -373,16 +373,16 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    DatasetSaveOptions o = {0};
+    SpingalettDatasetSaveOptions o = {0};
     if (two_sets) {
         o.target_name = "fine";
         o.extra_targets = &coarse;
         o.extra_target_count = 1;
     }
     for (int i = first_option; i < argc; i++) {
-        if (!strcmp(argv[i], "--fp16")) o.input_encoding = DATASET_ENCODING_FP16;
-        else if (!strcmp(argv[i], "--bf16")) o.input_encoding = DATASET_ENCODING_BFLOAT16;
-        else if (!strcmp(argv[i], "--u8")) o.input_encoding = DATASET_ENCODING_U8_AFFINE;
+        if (!strcmp(argv[i], "--fp16")) o.input_encoding = SPINGALETT_DATASET_ENCODING_FP16;
+        else if (!strcmp(argv[i], "--bf16")) o.input_encoding = SPINGALETT_DATASET_ENCODING_BFLOAT16;
+        else if (!strcmp(argv[i], "--u8")) o.input_encoding = SPINGALETT_DATASET_ENCODING_U8_AFFINE;
         else if (!strcmp(argv[i], "--store")) o.no_compression = true;
         else if (!strcmp(argv[i], "--cifar100") || !strcmp(argv[i], "--gray") || !strcmp(argv[i], "--rgb")) continue;
         else if (!strcmp(argv[i], "--size")) i++;

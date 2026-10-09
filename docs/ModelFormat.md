@@ -1,14 +1,14 @@
 # The .slett model format, versions 3 to 7
 
 `.slett` files store a network: its shape, its parameters in a chosen precision and, optionally,
-the optimizer state for resuming training. `save_spingalett()` and `spingalett_save_to_memory()`
+the optimizer state for resuming training. `spingalett_save()` and `spingalett_save_to_memory()`
 write the oldest version that can hold the network: version 3 for networks of dense layers only
 (which engines from Spingalett 0.5 on can run), version 4 for networks with convolution or pooling
 layers (0.7 on), version 5 for networks with batch normalization or grouped convolutions (0.8 on),
 version 6 for graphs: networks with a layer that reads other layers than the one before it, adds or
 concatenates several, or pools globally (0.10 on), version 7 for networks with transposed
-convolutions, upsampling or layer normalization (0.13 on). `load_spingalett()` and
-`load_spingalett_from_memory()` read versions 1 to 7.
+convolutions, upsampling or layer normalization (0.13 on). `spingalett_load()` and
+`spingalett_load_from_memory()` read versions 1 to 7.
 
 Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
 (`spingalett_model_init()` in `Spingalett.Inference.h`) checks the image and computes directly from

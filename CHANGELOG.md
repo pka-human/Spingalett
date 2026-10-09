@@ -45,7 +45,8 @@ RTX 4050 Laptop GPU; README).
   succeeded (the latter is false for a value of no mode, which it ignored).
 - **Every public name has the library's prefix.** Types are `Spingalett*` (`SpingalettNetwork`,
   `SpingalettTrainArgs`, `SpingalettActivationFunction`, ...), enumerators `SPINGALETT_*`
-  (`SPINGALETT_ACT_RELU`, `SPINGALETT_LAYER_CONV2D`, ...), and the builders and functions `spingalett_*`:
+  (`SPINGALETT_ACT_RELU`, `SPINGALETT_LAYER_CONV2D`, ...; the weight initializations, shortened,
+  `SPINGALETT_INIT_HE` and the like), and the builders and functions `spingalett_*`:
   `spingalett_network_new()`, `spingalett_layer()`, `spingalett_conv2d()` and the other layers,
   `spingalett_train()`, `spingalett_predict()`, `spingalett_evaluate()`, `spingalett_forward()`,
   `spingalett_save()`, `spingalett_load()`, `spingalett_load_from_memory()`, `spingalett_activate()`,

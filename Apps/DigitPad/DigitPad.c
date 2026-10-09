@@ -225,10 +225,10 @@ static int best_class(int *runner_up) {
     return best;
 }
 
-static bool classify(NeuralNetwork *net, const float *img, int w, int h) {
+static bool classify(SpingalettNetwork *net, const float *img, int w, int h) {
     has_ink = digit_normalize(img, w, h, sat, input);
     if (!has_ink) return true;
-    float *out = forward(.net = net, .input = input);
+    float *out = spingalett_forward(.net = net, .input = input);
     if (!out) return false;
     memcpy(probs, out, sizeof probs);
     return true;
@@ -425,7 +425,7 @@ static void print_prediction(void) {
     fflush(stdout);
 }
 
-static int classify_file(NeuralNetwork *net, const char *path) {
+static int classify_file(SpingalettNetwork *net, const char *path) {
     int w, h;
     float *img = load_pgm(path, &w, &h);
     if (!img) { fprintf(stderr, "DigitPad: cannot read %s (expected a binary PGM)\n", path); return 1; }
@@ -476,7 +476,7 @@ int main(int argc, char **argv) {
     spingalett_set_verbose(false);
     char model_path[4096];
     bool found = find_model(model_arg, model_path, sizeof model_path);
-    NeuralNetwork *net = found ? load_spingalett(model_path) : NULL;
+    SpingalettNetwork *net = found ? spingalett_load(model_path) : NULL;
     if (!net) {
         char message[4300];
         snprintf(message, sizeof message, "cannot load the model %s", model_path);
@@ -485,14 +485,14 @@ int main(int argc, char **argv) {
     }
     if (classify_path) {
         int status = classify_file(net, classify_path);
-        free_network(net);
+        spingalett_network_free(net);
         return status;
     }
     read_model_info(model_path);
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fatal(SDL_GetError()); free_network(net); return 1; }
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fatal(SDL_GetError()); spingalett_network_free(net); return 1; }
 
     /* double the window on tall screens; the usable bounds are in window coordinates on every
      * platform (Windows reports scaled values to programs that are not DPI-aware) */
@@ -613,6 +613,6 @@ int main(int argc, char **argv) {
     free(ui.alpha); free(title.alpha); free(big.alpha);
     free(undo_stack);
     free(sat);
-    free_network(net);
+    spingalett_network_free(net);
     return 0;
 }

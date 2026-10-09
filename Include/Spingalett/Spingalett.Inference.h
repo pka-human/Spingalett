@@ -149,7 +149,7 @@ typedef enum {
     SPINGALETT_PRECISION_INT8,                 /* q * scale, q in -127..127 */
     SPINGALETT_PRECISION_INT4,                 /* q * scale, q in -7..7 */
     SPINGALETT_PRECISION_INT2,                 /* ternary: q * scale, q in {-1, 0, 1} */
-    PRECISION_COUNT
+    SPINGALETT_PRECISION_COUNT
 } SpingalettPrecisionMode;
 
 /*
@@ -255,6 +255,7 @@ typedef SpingalettPrecisionMode PrecisionMode;
 #define PRECISION_INT8 SPINGALETT_PRECISION_INT8
 #define PRECISION_INT4 SPINGALETT_PRECISION_INT4
 #define PRECISION_INT2 SPINGALETT_PRECISION_INT2
+#define PRECISION_COUNT SPINGALETT_PRECISION_COUNT
 #endif
 
 #ifdef __cplusplus

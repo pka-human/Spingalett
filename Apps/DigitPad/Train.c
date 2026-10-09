@@ -13,7 +13,7 @@
  * with on-the-fly augmentation (random rotation, scale, aspect, shear, shift and stroke thickness)
  * fed through a data generator, so the network copes with digits drawn by hand rather than only
  * with scanned MNIST digits. 5,000 training images are held out to select the best epoch, whose
- * weights train() restores; the test set is evaluated once.
+ * weights spingalett_train() restores; the test set is evaluated once.
  *
  *   DigitPadTrain <mnist-dir> <output.slett> [epochs]
  */
@@ -79,7 +79,7 @@ static double now(void) {
 
 typedef struct { double started, last; } EpochClock;   /* when training began, when the last epoch ended */
 
-static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *data) {
+static bool on_epoch(SpingalettNetwork *net, const SpingalettTrainProgress *p, void *data) {
     (void)net;
     EpochClock *clock = data;
     double t = now();
@@ -113,40 +113,40 @@ int main(int argc, char **argv) {
 
     spingalett_set_verbose(false);
 #if defined(SPINGALETT_HAS_OPENMP)
-    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    spingalett_set_compute_mode(SPINGALETT_COMPUTE_OPENMP);
 #endif
     spingalett_seed(2026);
 
-    NeuralNetwork *net = new_spingalett(LOSS_CROSS_ENTROPY);
-    layer(.net = net, .height = DIGIT_SIDE, .width = DIGIT_SIDE, .channels = 1);
+    SpingalettNetwork *net = spingalett_network_new(SPINGALETT_LOSS_CROSS_ENTROPY);
+    spingalett_layer(.net = net, .height = DIGIT_SIDE, .width = DIGIT_SIDE, .channels = 1);
     const uint32_t widths[2] = {32, 64};
     for (int stage = 0; stage < 2; stage++) {
         for (int k = 0; k < 2; k++) {
-            conv2d(.net = net, .filters = widths[stage], .kernel = 3, .padding = 1, .act_func = ACT_NONE,
-                   .weight_initialization = WEIGHT_INITIALIZATION_HE);
-            batch_norm(.net = net, .act_func = ACT_RELU);
+            spingalett_conv2d(.net = net, .filters = widths[stage], .kernel = 3, .padding = 1,
+                              .act_func = SPINGALETT_ACT_NONE, .weight_initialization = SPINGALETT_INIT_HE);
+            spingalett_batch_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);
         }
-        max_pool2d(.net = net, .kernel = 2);
+        spingalett_max_pool2d(.net = net, .kernel = 2);
     }
-    layer(net, 128, ACT_NONE, WEIGHT_INITIALIZATION_HE);
-    batch_norm(.net = net, .act_func = ACT_RELU, .dropout_rate = 0.3f);
-    layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
+    spingalett_layer(net, 128, SPINGALETT_ACT_NONE, SPINGALETT_INIT_HE);
+    spingalett_batch_norm(.net = net, .act_func = SPINGALETT_ACT_RELU, .dropout_rate = 0.3f);
+    spingalett_layer(net, 10, SPINGALETT_ACT_SOFTMAX, SPINGALETT_INIT_XAVIER);
 
-    LRScheduleParams schedule = {.warmup_epochs = 1, .min_lr = 1e-5f};
+    SpingalettLRScheduleParams schedule = {.warmup_epochs = 1, .min_lr = 1e-5f};
     printf("training a convolutional network (%llu parameters) on %u augmented samples per epoch, %u held out\n",
            (unsigned long long)spingalett_parameter_count(net), train_set.count, val_set.count);
     double t0 = now();
     EpochClock clock = {t0, t0};
-    TrainReport report = train(
+    SpingalettTrainReport report = spingalett_train(
         .net = net,
-        .training_mode = MODE_GENERATOR_FUNCTION,
+        .training_mode = SPINGALETT_MODE_GENERATOR_FUNCTION,
         .generator = augmented_batch,
         .generator_data = &stream,
         .sample_count = train_set.count,        /* samples per epoch from the endless stream */
         .epochs = epochs,
-        .training_strategy = STRATEGY_SMALL_BATCH,
+        .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH,
         .batch_size = 128,
-        .optimizer_type = OPTIMIZER_ADAMW,
+        .optimizer_type = SPINGALETT_OPTIMIZER_ADAMW,
         .learning_rate = 2e-3f,
         .weight_decay = 5e-4f,
         .max_grad_norm = 5.0f,
@@ -155,31 +155,31 @@ int main(int argc, char **argv) {
         .val_inputs = val_set.inputs,
         .val_targets = val_set.targets,
         .val_count = val_set.count,
-        .monitor = MONITOR_VAL_ACCURACY,
+        .monitor = SPINGALETT_MONITOR_VAL_ACCURACY,
         .restore_best_weights = true,
         .callback = on_epoch,
         .callback_data = &clock
     );
-    if (report.status == TRAIN_FAILED) {
+    if (report.status == SPINGALETT_TRAIN_FAILED) {
         fprintf(stderr, "training failed: %s\n", spingalett_last_error_message());
         return 1;
     }
 
     /* the best epoch's weights are back in place: evaluate on the untouched test set, clean and distorted */
-    EvalMetrics test = evaluate(.net = net, .inputs = test_set.inputs, .targets = test_set.targets,
-                                .sample_count = test_set.count);
+    SpingalettEvalMetrics test = spingalett_evaluate(.net = net, .inputs = test_set.inputs, .targets = test_set.targets,
+                                                     .sample_count = test_set.count);
     float *distorted = malloc((size_t)test_set.count * DIGIT_PIXELS * sizeof(float));
     DigitRng rng = {7};
     for (uint32_t i = 0; i < test_set.count; i++)
         digit_augment(test_set.inputs + (size_t)i * DIGIT_PIXELS, distorted + (size_t)i * DIGIT_PIXELS, &rng);
-    EvalMetrics robust = evaluate(.net = net, .inputs = distorted, .targets = test_set.targets,
-                                  .sample_count = test_set.count);
+    SpingalettEvalMetrics robust = spingalett_evaluate(.net = net, .inputs = distorted, .targets = test_set.targets,
+                                                       .sample_count = test_set.count);
     printf("best epoch %zu: validation %.2f%%, test %.2f%%, distorted test %.2f%% (%.0f s)\n",
            report.best_epoch, 100.0 * (double)report.best_value, 100.0 * (double)test.accuracy,
            100.0 * (double)robust.accuracy, now() - clock.started);
 
     spingalett_clear_error();
-    save_spingalett(.net = net, .filename = output, .do_not_save_optimizer = true);
+    spingalett_save(.net = net, .filename = output, .do_not_save_optimizer = true);
     if (spingalett_last_error_code() != SPINGALETT_OK) {
         fprintf(stderr, "cannot save %s: %s\n", output, spingalett_last_error_message());
         return 1;
@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
                 100.0 * (double)test.accuracy);
         fclose(f);
     }
-    free_network(net);
+    spingalett_network_free(net);
     free(distorted);
     free(stream.order);
     spingalett_dataset_free(&train_set);

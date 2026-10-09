@@ -37,9 +37,9 @@ int main(void) {
     SpingalettNetwork *net = spingalett_network_new(.loss_func = SPINGALETT_LOSS_MSE);
     spingalett_layer(.net = net, .neurons_amount = 2);
     spingalett_layer(.net = net, .neurons_amount = 8, .act_func = SPINGALETT_ACT_TANH,
-                     .weight_initialization = SPINGALETT_WEIGHT_INITIALIZATION_XAVIER);
+                     .weight_initialization = SPINGALETT_INIT_XAVIER);
     spingalett_layer(.net = net, .neurons_amount = 1, .act_func = SPINGALETT_ACT_SIGMOID,
-                     .weight_initialization = SPINGALETT_WEIGHT_INITIALIZATION_XAVIER);
+                     .weight_initialization = SPINGALETT_INIT_XAVIER);
     SpingalettTrainReport r = spingalett_train(.net = net, .inputs = x, .targets = t, .sample_count = 4, .epochs = 3000,
                                                .learning_rate = 0.05f, .optimizer_type = SPINGALETT_OPTIMIZER_ADAM,
                                                .training_strategy = SPINGALETT_STRATEGY_FULL_BATCH);

@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <math.h>
 
-static bool on_progress(NeuralNetwork *net, const TrainProgress *progress, void *user_data) {
+static bool on_progress(SpingalettNetwork *net, const SpingalettTrainProgress *progress, void *user_data) {
     (void)net;
     float target_error = *(const float *)user_data;
     printf("  [callback] epoch %zu, error=%.6f\n", progress->epoch, (double)progress->train_loss);
@@ -32,18 +32,18 @@ int main(void) {
        hundred falls into XOR's local minimum (two of the four cases at 0.5). */
     spingalett_seed(42);
 
-    NeuralNetwork *nn = new_spingalett(.loss_func = LOSS_MSE);
+    SpingalettNetwork *nn = spingalett_network_new(.loss_func = SPINGALETT_LOSS_MSE);
 
-    layer(nn, 2);
-    layer(nn, 8, ACT_FOO52, WEIGHT_INITIALIZATION_HE);
-    layer(nn, 1, ACT_SIGMOID, WEIGHT_INITIALIZATION_XAVIER);
+    spingalett_layer(nn, 2);
+    spingalett_layer(nn, 8, SPINGALETT_ACT_FOO52, SPINGALETT_INIT_HE);
+    spingalett_layer(nn, 1, SPINGALETT_ACT_SIGMOID, SPINGALETT_INIT_XAVIER);
 
     float target_error = 1e-5f;
-    TrainReport report = train(
+    SpingalettTrainReport report = spingalett_train(
         .net = nn,
-        .training_mode = MODE_ARRAY,
-        .training_strategy = STRATEGY_FULL_BATCH,
-        .optimizer_type = OPTIMIZER_ADAMW,
+        .training_mode = SPINGALETT_MODE_ARRAY,
+        .training_strategy = SPINGALETT_STRATEGY_FULL_BATCH,
+        .optimizer_type = SPINGALETT_OPTIMIZER_ADAMW,
         .inputs = inputs,
         .targets = targets,
         .sample_count = 4,
@@ -60,7 +60,7 @@ int main(void) {
     printf("\n--- XOR Results ---\n");
     int passed = 0;
     for (int i = 0; i < 4; i++) {
-        float *out = forward(.net = nn, .input = &inputs[i * 2]);
+        float *out = spingalett_forward(.net = nn, .input = &inputs[i * 2]);
         float expected = targets[i];
         float err = fabsf(out[0] - expected);
         const char *status = (err < 0.1f) ? "OK" : "FAIL";
@@ -71,28 +71,28 @@ int main(void) {
     }
     printf("Passed: %d/4\n", passed);
 
-    save_spingalett(
+    spingalett_save(
         .net = nn,
         .filename = "xor_model",
-        .precision = PRECISION_FLOAT32
+        .precision = SPINGALETT_PRECISION_FLOAT32
     );
 
-    free_network(nn);
+    spingalett_network_free(nn);
 
     printf("\n--- Loading saved model ---\n");
-    NeuralNetwork *loaded = load_spingalett("xor_model.slett");
+    SpingalettNetwork *loaded = spingalett_load("xor_model.slett");
     if (loaded) {
         spingalett_set_verbose(false);
 
         printf("\n--- Loaded model results ---\n");
         for (int i = 0; i < 4; i++) {
-            float *out = forward(.net = loaded, .input = &inputs[i * 2]);
+            float *out = spingalett_forward(.net = loaded, .input = &inputs[i * 2]);
             printf("  in=[%.0f, %.0f]  output=%.4f\n",
                    (double)inputs[i * 2], (double)inputs[i * 2 + 1], (double)out[0]);
         }
 
         spingalett_set_verbose(true);
-        free_network(loaded);
+        spingalett_network_free(loaded);
     }
 
     return 0;

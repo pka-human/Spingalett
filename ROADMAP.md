@@ -30,21 +30,20 @@ else.
 - **Data sets on the GPU** (done): `SpingalettDeviceData` and the `device_*` fields of the
   argument structs, which change their layout.
 
-- **Names:** every public name under the library's prefix (`spingalett_`, `Spingalett`,
-  `SPINGALETT_`): today the network type, the argument structs, the enumerations (`LAYER_DENSE`,
-  `ACT_RELU`, ...) and the builder macros (`layer()`, `train()`, `predict()`, ...) are not, and
-  collide with other code. The short names stay available from a header of their own, so that
-  programs written for 0.x keep compiling.
-- **Structs that can grow:** reserved fields (or a size field) in the public argument and
-  description structs, so that 1.x can add options without breaking the ABI; one way of reporting
-  errors everywhere; anything deprecated removed.
-- **Zero means the default:** a field left out of a builder's arguments does what its name
-  suggests. Today `act_func` 0 is `ACT_SIGMOID`, so an addition or concatenation written without
-  `.act_func = ACT_NONE` applies a sigmoid; in 1.0 a zeroed activation is none.
+- **Names** (done): every public name under the library's prefix (`spingalett_`, `Spingalett`,
+  `SPINGALETT_`; the weight initializations shortened to `SPINGALETT_INIT_*`); the names of 0.x
+  stay available from `Spingalett.Short.h`, which `Spingalett.h` includes unless
+  `SPINGALETT_NO_SHORT_NAMES` is defined. The examples and the documentation use the new names.
+- **Structs that can grow** (done): every public struct ends with `SPINGALETT_RESERVED` zeroed
+  words; one way of reporting errors (stated in `Spingalett.h`; `spingalett_save()` and
+  `spingalett_set_compute_mode()` now return whether they succeeded); nothing was deprecated.
+- **Zero means the default** (done): `SPINGALETT_ACT_NONE` is 0, so a layer whose arguments leave
+  out `.act_func` has no activation; `.slett` files keep their activation codes.
 - **Formats:** `.slett` version 7 and `.slettd` version 2 frozen as the 1.0 formats (later versions
   only add kinds of layers or coders, and every 1.x engine reads every 1.x file it can run).
-- **C++ wrapper:** a header-only `spingalett.hpp` with RAII types (`Network`, `Model`, `Dataset`),
-  `std::span` inputs, `std::expected` for errors, and the builder as a fluent API.
+- **C++ wrapper** (done): the header-only `Spingalett.hpp` (C++23) with move-only owners (`Network`,
+  `Model`, `Dataset`, `DeviceData`), `std::span` inputs, `std::expected` for errors, and a fluent
+  `Builder`.
 - **Documentation:** a reference generated from the headers and a tutorial path (MNIST, CIFAR-10,
   a U-Net, deployment to a microcontroller).
 - **Room for CUDA:** `COMPUTE_CUDA` reserved in `ComputeMode` (it falls back to the CPU until 1.1),

@@ -25,12 +25,12 @@ typedef enum {
 typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *message);
 
 typedef enum {
-    SPINGALETT_WEIGHT_INITIALIZATION_RANDOM,   /* uniform in [-1, 1] */
-    SPINGALETT_WEIGHT_INITIALIZATION_XAVIER,   /* Glorot normal: variance 2 / (fan_in + fan_out) */
-    SPINGALETT_WEIGHT_INITIALIZATION_HE,       /* He normal: variance 2 / fan_in */
-    SPINGALETT_WEIGHT_INITIALIZATION_NONE,     /* zeros */
-    SPINGALETT_WEIGHT_INITIALIZATION_LECUN,    /* LeCun normal: variance 1 / fan_in */
-    SPINGALETT_WEIGHT_INITIALIZATION_COUNT
+    SPINGALETT_INIT_RANDOM,   /* uniform in [-1, 1] */
+    SPINGALETT_INIT_XAVIER,   /* Glorot normal: variance 2 / (fan_in + fan_out) */
+    SPINGALETT_INIT_HE,       /* He normal: variance 2 / fan_in */
+    SPINGALETT_INIT_NONE,     /* zeros */
+    SPINGALETT_INIT_LECUN,    /* LeCun normal: variance 1 / fan_in */
+    SPINGALETT_INIT_COUNT
 } SpingalettWeightInitialization;
 
 typedef enum {
