@@ -886,7 +886,7 @@ static bool check_trainable(NeuralNetwork *net) {
     }
     /* (a copy train() left on the GPU may train again without coming back) */
     if (!net->gpu_kept) spingalett_network_sync(net);
-    return spingalett_check_graph(net, "train") && spingalett_training_state(net);
+    return spingalett_check_graph(net, "train");
 }
 
 static TrainReport train_failed(const char *message) {
@@ -999,10 +999,12 @@ TrainReport train_struct_arguments(TrainArgs args) {
 
     if (args.reset_optimizer) {
         spingalett_network_release_gpu(net);
-        memset(net->opt_m_weights, 0, net->total_weights * sizeof(float));
-        memset(net->opt_v_weights, 0, net->total_weights * sizeof(float));
-        memset(net->opt_m_biases,  0, net->total_biases  * sizeof(float));
-        memset(net->opt_v_biases,  0, net->total_biases  * sizeof(float));
+        if (net->opt_m_weights) {               /* (none before the network first trains) */
+            memset(net->opt_m_weights, 0, net->total_weights * sizeof(float));
+            memset(net->opt_v_weights, 0, net->total_weights * sizeof(float));
+            memset(net->opt_m_biases,  0, net->total_biases  * sizeof(float));
+            memset(net->opt_v_biases,  0, net->total_biases  * sizeof(float));
+        }
         net->time_step = 0;
         spingalett_log(LOG_INFO, "Optimizer state reset");
     }
@@ -1129,10 +1131,18 @@ TrainReport train_struct_arguments(TrainArgs args) {
         return (TrainReport){.status = TRAIN_FAILED};
     }
 
-    // The accumulating paths add into grad_* and expect it to start at zero; a previous run
-    // on another backend may have left the last batch's gradients there.
-    memset(net->grad_weights, 0, net->total_weights * sizeof(float));
-    memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
+    /* The CPU's accumulating paths add into grad_* and expect it to start at zero; a previous run on
+       another backend may have left the last batch's gradients there. On the GPU the network's
+       gradients and moments need not exist on the host until they are brought back (a fresh
+       network's: 11 MB of pages touched for the MLP of Examples/Benchmark.c, 2.5 ms). */
+    if (!t.gpu && !spingalett_training_state(net)) {
+        trainer_free(&t);
+        return train_failed("Failed to allocate the training state");
+    }
+    if (net->grad_weights) {
+        memset(net->grad_weights, 0, net->total_weights * sizeof(float));
+        memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
+    }
 
     /* On the GPU the parameters stay on the device: the network's arrays are brought up to date
        (spingalett_network_sync()) only where they are read, by a callback, an autosave, the NaN check
@@ -1418,7 +1428,7 @@ SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch
         set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_new: max_batch is 0");
         return NULL;
     }
-    if (!check_trainable(net))
+    if (!check_trainable(net) || !spingalett_training_state(net))
         return NULL;
     spingalett_network_release_gpu(net);           /* the copy a train() left: the trainer makes its own */
     SpingalettTrainer *tr = (SpingalettTrainer *)calloc(1, sizeof(SpingalettTrainer));

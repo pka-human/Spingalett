@@ -410,6 +410,8 @@ bool spingalett_gpu_upload(SpgGpuNet *g) {
 
 bool spingalett_gpu_download(SpgGpuNet *g) {
     drain(g);
+    /* the host's gradients and moments, made when they first come back */
+    if ((g->grads.buffer || g->moment1.buffer || g->moment2.buffer) && !spingalett_training_state(g->net)) return false;
     return !g->lost && parameters(g, true, false, NULL);
 }
 
