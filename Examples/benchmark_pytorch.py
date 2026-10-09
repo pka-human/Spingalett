@@ -11,7 +11,11 @@ synthetic 28 x 28 images: one epoch of mini-batches of 128 with AdamW, and infer
 layer. Then ResNet-20 (Examples/CIFAR10.c resnet20) on 4,096 synthetic 32 x 32 images: one epoch
 of mini-batches of 128 with SGD and momentum, and inference in batches of 1,000. Then the U-Net of
 Examples/Segmentation.c on 1,024 synthetic 64 x 64 images with three sigmoid outputs a pixel (binary
-cross-entropy): one epoch of mini-batches of 32 with AdamW, and inference in batches of 256. Each measurement
+cross-entropy): one epoch of mini-batches of 32 with AdamW, and inference in batches of 256. Then a
+MobileNet-style network (a 3 x 3 convolution of 32 filters and four depthwise-separable blocks of 64 to 256
+channels, each convolution normalized) on 4,096 synthetic 32 x 32 images: one epoch of mini-batches of
+128 with SGD and momentum, and inference in batches of 1,000, channels-last (PyTorch's faster layout for
+its depthwise convolutions). Each measurement
 runs on a fresh model after one untimed warm-up step, so lazy initialization inside PyTorch is not
 counted.
 
@@ -253,6 +257,48 @@ def unet_throughput(x, y):
     return train, infer
 
 
+MOBILE_SAMPLES = 4096
+
+
+def make_mobilenet():
+    """Examples/Benchmark.c's MobileNet-style network: depthwise 3 x 3 and pointwise 1 x 1 convolutions."""
+    layers, c = [nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU()], 32
+    for w, s in ((64, 1), (128, 2), (128, 1), (256, 2)):
+        layers += [nn.Conv2d(c, c, 3, padding=1, stride=s, groups=c), nn.BatchNorm2d(c), nn.ReLU(),
+                   nn.Conv2d(c, w, 1), nn.BatchNorm2d(w), nn.ReLU()]
+        c = w
+    return nn.Sequential(*layers, nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(c, 10))
+
+
+def mobilenet_throughput(x, y):
+    model = make_mobilenet().to(DEVICE).to(memory_format=torch.channels_last)
+    opt = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+    loss_fn = nn.CrossEntropyLoss()
+
+    def step(xb, yb):
+        opt.zero_grad(set_to_none=True)
+        with amp():
+            loss = loss_fn(model(xb.contiguous(memory_format=torch.channels_last)), yb)
+        loss.backward()
+        opt.step()
+
+    step(to_dev(x[:CNN_BATCH]), to_dev(y[:CNN_BATCH]))  # warm-up
+    start = clock()
+    perm = perm_of(MOBILE_SAMPLES)
+    for i in range(0, MOBILE_SAMPLES, CNN_BATCH):
+        idx = perm[i:i + CNN_BATCH]
+        step(to_dev(x[idx]), to_dev(y[idx]))
+    train = MOBILE_SAMPLES / (clock() - start)
+    model.eval()
+    with torch.inference_mode(), amp():
+        torch.softmax(model(to_dev(x[:64]).contiguous(memory_format=torch.channels_last)), dim=1)  # warm-up
+        start = clock()
+        for i in range(0, MOBILE_SAMPLES, 1000):
+            back(torch.softmax(model(to_dev(x[i:i + 1000]).contiguous(memory_format=torch.channels_last)), dim=1))
+        infer = MOBILE_SAMPLES / (clock() - start)
+    return train, infer
+
+
 def data(t):
     """Training data where the run keeps it: the device, or (pinned) the host with --host-data."""
     return t.pin_memory() if HOST else t.to(DEVICE)
@@ -308,6 +354,12 @@ def main():
     print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
     train, infer = unet_throughput(data(torch.rand(UNET_SAMPLES, 3, 64, 64)),
                                    data(torch.randint(0, 2, (UNET_SAMPLES, 3, 64, 64)).float()))
+    print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
+
+    print(f"\nMobileNet-style network, {MOBILE_SAMPLES} images")
+    print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
+    train, infer = mobilenet_throughput(data(torch.rand(MOBILE_SAMPLES, 3, 32, 32)),
+                                        data(torch.randint(0, 10, (MOBILE_SAMPLES,))))
     print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
 
 

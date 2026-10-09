@@ -24,7 +24,10 @@
  * synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with SGD and momentum, and
  * inference. Then the U-Net of Examples/Segmentation.c (transposed convolutions up, three sigmoid
  * outputs a pixel) on 1,024 synthetic 64 x 64 x 3 images: one epoch of mini-batches of 32 with AdamW
- * (lr 1e-3), and inference.
+ * (lr 1e-3), and inference. Then a MobileNet-style network (a 3 x 3 convolution of 32 filters and four
+ * depthwise-separable blocks, a depthwise 3 x 3 convolution and a pointwise 1 x 1 one of 64 to 256
+ * filters, each normalized) on 4,096 synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with
+ * SGD and momentum (lr 0.05), and inference.
  *
  * With a usable GPU (spingalett_gpu_device()), every workload also runs with COMPUTE_VULKAN, after a
  * first run that is not timed (it makes the GPU's pipelines and times the matrix products' tiles,
@@ -317,6 +320,55 @@ static void unet_benchmark(const char *name, ComputeMode mode, const float *imag
     }
 }
 
+#define MOBILE_SAMPLES 4096
+
+/* depthwise 3 x 3 and pointwise 1 x 1 convolutions, each normalized */
+static NeuralNetwork *create_mobilenet(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 32, .width = 32, .channels = 3);
+    conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    static const uint32_t widths[] = {64, 128, 128, 256}, strides[] = {1, 2, 1, 2};
+    uint32_t c = 32;
+    for (int b = 0; b < 4; b++) {
+        conv2d(.net = net, .filters = c, .kernel = 3, .padding = 1, .stride = strides[b], .groups = c,
+               .act_func = ACT_NONE, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        batch_norm(.net = net, .act_func = ACT_RELU);
+        conv2d(.net = net, .filters = widths[b], .kernel = 1, .act_func = ACT_NONE,
+               .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        batch_norm(.net = net, .act_func = ACT_RELU);
+        c = widths[b];
+    }
+    global_avg_pool2d(.net = net);
+    layer(.net = net, .neurons_amount = 10, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+    return net;
+}
+
+static void mobilenet_benchmark(const char *name, ComputeMode mode, const float *images, const float *labels) {
+    spingalett_set_compute_mode(mode);
+    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) {   /* the GPU's first run */
+    NeuralNetwork *net = create_mobilenet();
+    Sets d = sets_of(images, 3072u, labels, OUTPUT_SIZE, MOBILE_SAMPLES);
+    double start = now();
+    train(.net = net, .inputs = d.x ? NULL : images, .targets = d.t ? NULL : labels, .device_inputs = d.x,
+          .device_targets = d.t, .sample_count = MOBILE_SAMPLES, .epochs = 1, .learning_rate = 0.05f, .momentum = 0.9f,
+          .optimizer_type = OPTIMIZER_MOMENTUM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = CNN_BATCH);
+    double trained = now() - start;
+    float *outputs = (float *)malloc((size_t)MOBILE_SAMPLES * OUTPUT_SIZE * sizeof(float));
+    for (int timed = 0; timed < 2; timed++) {
+        start = now();
+        predict(.net = net, .inputs = d.x ? NULL : images, .device_inputs = d.x, .sample_count = MOBILE_SAMPLES,
+                .outputs = outputs);
+    }
+    double inferred = now() - start;
+    if (!untimed) printf("%-24s %14.0f %14.0f\n", name, MOBILE_SAMPLES / trained, MOBILE_SAMPLES / inferred);
+    sets_free(d);
+    free(outputs);
+    free_network(net);
+    }
+}
+
 static void run_benchmark(const char *name, ComputeMode mode, const float *inputs, const float *targets) {
     spingalett_set_compute_mode(mode);
     if (mode == COMPUTE_VULKAN) {           /* the GPU's first use, not timed */
@@ -531,6 +583,39 @@ int main(int argc, char **argv) {
         if (bf16) {
             spingalett_set_gpu_precision(PRECISION_BFLOAT16);
             unet_benchmark(dev ? "Vulkan bf16, data on GPU" : "Vulkan GPU bf16", COMPUTE_VULKAN, images, labels);
+            spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        }
+    }
+    on_device = false;
+    free(images);
+    free(labels);
+
+    /* the MobileNet-style network on random 32 x 32 x 3 images, one-hot labels */
+    images = (float *)malloc((size_t)MOBILE_SAMPLES * 3072 * sizeof(float));
+    labels = (float *)calloc((size_t)MOBILE_SAMPLES * OUTPUT_SIZE, sizeof(float));
+    if (!images || !labels) {
+        fprintf(stderr, "Allocation failed\n");
+        return 1;
+    }
+    for (size_t i = 0; i < (size_t)MOBILE_SAMPLES * 3072; i++) images[i] = (float)rand() / (float)RAND_MAX;
+    for (size_t s = 0; s < MOBILE_SAMPLES; s++) labels[s * OUTPUT_SIZE + (size_t)rand() % OUTPUT_SIZE] = 1.0f;
+    NeuralNetwork *mobile = create_mobilenet();
+    printf("\nMobileNet-style network (depthwise-separable), %u layers, %" PRIu64 " parameters, %d images\n",
+           spingalett_layer_count(mobile), spingalett_parameter_count(mobile), MOBILE_SAMPLES);
+    free_network(mobile);
+    printf("%-24s %14s %14s\n", "samples/s", "training", "inference");
+    if (cpu) {
+        mobilenet_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, images, labels);
+#if defined(SPINGALETT_HAS_OPENMP)
+        mobilenet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
+#endif
+    }
+    for (int dev = 0; gpu && dev < 2; dev++) {      /* the host's arrays, then data sets on the GPU */
+        on_device = dev;
+        mobilenet_benchmark(dev ? "Vulkan GPU, data on GPU" : "Vulkan GPU", COMPUTE_VULKAN, images, labels);
+        if (bf16) {
+            spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+            mobilenet_benchmark(dev ? "Vulkan bf16, data on GPU" : "Vulkan GPU bf16", COMPUTE_VULKAN, images, labels);
             spingalett_set_gpu_precision(PRECISION_FLOAT32);
         }
     }
