@@ -561,11 +561,11 @@ float compute_sample_loss(const float *output, const float *target,
     } else if (loss_func == LOSS_CROSS_ENTROPY) {
         if (output_act == ACT_SIGMOID) {
             for (uint32_t k = 0; k < output_size; k++) {
-                float o = output[k];
-                float t = target[k];
-                if (o < epsilon_log) o = epsilon_log;
-                if (o > 1.0f - epsilon_log) o = 1.0f - epsilon_log;
-                loss -= (t * logf(o) + (1.0f - t) * logf(1.0f - o));
+                /* 1 - o bounded below rather than o above: 1 - 1e-9 is 1 in float, and an output
+                   saturated at 1 would give 0 log 0 (fmaxf, which reassociation cannot turn back
+                   into a comparison of o) */
+                const float o = output[k], t = target[k];
+                loss -= (t * logf(fmaxf(o, epsilon_log)) + (1.0f - t) * logf(fmaxf(1.0f - o, epsilon_log)));
             }
         } else {
             for (uint32_t k = 0; k < output_size; k++) {

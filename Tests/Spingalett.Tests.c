@@ -1306,7 +1306,13 @@ static void evaluate_matches_manual(void) {
     float bx[] = {0, 0, 1, 0, 0, 0, 1, 0}, by[] = {0, 1, 1, 0};   /* outputs: <0.5, >0.5, <0.5, >0.5 */
     EvalMetrics mb = evaluate(.net = b, .inputs = bx, .targets = by, .sample_count = 4);
     CHECK(fabsf(mb.accuracy - 0.5f) < 1e-6f, "binary accuracy %.3f, expected 0.5", (double)mb.accuracy);
-    free_network(b); free_network(net); free(x); free(y);
+
+    /* a sigmoid saturated at 1 (in float): -log(1e-9) for a target of 0, nothing for a target of 1 */
+    NeuralNetwork *sat = build(LOSS_CROSS_ENTROPY, lb, 2, (const float[]){0.0f, 0.0f}, (const float[]){100.0f});
+    EvalMetrics ms = evaluate(.net = sat, .inputs = bx, .targets = (const float[]){1, 0, 1, 0}, .sample_count = 4);
+    CHECK(fabs(ms.loss + log(1e-9) / 2.0) < 1e-3, "saturated sigmoid: loss %g, expected %g", (double)ms.loss,
+          -log(1e-9) / 2.0);
+    free_network(sat); free_network(b); free_network(net); free(x); free(y);
 }
 
 typedef struct {
@@ -4278,6 +4284,24 @@ static void gpu_equivalence(int which) {
     free(pc); free(pg); free(x); free(t);
 }
 
+/* The training loss of a sigmoid output saturated at 1, on the CPU and the GPU: finite, the same. */
+static void gpu_saturated(void) {
+    L ls[] = {{2, ACT_NONE}, {1, ACT_SIGMOID}};
+    const float x[] = {0, 0, 1, 0, 0, 0, 1, 0}, t[] = {1, 0, 1, 0};
+    float loss[2];
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = build(LOSS_CROSS_ENTROPY, ls, 2, (const float[]){0.0f, 0.0f}, (const float[]){100.0f});
+        spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+        TrainReport r = train(.net = net, .inputs = x, .targets = t, .sample_count = 4, .epochs = 1, .batch_size = 4,
+                              .training_strategy = STRATEGY_SMALL_BATCH, .learning_rate = 1e-6f, .report_interval = 0);
+        loss[k] = r.train_loss;
+        free_network(net);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    CHECK(isfinite(loss[0]) && fabsf(loss[0] - loss[1]) <= 1e-4f * loss[0],
+          "gpu: saturated sigmoid losses %g (CPU) / %g (GPU)", (double)loss[0], (double)loss[1]);
+}
+
 typedef struct { const float *x, *t; uint32_t n, in, out, at; } GpuServe;
 
 static uint32_t gpu_serve(float *inputs, float *targets, uint32_t count, void *data) {
@@ -4785,6 +4809,7 @@ int main(int argc, char **argv) {
         } else {
             printf("  device: %s\n", spingalett_gpu_device());
             for (int k = 0; k < 6; k++) gpu_equivalence(k);
+            gpu_saturated();
             gpu_training_options();
             gpu_threads();
             gpu_trainer();

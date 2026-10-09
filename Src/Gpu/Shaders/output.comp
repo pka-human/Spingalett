@@ -72,8 +72,8 @@ void main() {
             loss += d * d;
             dot += d * o;
         } else if (ACT == ACT_SIGMOID) {
-            float c = clamp(o, eps, 1.0 - eps);
-            loss -= t * log(c) + (1.0 - t) * log(1.0 - c);
+            /* 1 - o bounded below (1 - 1e-9 is 1 in float): a saturated output gives no 0 log 0 */
+            loss -= t * log(max(o, eps)) + (1.0 - t) * log(max(1.0 - o, eps));
         } else {
             loss -= t * log(max(o, eps));
         }
