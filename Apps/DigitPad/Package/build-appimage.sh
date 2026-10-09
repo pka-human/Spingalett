@@ -86,7 +86,7 @@ fi
 step "building DigitPad"
 cmake -S "$root" -B "$work/build" -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=ON \
     -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=OFF -DBUILD_WITH_OPENBLAS=OFF \
-    -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF -DSDL2_DIR="$sdl/lib/cmake/SDL2" \
+    -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF -DSPINGALETT_RUNTIME=OFF -DSPINGALETT_CUDA=OFF -DSDL2_DIR="$sdl/lib/cmake/SDL2" \
     -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
     -DSPINGALETT_BIN_DIR="$work/build/Bin" -DSPINGALETT_LIB_DIR="$work/build/Lib"
 cmake --build "$work/build" -j "$jobs" --target DigitPad

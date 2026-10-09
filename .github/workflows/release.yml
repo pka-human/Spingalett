@@ -84,11 +84,16 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.ref }}
 
-      # the shaders, compiled once with a recent glslc (bfloat16 on the matrix units needs one)
+      # the shaders, compiled once with a recent glslc (bfloat16 on the matrix units needs one), and
+      # the CUDA kernels' PTX
       - uses: actions/download-artifact@v4
         with:
           name: spirv
           path: spirv
+      - uses: actions/download-artifact@v4
+        with:
+          name: ptx
+          path: ptx
 
       - name: MSYS2 (UCRT64 GCC)
         if: runner.os == 'Windows'
@@ -155,12 +160,13 @@ jobs:
         run: |
           root=$PWD; [ "$RUNNER_OS" = Windows ] && root=$(cygpath -m "$PWD")    # native CMake, MSYS shell
           args=(-DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF "-DCMAKE_C_FLAGS=${{ matrix.flags }}")
-          library=(-DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE" -DSPINGALETT_VULKAN=ON -DSPINGALETT_SPIRV_DIR="$root/spirv")
+          library=(-DCMAKE_INSTALL_PREFIX="$root/$ARCHIVE" -DSPINGALETT_VULKAN=ON -DSPINGALETT_SPIRV_DIR="$root/spirv"
+                   -DSPINGALETT_CUDA=ON -DSPINGALETT_PTX_DIR="$root/ptx")
           runtime=(-DCMAKE_INSTALL_PREFIX="$root/$RUNTIME_ARCHIVE" -DSPINGALETT_RUNTIME_ONLY=ON
                    -DSPINGALETT_BIN_DIR="$root/BuildRuntime/Bin" -DSPINGALETT_LIB_DIR="$root/BuildRuntime/Lib")
           case "${{ matrix.name }}" in
             macos-*)   omp="$PWD/libomp"
-                       library+=("-DSPINGALETT_VULKAN_INCLUDE=$(brew --prefix vulkan-headers)/include")
+                       library+=("-DSPINGALETT_VULKAN_INCLUDE=$(brew --prefix vulkan-headers)/include" -DSPINGALETT_CUDA=OFF)
                        args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
                               -DBUILD_WITH_OPENMP=ON "-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$omp/include"
                               -DOpenMP_C_LIB_NAMES=omp "-DOpenMP_omp_LIBRARY=$omp/lib/libomp.dylib") ;;
@@ -185,8 +191,8 @@ jobs:
 
       - name: Test
         run: |
-          ctest --test-dir Build --output-on-failure
-          ctest --test-dir BuildRuntime --output-on-failure
+          .github/scripts/ctest.sh --test-dir Build
+          .github/scripts/ctest.sh --test-dir BuildRuntime
 
       - name: Install
         run: |
@@ -343,9 +349,9 @@ jobs:
 
   # manylinux wheels: the library built in the manylinux 2.28 images (glibc 2.28, any Linux of 2018
   # on), libgomp vendored by auditwheel; x86-64 builds choose AVX2 or AVX-512 kernels at run time
-  # The shaders as SPIR-V (the same for every platform), compiled once for every package and wheel:
-  # with Arch Linux's shaderc, recent enough for the bfloat16 kernel (Ubuntu's is not, and the
-  # manylinux containers have none); each is checked by spirv-val
+  # The shaders as SPIR-V and the CUDA kernels as PTX (the same for every platform), compiled once for
+  # every package and wheel: with Arch Linux's shaderc, recent enough for the bfloat16 kernel (Ubuntu's
+  # is not, and the manylinux containers have none), each checked by spirv-val; and its clang
   shaders:
     needs: version
     if: needs.version.outputs.binaries == 'true'
@@ -353,16 +359,20 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Tools
-        run: pacman -Syu --noconfirm --needed cmake ninja gcc shaderc vulkan-headers spirv-tools
+        run: pacman -Syu --noconfirm --needed cmake ninja gcc clang shaderc vulkan-headers spirv-tools
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.ref }}
       - name: Compile
         run: |
           glslc --version
-          cmake -S . -B Build -G Ninja -DSPINGALETT_VULKAN=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF
-          cmake --build Build --target spingalett_shaders
-          mkdir spirv && cp Build/Gpu/*.spv.inc spirv/
+          clang --version | head -1
+          cmake -S . -B Build -G Ninja -DSPINGALETT_VULKAN=ON -DSPINGALETT_CUDA=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF
+          cmake --build Build --target spingalett_shaders spingalett_cuda_kernels
+          mkdir spirv ptx && cp Build/Gpu/*.spv.inc spirv/ && cp Build/Cuda/*.ptx.inc ptx/
+          # the CUDA kernels as gzip-compressed PTX (cmake/PtxToC.cmake), the same for every platform
+          ls ptx | wc -l
+          for f in ptx/*.ptx.inc; do grep -q '^0x1f,0x8b,' "$f" || { echo "::error::$f is no compressed PTX"; exit 1; }; done
           # every kernel compiled (an empty module would leave the matrix units out of the packages)
           for f in spirv/*.spv.inc; do grep -q 0x07230203 "$f" || { echo "::error::$f is empty"; exit 1; }; done
           for f in Src/Gpu/Shaders/*.comp; do
@@ -372,6 +382,11 @@ jobs:
         with:
           name: spirv
           path: spirv/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ptx
+          path: ptx/
           if-no-files-found: error
 
   wheels:
@@ -394,6 +409,10 @@ jobs:
         with:
           name: spirv
           path: spirv
+      - uses: actions/download-artifact@v4
+        with:
+          name: ptx
+          path: ptx
       - name: Build the library
         run: |
           dnf install -y vulkan-headers
@@ -401,9 +420,10 @@ jobs:
           export PATH="/opt/python/cp312-cp312/bin:$PATH"
           gcc --version | head -1
           cmake -S . -B Build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON \
-                -DBUILD_EXAMPLE=OFF -DSPINGALETT_VULKAN=ON -DSPINGALETT_SPIRV_DIR=$PWD/spirv
+                -DBUILD_EXAMPLE=OFF -DSPINGALETT_VULKAN=ON -DSPINGALETT_SPIRV_DIR=$PWD/spirv \
+                -DSPINGALETT_CUDA=ON -DSPINGALETT_PTX_DIR=$PWD/ptx
           cmake --build Build --parallel
-          ctest --test-dir Build --output-on-failure -R core
+          .github/scripts/ctest.sh --test-dir Build -R core
       - name: Wheel
         run: |
           export PATH="/opt/python/cp312-cp312/bin:$PATH"

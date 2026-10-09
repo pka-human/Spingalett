@@ -111,7 +111,7 @@ fi
 step "building DigitPad"
 set -- -S "$root" -B "$work/build" -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=ON \
     -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=OFF -DBUILD_WITH_OPENBLAS=OFF \
-    -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF \
+    -DBUILD_TESTS=OFF -DBUILD_EXAMPLE=OFF -DSPINGALETT_RUNTIME=OFF -DSPINGALETT_CUDA=OFF \
     -DCMAKE_EXE_LINKER_FLAGS=-static-libgcc -DCMAKE_SHARED_LINKER_FLAGS=-static-libgcc \
     -DSPINGALETT_BIN_DIR="$work/build/Bin" -DSPINGALETT_LIB_DIR="$work/build/Lib"
 if $cross; then set -- "$@" -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DSDL2_DIR="$sdl/lib/cmake/SDL2"; fi
