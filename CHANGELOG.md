@@ -64,6 +64,11 @@ changes, which are listed under **Changed**.
   U-Net infers 1.57 times as fast (6,570 to 10,300 images per second), ResNet-20 1.36 times (24,500
   to 33,200), the MNIST CNN 1.2 to 1.3 times; bfloat16 alike (U-Net 11,600 to 17,500).
 
+- Full-batch training on the GPU fills the next epoch's first chunk while the device trains on the
+  last of this one (the same rows, in order, without validation), and the host rounds inputs kept as
+  bfloat16 straight into the device's memory as it gathers them: the MLP trains full batches in
+  bfloat16 13% faster (1,930,000 to 2,200,000 samples per second).
+
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
   the epochs after it: they now go to the device before the next epoch.

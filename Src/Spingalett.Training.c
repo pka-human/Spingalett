@@ -584,6 +584,8 @@ typedef struct {
 
     SpgGpuNet *gpu;             /* COMPUTE_VULKAN: the network on the GPU (no CPU workspaces then) */
     bool gpu_failed;
+    bool gpu_ahead;             /* fill the next step's first chunk at the end of this one (it is known) */
+    bool gpu_filled;            /* the first chunk of this step was filled ahead */
 } Trainer;
 
 static void trainer_free(Trainer *t) {
@@ -712,6 +714,34 @@ static void augment_image(const Trainer *t, const float *src, float *dst, uint64
     }
 }
 
+/* Fills the GPU's next chunk with rows order[start + c0 ..] (start + c0.. when order is NULL) of
+   n samples: gathered (augmented) and, where the device keeps its inputs as bfloat16 in memory the host
+   writes, rounded straight into it; the targets smoothed. */
+static void gpu_fill(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order, uint32_t start,
+                     uint32_t c0, uint32_t n, uint64_t step) {
+    const NeuralNetwork *net = t->net;
+    const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
+    float *targets;
+    uint16_t *x16 = t->augment ? NULL : spingalett_gpu_chunk_inputs_bf16(t->gpu, &targets);
+    float *x = x16 ? NULL : spingalett_gpu_chunk_inputs(t->gpu, &targets);
+    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, (uint64_t)n * in_sz * (t->augment ? 4u : 1u)) && n > 1,
+        for (int64_t s = 0; s < (int64_t)n; s++) {
+            uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
+            const float *src = inputs + (size_t)idx * in_sz;
+            if (x16)
+                spingalett_round_bf16(x16 + (size_t)s * in_sz, src, in_sz);
+            else if (t->augment)
+                augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
+            else
+                memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
+            memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
+        }
+    );
+    if (t->args->label_smoothing > 0.0f)
+        smooth_targets(targets, targets, n, out_sz, net->act_func[net->layers - 2], t->args->label_smoothing, t->mode);
+    if (!x16) spingalett_gpu_chunk_ready(t->gpu, n);
+}
+
 /* Trains on rows order[start .. start+count) of inputs/targets (rows start.. directly when order
    is NULL) and performs the optimizer step(s). Returns the summed loss. */
 static float trainer_step(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order,
@@ -730,25 +760,18 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
         const uint64_t step = net->time_step;
         for (uint32_t c0 = 0; c0 < count && !t->gpu_failed; c0 += cap) {
             uint32_t n = (count - c0 < cap) ? count - c0 : cap;
-            float *targets, *x = spingalett_gpu_chunk_inputs(t->gpu, &targets);
-            SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, (uint64_t)n * in_sz * (t->augment ? 4u : 1u)) && n > 1,
-                for (int64_t s = 0; s < (int64_t)n; s++) {
-                    uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
-                    const float *src = inputs + (size_t)idx * in_sz;
-                    if (t->augment)
-                        augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
-                    else
-                        memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
-                    memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
-                }
-            );
-            if (args->label_smoothing > 0.0f)
-                smooth_targets(targets, targets, n, out_sz, out_act, args->label_smoothing, t->mode);
+            if (!(c0 == 0 && t->gpu_filled)) gpu_fill(t, inputs, targets_in, order, start, c0, n, step);
+            t->gpu_filled = false;
             bool last = c0 + n == count;
             if (last) trainer_begin_step(t);
             SpgGpuStep st = {t->opt.lr, t->opt.m_factor, t->opt.v_factor, step};
             if (!spingalett_gpu_train_chunk(t->gpu, n, count, c0, c0 == 0, last, &st))
                 t->gpu_failed = true;
+        }
+        /* the next step's first chunk (the same rows), filled while the device trains on this one */
+        if (t->gpu_ahead && !t->gpu_failed) {
+            gpu_fill(t, inputs, targets_in, order, start, 0, count < cap ? count : cap, net->time_step);
+            t->gpu_filled = true;
         }
         return 0.0f;
     }
@@ -1206,6 +1229,9 @@ TrainReport train_struct_arguments(TrainArgs args) {
             for (uint32_t bi = 0; bi < steps_per_epoch; bi++) {
                 uint32_t start = bi * step_size;
                 uint32_t count = (sample_count - start < step_size) ? sample_count - start : step_size;
+                /* full batches in order: the next epoch starts with the same chunk, filled ahead (not with
+                   validation, which runs on the GPU's chunks in between) */
+                t.gpu_ahead = t.gpu && steps_per_epoch == 1 && !t.order && !has_validation && epoch < epochs;
                 total_error += trainer_step(&t, args.inputs, args.targets, t.order, start, count);
             }
             epoch_samples = sample_count;

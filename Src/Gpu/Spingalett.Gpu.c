@@ -37,6 +37,7 @@ typedef struct {
        so that they are copied while the other slot's chunk runs */
     SpgGpuBuffer header, input, target;
     float *host_inputs;             /* inputs kept as bfloat16: the host's floats, rounded on submission */
+    bool staged;                    /* the chunk's inputs are on the device already (rounded or written) */
     struct { uint64_t key; SpgGpuCommands *commands; } cache[8];
     uint32_t used;                  /* entries of cache */
     SpgGpuCommands *pending;        /* submitted and not yet harvested */
@@ -484,6 +485,7 @@ bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTrain
         }
     g->cfg = *training;
     g->step_loss = g->total_loss = 0.0f;
+    g->slots[0].staged = g->slots[1].staged = false;
     return true;
 }
 
@@ -1520,7 +1522,7 @@ static float *inputs_of(Slot *s) {
 }
 
 /* n inputs rounded to bfloat16, to the nearest, ties to even, as gemm_common.glsl's to_bf16() */
-static void round_bf16(uint16_t *dst, const float *src, size_t n) {
+void spingalett_round_bf16(uint16_t *dst, const float *src, size_t n) {
     for (size_t i = 0; i < n; i++) {
         uint32_t u;
         memcpy(&u, &src[i], sizeof u);
@@ -1531,9 +1533,12 @@ static void round_bf16(uint16_t *dst, const float *src, size_t n) {
 /* The host's inputs of n samples rounded into the device's buffer (or staging), when the inputs are
    kept as bfloat16. */
 static void stage_inputs(const SpgGpuNet *g, Slot *s, uint32_t n) {
-    if (!s->host_inputs) return;
+    if (s->staged || !s->host_inputs) {
+        s->staged = false;
+        return;
+    }
     void *dst = s->input.mapped ? s->input.mapped : (char *)s->staging.mapped + s->inputs;
-    round_bf16((uint16_t *)dst, s->host_inputs, (size_t)n * g->net->topology[0]);
+    spingalett_round_bf16((uint16_t *)dst, s->host_inputs, (size_t)n * g->net->topology[0]);
 }
 
 static void copy_in(SpgGpuCommands *c, Slot *s, size_t input_bytes) {
@@ -1545,6 +1550,21 @@ float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets) {
     Slot *s = next_slot(g);
     if (targets) *targets = (float *)((char *)s->staging.mapped + s->targets);
     return inputs_of(s);
+}
+
+uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
+    Slot *s = &g->slots[g->next];
+    if (!s->host_inputs || !s->input.mapped) return NULL;
+    next_slot(g);
+    if (targets) *targets = (float *)((char *)s->staging.mapped + s->targets);
+    s->staged = true;
+    return (uint16_t *)s->input.mapped;
+}
+
+void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) {
+    Slot *s = &g->slots[g->next];
+    stage_inputs(g, s, n);
+    s->staged = s->host_inputs != NULL;
 }
 
 /* Drops the slot's cache entry of commands whose recording failed; NULL. */
@@ -1679,9 +1699,10 @@ bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, u
         const uint32_t m = n - start < g->capacity ? n - start : g->capacity;
         float *dst = spingalett_gpu_chunk_inputs(g, NULL);
         Slot *s = &g->slots[g->next];
+        s->staged = false;
         if (s->host_inputs)         /* rounded straight from the caller's floats */
-            round_bf16((uint16_t *)(s->input.mapped ? s->input.mapped : (char *)s->staging.mapped + s->inputs),
-                       inputs + (size_t)start * in, (size_t)m * in);
+            spingalett_round_bf16((uint16_t *)(s->input.mapped ? s->input.mapped : (char *)s->staging.mapped + s->inputs),
+                                  inputs + (size_t)start * in, (size_t)m * in);
         else
             memcpy(dst, inputs + (size_t)start * in, (size_t)m * in * sizeof(float));
         SpgGpuCommands *c = chunk_commands(g, s, (uint64_t)m | 1ull << 63, m, m, false, false, false);

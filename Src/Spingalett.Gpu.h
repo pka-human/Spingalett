@@ -76,6 +76,14 @@ bool spingalett_gpu_download(SpgGpuNet *g);
 /* Where the next chunk's inputs and targets go (rows of the input and output layers), once the
    device is done with the chunk that used that memory before. */
 float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets);
+/* The same, where the network keeps its inputs as bfloat16 in device memory the host writes: the
+   device's buffer, which the caller fills with spingalett_round_bf16() (NULL where it does not). */
+uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets);
+/* The next chunk's inputs, of n samples, filled: rounded to the device's buffer now, rather than when
+   the chunk is submitted (so that a chunk can be made ready ahead). */
+void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n);
+/* Floats rounded to bfloat16, to the nearest, ties to even (as the GPU rounds). */
+void spingalett_round_bf16(uint16_t *dst, const float *src, size_t n);
 /* Trains on the n samples filled in: forward, loss and backward passes, their gradients scaled by
    1 / count and added to the step's (first: the step's first chunk, which replaces them), then with
    `last` the optimizer step. position: the chunk's first sample within its step (dropout). */
@@ -137,6 +145,11 @@ static inline bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, con
 }
 static inline bool spingalett_gpu_upload(SpgGpuNet *g) { (void)g; return false; }
 static inline bool spingalett_gpu_download(SpgGpuNet *g) { (void)g; return false; }
+static inline uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
+    (void)g; (void)targets;
+    return NULL;
+}
+static inline void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) { (void)g; (void)n; }
 static inline float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets) {
     (void)g; (void)targets;
     return NULL;

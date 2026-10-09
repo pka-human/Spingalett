@@ -4837,7 +4837,12 @@ static float *gpu_params_of(NeuralNetwork *net, size_t *count) {
    between them or not; and training on the CPU after the GPU starts from the GPU's parameters. */
 static void gpu_kept(void) {
     static const int nets[] = {0, 2};
-    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+    /* in single precision, and in bfloat16 (inputs rounded straight into the device's memory, the next
+       epoch's first chunk filled ahead) */
+    for (size_t jp = 0; jp < 2 * (sizeof nets / sizeof nets[0]); jp++) {
+        const size_t j = jp % (sizeof nets / sizeof nets[0]);
+        const bool bf16 = jp >= sizeof nets / sizeof nets[0];
+        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
         const int which = nets[j];
         float *w[5] = {NULL};
         size_t count = 0;
@@ -4892,11 +4897,13 @@ static void gpu_kept(void) {
         }
         const bool same = !memcmp(w[0], w[1], count * sizeof(float)) && !memcmp(w[0], w[2], count * sizeof(float));
         const bool cpu = !memcmp(w[3], w[4], count * sizeof(float));
-        CHECK(same, "gpu kept net %d: two calls of train() differ from one of two epochs", which);
-        CHECK(cpu, "gpu kept net %d: training on the CPU after the GPU did not start from its parameters", which);
-        printf("  gpu kept net %d: train() again on its copy %s, then on the CPU %s\n", which, same ? "ok" : "FAILED",
-               cpu ? "ok" : "FAILED");
+        CHECK(same, "gpu kept net %d%s: two calls of train() differ from one of two epochs", which, bf16 ? " bf16" : "");
+        CHECK(cpu, "gpu kept net %d%s: training on the CPU after the GPU did not start from its parameters", which,
+              bf16 ? " bf16" : "");
+        printf("  gpu kept net %d%s: train() again on its copy %s, then on the CPU %s\n", which, bf16 ? " bf16" : "",
+               same ? "ok" : "FAILED", cpu ? "ok" : "FAILED");
         for (int k = 0; k < 5; k++) free(w[k]);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
     }
     spingalett_set_compute_mode(COMPUTE_OPENMP);
 }
