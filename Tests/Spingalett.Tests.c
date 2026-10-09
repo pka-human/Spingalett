@@ -19,6 +19,7 @@
 
 #include <Spingalett/Spingalett.Short.h>    /* the names of 0.x, and Spingalett.h */
 #include "Spingalett.Network.h"      /* white-box: the network's arrays */
+#include "Spingalett.RuntimeData.h"  /* the samples of export-models */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5224,10 +5225,104 @@ static void gpu_bf16(void) {
     }
 }
 
+/* ---------------------------------------------------------------- models for the runtime's tests */
+
+/* Network k of those export-models writes (NULL past the last), named in *name. */
+static NeuralNetwork *runtime_net(int k, const char **name) {
+    static const char *names[] = {"norm0", "norm1", "norm2", "norm3", "graph0", "graph1", "graph2", "graph3",
+                                  "graph4", "graph5", "graph6", "graph7", "conv5", "conv6", "conv7", "conv8",
+                                  "conv9", "resnet"};
+    lcg_state = 500u + (unsigned)k;
+    if (k == 0) { *name = "mlp"; return deploy_net(); }
+    if (k == 1) { *name = "cnn"; return conv_deploy_net(); }
+    if (k - 2 >= (int)(sizeof names / sizeof *names)) return NULL;
+    *name = names[k - 2];
+    NeuralNetwork *net = k < 6 ? norm_net(k - 2) : k < 14 ? graph_net(k - 6) : k < 19 ? conv_net(k - 9)
+                                                                                     : resnet(2, 16, 0.0f);
+    graph_init(net);
+    for (uint64_t i = 0; i < net->total_biases; i++) {   /* the batch normalizations' statistics */
+        net->running_mean[i] = frand() * 0.4f - 0.2f;
+        net->running_var[i] = 0.5f + frand();
+    }
+    return net;
+}
+
+static bool write_floats(const char *dir, const char *name, const char *suffix, const float *x, size_t n) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s.%s", dir, name, suffix);
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(x, sizeof(float), n, f) == n;
+    return fclose(f) == 0 && ok;
+}
+
+/* SpingalettTests export-models DIR: networks of every kind of layer saved as .slett files in every
+   precision (and one with its optimizer state), with what the full library's spingalett_model_predict()
+   (single-threaded and on four threads), spingalett_model_run() and spingalett_model_evaluate() give for
+   the samples of Spingalett.RuntimeData.h: NAME.st, NAME.omp, NAME.run and NAME.eval, raw floats. The
+   runtime must give the same bits (Spingalett.RuntimeTests.c). DIR/models.txt lists the names and the
+   samples of each. */
+static int export_runtime_models(const char *dir) {
+    static const char *pnames[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
+    char path[1024];
+    snprintf(path, sizeof path, "%s/models.txt", dir);
+    FILE *list = fopen(path, "w");
+    if (!list) return 1;
+    int rc = 0, written = 0;
+    const char *base;
+    NeuralNetwork *net;
+    for (int k = 0; (net = runtime_net(k, &base)); k++) {
+        const uint32_t count = 300, in = net->topology[0], out = net->topology[net->layers - 1];
+        float *x = malloc((size_t)count * in * sizeof(float)), *t = malloc((size_t)count * out * sizeof(float));
+        float *y = malloc((size_t)count * out * sizeof(float));
+        runtime_inputs(x, (size_t)count * in);
+        runtime_targets(t, count, out);
+        for (int p = 0; p <= PRECISION_COUNT; p++) {
+            /* PRECISION_COUNT: the FLOAT32 network with its (zero) optimizer state, as training saves it */
+            const bool state = p == PRECISION_COUNT;
+            if (state && k != 0) continue;
+            char name[128];
+            snprintf(name, sizeof name, "%s_%s%s", base, pnames[state ? 0 : p], state ? "_state" : "");
+            snprintf(path, sizeof path, "%s/%s.slett", dir, name);
+            SpingalettModel *m = NULL;
+            if (save_spingalett(.net = net, .filename = path, .precision = state ? PRECISION_FLOAT32 : (PrecisionMode)p,
+                                .do_not_save_optimizer = !state))
+                m = spingalett_model_load(path);
+            if (!m) { rc = 1; continue; }
+            bool ok = true;
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            ok = ok && spingalett_model_predict(m, x, count, y) && write_floats(dir, name, "st", y, (size_t)count * out);
+            spingalett_set_compute_mode(COMPUTE_OPENMP);
+            ok = ok && spingalett_model_predict(m, x, count, y) && write_floats(dir, name, "omp", y, (size_t)count * out);
+            for (uint32_t s = 0; s < count && ok; s++)
+                ok = spingalett_model_run(m, x + (size_t)s * in, y + (size_t)s * out, NULL) == SPINGALETT_OK;
+            ok = ok && write_floats(dir, name, "run", y, (size_t)count * out);
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            EvalMetrics e = spingalett_model_evaluate(m, x, t, count);
+            float metrics[2] = {e.loss, e.accuracy};
+            ok = ok && write_floats(dir, name, "eval", metrics, 2);
+            if (ok) fprintf(list, "%s %u\n", name, count), written++;
+            else rc = 1;
+            spingalett_model_free(m);
+        }
+        free(x); free(t); free(y);
+        free_network(net);
+    }
+    if (fclose(list) != 0) rc = 1;
+    printf("export-models: %d models in %s\n", written, dir);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "export-headers")) {
         spingalett_set_verbose(false);
         return export_test_headers(argv[2]);
+    }
+    if (argc > 2 && !strcmp(argv[1], "export-models")) {
+        spingalett_set_verbose(false);
+        spingalett_set_num_threads(4);
+        spingalett_seed(1);
+        return export_runtime_models(argv[2]);
     }
     const char *only = argc > 1 ? argv[1] : "";
     spingalett_set_verbose(false);

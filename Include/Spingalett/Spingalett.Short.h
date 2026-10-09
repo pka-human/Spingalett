@@ -9,7 +9,8 @@
  * so on, so that programs written for them keep compiling: include this header in place of
  * Spingalett.h, or define SPINGALETT_SHORT_NAMES before including that. The engine's names
  * (ActivationFunction, ACT_*, LOSS_*, LAYER_*, UPSAMPLE_*, PRECISION_*) come with
- * Spingalett.Inference.h when SPINGALETT_SHORT_NAMES is defined. They are macros and typedefs in the
+ * Spingalett.Inference.h, and the runtime's (LogLevel, LogCallback, ComputeMode, EvalMetrics, LOG_*,
+ * COMPUTE_*) with Spingalett.Runtime.h, when SPINGALETT_SHORT_NAMES is defined. They are macros and typedefs in the
  * global namespace (LOG_DEBUG is also <syslog.h>'s, and a function of the program named train() or
  * layer() would be replaced), which is why Spingalett.h leaves them out unless asked.
  */
@@ -19,21 +20,18 @@
 #define SPINGALETT_SHORT_NAMES
 #endif
 #include "Spingalett.h"
-#include "Spingalett.Inference.h"   /* its short names, when it was included before this header */
+#include "Spingalett.Runtime.h"     /* their short names, when they were included before this header */
+#include "Spingalett.Inference.h"
 
 /* types */
 typedef SpingalettNetwork NeuralNetwork;
-typedef SpingalettLogLevel LogLevel;
-typedef SpingalettLogCallback LogCallback;
 typedef SpingalettWeightInitialization WeightInitialization;
 typedef SpingalettTrainingMode TrainingMode;
 typedef SpingalettTrainingStrategy TrainingStrategy;
 typedef SpingalettOptimizerType OptimizerType;
-typedef SpingalettComputeMode ComputeMode;
 typedef SpingalettAutoSaveMode AutoSaveMode;
 typedef SpingalettParameterKind ParameterKind;
 typedef SpingalettMonitorMetric MonitorMetric;
-typedef SpingalettEvalMetrics EvalMetrics;
 typedef SpingalettTrainProgress TrainProgress;
 typedef SpingalettTrainCallback TrainCallback;
 typedef SpingalettTrainStatus TrainStatus;
@@ -54,11 +52,6 @@ typedef SpingalettDatasetSaveOptions DatasetSaveOptions;
 typedef SpingalettDatasetReaderOptions DatasetReaderOptions;
 
 /* constants */
-#define LOG_DEBUG SPINGALETT_LOG_DEBUG
-#define LOG_INFO SPINGALETT_LOG_INFO
-#define LOG_WARNING SPINGALETT_LOG_WARNING
-#define LOG_ERROR SPINGALETT_LOG_ERROR
-#define LOG_NONE SPINGALETT_LOG_NONE
 #define WEIGHT_INITIALIZATION_RANDOM SPINGALETT_INIT_RANDOM
 #define WEIGHT_INITIALIZATION_XAVIER SPINGALETT_INIT_XAVIER
 #define WEIGHT_INITIALIZATION_HE SPINGALETT_INIT_HE
@@ -78,12 +71,6 @@ typedef SpingalettDatasetReaderOptions DatasetReaderOptions;
 #define OPTIMIZER_ADAM SPINGALETT_OPTIMIZER_ADAM
 #define OPTIMIZER_ADAMW SPINGALETT_OPTIMIZER_ADAMW
 #define OPTIMIZER_COUNT SPINGALETT_OPTIMIZER_COUNT
-#define COMPUTE_SINGLE_THREADED SPINGALETT_COMPUTE_SINGLE_THREADED
-#define COMPUTE_OPENMP SPINGALETT_COMPUTE_OPENMP
-#define COMPUTE_OPENBLAS SPINGALETT_COMPUTE_OPENBLAS
-#define COMPUTE_CUDA SPINGALETT_COMPUTE_CUDA
-#define COMPUTE_VULKAN SPINGALETT_COMPUTE_VULKAN
-#define COMPUTE_COUNT SPINGALETT_COMPUTE_COUNT
 #define AUTOSAVE_OFF SPINGALETT_AUTOSAVE_OFF
 #define AUTOSAVE_OVERWRITE SPINGALETT_AUTOSAVE_OVERWRITE
 #define AUTOSAVE_NEW_FILES SPINGALETT_AUTOSAVE_NEW_FILES

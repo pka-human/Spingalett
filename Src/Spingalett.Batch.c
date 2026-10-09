@@ -422,17 +422,6 @@ bool spingalett_predict_args(PredictArgs args) {
     return true;
 }
 
-bool spingalett_sample_correct(const float *out, const float *target, uint32_t n) {
-    if (n == 1)
-        return (out[0] >= 0.5f) == (target[0] >= 0.5f);
-    uint32_t best_out = 0, best_target = 0;
-    for (uint32_t k = 1; k < n; k++) {
-        if (out[k] > out[best_out]) best_out = k;
-        if (target[k] > target[best_target]) best_target = k;
-    }
-    return best_out == best_target;
-}
-
 void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
                                const float *inputs, const float *targets, uint32_t n, ComputeMode mode,
                                double *loss_sum, uint32_t *correct) {

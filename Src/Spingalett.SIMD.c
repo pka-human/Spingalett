@@ -171,7 +171,7 @@ void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act) 
 #endif
 
     for (; i < total; i++)
-        data[i] = activate(data[i], act);
+        data[i] = spingalett_activate_value(data[i], act);
 }
 
 void spingalett_epilogue_bias_activation(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols,
@@ -577,6 +577,17 @@ float compute_sample_loss(const float *output, const float *target,
     }
 
     return loss;
+}
+
+bool spingalett_sample_correct(const float *out, const float *target, uint32_t n) {
+    if (n == 1)
+        return (out[0] >= 0.5f) == (target[0] >= 0.5f);
+    uint32_t best_out = 0, best_target = 0;
+    for (uint32_t k = 1; k < n; k++) {
+        if (out[k] > out[best_out]) best_out = k;
+        if (target[k] > target[best_target]) best_target = k;
+    }
+    return best_out == best_target;
 }
 
 void spingalett_fp16_encode(const float *restrict src, size_t n, uint16_t *restrict dst) {

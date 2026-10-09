@@ -19,7 +19,9 @@
 #endif
 
 static _Atomic ComputeMode s_compute_mode = COMPUTE_SINGLE_THREADED;
+#if !defined(SPINGALETT_RUNTIME)
 static _Atomic PrecisionMode s_gpu_precision = PRECISION_FLOAT32;
+#endif
 static _Atomic unsigned s_num_threads = 0;
 
 static _Atomic LogLevel s_log_level = LOG_INFO;
@@ -164,6 +166,9 @@ ComputeMode resolve_compute_mode(void) {
     }
 }
 
+/* The GPU: the full library's (the runtime computes on the CPU, and COMPUTE_VULKAN gives its models the
+   CPU's threads, as in the full library). */
+#if !defined(SPINGALETT_RUNTIME)
 bool spingalett_use_gpu(void) {
     if (spingalett_get_compute_mode() != COMPUTE_VULKAN) return false;
     if (spingalett_gpu_available()) return true;
@@ -191,3 +196,4 @@ bool spingalett_set_gpu_precision(PrecisionMode precision) {
 PrecisionMode spingalett_get_gpu_precision(void) {
     return atomic_load(&s_gpu_precision);
 }
+#endif

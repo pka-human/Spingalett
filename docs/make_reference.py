@@ -13,6 +13,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEADERS = [
     ('Spingalett.h', 'The library: networks, training, inference, files, data sets, the GPU'),
+    ('Spingalett.Runtime.h', 'The runtime: deployment models, errors and settings, without training (libspingalett-runtime)'),
     ('Spingalett.Inference.h', 'The inference engine: models over .slett images, without heap or I/O'),
 ]
 OUT = os.path.join(ROOT, 'docs', 'Reference.md')

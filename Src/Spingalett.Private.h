@@ -14,6 +14,14 @@
 #include "Spingalett.Network.h"
 #include <stdint.h>
 
+/* The runtime library (cmake/Runtime.cmake) is built from part of the sources with SPINGALETT_RUNTIME
+   defined: deployment models on the CPU, without the GPU backend or OpenBLAS, even in a build tree
+   whose Spingalett.Config.h has them for the full library. */
+#if defined(SPINGALETT_RUNTIME)
+#undef SPINGALETT_HAS_VULKAN
+#undef SPINGALETT_HAS_OPENBLAS
+#endif
+
 #if defined(SPINGALETT_HAS_OPENBLAS)
 #include <cblas.h>
 #endif
@@ -308,9 +316,6 @@ void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
 
-/* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
-   spingalett_aligned_free). NULL on error, with the error set. */
-void *spingalett_read_file(const char *path, size_t *size);
 /* ------------------------------------------------------------------------- importers (Import.c) */
 
 /* A file's bytes: mapped read-only where the platform allows, read into memory otherwise. */
@@ -349,12 +354,31 @@ void spingalett_import_dense(float *dst, const uint8_t *src, int dtype, uint32_t
 char **spingalett_copy_names(const char *const *names, uint32_t count);
 /* load_spingalett_from_memory that also reports the precision of the first weight layer. */
 NeuralNetwork *spingalett_load_from_memory_ex(const void *data, size_t size, PrecisionMode *precision);
-/* Whether a sample counts as correctly classified (see EvalMetrics). */
-bool spingalett_sample_correct(const float *output, const float *target, uint32_t n);
-
 void *spingalett_aligned_alloc(size_t size);
 void *spingalett_aligned_calloc(size_t count, size_t elem_size);
 void  spingalett_aligned_free(void *ptr);
+/* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
+   spingalett_aligned_free). NULL on error, with the error set. */
+void *spingalett_read_file(const char *path, size_t *size);
+
+/* One value through an activation (softmax, which needs the whole vector, leaves it as it is):
+   spingalett_activate(), inline for the kernels' tails. */
+static inline float spingalett_activate_value(float x, ActivationFunction act) {
+    switch (act) {
+        case ACT_RELU:
+            return x > 0.0f ? x : 0.0f;
+        case ACT_LEAKY_RELU:
+            return x > 0.0f ? x : 0.01f * x;
+        case ACT_SIGMOID:
+            return 1.0f / (1.0f + expf(-x));
+        case ACT_TANH:
+            return tanhf(x);
+        case ACT_FOO52:
+            return x > 1.0f ? 1.0f + 0.01f * (x - 1.0f) : (x < 0.0f ? 0.01f * x : x);
+        default:
+            return x;
+    }
+}
 
 void apply_softmax(float *layer, uint32_t size);
 void apply_activation_batch(float *data, uint32_t size, ActivationFunction act);
@@ -628,6 +652,8 @@ void spingalett_fp_flush_denormals_end(void);
 float compute_sample_loss(const float *output, const float *target,
                           uint32_t output_size, LossFunction loss_func,
                           ActivationFunction output_act);
+/* Whether a sample counts as correctly classified (see EvalMetrics). */
+bool spingalett_sample_correct(const float *output, const float *target, uint32_t n);
 
 extern const char * const act_func_names[];
 extern const char * const loss_func_names[];

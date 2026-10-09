@@ -27,36 +27,29 @@ if(SPINGALETT_INFERENCE_ONLY)
 endif()
 
 # ------------------------------------------------------------------------------
-# Feature flags (populated below, used for config header)
+# The libraries: the full one, and the runtime next to it or alone (cmake/Runtime.cmake)
 # ------------------------------------------------------------------------------
+option(SPINGALETT_RUNTIME "Build the runtime library (deployment models, without training) next to the library" ON)
+option(SPINGALETT_RUNTIME_ONLY "Build only the runtime library: deployment models on the CPU, no training, importers or GPU backend" OFF)
+
+# Feature flags (populated below, used for config header)
 set(SPINGALETT_HAS_OPENMP OFF)
 set(SPINGALETT_HAS_OPENBLAS OFF)
 set(SPINGALETT_HAS_CUDA OFF)
+set(SPINGALETT_HAS_VULKAN OFF)
 
-# ------------------------------------------------------------------------------
-# Library sources
-# ------------------------------------------------------------------------------
-file(GLOB SPINGALETT_SOURCES "Src/*.c")
+# How both libraries are compiled and linked (flags, OpenMP, the kernels chosen at run time):
+# spingalett_build, which each links privately, so that the runtime computes what the library does.
+add_library(spingalett_build INTERFACE)
+target_include_directories(spingalett_build INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/Src)
+target_compile_definitions(spingalett_build INTERFACE SPINGALETT_EXPORTS)
 
-add_library(spingalett SHARED ${SPINGALETT_SOURCES})
-add_library(Spingalett::spingalett ALIAS spingalett)
-
-target_include_directories(spingalett
-    PRIVATE Src
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Include>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/Spingalett>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-
-target_compile_definitions(spingalett PRIVATE SPINGALETT_EXPORTS)
-
-# Background threads (the data set reader decodes ahead): POSIX threads, or Win32 on Windows
+# Background threads (the data set reader decodes ahead; models lock while preparing their weights):
+# POSIX threads, or Win32 on Windows
 if(NOT WIN32)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
-    target_link_libraries(spingalett PRIVATE Threads::Threads)
+    target_link_libraries(spingalett_build INTERFACE Threads::Threads)
 endif()
 
 # ------------------------------------------------------------------------------
@@ -67,7 +60,7 @@ option(BUILD_WITH_OPENMP "Enable OpenMP" OFF)
 if(BUILD_WITH_OPENMP)
     find_package(OpenMP QUIET)
     if(OpenMP_C_FOUND)
-        target_link_libraries(spingalett PRIVATE OpenMP::OpenMP_C)
+        target_link_libraries(spingalett_build INTERFACE OpenMP::OpenMP_C)
         set(SPINGALETT_HAS_OPENMP ON)
         message(STATUS "Spingalett: OpenMP enabled (FindOpenMP)")
     else()
@@ -77,8 +70,8 @@ if(BUILD_WITH_OPENMP)
                 include(CheckCCompilerFlag)
                 check_c_compiler_flag("-fopenmp" HAVE_FOPENMP)
                 if(HAVE_FOPENMP)
-                    target_compile_options(spingalett PRIVATE -fopenmp)
-                    target_link_libraries(spingalett PRIVATE -fopenmp)
+                    target_compile_options(spingalett_build INTERFACE -fopenmp)
+                    target_link_libraries(spingalett_build INTERFACE -fopenmp)
                     set(SPINGALETT_HAS_OPENMP ON)
                     message(STATUS "Spingalett: OpenMP enabled (Clang fallback)")
                 endif()
@@ -92,6 +85,248 @@ if(BUILD_WITH_OPENMP)
 else()
     message(STATUS "Spingalett: OpenMP disabled by option")
 endif()
+
+# ------------------------------------------------------------------------------
+# Compiler flags
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Compiler flags
+# ------------------------------------------------------------------------------
+include(CheckCCompilerFlag)
+
+# -march=native tunes the library for the build machine. Turn it off for binaries that must run
+# elsewhere and pick a baseline through CMAKE_C_FLAGS instead (e.g. -march=x86-64-v3 for AVX2).
+option(SPINGALETT_NATIVE_ARCH "Optimize for the build machine (-march=native)" ON)
+
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(spingalett_build INTERFACE
+        -Wall -Wextra -Wpedantic
+        -Wno-missing-field-initializers
+    )
+
+    if(NOT WIN32)
+        target_compile_options(spingalett_build INTERFACE -fvisibility=hidden)
+    endif()
+
+    target_compile_options(spingalett_build INTERFACE
+        $<$<CONFIG:Release>:
+            -O3
+            -fno-math-errno
+            -fno-signed-zeros
+            -fno-trapping-math
+            -fassociative-math
+            -freciprocal-math
+            -funroll-loops
+            -fomit-frame-pointer
+            -fno-plt
+            -fno-stack-protector
+            -ffunction-sections
+            -fdata-sections
+            -ftree-vectorize
+        >
+        $<$<CONFIG:RelWithDebInfo>:
+            -O2
+            -fno-math-errno
+            -fno-signed-zeros
+            -fno-trapping-math
+            -fassociative-math
+            -freciprocal-math
+            -funroll-loops
+            -ffunction-sections
+            -fdata-sections
+            -ftree-vectorize
+        >
+        $<$<CONFIG:Debug>:
+            -O0 -g3
+        >
+    )
+
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU")
+        target_compile_options(spingalett_build INTERFACE
+            $<$<NOT:$<CONFIG:Debug>>:
+                -fno-semantic-interposition
+                -fprefetch-loop-arrays
+            >
+        )
+    endif()
+
+    if(SPINGALETT_NATIVE_ARCH AND NOT WIN32)
+        target_compile_options(spingalett_build INTERFACE
+            $<$<NOT:$<CONFIG:Debug>>:-march=native -mtune=native>
+        )
+    endif()
+
+    if(APPLE)                                   # ld64: no --gc-sections or -s
+        target_link_options(spingalett_build INTERFACE
+            $<$<CONFIG:Release>:-Wl,-dead_strip -Wl,-x>
+            $<$<CONFIG:RelWithDebInfo>:-Wl,-dead_strip>
+        )
+    elseif(NOT WIN32)
+        target_link_options(spingalett_build INTERFACE
+            $<$<CONFIG:Release>:-s -Wl,--gc-sections>
+            $<$<CONFIG:RelWithDebInfo>:-Wl,--gc-sections>
+        )
+    endif()
+
+elseif(MSVC)
+    target_compile_options(spingalett_build INTERFACE /W4)
+    target_compile_options(spingalett_build INTERFACE
+        $<$<CONFIG:Release>:/O2 /Oi /GL /fp:fast>
+        $<$<CONFIG:RelWithDebInfo>:/O2 /Oi>
+        $<$<CONFIG:Debug>:/Od /Zi>
+    )
+    target_link_options(spingalett_build INTERFACE
+        $<$<CONFIG:Release>:/LTCG>
+    )
+
+    check_c_compiler_flag("/arch:AVX2" MSVC_HAS_AVX2)
+    if(MSVC_HAS_AVX2)
+        target_compile_options(spingalett_build INTERFACE
+            $<$<NOT:$<CONFIG:Debug>>:/arch:AVX2>
+        )
+        message(STATUS "Spingalett: MSVC AVX2+FMA enabled")
+    else()
+        check_c_compiler_flag("/arch:AVX" MSVC_HAS_AVX)
+        if(MSVC_HAS_AVX)
+            target_compile_options(spingalett_build INTERFACE
+                $<$<NOT:$<CONFIG:Debug>>:/arch:AVX>
+            )
+            message(STATUS "Spingalett: MSVC AVX enabled")
+        endif()
+    endif()
+endif()
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(spingalett_build INTERFACE m)
+endif()
+
+# x86-64 binaries that are not tuned for the build machine (release packages, MinGW) also carry
+# GEMM and convolution kernels for AVX2 and AVX-512 (Src/Spingalett.GEMM.c, Src/Spingalett.ConvGEMM.c)
+# and batched INT8 kernels for AVX-512
+# VNNI and AVX-VNNI (Src/Spingalett.Int8Tiles.c), and pick them at run time; AArch64 Linux ones
+# carry INT8 kernels for the dot product instructions.
+option(SPINGALETT_CPU_DISPATCH "Choose AVX2, AVX-512, VNNI and ARM dot product kernels at run time on builds without -march=native" ON)
+set(_spg_native_flags OFF)
+if(SPINGALETT_NATIVE_ARCH AND NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(_spg_native_flags ON)
+endif()
+if(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    set(SPINGALETT_GEMM_VARIANTS
+        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX2.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX512.c)
+    target_sources(spingalett_build INTERFACE ${SPINGALETT_GEMM_VARIANTS}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.ConvGEMM.AVX2.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.ConvGEMM.AVX512.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVX512.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c)
+    target_compile_definitions(spingalett_build INTERFACE SPINGALETT_GEMM_DISPATCH SPINGALETT_INT8_DISPATCH)
+    # -fno-lto: link-time optimization must not move code between instruction sets
+    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX2.c Src/Kernels/Spingalett.ConvGEMM.AVX2.c
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-fno-lto")
+    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX512.c Src/Kernels/Spingalett.ConvGEMM.AVX512.c
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mfma;-fno-lto")
+    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVX512.c
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vnni;-mavx2;-mfma;-fno-lto")
+    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavxvnni;-fno-lto")
+    message(STATUS "Spingalett: GEMM kernels for AVX2 and AVX-512, INT8 kernels for AVX-512 VNNI and AVX-VNNI, chosen at run time")
+elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+       AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # AArch64 Linux: batched INT8 kernels for the dot product instructions (ARMv8.2), where present
+    target_sources(spingalett_build INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.DotProd.c)
+    target_compile_definitions(spingalett_build INTERFACE SPINGALETT_INT8_DISPATCH)
+    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.DotProd.c
+        PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod;-fno-lto")
+    message(STATUS "Spingalett: INT8 kernels for the ARM dot product instructions chosen at run time")
+endif()
+
+# The inference engine and batched model inference compute in IEEE order (no reassociation,
+# reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
+    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c
+        PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
+endif()
+
+if(NOT MSVC)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT ipo_result)
+endif()
+
+# Before 1.0 a minor release may break the ABI, so the soname carries major.minor (.so.0.4).
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+else()
+    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR})
+endif()
+
+# A shared library of the project: compiled as spingalett_build says, its public headers in Include/
+# and the build tree (Spingalett.Config.h), its exported functions given the symbol versions of `map`
+# on ELF platforms, link-time optimization where the compiler has it, and the soname of the major
+# version.
+function(spingalett_library target map)
+    target_link_libraries(${target} PRIVATE spingalett_build)
+    target_include_directories(${target} PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/Include>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/Spingalett>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND UNIX AND NOT APPLE)
+        target_link_options(${target} PRIVATE -Wl,--version-script=${map})
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${map})
+    endif()
+    if(ipo_result)
+        set_target_properties(${target} PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
+            INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+    endif()
+    set_target_properties(${target} PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${SPINGALETT_SOVERSION})
+    # macOS packages carry their OpenMP runtime (@rpath/libomp.dylib) next to the library
+    if(APPLE)
+        set_target_properties(${target} PROPERTIES INSTALL_RPATH "@loader_path")
+    endif()
+endfunction()
+
+# Spingalett.Config.h: the version and what the build has (written once the full library's backends
+# are known, or for the runtime alone).
+function(spingalett_write_config)
+    configure_file(${PROJECT_SOURCE_DIR}/Include/Spingalett/Spingalett.Config.h.in
+                   ${PROJECT_BINARY_DIR}/Spingalett/Spingalett.Config.h @ONLY)
+endfunction()
+
+# ------------------------------------------------------------------------------
+# The runtime (deployment models without training), next to the library or alone
+# ------------------------------------------------------------------------------
+include(cmake/Package.cmake)
+include(cmake/Runtime.cmake)
+if(SPINGALETT_RUNTIME OR SPINGALETT_RUNTIME_ONLY)
+    spingalett_runtime_library()
+endif()
+if(SPINGALETT_RUNTIME_ONLY)
+    spingalett_write_config()
+    option(BUILD_EXAMPLE "Build examples" ON)
+    option(BUILD_TESTS "Build the test suite" ON)
+    if(BUILD_EXAMPLE)
+        spingalett_runtime_examples()
+    endif()
+    if(BUILD_TESTS)
+        enable_testing()
+        spingalett_runtime_tests("")
+    endif()
+    spingalett_runtime_install(ON)
+    spingalett_install_package()
+    return()
+endif()
+
+# ------------------------------------------------------------------------------
+# The library
+# ------------------------------------------------------------------------------
+file(GLOB SPINGALETT_SOURCES "Src/*.c")
+
+add_library(spingalett SHARED ${SPINGALETT_SOURCES})
+add_library(Spingalett::spingalett ALIAS spingalett)
+spingalett_library(spingalett ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.map)
 
 # ------------------------------------------------------------------------------
 # OpenBLAS
@@ -153,202 +388,7 @@ endif()
 # ------------------------------------------------------------------------------
 include(cmake/Vulkan.cmake)
 
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Config.h.in
-    ${CMAKE_CURRENT_BINARY_DIR}/Spingalett/Spingalett.Config.h
-    @ONLY
-)
-
-# ------------------------------------------------------------------------------
-# Compiler flags
-# ------------------------------------------------------------------------------
-include(CheckCCompilerFlag)
-
-# -march=native tunes the library for the build machine. Turn it off for binaries that must run
-# elsewhere and pick a baseline through CMAKE_C_FLAGS instead (e.g. -march=x86-64-v3 for AVX2).
-option(SPINGALETT_NATIVE_ARCH "Optimize for the build machine (-march=native)" ON)
-
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(spingalett PRIVATE
-        -Wall -Wextra -Wpedantic
-        -Wno-missing-field-initializers
-    )
-
-    if(NOT WIN32)
-        target_compile_options(spingalett PRIVATE -fvisibility=hidden)
-    endif()
-    # ELF: the exported functions carry the symbol versions of Src/Spingalett.map
-    if(UNIX AND NOT APPLE)
-        target_link_options(spingalett PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.map)
-        set_property(TARGET spingalett APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.map)
-    endif()
-
-    target_compile_options(spingalett PRIVATE
-        $<$<CONFIG:Release>:
-            -O3
-            -fno-math-errno
-            -fno-signed-zeros
-            -fno-trapping-math
-            -fassociative-math
-            -freciprocal-math
-            -funroll-loops
-            -fomit-frame-pointer
-            -fno-plt
-            -fno-stack-protector
-            -ffunction-sections
-            -fdata-sections
-            -ftree-vectorize
-        >
-        $<$<CONFIG:RelWithDebInfo>:
-            -O2
-            -fno-math-errno
-            -fno-signed-zeros
-            -fno-trapping-math
-            -fassociative-math
-            -freciprocal-math
-            -funroll-loops
-            -ffunction-sections
-            -fdata-sections
-            -ftree-vectorize
-        >
-        $<$<CONFIG:Debug>:
-            -O0 -g3
-        >
-    )
-
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU")
-        target_compile_options(spingalett PRIVATE
-            $<$<NOT:$<CONFIG:Debug>>:
-                -fno-semantic-interposition
-                -fprefetch-loop-arrays
-            >
-        )
-    endif()
-
-    if(SPINGALETT_NATIVE_ARCH AND NOT WIN32)
-        target_compile_options(spingalett PRIVATE
-            $<$<NOT:$<CONFIG:Debug>>:-march=native -mtune=native>
-        )
-    endif()
-
-    if(APPLE)                                   # ld64: no --gc-sections or -s
-        target_link_options(spingalett PRIVATE
-            $<$<CONFIG:Release>:-Wl,-dead_strip -Wl,-x>
-            $<$<CONFIG:RelWithDebInfo>:-Wl,-dead_strip>
-        )
-    elseif(NOT WIN32)
-        target_link_options(spingalett PRIVATE
-            $<$<CONFIG:Release>:-s -Wl,--gc-sections>
-            $<$<CONFIG:RelWithDebInfo>:-Wl,--gc-sections>
-        )
-    endif()
-
-elseif(MSVC)
-    target_compile_options(spingalett PRIVATE /W4)
-    target_compile_options(spingalett PRIVATE
-        $<$<CONFIG:Release>:/O2 /Oi /GL /fp:fast>
-        $<$<CONFIG:RelWithDebInfo>:/O2 /Oi>
-        $<$<CONFIG:Debug>:/Od /Zi>
-    )
-    target_link_options(spingalett PRIVATE
-        $<$<CONFIG:Release>:/LTCG>
-    )
-
-    check_c_compiler_flag("/arch:AVX2" MSVC_HAS_AVX2)
-    if(MSVC_HAS_AVX2)
-        target_compile_options(spingalett PRIVATE
-            $<$<NOT:$<CONFIG:Debug>>:/arch:AVX2>
-        )
-        message(STATUS "Spingalett: MSVC AVX2+FMA enabled")
-    else()
-        check_c_compiler_flag("/arch:AVX" MSVC_HAS_AVX)
-        if(MSVC_HAS_AVX)
-            target_compile_options(spingalett PRIVATE
-                $<$<NOT:$<CONFIG:Debug>>:/arch:AVX>
-            )
-            message(STATUS "Spingalett: MSVC AVX enabled")
-        endif()
-    endif()
-endif()
-
-if(UNIX AND NOT APPLE)
-    target_link_libraries(spingalett PRIVATE m)
-endif()
-
-# x86-64 binaries that are not tuned for the build machine (release packages, MinGW) also carry
-# GEMM and convolution kernels for AVX2 and AVX-512 (Src/Spingalett.GEMM.c, Src/Spingalett.ConvGEMM.c)
-# and batched INT8 kernels for AVX-512
-# VNNI and AVX-VNNI (Src/Spingalett.Int8Tiles.c), and pick them at run time; AArch64 Linux ones
-# carry INT8 kernels for the dot product instructions.
-option(SPINGALETT_CPU_DISPATCH "Choose AVX2, AVX-512, VNNI and ARM dot product kernels at run time on builds without -march=native" ON)
-set(_spg_native_flags OFF)
-if(SPINGALETT_NATIVE_ARCH AND NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    set(_spg_native_flags ON)
-endif()
-if(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
-   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
-    set(SPINGALETT_GEMM_VARIANTS
-        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX2.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.GEMM.AVX512.c)
-    target_sources(spingalett PRIVATE ${SPINGALETT_GEMM_VARIANTS}
-                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.ConvGEMM.AVX2.c
-                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.ConvGEMM.AVX512.c
-                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVX512.c
-                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c)
-    target_compile_definitions(spingalett PRIVATE SPINGALETT_GEMM_DISPATCH SPINGALETT_INT8_DISPATCH)
-    # -fno-lto: link-time optimization must not move code between instruction sets
-    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX2.c Src/Kernels/Spingalett.ConvGEMM.AVX2.c
-        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-fno-lto")
-    set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX512.c Src/Kernels/Spingalett.ConvGEMM.AVX512.c
-        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mfma;-fno-lto")
-    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVX512.c
-        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vnni;-mavx2;-mfma;-fno-lto")
-    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c
-        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavxvnni;-fno-lto")
-    message(STATUS "Spingalett: GEMM kernels for AVX2 and AVX-512, INT8 kernels for AVX-512 VNNI and AVX-VNNI, chosen at run time")
-elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
-       AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # AArch64 Linux: batched INT8 kernels for the dot product instructions (ARMv8.2), where present
-    target_sources(spingalett PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.DotProd.c)
-    target_compile_definitions(spingalett PRIVATE SPINGALETT_INT8_DISPATCH)
-    set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.DotProd.c
-        PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod;-fno-lto")
-    message(STATUS "Spingalett: INT8 kernels for the ARM dot product instructions chosen at run time")
-endif()
-
-# The inference engine and batched model inference compute in IEEE order (no reassociation,
-# reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
-    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c
-        PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
-endif()
-
-if(NOT MSVC)
-    include(CheckIPOSupported)
-    check_ipo_supported(RESULT ipo_result)
-    if(ipo_result)
-        set_target_properties(spingalett PROPERTIES
-            INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
-            INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE
-        )
-    endif()
-endif()
-
-# Before 1.0 a minor release may break the ABI, so the soname carries major.minor (.so.0.4).
-if(PROJECT_VERSION_MAJOR EQUAL 0)
-    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
-else()
-    set(SPINGALETT_SOVERSION ${PROJECT_VERSION_MAJOR})
-endif()
-set_target_properties(spingalett PROPERTIES
-    VERSION ${PROJECT_VERSION}
-    SOVERSION ${SPINGALETT_SOVERSION}
-)
-# macOS packages carry their OpenMP runtime (@rpath/libomp.dylib) next to the library
-if(APPLE)
-    set_target_properties(spingalett PROPERTIES INSTALL_RPATH "@loader_path")
-endif()
+spingalett_write_config()
 
 # ------------------------------------------------------------------------------
 # Examples
@@ -383,6 +423,9 @@ if(BUILD_EXAMPLE)
         endif()
         install(TARGETS ${SPINGALETT_TOOL} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     endforeach()
+    if(TARGET spingalett_runtime)
+        spingalett_runtime_examples()
+    endif()
 endif()
 
 # ------------------------------------------------------------------------------
@@ -489,6 +532,7 @@ if(BUILD_TESTS)
     # exported functions those of Src/Spingalett.map (Tests/check_abi.py).
     if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
         set(abi_headers ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.h
+                        ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Runtime.h
                         ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Inference.h)
         add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/abi_dump.c
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/check_abi.py source
@@ -561,6 +605,11 @@ if(BUILD_TESTS)
         set_tests_properties(gpu.kernels PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # The runtime on its own, against the models and results of the full library.
+    if(TARGET spingalett_runtime)
+        spingalett_runtime_tests(SpingalettTests)
+    endif()
+
     # The inference engine on its own, also running models exported as C headers.
     include(cmake/SpingalettEngine.cmake)
     spingalett_engine_library(SpingalettEngine)
@@ -593,10 +642,8 @@ if(BUILD_TESTS)
 endif()
 
 # ------------------------------------------------------------------------------
-# Install (headers, library and a CMake package: find_package(Spingalett))
+# Install (headers, the libraries, a CMake package: find_package(Spingalett), pkg-config files)
 # ------------------------------------------------------------------------------
-include(CMakePackageConfigHelpers)
-
 install(TARGETS spingalett
     EXPORT SpingalettTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -609,40 +656,9 @@ install(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/Spingalett/Spingalett.Config.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/Spingalett
 )
-
-set(SPINGALETT_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/Spingalett)
-install(EXPORT SpingalettTargets NAMESPACE Spingalett:: DESTINATION ${SPINGALETT_CMAKE_DIR})
-configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/SpingalettConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
-    INSTALL_DESTINATION ${SPINGALETT_CMAKE_DIR}
-)
-# 1.x keeps the API and ABI of 1.0, so any 1.x of at least the version asked for will do (before 1.0 a
-# minor release could change them, and only the same major.minor was compatible).
-if(PROJECT_VERSION_MAJOR EQUAL 0)
-    set(SPINGALETT_COMPATIBILITY SameMinorVersion)
-else()
-    set(SPINGALETT_COMPATIBILITY SameMajorVersion)
+spingalett_install_pkg_config(spingalett spingalett "Spingalett"
+    "Neural networks in C: training on the CPU and on GPUs, deployment down to INT2")
+if(TARGET spingalett_runtime)
+    spingalett_runtime_install(OFF)
 endif()
-write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
-    COMPATIBILITY ${SPINGALETT_COMPATIBILITY}
-)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
-              ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
-        DESTINATION ${SPINGALETT_CMAKE_DIR})
-
-# pkg-config (spingalett.pc), relocatable: the prefix is found from the file's own directory.
-set(SPINGALETT_PC_DIR ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-cmake_path(ABSOLUTE_PATH SPINGALETT_PC_DIR BASE_DIRECTORY ${CMAKE_INSTALL_PREFIX} OUTPUT_VARIABLE pc_dir)
-file(RELATIVE_PATH SPINGALETT_PC_PREFIX ${pc_dir} ${CMAKE_INSTALL_PREFIX})
-string(REGEX REPLACE "/$" "" SPINGALETT_PC_PREFIX "${SPINGALETT_PC_PREFIX}")
-foreach(dir LIBDIR INCLUDEDIR)
-    if(IS_ABSOLUTE "${CMAKE_INSTALL_${dir}}")
-        set(SPINGALETT_PC_${dir} "${CMAKE_INSTALL_${dir}}")
-    else()
-        set(SPINGALETT_PC_${dir} "\${prefix}/${CMAKE_INSTALL_${dir}}")
-    endif()
-endforeach()
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/spingalett.pc.in ${CMAKE_CURRENT_BINARY_DIR}/spingalett.pc @ONLY)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/spingalett.pc DESTINATION ${SPINGALETT_PC_DIR})
+spingalett_install_package()
