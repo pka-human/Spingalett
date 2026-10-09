@@ -1220,6 +1220,9 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 - 0.14, the release candidate: every public name under the library's prefix, structs that can
   grow, the formats frozen, a C++ wrapper
 - 1.0: the API and ABI frozen
+- Before and after 1.0, changing no API: the GPU's gap to PyTorch in bfloat16 and on large dense
+  products closed (tile choice, activations in bfloat16, fewer passes, Winograd convolutions)
+- 1.1: a CUDA backend of its own kernels (no cuDNN), next to Vulkan
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 
 ## Contributing
