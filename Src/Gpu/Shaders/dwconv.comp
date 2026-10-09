@@ -29,8 +29,11 @@
  *
  * PRO: x is the input of a batch normalization the convolution reads (APPLY, WEIGHTS; e0 of a SPREAD's
  * DERIV, the normalization's input for its output), applied as it is read: act(x a[c] + b[c]) with the
- * coefficients of bn.comp at bn (a) and bn + in_c (b), so that the normalization's outputs are never
- * stored (VEC 4 only).
+ * coefficients of bn.comp (bn: mean, 1 / std, a, b), so that the normalization's outputs are never
+ * stored (VEC 4 only). SUMS: such a SPREAD also sums what colsum.comp's DY sums for the normalization's
+ * backward pass, the gradient it stores (dy) and dy (e0 - mean), each thread over its values in order
+ * (a thread keeps one group of four channels: 256 is a multiple of in_c / 4), then the workgroup's
+ * threads of a channel in a fixed tree: part[workgroup][2][in_c].
  */
 
 #version 460
@@ -57,11 +60,12 @@ layout(constant_id = 6) const uint SW = 1;
 layout(constant_id = 7) const uint VEC = 1;
 layout(constant_id = 8) const uint PW = 0;      /* the padding in x */
 layout(constant_id = 9) const uint PRO = 0;     /* 0, or 1 + the activation of the normalization applied to x */
-layout(constant_id = 10) const uint HALF = 0;   /* words: x 0, y 2, e0 3 (half.glsl) */
+layout(constant_id = 10) const uint SUMS = 0;
+layout(constant_id = 11) const uint HALF = 0;   /* words: x 0, y 2, e0 3 (half.glsl) */
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform Push {
-    F32 x, w, y, e0, bn;
+    F32 x, w, y, e0, bn, part;
     uint total;                     /* threads' work: values of the result (VEC 1), runs of PX pixels of
                                        four channels (VEC 4; single pixels in a SPREAD whose stride does
                                        not divide PX) */
@@ -74,8 +78,10 @@ layout(push_constant) uniform Push {
 #include "half.glsl"
 
 /* the coefficients of PRO's normalization for channels c .. c + 3, and x through it */
-vec4 norm_a(uint c) { return PRO != 0u ? F32x4(p.bn).v[c >> 2] : vec4(1.0); }
-vec4 norm_b(uint c) { return PRO != 0u ? F32x4(p.bn).v[(p.in_c + c) >> 2] : vec4(0.0); }
+vec4 norm_a(uint c) { return PRO != 0u ? F32x4(p.bn).v[(2u * p.in_c + c) >> 2] : vec4(1.0); }
+vec4 norm_b(uint c) { return PRO != 0u ? F32x4(p.bn).v[(3u * p.in_c + c) >> 2] : vec4(0.0); }
+
+vec4 dy_sum = vec4(0.0), dyx_sum = vec4(0.0);  /* SUMS: the thread's */
 vec4 normalized(vec4 v, vec4 a, vec4 b) {
     if (PRO == 0u) return v;
     const vec4 t = v * a + b;
@@ -100,8 +106,17 @@ void finish4(uint i, uint channel, vec4 v) {
     } else {
         if (p.beta != 0.0) v += p.beta * ld4(p.y, i, 2u);
         if (EPI == EPI_DERIV) {
-            const vec4 e = normalized(ld4(p.e0, i, 3u), norm_a(channel), norm_b(channel));
+            const vec4 x = ld4(p.e0, i, 3u), e = normalized(x, norm_a(channel), norm_b(channel));
             [[unroll]] for (uint k = 0u; k < 4u; k++) v[k] *= derivative(e[k], ACT);
+            if (SUMS != 0u) {
+                vec4 g = v;                                 /* the gradient as stored */
+#ifdef SPG_HALF
+                if (((HALF >> 2u) & 1u) != 0u)
+                    g = vec4(from_bf16(to_bf16(v.x)), from_bf16(to_bf16(v.y)), from_bf16(to_bf16(v.z)), from_bf16(to_bf16(v.w)));
+#endif
+                dy_sum += g;
+                dyx_sum = fma(g, x - F32x4(p.bn).v[channel >> 2], dyx_sum);
+            }
         }
     }
     st4(p.y, i, 2u, v);
@@ -176,6 +191,31 @@ void spread4(uint row, uint ix0, uint c) {
         if (ix0 + j < p.in_w) finish4((row * p.in_w + ix0 + j) * p.in_c + c, c, sum[j]);
 }
 
+shared vec4 red[256], red2[256];
+
+/* SUMS: the workgroup's sums of each channel, its threads' (lanes of in_c / 4 threads) added pairwise, 1
+   apart, then 2, 4, ... */
+void spread_sums() {
+    const uint quads = p.in_c / 4u, tid = gl_LocalInvocationID.x, lanes = 256u / quads, lane = tid / quads;
+    red[tid] = dy_sum;
+    red2[tid] = dyx_sum;
+    barrier();
+    for (uint step = 1u; step < lanes; step *= 2u) {
+        if (lane % (2u * step) == 0u && lane + step < lanes) {
+            red[tid] += red[tid + step * quads];
+            red2[tid] += red2[tid + step * quads];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        const uint base = gl_WorkGroupID.x * 2u * p.in_c + tid * 4u;
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            p.part.v[base + k] = red[tid][k];
+            p.part.v[base + p.in_c + k] = red2[tid][k];
+        }
+    }
+}
+
 /* VEC 4: APPLY over runs of PX output pixels, SPREAD over runs of PX input pixels where PX is a multiple
    of the stride (one pixel a thread otherwise) */
 void main4() {
@@ -206,9 +246,8 @@ void main4() {
             finish4(i, c, sum);
         }
     }
+    if (MODE == SPREAD && SUMS != 0u) spread_sums();
 }
-
-shared vec4 red[256];
 
 /* WEIGHTS takes runs of WRUN output pixels of a row where the taps' sums of four channels stay in registers:
    with VEC 4 and windows of up to 9 taps (in the arithmetic of specialization constants, which the

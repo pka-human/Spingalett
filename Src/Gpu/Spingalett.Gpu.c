@@ -29,6 +29,7 @@
 #define COLSUM_ROWS 1024u           /* rows per slice of colsum.comp */
 #define SUMSQ_SLICE 4096u           /* sumsq.comp */
 #define DW_RUN      4u              /* adjacent pixels a thread of dwconv.comp computes (its PX) */
+#define DW_SUMS     128u            /* workgroups, at most, of a depthwise data gradient that sums (SUMS) */
 
 /* ------------------------------------------------------------------------- the network */
 
@@ -505,6 +506,8 @@ static uint64_t part_floats(const NeuralNetwork *net, uint32_t capacity) {
         uint64_t rows = (uint64_t)capacity * s->height * s->width;
         uint64_t slices = (rows + COLSUM_ROWS - 1u) / COLSUM_ROWS;
         if (slices * 2u * s->channels > need) need = slices * 2u * s->channels;
+        if (s->type == LAYER_BATCH_NORM && 2u * DW_SUMS * s->channels > need)       /* (dw_sums()) */
+            need = 2u * DW_SUMS * s->channels;
         if (spingalett_filters(s->type) && depthwise(net, l)) {
             /* dwconv.comp's partial sums of the weight gradient, a slice of the output pixels each */
             const ConvView v = conv_view(net, l);
@@ -552,6 +555,30 @@ static const SpgGpuBuffer *outputs_of(const SpgGpuNet *g, uint32_t l) {
 static uint32_t applied_norm(const SpgGpuNet *g, uint32_t l) {
     const uint32_t src = spingalett_source(g->net, l);
     return g->pro[src] == l ? src : 0u;
+}
+
+/* The threads' work of dw_pass() in mode over n samples (vec: channels a thread): runs of DW_RUN pixels of
+   a row, of one where they do not apply. */
+static uint64_t dw_items(const SpgGpuNet *g, uint32_t l, uint32_t mode, uint32_t n, uint32_t vec) {
+    const ConvView v = conv_view(g->net, l);
+    const bool apply = mode == SPG_DW_APPLY;
+    const uint32_t rows = apply ? v.out_h : v.in_h, width = apply ? v.out_w : v.in_w, C = apply ? v.out_c : v.in_c;
+    const uint32_t run = vec == 4u && (apply || DW_RUN % g->net->shapes[l].stride_w == 0) ? DW_RUN : 1u;
+    return (uint64_t)n * rows * ((width + run - 1u) / run) * (C / vec);
+}
+
+/* The workgroups whose sums (dwconv.comp's SUMS) give normalization bn's backward pass over n samples
+   what colsum.comp would, or 0: the data gradient of the depthwise convolution that applies it (pro[]),
+   with its derivative, sums as it computes the normalization's gradient. The convolution follows the
+   normalization, so that nothing between that gradient and the normalization's backward pass uses part;
+   a thread keeps one group of four channels (256 a multiple of channels / 4). */
+static uint32_t dw_sums(const SpgGpuNet *g, uint32_t bn, uint32_t n) {
+    const NeuralNetwork *net = g->net;
+    if (!g->training || !g->pro[bn] || g->pro[bn] != bn + 1u || net->act_func[bn - 1] == ACT_NONE ||
+        256u % (net->shapes[bn].channels / 4u) != 0)
+        return 0;
+    const uint32_t wg = groups(dw_items(g, bn + 1u, SPG_DW_SPREAD, n, 4u), 256u);
+    return wg < DW_SUMS ? wg : DW_SUMS;
 }
 
 bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training) {
@@ -838,7 +865,7 @@ static const struct { uint16_t words; uint8_t id; } half_words[SPG_KERNEL_COUNT]
     [SPG_KERNEL_colsum] = {0x7, 2}, [SPG_KERNEL_bn] = {0x2, 1}, [SPG_KERNEL_eltwise] = {0x10F, 2},
     [SPG_KERNEL_pool] = {0xF, 3}, [SPG_KERNEL_combine] = {0x7, 3}, [SPG_KERNEL_upsample] = {0xF, 3},
     [SPG_KERNEL_ln] = {0x7, 3}, [SPG_KERNEL_optim] = {0x100, 1}, [SPG_KERNEL_rows] = {0x2, 2},
-    [SPG_KERNEL_dwconv] = {0xD, 10},
+    [SPG_KERNEL_dwconv] = {0xD, 11},
 };
 
 /* Records a kernel after the barrier it needs; its bfloat16 variant, told which buffers are such, when
@@ -946,23 +973,23 @@ static void dw_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t m
        row: output pixels (APPLY), or input pixels where the run is a multiple of the stride (SPREAD) */
     const uint32_t vec = v.OG == 1u && v.in_c % 4u == 0 ? 4u : 1u;
     const bool apply = mode == SPG_DW_APPLY;
-    const uint32_t rows = apply ? v.out_h : v.in_h, width = apply ? v.out_w : v.in_w, C = apply ? v.out_c : v.in_c;
-    const uint32_t run = vec == 4u && (apply || DW_RUN % s->stride_w == 0) ? DW_RUN : 1u;
     /* the normalization the convolution applies: to x of its forward pass, to e0 of its data gradient's
-       derivative */
+       derivative, which may also sum for the normalization's backward pass (over `sums` workgroups) */
     const uint32_t bn = apply || epi == SPG_EPI_DERIV ? applied_norm(g, l) : 0u;
+    const uint32_t sums = !apply && bn ? dw_sums(g, bn, n) : 0u;
     SpgDwconvPush p = {x->address, weights_at(g, l - 1), y->address, bias ? biases_at(g, l - 1) : e0,
-                       bn ? g->bn[bn].address + 8u * v.in_c : 0, n * rows * ((width + run - 1u) / run) * (C / vec),
+                       bn ? g->bn[bn].address : 0, sums ? g->part.address : 0, (uint32_t)dw_items(g, l, mode, n, vec),
                        v.in_h, v.in_w, v.in_c, v.out_h, v.out_w, v.out_c, v.OG, s->pad_h, 0, 0, 0, beta};
-    const uint32_t spec[10] = {mode, epi, act, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, vec, s->pad_w,
-                               bn ? 1u + g->net->act_func[bn - 1] : 0u};
+    const uint32_t spec[11] = {mode, epi, act, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, vec, s->pad_w,
+                               bn ? 1u + g->net->act_func[bn - 1] : 0u, sums ? 1u : 0u};
     if (bn) reads(a, span(g->bn[bn].address, 4u * v.in_c));
+    if (sums) writes(a, span(g->part.address, 2ull * sums * v.in_c));
     reads(a, whole(x));
     reads(a, weights_of(g, l - 1));
     if (bias) reads(a, biases_of(g, l - 1));
     if (beta != 0.0f) reads(a, whole(y));
     writes(a, whole(y));
-    kernel(r, a, SPG_KERNEL_dwconv, spec, 10, &p, sizeof p, groups(p.total, 256u), 1, 1);
+    kernel(r, a, SPG_KERNEL_dwconv, spec, 11, &p, sizeof p, sums ? sums : groups(p.total, 256u), 1, 1);
 }
 
 static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *x, const SpgGpuBuffer *y,
@@ -1381,17 +1408,20 @@ static void bn_backward(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t n, floa
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, cl);
     const LayerShape *s = &net->shapes[cl];
-    const uint32_t C = s->channels, R = n * s->height * s->width, slices = (R + COLSUM_ROWS - 1u) / COLSUM_ROWS;
-    uint32_t cols = C <= 16u ? 16u : C <= 32u ? 32u : 64u;
-    SpgColsumPush cp = {g->act[src].address, g->delta[cl].address, g->bn[cl].address, g->part.address, R, C,
-                        COLSUM_ROWS, 0};
-    uint32_t spec[2] = {cols, SPG_COLSUM_DY};
-    Access a = {0};
-    reads(&a, whole(&g->act[src]));
-    reads(&a, whole(&g->delta[cl]));
-    reads(&a, span(g->bn[cl].address, C));
-    writes(&a, span(g->part.address, 2ull * slices * C));
-    kernel(r, &a, SPG_KERNEL_colsum, spec, 2, &cp, sizeof cp, (C + cols - 1) / cols, slices, 1);
+    const uint32_t C = s->channels, R = n * s->height * s->width, sums = dw_sums(g, cl, n);
+    const uint32_t slices = sums ? sums : (R + COLSUM_ROWS - 1u) / COLSUM_ROWS;
+    if (!sums) {    /* (otherwise the data gradient that made delta[cl] summed) */
+        uint32_t cols = C <= 16u ? 16u : C <= 32u ? 32u : 64u;
+        SpgColsumPush cp = {g->act[src].address, g->delta[cl].address, g->bn[cl].address, g->part.address, R, C,
+                            COLSUM_ROWS, 0};
+        uint32_t spec[2] = {cols, SPG_COLSUM_DY};
+        Access a = {0};
+        reads(&a, whole(&g->act[src]));
+        reads(&a, whole(&g->delta[cl]));
+        reads(&a, span(g->bn[cl].address, C));
+        writes(&a, span(g->part.address, 2ull * slices * C));
+        kernel(r, &a, SPG_KERNEL_colsum, spec, 2, &cp, sizeof cp, (C + cols - 1) / cols, slices, 1);
+    }
     SpgBnPush bp = {
         .part = g->part.address, .gamma = weights_at(g, cl - 1), .stats = g->bn[cl].address,
         .coef = g->bn[cl].address + 16u * C, .ggamma = grad_weights_at(g, cl - 1), .gbeta = grad_biases_at(g, cl - 1),
@@ -1462,15 +1492,15 @@ static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, f
         const DwSlices d = dw_slices(&v, n);
         const uint32_t slices = d.slices;
         const uint32_t bn = transposed ? 0u : applied_norm(g, l + 1);
-        SpgDwconvPush p = {x->address, g->part.address, dy->address, 0, bn ? g->bn[bn].address + 8u * v.in_c : 0, 0,
+        SpgDwconvPush p = {x->address, g->part.address, dy->address, 0, bn ? g->bn[bn].address : 0, 0, 0,
                            v.in_h, v.in_w, v.in_c, v.out_h, v.out_w, v.out_c, v.OG, s->pad_h, d.units, d.rows, d.lanes,
                            0.0f};
-        const uint32_t spec[10] = {SPG_DW_WEIGHTS, 0, ACT_NONE, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w,
-                                   d.vec, s->pad_w, bn ? 1u + net->act_func[bn - 1] : 0u};
+        const uint32_t spec[11] = {SPG_DW_WEIGHTS, 0, ACT_NONE, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w,
+                                   d.vec, s->pad_w, bn ? 1u + net->act_func[bn - 1] : 0u, 0};
         if (bn) reads(&a, span(g->bn[bn].address, 4u * v.in_c));
         const Range part = span(g->part.address, (uint64_t)slices * v.out_c * v.taps);
         writes(&a, part);
-        kernel(r, &a, SPG_KERNEL_dwconv, spec, 10, &p, sizeof p, slices, (v.out_c / d.vec + d.per - 1u) / d.per, 1);
+        kernel(r, &a, SPG_KERNEL_dwconv, spec, 11, &p, sizeof p, slices, (v.out_c / d.vec + d.per - 1u) / d.per, 1);
         const Range grad = span(grad_weights_at(g, l), weight_count(g, l));
         SpgReducePush rp = {g->part.address, grad_weights_at(g, l), v.out_c * v.taps, v.out_c * v.taps, slices, scale,
                             beta, 0};

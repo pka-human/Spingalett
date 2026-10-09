@@ -157,7 +157,7 @@ enum { SPG_COMBINE_ADD, SPG_COMBINE_SLICE, SPG_COMBINE_GAP };
 
 /* dwconv.comp */
 typedef struct {
-    uint64_t x, w, y, e0, bn;
+    uint64_t x, w, y, e0, bn, part;
     uint32_t total, in_h, in_w, in_c, out_h, out_w, out_c, og;
     uint32_t ph, pixels, rows, lanes;       /* (the padding in x is a constant of the kernel) */
     float beta;

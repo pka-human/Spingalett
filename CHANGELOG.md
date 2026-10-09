@@ -41,7 +41,9 @@ RTX 4050 Laptop GPU; README).
   derivative of its data gradient: the normalization's outputs are never written or read back.
   MobileNet-style training runs 10.6% faster in single precision (12,052 to 13,335 samples/s) and 8%
   in bfloat16 (26,395 to 28,516), inference 34% and 20% (58,693 to 78,612; 94,507 to 113,703), on an
-  RTX 4050 Laptop GPU.
+  RTX 4050 Laptop GPU. The convolution's data gradient also sums what the normalization's backward
+  pass needs, which then reads its gradient once less: training another 4% faster in single
+  precision (13,391 to 13,927) and 1.5% in bfloat16.
 - The GPU's depthwise kernel computes four adjacent pixels of a row a thread, with the filters in
   registers and the loads of overlapping windows shared: MobileNet-style training in bfloat16 runs 8.7%
   faster (24,424 to 26,545 samples/s) and its inference 17% (81,941 to 95,869) on an RTX 4050 Laptop
