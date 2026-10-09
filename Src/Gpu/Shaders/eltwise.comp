@@ -16,6 +16,7 @@
  *   BDATA     y = (a[c] x + (a[C + c] b + a[2C + c])) act'(b)    (its data gradient; x = dy, b = input)
  *   SCALE     y = y a[0]                        (gradient clipping)
  *   AFFINE_ADD  y = act(z + (x a[c] + b[c]))   (a batch normalization added to z: residual blocks)
+ *   COPY      y = x                             (the weights' bfloat16 copy)
  */
 
 #version 460
@@ -39,6 +40,7 @@ layout(local_size_x = 256) in;
 #define BDATA    6u
 #define SCALE    7u
 #define AFFINE_ADD 8u
+#define COPY     9u
 
 #define FLAG_A   1u
 
@@ -123,6 +125,8 @@ void main() {
         } else if (OP == AFFINE_ADD) {
             uint c = i % p.n;
             st(p.y, i, 0u, activate(ld(p.z, i, 8u) + (ld(p.x, i, 1u) * ld(p.a, c, 2u) + ld(p.b, c, 3u)), ACT));
+        } else if (OP == COPY) {
+            st(p.y, i, 0u, ld(p.x, i, 1u));
         }
     }
 }

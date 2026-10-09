@@ -70,6 +70,9 @@ struct SpgGpuNet {
     SpgGpuBuffer part;              /* partial sums: colsum slices, split products, norm slices */
     SpgGpuBuffer wt;                /* convolution weights regrouped for data gradients (conv_spread()) */
     SpgGpuBuffer transfer;          /* host-visible: parameters on their way in or out */
+    SpgGpuBuffer wh;                /* the weights as bfloat16, which the products read in bfloat16 when
+                                       the chunks are large enough to read them many times (written by
+                                       the optimizer with the weights, and after uploads) */
     SpgGpuArena *arena;             /* the memory of all of these but the transfer buffer */
     size_t transfer_bytes;          /* its size, when it is made */
     SpgGpuCommands *once;           /* uploads and downloads */
@@ -101,6 +104,10 @@ static inline uint32_t layer_groups(const LayerShape *s) {
 
 static inline uint64_t align4(uint64_t n) {
     return (n + 3u) & ~(uint64_t)3u;
+}
+
+static inline uint64_t align8(uint64_t n) {
+    return (n + 7u) & ~(uint64_t)7u;
 }
 
 /* The convolution the products of layer l compute: a convolution layer's own, or for a transposed
@@ -356,6 +363,19 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating) {
         if (net->time_step == 0) items[k].kind = ITEM_ZERO;
     bool ok = transfer(g, items, n, down);
     free(items);
+    /* the weights' bfloat16 copy from those uploaded */
+    if (ok && !down && g->wh.buffer) {
+        SpgGpuCommands *c = g->once;
+        SpgEltwisePush p = {g->wh.address, g->params.address, 0, 0, 0, (uint32_t)g->Wp, 1, 0, 0, 0.0f, 0, 0};
+        uint32_t spec[3] = {SPG_ELT_COPY, ACT_NONE, 1u};          /* y kept as bfloat16 */
+        ok = spg_gpu_record_begin(c);
+        if (ok) {
+            spg_gpu_barrier(c);
+            spg_gpu_dispatch(c, SPG_KERNEL_eltwise_h, spec, 3, &p, sizeof p, groups(g->Wp, 256u), 1, 1);
+            spg_gpu_barrier(c);
+            ok = spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
+        }
+    }
     return ok;
 }
 
@@ -493,12 +513,14 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
         g->half[l] = kept_half(g, l);
         g->dhalf[l] = training && l > 0 && g->half[l];
     }
-    /* every layer's parameters at a multiple of four floats */
+    /* every layer's parameters at a multiple of four floats (weights of eight with a bfloat16 copy,
+       which then starts at 16 bytes) */
+    const bool wh = g->bf16 && spg_gpu_bf16_storage() && capacity >= 256u;
     for (uint32_t l = 0; l + 1 < L; l++) {
-        uint64_t rows = spingalett_weight_rows(net, l);
+        uint64_t rows = spingalett_weight_rows(net, l), count = rows * spingalett_weight_row_len(net, l);
         g->woff[l] = g->Wp;
         g->boff[l] = g->Bp;
-        g->Wp += align4(rows * spingalett_weight_row_len(net, l));
+        g->Wp += wh ? align8(count) : align4(count);
         g->Bp += align4(rows);
     }
 
@@ -511,6 +533,7 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
     const uint64_t P = g->Wp + 3u * g->Bp, pair = g->Wp + g->Bp;
     const uint32_t out = net->topology[L - 1];
     spg_gpu_arena_add(A, &g->params, P * 4u, written);
+    if (wh) spg_gpu_arena_add(A, &g->wh, g->Wp * 2u, SPG_MEMORY_DEVICE);
     spg_gpu_arena_add(A, &g->scalars, 16u, SPG_MEMORY_DEVICE);
     spg_gpu_arena_add(A, &g->part, part_floats(net, capacity) * 4u, SPG_MEMORY_DEVICE);
     uint64_t widest_shared = 0, wt = 0, geometries = 0, widest_geometry = 0;
@@ -662,7 +685,7 @@ static bool in_half(const SpgGpuNet *g, uint64_t address) {
         if (g->dhalf[l] && address >= g->delta[l].address && address < g->delta[l].address + g->delta[l].size)
             return true;
     }
-    return false;
+    return address && g->wh.buffer && address >= g->wh.address && address < g->wh.address + g->wh.size;
 }
 
 /* The kernels with variants that keep activations as bfloat16 (SPG_KERNEL_H): the push constant words
@@ -670,7 +693,7 @@ static bool in_half(const SpgGpuNet *g, uint64_t address) {
 static const struct { uint16_t words; uint8_t id; } half_words[SPG_KERNEL_COUNT] = {
     [SPG_KERNEL_colsum] = {0x7, 2}, [SPG_KERNEL_bn] = {0x2, 1}, [SPG_KERNEL_eltwise] = {0x10F, 2},
     [SPG_KERNEL_pool] = {0xF, 3}, [SPG_KERNEL_combine] = {0x7, 3}, [SPG_KERNEL_upsample] = {0xF, 3},
-    [SPG_KERNEL_ln] = {0x7, 3},
+    [SPG_KERNEL_ln] = {0x7, 3}, [SPG_KERNEL_optim] = {0x100, 1},
 };
 
 /* Records a kernel after the barrier it needs; its bfloat16 variant, told which buffers are such, when
@@ -726,6 +749,14 @@ static uint64_t running_at(const SpgGpuNet *g, uint32_t l, uint32_t which) {
 static uint64_t grad_weights_at(const SpgGpuNet *g, uint32_t l) { return at(&g->grads, g->woff[l]); }
 static uint64_t grad_biases_at(const SpgGpuNet *g, uint32_t l) { return at(&g->grads, g->Wp + g->boff[l]); }
 static Range weights_of(const SpgGpuNet *g, uint32_t l) { return span(weights_at(g, l), weight_count(g, l)); }
+/* The weights the products read: the bfloat16 copy where the network keeps one. */
+static uint64_t mm_weights_at(const SpgGpuNet *g, uint32_t l) {
+    return g->wh.buffer ? g->wh.address + 2u * g->woff[l] : weights_at(g, l);
+}
+static Range mm_weights_of(const SpgGpuNet *g, uint32_t l) {
+    if (!g->wh.buffer) return weights_of(g, l);
+    return (Range){mm_weights_at(g, l), mm_weights_at(g, l) + 2u * weight_count(g, l)};
+}
 static Range biases_of(const SpgGpuNet *g, uint32_t l) { return span(biases_at(g, l), bias_count(g, l)); }
 
 /* out = scale * (column sums of R rows of C floats at x) + beta out */
@@ -765,7 +796,7 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
     const uint32_t K = v.taps * v.CG;
     const bool bias = epi == SPG_EPI_BIAS_ACT;
     SpgGemmPush p = {
-        .a = x->address, .b = weights_at(g, l - 1), .c = y->address, .e0 = bias ? biases_at(g, l - 1) : e0,
+        .a = x->address, .b = mm_weights_at(g, l - 1), .c = y->address, .e0 = bias ? biases_at(g, l - 1) : e0,
         .geo = g->geo[l].address, .M = n * v.out_h * v.out_w, .N = v.OG, .K = K, .ldb = K, .ldc = v.out_c,
         .a_group = v.CG, .b_group = v.OG * K, .c_group = v.OG, .alpha = 1.0f, .beta = beta,
         .flags = bias ? SPG_GEMM_BIAS : 0u,
@@ -775,7 +806,7 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
     m.wide_a = v.CG % 8u == 0 && v.in_c % 8u == 0;
     m.wide_b = true;
     reads(a, whole(x));
-    reads(a, weights_of(g, l - 1));
+    reads(a, mm_weights_of(g, l - 1));
     if (bias) reads(a, biases_of(g, l - 1));
     reads(a, whole(&g->geo[l]));
     writes(a, whole(y));
@@ -875,14 +906,14 @@ static void dense_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uin
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, l), K = net->topology[src], N = net->topology[l];
     SpgGemmPush p = {
-        .a = g->act[src].address, .b = weights_at(g, l - 1), .c = g->act[l].address, .e0 = biases_at(g, l - 1),
+        .a = g->act[src].address, .b = mm_weights_at(g, l - 1), .c = g->act[l].address, .e0 = biases_at(g, l - 1),
         .M = n, .N = N, .K = K, .lda = K, .ldb = K, .ldc = N, .alpha = 1.0f, .flags = SPG_GEMM_BIAS,
     };
     SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, act, 1, false, true, true, 0, (uint64_t)n * N, g->bf16,
                      0, true, true};
     Access a = {0};
     reads(&a, whole(&g->act[src]));
-    reads(&a, weights_of(g, l - 1));
+    reads(&a, mm_weights_of(g, l - 1));
     reads(&a, biases_of(g, l - 1));
     writes(&a, whole(&g->act[l]));
     product(r, &a, &p, &m);
@@ -1084,13 +1115,13 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
         case LAYER_DENSE: {         /* dst = delta[cl] W, W stored [next x cur] */
             const uint32_t cur = net->topology[i], next = net->topology[cl];
             SpgGemmPush p = {
-                .a = g->delta[cl].address, .b = weights_at(g, cl - 1), .c = dst->address, .e0 = g->act[i].address,
+                .a = g->delta[cl].address, .b = mm_weights_at(g, cl - 1), .c = dst->address, .e0 = g->act[i].address,
                 .M = n, .N = cur, .K = next, .lda = next, .ldb = cur, .ldc = cur, .alpha = 1.0f,
                 .beta = accumulate ? 1.0f : 0.0f,
             };
             SpgGemmMode m = {SPG_A_ROW, SPG_B_ROW, derive ? SPG_EPI_DERIV : SPG_EPI_STORE, fused, 1, false, true, true, 0,
                              (uint64_t)n * cur, g->bf16, 0, true, true};
-            reads(&a, weights_of(g, cl - 1));
+            reads(&a, mm_weights_of(g, cl - 1));
             product(r, &a, &p, &m);
             return derive;
         }
@@ -1374,6 +1405,7 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
     reads(&a, grads);
     reads(&a, whole(&g->header));
     writes(&a, whole(&g->params));
+    if (g->wh.buffer) writes(&a, whole(&g->wh));
     if (g->moment1.buffer) writes(&a, whole(&g->moment1));
     if (g->moment2.buffer) writes(&a, whole(&g->moment2));
     /* weights, with no decay for the normalizations' gamma; biases without decay */
@@ -1384,6 +1416,7 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
         uint64_t w0 = per_layer ? g->woff[l] : 0, count = per_layer ? weight_count(g, l) : W;
         if (count > 0) {
             p.w = at(&g->params, w0); p.g = at(&g->grads, w0); p.n = (uint32_t)count;
+            p.wh = g->wh.buffer ? g->wh.address + 2u * w0 : 0;
             p.m = g->moment1.buffer ? at(&g->moment1, w0) : 0;
             p.v = g->moment2.buffer ? at(&g->moment2, w0) : 0;
             p.decay = per_layer && spingalett_normalization(net->shapes[l + 1].type) ? 0.0f : o->decay;
@@ -1392,7 +1425,7 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
         if (!per_layer) break;
     }
     if (B > 0) {
-        p.w = at(&g->params, W); p.g = at(&g->grads, W); p.n = (uint32_t)B; p.decay = 0.0f;
+        p.w = at(&g->params, W); p.g = at(&g->grads, W); p.n = (uint32_t)B; p.decay = 0.0f; p.wh = 0;
         p.m = g->moment1.buffer ? at(&g->moment1, W) : 0;
         p.v = g->moment2.buffer ? at(&g->moment2, W) : 0;
         kernel(r, &a, SPG_KERNEL_optim, &spec, 1, &p, sizeof p, groups(B, 256u), 1, 1);

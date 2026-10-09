@@ -120,7 +120,7 @@ typedef struct {
     uint64_t z;
 } SpgEltwisePush;
 enum { SPG_ELT_BIAS_ACT, SPG_ELT_DERIV, SPG_ELT_MUL, SPG_ELT_ADD, SPG_ELT_DROPOUT, SPG_ELT_AFFINE, SPG_ELT_BDATA,
-       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD };
+       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD, SPG_ELT_COPY };
 
 /* output.comp */
 typedef struct {
@@ -166,6 +166,7 @@ typedef struct {
     uint64_t w, m, v, g, header;
     uint32_t n;
     float decay, momentum, beta1, beta2, epsilon;
+    uint64_t wh;                    /* the weights' bfloat16 copy, written with them (0: none) */
 } SpgOptimPush;
 
 /* sumsq.comp */
