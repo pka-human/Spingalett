@@ -42,11 +42,14 @@ typedef enum { SPG_MEMORY_DEVICE, SPG_MEMORY_HOST, SPG_MEMORY_HOST_WRITES } SpgM
    network on the GPU has dozens of buffers. */
 typedef struct SpgGpuArena SpgGpuArena;
 
-/* The kernels (Src/Gpu/Shaders/<name>.comp). */
+/* The kernels (Src/Gpu/Shaders/<name>.comp); a kernel's bfloat16 variant, SPG_KERNEL_<name>_h, follows
+   it. */
 typedef enum {
 #define SPG_KERNEL(name) SPG_KERNEL_##name,
+#define SPG_KERNEL_H(name) SPG_KERNEL_##name, SPG_KERNEL_##name##_h,
 #include "Spingalett.Kernels.def"
 #undef SPG_KERNEL
+#undef SPG_KERNEL_H
     SPG_KERNEL_COUNT
 } SpgKernel;
 

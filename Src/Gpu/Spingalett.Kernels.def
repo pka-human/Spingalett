@@ -4,19 +4,21 @@
 */
 
 /* The GPU kernels: SPG_KERNEL(name) is Shaders/name.comp, compiled to SPIR-V and embedded by
-   cmake/Vulkan.cmake. */
+   cmake/Vulkan.cmake. SPG_KERNEL_H(name) is compiled twice: as name, and with SPG_HALF defined as
+   name_h, the variant that may keep activations as bfloat16 (16-bit storage, which only devices with
+   bfloat16 matrix units are asked for). */
 
 SPG_KERNEL(gemm)
 SPG_KERNEL(gemm_mma)
-SPG_KERNEL(colsum)
+SPG_KERNEL_H(colsum)
 SPG_KERNEL(reduce)
-SPG_KERNEL(bn)
-SPG_KERNEL(eltwise)
+SPG_KERNEL_H(bn)
+SPG_KERNEL_H(eltwise)
 SPG_KERNEL(output)
-SPG_KERNEL(pool)
-SPG_KERNEL(combine)
+SPG_KERNEL_H(pool)
+SPG_KERNEL_H(combine)
 SPG_KERNEL(wtrans)
 SPG_KERNEL(optim)
 SPG_KERNEL(sumsq)
-SPG_KERNEL(upsample)
-SPG_KERNEL(ln)
+SPG_KERNEL_H(upsample)
+SPG_KERNEL_H(ln)

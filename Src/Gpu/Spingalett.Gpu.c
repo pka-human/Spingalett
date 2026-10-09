@@ -388,23 +388,15 @@ static uint64_t part_floats(const NeuralNetwork *net, uint32_t capacity) {
     return need;
 }
 
-/* Whether layer l's outputs are kept as bfloat16: with products in bfloat16, for a layer made by a
-   product (or the input, which the host rounds) and read only by products, which apply its
-   activation's derivative as they compute its gradient (no dropout, no softmax, not the output).
-   Their values are those the matrix units would round them to anyway. */
-static bool kept_half(const SpgGpuNet *g, uint32_t l, bool training) {
+/* Whether layer l's outputs are kept as bfloat16: with products in bfloat16, those of every layer but
+   the output layer (and a softmax), the network's input among them (rounded by the host). Products
+   round their operands to bfloat16 anyway; the passes between them (normalizations, pooling,
+   additions, concatenations, upsampling, dropout) read and write bfloat16 and compute in single
+   precision, as PyTorch's autocast keeps activations. Gradients stay in single precision. */
+static bool kept_half(const SpgGpuNet *g, uint32_t l) {
     const NeuralNetwork *net = g->net;
-    const LayerType type = net->shapes[l].type;
     if (!g->bf16 || !spg_gpu_bf16_storage() || l + 1 >= net->layers || g->uses[l] == 0 || g->fold[l]) return false;
-    if (l > 0 && ((type != LAYER_DENSE && !spingalett_filters(type)) || net->act_func[l - 1] == ACT_SOFTMAX ||
-                  (training && net->dropout_rates[l] > 0.0f)))
-        return false;
-    for (uint32_t c = l + 1; c < net->layers; c++)
-        for (uint32_t k = 0; k < spingalett_input_count(net, c); k++)
-            if (spingalett_inputs(net, c)[k] == l && net->shapes[c].type != LAYER_DENSE &&
-                !spingalett_filters(net->shapes[c].type))
-                return false;
-    return true;
+    return l == 0 || net->act_func[l - 1] != ACT_SOFTMAX;
 }
 
 void spingalett_gpu_net_free(SpgGpuNet *g) {
@@ -463,7 +455,7 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
             }
         }
     }
-    for (uint32_t l = 0; l < L; l++) g->half[l] = kept_half(g, l, training != NULL);
+    for (uint32_t l = 0; l < L; l++) g->half[l] = kept_half(g, l);
     /* every layer's parameters at a multiple of four floats */
     for (uint32_t l = 0; l + 1 < L; l++) {
         uint64_t rows = spingalett_weight_rows(net, l);
@@ -625,17 +617,41 @@ static void need(Recorder *r, const Access *a) {
     r->group = a->group;
 }
 
-static void kernel(Recorder *r, const Access *a, SpgKernel k, const uint32_t *spec, uint32_t spec_count,
-                   const void *push, uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
-    need(r, a);
-    spg_gpu_dispatch(r->c, k, spec, spec_count, push, push_size, gx, gy, gz);
-}
-
 /* Whether address is in the output of a layer kept as bfloat16. */
 static bool in_half(const SpgGpuNet *g, uint64_t address) {
     for (uint32_t l = 0; address && l < g->layers; l++)
         if (g->half[l] && address >= g->act[l].address && address < g->act[l].address + g->act[l].size) return true;
     return false;
+}
+
+/* The kernels with variants that keep activations as bfloat16 (SPG_KERNEL_H): the push constant words
+   that may hold an activation's address (half.glsl), and the constant_id of their HALF. */
+static const struct { uint16_t words; uint8_t id; } half_words[SPG_KERNEL_COUNT] = {
+    [SPG_KERNEL_colsum] = {0x7, 2}, [SPG_KERNEL_bn] = {0x2, 1}, [SPG_KERNEL_eltwise] = {0x10F, 2},
+    [SPG_KERNEL_pool] = {0xF, 3}, [SPG_KERNEL_combine] = {0x7, 3}, [SPG_KERNEL_upsample] = {0xF, 3},
+    [SPG_KERNEL_ln] = {0x7, 3},
+};
+
+/* Records a kernel after the barrier it needs; its bfloat16 variant, told which buffers are such, when
+   it reads or writes an activation kept as bfloat16 (every constant before HALF given). */
+static void kernel(Recorder *r, const Access *a, SpgKernel k, const uint32_t *spec, uint32_t spec_count,
+                   const void *push, uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
+    need(r, a);
+    uint32_t mask = 0;
+    for (uint32_t w = 0; r->g && w < 16u; w++)
+        if ((half_words[k].words >> w & 1u) && 8u * w + 8u <= push_size) {
+            uint64_t address;
+            memcpy(&address, (const char *)push + 8u * w, sizeof address);
+            if (in_half(r->g, address)) mask |= 1u << w;
+        }
+    if (mask && spec_count == half_words[k].id && spec_count < SPG_SPEC_MAX) {
+        uint32_t with[SPG_SPEC_MAX];
+        if (spec_count) memcpy(with, spec, spec_count * sizeof(uint32_t));
+        with[spec_count] = mask;
+        spg_gpu_dispatch(r->c, (SpgKernel)(k + 1), with, spec_count + 1u, push, push_size, gx, gy, gz);
+        return;
+    }
+    spg_gpu_dispatch(r->c, k, spec, spec_count, push, push_size, gx, gy, gz);
 }
 
 static void product(Recorder *r, const Access *a, SpgGemmPush *p, const SpgGemmMode *m) {

@@ -16,9 +16,13 @@
  */
 
 #version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const uint HALF = 0;    /* word: x 1 (half.glsl) */
 layout(local_size_x = 64) in;
 
 #define TRAIN    0u
@@ -31,6 +35,8 @@ layout(push_constant) uniform Push {
     uint C, slices;
     float m, eps, momentum, scale, beta_g;
 } p;
+
+#include "half.glsl"
 
 /* sums j (0 or 1) of channel c over the slices */
 float total(uint c, uint j) {
@@ -55,7 +61,7 @@ void main() {
     }
     if (MODE == TRAIN) {
         float d = total(c, 0u) / p.m, var = max(total(c, 1u) / p.m - d * d, 0.0);
-        float mean = p.x.v[c] + d, inv = 1.0 / sqrt(var + p.eps);
+        float mean = ld(p.x, c, 1u) + d, inv = 1.0 / sqrt(var + p.eps);
         p.stats.v[c] = mean;
         p.stats.v[C + c] = inv;
         p.rmean.v[c] += p.momentum * (mean - p.rmean.v[c]);

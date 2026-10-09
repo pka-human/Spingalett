@@ -64,18 +64,9 @@ const bool VA = (VEC & 1u) != 0u, VB = (VEC & 2u) != 0u;
 const bool HA = (HALF & 1u) != 0u, HB = (HALF & 2u) != 0u, HC = (HALF & 4u) != 0u, HE = (HALF & 8u) != 0u;
 
 #ifdef SPG_HALF
-layout(buffer_reference, std430, buffer_reference_align = 2) buffer BF16 { uint16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer BF16x4 { u16vec4 v[]; };
 struct Raw8 { u16vec4 lo, hi; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer BF16x8 { Raw8 v[]; };
-
-float from_bf16(uint h) { return uintBitsToFloat(h << 16); }
-/* to the nearest bfloat16, ties to even (NaN stays NaN) */
-uint to_bf16(float f) {
-    uint u = floatBitsToUint(f);
-    if (isnan(f)) return (u >> 16) | 0x40u;
-    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
-}
 #endif
 /* the axis a thread's loads run along: k (true) or the other one */
 const bool A_KFAST = AMODE != A_COL, B_KFAST = BMODE == B_COL;

@@ -30,14 +30,19 @@ changes, which are listed under **Changed**.
   512 -> 1000 forward pass 415 us against 331), and timing takes half as long (the 255 products of
   `Bin/Benchmark gpu`: 10.7 to 5.4 s, once per process).
 
-- With `PRECISION_BFLOAT16`, the outputs of layers that only matrix products read (dense and
-  convolution layers feeding dense and convolution layers, and the network's inputs) are kept on the
-  GPU as bfloat16, the values the products round them to: half the memory, read eight values to a
-  load and moved to the matrix units' shared memory as they are; the host rounds the inputs as it
-  writes them, halving the bytes it sends. Products that read or write such outputs run on the
-  matrix units whatever their size. The MLP of `Examples/Benchmark.c` trains full batches 9% faster
-  in bfloat16 and infers 60% faster (1,840,000 to 2,940,000 samples per second, interleaved runs).
-  `SPINGALETT_GPU_NO_BF16_STORAGE=1` keeps them in single precision.
+- With `PRECISION_BFLOAT16`, the GPU keeps the layers' outputs (all but the output layer's, and the
+  network's inputs) as bfloat16, the values the products round them to anyway, as PyTorch's autocast
+  does: half the memory and half the bytes every pass moves. The matrix units' kernel reads them
+  eight to a load and moves their bits to shared memory as they are; normalizations, pooling,
+  additions, concatenations, upsampling and dropout read and write bfloat16 and compute in single
+  precision (variants of their kernels built with 16-bit storage, which only devices with bfloat16
+  matrix units are asked for); the host rounds the inputs as it sends them, halving the bytes.
+  Parameters, gradients and the optimizer stay in single precision. On an RTX 4050 Laptop GPU, in
+  bfloat16: ResNet-20 trains at 14,300 samples per second instead of 11,500 and infers at 51,100
+  instead of 29,300, the U-Net 5,260 and 12,500 instead of 4,190 and 7,670, the MLP infers at
+  2,940,000 instead of 1,840,000; CIFAR-10 with `Examples/CIFAR10.c resnet20` reaches the same test
+  accuracy after 10 epochs (85.10% against 85.04%), 24% faster. `SPINGALETT_GPU_NO_BF16_STORAGE=1`
+  keeps them in single precision.
 
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
