@@ -291,9 +291,10 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u%s", spec[0], spec[1], spec[2], spec[3], spec[4], a, b,
                  v ? "v" : "");
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
-        if (count >= 7) {
+        if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];
-            snprintf(window, sizeof window, "dwconv_k%u%us%u%u", spec[3], spec[4], spec[5], spec[6]);
+            snprintf(window, sizeof window, "dwconv_k%u%us%u%u_m%uv%u", spec[3], spec[4], spec[5], spec[6], spec[0],
+                     spec[7]);
             for (uint32_t u = 0; u < UNIT_COUNT; u++)
                 if (!strcmp(spg_cuda_units[u].name, window)) return (int)u;
         }

@@ -23,14 +23,16 @@ SPG_CUDA_UNIT(upsample, upsample, "")
 SPG_CUDA_UNIT(ln, ln, "")
 SPG_CUDA_UNIT(rows, rows, "")
 
-/* depthwise convolutions: any window and stride, and the common ones as constants */
-SPG_CUDA_UNIT(dwconv, dwconv, "-DWINDOW=0,0,0,0")
-SPG_CUDA_UNIT(dwconv_k33s11, dwconv, "-DWINDOW=3,3,1,1")
-SPG_CUDA_UNIT(dwconv_k33s22, dwconv, "-DWINDOW=3,3,2,2")
-SPG_CUDA_UNIT(dwconv_k55s11, dwconv, "-DWINDOW=5,5,1,1")
-SPG_CUDA_UNIT(dwconv_k55s22, dwconv, "-DWINDOW=5,5,2,2")
-SPG_CUDA_UNIT(dwconv_k77s11, dwconv, "-DWINDOW=7,7,1,1")
-SPG_CUDA_UNIT(dwconv_k77s22, dwconv, "-DWINDOW=7,7,2,2")
+/* depthwise convolutions: any window, stride, mode, VEC and padding, and the common windows (KH, KW, SH, SW),
+   padded (KW - 1) / 2, for every mode (0 APPLY, 1 SPREAD, 2 WEIGHTS) and VEC (1, 4) as constants: units
+   dwconv_k<KH><KW>s<SH><SW>_m<MODE>v<VEC> */
+SPG_CUDA_UNIT(dwconv, dwconv, "-DWINDOW=0,0,0,0,ANY,ANY,ANY")
+SPG_CUDA_DW_WINDOW(3, 3, 1, 1)
+SPG_CUDA_DW_WINDOW(3, 3, 2, 2)
+SPG_CUDA_DW_WINDOW(5, 5, 1, 1)
+SPG_CUDA_DW_WINDOW(5, 5, 2, 2)
+SPG_CUDA_DW_WINDOW(7, 7, 1, 1)
+SPG_CUDA_DW_WINDOW(7, 7, 2, 2)
 
 /* the matrix product in single precision (gemm.cu): every tile (BM, BN, BK, TM, TN), which is also the table
    of Spingalett.GpuKernels.c, for every operand mode the executor uses (A, B, VEC: A_CONV and B_CONV 2, or 3

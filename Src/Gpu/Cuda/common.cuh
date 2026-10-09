@@ -177,6 +177,22 @@ DEVICE float4_ activate4(float4_ v, uint32_t act) {
     return float4_{activate(v.x, act), activate(v.y, act), activate(v.z, act), activate(v.w, act)};
 }
 
+/* The activations that are a slope below zero: none, ReLU and leaky ReLU (their slope); -1 for the others.
+   Kernels whose activation comes from the spec compute these inline (a select a value) and call activate()
+   (a switch a value) for the others. */
+DEVICE float act_slope(uint32_t act) {
+    return act == ACT_NONE ? 1.0f : act == ACT_RELU ? 0.0f : act == ACT_LEAKY_RELU ? 0.01f : -1.0f;
+}
+
+/* activate() and derivative() of such an activation (ReLU's zero a zero, not x times zero) */
+DEVICE float sloped(float x, float slope) { return x > 0.0f ? x : slope == 0.0f ? 0.0f : x * slope; }
+DEVICE float sloped_derivative(float y, float slope) { return y > 0.0f ? 1.0f : slope; }
+DEVICE float4_ sloped4(float4_ v, float s) { return float4_{sloped(v.x, s), sloped(v.y, s), sloped(v.z, s), sloped(v.w, s)}; }
+
+/* activate4() and derivative() through the slope where there is one */
+DEVICE float4_ activate4s(float4_ v, uint32_t act, float slope) { return slope >= 0.0f ? sloped4(v, slope) : activate4(v, act); }
+DEVICE float derivative_s(float y, uint32_t act, float slope) { return slope >= 0.0f ? sloped_derivative(y, slope) : derivative(y, act); }
+
 /* Step header (SpgStepHeader in Spingalett.Gpu.c), as common.glsl */
 #define STEP_LR         0u
 #define STEP_M_FACTOR   1u

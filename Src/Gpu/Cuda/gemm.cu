@@ -135,16 +135,6 @@ static __device__ __attribute__((noinline)) void store_c4(Epilogue e, uint32_t z
     C4[at >> 2] = v;
 }
 
-/* The activations that are a slope below zero: none, ReLU and leaky ReLU (their slope); -1 for the others. */
-DEVICE float act_slope(uint32_t act) {
-    return act == ACT_NONE ? 1.0f : act == ACT_RELU ? 0.0f : act == ACT_LEAKY_RELU ? 0.01f : -1.0f;
-}
-
-/* activate() and derivative() of such an activation (ReLU's zero a zero, not x times zero) */
-DEVICE float sloped(float x, float slope) { return x > 0.0f ? x : slope == 0.0f ? 0.0f : x * slope; }
-DEVICE float sloped_derivative(float y, float slope) { return y > 0.0f ? 1.0f : slope; }
-DEVICE float4_ sloped4(float4_ v, float s) { return float4_{sloped(v.x, s), sloped(v.y, s), sloped(v.z, s), sloped(v.w, s)}; }
-
 /* store_c4() inline for the sloped activations (slope at least zero; EPI_SCALE_ACT not among them) */
 DEVICE void store_sloped(const Epilogue &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row,
                          uint32_t n, float4_ v) {

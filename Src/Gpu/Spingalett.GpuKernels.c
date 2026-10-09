@@ -43,10 +43,12 @@ static const Tile mma_tiles[] = {
 static const Tile cuda_fp32_tiles[] = {
 #define SPG_CUDA_UNIT(name, source, defines)
 #define SPG_CUDA_GEMM_MODES(a, b, vec)
+#define SPG_CUDA_DW_WINDOW(kh, kw, sh, sw)
 #define SPG_CUDA_GEMM_TILE(bm, bn, bk, tm, tn) {bm, bn, bk, tm, tn},
 #include "Cuda/Kernels.def"
 #undef SPG_CUDA_UNIT
 #undef SPG_CUDA_GEMM_MODES
+#undef SPG_CUDA_DW_WINDOW
 #undef SPG_CUDA_GEMM_TILE
 };
 
