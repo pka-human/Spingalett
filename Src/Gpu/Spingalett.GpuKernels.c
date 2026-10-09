@@ -120,6 +120,11 @@ static bool aligned(uint64_t address, uint32_t group) {
  * speed, never the bits: products are timed with each candidate tile on their first use (outputs to
  * scratch memory) and the fastest is kept for the life of the process. SPINGALETT_GPU_TUNE=0 keeps
  * the estimate of choose_tile() instead.
+ *
+ * Times are the device's (timestamps), in rounds that run every candidate once, all in one
+ * submission: a round of single runs to weed out the slow, then rounds of the rest, of which each
+ * candidate's fastest counts, so that clocks still rising or other work on the device weigh on no
+ * tile in particular. A device idle for a while is first kept busy for 25 ms, to raise its clocks.
  */
 typedef struct {
     uint32_t key[15];
@@ -133,6 +138,7 @@ static struct {
     Choice *choices;
     size_t count, cap;
     SpgGpuBuffer scratch;
+    double last;                    /* when the last product was timed (spg_seconds()) */
 } tuner;
 
 static bool tuner_ready(void) {
@@ -189,22 +195,37 @@ double spg_seconds(void) {
 #endif
 }
 
-/* Seconds per run of the product with tile t (0 when it cannot run). */
-static double time_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, const Tile *t, bool mma, int reps) {
+/* Device seconds per run of each of `count` candidates (0: not timed): `rounds` rounds of `reps` runs
+   of each, the fastest round kept; false when the commands could not run. */
+static bool time_tiles(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, bool mma, const int *order,
+                       uint32_t count, uint32_t rounds, uint32_t reps, double *seconds) {
+    const Table tab = table(mma);
     SpgGpuCommands *c = spg_gpu_commands_create();
-    if (!c) return 0.0;
+    if (!c) return false;
     spg_gpu_commands_untimed(c);
-    bool ok = spg_gpu_record_begin(c);
-    for (int r = 0; ok && r < reps; r++) {
-        dispatch_tile(c, p, m, vec, t, mma);
-        spg_gpu_barrier(c);
+    const uint32_t stamps = 2u * rounds * count;
+    bool ok = spg_gpu_commands_stamps(c, stamps) && spg_gpu_record_begin(c);
+    for (uint32_t r = 0; ok && r < rounds; r++)
+        for (uint32_t k = 0; k < count; k++) {
+            spg_gpu_timestamp(c, 2u * (r * count + k));
+            for (uint32_t rep = 0; rep < reps; rep++) {
+                dispatch_tile(c, p, m, vec, &tab.list[order[k]], mma);
+                spg_gpu_barrier(c);
+            }
+            spg_gpu_timestamp(c, 2u * (r * count + k) + 1u);
+        }
+    double *ns = (double *)malloc(stamps * sizeof(double));
+    ok = ok && ns && spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c) && spg_gpu_timestamps(c, ns, stamps);
+    for (uint32_t k = 0; ok && k < count; k++) {
+        seconds[k] = 0.0;
+        for (uint32_t r = 0; r < rounds; r++) {
+            const double t = (ns[2u * (r * count + k) + 1u] - ns[2u * (r * count + k)]) * 1e-9 / reps;
+            if (t > 0.0 && (seconds[k] == 0.0 || t < seconds[k])) seconds[k] = t;
+        }
     }
-    ok = ok && spg_gpu_record_end(c);
-    double start = spg_seconds();
-    ok = ok && spg_gpu_submit(c) && spg_gpu_wait(c);
-    double s = spg_seconds() - start;
+    free(ns);
     spg_gpu_commands_free(c);
-    return ok ? s / reps : 0.0;
+    return ok;
 }
 
 /* The fastest tile for this product, timed now if it is new; -1 when it cannot be timed. */
@@ -234,7 +255,7 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, 
     SpgGemmPush q = *p;
     q.c = tuner.scratch.address;
     q.beta = 0.0f;
-    /* candidates: the tiles that waste at most half again the least padding, at most eight of them,
+    /* candidates: the tiles that waste at most half again the least padding, at most sixteen of them,
        those with the most register reuse among those that give enough workgroups (when some do) */
     const uint32_t z = m->groups * p->slices;
     double least = 0.0;
@@ -261,16 +282,32 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, 
                 double ts = score[a]; score[a] = score[b]; score[b] = ts;
                 int to = order[a]; order[a] = order[b]; order[b] = to;
             }
-    if (count > (mma ? 16u : 8u)) count = mma ? 16u : 8u;
-    double best = 0.0;
+    if (count > 16u) count = 16u;
+    double t[64];
     int chosen = -1;
-    for (uint32_t c = 0; c < count; c++) {
-        const Tile *t = &tab.list[order[c]];
-        time_tile(&q, m, vec, t, mma, 1);       /* the pipeline made, the caches warm */
-        double s = time_tile(&q, m, vec, t, mma, 3);
-        if (s > 0.0 && s < 0.0005) s = time_tile(&q, m, vec, t, mma, (int)(0.0015 / s) + 1);   /* about 1.5 ms */
-        if (s > 0.0 && (chosen < 0 || s < best)) { best = s; chosen = order[c]; }
+    /* a device idle for a second or more (or never tuned) is kept busy for 25 ms first */
+    if (count > 0 && (tuner.last == 0.0 || spg_seconds() - tuner.last > 1.0) &&
+        time_tiles(&q, m, vec, mma, order, 1, 1, 1, t) && t[0] > 0.0) {
+        uint32_t reps = (uint32_t)(0.025 / t[0]);
+        time_tiles(&q, m, vec, mma, order, 1, 1, reps < 1u ? 1u : reps > 4096u ? 4096u : reps, t);
     }
+    /* single runs of every candidate; then rounds of those within half again of the fastest (eight at
+       most), each run long enough (20 us) for the timestamps' grain */
+    if (count > 0 && time_tiles(&q, m, vec, mma, order, count, 1, 1, t)) {
+        double fastest = 0.0;
+        for (uint32_t k = 0; k < count; k++)
+            if (t[k] > 0.0 && (fastest == 0.0 || t[k] < fastest)) fastest = t[k];
+        uint32_t kept = 0;
+        for (uint32_t k = 0; k < count; k++)            /* in order of score, which ties keep */
+            if (t[k] > 0.0 && t[k] <= 1.5 * fastest && kept < 8u) order[kept++] = order[k];
+        const uint32_t reps = fastest > 0.0 && fastest < 20e-6 ? (uint32_t)(20e-6 / fastest) + 1u : 1u;
+        if (kept > 0 && time_tiles(&q, m, vec, mma, order, kept, 4, reps, t)) {
+            double best = 0.0;
+            for (uint32_t k = 0; k < kept; k++)
+                if (t[k] > 0.0 && (chosen < 0 || t[k] < best)) { best = t[k]; chosen = order[k]; }
+        }
+    }
+    tuner.last = spg_seconds();
     if (chosen >= 0) {
         memcpy(tuner.choices[tuner.count].key, key, sizeof key);
         tuner.choices[tuner.count++].tile = (uint32_t)chosen;

@@ -140,6 +140,7 @@ static struct {
     size_t pipeline_count, pipeline_cap;
     SpgSignal *lock;                /* the pipelines and the queue */
     float tick_ns;                  /* timestamp period */
+    uint32_t stamp_bits;            /* valid bits of the queue's timestamps (0: none) */
     bool profile;                   /* SPINGALETT_GPU_PROFILE: time every dispatch */
     struct { char label[48]; double ms; uint64_t calls; } stats[256];
     uint32_t stat_count;
@@ -270,6 +271,7 @@ static bool open_device(void) {
     for (uint32_t q = 0; q < nf && gpu.family == UINT32_MAX; q++)
         if (families[q].queueFlags & VK_QUEUE_COMPUTE_BIT) gpu.family = q;
     if (gpu.family == UINT32_MAX) return false;
+    gpu.stamp_bits = families[gpu.family].timestampValidBits;
 
     /* a portability implementation (MoltenVK) must have its subset extension enabled */
     VkExtensionProperties *extensions = NULL;
@@ -617,6 +619,8 @@ struct SpgGpuCommands {
     VkQueryPool queries;            /* profiling: two timestamps per dispatch */
     uint32_t timed;
     char (*labels)[48];
+    VkQueryPool stamps;             /* spg_gpu_commands_stamps() */
+    uint32_t stamp_count;
 };
 
 SpgGpuCommands *spg_gpu_commands_create(void) {
@@ -649,11 +653,38 @@ void spg_gpu_commands_untimed(SpgGpuCommands *c) {
     c->queries = VK_NULL_HANDLE;
 }
 
+bool spg_gpu_commands_stamps(SpgGpuCommands *c, uint32_t count) {
+    if (gpu.stamp_bits == 0 || gpu.tick_ns <= 0.0f || count == 0) return false;
+    VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, count, 0};
+    if (vkCreateQueryPool(gpu.device, &qci, NULL, &c->stamps) != VK_SUCCESS) {
+        c->stamps = VK_NULL_HANDLE;
+        return false;
+    }
+    c->stamp_count = count;
+    return true;
+}
+
+void spg_gpu_timestamp(SpgGpuCommands *c, uint32_t index) {
+    if (c->stamps && index < c->stamp_count)
+        vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->stamps, index);
+}
+
+bool spg_gpu_timestamps(SpgGpuCommands *c, double *ns, uint32_t count) {
+    if (!c->stamps || count > c->stamp_count) return false;
+    uint64_t *ticks = (uint64_t *)malloc(count * sizeof(uint64_t));
+    bool ok = ticks && vkGetQueryPoolResults(gpu.device, c->stamps, 0, count, count * sizeof(uint64_t), ticks,
+                                             sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+    for (uint32_t k = 0; ok && k < count; k++) ns[k] = (double)ticks[k] * gpu.tick_ns;
+    free(ticks);
+    return ok;
+}
+
 void spg_gpu_commands_free(SpgGpuCommands *c) {
     if (!c) return;
     if (c->pending) spg_gpu_wait(c);
     if (c->fence) vkDestroyFence(gpu.device, c->fence, NULL);
     if (c->queries) vkDestroyQueryPool(gpu.device, c->queries, NULL);
+    if (c->stamps) vkDestroyQueryPool(gpu.device, c->stamps, NULL);
     free(c->labels);
     if (c->pool) vkDestroyCommandPool(gpu.device, c->pool, NULL);       /* its buffer with it */
     free(c);
@@ -665,6 +696,7 @@ bool spg_gpu_record_begin(SpgGpuCommands *c) {
     c->ok = vkBeginCommandBuffer(c->cb, &bi) == VK_SUCCESS;
     c->timed = 0;
     if (c->ok && c->queries) vkCmdResetQueryPool(c->cb, c->queries, 0, 2u * PROFILE_QUERIES);
+    if (c->ok && c->stamps) vkCmdResetQueryPool(c->cb, c->stamps, 0, c->stamp_count);
     return c->ok;
 }
 

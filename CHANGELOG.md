@@ -22,6 +22,14 @@ changes, which are listed under **Changed**.
   samples per second; an epoch 25.6 to 21.7 ms) and infers 1.5 times as fast (1,150,000 to
   1,800,000 samples per second). `SPINGALETT_GPU_NO_HOST_WRITES=1` keeps the copies.
 
+- The GPU's matrix products choose their tiles by the device's own timestamps, in rounds that run
+  every candidate once in one submission (a round of single runs over up to 16 candidates, then
+  four rounds of the eight fastest, each candidate's fastest round kept), after keeping an idle
+  device busy for 25 ms to raise its clocks. The tile chosen is now within the noise of the
+  fastest on the products of `SpingalettGpuTests bench` (it was up to 25% slower: the MLP's
+  512 -> 1000 forward pass 415 us against 331), and timing takes half as long (the 255 products of
+  `Bin/Benchmark gpu`: 10.7 to 5.4 s, once per process).
+
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
   the epochs after it: they now go to the device before the next epoch.

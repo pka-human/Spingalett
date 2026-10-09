@@ -87,6 +87,12 @@ SpgGpuCommands *spg_gpu_commands_create(void);
 void spg_gpu_commands_free(SpgGpuCommands *commands);
 /* Leaves the commands out of SPINGALETT_GPU_PROFILE's times (trial runs). */
 void spg_gpu_commands_untimed(SpgGpuCommands *commands);
+/* Timestamps for measurements of the commands' own: room for `count` (false without timestamps on
+   the device's queue); spg_gpu_timestamp() records index once everything recorded before it has
+   run, and spg_gpu_timestamps() reads them in nanoseconds after spg_gpu_wait(). */
+bool spg_gpu_commands_stamps(SpgGpuCommands *commands, uint32_t count);
+void spg_gpu_timestamp(SpgGpuCommands *commands, uint32_t index);
+bool spg_gpu_timestamps(SpgGpuCommands *commands, double *ns, uint32_t count);
 bool spg_gpu_record_begin(SpgGpuCommands *commands);
 /* spec: the kernel's specialization constants 0 .. spec_count - 1; push: its parameters; groups in
    x, y and z (nothing is recorded when one is 0) */
