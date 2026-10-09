@@ -70,9 +70,9 @@ the library inside) are included.
 
 Prebuilt libraries for Linux (x86-64 and ARM64), Windows and macOS are attached to every
 [release](https://github.com/pka-human/Spingalett/releases): each archive contains the headers,
-the shared library, a CMake package, `DatasetTool` and `ModelTool`. Extract one and point CMake at it with
-`-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with `-I<dir>/include -L<dir>/lib
--lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
+the shared library, a CMake package, a pkg-config file, `DatasetTool` and `ModelTool`. Extract one
+and point CMake at it with `-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with
+`-I<dir>/include -L<dir>/lib -lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
 `-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
 when the processor has them, and the `-v3` build also compiles the rest of the library
 (activations, optimizers, the inference engine) for AVX2. The Windows DLL ships with import
