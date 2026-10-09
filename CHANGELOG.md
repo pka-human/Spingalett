@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
+## [Unreleased]
+
+### Changed
+- `train()` on the GPU keeps the network's parameters on the device between epochs instead of
+  copying them (and the gradients and optimizer moments) back after each: they come back where they
+  are read (a callback, an autosave, the NaN check, the best epoch's copy) and when training ends.
+  The 784-512-1000-10 MLP of `Examples/Benchmark.c` trains full batches 22% faster on an RTX 4050
+  Laptop GPU (5 epochs: 553,000 to 673,000 samples per second).
+
+### Fixed
+- Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
+  the epochs after it: they now go to the device before the next epoch.
+
 ## [0.13.0] - 2026-10-09
 
 "Layers": transposed convolutions, upsampling and layer normalization, for U-Nets and more of ONNX,

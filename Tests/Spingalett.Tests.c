@@ -4659,6 +4659,75 @@ static void gpu_trainer(void) {
     }
 }
 
+/* Halves the weights of layer 1 through the public functions. */
+static void gpu_halve_layer(NeuralNetwork *net) {
+    SpingalettNetworkLayer info;
+    spingalett_network_layer(net, 1, &info);
+    float *w = (float *)malloc(info.weight_count * sizeof(float));
+    spingalett_get_parameters(net, 1, PARAM_WEIGHTS, w, info.weight_count);
+    for (uint64_t i = 0; i < info.weight_count; i++) w[i] *= 0.5f;
+    spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, info.weight_count);
+    free(w);
+}
+
+static bool gpu_halve_after_first(NeuralNetwork *net, const TrainProgress *progress, void *data) {
+    (void)data;
+    if (progress->epoch == 1) gpu_halve_layer(net);
+    return false;
+}
+
+/* train() on the GPU keeps the parameters on the device between epochs: a callback that reads a
+   layer's weights after the first epoch and writes them back halved gives the same bits as two calls
+   of train() with the weights halved between them. */
+static void gpu_callback(void) {
+    static const int nets[] = {0, 7};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
+        float *w[2] = {NULL, NULL};
+        size_t count = 0;
+        for (int k = 0; k < 2; k++) {
+            NeuralNetwork *net = gpu_net(which);
+            const uint32_t n = 48, in = net->topology[0], out = net->topology[net->layers - 1];
+            float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+            lcg_state = 99;
+            for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+            for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            TrainArgs a = {.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
+                           .optimizer_type = OPTIMIZER_MOMENTUM, .momentum = 0.9f, .beta1 = 0.9f, .beta2 = 0.999f,
+                           .epsilon = 1e-8f, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0};
+            if (k == 0) {
+                a.callback = gpu_halve_after_first;
+                a.callback_interval = 1;
+                train_struct_arguments(a);
+            } else {
+                a.epochs = 1;
+                train_struct_arguments(a);
+                gpu_halve_layer(net);
+                train_struct_arguments(a);
+            }
+            count = spingalett_parameter_count(net);
+            w[k] = (float *)malloc(count * sizeof(float));
+            size_t off = 0;
+            for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+                SpingalettNetworkLayer info;
+                spingalett_network_layer(net, l, &info);
+                spingalett_get_parameters(net, l, PARAM_WEIGHTS, w[k] + off, info.weight_count);
+                off += info.weight_count;
+                spingalett_get_parameters(net, l, PARAM_BIASES, w[k] + off, info.bias_count);
+                off += info.bias_count;
+            }
+            free(x); free(t);
+            free_network(net);
+        }
+        const bool same = !memcmp(w[0], w[1], count * sizeof(float));
+        CHECK(same, "gpu callback net %d: weights written by a callback differ from those written between calls", which);
+        printf("  gpu callback net %d: weights written in a callback %s\n", which, same ? "ok" : "FAILED");
+        free(w[0]); free(w[1]);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+}
+
 /* Products in bfloat16 on the matrix units (where the device has them): predictions within a few
    per cent of single precision (8 bits of mantissa in the operands), training as far along (its
    loss), and repeating bit for bit. */
@@ -4913,6 +4982,7 @@ int main(int argc, char **argv) {
             gpu_training_options();
             gpu_threads();
             gpu_trainer();
+            gpu_callback();
             gpu_bf16();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);

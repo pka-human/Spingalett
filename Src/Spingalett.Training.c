@@ -1088,6 +1088,18 @@ TrainReport train_struct_arguments(TrainArgs args) {
     memset(net->grad_weights, 0, net->total_weights * sizeof(float));
     memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
 
+    /* On the GPU the parameters stay on the device between epochs: the network's arrays are brought
+       up to date (spingalett_network_sync()) only where they are read, by a callback, an autosave,
+       the NaN check or the copy of the best epoch, and at the end; what a callback writes goes back
+       to the device before the next epoch. A trainer of the step API that has the network keeps it
+       (synced when training began) and gets it back after. */
+    SpgGpuNet *outer_gpu = net->gpu_trainer;
+    uint64_t gpu_version = net->param_version;
+    if (t.gpu) {
+        net->gpu_trainer = t.gpu;
+        net->gpu_newer = false;
+    }
+
     /* STRATEGY_SAMPLE walks the whole set in one call and steps after every sample. */
     uint32_t step_size = (training_strategy == STRATEGY_SAMPLE) ? sample_count : t.batch_size;
     uint32_t steps_per_epoch = step_size ? (sample_count + step_size - 1) / step_size : 0;
@@ -1175,17 +1187,23 @@ TrainReport train_struct_arguments(TrainArgs args) {
             epoch_samples = sample_count;
         }
 
-        if (t.gpu && (t.gpu_failed || !spingalett_gpu_take_loss(t.gpu, &total_error) || !spingalett_gpu_download(t.gpu))) {
-            set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
-            spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
-            report.status = TRAIN_FAILED;
-            break;
+        if (t.gpu) {
+            bool lost = t.gpu_failed || !spingalett_gpu_take_loss(t.gpu, &total_error);
+            net->gpu_newer = true;
+            if (lost) {
+                set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
+                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                report.status = TRAIN_FAILED;
+                break;
+            }
         }
 
         report.epochs_run = epoch;
         report.train_loss = total_error / (float)epoch_samples;
 
-        if (args.nan_check_interval > 0 && (epoch % args.nan_check_interval == 0) && check_nan_inf(net)) {
+        const bool check_nan = args.nan_check_interval > 0 && epoch % args.nan_check_interval == 0;
+        if (check_nan) spingalett_network_sync(net);
+        if (check_nan && check_nan_inf(net)) {
             spingalett_log(LOG_ERROR, "NaN/Inf detected in weights at epoch %zu, stopping training", epoch);
             report.status = TRAIN_DIVERGED;
             break;
@@ -1223,8 +1241,10 @@ TrainReport train_struct_arguments(TrainArgs args) {
                 report.best_epoch = epoch;
                 report.best_value = value;
                 epochs_without_improvement = 0;
-                if (t.best_params)
+                if (t.best_params) {
+                    spingalett_network_sync(net);
                     save_params(t.best_params, net);
+                }
             } else {
                 epochs_without_improvement++;
             }
@@ -1264,6 +1284,17 @@ TrainReport train_struct_arguments(TrainArgs args) {
             }
         }
 
+        /* parameters the callback wrote: to the device for the next epoch */
+        if (t.gpu && net->param_version != gpu_version) {
+            gpu_version = net->param_version;
+            if (!spingalett_gpu_upload(t.gpu)) {
+                set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
+                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                report.status = TRAIN_FAILED;
+                break;
+            }
+        }
+
         if (args.early_stopping_patience > 0 && epochs_without_improvement >= args.early_stopping_patience) {
             spingalett_log(LOG_INFO, "Early stopping at epoch %zu: no improvement since epoch %zu",
                            epoch, report.best_epoch);
@@ -1272,6 +1303,11 @@ TrainReport train_struct_arguments(TrainArgs args) {
         }
     }
 
+    if (t.gpu) {
+        spingalett_network_sync(net);
+        net->gpu_trainer = outer_gpu;
+        net->gpu_newer = false;
+    }
     if (t.best_params && report.best_epoch > 0 && report.best_epoch != report.epochs_run) {
         restore_params(net, t.best_params);
         report.restored_best = true;
