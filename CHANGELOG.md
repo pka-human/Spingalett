@@ -57,6 +57,8 @@ RTX 4050 Laptop GPU; README).
   up to 2^25 values a sample run in smaller chunks.
 - A chunk filled ahead on the GPU for a step that did not come (early stopping, a callback) no longer
   leaves its rows' flags to the next `train()` of the network's copy.
+- `Examples/XOR.c` seeds the generator: started from the clock, about one run in five hundred ended
+  in XOR's local minimum and failed the release workflow's check of the installed package.
 
 ## [0.13.1] - 2026-10-09
 

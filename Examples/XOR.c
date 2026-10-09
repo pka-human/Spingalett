@@ -28,6 +28,10 @@ int main(void) {
         0.f
     };
 
+    /* A fixed seed gives the same initial weights on every run: unseeded, about one start in five
+       hundred falls into XOR's local minimum (two of the four cases at 0.5). */
+    spingalett_seed(42);
+
     NeuralNetwork *nn = new_spingalett(.loss_func = LOSS_MSE);
 
     layer(nn, 2);
