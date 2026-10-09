@@ -1991,13 +1991,15 @@ float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets) {
     return result;
 }
 
+/* Where the host rounds a slot's inputs kept as bfloat16 (straight from the caller's floats): the device's
+   buffer where it can write it, else staging, from which the slot's commands copy them. */
 static uint16_t *spingalett_gpu_chunk_inputs_bf16_here(SpgGpuNet *g, float **targets) {
     Slot *s = &g->slots[g->next];
-    if (!s->host_inputs || !s->input.mapped) return NULL;
+    if (!s->host_inputs) return NULL;
     next_slot(g);
     if (targets) *targets = (float *)((char *)s->staging.mapped + s->targets);
     s->staged = true;
-    return (uint16_t *)s->input.mapped;
+    return (uint16_t *)(s->input.mapped ? s->input.mapped : (char *)s->staging.mapped + s->inputs);
 }
 
 uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
@@ -2312,11 +2314,19 @@ static bool spingalett_gpu_predict_rows_here(SpgGpuNet *g, const float *inputs, 
             memcpy(header_of(s), header, sizeof header);
         } else if (rows) {
             /* read where they are */
-        } else if (s->host_inputs) {    /* rounded straight from the caller's floats */
-            spingalett_round_bf16((uint16_t *)(s->input.mapped ? s->input.mapped : (char *)s->staging.mapped + s->inputs),
-                                  inputs + (size_t)start * in, (size_t)m * in);
         } else {
-            memcpy(dst, inputs + (size_t)start * in, (size_t)m * in * sizeof(float));
+            /* rounded straight from the caller's floats (or copied), on the OpenMP threads for a chunk of a
+               megabyte or more (as training fills its chunks) */
+            uint16_t *d16 = s->host_inputs ? (uint16_t *)(s->input.mapped ? s->input.mapped
+                                                                          : (char *)s->staging.mapped + s->inputs)
+                                           : NULL;
+            const float *src = inputs + (size_t)start * in;
+            SPINGALETT_PARALLEL_FOR((uint64_t)m * in >= (1u << 18) && m > 1,
+                for (int64_t r = 0; r < (int64_t)m; r++) {
+                    if (d16) spingalett_round_bf16(d16 + (size_t)r * in, src + (size_t)r * in, in);
+                    else memcpy(dst + (size_t)r * in, src + (size_t)r * in, in * sizeof(float));
+                }
+            );
         }
         SpgGpuCommands *c = chunk_commands(g, s, (uint64_t)m | 1ull << 63 | (gather ? 1ull << 59 : 0), m, m, false,
                                            false, false, gather ? 1u : 0u, rows && !gather ? &view : NULL);
