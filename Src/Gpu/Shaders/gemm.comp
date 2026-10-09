@@ -92,10 +92,16 @@ void main() {
     boff = g * p.b_group;
     prepare(kbeg);
 
-    /* thread (tr, tc) computes rows tr TM .. + TM and columns tc TN .. + TN of the tile */
-    const uint tc = tid % (BN / TN), tr = tid / (BN / TN);
-    /* acc[i * TN / 4 + j]: row i, columns 4j .. 4j + 3; precise, so that every fma() stays fused (the
-       same chain of fused multiply-adds whatever the tile) */
+    /* thread (tr, tc) computes rows 4 tr + RS i' + (0 .. 3) and columns 4 tc + CS j' + (0 .. 3) of the
+       tile (i' < TM / 4, j' < TN / 4); threads go in groups of 32 that cover 4 x 8 threads' blocks where
+       the tile allows (so that a subgroup's reads of shared memory are 128 bytes of consecutive vectors
+       of B and four of A), else in rows of BN / TN */
+    const bool WARPED = THREADS % 32u == 0u && (BM / TM) % 4u == 0u && (BN / TN) % 8u == 0u;
+    const uint RS = 4u * (BM / TM), CS = 4u * (BN / TN), WCOLS = (BN / TN) / 8u;
+    const uint tr = WARPED ? (tid / 32u / WCOLS) * 4u + (tid % 32u) / 8u : tid / (BN / TN);
+    const uint tc = WARPED ? (tid / 32u % WCOLS) * 8u + tid % 8u : tid % (BN / TN);
+    /* acc[i * TN / 4 + j']: row 4 tr + RS (i / 4) + i % 4, columns 4 tc + CS j' + (0 .. 3); precise, so
+       that every fma() stays fused (the same chain of fused multiply-adds whatever the tile) */
     precise vec4 acc[TM * TN / 4];
     [[unroll]] for (uint i = 0; i < TM * TN / 4u; i++) acc[i] = vec4(0.0);
 
@@ -106,8 +112,8 @@ void main() {
         if (k0 + BK < kend) fetch(k0 + BK);
         [[unroll]] for (uint kk = 0; kk < BK; kk++) {
             vec4 av[TM / 4], bv[TN / 4];
-            [[unroll]] for (uint i = 0; i < TM / 4u; i++) av[i] = As[kk * SA + tr * (TM / 4u) + i];
-            [[unroll]] for (uint j = 0; j < TN / 4u; j++) bv[j] = Bs[kk * SB + tc * (TN / 4u) + j];
+            [[unroll]] for (uint i = 0; i < TM / 4u; i++) av[i] = As[kk * SA + i * (BM / TM) + tr];
+            [[unroll]] for (uint j = 0; j < TN / 4u; j++) bv[j] = Bs[kk * SB + j * (BN / TN) + tc];
             [[unroll]] for (uint i = 0; i < TM; i++) {
                 float a = av[i >> 2][i & 3u];
                 [[unroll]] for (uint j = 0; j < TN / 4u; j++) acc[i * (TN / 4u) + j] = fma(vec4(a), bv[j], acc[i * (TN / 4u) + j]);
@@ -118,12 +124,12 @@ void main() {
 
     const uint coff = g * p.c_group;
     [[unroll]] for (uint i = 0; i < TM; i++) {
-        uint m = m0 + tr * TM + i;
-        if (m >= p.M) break;
+        uint m = m0 + 4u * tr + RS * (i >> 2) + (i & 3u);
+        if (m >= p.M) continue;
         const uint row = c_row(m);
         [[unroll]] for (uint j = 0; j < TN; j++) {
-            uint n = n0 + tc * TN + j;
-            if (n >= p.N) break;
+            uint n = n0 + 4u * tc + CS * (j >> 2) + (j & 3u);
+            if (n >= p.N) continue;
             store_c(z, coff, m, row, n, acc[i * (TN / 4u) + (j >> 2)][j & 3u]);
         }
     }
