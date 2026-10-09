@@ -75,7 +75,9 @@ bfloat16, where the products on the matrix units reach 15 to 17 TFLOPS on its sh
 to 19.5.
 
 Done in 0.13.1: the tile choice, activations and gradients in bfloat16, the pooling backward pass
-(part of 2), larger tiles on the matrix units (part of 1). Done in 0.14: data sets on the GPU. The
+(part of 2), larger tiles on the matrix units (part of 1). Done in 0.14: data sets on the GPU, a
+kernel of its own for depthwise convolutions (part of 2: a MobileNet-style network trains 2.9 and 10
+times as fast, ahead of PyTorch). The
 next steps, each measured against the release before and against PyTorch:
 
 1. **The matrix units' kernel:** stores to shared memory without bank conflicts (a swizzled
@@ -83,9 +85,10 @@ next steps, each measured against the release before and against PyTorch:
    chosen by the tile the timing picked rather than by a single-precision estimate; target: cuBLAS's
    17 to 19.5 TFLOPS on the MLP's products, the weight gradients' among them.
 2. **Fewer passes:** batch normalization's sums gathered in the epilogue of the convolution before
-   it, its normalization and activation applied as the next layer reads its input; concatenated
-   layers writing straight into their channels of the concatenation; a kernel of its own for
-   depthwise convolutions; the first layer's three channels padded to four for vector loads.
+   it, its normalization and activation applied as the next layer reads its input (most of a
+   MobileNet-style network's time after its depthwise convolutions); concatenated layers writing
+   straight into their channels of the concatenation; the first layer's three channels padded to four
+   for vector loads.
 3. **Gathered rows in the products:** the first layer's products reading a shuffled mini-batch's
    rows of a data set through their indices, rather than after a gather (mini-batches of the MLP:
    two small dispatches a step).

@@ -31,6 +31,14 @@ RTX 4050 Laptop GPU; README).
 ### Changed
 - `TrainArgs`, `PredictArgs` and `EvaluateArgs` have new fields (above): programs built against 0.13
   need to be built again (the soname carries the minor version).
+- Depthwise convolutions (a group a channel) run on the GPU on a kernel of their own, which the matrix
+  kernel ran as products of k = taps that mostly multiplied padding: a MobileNet-style network (the
+  new fifth workload of `Examples/Benchmark.c`) trains 2.9 times as fast in single precision and 10
+  times as fast in bfloat16 on an RTX 4050 Laptop GPU, ahead of PyTorch with cuDNN (1.2 and 1.08 times
+  as fast as it), and infers 2.8 and 8.6 times as fast.
+- The first training of a process on a machine whose GPU driver has not compiled the kernels yet
+  makes the pipelines the tile choice times on several threads: 1.1 s instead of 2.75 s for the
+  fully connected network, 2.7 s instead of 6.2 s for ResNet-20 in bfloat16.
 - `predict()` and `evaluate()` on the GPU keep the parameters their copy of the network has while the
   network's do not change (they copied them on every call: 0.75 ms of a call of 3.2 for the fully
   connected network), and command buffers freed are used again (making one took 0.3 ms on NVIDIA's
@@ -40,7 +48,15 @@ RTX 4050 Laptop GPU; README).
   chunks of at most 2,048): in bfloat16 the convolutional networks infer 1.12 and 1.14 times as fast.
 - `Examples/Benchmark.c` times inference on a second call, as PyTorch's is timed after its warm-up
   (the first call makes the network's copy on the GPU, the counterpart of moving a PyTorch model
-  there), and runs every GPU workload on the host's arrays and on data sets in the GPU's memory.
+  there), runs every GPU workload on the host's arrays and on data sets in the GPU's memory, and has
+  a fifth workload, a MobileNet-style network (`benchmark_pytorch.py` too).
+
+### Fixed
+- The GPU's chunks keep a layer's values within the signed 32-bit indices its kernels compute: chunks
+  of 2,048 samples of layers of 2^20 values or more read and wrote outside their buffers. Networks of
+  up to 2^25 values a sample run in smaller chunks.
+- A chunk filled ahead on the GPU for a step that did not come (early stopping, a callback) no longer
+  leaves its rows' flags to the next `train()` of the network's copy.
 
 ## [0.13.1] - 2026-10-09
 

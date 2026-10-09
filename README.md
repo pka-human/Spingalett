@@ -1081,8 +1081,10 @@ hidden dense layer; and ResNet-20 (`Examples/CIFAR10.c resnet20`, 273K parameter
 4,096 synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with SGD and momentum, and
 inference; and the U-Net of `Examples/Segmentation.c` (118K parameters, 28 layers: transposed
 convolutions, concatenations, three sigmoid outputs a pixel) on 1,024 synthetic 64 x 64 x 3 images:
-one epoch of mini-batches of 32 with AdamW, and inference. `Examples/benchmark_pytorch.py` runs the
-same workloads in PyTorch. Run them with `Bin/Benchmark [threads]` and
+one epoch of mini-batches of 32 with AdamW, and inference; and a MobileNet-style network (69K
+parameters: a 3 x 3 convolution and four depthwise-separable blocks of 64 to 256 channels, each
+convolution normalized) on 4,096 synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with
+SGD and momentum, and inference. `Examples/benchmark_pytorch.py` runs the same workloads in PyTorch. Run them with `Bin/Benchmark [threads]` and
 `python Examples/benchmark_pytorch.py [threads]`.
 
 Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 efficiency cores, AVX2
@@ -1091,7 +1093,8 @@ and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build
 MKL and oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13
 to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was;
 0.11 to 0.13 leave all of them as they were on the CPU (within 4% of the release before, either
-way, in interleaved runs). The U-Net, new in 0.13, is measured with 0.13:
+way, in interleaved runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style network,
+new in 0.14, with 0.14:
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
@@ -1126,10 +1129,18 @@ way, in interleaved runs). The U-Net, new in 0.13, is measured with 0.13:
 | Spingalett (OpenMP) | 8 | 598 | 2,467 |
 | PyTorch | 8 | 365 | 754 |
 
+| MobileNet-style network | Threads | Training | Inference |
+|---|---:|---:|---:|
+| Spingalett | 1 | 797 | 3,762 |
+| PyTorch | 1 | 589 | 1,648 |
+| Spingalett (OpenMP) | 8 | 2,765 | 16,010 |
+| PyTorch | 8 | 1,377 | 3,808 |
+
 Spingalett trains the convolutional network 1.4 to 2.3 times as fast as PyTorch and runs it 2.6 to
 3.9 times as fast; with batch normalization 1.5 to 2.4 times and 3.4 to 5.5 times, since the
 normalization runs in the convolution's epilogue at inference. ResNet-20 trains 1.1 to 1.8 times as
-fast and runs 1.5 to 2.8 times as fast, the U-Net 1.1 to 1.6 times and 1.7 to 3.3 times. For the
+fast and runs 1.5 to 2.8 times as fast, the U-Net 1.1 to 1.6 times and 1.7 to 3.3 times, the
+MobileNet-style network 1.35 to 2 times and 2.3 to 4.2 times. For the
 fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast, full batches 1.1 to
 1.6 times and infers 1.1 to 1.7 times as fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: built without them
 (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
@@ -1159,21 +1170,26 @@ is timed after a first call (Spingalett) or a warm-up step (PyTorch):
 | Fully connected network, inference | 3,519,000 / 8,014,000 | 2,961,000 / 2,966,000 / 6,186,000 | 2,605,000 / 4,999,000 | 1,711,000 / 2,461,000 |
 | U-Net, training | 4,028 / 6,814 | 3,326 / 3,094 / 4,983 | 3,987 / 6,660 | 3,220 / 4,319 |
 | U-Net, inference | 12,030 / 21,790 | 6,390 / 6,627 / 11,840 | 11,970 / 21,760 | 6,053 / 10,970 |
+| MobileNet-style network, training | 11,940 / 24,480 | 9,839 / 8,618 / 22,860 | 11,940 / 24,390 | 9,737 / 22,100 |
+| MobileNet-style network, inference | 54,580 / 80,040 | 19,450 / 17,730 / 37,940 | 54,540 / 81,350 | 19,080 / 36,630 |
 
 Spingalett is ahead of PyTorch in every workload, in either setting. With the data in GPU memory, in
 single precision, it trains ResNet-20 1.25 times as fast as PyTorch with TF32 (1.4 times as fast as
 PyTorch in single precision) and runs it 1.8 times as fast, trains the convolutional networks 1.5 to
 1.8 times as fast and runs them 1.8 to 2.4 times as fast, the U-Net 1.2 to 1.3 and 1.8 to 1.9 times,
+the MobileNet-style network (PyTorch in channels-last, its faster layout for it) 1.2 and 2.8 times,
 and the fully connected network 1.1 times as fast in full batches, 3.2 to 3.6 times in mini-batches,
 and infers 1.19 times as fast. In bfloat16, against PyTorch's autocast: ResNet-20 1.5 and 2 times,
-the convolutional networks 1.5 to 1.7 and 1.85 to 2.1 times, the U-Net 1.4 and 1.8 times, the fully
-connected network 1.04 times in full batches, 5.8 times in mini-batches and 1.3 times in inference.
+the convolutional networks 1.5 to 1.7 and 1.85 to 2.1 times, the U-Net 1.4 and 1.8 times, the
+MobileNet-style network 1.07 and 2.1 times, the fully connected network 1.04 times in full batches,
+5.8 times in mini-batches and 1.3 times in inference.
 In single precision Spingalett trains ResNet-20 on the GPU 6.6 times as fast as on the eight threads
 of the CPU. Data sets on the GPU pay most for the fully connected network's inference, which host
 arrays bind to the bus (63 MB of samples, 31 MB as bfloat16): 1.35 times as fast in single precision
 and 1.6 times in bfloat16. Against 0.13.1 on the same machine (see the [CHANGELOG](CHANGELOG.md)),
-Spingalett infers the convolutional networks 1.12 to 1.14 times as fast in bfloat16, and predict()
-no longer copies the parameters of a network that has not changed.
+Spingalett infers the convolutional networks 1.12 to 1.14 times as fast in bfloat16, trains the
+MobileNet-style network 2.9 and 10 times as fast (its depthwise convolutions on a kernel of their
+own), and predict() no longer copies the parameters of a network that has not changed.
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
