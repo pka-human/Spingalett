@@ -7,6 +7,39 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+"Runtime": programs that only run trained models link `libspingalett-runtime`, the library's
+deployment models without its networks, training, data sets, importers or GPU backend: 510 KB
+where the library takes 2.0 MB (x86-64 release builds), and the same bits. The examples use the short names again.
+Programs of 1.0 run unchanged; no kernel changed.
+
+### Added
+- **The runtime:** `Spingalett.Runtime.h` declares what it has: `spingalett_model_load()`,
+  `spingalett_model_from_memory()`, `spingalett_model_predict()`, `spingalett_model_evaluate()`,
+  `spingalett_model_free()`, the engine of `Spingalett.Inference.h`, the version, errors, logging,
+  the compute mode and threads. These are the library's functions, which `Spingalett.h` now declares
+  through that header, built from the library's sources with its flags and kernels (chosen at run
+  time in release builds), so that a program written for the runtime runs with either library and
+  gets the same results; `runtime.library` compares them bit for bit on 121 models (every kind of
+  layer, every precision, one thread and four, single runs, evaluation). It reads `.slett` files of
+  versions 3 to 7 (what 0.5 and later write); files of versions 1 and 2 hold networks, and it refuses
+  them with `SPINGALETT_ERR_FORMAT_VERSION`, naming `ModelTool convert`. CMake builds it next to the
+  library (`SPINGALETT_RUNTIME`, on by default) or alone (`SPINGALETT_RUNTIME_ONLY`, which needs no
+  `glslc` or Vulkan headers); it installs as `Spingalett::runtime` and pkg-config's
+  `spingalett-runtime`, with the soname `libspingalett-runtime.so.1` and the library's symbol
+  versions. Every release archive carries it, and `spingalett-runtime-*` archives hold it alone. The
+  Conan recipe has a `runtime_only` option, and both packages give `Spingalett::runtime`.
+- `RunModel` (`Examples/Runtime/RunModel.c`, installed with the runtime): a model's layers and the
+  time of one sample and of batches, or the outputs of a file of raw float samples.
+
+### Changed
+- The examples, DigitPad and the code in the README use the short names of `Spingalett.Short.h`
+  (`NeuralNetwork`, `layer()`, `train()`, `ACT_RELU`), which read more easily; the descriptions and
+  `docs/Reference.md` keep the prefixed names that the library declares and exports. The README says
+  why the library needs its prefix.
+- `Spingalett.Short.h` takes the short names of the log levels, the compute modes and
+  `EvalMetrics` from `Spingalett.Runtime.h`, which gives them when `SPINGALETT_SHORT_NAMES` is
+  defined, as `Spingalett.Inference.h` gives the engine's.
+
 ## [1.0.0] - 2026-10-09
 
 "Stability": the API, the ABI and the formats of 0.14, which every 1.x release keeps (semantic

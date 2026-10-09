@@ -50,8 +50,8 @@ else.
   `docs/make_reference.py` (a test keeps it current), and `docs/Tutorial.md`, a path through the
   examples (XOR, MNIST, its CNN, CIFAR-10, a U-Net, deployment to a microcontroller).
 - **Room for CUDA** (done for the API): `SPINGALETT_COMPUTE_CUDA` reserved in the compute modes (it
-  falls back to the CPU until 1.1). The device layer under the GPU executor changes no API and comes
-  with the CUDA backend.
+  falls back to the CPU until 1.1). The device layer under the GPU executor changes no
+  API and comes with the CUDA backend.
 
 ## 1.0: stability (released)
 
@@ -67,6 +67,54 @@ ship with it.
 - **Packages** (done): `spingalett.pc` (relocatable), the CMake package compatible within a major
   version, a Conan recipe and a vcpkg port of the source tree (`packaging/`, tested in CI); the
   rules of compatibility in the README.
+
+## 1.1: the runtime and a CUDA backend
+
+Programs that only run trained models get a library of that part alone, and NVIDIA GPUs a backend
+of their own (below).
+
+- **The runtime** (done): `libspingalett-runtime` and `Spingalett.Runtime.h`, the deployment models
+  (loading, batched prediction on every core with the kernels chosen at run time, evaluation, the
+  engine) with errors, logging and the thread settings, built from the library's sources with its
+  flags, so that it gives the library's bits (`runtime.library` compares them on 121 models of every
+  kind of layer and precision); a quarter of the library's size, without networks, training, data
+  sets, importers or the GPU. Built next to the library or alone (`SPINGALETT_RUNTIME_ONLY`), with
+  its own archives, the CMake target `Spingalett::runtime`, pkg-config's `spingalett-runtime`, the
+  Conan and vcpkg packages, and `RunModel`.
+- **Examples in the short names** (done): the examples, DigitPad and the README's code use the
+  names of `Spingalett.Short.h`, which read more easily.
+
+### The CUDA backend
+
+The first large work of 1.x, now that the Vulkan backend's steps (under **Any time**) have shown how
+far Vulkan goes. What it cannot reach lies in what CUDA exposes and Vulkan does not: asynchronous copies into shared
+memory (`cp.async`), TF32 on the matrix units, `ldmatrix`, control of registers and shared memory.
+`COMPUTE_CUDA` (reserved in 0.14) runs on NVIDIA GPUs; Vulkan stays the backend for AMD, Intel and
+Apple GPUs, and for NVIDIA ones where CUDA is not built.
+
+- **Own kernels, no cuDNN or cuBLAS.** The CUDA driver (libcuda, which NVIDIA's driver installs)
+  is opened at run time, as the Vulkan loader is, so the library still loads and runs without it.
+  The kernels are CUDA C, compiled when the library is built to PTX (and to cubins for current
+  architectures), which the driver compiles for GPUs that come later: running needs no CUDA
+  toolkit, and packages stay a few megabytes.
+- **Why not cuDNN and cuBLAS:** they are half a gigabyte to a gigabyte of libraries for each CUDA
+  version; their fastest backward algorithms add through atomics, so runs would no longer repeat
+  their bits (PyTorch's deterministic mode gives those algorithms up, and their speed with them);
+  and the library measures its own kernels rather than wrapping others'. They remain what the
+  backend is measured against (`benchmark_pytorch.py --cuda`).
+- **The executor of the Vulkan backend, on the device layer of 0.14:** the batch path recorded
+  once per kind of chunk as a CUDA graph and replayed, as command buffers are now; the same fixed
+  orders of summation (no atomics, fixed slices), so CUDA runs repeat their bits too, and agree
+  with the CPU up to rounding.
+- **Kernels:** matrix products on `mma.sync` (TF32, bfloat16, FP16) fed by multi-stage `cp.async`
+  pipelines and `ldmatrix`, tiles chosen by timing; convolutions as implicit products over the tap
+  tables the Vulkan kernels use; activations in bfloat16, as the Vulkan executor keeps them; deployment models on the
+  GPU.
+- **Targets on the RTX 4050:** PyTorch's speed with cuDNN in each precision on ResNet-20, the MNIST
+  CNN and the U-Net, and within 10% of it on the MLP's full batches.
+- **Tests** as for Vulkan: the GPU against the CPU up to rounding, two runs bit for bit, the matrix
+  kernel's tiles bit for bit; CI compiles the kernels (nvcc in a container), and the GPU tests run
+  on an NVIDIA GPU before each release.
 
 ## Any time: work that changes no API
 
@@ -151,38 +199,6 @@ inference chunks larger than 32 MB of activations slowed even the MLP, whose lay
 cache between products; training chunks of 8,192 samples were no faster than of 4,096; the next
 epoch's first chunk submitted before the last one's losses come back would win 2 to 4% of full-batch
 epochs of 6 ms, and is left for now (it runs before early stopping and callbacks decide).
-
-## 1.1: a CUDA backend
-
-The first large work of 1.x, started once the steps above have shown how far Vulkan goes. What
-it cannot reach lies in what CUDA exposes and Vulkan does not: asynchronous copies into shared
-memory (`cp.async`), TF32 on the matrix units, `ldmatrix`, control of registers and shared memory.
-`COMPUTE_CUDA` (reserved in 0.14) runs on NVIDIA GPUs; Vulkan stays the backend for AMD, Intel and
-Apple GPUs, and for NVIDIA ones where CUDA is not built.
-
-- **Own kernels, no cuDNN or cuBLAS.** The CUDA driver (libcuda, which NVIDIA's driver installs)
-  is opened at run time, as the Vulkan loader is, so the library still loads and runs without it.
-  The kernels are CUDA C, compiled when the library is built to PTX (and to cubins for current
-  architectures), which the driver compiles for GPUs that come later: running needs no CUDA
-  toolkit, and packages stay a few megabytes.
-- **Why not cuDNN and cuBLAS:** they are half a gigabyte to a gigabyte of libraries for each CUDA
-  version; their fastest backward algorithms add through atomics, so runs would no longer repeat
-  their bits (PyTorch's deterministic mode gives those algorithms up, and their speed with them);
-  and the library measures its own kernels rather than wrapping others'. They remain what the
-  backend is measured against (`benchmark_pytorch.py --cuda`).
-- **The executor of the Vulkan backend, on the device layer of 0.14:** the batch path recorded
-  once per kind of chunk as a CUDA graph and replayed, as command buffers are now; the same fixed
-  orders of summation (no atomics, fixed slices), so CUDA runs repeat their bits too, and agree
-  with the CPU up to rounding.
-- **Kernels:** matrix products on `mma.sync` (TF32, bfloat16, FP16) fed by multi-stage `cp.async`
-  pipelines and `ldmatrix`, tiles chosen by timing; convolutions as implicit products over the tap
-  tables the Vulkan kernels use; activations in bfloat16, as the Vulkan executor keeps them; deployment models on the
-  GPU.
-- **Targets on the RTX 4050:** PyTorch's speed with cuDNN in each precision on ResNet-20, the MNIST
-  CNN and the U-Net, and within 10% of it on the MLP's full batches.
-- **Tests** as for Vulkan: the GPU against the CPU up to rounding, two runs bit for bit, the matrix
-  kernel's tiles bit for bit; CI compiles the kernels (nvcc in a container), and the GPU tests run
-  on an NVIDIA GPU before each release.
 
 ## After 1.0
 

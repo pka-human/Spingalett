@@ -23,8 +23,9 @@ accelerators; results are the same bits on one thread and many. Networks are dec
 designated initializers and all parameters live in flat contiguous arrays. For deployment, a trained network becomes a read-only
 model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
-alike. Models come in from ONNX files and PyTorch weights, and Python bindings (wheels with
-the library inside) are included.
+alike; programs that only run models link the runtime, a library of that part alone. Models come in
+from ONNX files and PyTorch weights, and Python bindings (wheels with the library inside) are
+included.
 
 ## Contents
 
@@ -59,7 +60,7 @@ the library inside) are included.
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy) |
-| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
+| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
@@ -70,7 +71,9 @@ the library inside) are included.
 
 Prebuilt libraries for Linux (x86-64 and ARM64), Windows and macOS are attached to every
 [release](https://github.com/pka-human/Spingalett/releases): each archive contains the headers,
-the shared library, a CMake package, a pkg-config file, `DatasetTool` and `ModelTool`. Extract one
+the shared library, a CMake package, a pkg-config file, `DatasetTool` and `ModelTool`, with the
+runtime library next to them; the `spingalett-runtime-*` archives hold the [runtime](#the-runtime)
+alone, for programs that only run models. Extract one
 and point CMake at it with `-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with
 `-I<dir>/include -L<dir>/lib -lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
 `-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
@@ -118,6 +121,8 @@ the processor supports (`spingalett_cpu_kernels()` names it).
 | `BUILD_EXAMPLE` | `ON` | Build the programs in `Examples/` |
 | `BUILD_TESTS` | `ON` | Build the test suite and register it with CTest |
 | `BUILD_APPS` | `OFF` | Build the DigitPad demo (needs SDL2) and its trainer |
+| `SPINGALETT_RUNTIME` | `ON` | Build the [runtime](#the-runtime) library next to the library |
+| `SPINGALETT_RUNTIME_ONLY` | `OFF` | Build only the runtime library (`Spingalett.Runtime.h`): deployment models on the CPU, without training, importers or the GPU backend (no `glslc` needed) |
 | `SPINGALETT_INFERENCE_ONLY` | `OFF` | Build only the inference engine (`Spingalett.Inference.h`) as a static library: no training, file I/O, OpenMP or heap |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
 | `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` (GCC, Clang): on x86-64 also build AVX2 and AVX-512 matrix kernels and AVX-512 VNNI and AVX-VNNI integer kernels, on AArch64 Linux integer kernels for the dot product instructions, and choose at run time |
@@ -128,25 +133,27 @@ the processor supports (`spingalett_cpu_kernels()` names it).
 
 An installed Spingalett is found with CMake's `find_package`; projects that vendor the
 repository can use `add_subdirectory()` instead. Both provide the target `Spingalett::spingalett`,
-which carries the include paths:
+and `Spingalett::runtime` for the runtime, which carry the include paths:
 
 ```cmake
-find_package(Spingalett 1.0 REQUIRED)         # or: add_subdirectory(external/Spingalett)
-target_link_libraries(my_app PRIVATE Spingalett::spingalett)
+find_package(Spingalett 1.1 REQUIRED)         # or: add_subdirectory(external/Spingalett)
+target_link_libraries(my_app PRIVATE Spingalett::spingalett)    # or Spingalett::runtime
 ```
 
-pkg-config finds it as `spingalett` (`cc app.c $(pkg-config --cflags --libs spingalett)`); the file
+pkg-config finds it as `spingalett` (`cc app.c $(pkg-config --cflags --libs spingalett)`), and the
+runtime as `spingalett-runtime`; the file
 locates the installation from its own directory, so an extracted release archive serves too, through
 `PKG_CONFIG_PATH=<dir>/lib/pkgconfig`.
 
 The repository carries a [Conan](https://conan.io) recipe and a [vcpkg](https://vcpkg.io) port that
-build the library of the checkout (shared, with OpenMP, kernels chosen at run time; the GPU backend
-as an option, with `glslc` and the Vulkan headers from the package manager). Both give
-`find_package(Spingalett)` and pkg-config's `spingalett`; they build with GCC or Clang (MinGW on
-Windows):
+build the library of the checkout (shared, with OpenMP, kernels chosen at run time, the runtime
+next to it; the GPU backend as an option, with `glslc` and the Vulkan headers from the package
+manager). Both give `find_package(Spingalett)` and pkg-config's `spingalett` and
+`spingalett-runtime`; they build with GCC or Clang (MinGW on Windows):
 
 ```bash
 conan create packaging/conan --build=missing                  # -o "&:vulkan=True": the GPU backend
+                                                              # -o "&:runtime_only=True": the runtime alone
 vcpkg install spingalett --overlay-ports=packaging/vcpkg      # "spingalett[vulkan]": the GPU backend
 ```
 
@@ -1039,6 +1046,58 @@ Sapphire Rapids), one sample at a time and batched:
 | Batched samples per second | | 50,600 | 48,500 | 57,400 | 184,600 | 172,200 | 195,900 |
 | Weights | 3.7 MB | 3.7 MB | 1.9 MB | 1.9 MB | 0.9 MB | 0.5 MB | 0.2 MB |
 
+### The runtime
+
+Programs that only run trained models can link the runtime instead of the library.
+`libspingalett-runtime`, declared by `Spingalett.Runtime.h`, holds what this section describes:
+`.slett` files loaded as models, `spingalett_model_predict()` and `spingalett_model_evaluate()` with
+the library's kernels, threads and choice of instruction sets at run time, the engine of
+`Spingalett.Inference.h`, errors, logging and the thread settings. It has no networks, training,
+data sets, importers or GPU backend, which leaves 510 KB of the full library's 2.0 MB (the x86-64
+release builds, with the kernels for AVX2 and AVX-512), and needs only the C library, threads and
+OpenMP. It computes the same bits as the library, as fast: its functions are the library's
+(`Spingalett.h` declares them through `Spingalett.Runtime.h`), compiled from the same sources with
+the same flags; the tests compare the two on models of every kind of layer in every precision, and
+alternated in one process on an Intel Core i7-12650H they predict batches of the benchmark's MLP,
+the MNIST CNN and ResNet-20, in FP32 and INT8, within 1.5% of each other either way on one thread
+and on eight (2.5% on all sixteen, which mix the processor's two kinds of cores). A program written
+for the runtime also builds and runs with the full library.
+
+```c
+#define SPINGALETT_SHORT_NAMES                         /* COMPUTE_OPENMP, PRECISION_INT8, ... */
+#include <Spingalett/Spingalett.Runtime.h>
+
+SpingalettModel *model = spingalett_model_load("model.slett");
+if (!model) { fprintf(stderr, "%s\n", spingalett_last_error_message()); return 1; }
+spingalett_set_compute_mode(COMPUTE_OPENMP);           /* every core */
+spingalett_model_predict(model, inputs, count, outputs);
+spingalett_model_free(model);
+```
+
+A build with `-DSPINGALETT_RUNTIME_ONLY=ON` makes the runtime alone, without `glslc` or the Vulkan
+headers; other builds make it next to the library (`SPINGALETT_RUNTIME`). It installs as the CMake
+target `Spingalett::runtime` and the pkg-config package `spingalett-runtime`, with `RunModel`
+(`Examples/Runtime/RunModel.c`), which describes a model and times it, or predicts the samples of a
+file of floats:
+
+```
+RunModel model.slett                        the layers, then the time of one sample and of batches
+RunModel model.slett inputs.f32 out.f32     the outputs of raw float samples (classes without out.f32)
+```
+
+The runtime reads `.slett` files of format versions 3 to 7, everything Spingalett 0.5 and later
+writes. Files of versions 1 and 2 (0.4 and earlier) hold networks rather than images; it refuses
+them with `SPINGALETT_ERR_FORMAT_VERSION`, and `ModelTool convert` rewrites them.
+
+| | Library | Runtime | Engine |
+|---|---|---|---|
+| Header | `Spingalett.h` | `Spingalett.Runtime.h` | `Spingalett.Inference.h` |
+| Training, networks, data sets, importers, the GPU | yes | | |
+| `.slett` models from FP32 to INT2 | yes | yes | yes |
+| Batches, threads, kernels chosen at run time | yes | yes | one sample at a time |
+| Heap, files | yes | yes | |
+| Size | 2.0 MB (x86-64) | 510 KB (x86-64) | about 12 KB of code on a Cortex-M4 |
+
 ### Running in place
 
 A model is a view of a `.slett` image (format version 3 or later: 4 with convolutions, 6 for graphs, 7 with
@@ -1354,18 +1413,20 @@ predicts 3,400 images a second on the CPU against 3,100 for the FP32 model.
 ## Project layout
 
 ```
-Include/Spingalett/   Public headers (Spingalett.h, the inference engine's Spingalett.Inference.h)
-                      and the CMake-generated configuration header template
+Include/Spingalett/   Public headers (Spingalett.h, the runtime's Spingalett.Runtime.h, the inference
+                      engine's Spingalett.Inference.h) and the CMake-generated configuration header
+                      template
 Src/                  Library sources (network, training, kernels, serialization, inference engine, ...)
 Src/Gpu/              The Vulkan GPU backend: device layer, network executor and compute shaders
 Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, throughput
                       benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
+Examples/Runtime/     RunModel, a program of the runtime alone
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets)
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
 Bindings/Python/      Python bindings
-cmake/                CMake package and inference-only build helpers
+cmake/                CMake package, pkg-config, runtime and inference-only build helpers
 ```
 
 ## Compatibility
@@ -1374,12 +1435,14 @@ From 1.0 on, Spingalett follows [semantic versioning](https://semver.org/): a 1.
 what 1.0 gave, and only 2.0 may take anything away.
 
 - **Source:** a program written for 1.x compiles against every later 1.y. No function, type, struct
-  field, enumerator or constant of the headers (`Spingalett.h`, `Spingalett.Inference.h`,
-  `Spingalett.Short.h`, `Spingalett.hpp`) is removed, renamed or given another meaning; releases add
+  field, enumerator or constant of the headers (`Spingalett.h`, `Spingalett.Runtime.h`,
+  `Spingalett.Inference.h`, `Spingalett.Short.h`, `Spingalett.hpp`) is removed, renamed or given
+  another meaning (a declaration may move to a header that `Spingalett.h` includes); releases add
   them. A new field takes the place of reserved words and means, at zero, what a program that does
   not know it expects, so the designated initializers of 1.0 keep their meaning.
 - **Binary:** a program built against 1.x runs with every later 1.y without being built again: the
-  shared library keeps the soname `libspingalett.so.1` (`libspingalett.1.dylib` on macOS), the structs
+  shared library keeps the soname `libspingalett.so.1` (`libspingalett.1.dylib` on macOS), and the
+  runtime `libspingalett-runtime.so.1` with the same symbol versions, the structs
   keep their size and the offsets of their fields, enumerators keep their values, and functions keep
   their parameters. On ELF platforms the functions carry symbol versions (`SPINGALETT_1.0`, then one
   per release that adds some), so that the loader refuses a library older than the program needs.
@@ -1410,7 +1473,7 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 - Any release of 1.x, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
   the single-precision kernel for convolutions of few channels, products in FP16, Winograd
   convolutions
-- 1.1: a CUDA backend of its own kernels (no cuDNN), next to Vulkan
+- 1.1: the runtime (done) and a CUDA backend of its own kernels (no cuDNN), next to Vulkan
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 
 ## Contributing

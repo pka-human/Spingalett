@@ -8,7 +8,8 @@ documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; 
 
 Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch
 normalization, adding and concatenating layers, as chains or graphs), deployment models in FP32 down
-to INT2, a standalone inference engine for microcontrollers (one C file, no heap), ONNX and PyTorch
+to INT2, the runtime (a library of the deployment models alone), a standalone inference engine for
+microcontrollers (one C file, no heap), ONNX and PyTorch
 import, a GPU backend through Vulkan compute, Python bindings over ctypes (wheels with the library
 inside), and the DigitPad demo app.
 Its promise is speed: **a change must not make anything slower**, and kernels are measured, not
@@ -18,11 +19,12 @@ assumed (see [Performance work](#performance-work)).
 
 | Path | Contents |
 |---|---|
-| `Include/Spingalett/Spingalett.h` | Public training and deployment API (`Spingalett.Inference.h`: the engine's API, included by it) |
+| `Include/Spingalett/Spingalett.h` | Public training and deployment API; it includes `Spingalett.Runtime.h` (the runtime's API: versions, errors, settings, deployment models), which includes `Spingalett.Inference.h` (the engine's) |
 | `Src/Spingalett.Private.h`, `Src/Spingalett.Network.h` | Internal declarations; the network is opaque to users |
 | `Src/Spingalett.Engine.h` | Internals shared by the engine and the desktop library (layer table, kernels, scratch rules) |
 | `Src/Spingalett.Inference.c` | The standalone engine: `.slett` parsing, per-sample kernels for every precision. Must stay free of heap, stdio, files and OpenMP (`model.engine_symbols` checks) and compile as C99 |
 | `Src/Spingalett.Model.c` | Batched deployment models (`spingalett_model_predict`): weights prepared once per owned model, a workspace kept between calls |
+| `cmake/Runtime.cmake`, `Src/Spingalett.Runtime.map` | The runtime library: the sources that load and run models, compiled with the library's flags (`spingalett_build`) and `SPINGALETT_RUNTIME`, its exports and their symbol versions |
 | `Src/Spingalett.Int8Tiles.c` | Batched INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product) |
 | `Src/Spingalett.GEMM.c` | Float matrix kernels, including implicit im2col and epilogues |
 | `Src/Spingalett.ConvGEMM.c` | Convolutions as indirect products: windows read through per-tap pointers (forward, data and weight gradients) |
@@ -34,8 +36,8 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
 | `Src/Gpu/` | The GPU backend: `Spingalett.Vulkan.c` (device, buffers, pipelines; the loader opened at run time), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use; convolution geometries), `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as command buffers), `Shaders/*.comp` (GLSL, listed in `Spingalett.Kernels.def`; `SPG_KERNEL_H` ones are built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
-| `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
-| `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools, the demo app, the bindings (a package; `setup.py` builds wheels) |
+| `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), `RuntimeTests.c` (the runtime alone, C99), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
+| `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools (`Examples/Runtime/`: programs of the runtime), the demo app, the bindings (a package; `setup.py` builds wheels) |
 
 ## Build and test
 
@@ -60,6 +62,8 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   and with Clang, whose UBSan also catches offsets applied to null pointers
   (`LSAN_OPTIONS=suppressions=Tests/lsan.supp`: LLVM's OpenMP runtime keeps memory until exit);
 - the engine alone: `cc -std=c99 -Wall -Wextra -Wpedantic -Werror -DSPINGALETT_INFERENCE_ONLY -IInclude -ISrc -c Src/Spingalett.Inference.c`;
+- the runtime alone (`-DSPINGALETT_RUNTIME_ONLY=ON`) for changes to the files it is built from
+  (`cmake/Runtime.cmake`) or to its header;
 - for SIMD changes, every instruction set the code has a path for. AArch64 cross builds run under
   `qemu-aarch64` (`QEMU_CPU=cortex-a53` for no dot product, `max` for all features); MinGW builds
   run under Wine; `Examples/Embedded/run-qemu.sh` runs the engine on a Cortex-M4. AVX-512 paths on
@@ -94,6 +98,16 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   `Src/Spingalett.map` (the symbol versions; the test checks that it lists the headers' functions and
   that the library exports them), and the baseline is recorded again at each release
   (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`).
+- **The runtime gives the library's bits.** `libspingalett-runtime` is the library's model code
+  compiled again with the same flags (`spingalett_build`), so a model computes the same in both:
+  `runtime.library` compares the runtime with the full library's outputs on every kind of layer and
+  precision (`SpingalettTests export-models`). Code that the runtime's sources need from elsewhere
+  moves into them (as `spingalett_read_file()` and `spingalett_sample_correct()` did), and what they
+  hold for networks, training or the GPU is left out with `#if !defined(SPINGALETT_RUNTIME)`, so that
+  the runtime links without the rest even in Debug builds; its exports are exactly
+  `Src/Spingalett.Runtime.map` (`runtime.abi`). A function added to `Spingalett.Runtime.h` or
+  `Spingalett.Inference.h` goes into both maps, in the same node. `Tests/Data/runtime` holds models
+  of past releases, which every 1.x runtime must run.
 - **ABI with Python.** `Tests/Spingalett.Layout.c` and `test_python_layout.py` check that the
   ctypes structures match the C ones; a new field in a public struct needs both sides.
 - **Engine scratch.** The engine's workspace size comes from `slett_conv_scratch()`; kernels may
@@ -204,7 +218,9 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`,
 `Bindings/Python/spingalett/__init__.py` and `packaging/vcpkg/spingalett/vcpkg.json`. A release records
 its ABI (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`), and one that adds
-functions gives them a new node in `Src/Spingalett.map`. `.github/workflows/release.yml` builds packages for Linux
-(x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), trains the DigitPad model
+functions gives them a new node in `Src/Spingalett.map` (and `Src/Spingalett.Runtime.map`, for the
+runtime's). `.github/workflows/release.yml` builds packages for Linux
+(x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), each also as a runtime
+archive (`SPINGALETT_RUNTIME_ONLY`), trains the DigitPad model
 (2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip. The
 maintainer merges pull requests and pushes tags.

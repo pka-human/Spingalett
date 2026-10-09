@@ -114,6 +114,9 @@ inference engine alone (`Src/Spingalett.Inference.c` and `Spingalett.Inference.h
 
 ## Further
 
+- Models in a program that does not train: `Examples/Runtime/RunModel.c` links the runtime,
+  `libspingalett-runtime` (`Spingalett.Runtime.h`), a quarter of the library's size with the same
+  kernels and results (`Bin/RunModel mnist.slett` after step 2; README, The runtime).
 - C++: `Spingalett/Spingalett.hpp` wraps the same calls in owning types, `std::span` and
   `std::expected` (README, section C++).
 - Python: `pip install spingalett` gives the same library to NumPy programs
