@@ -159,11 +159,10 @@ enum { SPG_COMBINE_ADD, SPG_COMBINE_SLICE, SPG_COMBINE_GAP };
 typedef struct {
     uint64_t x, w, y, e0;
     uint32_t total, in_h, in_w, in_c, out_h, out_w, out_c, og;
-    uint32_t ph, pw, pixels, rows;
+    uint32_t ph, pw, pixels, rows, lanes;
     float beta;
 } SpgDwconvPush;
 enum { SPG_DW_APPLY, SPG_DW_SPREAD, SPG_DW_WEIGHTS };
-#define SPG_DW_ROWS 256u            /* output pixels a slice of the weight gradient */
 #define SPG_DW_TAPS 49u             /* taps at most */
 
 /* rows.comp */
