@@ -4148,7 +4148,10 @@ static void pytorch_transposed(void) {
     free(data);
 }
 
-/* ---- the GPU (COMPUTE_VULKAN) against the CPU ---- */
+/* ---- the GPU (COMPUTE_VULKAN, or COMPUTE_CUDA in the group "cuda") against the CPU ---- */
+
+/* The compute mode of the GPU group's tests: gpu_mode, or COMPUTE_CUDA. */
+static ComputeMode gpu_mode = COMPUTE_VULKAN;
 
 /* Networks covering every kind of layer the GPU runs: dense layers, convolutions (strided, grouped,
    depthwise), pooling, batch normalization (of convolutions and of dense layers), residual additions,
@@ -4384,7 +4387,7 @@ static void gpu_equivalence(int which) {
     float *pc = (float *)malloc((size_t)n * out_sz * sizeof(float)), *pg = (float *)malloc((size_t)n * out_sz * sizeof(float));
     spingalett_set_compute_mode(COMPUTE_OPENMP);
     predict(.net = probe, .inputs = x, .outputs = pc, .sample_count = n);
-    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    spingalett_set_compute_mode(gpu_mode);
     predict(.net = probe, .inputs = x, .outputs = pg, .sample_count = n);
     free_network(probe);
     double predicted = gpu_max_rel(pc, pg, (size_t)n * out_sz);
@@ -4395,8 +4398,8 @@ static void gpu_equivalence(int which) {
     const float clip = which == 1 ? 0.5f : 0.0f;
     const TrainingStrategy mini = STRATEGY_SMALL_BATCH, whole = STRATEGY_FULL_BATCH;
     float *oc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], mini, clip, true, &wc, &count, &rc);
-    float *og = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], mini, clip, true, &wg, &count, &rg);
-    float *og2 = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], mini, clip, true, &wg2, &count, &rg2);
+    float *og = gpu_trained(which, gpu_mode, x, t, n, out_sz, opts[which], mini, clip, true, &wg, &count, &rg);
+    float *og2 = gpu_trained(which, gpu_mode, x, t, n, out_sz, opts[which], mini, clip, true, &wg2, &count, &rg2);
     double trained = gpu_max_rel(oc, og, (size_t)n * out_sz);
     bool same = !memcmp(wg, wg2, count * sizeof(float)) && !memcmp(og, og2, (size_t)n * out_sz * sizeof(float));
     /* full batch: the CPU normalizes over chunks of a bounded size, so only networks without batch
@@ -4404,7 +4407,7 @@ static void gpu_equivalence(int which) {
     float *fc, *fg;
     TrainReport fr1, fr2;
     float *ofc = gpu_trained(which, COMPUTE_OPENMP, x, t, n, out_sz, opts[which], whole, 0.0f, true, &fc, &count, &fr1);
-    float *ofg = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, opts[which], whole, 0.0f, true, &fg, &count, &fr2);
+    float *ofg = gpu_trained(which, gpu_mode, x, t, n, out_sz, opts[which], whole, 0.0f, true, &fg, &count, &fr2);
     double full = which == 5 ? 0.0 : gpu_max_rel(ofc, ofg, (size_t)n * out_sz);
     CHECK(predicted < 1e-4, "gpu net %d: predictions differ by %.2e", which, predicted);
     CHECK(rg.status == TRAIN_COMPLETED && fr2.status == TRAIN_COMPLETED, "gpu net %d: training failed", which);
@@ -4427,7 +4430,7 @@ static void gpu_saturated(void) {
     float loss[2];
     for (int k = 0; k < 2; k++) {
         NeuralNetwork *net = build(LOSS_CROSS_ENTROPY, ls, 2, (const float[]){0.0f, 0.0f}, (const float[]){100.0f});
-        spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+        spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_OPENMP);
         TrainReport r = train(.net = net, .inputs = x, .targets = t, .sample_count = 4, .epochs = 1, .batch_size = 4,
                               .training_strategy = STRATEGY_SMALL_BATCH, .learning_rate = 1e-6f, .report_interval = 0);
         loss[k] = r.train_loss;
@@ -4465,7 +4468,7 @@ static void gpu_training_options(void) {
     size_t count = 0;
     for (int k = 0; k < 2; k++) {
         NeuralNetwork *net = gpu_net(0);
-        spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+        spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_OPENMP);
         spingalett_seed(5);
         r[k] = train(.net = net, .inputs = x, .targets = t, .sample_count = 192, .val_inputs = x + 192 * in_sz,
                      .val_targets = t + 192 * out_sz, .val_count = 64, .epochs = 6, .batch_size = 16,
@@ -4505,7 +4508,7 @@ static void gpu_training_options(void) {
         float val[2], mean[2][16], var[2][16];
         for (int k = 0; k < 2; k++) {
             NeuralNetwork *net = gpu_net(2);
-            spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+            spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_OPENMP);
             spingalett_seed(9);
             TrainReport rb = train(.net = net, .inputs = bx, .targets = bt, .sample_count = 64, .val_inputs = bx + 64 * bin,
                                    .val_targets = bt + 64 * bout, .val_count = 32, .epochs = 3, .batch_size = 16,
@@ -4529,7 +4532,7 @@ static void gpu_training_options(void) {
     TrainReport g[2];
     for (int k = 0; k < 2; k++) {
         NeuralNetwork *net = gpu_net(0);
-        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        spingalett_set_compute_mode(gpu_mode);
         GpuServe serve = {x, t, n, in_sz, out_sz, 0};
         g[k] = k ? train(.net = net, .training_mode = MODE_GENERATOR_FUNCTION, .generator = gpu_serve,
                          .generator_data = &serve, .sample_count = n, .epochs = 2, .batch_size = 32,
@@ -4545,7 +4548,7 @@ static void gpu_training_options(void) {
     TrainReport s[2];
     for (int k = 0; k < 2; k++) {
         NeuralNetwork *net = gpu_net(0);
-        spingalett_set_compute_mode(k ? COMPUTE_VULKAN : COMPUTE_OPENMP);
+        spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_OPENMP);
         spingalett_seed(3);
         s[k] = train(.net = net, .inputs = x, .targets = t, .sample_count = 64, .epochs = 1,
                      .training_strategy = STRATEGY_SAMPLE, .report_interval = 0);
@@ -4598,7 +4601,7 @@ static void *gpu_train_job(void *arg) {
 
 static void gpu_threads(void) {
 #if !defined(_WIN32)
-    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    spingalett_set_compute_mode(gpu_mode);
     GpuJob alone[2] = {{1, NULL, 0}, {2, NULL, 0}}, together[2] = {{1, NULL, 0}, {2, NULL, 0}};
     for (int k = 0; k < 2; k++) gpu_train_job(&alone[k]);
     pthread_t threads[2];
@@ -4630,7 +4633,7 @@ static void *gpu_predict_job(void *arg) {
    on its own, bit for bit. */
 static void gpu_kept_threads(void) {
 #if !defined(_WIN32)
-    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    spingalett_set_compute_mode(gpu_mode);
     NeuralNetwork *net = gpu_net(0);
     const uint32_t n = 300, in = net->topology[0], out = net->topology[net->layers - 1];
     float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
@@ -4665,7 +4668,7 @@ static void gpu_kept_threads(void) {
 static void gpu_device_data_threads(void) {
 #if !defined(_WIN32)
     if (!spingalett_set_gpu_precision(PRECISION_BFLOAT16)) return;
-    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    spingalett_set_compute_mode(gpu_mode);
     NeuralNetwork *net = gpu_net(2);
     const uint32_t n = 300, in = net->topology[0], out = net->topology[net->layers - 1];
     float *x = (float *)malloc((size_t)n * in * sizeof(float));
@@ -4702,7 +4705,7 @@ static void gpu_kept_copy(void) {
     static const int nets[] = {1, 2, 6};
     for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
         const int which = nets[j];
-        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        spingalett_set_compute_mode(gpu_mode);
         NeuralNetwork *net = gpu_net(which);
         const uint32_t n = 40, in = net->topology[0], out = net->topology[net->layers - 1];
         float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
@@ -4754,7 +4757,7 @@ static void gpu_predict_cached(void) {
     bool ok = true;
     const char *failed = NULL;
     for (int stage = 0; stage < 5 && ok; stage++) {
-        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        spingalett_set_compute_mode(gpu_mode);
         predict(.net = net, .inputs = x, .outputs = yg, .sample_count = n);
         if (stage) memcpy(before, yg, (size_t)n * out * sizeof(float));
         /* the change of this stage, then the GPU's predictions against the CPU's */
@@ -4767,7 +4770,7 @@ static void gpu_predict_cached(void) {
             spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, info.weight_count);
             free(w);
         } else if (stage == 2 || stage == 3) {
-            spingalett_set_compute_mode(stage == 2 ? COMPUTE_OPENMP : COMPUTE_VULKAN);
+            spingalett_set_compute_mode(stage == 2 ? COMPUTE_OPENMP : gpu_mode);
             SpingalettTrainer *tr = spingalett_trainer_new(net, n);
             spingalett_trainer_forward(tr, x, n);
             if (stage == 3) {
@@ -4775,7 +4778,7 @@ static void gpu_predict_cached(void) {
                 spingalett_trainer_step(tr, &(OptimizerArgs){.type = OPTIMIZER_SGD, .learning_rate = 0.1f});
             }
             /* predictions while the trainer has the network (on the GPU: its copy brought back) */
-            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            spingalett_set_compute_mode(gpu_mode);
             predict(.net = net, .inputs = x, .outputs = yg, .sample_count = n);
             spingalett_set_compute_mode(COMPUTE_OPENMP);
             predict(.net = net, .inputs = x, .outputs = yc, .sample_count = n);
@@ -4786,7 +4789,7 @@ static void gpu_predict_cached(void) {
             train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .batch_size = 8,
                   .training_strategy = STRATEGY_SMALL_BATCH, .report_interval = 0);
         }
-        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        spingalett_set_compute_mode(gpu_mode);
         predict(.net = net, .inputs = x, .outputs = yg, .sample_count = n);
         spingalett_set_compute_mode(COMPUTE_OPENMP);
         predict(.net = net, .inputs = x, .outputs = yc, .sample_count = n);
@@ -4875,8 +4878,8 @@ static void gpu_trainer(void) {
         }
         free_network(probe);
         gpu_trainer_run(which, COMPUTE_OPENMP, p[0], count, loss[0], y[0]);
-        gpu_trainer_run(which, COMPUTE_VULKAN, p[1], count, loss[1], y[1]);
-        gpu_trainer_run(which, COMPUTE_VULKAN, p[2], count, loss[2], y[2]);
+        gpu_trainer_run(which, gpu_mode, p[1], count, loss[1], y[1]);
+        gpu_trainer_run(which, gpu_mode, p[2], count, loss[2], y[2]);
         double dl = 0.0;
         for (int s = 0; s < 6; s++) dl = fmax(dl, fabs((double)loss[0][s] - loss[1][s]) / fmax(1e-6, fabs((double)loss[0][s])));
         NeuralNetwork *shape = gpu_net(which);
@@ -4924,7 +4927,7 @@ static void gpu_callback(void) {
             lcg_state = 99;
             for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
             for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
-            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            spingalett_set_compute_mode(gpu_mode);
             TrainArgs a = {.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
                            .optimizer_type = OPTIMIZER_MOMENTUM, .momentum = 0.9f, .beta1 = 0.9f, .beta2 = 0.999f,
                            .epsilon = 1e-8f, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0};
@@ -4998,7 +5001,7 @@ static void gpu_kept(void) {
             lcg_state = 555;
             for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
             for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
-            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            spingalett_set_compute_mode(gpu_mode);
             TrainArgs a = {.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .learning_rate = 0.01f,
                            .optimizer_type = OPTIMIZER_MOMENTUM, .momentum = 0.9f, .beta1 = 0.9f, .beta2 = 0.999f,
                            .epsilon = 1e-8f, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0};
@@ -5115,9 +5118,9 @@ static void gpu_device_data(void) {
             const TrainingStrategy st = strategy ? STRATEGY_FULL_BATCH : STRATEGY_SMALL_BATCH;
             TrainReport r0, r;
             size_t count;
-            float *w0 = gpu_data_trained(which, COMPUTE_VULKAN, st, sides[0], &r0, &count);
+            float *w0 = gpu_data_trained(which, gpu_mode, st, sides[0], &r0, &count);
             for (int k = 1; k < 4; k++) {
-                float *w = gpu_data_trained(which, COMPUTE_VULKAN, st, sides[k], &r, &count);
+                float *w = gpu_data_trained(which, gpu_mode, st, sides[k], &r, &count);
                 same = same && r.status == TRAIN_COMPLETED && !memcmp(w0, w, count * sizeof(float)) &&
                        r.train_loss == r0.train_loss && r.validation.loss == r0.validation.loss;
                 free(w);
@@ -5139,7 +5142,7 @@ static void gpu_device_data(void) {
         float *y0 = (float *)malloc((size_t)n * out * sizeof(float)), *y1 = (float *)malloc((size_t)n * out * sizeof(float));
         bool inference = true;
         for (int m = 0; m < 2; m++) {
-            spingalett_set_compute_mode(m ? COMPUTE_OPENMP : COMPUTE_VULKAN);
+            spingalett_set_compute_mode(m ? COMPUTE_OPENMP : gpu_mode);
             memset(y1, 0xFF, (size_t)n * out * sizeof(float));
             inference = inference && predict(.net = probe, .inputs = x, .outputs = y0, .sample_count = n) &&
                         predict(.net = probe, .device_inputs = dx, .outputs = y1, .sample_count = n) &&
@@ -5148,7 +5151,7 @@ static void gpu_device_data(void) {
             EvalMetrics e1 = evaluate(.net = probe, .device_inputs = dx, .device_targets = dt, .sample_count = n);
             inference = inference && e0.loss == e1.loss && e0.accuracy == e1.accuracy;
         }
-        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        spingalett_set_compute_mode(gpu_mode);
         /* refused: rows of another size, too few rows, a set and an array of the same samples */
         spingalett_set_log_level(LOG_NONE);
         const bool refused = !predict(.net = probe, .device_inputs = dt, .outputs = y1, .sample_count = n) &&
@@ -5195,7 +5198,7 @@ static void gpu_bf16(void) {
         for (size_t i = 0; i < (size_t)n * in_sz; i++) x[i] = frand() * 2.0f - 1.0f;
         for (uint32_t s = 0; s < n; s++) t[s * out_sz + (uint32_t)(frand() * out_sz) % out_sz] = 1.0f;
         float *p[2] = {(float *)malloc((size_t)n * out_sz * sizeof(float)), (float *)malloc((size_t)n * out_sz * sizeof(float))};
-        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        spingalett_set_compute_mode(gpu_mode);
         for (int k = 0; k < 2; k++) {
             spingalett_set_gpu_precision(k ? PRECISION_BFLOAT16 : PRECISION_FLOAT32);
             predict(.net = probe, .inputs = x, .outputs = p[k], .sample_count = n);
@@ -5208,7 +5211,7 @@ static void gpu_bf16(void) {
         TrainReport r[3];
         for (int k = 0; k < 3; k++) {
             spingalett_set_gpu_precision(k == 0 ? PRECISION_FLOAT32 : PRECISION_BFLOAT16);
-            o[k] = gpu_trained(which, COMPUTE_VULKAN, x, t, n, out_sz, OPTIMIZER_MOMENTUM, STRATEGY_SMALL_BATCH, 0.0f,
+            o[k] = gpu_trained(which, gpu_mode, x, t, n, out_sz, OPTIMIZER_MOMENTUM, STRATEGY_SMALL_BATCH, 0.0f,
                                false, &w[k], &count, &r[k]);
         }
         spingalett_set_gpu_precision(PRECISION_FLOAT32);
@@ -5515,12 +5518,16 @@ int main(int argc, char **argv) {
         for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);
         model_conv();
     }
-    if (!*only || !strcmp(only, "gpu")) {
-        printf("[GPU]\n");
-        if (!spingalett_gpu_device()) {
-            printf("  skipped: no usable Vulkan device\n");
+    for (int backend = 0; backend < 2; backend++) {
+        /* the group "gpu" on Vulkan, "cuda" on CUDA */
+        if (*only && strcmp(only, backend ? "cuda" : "gpu")) continue;
+        gpu_mode = backend ? COMPUTE_CUDA : COMPUTE_VULKAN;
+        const char *device = backend ? spingalett_cuda_device() : spingalett_gpu_device();
+        printf("[GPU, %s]\n", backend ? "CUDA" : "Vulkan");
+        if (!device) {
+            printf("  skipped: no usable %s device\n", backend ? "CUDA" : "Vulkan");
         } else {
-            printf("  device: %s\n", spingalett_gpu_device());
+            printf("  device: %s\n", device);
             for (int k = 0; k < 9; k++) gpu_equivalence(k);
             gpu_equivalence(11);
             gpu_equivalence(12);

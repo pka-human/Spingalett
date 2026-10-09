@@ -149,11 +149,6 @@ ComputeMode resolve_compute_mode(void) {
             return mode;
 #endif
         case COMPUTE_CUDA:
-#if !defined(SPINGALETT_HAS_CUDA)
-            return fallback_to_single_threaded(mode, "CUDA");
-#else
-            return mode;
-#endif
         case COMPUTE_VULKAN:
             /* what runs on the CPU uses its threads */
 #if defined(_OPENMP)
@@ -170,12 +165,21 @@ ComputeMode resolve_compute_mode(void) {
    CPU's threads, as in the full library). */
 #if !defined(SPINGALETT_RUNTIME)
 bool spingalett_use_gpu(void) {
-    if (spingalett_get_compute_mode() != COMPUTE_VULKAN) return false;
-    if (spingalett_gpu_available()) return true;
-    if (!atomic_exchange(&s_fallback_warned[COMPUTE_VULKAN], true))
-        spingalett_log(LOG_WARNING, "Vulkan requested but %s. Falling back to the CPU.",
-#if defined(SPINGALETT_HAS_VULKAN)
-                       "no usable device was found (Vulkan 1.2 with buffer device addresses)"
+    const ComputeMode mode = spingalett_get_compute_mode();
+    if (mode != COMPUTE_VULKAN && mode != COMPUTE_CUDA) return false;
+    if (spingalett_gpu_select(mode)) return true;
+    const bool cuda = mode == COMPUTE_CUDA;
+    if (!atomic_exchange(&s_fallback_warned[mode], true))
+        spingalett_log(LOG_WARNING, "%s requested but %s. Falling back to the CPU.", cuda ? "CUDA" : "Vulkan",
+#if defined(SPINGALETT_HAS_VULKAN) && defined(SPINGALETT_HAS_CUDA)
+                       cuda ? "no usable device was found (compute capability 8.0 or later, a CUDA 11 driver)"
+                            : "no usable device was found (Vulkan 1.2 with buffer device addresses)"
+#elif defined(SPINGALETT_HAS_VULKAN)
+                       cuda ? "the library was built without it"
+                            : "no usable device was found (Vulkan 1.2 with buffer device addresses)"
+#elif defined(SPINGALETT_HAS_CUDA)
+                       cuda ? "no usable device was found (compute capability 8.0 or later, a CUDA 11 driver)"
+                            : "the library was built without it"
 #else
                        "the library was built without it"
 #endif
@@ -183,14 +187,25 @@ bool spingalett_use_gpu(void) {
     return false;
 }
 
+/* The name of a backend's device, the calling thread's backend left as it was. */
+static const char *device_of(ComputeMode mode) {
+    return spingalett_gpu_name_of(mode);
+}
+
 const char *spingalett_gpu_device(void) {
-    return spingalett_gpu_name();
+    return device_of(COMPUTE_VULKAN);
+}
+
+const char *spingalett_cuda_device(void) {
+    return device_of(COMPUTE_CUDA);
 }
 
 bool spingalett_set_gpu_precision(PrecisionMode precision) {
     if (precision != PRECISION_FLOAT32 && precision != PRECISION_BFLOAT16) return false;
     atomic_store(&s_gpu_precision, precision);
-    return spingalett_gpu_available() && (precision == PRECISION_FLOAT32 || spingalett_gpu_bf16());
+    /* (what the backend of the compute mode does: CUDA's for COMPUTE_CUDA, else Vulkan's) */
+    const ComputeMode mode = spingalett_get_compute_mode() == COMPUTE_CUDA ? COMPUTE_CUDA : COMPUTE_VULKAN;
+    return spingalett_gpu_name_of(mode) && (precision == PRECISION_FLOAT32 || spingalett_gpu_bf16_of(mode));
 }
 
 PrecisionMode spingalett_get_gpu_precision(void) {

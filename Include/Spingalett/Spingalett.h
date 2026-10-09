@@ -383,6 +383,13 @@ typedef struct {
    addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
    SPINGALETT_GPU_DEVICE picks one by its index in the Vulkan device list. */
 SPINGALETT_API const char *spingalett_gpu_device(void);
+/* The name of the GPU that SPINGALETT_COMPUTE_CUDA uses (opening it on first call), or NULL when the library
+   was built without the CUDA backend or no device is usable: an NVIDIA GPU of compute capability 8.0 or
+   later (Ampere and newer) with a driver of CUDA 11.0 or later, which the library opens at run time.
+   SPINGALETT_CUDA_DEVICE picks one by its index in the driver's list. Networks and data sets on the GPU
+   stay on the backend they were made on: a data set made under SPINGALETT_COMPUTE_VULKAN is copied
+   through the host to train a network on CUDA, and the other way. */
+SPINGALETT_API const char *spingalett_cuda_device(void);
 /* Precision of the GPU's matrix products: SPINGALETT_PRECISION_FLOAT32 (the default: single precision, as on
    the CPU) or SPINGALETT_PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
    multiplied on the GPU's matrix units with the products added in single precision: faster; the
@@ -392,8 +399,9 @@ SPINGALETT_API const char *spingalett_gpu_device(void);
    autocast). Devices without bfloat16
    cooperative matrices keep single precision. Applies from the next spingalett_train(), spingalett_predict() or
    spingalett_evaluate() call, or the next trainer; results stay deterministic. Returns whether the GPU
-   multiplies in that precision (false without a device, or for bfloat16 without its matrix units);
-   other values are ignored and return false. */
+   of the compute mode (SPINGALETT_COMPUTE_CUDA's, else SPINGALETT_COMPUTE_VULKAN's) multiplies in that
+   precision (false without a device, or for bfloat16 without its matrix units); other values are
+   ignored and return false. */
 SPINGALETT_API bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
 SPINGALETT_API SpingalettPrecisionMode spingalett_get_gpu_precision(void);
 
@@ -478,9 +486,11 @@ SPINGALETT_API SpingalettTrainReport spingalett_train_args(SpingalettTrainArgs a
 
 /*
  * Data sets in the GPU's memory: count rows of size floats copied to the device once, for the
- * device_* fields of spingalett_train(), spingalett_predict() and spingalett_evaluate(). With SPINGALETT_COMPUTE_VULKAN those calls read their
- * chunks on the device, where spingalett_train() gathers, augments and smooths them, instead of copying samples
- * from the host for every pass; on the CPU they copy the rows back first. With SPINGALETT_PRECISION_BFLOAT16 a set
+ * device_* fields of spingalett_train(), spingalett_predict() and spingalett_evaluate(). A set is made in
+ * the memory of the compute mode's GPU (SPINGALETT_COMPUTE_CUDA's, else SPINGALETT_COMPUTE_VULKAN's).
+ * On that backend those calls read their chunks on the device, where spingalett_train() gathers,
+ * augments and smooths them, instead of copying samples from the host for every pass; on the CPU, or
+ * the other backend, they copy the rows through the host first. With SPINGALETT_PRECISION_BFLOAT16 a set
  * makes a copy of its rows as bfloat16 on first use (half its size again), which networks read as the
  * inputs they keep as such. A set's row size is the network's input (or output) size, and it holds at
  * least the call's samples. NULL without a usable GPU, or when its memory runs out. A set may serve

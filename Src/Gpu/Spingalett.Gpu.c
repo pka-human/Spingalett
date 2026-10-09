@@ -53,6 +53,7 @@ typedef struct {
 } Slot;
 
 struct SpgGpuNet {
+    SpgBackend backend;             /* the backend it was made on (its functions run there) */
     NeuralNetwork *net;
     uint32_t capacity, layers;
     bool training;
@@ -177,6 +178,26 @@ static DwSlices dw_slices(const ConvView *v, uint64_t n) {
     return d;
 }
 
+bool spingalett_gpu_select(ComputeMode mode) {
+    const SpgBackend backend = mode == COMPUTE_CUDA ? SPG_BACKEND_CUDA : SPG_BACKEND_VULKAN;
+    spg_gpu_use(backend);
+    return spg_gpu_built(backend) && spg_gpu_open();
+}
+
+const char *spingalett_gpu_name_of(ComputeMode mode) {
+    const SpgBackend saved = spg_gpu_using();
+    const char *name = spingalett_gpu_select(mode) ? spg_gpu_device_name() : NULL;
+    spg_gpu_use(saved);
+    return name;
+}
+
+bool spingalett_gpu_bf16_of(ComputeMode mode) {
+    const SpgBackend saved = spg_gpu_using();
+    const bool bf16 = spingalett_gpu_select(mode) && spg_gpu_mma_bf16();
+    spg_gpu_use(saved);
+    return bf16;
+}
+
 bool spingalett_gpu_available(void) {
     return spg_gpu_open();
 }
@@ -263,20 +284,52 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
     return cap < want ? (uint32_t)cap : want;
 }
 
-uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) {
+static uint32_t spingalett_gpu_net_capacity_here(const SpgGpuNet *g) {
     return g->capacity;
 }
 
-uint64_t spingalett_gpu_net_version(const SpgGpuNet *g) {
+uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    uint32_t result = spingalett_gpu_net_capacity_here(g);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static uint64_t spingalett_gpu_net_version_here(const SpgGpuNet *g) {
     return g->version;
 }
 
-void spingalett_gpu_net_set_version(SpgGpuNet *g, uint64_t version) {
+uint64_t spingalett_gpu_net_version(const SpgGpuNet *g) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    uint64_t result = spingalett_gpu_net_version_here(g);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static void spingalett_gpu_net_set_version_here(SpgGpuNet *g, uint64_t version) {
     g->version = version;
 }
 
-bool spingalett_gpu_net_current(const SpgGpuNet *g) {
+void spingalett_gpu_net_set_version(SpgGpuNet *g, uint64_t version) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    spingalett_gpu_net_set_version_here(g, version);
+    spg_gpu_use(saved);
+}
+
+static bool spingalett_gpu_net_current_here(const SpgGpuNet *g) {
     return !g->lost && g->bf16 == (spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16());
+}
+
+bool spingalett_gpu_net_current(const SpgGpuNet *g) {
+    /* (made on the backend the caller uses, too) */
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = g && g->backend == saved && spingalett_gpu_net_current_here(g);
+    spg_gpu_use(saved);
+    return result;
 }
 
 /* ------------------------------------------------------------------------- transfers */
@@ -481,16 +534,32 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating, const SpgGpuNet *
     return ok;
 }
 
-bool spingalett_gpu_upload(SpgGpuNet *g) {
+static bool spingalett_gpu_upload_here(SpgGpuNet *g) {
     drain(g);
     return parameters(g, false, false, NULL);
 }
 
-bool spingalett_gpu_download(SpgGpuNet *g) {
+bool spingalett_gpu_upload(SpgGpuNet *g) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_upload_here(g);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static bool spingalett_gpu_download_here(SpgGpuNet *g) {
     drain(g);
     /* the host's gradients and moments, made when they first come back */
     if ((g->grads.buffer || g->moment1.buffer || g->moment2.buffer) && !spingalett_training_state(g->net)) return false;
     return !g->lost && parameters(g, true, false, NULL);
+}
+
+bool spingalett_gpu_download(SpgGpuNet *g) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_download_here(g);
+    spg_gpu_use(saved);
+    return result;
 }
 
 /* Whether two copies of a network lay its parameters out alike (the layout is the network's). */
@@ -498,11 +567,19 @@ static bool alike(const SpgGpuNet *g, const SpgGpuNet *from) {
     return from && from->net == g->net && from->Wp == g->Wp && from->Bp == g->Bp && !from->lost;
 }
 
-bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from) {
-    if (!alike(g, from)) return false;
+static bool spingalett_gpu_take_parameters_here(SpgGpuNet *g, SpgGpuNet *from) {
+    if (g->backend != from->backend || !alike(g, from)) return false;
     drain(g);
     drain(from);
     return parameters(g, false, false, from);
+}
+
+bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_take_parameters_here(g, from);
+    spg_gpu_use(saved);
+    return result;
 }
 
 /* ------------------------------------------------------------------------- creation */
@@ -592,7 +669,7 @@ static uint32_t dw_sums(const SpgGpuNet *g, uint32_t bn, uint32_t n) {
     return wg < DW_SUMS ? wg : DW_SUMS;
 }
 
-bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training) {
+static bool spingalett_gpu_net_reuse_here(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training) {
     const OptimizerType o = training->optimizer;
     if (!g->training || g->lost || g->capacity != capacity || !spingalett_gpu_net_current(g) ||
         ((o == OPTIMIZER_MOMENTUM || o == OPTIMIZER_ADAM || o == OPTIMIZER_ADAMW) && !g->moment1.buffer) ||
@@ -617,7 +694,15 @@ bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTrain
     return true;
 }
 
-void spingalett_gpu_net_free(SpgGpuNet *g) {
+bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_net_reuse_here(g, capacity, training);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static void spingalett_gpu_net_free_here(SpgGpuNet *g) {
     if (!g) return;
     drain(g);
     for (uint32_t k = 0; k < 2; k++)
@@ -633,6 +718,13 @@ void spingalett_gpu_net_free(SpgGpuNet *g) {
     spg_gemm_release();
 }
 
+void spingalett_gpu_net_free(SpgGpuNet *g) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    spingalett_gpu_net_free_here(g);
+    spg_gpu_use(saved);
+}
+
 SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training) {
     return spingalett_gpu_net_create_from(net, capacity, training, NULL);
 }
@@ -640,7 +732,9 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
 SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training,
                                           SpgGpuNet *from) {
     if (!spg_gpu_open() || capacity == 0) return NULL;
+    if (from && from->backend != spg_gpu_using()) from = NULL;      /* (the parameters from the host then) */
     SpgGpuNet *g = (SpgGpuNet *)calloc(1, sizeof *g);
+    if (g) g->backend = spg_gpu_using();
     if (!g) return NULL;
     const uint32_t L = net->layers;
     g->net = net;
@@ -1688,6 +1782,7 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
 /* ------------------------------------------------------------------------- data sets on the GPU */
 
 struct SpingalettDeviceData {
+    SpgBackend backend;             /* the backend whose memory holds it */
     SpgGpuArena *arena;
     SpgGpuBuffer buffer;            /* count rows of size floats */
     uint32_t count, size;
@@ -1727,6 +1822,7 @@ SpingalettDeviceData *spingalett_gpu_data_create(const float *values, uint32_t c
         free(d);
         return NULL;
     }
+    d->backend = spg_gpu_using();
     d->count = count;
     d->size = size;
     const size_t bytes = (size_t)count * size * sizeof(float);
@@ -1742,15 +1838,26 @@ SpingalettDeviceData *spingalett_gpu_data_create(const float *values, uint32_t c
     return d;
 }
 
+bool spingalett_gpu_data_on(const SpingalettDeviceData *d, const SpgGpuNet *g) {
+    return d && g && d->backend == g->backend;
+}
+
 uint32_t spingalett_gpu_data_count(const SpingalettDeviceData *d) { return d ? d->count : 0; }
 uint32_t spingalett_gpu_data_size(const SpingalettDeviceData *d) { return d ? d->size : 0; }
 
-void spingalett_gpu_data_free(SpingalettDeviceData *d) {
+static void spingalett_gpu_data_free_here(SpingalettDeviceData *d) {
     if (!d) return;
     spg_gpu_arena_free(d->half_arena);
     spg_gpu_arena_free(d->arena);
     spg_signal_free(d->lock);
     free(d);
+}
+
+void spingalett_gpu_data_free(SpingalettDeviceData *d) {
+    const SpgBackend saved = spg_gpu_using();
+    if (d) spg_gpu_use(d->backend);
+    spingalett_gpu_data_free_here(d);
+    spg_gpu_use(saved);
 }
 
 /* The set's rows as bfloat16 (NULL when they cannot be made: no memory, or more values than the
@@ -1785,10 +1892,18 @@ static const SpgGpuBuffer *data_half(const SpingalettDeviceData *cd) {
     return d->half_state > 0 ? &d->half : NULL;
 }
 
-bool spingalett_gpu_data_read(const SpingalettDeviceData *d, uint32_t first, uint32_t count, float *dst) {
+static bool spingalett_gpu_data_read_here(const SpingalettDeviceData *d, uint32_t first, uint32_t count, float *dst) {
     if (!d || (uint64_t)first + count > d->count) return false;
     return count == 0 || data_copy(&d->buffer, (size_t)first * d->size * sizeof(float), dst,
                                    (size_t)count * d->size * sizeof(float), true);
+}
+
+bool spingalett_gpu_data_read(const SpingalettDeviceData *d, uint32_t first, uint32_t count, float *dst) {
+    const SpgBackend saved = spg_gpu_using();
+    if (d) spg_gpu_use(d->backend);
+    bool result = spingalett_gpu_data_read_here(d, first, count, dst);
+    spg_gpu_use(saved);
+    return result;
 }
 
 /* ------------------------------------------------------------------------- chunks */
@@ -1862,13 +1977,21 @@ static void copy_in(SpgGpuCommands *c, Slot *s, size_t input_bytes) {
     if (!s->input.mapped) spg_gpu_copy(c, &s->staging, s->inputs, &s->input, 0, input_bytes);
 }
 
-float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets) {
+static float *spingalett_gpu_chunk_inputs_here(SpgGpuNet *g, float **targets) {
     Slot *s = next_slot(g);
     if (targets) *targets = (float *)((char *)s->staging.mapped + s->targets);
     return inputs_of(s);
 }
 
-uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
+float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    float * result = spingalett_gpu_chunk_inputs_here(g, targets);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static uint16_t *spingalett_gpu_chunk_inputs_bf16_here(SpgGpuNet *g, float **targets) {
     Slot *s = &g->slots[g->next];
     if (!s->host_inputs || !s->input.mapped) return NULL;
     next_slot(g);
@@ -1877,13 +2000,28 @@ uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
     return (uint16_t *)s->input.mapped;
 }
 
-void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) {
+uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    uint16_t * result = spingalett_gpu_chunk_inputs_bf16_here(g, targets);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static void spingalett_gpu_chunk_ready_here(SpgGpuNet *g, uint32_t n) {
     Slot *s = &g->slots[g->next];
     stage_inputs(g, s, n);
     s->staged = s->host_inputs != NULL;
 }
 
-void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows) {
+void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    spingalett_gpu_chunk_ready_here(g, n);
+    spg_gpu_use(saved);
+}
+
+static void spingalett_gpu_set_rows_here(SpgGpuNet *g, const SpgGpuRows *rows) {
     if (rows) g->rows = *rows;
     else memset(&g->rows, 0, sizeof g->rows);
     /* (a chunk filled ahead for a step that did not come takes nothing from them) */
@@ -1893,18 +2031,41 @@ void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows) {
     }
 }
 
-uint32_t *spingalett_gpu_chunk_rows(SpgGpuNet *g) {
+void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    spingalett_gpu_set_rows_here(g, rows);
+    spg_gpu_use(saved);
+}
+
+static uint32_t *spingalett_gpu_chunk_rows_here(SpgGpuNet *g) {
     Slot *s = next_slot(g);
     s->gathered = (g->rows.inputs && !s->in_place ? 1u : 0u) | (g->rows.targets ? 2u : 0u);
     return (uint32_t *)((char *)s->staging.mapped + s->indices);
 }
 
-bool spingalett_gpu_chunk_in_place(SpgGpuNet *g, uint32_t first) {
+uint32_t *spingalett_gpu_chunk_rows(SpgGpuNet *g) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    uint32_t * result = spingalett_gpu_chunk_rows_here(g);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static bool spingalett_gpu_chunk_in_place_here(SpgGpuNet *g, uint32_t first) {
     if (!g->rows.inputs || g->rows.shift || g->rows.flip || (g->half[0] && !data_half(g->rows.inputs))) return false;
     Slot *s = next_slot(g);
     s->in_place = true;
     s->first = first;
     return true;
+}
+
+bool spingalett_gpu_chunk_in_place(SpgGpuNet *g, uint32_t first) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_chunk_in_place_here(g, first);
+    spg_gpu_use(saved);
+    return result;
 }
 
 /* Drops the slot's cache entry of commands whose recording failed; NULL. */
@@ -2062,7 +2223,7 @@ static void step_header(const SpgGpuNet *g, const SpgGpuStep *step, uint32_t pos
     rows_header(&g->rows, header);
 }
 
-bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32_t position, bool first, bool last,
+static bool spingalett_gpu_train_chunk_here(SpgGpuNet *g, uint32_t n, uint32_t count, uint32_t position, bool first, bool last,
                                 const SpgGpuStep *step) {
     if (!g->training || g->lost || n == 0 || n > g->capacity) return false;
     Slot *s = &g->slots[g->next];
@@ -2088,18 +2249,43 @@ bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32
     return true;
 }
 
-bool spingalett_gpu_take_loss(SpgGpuNet *g, float *loss) {
+bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32_t position, bool first, bool last,
+                                const SpgGpuStep *step) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_train_chunk_here(g, n, count, position, first, last, step);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static bool spingalett_gpu_take_loss_here(SpgGpuNet *g, float *loss) {
     drain(g);
     *loss = g->total_loss;
     g->total_loss = 0.0f;
     return !g->lost;
 }
 
-bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n) {
+bool spingalett_gpu_take_loss(SpgGpuNet *g, float *loss) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_take_loss_here(g, loss);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static bool spingalett_gpu_predict_here(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n) {
     return spingalett_gpu_predict_rows(g, inputs, NULL, 0, outputs, n);
 }
 
-bool spingalett_gpu_predict_rows(SpgGpuNet *g, const float *inputs, const SpingalettDeviceData *rows, uint32_t first,
+bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_predict_here(g, inputs, outputs, n);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static bool spingalett_gpu_predict_rows_here(SpgGpuNet *g, const float *inputs, const SpingalettDeviceData *rows, uint32_t first,
                                  float *outputs, uint32_t n) {
     const NeuralNetwork *net = g->net;
     const uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
@@ -2146,6 +2332,15 @@ bool spingalett_gpu_predict_rows(SpgGpuNet *g, const float *inputs, const Spinga
     }
     drain(g);
     return !g->lost;
+}
+
+bool spingalett_gpu_predict_rows(SpgGpuNet *g, const float *inputs, const SpingalettDeviceData *rows, uint32_t first,
+                                 float *outputs, uint32_t n) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_predict_rows_here(g, inputs, rows, first, outputs, n);
+    spg_gpu_use(saved);
+    return result;
 }
 
 /* ------------------------------------------------------------------------- passes (the step API) */
@@ -2220,7 +2415,7 @@ static bool run_pass(SpgGpuNet *g, SpgGpuCommands *c, const uint32_t *header) {
     return !g->lost;
 }
 
-float *spingalett_gpu_pass_buffers(SpgGpuNet *g, float **targets) {
+static float *spingalett_gpu_pass_buffers_here(SpgGpuNet *g, float **targets) {
     drain(g);
     g->next = 0;
     Slot *s = &g->slots[0];
@@ -2228,7 +2423,15 @@ float *spingalett_gpu_pass_buffers(SpgGpuNet *g, float **targets) {
     return inputs_of(s);
 }
 
-const float *spingalett_gpu_pass_forward(SpgGpuNet *g, uint32_t n, uint32_t position, uint64_t step) {
+float *spingalett_gpu_pass_buffers(SpgGpuNet *g, float **targets) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    float * result = spingalett_gpu_pass_buffers_here(g, targets);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static const float *spingalett_gpu_pass_forward_here(SpgGpuNet *g, uint32_t n, uint32_t position, uint64_t step) {
     if (!g->training || n == 0 || n > g->capacity) return NULL;
     const SpgGpuStep st = {0.0f, 0.0f, 0.0f, step};
     uint32_t header[SPG_STEP_HEADER];
@@ -2239,7 +2442,15 @@ const float *spingalett_gpu_pass_forward(SpgGpuNet *g, uint32_t n, uint32_t posi
     return (const float *)((const char *)s->staging.mapped + s->outputs);
 }
 
-bool spingalett_gpu_pass_backward(SpgGpuNet *g, uint32_t n, bool from_grads, bool add, float *loss) {
+const float *spingalett_gpu_pass_forward(SpgGpuNet *g, uint32_t n, uint32_t position, uint64_t step) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    const float * result = spingalett_gpu_pass_forward_here(g, n, position, step);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static bool spingalett_gpu_pass_backward_here(SpgGpuNet *g, uint32_t n, bool from_grads, bool add, float *loss) {
     if (!g->training || n == 0 || n > g->capacity) return false;
     if (!run_pass(g, pass_commands(g, n, from_grads ? PASS_GRADS : PASS_LOSS, add), NULL)) return false;
     if (loss) {
@@ -2252,7 +2463,15 @@ bool spingalett_gpu_pass_backward(SpgGpuNet *g, uint32_t n, bool from_grads, boo
     return true;
 }
 
-bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const SpgGpuStep *step, float grad_scale) {
+bool spingalett_gpu_pass_backward(SpgGpuNet *g, uint32_t n, bool from_grads, bool add, float *loss) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_pass_backward_here(g, n, from_grads, add, loss);
+    spg_gpu_use(saved);
+    return result;
+}
+
+static bool spingalett_gpu_pass_step_here(SpgGpuNet *g, const SpgGpuTraining *cfg, const SpgGpuStep *step, float grad_scale) {
     if (!g->training) return false;
     /* the optimizer's settings are recorded in its commands: other settings record them again */
     Slot *s = &g->slots[0];
@@ -2276,4 +2495,12 @@ bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const Spg
     uint32_t header[SPG_STEP_HEADER];
     step_header(g, step, 0, grad_scale, header);
     return run_pass(g, pass_commands(g, 0, PASS_STEP, false), header);
+}
+
+bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const SpgGpuStep *step, float grad_scale) {
+    const SpgBackend saved = spg_gpu_using();
+    if (g) spg_gpu_use(g->backend);
+    bool result = spingalett_gpu_pass_step_here(g, cfg, step, grad_scale);
+    spg_gpu_use(saved);
+    return result;
 }

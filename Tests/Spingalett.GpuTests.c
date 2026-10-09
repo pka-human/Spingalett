@@ -4,10 +4,11 @@
 */
 
 /*
- * The GPU's matrix product (Src/Gpu/Shaders/gemm.comp) against a reference in double precision:
- * dense layers, convolutions (groups, strides, padding, rectangular windows) and their data and
- * weight gradients, with every tile and with and without vector loads. Without a usable Vulkan device
- * the tests are skipped (exit code 77).
+ * The GPU's matrix product (Src/Gpu/Shaders/gemm.comp on Vulkan, Src/Gpu/Cuda/gemm.cu on CUDA) against a
+ * reference in double precision: dense layers, convolutions (groups, strides, padding, rectangular
+ * windows) and their data and weight gradients, with every tile and with and without vector loads.
+ * Without a usable device the tests are skipped (exit code 77). SPINGALETT_GPU_BACKEND=cuda tests the
+ * CUDA backend.
  *
  *   SpingalettGpuTests            the tests, with the tile chosen and a third of the others, in single
  *                                 precision and (with matrix units) in bfloat16 on them
@@ -496,11 +497,14 @@ static void bench(bool dense_only) {
 }
 
 int main(int argc, char **argv) {
+    const char *backend = getenv("SPINGALETT_GPU_BACKEND");
+    const bool cuda = backend && !strcmp(backend, "cuda");
+    spg_gpu_use(cuda ? SPG_BACKEND_CUDA : SPG_BACKEND_VULKAN);
     if (!spg_gpu_open()) {
-        printf("no usable Vulkan device: GPU tests skipped\n");
+        printf("no usable %s device: GPU tests skipped\n", cuda ? "CUDA" : "Vulkan");
         return 77;
     }
-    printf("device: %s\n", spg_gpu_device_name());
+    printf("device: %s (%s)\n", spg_gpu_device_name(), cuda ? "CUDA" : "Vulkan");
     printf("matrix units: %s\n", spg_gpu_mma_bf16() ? "bfloat16 cooperative matrices" : "none");
     if (argc > 1 && !strcmp(argv[1], "bench")) {
         bool dense = false;

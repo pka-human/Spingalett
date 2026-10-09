@@ -14,8 +14,9 @@
  * while the device runs the previous one. Results are deterministic: every sum is taken in a fixed
  * order, never by atomics.
  *
- * Without the Vulkan backend (SPINGALETT_HAS_VULKAN undefined), every function reports that the GPU
- * is unavailable.
+ * The work runs on Vulkan or CUDA (spingalett_gpu_select()); a network or data set on the GPU stays on
+ * the backend it was made on. Without either backend (SPINGALETT_HAS_VULKAN and SPINGALETT_HAS_CUDA
+ * undefined), every function reports that the GPU is unavailable.
  */
 
 #pragma once
@@ -47,10 +48,20 @@ typedef struct {
     float keep, share;              /* label smoothing of the targets: keep t + share (keep 0: none) */
 } SpgGpuRows;
 
-#if defined(SPINGALETT_HAS_VULKAN)
+#if defined(SPINGALETT_HAS_VULKAN) || defined(SPINGALETT_HAS_CUDA)
 
-/* Whether a device is usable (opens it on first use), and its name; whether it multiplies bfloat16
-   matrices on matrix units. */
+/* Directs the calling thread's GPU work to the backend of a compute mode (CUDA for COMPUTE_CUDA, Vulkan
+   otherwise); whether it has a usable device. */
+bool spingalett_gpu_select(ComputeMode mode);
+/* Whether a data set on the GPU is in the memory of the network's backend. */
+bool spingalett_gpu_data_on(const SpingalettDeviceData *data, const SpgGpuNet *g);
+/* The device of a compute mode's backend: its name (NULL without one), whether it multiplies bfloat16 on
+   matrix units; the calling thread's backend stays as it was. */
+const char *spingalett_gpu_name_of(ComputeMode mode);
+bool spingalett_gpu_bf16_of(ComputeMode mode);
+
+/* Whether the calling thread's backend has a usable device (opens it on first use), and its name;
+   whether it multiplies bfloat16 matrices on matrix units. */
 bool spingalett_gpu_available(void);
 bool spingalett_gpu_bf16(void);
 const char *spingalett_gpu_name(void);
@@ -144,6 +155,13 @@ bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const Spg
 
 #else
 
+static inline bool spingalett_gpu_select(ComputeMode mode) { (void)mode; return false; }
+static inline bool spingalett_gpu_data_on(const SpingalettDeviceData *data, const SpgGpuNet *g) {
+    (void)data; (void)g;
+    return false;
+}
+static inline const char *spingalett_gpu_name_of(ComputeMode mode) { (void)mode; return NULL; }
+static inline bool spingalett_gpu_bf16_of(ComputeMode mode) { (void)mode; return false; }
 static inline bool spingalett_gpu_available(void) { return false; }
 static inline bool spingalett_gpu_bf16(void) { return false; }
 static inline const char *spingalett_gpu_name(void) { return NULL; }

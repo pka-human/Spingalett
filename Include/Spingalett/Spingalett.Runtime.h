@@ -39,14 +39,15 @@ typedef enum {
 typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *message);
 
 /* Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU in every
-   mode: on all its threads with SPINGALETT_COMPUTE_OPENMP and SPINGALETT_COMPUTE_VULKAN, on one
-   otherwise. The runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with
-   a warning, as in a full library built without it. */
+   mode: on all its threads with SPINGALETT_COMPUTE_OPENMP and the GPU modes, on one otherwise. The
+   runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with a warning, as in
+   a full library built without it. */
 typedef enum {
     SPINGALETT_COMPUTE_SINGLE_THREADED,
     SPINGALETT_COMPUTE_OPENMP,
     SPINGALETT_COMPUTE_OPENBLAS,
-    SPINGALETT_COMPUTE_CUDA,                   /* reserved: falls back to the CPU */
+    SPINGALETT_COMPUTE_CUDA,                   /* an NVIDIA GPU through CUDA (spingalett_cuda_device()); the CPU parts
+                                       of training run as with SPINGALETT_COMPUTE_OPENMP */
     SPINGALETT_COMPUTE_VULKAN,                 /* the GPU through Vulkan compute (spingalett_gpu_device()); the CPU
                                        parts of training run as with SPINGALETT_COMPUTE_OPENMP */
     SPINGALETT_COMPUTE_COUNT

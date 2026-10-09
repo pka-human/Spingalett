@@ -1166,16 +1166,20 @@ TrainReport spingalett_train_args(TrainArgs args) {
         return (TrainReport){.status = TRAIN_FAILED};
     }
 
-    /* Data sets on the GPU: gathered there when the network trains there (augmentation shifts of up to
-       2^23 cells, rows.comp's), copied to the host otherwise; the validation's targets to the host
-       always, where the losses are added up. */
-    t.gpu_rows_in = t.gpu && args.device_inputs && args.augment_shift < (1u << 23);
-    t.gpu_rows_out = t.gpu && args.device_targets;
+    /* Data sets on the GPU: gathered there when the network trains there, on that backend (augmentation
+       shifts of up to 2^23 cells, rows.comp's), copied to the host otherwise; the validation's targets
+       to the host always, where the losses are added up. */
+    t.gpu_rows_in = t.gpu && args.device_inputs && args.augment_shift < (1u << 23) &&
+                    spingalett_gpu_data_on(args.device_inputs, t.gpu);
+    t.gpu_rows_out = t.gpu && args.device_targets && spingalett_gpu_data_on(args.device_targets, t.gpu);
     const SpingalettDeviceData *sets[4] = {
         t.gpu_rows_in ? NULL : args.device_inputs, t.gpu_rows_out ? NULL : args.device_targets,
-        t.gpu ? NULL : args.device_val_inputs, has_validation ? args.device_val_targets : NULL,
+        t.gpu && spingalett_gpu_data_on(args.device_val_inputs, t.gpu) ? NULL : args.device_val_inputs,
+        has_validation ? args.device_val_targets : NULL,
     };
     const float **hosts[4] = {&args.inputs, &args.targets, &args.val_inputs, &args.val_targets};
+    const SpingalettDeviceData **devices[4] = {&args.device_inputs, &args.device_targets, &args.device_val_inputs,
+                                               &args.device_val_targets};
     for (int k = 0; k < 4; k++) {
         if (!sets[k]) continue;
         t.copies[k] = spingalett_device_rows(sets[k], k < 2 ? sample_count : args.val_count, "train");
@@ -1190,6 +1194,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             return (TrainReport){.status = TRAIN_FAILED};
         }
         *hosts[k] = t.copies[k];
+        *devices[k] = NULL;
     }
     if (t.gpu_rows_in || t.gpu_rows_out) {
         SpgGpuRows rows = {

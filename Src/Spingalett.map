@@ -109,3 +109,8 @@ SPINGALETT_1.0 {
     local:
         *;
 };
+
+SPINGALETT_1.1 {
+    global:
+        spingalett_cuda_device;
+} SPINGALETT_1.0;

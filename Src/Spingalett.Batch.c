@@ -308,7 +308,8 @@ SpingalettDeviceData *spingalett_device_data_new(const float *values, uint32_t c
         set_error(SPINGALETT_ERR_INVALID, "spingalett_device_data_new: values is NULL, or count or size is 0");
         return NULL;
     }
-    if (!spingalett_gpu_available()) {
+    /* in the memory of the compute mode's GPU: CUDA's for COMPUTE_CUDA, else Vulkan's */
+    if (!spingalett_gpu_select(spingalett_get_compute_mode() == COMPUTE_CUDA ? COMPUTE_CUDA : COMPUTE_VULKAN)) {
         set_error(SPINGALETT_ERR_INVALID, "spingalett_device_data_new: no usable GPU");
         return NULL;
     }
@@ -390,7 +391,13 @@ bool spingalett_predict_args(PredictArgs args) {
 
     SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
     if (gpu) {
-        bool ok = spingalett_gpu_predict_rows(gpu, args.inputs, args.device_inputs, 0, args.outputs, args.sample_count);
+        /* a data set in the other GPU backend's memory comes through the host */
+        float *copy = args.device_inputs && !spingalett_gpu_data_on(args.device_inputs, gpu)
+                    ? spingalett_device_rows(args.device_inputs, args.sample_count, "predict") : NULL;
+        bool ok = (copy || !args.device_inputs || spingalett_gpu_data_on(args.device_inputs, gpu)) &&
+                  spingalett_gpu_predict_rows(gpu, copy ? copy : args.inputs, copy ? NULL : args.device_inputs, 0,
+                                              args.outputs, args.sample_count);
+        spingalett_aligned_free(copy);
         spingalett_gpu_done(net, gpu);
         if (ok) return true;
         spingalett_log(LOG_WARNING, "predict: the GPU failed; predicting on the CPU");
@@ -557,8 +564,13 @@ EvalMetrics spingalett_evaluate_args(EvaluateArgs args) {
     if (gpu) {
         double loss;
         uint32_t correct;
-        bool ok = spingalett_gpu_evaluate(gpu, net, args.inputs, args.device_inputs, args.targets, args.sample_count,
-                                          &loss, &correct);
+        /* a data set in the other GPU backend's memory comes through the host */
+        float *copy = args.device_inputs && !spingalett_gpu_data_on(args.device_inputs, gpu)
+                    ? spingalett_device_rows(args.device_inputs, args.sample_count, "evaluate") : NULL;
+        bool ok = (copy || !args.device_inputs || spingalett_gpu_data_on(args.device_inputs, gpu)) &&
+                  spingalett_gpu_evaluate(gpu, net, copy ? copy : args.inputs, copy ? NULL : args.device_inputs,
+                                          args.targets, args.sample_count, &loss, &correct);
+        spingalett_aligned_free(copy);
         spingalett_gpu_done(net, gpu);
         if (ok) {
             spingalett_aligned_free(targets);

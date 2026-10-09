@@ -3,28 +3,15 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
-/* The parameters of the GPU kernels (Src/Gpu/Shaders): push constants laid out as their GLSL blocks
-   (std430: addresses 8 bytes), their modes, and the matrix product with its choice of tiles. */
+/* The GPU kernels' modes (their parameters: Spingalett.GpuPush.h) and the matrix product with its
+   choice of tiles. */
 
 #pragma once
 
-#include "Spingalett.Vulkan.h"
+#include "Spingalett.Device.h"
+#include "Spingalett.GpuPush.h"
 
-/* gemm.comp */
-typedef struct {
-    uint64_t a, b, c, e0, e1, geo;
-    uint32_t M, N, K, lda, ldb, ldc;
-    uint32_t a_group, b_group, c_group;
-    uint32_t slices, slice_k;
-    float alpha, beta;
-    uint32_t flags;
-    uint32_t m_tile0;               /* set by spg_gemm(): the first tile of rows of a dispatch */
-} SpgGemmPush;
 
-enum { SPG_A_ROW, SPG_A_COL, SPG_A_CONV };
-enum { SPG_B_ROW, SPG_B_COL, SPG_B_CONV };
-enum { SPG_EPI_STORE, SPG_EPI_BIAS_ACT, SPG_EPI_SCALE_ACT, SPG_EPI_PARTIAL, SPG_EPI_DERIV };
-#define SPG_GEMM_BIAS 1u            /* flags: EPI_BIAS_ACT adds e0 */
 
 typedef struct {
     uint32_t amode, bmode, epi, act;
@@ -87,112 +74,3 @@ bool spg_conv_geometry(uint32_t *geo, SpgConvGeometry *info, uint32_t h, uint32_
                        uint32_t ow, uint32_t out, uint32_t groups, uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw,
                        uint32_t ph, uint32_t pw);
 
-/* colsum.comp */
-typedef struct {
-    uint64_t x, dy, k, part;
-    uint32_t R, C, slice_rows, pad;
-} SpgColsumPush;
-enum { SPG_COLSUM_SUM, SPG_COLSUM_SHIFTED, SPG_COLSUM_DY, SPG_COLSUM_LN };
-
-/* reduce.comp */
-typedef struct {
-    uint64_t part, out;
-    uint32_t total, width, slices;
-    float scale, beta;
-    uint32_t pad;
-} SpgReducePush;
-
-/* bn.comp */
-typedef struct {
-    uint64_t part, x, gamma, beta, rmean, rvar, stats, coef, ggamma, gbeta;
-    uint32_t C, slices;
-    float m, eps, momentum, scale, beta_g;
-    uint32_t pad;
-} SpgBnPush;
-enum { SPG_BN_TRAIN, SPG_BN_INFER, SPG_BN_BACKWARD };
-
-/* eltwise.comp */
-typedef struct {
-    uint64_t y, x, a, b, header;
-    uint32_t total, n, layer, threshold;
-    float keep_scale;
-    uint32_t flags;
-    uint64_t z;
-} SpgEltwisePush;
-enum { SPG_ELT_BIAS_ACT, SPG_ELT_DERIV, SPG_ELT_MUL, SPG_ELT_ADD, SPG_ELT_DROPOUT, SPG_ELT_AFFINE, SPG_ELT_BDATA,
-       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD, SPG_ELT_COPY };
-
-/* output.comp */
-typedef struct {
-    uint64_t y, t, delta, loss;
-    uint32_t rows, n;
-} SpgOutputPush;
-enum { SPG_OUT_SOFTMAX, SPG_OUT_LOSS, SPG_OUT_GRADS };
-
-/* pool.comp */
-typedef struct {
-    uint64_t x, y, dy, dx;
-    uint32_t n, H, W, C, OH, OW, KH, KW, SH, SW, PH, PW;
-} SpgPoolPush;
-
-/* upsample.comp */
-typedef struct {
-    uint64_t x, y, dy, dx;
-    uint32_t n, H, W, C, SH, SW, flags, pad;
-} SpgUpsamplePush;
-
-/* ln.comp */
-typedef struct {
-    uint64_t x, y, dy, gamma, beta, stats;
-    uint32_t cells, C, flags;
-    float eps;
-} SpgLnPush;
-
-/* combine.comp */
-typedef struct {
-    uint64_t x, y, b;
-    uint32_t n, cells, C, c0, ck, flags;
-} SpgCombinePush;
-enum { SPG_COMBINE_ADD, SPG_COMBINE_SLICE, SPG_COMBINE_GAP };
-
-/* dwconv.comp */
-typedef struct {
-    uint64_t x, w, y, e0, bn, part;
-    uint32_t total, in_h, in_w, in_c, out_h, out_w, out_c, og;
-    uint32_t ph, pixels, rows, lanes;       /* (the padding in x is a constant of the kernel) */
-    float beta;
-} SpgDwconvPush;
-enum { SPG_DW_APPLY, SPG_DW_SPREAD, SPG_DW_WEIGHTS };
-#define SPG_DW_TAPS 49u             /* taps at most */
-
-/* rows.comp */
-typedef struct {
-    uint64_t index, dst, header;
-    uint32_t n, size;
-    uint32_t height, width, channels;
-} SpgRowsPush;
-
-/* wtrans.comp */
-typedef struct {
-    uint64_t w, wt, order;
-    uint32_t total, OG, CG, taps;
-} SpgWtransPush;
-
-/* optim.comp */
-typedef struct {
-    uint64_t w, m, v, g, header;
-    uint32_t n;
-    float decay, momentum, beta1, beta2, epsilon;
-    uint64_t wh;                    /* the weights' bfloat16 copy, written with them (0: none) */
-} SpgOptimPush;
-
-/* sumsq.comp */
-typedef struct {
-    uint64_t a, b, part, scalars;
-    uint32_t n_a, n_b, slices;
-    float max_norm;
-} SpgSumsqPush;
-enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
-
-#define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
-#define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */

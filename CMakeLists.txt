@@ -386,7 +386,7 @@ endif()
 # ------------------------------------------------------------------------------
 # GPU backend (Vulkan compute)
 # ------------------------------------------------------------------------------
-include(cmake/Vulkan.cmake)
+include(cmake/Gpu.cmake)
 
 spingalett_write_config()
 
@@ -583,26 +583,39 @@ if(BUILD_TESTS)
         endif()
     endif()
 
-    foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model gpu xor)
+    foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()
 
-    # The GPU kernels against references in double precision (skipped without a Vulkan device).
-    if(SPINGALETT_HAS_VULKAN)
+    # The GPU kernels against references in double precision, on each backend (skipped without a
+    # device).
+    if(SPINGALETT_HAS_VULKAN OR SPINGALETT_HAS_CUDA)
         add_executable(SpingalettGpuTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.GpuTests.c
-                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Vulkan.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Device.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuKernels.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c)
-        target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_BINARY_DIR}/Gpu
-                                   ${CMAKE_CURRENT_SOURCE_DIR}/Include ${SPINGALETT_VULKAN_INCLUDE})
-        add_dependencies(SpingalettGpuTests spingalett_shaders)
+        target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_SOURCE_DIR}/Include
+                                   ${CMAKE_CURRENT_BINARY_DIR})
         target_link_libraries(SpingalettGpuTests PRIVATE ${CMAKE_DL_LIBS})
         if(NOT WIN32)
             target_link_libraries(SpingalettGpuTests PRIVATE Threads::Threads m)
         endif()
-        add_test(NAME gpu.kernels COMMAND SpingalettGpuTests)
-        set_tests_properties(gpu.kernels PROPERTIES SKIP_RETURN_CODE 77)
+        if(SPINGALETT_HAS_VULKAN)
+            target_sources(SpingalettGpuTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Vulkan.c)
+            target_include_directories(SpingalettGpuTests PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/Gpu
+                                       ${SPINGALETT_VULKAN_INCLUDE})
+            add_dependencies(SpingalettGpuTests spingalett_shaders)
+            add_test(NAME gpu.kernels COMMAND SpingalettGpuTests)
+            set_tests_properties(gpu.kernels PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+        if(SPINGALETT_HAS_CUDA)
+            target_sources(SpingalettGpuTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Cuda.c)
+            target_include_directories(SpingalettGpuTests PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/Cuda)
+            add_dependencies(SpingalettGpuTests spingalett_cuda_kernels)
+            add_test(NAME cuda.kernels COMMAND ${CMAKE_COMMAND} -E env SPINGALETT_GPU_BACKEND=cuda $<TARGET_FILE:SpingalettGpuTests>)
+            set_tests_properties(cuda.kernels PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
     endif()
 
     # The runtime on its own, against the models and results of the full library.

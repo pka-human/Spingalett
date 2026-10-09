@@ -38,9 +38,21 @@ static const Tile mma_tiles[] = {
     {128, 128, 32, 2, 4},
 };
 
+/* The tiles of the CUDA backend's product in single precision (Src/Gpu/Cuda/gemm.cu): those of
+   Src/Gpu/Cuda/Kernels.def, which compiles each. */
+static const Tile cuda_fp32_tiles[] = {
+    {128, 128, 16, 8, 8}, {128, 64, 16, 8, 4}, {64, 128, 16, 4, 8}, {64, 64, 16, 4, 4}, {128, 32, 16, 4, 4},
+    {32, 128, 16, 4, 4}, {256, 32, 16, 8, 4}, {256, 16, 16, 8, 4}, {64, 32, 16, 4, 4}, {32, 64, 16, 4, 4},
+    {128, 16, 16, 4, 4}, {32, 32, 16, 4, 4}, {64, 16, 16, 4, 4}, {16, 64, 16, 4, 4}, {16, 144, 16, 4, 4},
+    {32, 144, 16, 8, 4}, {64, 144, 16, 8, 8},
+};
+
 typedef struct { const Tile *list; uint32_t count; } Table;
 
+/* The tiles of the calling thread's backend. */
 static Table table(bool mma) {
+    if (spg_gpu_using() == SPG_BACKEND_CUDA)
+        return (Table){cuda_fp32_tiles, mma ? 0u : sizeof cuda_fp32_tiles / sizeof cuda_fp32_tiles[0]};
     return mma ? (Table){mma_tiles, sizeof mma_tiles / sizeof mma_tiles[0]}
                : (Table){fp32_tiles, sizeof fp32_tiles / sizeof fp32_tiles[0]};
 }
@@ -163,6 +175,7 @@ typedef struct {
     uint32_t tile;                  /* index of the fastest in its table */
 } Choice;
 
+/* (a tuner a backend: the choices and scratch memory of one device) */
 static struct {
     SpgSignal *lock;
     atomic_int state;               /* 0: not set up, 1: setting up, 2: ready */
@@ -171,7 +184,8 @@ static struct {
     size_t count, cap;
     SpgGpuBuffer scratch;
     double last;                    /* when the last product was timed (spg_seconds()) */
-} tuner;
+} tuners[SPG_BACKEND_COUNT];
+#define tuner tuners[spg_gpu_using()]
 
 static bool tuner_ready(void) {
     int expected = 0;

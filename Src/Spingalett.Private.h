@@ -19,6 +19,7 @@
    whose Spingalett.Config.h has them for the full library. */
 #if defined(SPINGALETT_RUNTIME)
 #undef SPINGALETT_HAS_VULKAN
+#undef SPINGALETT_HAS_CUDA
 #undef SPINGALETT_HAS_OPENBLAS
 #endif
 
@@ -626,7 +627,8 @@ void spingalett_fp16_encode(const float *restrict src, size_t n, uint16_t *restr
 float spingalett_clip_grad_norm(NeuralNetwork *net, float max_norm);
 
 ComputeMode resolve_compute_mode(void);
-/* Whether the compute mode is COMPUTE_VULKAN and a device is usable (warns once when it is not). */
+/* Whether the compute mode is COMPUTE_VULKAN or COMPUTE_CUDA and that backend has a usable device, which the
+   calling thread's GPU work then goes to (warns once when it has none). */
 bool spingalett_use_gpu(void);
 /* A network on the GPU for inference over up to `count` samples a chunk, when COMPUTE_VULKAN is set
    and it fits (NULL otherwise, with a warning when the GPU was usable). */

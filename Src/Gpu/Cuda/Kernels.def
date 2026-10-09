@@ -1,0 +1,50 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* The units of PTX of the CUDA backend: SPG_CUDA_UNIT(name, source, "defines") is Src/Gpu/Cuda/<source>.cu
+   compiled by cmake/Cuda.cmake with -DSPG_ENTRY=spg_<name> and the defines, a module of its own whose
+   kernel is spg_<name>, given to the driver (and compiled by it) when first dispatched. */
+
+SPG_CUDA_UNIT(reduce, reduce, "")
+SPG_CUDA_UNIT(colsum, colsum, "")
+SPG_CUDA_UNIT(bn, bn, "")
+SPG_CUDA_UNIT(eltwise, eltwise, "")
+SPG_CUDA_UNIT(output, output, "")
+SPG_CUDA_UNIT(pool, pool, "")
+SPG_CUDA_UNIT(combine, combine, "")
+SPG_CUDA_UNIT(wtrans, wtrans, "")
+SPG_CUDA_UNIT(optim, optim, "")
+SPG_CUDA_UNIT(sumsq, sumsq, "")
+SPG_CUDA_UNIT(upsample, upsample, "")
+SPG_CUDA_UNIT(ln, ln, "")
+SPG_CUDA_UNIT(rows, rows, "")
+
+/* depthwise convolutions: any window and stride, and the common ones as constants */
+SPG_CUDA_UNIT(dwconv, dwconv, "-DWINDOW=0,0,0,0")
+SPG_CUDA_UNIT(dwconv_k33s11, dwconv, "-DWINDOW=3,3,1,1")
+SPG_CUDA_UNIT(dwconv_k33s22, dwconv, "-DWINDOW=3,3,2,2")
+SPG_CUDA_UNIT(dwconv_k55s11, dwconv, "-DWINDOW=5,5,1,1")
+SPG_CUDA_UNIT(dwconv_k55s22, dwconv, "-DWINDOW=5,5,2,2")
+SPG_CUDA_UNIT(dwconv_k77s11, dwconv, "-DWINDOW=7,7,1,1")
+SPG_CUDA_UNIT(dwconv_k77s22, dwconv, "-DWINDOW=7,7,2,2")
+
+/* the matrix product in single precision: its tiles (BM, BN, BK, TM, TN; the table of GpuKernels.c) */
+SPG_CUDA_UNIT(gemm_128x128x16_8x8, gemm, "-DTILE=128,128,16,8,8")
+SPG_CUDA_UNIT(gemm_128x64x16_8x4, gemm, "-DTILE=128,64,16,8,4")
+SPG_CUDA_UNIT(gemm_64x128x16_4x8, gemm, "-DTILE=64,128,16,4,8")
+SPG_CUDA_UNIT(gemm_64x64x16_4x4, gemm, "-DTILE=64,64,16,4,4")
+SPG_CUDA_UNIT(gemm_128x32x16_4x4, gemm, "-DTILE=128,32,16,4,4")
+SPG_CUDA_UNIT(gemm_32x128x16_4x4, gemm, "-DTILE=32,128,16,4,4")
+SPG_CUDA_UNIT(gemm_256x32x16_8x4, gemm, "-DTILE=256,32,16,8,4")
+SPG_CUDA_UNIT(gemm_256x16x16_8x4, gemm, "-DTILE=256,16,16,8,4")
+SPG_CUDA_UNIT(gemm_64x32x16_4x4, gemm, "-DTILE=64,32,16,4,4")
+SPG_CUDA_UNIT(gemm_32x64x16_4x4, gemm, "-DTILE=32,64,16,4,4")
+SPG_CUDA_UNIT(gemm_128x16x16_4x4, gemm, "-DTILE=128,16,16,4,4")
+SPG_CUDA_UNIT(gemm_32x32x16_4x4, gemm, "-DTILE=32,32,16,4,4")
+SPG_CUDA_UNIT(gemm_64x16x16_4x4, gemm, "-DTILE=64,16,16,4,4")
+SPG_CUDA_UNIT(gemm_16x64x16_4x4, gemm, "-DTILE=16,64,16,4,4")
+SPG_CUDA_UNIT(gemm_16x144x16_4x4, gemm, "-DTILE=16,144,16,4,4")
+SPG_CUDA_UNIT(gemm_32x144x16_8x4, gemm, "-DTILE=32,144,16,8,4")
+SPG_CUDA_UNIT(gemm_64x144x16_8x8, gemm, "-DTILE=64,144,16,8,8")
