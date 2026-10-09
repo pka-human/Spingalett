@@ -55,6 +55,15 @@ changes, which are listed under **Changed**.
   CNN (322 to 60 us a pass), which trains 12% faster in single precision (81,900 to 91,600 samples
   per second) and 26% faster in bfloat16 (95,000 to 120,000); with batch normalization 10% and 16%.
 
+- `predict()` and `evaluate()` on the GPU run on the copy `train()` left in the network when its chunks
+  are not much smaller than the call's (no copy either way), and otherwise make their own copy with
+  the parameters copied from it on the device (not through the host); four calls on four threads at
+  once give the bits of one.
+- Inference on the GPU runs in chunks of at most 32 MB of activations (at least 64 samples), whose
+  layers' outputs stay in the GPU's cache from one layer to the next: on an RTX 4050 Laptop GPU the
+  U-Net infers 1.57 times as fast (6,570 to 10,300 images per second), ResNet-20 1.36 times (24,500
+  to 33,200), the MNIST CNN 1.2 to 1.3 times; bfloat16 alike (U-Net 11,600 to 17,500).
+
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
   the epochs after it: they now go to the device before the next epoch.

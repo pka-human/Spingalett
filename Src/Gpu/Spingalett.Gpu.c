@@ -175,12 +175,21 @@ static uint64_t sample_floats(const NeuralNetwork *net, bool training) {
     return f + net->topology[net->layers - 1];      /* targets */
 }
 
+/* Bytes of the activations of an inference chunk, at most: a chunk whose layers' outputs stay in the
+   GPU's cache from one layer to the next runs faster than a larger one (the U-Net of
+   Examples/Benchmark.c infers 1.57 times as fast in chunks of 32 MB as in chunks of 2,048 images on an
+   RTX 4050 Laptop GPU) and takes less memory to make. */
+#define INFERENCE_BYTES (32ull << 20)
+
 uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool training) {
     uint64_t memory = spg_gpu_memory();
     if (memory == 0 || want == 0) return 0;
     /* half the device's memory for the chunk's buffers (the parameters and scratch are smaller) */
     uint64_t per = sample_floats(net, training) * 4u, cap = memory / 2u / (per ? per : 1u);
     if (cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
+    /* inference in chunks that keep to the cache, of 64 samples at least */
+    const uint64_t cached = INFERENCE_BYTES / (per ? per : 1u) < 64u ? 64u : INFERENCE_BYTES / (per ? per : 1u);
+    if (!training && cap > cached) cap = cached;
     return cap < want ? (uint32_t)cap : want;
 }
 
@@ -243,14 +252,16 @@ static void drain(SpgGpuNet *g) {
  * as it holds: an item is the first `bytes` of a device buffer, from or to the network's arrays w and
  * b (weights and biases of every layer, laid out by pack(); with mean and var, the parameters), or
  * the geometry of conv layer `layer` (uploads), or zeros (uploads: gradients start zeroed, their
- * padding never written).
+ * padding never written), or (uploads) the same buffer of another copy of the network, copied on the
+ * device.
  */
 typedef struct {
     const SpgGpuBuffer *device;
     size_t bytes;
-    enum { ITEM_ARRAYS, ITEM_GEOMETRY, ITEM_ZERO } kind;
+    enum { ITEM_ARRAYS, ITEM_GEOMETRY, ITEM_ZERO, ITEM_COPY } kind;
     float *w, *b, *mean, *var;
     uint32_t layer;
+    const SpgGpuBuffer *from;
 } Item;
 
 static void write_geometry(const SpgGpuNet *g, uint32_t l, uint32_t *geo) {
@@ -282,12 +293,12 @@ static void image(SpgGpuNet *g, const Item *it, void *at, bool down) {
 /* Whether the host writes the item's upload straight into the device's memory (zeros are filled by
    the device, which is faster than the host's writes over the bus). */
 static bool direct(const Item *it, bool down) {
-    return !down && it->device->mapped && it->kind != ITEM_ZERO;
+    return !down && it->device->mapped && it->kind != ITEM_ZERO && it->kind != ITEM_COPY;
 }
 
-/* Bytes of the transfer buffer the item takes: direct uploads and zeros take none. */
+/* Bytes of the transfer buffer the item takes: direct uploads, zeros and copies take none. */
 static size_t staged(const Item *it, bool down) {
-    if (direct(it, down) || (!down && it->kind == ITEM_ZERO)) return 0;
+    if (direct(it, down) || (!down && (it->kind == ITEM_ZERO || it->kind == ITEM_COPY))) return 0;
     return (it->bytes + 15u) & ~(size_t)15u;
 }
 
@@ -321,6 +332,7 @@ static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down)
             const Item *it = &items[k];
             if (direct(it, down)) continue;
             if (it->kind == ITEM_ZERO) spg_gpu_fill(c, it->device, 0, it->bytes, 0u);
+            else if (it->kind == ITEM_COPY) spg_gpu_copy(c, it->from, 0, it->device, 0, it->bytes);
             else if (down) spg_gpu_copy(c, it->device, 0, &g->transfer, at, it->bytes);
             else spg_gpu_copy(c, &g->transfer, at, it->device, 0, it->bytes);
         }
@@ -334,12 +346,13 @@ static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down)
 }
 
 static Item arrays(const SpgGpuBuffer *device, size_t floats, float *w, float *b) {
-    return (Item){device, floats * sizeof(float), ITEM_ARRAYS, w, b, NULL, NULL, 0};
+    return (Item){device, floats * sizeof(float), ITEM_ARRAYS, w, b, NULL, NULL, 0, NULL};
 }
 
 /* The parameters and moments to or from the device, and the gradients from it; when the network is
-   made, the geometries of its conv layers and its gradients zeroed with them. */
-static bool parameters(SpgGpuNet *g, bool down, bool creating) {
+   made, the geometries of its conv layers and its gradients zeroed with them. With `from` (uploads),
+   the parameters (and moments both have) come from that copy of the network on the device. */
+static bool parameters(SpgGpuNet *g, bool down, bool creating, const SpgGpuNet *from) {
     NeuralNetwork *net = g->net;
     const uint32_t L = g->layers;
     Item *items = (Item *)malloc((L + 4u) * sizeof(Item));
@@ -347,7 +360,8 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating) {
     uint32_t n = 0;
     for (uint32_t l = 0; creating && l < L; l++)
         if (g->conv[l])
-            items[n++] = (Item){&g->geo[l], g->conv[l]->size * sizeof(uint32_t), ITEM_GEOMETRY, NULL, NULL, NULL, NULL, l};
+            items[n++] = (Item){&g->geo[l], g->conv[l]->size * sizeof(uint32_t), ITEM_GEOMETRY, NULL, NULL, NULL, NULL, l,
+                                NULL};
     items[n] = arrays(&g->params, g->Wp + 3u * g->Bp, net->weights, net->biases);
     items[n].mean = net->running_mean;
     items[n++].var = net->running_var;
@@ -361,6 +375,15 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating) {
     /* a network that has taken no step has its moments zero: filled by the device when it is made */
     for (uint32_t k = n - (g->moment1.buffer != NULL) - (g->moment2.buffer != NULL); creating && !down && k < n; k++)
         if (net->time_step == 0) items[k].kind = ITEM_ZERO;
+    for (uint32_t k = 0; from && !down && k < n; k++) {
+        const SpgGpuBuffer *same = items[k].device == &g->params ? &from->params
+                                 : items[k].device == &g->moment1 ? &from->moment1
+                                 : items[k].device == &g->moment2 ? &from->moment2 : NULL;
+        if (same && same->buffer && items[k].kind == ITEM_ARRAYS) {
+            items[k].kind = ITEM_COPY;
+            items[k].from = same;
+        }
+    }
     bool ok = transfer(g, items, n, down);
     free(items);
     /* the weights' bfloat16 copy from those uploaded */
@@ -381,12 +404,24 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating) {
 
 bool spingalett_gpu_upload(SpgGpuNet *g) {
     drain(g);
-    return parameters(g, false, false);
+    return parameters(g, false, false, NULL);
 }
 
 bool spingalett_gpu_download(SpgGpuNet *g) {
     drain(g);
-    return !g->lost && parameters(g, true, false);
+    return !g->lost && parameters(g, true, false, NULL);
+}
+
+/* Whether two copies of a network lay its parameters out alike (the layout is the network's). */
+static bool alike(const SpgGpuNet *g, const SpgGpuNet *from) {
+    return from && from->net == g->net && from->Wp == g->Wp && from->Bp == g->Bp && !from->lost;
+}
+
+bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from) {
+    if (!alike(g, from)) return false;
+    drain(g);
+    drain(from);
+    return parameters(g, false, false, from);
 }
 
 /* ------------------------------------------------------------------------- creation */
@@ -469,6 +504,11 @@ void spingalett_gpu_net_free(SpgGpuNet *g) {
 }
 
 SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training) {
+    return spingalett_gpu_net_create_from(net, capacity, training, NULL);
+}
+
+SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training,
+                                          SpgGpuNet *from) {
     if (!spg_gpu_open() || capacity == 0) return NULL;
     SpgGpuNet *g = (SpgGpuNet *)calloc(1, sizeof *g);
     if (!g) return NULL;
@@ -513,14 +553,14 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
         g->half[l] = kept_half(g, l);
         g->dhalf[l] = training && l > 0 && g->half[l];
     }
-    /* every layer's parameters at a multiple of four floats (weights of eight with a bfloat16 copy,
-       which then starts at 16 bytes) */
+    /* every layer's weights at a multiple of eight floats (a bfloat16 copy's start at 16 bytes), its
+       biases at one of four: the same layout in every copy of the network */
     const bool wh = g->bf16 && spg_gpu_bf16_storage() && capacity >= 256u;
     for (uint32_t l = 0; l + 1 < L; l++) {
         uint64_t rows = spingalett_weight_rows(net, l), count = rows * spingalett_weight_row_len(net, l);
         g->woff[l] = g->Wp;
         g->boff[l] = g->Bp;
-        g->Wp += wh ? align8(count) : align4(count);
+        g->Wp += align8(count);
         g->Bp += align4(rows);
     }
 
@@ -609,7 +649,8 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
     for (uint32_t l = 1; training && l < L; l++)
         if (g->fold[l]) g->delta[l] = g->delta[g->fold[l]];     /* the addition's gradient, shared */
     drain(g);
-    if (parameters(g, false, true)) return g;
+    if (from) drain(from);
+    if (parameters(g, false, true, alike(g, from) ? from : NULL)) return g;
 fail:
     spingalett_gpu_net_free(g);
     return NULL;

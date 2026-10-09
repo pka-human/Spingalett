@@ -306,7 +306,6 @@ bool predict_struct_arguments(PredictArgs args) {
         set_error(SPINGALETT_ERR_INVALID, "predict: net, inputs or outputs is NULL");
         return false;
     }
-    spingalett_network_sync(net);
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "predict: network must have at least 2 layers");
         return false;
@@ -324,6 +323,7 @@ bool predict_struct_arguments(PredictArgs args) {
         spingalett_log(LOG_WARNING, "predict: the GPU failed; predicting on the CPU");
     }
 
+    spingalett_network_sync(net);       /* (the GPU's spingalett_gpu_for() runs on its copy or syncs) */
     ComputeMode mode = resolve_compute_mode();
     uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
@@ -384,21 +384,49 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
         spingalett_log(LOG_WARNING, "The GPU cannot run this network (%s); running it on the CPU", why);
         return NULL;
     }
+    /* the copy train() left, its parameters there already (taken from the host when it wrote them
+       since), when no other call holds it and its chunks are not much smaller than this call's */
+    SpgGpuNet *kept = net->gpu_kept ? net->gpu_trainer : NULL;
+    if (kept && spingalett_gpu_net_current(kept) &&
+        (spingalett_gpu_net_capacity(kept) >= 256u || spingalett_gpu_net_capacity(kept) >= count) &&
+        spingalett_network_hold_gpu(net, false)) {
+        if (net->param_version == net->gpu_version) return kept;
+        if (spingalett_gpu_upload(kept)) {
+            net->gpu_version = net->param_version;
+            atomic_store(&net->gpu_newer, false);
+            return kept;
+        }
+        spingalett_network_let_go_gpu(net);
+    }
+    /* else a copy of its own, its parameters taken from the kept copy on the device when it has them
+       (no copy back to the host), or from the host's arrays */
+    SpgGpuNet *source = kept && spingalett_gpu_net_current(kept) && net->param_version == net->gpu_version &&
+                        spingalett_network_hold_gpu(net, true) ? kept : NULL;
+    if (!source) spingalett_network_sync(net);
     /* chunks of a power of two (at least 64) samples, so that calls of nearby sizes share one */
     uint32_t want = 64;
     while (want < count && want < SPINGALETT_BATCH_CHUNK) want *= 2;
     uint32_t capacity = spingalett_gpu_capacity(net, want, false);
     SpgGpuNet *gpu = atomic_exchange(&net->gpu_predict, NULL);
     if (gpu && spingalett_gpu_net_capacity(gpu) >= capacity && spingalett_gpu_net_current(gpu)) {
-        if (spingalett_gpu_upload(gpu)) return gpu;     /* the parameters as they are now */
+        /* the parameters as they are now */
+        if (source ? spingalett_gpu_take_parameters(gpu, source) : spingalett_gpu_upload(gpu)) {
+            if (source) spingalett_network_let_go_gpu(net);
+            return gpu;
+        }
     }
     spingalett_gpu_net_free(gpu);
-    gpu = capacity ? spingalett_gpu_net_create(net, capacity, NULL) : NULL;
+    gpu = capacity ? spingalett_gpu_net_create_from(net, capacity, NULL, source) : NULL;
+    if (source) spingalett_network_let_go_gpu(net);
     if (!gpu) spingalett_log(LOG_WARNING, "Not enough GPU memory for the network; running it on the CPU");
     return gpu;
 }
 
 void spingalett_gpu_done(NeuralNetwork *net, SpgGpuNet *gpu) {
+    if (net->gpu_kept && gpu == net->gpu_trainer) {
+        spingalett_network_let_go_gpu(net);
+        return;
+    }
     SpgGpuNet *empty = NULL;
     if (!atomic_compare_exchange_strong(&net->gpu_predict, &empty, gpu))
         spingalett_gpu_net_free(gpu);                   /* another call put one back first */
@@ -436,7 +464,6 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
         set_error(SPINGALETT_ERR_INVALID, "evaluate: net, inputs or targets is NULL, or sample_count is 0");
         return m;
     }
-    spingalett_network_sync(net);
     if (net->layers < 2) {
         set_error(SPINGALETT_ERR_INVALID, "evaluate: network must have at least 2 layers");
         return m;
@@ -458,6 +485,7 @@ EvalMetrics evaluate_struct_arguments(EvaluateArgs args) {
         spingalett_log(LOG_WARNING, "evaluate: the GPU failed; evaluating on the CPU");
     }
 
+    spingalett_network_sync(net);
     ComputeMode mode = resolve_compute_mode();
     uint32_t capacity = spingalett_batch_capacity(net, args.sample_count);
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);

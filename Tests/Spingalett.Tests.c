@@ -4573,6 +4573,93 @@ static void gpu_threads(void) {
 #endif
 }
 
+typedef struct { NeuralNetwork *net; const float *x; float *y; uint32_t n; } GpuPredictJob;
+
+static void *gpu_predict_job(void *arg) {
+    GpuPredictJob *job = (GpuPredictJob *)arg;
+    predict(.net = job->net, .inputs = job->x, .outputs = job->y, .sample_count = job->n);
+    return NULL;
+}
+
+/* predict() on four threads at once on a network whose copy train() left on the GPU (one call takes
+   the copy, the others make their own from the parameters brought back): the outputs of one call
+   on its own, bit for bit. */
+static void gpu_kept_threads(void) {
+#if !defined(_WIN32)
+    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    NeuralNetwork *net = gpu_net(0);
+    const uint32_t n = 300, in = net->topology[0], out = net->topology[net->layers - 1];
+    float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+    lcg_state = 9;
+    for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+    for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+    train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
+          .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0);
+    GpuPredictJob jobs[4];
+    pthread_t threads[4];
+    int started = 0;
+    for (int k = 0; k < 4; k++) {
+        jobs[k] = (GpuPredictJob){net, x, (float *)malloc((size_t)n * out * sizeof(float)), n};
+        if (pthread_create(&threads[k], NULL, gpu_predict_job, &jobs[k]) == 0) started++;
+    }
+    for (int k = 0; k < started; k++) pthread_join(threads[k], NULL);
+    float *alone = (float *)malloc((size_t)n * out * sizeof(float));
+    predict(.net = net, .inputs = x, .outputs = alone, .sample_count = n);
+    bool same = started == 4;
+    for (int k = 0; same && k < 4; k++) same = !memcmp(jobs[k].y, alone, (size_t)n * out * sizeof(float));
+    CHECK(same, "gpu: predict() on four threads at once differs from one call");
+    printf("  gpu: predict() on four threads at once on a kept copy %s\n", same ? "ok" : "FAILED");
+    for (int k = 0; k < 4; k++) free(jobs[k].y);
+    free(alone); free(x); free(t);
+    free_network(net);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+#endif
+}
+
+/* predict() after train() of small chunks, whose kept copy on the GPU gives its parameters to the
+   prediction's own copy on the device: the outputs of a fresh network given the same parameters on
+   the host, bit for bit. */
+static void gpu_kept_copy(void) {
+    static const int nets[] = {1, 2, 6};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
+        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        NeuralNetwork *net = gpu_net(which);
+        const uint32_t n = 40, in = net->topology[0], out = net->topology[net->layers - 1];
+        float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+        float *y[2] = {(float *)malloc((size_t)n * out * sizeof(float)), (float *)malloc((size_t)n * out * sizeof(float))};
+        lcg_state = 77;
+        for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+        for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+        train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .batch_size = 16,
+              .learning_rate = 0.01f, .training_strategy = STRATEGY_SMALL_BATCH, .report_interval = 0);
+        predict(.net = net, .inputs = x, .outputs = y[0], .sample_count = n);
+        /* the same parameters (and running statistics) on the host, in a fresh network */
+        NeuralNetwork *copy = gpu_net(which);
+        for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+            SpingalettNetworkLayer info;
+            spingalett_network_layer(net, l, &info);
+            static const ParameterKind kinds[] = {PARAM_WEIGHTS, PARAM_BIASES, PARAM_RUNNING_MEAN, PARAM_RUNNING_VARIANCE};
+            for (int k = 0; k < 4; k++) {
+                const uint64_t count = k == 0 ? info.weight_count : info.bias_count;
+                if (count == 0 || (k >= 2 && info.type != LAYER_BATCH_NORM)) continue;
+                float *v = (float *)malloc(count * sizeof(float));
+                spingalett_get_parameters(net, l, kinds[k], v, count);
+                spingalett_set_parameters(copy, l, kinds[k], v, count);
+                free(v);
+            }
+        }
+        predict(.net = copy, .inputs = x, .outputs = y[1], .sample_count = n);
+        const bool same = !memcmp(y[0], y[1], (size_t)n * out * sizeof(float));
+        CHECK(same, "gpu kept copy net %d: predict() from the kept copy differs from the host's parameters", which);
+        printf("  gpu kept copy net %d: predict() from the copy on the device %s\n", which, same ? "ok" : "FAILED");
+        free(x); free(t); free(y[0]); free(y[1]);
+        free_network(net);
+        free_network(copy);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+}
+
 /* The step API on the GPU: the same steps as on the CPU (built-in loss with label smoothing, a loss
    of the caller's, two backward passes a step, two optimizers), up to rounding (compared by the
    trained networks' outputs in training: biases before a normalization have no gradient but its
@@ -5070,6 +5157,8 @@ int main(int argc, char **argv) {
             gpu_trainer();
             gpu_callback();
             gpu_kept();
+            gpu_kept_threads();
+            gpu_kept_copy();
             gpu_bf16();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);

@@ -91,6 +91,7 @@ struct NeuralNetwork {
     struct SpgGpuNet *gpu_trainer;
     atomic_bool gpu_newer;
     bool gpu_kept;
+    atomic_bool gpu_busy;           /* the kept copy in use (a predict(), a copy back, its release) */
     uint64_t param_version, gpu_version;
 };
 

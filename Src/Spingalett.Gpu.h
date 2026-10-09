@@ -53,6 +53,12 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
 /* The network's parameters on the device, for chunks of up to `capacity` samples; with `training`,
    the gradients, optimizer state and outputs of every layer too. NULL when memory runs out. */
 SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training);
+/* The same, its parameters (and the moments both have) taken from another copy of the network on the
+   device rather than from the host's arrays (which need not be up to date then). */
+SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training,
+                                          SpgGpuNet *from);
+/* Takes the parameters (and moments) of another copy of the network, on the device. */
+bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from);
 void spingalett_gpu_net_free(SpgGpuNet *g);
 uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g);
 /* Whether it was made for the current GPU precision (spingalett_set_gpu_precision()). */
@@ -114,6 +120,15 @@ static inline SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t 
     return NULL;
 }
 static inline void spingalett_gpu_net_free(SpgGpuNet *g) { (void)g; }
+static inline SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
+                                                        const SpgGpuTraining *t, SpgGpuNet *from) {
+    (void)net; (void)capacity; (void)t; (void)from;
+    return NULL;
+}
+static inline bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from) {
+    (void)g; (void)from;
+    return false;
+}
 static inline uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) { (void)g; return 0; }
 static inline bool spingalett_gpu_net_current(const SpgGpuNet *g) { (void)g; return false; }
 static inline bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *t) {
