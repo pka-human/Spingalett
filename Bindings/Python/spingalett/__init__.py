@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.14.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",

@@ -1,4 +1,4 @@
-# The ABI of Spingalett 0.14.0, written by Tests/check_abi.py update: later releases keep every
+# The ABI of Spingalett 1.0.0, written by Tests/check_abi.py update: later releases keep every
 # entry (layouts on 64-bit platforms). Recorded again at each release, with what it added.
 enum SPINGALETT_LOG_DEBUG 0
 enum SPINGALETT_LOG_INFO 1

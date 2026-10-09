@@ -2,10 +2,19 @@
 
 All notable changes to this project are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
-[semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
-changes, which are listed under **Changed**.
+[semantic versioning](https://semver.org/): from 1.0 only a major release breaks the API or ABI
+(before 1.0 a minor release could, and listed such changes under **Changed**).
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-10-09
+
+"Stability": the API, the ABI and the formats of 0.14, which every 1.x release keeps (semantic
+versioning, stated in the README's **Compatibility**). The soname is `libspingalett.so.1`, its
+functions carry the symbol version `SPINGALETT_1.0`, and the `api.abi` test compares each release
+with the one before. The names of 0.x without the prefix come only on request; pkg-config, Conan and
+vcpkg find or build the library. Programs of 0.14 must be built again for the soname, and those that
+use the short names include `Spingalett.Short.h`. No kernel changed since 0.14.
 
 ### Added
 - **Packages:** a pkg-config file, `spingalett.pc`, which finds the installation from its own
@@ -18,11 +27,6 @@ changes, which are listed under **Changed**.
   sizes and fields, the enumerators, the constants and the functions' declarations with those of the
   last release (`Tests/Data/abi.txt`): additions pass, changes fail. The README states what 1.x keeps
   (**Compatibility**).
-
-### Fixed
-- Offsets applied to null pointers, undefined behaviour that Clang's UndefinedBehaviorSanitizer
-  reports (GCC's does not): the data gradient of grouped convolutions without an activation, and
-  training on inputs in the GPU's memory. CI runs the sanitizers with Clang too.
 
 ### Changed
 - **The names of 0.x only on request:** `Spingalett.h` no longer includes `Spingalett.Short.h`. A
@@ -37,6 +41,11 @@ changes, which are listed under **Changed**.
 - Python: the bindings load the library by its soname of 1.x (`libspingalett.so.1`,
   `libspingalett.1.dylib`) and accept a library of their major version and at least their minor one,
   where they needed the same major.minor version.
+
+### Fixed
+- Offsets applied to null pointers, undefined behaviour that Clang's UndefinedBehaviorSanitizer
+  reports (GCC's does not): the data gradient of grouped convolutions without an activation, and
+  training on inputs in the GPU's memory. CI runs the sanitizers with Clang too.
 
 ## [0.14.0] - 2026-10-09
 
@@ -996,7 +1005,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/pka-human/Spingalett/compare/v0.14.0...v1.0.0
 [0.14.0]: https://github.com/pka-human/Spingalett/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/pka-human/Spingalett/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/pka-human/Spingalett/compare/v0.12.0...v0.13.0

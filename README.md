@@ -131,7 +131,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.14 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 1.0 REQUIRED)         # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
 ```
 
@@ -1395,16 +1395,15 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 0.14.0, the release candidate for 1.0: its API (prefixed names, structs
-that can grow, zero as every field's default) and its formats (`.slett` 7, `.slettd` 2) are those
-1.0 is to keep, unless testing it shows otherwise. Until 1.0 the shared library's soname carries the
-minor version (`libspingalett.so.0.14`). Since 0.7 the network is an opaque handle, so its internal
-layout can change without breaking programs. Saved models are versioned and remain loadable.
+Spingalett is at version 1.0.0. Its API (prefixed names, structs that can grow, zero as every
+field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 7, `.slettd` 2)
+are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
+handle, so its internal layout can change without breaking programs; saved models are versioned and
+remain loadable.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 1.0: the API and ABI of 0.14 frozen
-- Before and after 1.0, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
+- Any release of 1.x, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
   the single-precision kernel for convolutions of few channels, products in FP16, Winograd
   convolutions
 - 1.1: a CUDA backend of its own kernels (no cuDNN), next to Vulkan

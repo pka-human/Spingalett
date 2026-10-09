@@ -191,15 +191,17 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - Comments say what a block computes and why, in full sentences; match the density of the code
   around them. Documentation is formal English and states facts, not intentions.
 - Public API changes go to `Spingalett.h` with a comment, the README, the Python bindings and their
-  README, and the CHANGELOG (breaking changes under **Changed**). Before 1.0 a minor release may
-  break the API; the soname carries the minor version.
+  README, and the CHANGELOG. From 1.0 the API and ABI follow semantic versioning (README,
+  **Compatibility**): a 1.x release only adds, and the soname carries the major version.
 - Commits are small and topical, with a subject line in the imperative and a body that says what
   changed and why (with measurements for performance work).
 
 ## Releases
 
-The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`
-and `Bindings/Python/spingalett/__init__.py`. `.github/workflows/release.yml` builds packages for Linux
+The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`,
+`Bindings/Python/spingalett/__init__.py` and `packaging/vcpkg/spingalett/vcpkg.json`. A release records
+its ABI (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`), and one that adds
+functions gives them a new node in `Src/Spingalett.map`. `.github/workflows/release.yml` builds packages for Linux
 (x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), trains the DigitPad model
 (2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip. The
 maintainer merges pull requests and pushes tags.
