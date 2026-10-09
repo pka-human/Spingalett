@@ -128,7 +128,9 @@ typedef struct {
 
 static ConvView conv_view(const NeuralNetwork *net, uint32_t l);
 
-/* Whether layer l's convolution is depthwise (a group a channel), which dwconv.comp runs. */
+/* Whether layer l's convolution is depthwise (a group a channel, of fewer filters than a block of the
+   matrix units), which dwconv.comp runs: products of a single channel (a group of all the filters, or
+   blocks of filters of one channel) run faster on the matrix kernel. */
 static bool depthwise(const NeuralNetwork *net, uint32_t l);
 
 static ConvView conv_view(const NeuralNetwork *net, uint32_t l) {
@@ -144,7 +146,7 @@ static ConvView conv_view(const NeuralNetwork *net, uint32_t l) {
 
 static bool depthwise(const NeuralNetwork *net, uint32_t l) {
     const ConvView v = conv_view(net, l);
-    return v.CG == 1u && v.G == v.in_c && v.taps <= SPG_DW_TAPS;
+    return v.CG == 1u && v.G == v.in_c && v.G > 1u && v.OG < 16u && v.taps <= SPG_DW_TAPS;
 }
 
 /* The slices of a depthwise weight gradient (dwconv.comp's WEIGHTS) over `pixels` output pixels: the
