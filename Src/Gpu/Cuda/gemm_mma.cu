@@ -18,8 +18,9 @@
  * and ldmatrix gives the fragments, transposing those of the other layout.
  *
  * An output's products are added 16 values of k at a time, in the order of k, by the same instruction
- * whatever the tile: tiles change the speed only. The epilogues of the activations that are a slope
- * (act_slope()) are inline, two outputs of a row at a time; the others call store_one().
+ * whatever the tile: tiles change the speed only. The results go to the epilogue through shared memory,
+ * four outputs of a row a thread: inline for the activations that are a slope (act_slope()), through
+ * store_one() for the others.
  */
 
 #include "gemm_common.cuh"
@@ -74,62 +75,27 @@ static __device__ __attribute__((noinline)) void store_one(Epi e, uint32_t z, ui
     st(e.c, at, 2u, e.half, v);
 }
 
-/* Two consecutive values from i (even) of x, a float or bfloat16 buffer (bit w of half), and their store. */
-DEVICE void ld2(uint64_t x, uint32_t i, uint32_t w, uint32_t half, float &a, float &b) {
-    if ((half >> w) & 1u) {
-        const uint32_t u = ((const uint32_t *)x)[i >> 1];
-        a = bits_float(u << 16);
-        b = bits_float(u & 0xFFFF0000u);
-        return;
-    }
-    const float *f = F(x) + i;
-    a = f[0];
-    b = f[1];
-}
-DEVICE void st2(uint64_t x, uint32_t i, uint32_t w, uint32_t half, float a, float b) {
-    if ((half >> w) & 1u) {
-        ((uint32_t *)x)[i >> 1] = to_bf16(a) | to_bf16(b) << 16;
-        return;
-    }
-    float *f = F(x) + i;
-    f[0] = a;
-    f[1] = b;
-}
-
-/* Outputs n and n + 1 of row m through the epilogue of a sloped activation (EPI_SCALE_ACT not among them). */
-DEVICE void store_two(const Epi &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row, uint32_t n,
-                      float v0, float v1) {
+/* Outputs n .. n + 3 of row m through the epilogue of a sloped activation (EPI_SCALE_ACT not among them). */
+DEVICE void store_four(const Epi &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row, uint32_t n,
+                       float4_ v) {
     if (e.epi == EPI_PARTIAL) {
-        float *C = F(e.c) + (z * e.M + m) * e.N + n;
-        C[0] = v0;
-        C[1] = v1;
+        ((float4_ *)e.c)[((z * e.M + m) * e.N + n) >> 2] = v;
         return;
     }
     const uint32_t at = coff + row * e.ldc + n;
     if (e.epi == EPI_BIAS_ACT) {
-        if (e.flags & FLAG_BIAS) {
-            v0 += F(e.e0)[coff + n];
-            v1 += F(e.e0)[coff + n + 1u];
-        }
-        v0 = sloped(v0, slope);
-        v1 = sloped(v1, slope);
+        if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
+        v = sloped4(v, slope);
     } else {
-        v0 *= e.alpha;
-        v1 *= e.alpha;
-        if (e.beta != 0.0f) {
-            float c0, c1;
-            ld2(e.c, at, 2u, e.half, c0, c1);
-            v0 += e.beta * c0;
-            v1 += e.beta * c1;
-        }
+        v = scale4(v, e.alpha);
+        if (e.beta != 0.0f) v = add4(v, scale4(ld4(e.c, at, 2u, e.half), e.beta));
         if (e.epi == EPI_DERIV) {
-            float d0, d1;
-            ld2(e.e0, at, 3u, e.half, d0, d1);
-            v0 *= sloped_derivative(d0, slope);
-            v1 *= sloped_derivative(d1, slope);
+            const float4_ d = ld4(e.e0, at, 3u, e.half);
+            v = mul4(v, float4_{sloped_derivative(d.x, slope), sloped_derivative(d.y, slope), sloped_derivative(d.z, slope),
+                                sloped_derivative(d.w, slope)});
         }
     }
-    st2(e.c, at, 2u, e.half, v0, v1);
+    st4(e.c, at, 2u, e.half, v);
 }
 
 #define ONE    0u               /* the ways of reading an operand */
@@ -360,6 +326,11 @@ struct Mma {
         return (n * CH + CY + CSH * (r / RW)) * CW + CX + CSW * (r % RW);
     }
 
+    /* rows of results a round of the epilogue, in the stages' shared memory: floats of BN + 4 a row */
+    static constexpr uint32_t CP = BN + 4u, SMEM = STAGES * STAGE * 2u;
+    static constexpr uint32_t RCH = BM * CP * 4u <= SMEM ? BM : BM / 2u * CP * 4u <= SMEM ? BM / 2u : BM / 4u * CP * 4u <= SMEM ? BM / 4u : BM / 8u;
+    float *cs_base;
+
     MEMBER void run(uint32_t smem) {
         tid = thread_x();
         const uint32_t z = block_z(), g = z / p.slices, s = z % p.slices;
@@ -408,36 +379,50 @@ struct Mma {
             if (REGS && more) store_step(smem + ((step + 1u) % STAGES) * STAGE * 2u);
         }
 
-        /* fragment (i, j): rows lane / 4 and + 8 of its 16, columns 2 (lane % 4) and + 1 of its 8 */
+        /* the results through shared memory, RCH rows of the tile at a time: fragment (i, j) holds rows lane / 4
+           and + 8 of its 16, columns 2 (lane % 4) and + 1 of its 8, which as they are would make stores of 8
+           rows of 16 bytes a warp; read back, a thread finishes four consecutive outputs of a row */
         const uint32_t coff = g * p.c_group;
         const Epi e = {p.c, p.e0, p.e1, p.M, p.N, p.ldc, EPI, ACT, p.flags, HALF, p.alpha, p.beta};
         const float slope = act_slope(ACT);
         const bool sloped_epi = EPI == EPI_PARTIAL || EPI == EPI_STORE || (EPI != EPI_SCALE_ACT && slope >= 0.0f);
-        /* two outputs at once: at even indices of C (and of e0 with it), at 8 bytes */
-        const bool pairs = sloped_epi && (p.c % 8u) == 0u &&
-                           (EPI == EPI_PARTIAL ? p.N % 2u == 0u
-                                               : (p.ldc % 2u) == 0u && (coff % 2u) == 0u &&
-                                                 (EPI == EPI_STORE || p.e0 % 8u == 0u));
+        /* four outputs at once: at indices of C (and of e0 with it) that are multiples of four, at 16 bytes */
+        const bool fours = sloped_epi && (p.c % 16u) == 0u &&
+                           (EPI == EPI_PARTIAL ? p.N % 4u == 0u
+                                               : (p.ldc % 4u) == 0u && (coff % 4u) == 0u &&
+                                                 (EPI == EPI_STORE || p.e0 % 16u == 0u));
+        float *Cs = (float *)__builtin_assume_aligned(cs_base, 16);
 #pragma unroll
-        for (uint32_t i = 0; i < TM; i++)
+        for (uint32_t r0 = 0; r0 < BM; r0 += RCH) {
+            barrier();
 #pragma unroll
-            for (uint32_t h = 0; h < 2u; h++) {
-                const uint32_t m = m0 + (wm * TM + i) * 16u + lane / 4u + 8u * h;
-                if (m >= p.M) continue;
-                const uint32_t row = c_row(m);
+            for (uint32_t i = 0; i < TM; i++)
 #pragma unroll
-                for (uint32_t j = 0; j < 2u * TN; j++) {
-                    const uint32_t n = n0 + wn * TN * 16u + 8u * j + 2u * (lane % 4u);
-                    if (n >= p.N) continue;
-                    const float v0 = acc[i][j][2u * h], v1 = acc[i][j][2u * h + 1u];
-                    if (pairs && n + 1u < p.N) {
-                        store_two(e, slope, z, coff, m, row, n, v0, v1);
-                        continue;
+                for (uint32_t h = 0; h < 2u; h++) {
+                    const uint32_t lr = (wm * TM + i) * 16u + lane / 4u + 8u * h;
+                    if (lr < r0 || lr >= r0 + RCH) continue;
+#pragma unroll
+                    for (uint32_t j = 0; j < 2u * TN; j++) {
+                        float *at = Cs + (lr - r0) * CP + wn * TN * 16u + 8u * j + 2u * (lane % 4u);
+                        at[0] = acc[i][j][2u * h];
+                        at[1] = acc[i][j][2u * h + 1u];
                     }
-                    store_one(e, z, coff, m, row, n, v0);
-                    if (n + 1u < p.N) store_one(e, z, coff, m, row, n + 1u, v1);
                 }
+            barrier();
+#pragma unroll 1
+            for (uint32_t q = tid; q < RCH * (BN / 4u); q += THREADS) {
+                const uint32_t lr = q / (BN / 4u), ln = 4u * (q % (BN / 4u));
+                const uint32_t m = m0 + r0 + lr, n = n0 + ln;
+                if (m >= p.M || n >= p.N) continue;
+                const float4_ v = *(const float4_ *)(Cs + lr * CP + ln);
+                const uint32_t row = c_row(m);
+                if (fours && n + 3u < p.N) {
+                    store_four(e, slope, z, coff, m, row, n, v);
+                    continue;
+                }
+                for (uint32_t k = 0; k < 4u && n + k < p.N; k++) store_one(e, z, coff, m, row, n + k, get4(v, k));
             }
+        }
     }
 };
 
@@ -452,5 +437,6 @@ extern "C" __global__ void __attribute__((launch_bounds(Mma<MMA>::THREADS, 512u 
 SPG_ENTRY(const SpgGemmPush p, const Spec spec) {
     extern __shared__ float4_ smem[];
     Mma<MMA> mma_(p, spec);
+    mma_.cs_base = (float *)smem;
     mma_.run(shared_address(smem));
 }
