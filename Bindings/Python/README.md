@@ -87,6 +87,14 @@ res.add_conv2d(16, 3, padding=1, activation=sg.Activation.NONE).add_batch_norm()
 res.add_add([x, -1], activation=sg.Activation.RELU)       # -1: the layer before
 res.add_global_avg_pool().add_layer(10, sg.Activation.SOFTMAX, sg.Init.XAVIER)
 
+# a U-Net: transposed convolutions up, concatenated with the maps on the way down; a sigmoid a pixel
+unet = sg.Network(sg.Loss.CROSS_ENTROPY)
+e = unet.add_input(64, 64, 3).add_conv2d(16, 3, padding=1).last                  # 64 x 64 x 16
+unet.add_max_pool2d(2).add_conv2d(32, 3, padding=1)                                 # 32 x 32 x 32
+u = unet.add_conv_transpose2d(16, 2, stride=2).last                                 # 64 x 64 x 16
+unet.add_concat([e, u]).add_layer_norm(sg.Activation.RELU)                          # 64 x 64 x 32
+unet.add_upsample(2, sg.Upsample.BILINEAR).add_conv2d(1, 1, activation=sg.Activation.SIGMOID)
+
 # PyTorch: a module through ONNX in memory, or a state dict into a network of the same layers
 import torch
 model = torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.ReLU(), torch.nn.Flatten(),
@@ -106,13 +114,14 @@ with sg.Network.load("xor.slett") as net:
 
 | API | Notes |
 |---|---|
-| `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer; `layers` may mix `Layer`, `Input`, `Conv2D`, `MaxPool2D`, `AvgPool2D`, `BatchNorm`, `Add`, `Concat`, `GlobalAvgPool` and plain widths |
+| `Network(loss, layers)` / `add_layer(...)` | first layer is the input layer; `layers` may mix `Layer`, `Input`, `Conv2D`, `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D`, `Upsample2D`, `BatchNorm`, `LayerNorm`, `Add`, `Concat`, `GlobalAvgPool` and plain widths |
 | `inputs=` on every `add_*`, `last`, `len(net)` | a layer reads the one before it, or the earlier layers `inputs` names (indices; negative ones count back from the new layer); `last` is the index of the layer added last |
 | `add_add(inputs, activation=NONE, dropout=0)`, `add_concat(inputs, ...)`, `add_global_avg_pool(dropout=0, inputs=None)` | the sum of layers of one shape (residual connections), layers side by side along the channels, the mean of each channel |
 | `Network.from_onnx(path or bytes)`, `Network.from_torch(module, example_input)` | ONNX models (and PyTorch modules, exported to ONNX in memory) as networks with channels-last inputs: transpose NCHW images with `x.transpose(0, 2, 3, 1)` |
 | `load_pytorch(state_dict, path or bytes, modules=None)` | PyTorch weights (`state_dict()`, `torch.save` or safetensors files) into a network of the same layers, reordered for channels-last data; the network is unchanged on error |
 | `add_input(h, w, c)`, `add_conv2d(filters, kernel, stride=1, padding=0, activation=RELU, init=HE, dropout=0, groups=1)`, `add_max_pool2d(kernel, stride=0, padding=0)`, `add_avg_pool2d(...)` | convolution (grouped or depthwise with `groups`) and pooling over channels-last tensors; pooling's stride defaults to the kernel size |
 | `add_batch_norm(activation=NONE, epsilon=1e-5, momentum=0.1, dropout=0)` | per-channel normalization of the previous layer: batch statistics while training, running averages otherwise; `get_running_statistics(i)` / `set_running_statistics(i, mean, var)` |
+| `add_conv_transpose2d(filters, kernel, stride=1, padding=0, output_padding=0, activation=RELU, init=HE, dropout=0, groups=1)`, `add_upsample(factor=2, mode=Upsample.NEAREST)`, `add_layer_norm(activation=NONE, epsilon=1e-5)` | transposed convolution ((in - 1) stride - 2 padding + kernel + output_padding cells an axis), nearest or bilinear upsampling (PyTorch's `align_corners=False`), normalization of each cell over its channels (a dense layer's outputs are one cell) |
 | `layers`, `layer(i)`, `topology` | `LayerDescription(type, shape, outputs, activation, dropout, kernel, stride, padding, weight_count, bias_count, groups, epsilon, momentum, inputs)` per layer |
 | `forward(x)` | 1-D input -> vector, 2-D batch -> matrix (one batched `predict()` call; results are copies) |
 | `train(x, y, config=None, validation_data=None, **overrides)` | fields of `TrainConfig` (e.g. `epochs`, `strategy`, `batch_size`, `shuffle`, `early_stopping_patience`, `restore_best_weights`, `augment_shift`, `augment_flip`, `label_smoothing`); returns a `TrainResult`; `callback(network, progress)` gets a `Progress`; exceptions raised in callbacks stop training and are re-raised |
@@ -123,7 +132,7 @@ with sg.Network.load("xor.slett") as net:
 | `save_dataset(path, x, y, input_encoding=AUTO, target_encoding=AUTO, compress=True, shape=None, class_names=None, target_name=None, extra_targets=None)`, `load_dataset(path, target_set=0)`, `dataset_info(path)` | `.slettd` data set files, optionally with the input shape, class names and further sets of targets (`extra_targets`: dicts with `"targets"` and optionally `"name"`, `"class_names"`, `"encoding"`); `dataset_info` returns the counts, encodings, `shape` and `target_sets` |
 | `train_from_file(path, shuffle=True, in_memory=False, prefetch=True, target_set=0, ...)` | trains on a `.slettd` file through the C reader: streamed with a few chunks in memory, or with `in_memory=True` decoded once and kept in its compact form (a byte per 8-bit value); `prefetch=False` keeps decoding off a background thread |
 | `CosineDecay`, `LinearWarmup`, `StepDecay`, `WarmupCosine` | built-in schedules; any `fn(epoch, total, initial_lr)` works too |
-| `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weights `i` feed layer `i + 1`: shape `(out, in)` for a dense layer, `(filters, kernel_h, kernel_w, in_channels / groups)` for a convolution, gamma `(channels,)` for batch normalization (beta are its biases), empty for pooling |
+| `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weights `i` feed layer `i + 1`: shape `(out, in)` for a dense layer, `(filters, kernel_h, kernel_w, in_channels / groups)` for a convolution or a transposed one, gamma `(channels,)` for batch and layer normalization (beta are its biases), empty for pooling and upsampling |
 | `save(path, precision, save_optimizer)`, `Network.load(path)` | `.slett` files, shared with the C API |
 | `to_bytes(precision, save_optimizer=False)`, `Network.from_bytes(data)` | the same files as `bytes` |
 | `to_model(precision=INT8)` | a `Model`: read-only, computes in its precision (integer kernels for INT8, INT4, INT2) |
