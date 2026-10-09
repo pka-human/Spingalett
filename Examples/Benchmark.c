@@ -22,7 +22,9 @@
  *
  * Then ResNet-20 (He et al.'s residual network for CIFAR-10, Examples/CIFAR10.c resnet20) on 4,096
  * synthetic 32 x 32 x 3 images: one epoch of mini-batches of 128 with SGD and momentum, and
- * inference.
+ * inference. Then the U-Net of Examples/Segmentation.c (transposed convolutions up, three sigmoid
+ * outputs a pixel) on 1,024 synthetic 64 x 64 x 3 images: one epoch of mini-batches of 32 with AdamW
+ * (lr 1e-3), and inference.
  *
  * With a usable GPU (spingalett_gpu_device()), every workload also runs with COMPUTE_VULKAN, after a
  * first run that is not timed (it makes the GPU's pipelines and times the matrix products' tiles,
@@ -209,6 +211,61 @@ static void resnet_benchmark(const char *name, ComputeMode mode, const float *im
     }
 }
 
+#define UNET_SAMPLES 1024
+#define UNET_SIZE    64
+
+/* Examples/Segmentation.c's U-Net: two normalized 3 x 3 convolutions a level, transposed
+   convolutions up, the maps of the way down concatenated. */
+static uint32_t double_conv(NeuralNetwork *net, uint32_t filters) {
+    uint32_t last = 0;
+    for (int k = 0; k < 2; k++) {
+        conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1, .act_func = ACT_NONE,
+               .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        last = batch_norm(.net = net, .act_func = ACT_RELU);
+    }
+    return last;
+}
+
+static NeuralNetwork *create_unet(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = UNET_SIZE, .width = UNET_SIZE, .channels = 3);
+    uint32_t e1 = double_conv(net, 16);
+    max_pool2d(.net = net, .kernel = 2);
+    uint32_t e2 = double_conv(net, 32);
+    max_pool2d(.net = net, .kernel = 2);
+    double_conv(net, 64);
+    uint32_t u = conv_transpose2d(.net = net, .filters = 32, .kernel = 2, .stride = 2, .act_func = ACT_RELU,
+                                  .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    concat_layers(.net = net, .inputs = {e2, u}, .act_func = ACT_NONE);
+    double_conv(net, 32);
+    u = conv_transpose2d(.net = net, .filters = 16, .kernel = 2, .stride = 2, .act_func = ACT_RELU,
+                         .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    concat_layers(.net = net, .inputs = {e1, u}, .act_func = ACT_NONE);
+    double_conv(net, 16);
+    conv2d(.net = net, .filters = 3, .kernel = 1, .act_func = ACT_SIGMOID,
+           .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
+    return net;
+}
+
+static void unet_benchmark(const char *name, ComputeMode mode, const float *images, const float *masks) {
+    spingalett_set_compute_mode(mode);
+    for (int untimed = mode == COMPUTE_VULKAN; untimed >= 0; untimed--) {   /* the GPU's first run */
+    NeuralNetwork *net = create_unet();
+    double start = now();
+    train(.net = net, .inputs = images, .targets = masks, .sample_count = UNET_SAMPLES, .epochs = 1,
+          .learning_rate = 1e-3f, .weight_decay = 1e-4f, .optimizer_type = OPTIMIZER_ADAMW,
+          .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32);
+    double trained = now() - start;
+    float *outputs = (float *)malloc((size_t)UNET_SAMPLES * UNET_SIZE * UNET_SIZE * 3 * sizeof(float));
+    start = now();
+    predict(.net = net, .inputs = images, .sample_count = UNET_SAMPLES, .outputs = outputs);
+    double inferred = now() - start;
+    if (!untimed) printf("%-16s %14.0f %14.0f\n", name, UNET_SAMPLES / trained, UNET_SAMPLES / inferred);
+    free(outputs);
+    free_network(net);
+    }
+}
+
 static void run_benchmark(const char *name, ComputeMode mode, const float *inputs, const float *targets) {
     spingalett_set_compute_mode(mode);
     if (mode == COMPUTE_VULKAN) {           /* the GPU's first use, not timed */
@@ -379,6 +436,36 @@ int main(int argc, char **argv) {
     if (bf16) {
         spingalett_set_gpu_precision(PRECISION_BFLOAT16);
         resnet_benchmark("Vulkan GPU bf16", COMPUTE_VULKAN, images, labels);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    }
+    free(images);
+    free(labels);
+
+    /* the U-Net on random 64 x 64 x 3 images and random masks of three classes */
+    const size_t pixels = (size_t)UNET_SAMPLES * UNET_SIZE * UNET_SIZE;
+    images = (float *)malloc(pixels * 3 * sizeof(float));
+    labels = (float *)malloc(pixels * 3 * sizeof(float));
+    if (!images || !labels) {
+        fprintf(stderr, "Allocation failed\n");
+        return 1;
+    }
+    for (size_t i = 0; i < pixels * 3; i++) images[i] = (float)rand() / (float)RAND_MAX;
+    for (size_t i = 0; i < pixels * 3; i++) labels[i] = (float)(rand() % 2);
+    NeuralNetwork *unet = create_unet();
+    printf("\nU-Net (Examples/Segmentation.c), %u layers, %" PRIu64 " parameters, %d images of %d x %d\n",
+           spingalett_layer_count(unet), spingalett_parameter_count(unet), UNET_SAMPLES, UNET_SIZE, UNET_SIZE);
+    free_network(unet);
+    printf("%-16s %14s %14s\n", "samples/s", "training", "inference");
+    if (cpu) {
+        unet_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, images, labels);
+#if defined(SPINGALETT_HAS_OPENMP)
+        unet_benchmark("OpenMP", COMPUTE_OPENMP, images, labels);
+#endif
+    }
+    if (gpu) unet_benchmark("Vulkan GPU", COMPUTE_VULKAN, images, labels);
+    if (bf16) {
+        spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+        unet_benchmark("Vulkan GPU bf16", COMPUTE_VULKAN, images, labels);
         spingalett_set_gpu_precision(PRECISION_FLOAT32);
     }
     free(images);
