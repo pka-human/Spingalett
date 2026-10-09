@@ -5,69 +5,63 @@ All notable changes to this project are documented in this file. The format foll
 [semantic versioning](https://semver.org/); before 1.0, a minor release may contain breaking
 changes, which are listed under **Changed**.
 
-## [Unreleased]
+## [0.13.1] - 2026-10-09
+
+"GPU": the GPU backend faster in every workload, ahead of PyTorch with cuDNN on all but the
+fully connected network's full batches and inference with PyTorch's data already in GPU memory.
+On an RTX 4050 Laptop GPU against 0.13.0 (`Bin/Benchmark gpu`, medians of three interleaved runs):
+ResNet-20 trains 1.19 times as fast in single precision and 1.77 times in bfloat16, the U-Net 1.2
+and 1.77 times and infers 1.6 and 2.4 times as fast, the MNIST CNN trains 1.39 and 1.85 times as
+fast, and the MLP trains full batches 1.8 and 2.9 times as fast. No API changes.
 
 ### Changed
-- `train()` on the GPU keeps the network's parameters on the device between epochs instead of
-  copying them (and the gradients and optimizer moments) back after each, and the network keeps its
-  copy on the GPU after `train()` returns: the parameters come back where they are read (a
-  callback, an autosave, the NaN check, the best epoch's copy, and every function that reads them),
-  and the next `train()` with the same batch size and optimizer trains on the copy again. The
-  network frees it when it is freed, gains a layer, trains on the CPU or makes a trainer. The
-  784-512-1000-10 MLP of `Examples/Benchmark.c` trains full batches 22% faster on an RTX 4050 Laptop
-  GPU for the epochs alone (5 epochs: 553,000 to 673,000 samples per second), and a `train()` of one
-  epoch in bfloat16 takes 14.4 ms instead of 25 ms.
-
-- A network on the GPU takes its buffers from a few allocations instead of one each, uploads and
-  downloads its arrays in one submission instead of one per array, and, where the host can write
-  into all of the device's memory (resizable BAR, unified memory), the host writes each chunk's
-  inputs and the parameters straight into it instead of the device copying them over from host
-  memory. The MLP trains full batches 1.2 times as fast again (5 epochs: 673,000 to 831,000-876,000
-  samples per second; an epoch 25.6 to 21.7 ms) and infers 1.5 times as fast (1,150,000 to
-  1,800,000 samples per second). `SPINGALETT_GPU_NO_HOST_WRITES=1` keeps the copies.
-
-- The GPU's matrix products choose their tiles by the device's own timestamps, in rounds that run
-  every candidate once in one submission (a round of single runs over up to 16 candidates, then
-  four rounds of the eight fastest, each candidate's fastest round kept), after keeping an idle
-  device busy for 25 ms to raise its clocks. The tile chosen is now within the noise of the
-  fastest on the products of `SpingalettGpuTests bench` (it was up to 25% slower: the MLP's
-  512 -> 1000 forward pass 415 us against 331), and timing takes half as long (the 255 products of
-  `Bin/Benchmark gpu`: 10.7 to 5.4 s, once per process).
-
+- The network keeps its copy on the GPU: `train()` keeps the parameters on the device between
+  epochs (they were copied back after each, with the gradients and moments) and leaves the copy in
+  the network when it returns. The parameters come back where they are read (a callback, an
+  autosave, the NaN check, the best epoch's copy, and every function that reads them); the next
+  `train()` with the same batch size and optimizer trains on the copy again, and `predict()` and
+  `evaluate()` run on it, or take its parameters on the device into their own copy when its chunks
+  are much smaller than theirs. The network frees it when it is freed, gains a layer, trains on the
+  CPU or makes a trainer. Concurrent `predict()` calls give the bits of one.
 - With `PRECISION_BFLOAT16`, the GPU keeps the layers' outputs (all but the output layer's, and the
   network's inputs) and their gradients as bfloat16, the values the products round them to anyway,
-  as PyTorch's autocast does: half the memory and half the bytes every pass moves. The matrix units' kernel reads them
-  eight to a load and moves their bits to shared memory as they are; normalizations, pooling,
-  additions, concatenations, upsampling and dropout read and write bfloat16 and compute in single
-  precision (variants of their kernels built with 16-bit storage, which only devices with bfloat16
-  matrix units are asked for); the host rounds the inputs as it sends them, halving the bytes.
-  Parameters, their gradients and the optimizer stay in single precision. On an RTX 4050 Laptop
-  GPU, in bfloat16: ResNet-20 trains at 16,600 samples per second instead of 11,500 and infers at
-  51,100 instead of 29,300, the U-Net 5,260 and 12,500 instead of 4,190 and 7,670 (before the
-  gradients), the MLP infers at 2,940,000 instead of 1,840,000; CIFAR-10 with `Examples/CIFAR10.c
-  resnet20` reaches the same test accuracy after 10 epochs (85.40%, single precision 85.18%) at
-  15,800 samples per second instead of 9,980 (single precision 8,680).
+  as PyTorch's autocast does: half the memory and half the bytes every pass moves. The matrix units'
+  kernel reads them eight to a load and moves their bits to shared memory as they are;
+  normalizations, pooling, additions, concatenations, upsampling and dropout read and write bfloat16
+  and compute in single precision (variants of their kernels built with 16-bit storage, which only
+  devices with bfloat16 matrix units are asked for); the host rounds the inputs as it sends them,
+  halving the bytes; networks of large chunks keep a bfloat16 copy of the weights, which the
+  optimizer writes with them. Parameters, their gradients and the optimizer stay in single
+  precision. CIFAR-10 with `Examples/CIFAR10.c resnet20` reaches the same test accuracy after 10
+  epochs (85.40%, single precision 85.18%) at 15,800 samples per second against 8,680.
   `SPINGALETT_GPU_NO_BF16_STORAGE=1` keeps them in single precision.
-
-- The GPU's pooling backward pass takes windows that tile the input (stride the window, no padding,
-  as 2 x 2 max pooling of stride 2) a thread per window: it finds the maximum once and writes the
-  window's cells, instead of every cell searching its window again. 5.3 times as fast on the MNIST
-  CNN (322 to 60 us a pass), which trains 12% faster in single precision (81,900 to 91,600 samples
-  per second) and 26% faster in bfloat16 (95,000 to 120,000); with batch normalization 10% and 16%.
-
-- `predict()` and `evaluate()` on the GPU run on the copy `train()` left in the network when its chunks
-  are not much smaller than the call's (no copy either way), and otherwise make their own copy with
-  the parameters copied from it on the device (not through the host); four calls on four threads at
-  once give the bits of one.
+- A network on the GPU takes its buffers from a few allocations instead of one each, moves its
+  arrays in one submission instead of one per array, has the device zero a fresh network's moments,
+  and where the host can write into all of the device's memory (resizable BAR, unified memory), the
+  host writes each chunk's inputs and the parameters straight into it instead of the device copying
+  them from host memory (`SPINGALETT_GPU_NO_HOST_WRITES=1` keeps the copies). The host's gradients
+  and moments are made when they first come back from the GPU.
+- The matrix products choose their tiles by the device's timestamps, in rounds that run every
+  candidate once in one submission, after keeping an idle device busy for 25 ms to raise its clocks:
+  the tile chosen is within noise of the fastest (it was up to 25% slower), and timing takes half as
+  long (the 255 products of `Bin/Benchmark gpu`: 10.7 to 5.4 s, once per process). Larger tiles on
+  the matrix units (2 x 2 to 4 x 2 accumulators a subgroup, their loops unrolled so that the
+  accumulators stay in registers) and threads of `gemm.comp` grouped over 4 x 8 blocks.
 - Inference on the GPU runs in chunks of at most 32 MB of activations (at least 64 samples), whose
-  layers' outputs stay in the GPU's cache from one layer to the next: on an RTX 4050 Laptop GPU the
-  U-Net infers 1.57 times as fast (6,570 to 10,300 images per second), ResNet-20 1.36 times (24,500
-  to 33,200), the MNIST CNN 1.2 to 1.3 times; bfloat16 alike (U-Net 11,600 to 17,500).
+  layers' outputs stay in the GPU's cache from one layer to the next: the U-Net infers 1.57 times as
+  fast in single precision.
+- The pooling backward pass takes windows that tile the input (as 2 x 2 max pooling of stride 2) a
+  thread per window instead of every cell searching its window again: 5.3 times as fast.
+- Full-batch training fills the next epoch's first chunk while the device trains on the last of
+  this one, and the host rounds inputs kept as bfloat16 straight into the device's memory as it
+  gathers them.
+- `SPINGALETT_GPU_PROFILE` times copies too, and reports how long the device spent on each
+  submission.
 
-- Full-batch training on the GPU fills the next epoch's first chunk while the device trains on the
-  last of this one (the same rows, in order, without validation), and the host rounds inputs kept as
-  bfloat16 straight into the device's memory as it gathers them: the MLP trains full batches in
-  bfloat16 13% faster (1,930,000 to 2,200,000 samples per second).
+### Added
+- `Examples/benchmark_pytorch.py --host-data`: PyTorch with its data in host memory, as
+  Spingalett's functions take it. `SpingalettGpuTests bench dense` (and `bench bf16 dense half`,
+  operands kept as bfloat16) times the MLP's products.
 
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by

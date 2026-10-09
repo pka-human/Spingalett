@@ -33,7 +33,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer) layers |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
-| `Src/Gpu/` | The GPU backend: `Spingalett.Vulkan.c` (device, buffers, pipelines; the loader opened at run time), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use; convolution geometries), `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as command buffers), `Shaders/*.comp` (GLSL, listed in `Spingalett.Kernels.def`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
+| `Src/Gpu/` | The GPU backend: `Spingalett.Vulkan.c` (device, buffers, pipelines; the loader opened at run time), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use; convolution geometries), `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as command buffers), `Shaders/*.comp` (GLSL, listed in `Spingalett.Kernels.def`; `SPG_KERNEL_H` ones are built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
 | `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
 | `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools, the demo app, the bindings (a package; `setup.py` builds wheels) |
 
@@ -102,14 +102,24 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - **GPU dispatches state their memory.** The executor records a barrier only where a dispatch reads
   or writes what an earlier one wrote or read (`Recorder` in `Spingalett.Gpu.c`): every dispatch
   lists every range it reads and writes, or it will race with its neighbours.
-- **Parameters on the GPU.** A trainer made with `COMPUTE_VULKAN` keeps the network's parameters on
-  the device between passes: every public function that reads a network's parameters calls
+- **Parameters on the GPU.** A trainer made with `COMPUTE_VULKAN`, and the copy `train()` leaves in
+  the network on the GPU (`gpu_kept`; `predict()` and the next `train()` run on it), keep the
+  network's parameters on the device: every public function that reads a network's parameters calls
   `spingalett_network_sync()` first, and every one that writes them on the host calls
   `spingalett_network_written()` after. A new reader or writer needs the call, or it sees stale
-  values (the `gpu` group's `gpu_trainer` reads and rewrites weights between steps).
-- **Lazy training state.** Gradients and optimizer moments exist once a network has trained
-  (`spingalett_training_state()`); code that reads them before (saving optimizer state,
-  `spingalett_get_parameters()` of a gradient) treats them as zero.
+  values (the `gpu` group's `gpu_trainer`, `gpu_callback` and `gpu_kept` read and rewrite weights
+  between steps and calls). Code that uses the kept copy holds it (`spingalett_network_hold_gpu()`),
+  as sync and its release do; a change of the network's layers releases it first.
+- **Activations as bfloat16.** With `PRECISION_BFLOAT16` the executor keeps layers' outputs and
+  gradients as bfloat16 (`kept_half()`): products find which operands are such by address
+  (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push
+  constants' bfloat16 buffers. A kernel that reads or writes activations through anything but
+  `ld()`/`st()` (`half.glsl`) or the products' loads reads garbage in bfloat16: every new kernel
+  that touches activations needs a variant and an entry in `half_words[]`.
+- **Lazy training state.** Gradients and optimizer moments exist on the host once a network has
+  trained on the CPU, made a trainer, or had its GPU copy's parameters brought back
+  (`spingalett_training_state()`, which `spingalett_gpu_download()` calls); code that reads them
+  before (saving optimizer state, `spingalett_get_parameters()` of a gradient) treats them as zero.
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
   `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
   read afterwards (`model_shared` in the `model` group runs four threads; run it under
