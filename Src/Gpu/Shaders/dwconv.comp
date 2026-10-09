@@ -26,6 +26,11 @@
  * computes four channels at once, in vector loads, of PX adjacent pixels of a row (APPLY: output
  * pixels; SPREAD: input pixels, where PX is a multiple of the stride), which share the loads of their
  * windows' overlap and the filters, kept in registers; each value's sum keeps the order above.
+ *
+ * PRO: x is the input of a batch normalization the convolution reads (APPLY, WEIGHTS; e0 of a SPREAD's
+ * DERIV, the normalization's input for its output), applied as it is read: act(x a[c] + b[c]) with the
+ * coefficients of bn.comp at bn (a) and bn + in_c (b), so that the normalization's outputs are never
+ * stored (VEC 4 only).
  */
 
 #version 460
@@ -51,11 +56,12 @@ layout(constant_id = 5) const uint SH = 1;
 layout(constant_id = 6) const uint SW = 1;
 layout(constant_id = 7) const uint VEC = 1;
 layout(constant_id = 8) const uint PW = 0;      /* the padding in x */
-layout(constant_id = 9) const uint HALF = 0;    /* words: x 0, y 2, e0 3 (half.glsl) */
+layout(constant_id = 9) const uint PRO = 0;     /* 0, or 1 + the activation of the normalization applied to x */
+layout(constant_id = 10) const uint HALF = 0;   /* words: x 0, y 2, e0 3 (half.glsl) */
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform Push {
-    F32 x, w, y, e0;
+    F32 x, w, y, e0, bn;
     uint total;                     /* threads' work: values of the result (VEC 1), runs of PX pixels of
                                        four channels (VEC 4; single pixels in a SPREAD whose stride does
                                        not divide PX) */
@@ -66,6 +72,15 @@ layout(push_constant) uniform Push {
 } p;
 
 #include "half.glsl"
+
+/* the coefficients of PRO's normalization for channels c .. c + 3, and x through it */
+vec4 norm_a(uint c) { return PRO != 0u ? F32x4(p.bn).v[c >> 2] : vec4(1.0); }
+vec4 norm_b(uint c) { return PRO != 0u ? F32x4(p.bn).v[(p.in_c + c) >> 2] : vec4(0.0); }
+vec4 normalized(vec4 v, vec4 a, vec4 b) {
+    if (PRO == 0u) return v;
+    const vec4 t = v * a + b;
+    return vec4(activate(t.x, PRO - 1u), activate(t.y, PRO - 1u), activate(t.z, PRO - 1u), activate(t.w, PRO - 1u));
+}
 
 /* the epilogue of value i of the result */
 void finish(uint i, uint channel, float v) {
@@ -85,7 +100,7 @@ void finish4(uint i, uint channel, vec4 v) {
     } else {
         if (p.beta != 0.0) v += p.beta * ld4(p.y, i, 2u);
         if (EPI == EPI_DERIV) {
-            const vec4 e = ld4(p.e0, i, 3u);
+            const vec4 e = normalized(ld4(p.e0, i, 3u), norm_a(channel), norm_b(channel));
             [[unroll]] for (uint k = 0u; k < 4u; k++) v[k] *= derivative(e[k], ACT);
         }
     }
@@ -105,6 +120,7 @@ void apply4(uint row, uint ox0, uint o) {
     const uint taps = KH * KW, NC = (PX - 1u) * SW + KW;   /* the input columns the windows cover */
     const uint oy = row % p.out_h, n = row / p.out_h;
     const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox0 * SW) - int(PW);
+    const vec4 na = norm_a(o), nb = norm_b(o);
     vec4 w[KH * KW], sum[PX];
     [[unroll]] for (uint t = 0u; t < taps; t++) w[t] = w4(o, t);
     [[unroll]] for (uint j = 0u; j < PX; j++) sum[j] = vec4(0.0);
@@ -117,7 +133,7 @@ void apply4(uint row, uint ox0, uint o) {
         [[unroll]] for (uint k = 0u; k < NC; k++) {
             const int ix = x0 + int(k);
             inside[k] = ix >= 0 && ix < int(p.in_w);
-            v[k] = inside[k] ? ld4(p.x, (base + uint(ix)) * p.in_c + o, 0u) : vec4(0.0);
+            v[k] = inside[k] ? normalized(ld4(p.x, (base + uint(ix)) * p.in_c + o, 0u), na, nb) : vec4(0.0);
         }
         [[unroll]] for (uint j = 0u; j < PX; j++)
             [[unroll]] for (uint kx = 0u; kx < KW; kx++)
@@ -206,6 +222,7 @@ void weights() {
     const bool live = lane < lanes && q < quads;
     const uint o = q * VEC, c = o / p.og, NC = (WRUN - 1u) * SW + KW, per_row = (p.out_w + WRUN - 1u) / WRUN;
     const uint first = gl_WorkGroupID.x * p.rows, end = min(first + p.rows, p.pixels);
+    const vec4 na = live ? norm_a(c) : vec4(1.0), nb = live ? norm_b(c) : vec4(0.0);
     vec4 acc[KH * KW];
     [[unroll]] for (uint t = 0u; t < taps; t++) acc[t] = vec4(0.0);
     for (uint unit = first + lane; live && unit < end; unit += lanes) {
@@ -228,7 +245,7 @@ void weights() {
                 const int ix = x0 + int(k);
                 const uint at = (base + uint(ix)) * p.in_c + c;
                 inside[k] = ix >= 0 && ix < int(p.in_w);
-                v[k] = !inside[k] ? vec4(0.0) : VEC == 4u ? ld4(p.x, at, 0u) : vec4(ld(p.x, at, 0u));
+                v[k] = !inside[k] ? vec4(0.0) : VEC == 4u ? normalized(ld4(p.x, at, 0u), na, nb) : vec4(ld(p.x, at, 0u));
             }
             [[unroll]] for (uint kx = 0u; kx < KW; kx++)
                 [[unroll]] for (uint j = 0u; j < WRUN; j++)

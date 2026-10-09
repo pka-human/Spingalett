@@ -5181,7 +5181,7 @@ static void gpu_device_data(void) {
    per cent of single precision (8 bits of mantissa in the operands), training as far along (its
    loss), and repeating bit for bit. */
 static void gpu_bf16(void) {
-    static const int nets[] = {0, 1, 2, 6};
+    static const int nets[] = {0, 1, 2, 6, 11};
     for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
         const int which = nets[j];
         NeuralNetwork *probe = gpu_net(which);

@@ -125,6 +125,11 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   constants' bfloat16 buffers. A kernel that reads or writes activations through anything but
   `ld()`/`st()` (`half.glsl`) or the products' loads reads garbage in bfloat16: every new kernel
   that touches activations needs a variant and an entry in `half_words[]`.
+- **Normalizations applied by their readers.** On the GPU a batch normalization read only by an
+  addition (`fold[]`) or by a depthwise convolution (`pro[]`, dwconv.comp's PRO) has no outputs: its
+  reader applies it to the normalization's input as it reads. Code that reads a layer's outputs goes
+  through `outputs_of()` and, for a `pro[]` layer, applies the normalization (the forward pass, the
+  weight gradient, the derivative in the data gradient), or it reads a buffer that was never written.
 - **Lazy training state.** Gradients and optimizer moments exist on the host once a network has
   trained on the CPU, made a trainer, or had its GPU copy's parameters brought back
   (`spingalett_training_state()`, which `spingalett_gpu_download()` calls); code that reads them
