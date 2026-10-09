@@ -592,7 +592,7 @@ SPINGALETT_API bool spingalett_save_args(SpingalettSaveArgs args);
    expanded to float. */
 SPINGALETT_API SpingalettNetwork *spingalett_load(const char *filename);
 
-/* The bytes save_spingalett writes, in memory (aligned to 64 bytes, so they also serve as a model
+/* The bytes spingalett_save() writes, in memory (aligned to 64 bytes, so they also serve as a model
    image for spingalett_model_init). *size receives their count. Release with spingalett_free.
    Returns NULL on error. */
 SPINGALETT_API void *spingalett_save_to_memory(const SpingalettNetwork *net, SpingalettPrecisionMode precision,
@@ -825,7 +825,8 @@ SPINGALETT_API void spingalett_network_free(SpingalettNetwork *net);
 #endif
 
 /* The names of 0.x, without the prefix (layer(), train(), NeuralNetwork, ACT_RELU, ...), for programs
-   written for them; define SPINGALETT_NO_SHORT_NAMES before including this header to leave them out. */
-#if !defined(SPINGALETT_NO_SHORT_NAMES)
+   written for them: Spingalett.Short.h, which this header includes when SPINGALETT_SHORT_NAMES is
+   defined. */
+#if defined(SPINGALETT_SHORT_NAMES)
 #include "Spingalett.Short.h"
 #endif

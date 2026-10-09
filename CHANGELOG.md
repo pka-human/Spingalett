@@ -7,6 +7,15 @@ changes, which are listed under **Changed**.
 
 ## [Unreleased]
 
+### Changed
+- **The names of 0.x only on request:** `Spingalett.h` no longer includes `Spingalett.Short.h`. A
+  program written for 0.x includes `<Spingalett/Spingalett.Short.h>` in place of `Spingalett.h`, or
+  defines `SPINGALETT_SHORT_NAMES` before including it (`Spingalett.Inference.h` gives the engine's
+  names then). They are macros in the global namespace: `LOG_DEBUG`, `LOG_INFO` and `LOG_WARNING`
+  are also `<syslog.h>`'s, and a program's own `train()`, `layer()` or `predict()` was replaced by
+  the library's. `SPINGALETT_NO_SHORT_NAMES` is no longer needed; `Spingalett.hpp` refuses
+  `SPINGALETT_SHORT_NAMES`, whose macros would replace its methods.
+
 ## [0.14.0] - 2026-10-09
 
 "Release candidate": the last minor version of 0.x, with the API and the formats 1.0 is to keep.

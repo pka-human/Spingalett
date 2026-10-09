@@ -6,7 +6,7 @@
 /* Prints sizeof/offsetof of every public struct the Python bindings mirror with ctypes;
    Tests/test_python_layout.py compares them with the ctypes definitions. */
 
-#include <Spingalett/Spingalett.h>
+#include <Spingalett/Spingalett.Short.h>    /* the struct names of 0.x, which the Python test uses */
 #include <stddef.h>
 #include <stdio.h>
 

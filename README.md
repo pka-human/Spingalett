@@ -186,8 +186,9 @@ selects the documented default.
 Every public name carries the library's prefix: `spingalett_` for functions and builders,
 `Spingalett` for types, `SPINGALETT_` for constants. The names of 0.x without it (`layer()`,
 `train()`, `NeuralNetwork`, `ACT_RELU`, `WEIGHT_INITIALIZATION_HE`, ...) stay available from
-`Spingalett/Spingalett.Short.h`, which `Spingalett.h` includes unless `SPINGALETT_NO_SHORT_NAMES` is
-defined, so programs written for them compile unchanged; define it to keep such names for your own.
+`Spingalett/Spingalett.Short.h`: a program written for them includes it in place of `Spingalett.h` (or
+defines `SPINGALETT_SHORT_NAMES` before including that) and compiles unchanged. `Spingalett.h` leaves
+them out, so that names such as `train()` and `LOG_DEBUG` (also `<syslog.h>`'s) stay the program's.
 
 The `Examples/` directory contains this XOR program, an MNIST classifier
 (`Examples/download_mnist.sh data/mnist && Bin/MNIST data/mnist`), a convolutional one

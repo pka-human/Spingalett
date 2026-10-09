@@ -4,12 +4,15 @@
 */
 
 /*
- * A program that uses only the prefixed names: with SPINGALETT_NO_SHORT_NAMES the headers leave out
- * the names of 0.x, so that a program may use them for its own (the declarations below would
- * conflict with any that leaked), and the prefixed builders train, predict, save and load a network.
+ * A program that uses only the prefixed names: the headers leave out the names of 0.x unless asked
+ * (Spingalett.Short.h), so that a program may use them for its own (the declarations below, and
+ * <syslog.h>'s LOG_DEBUG, would conflict with any that leaked), and the prefixed builders train,
+ * predict, save and load a network.
  */
 
-#define SPINGALETT_NO_SHORT_NAMES
+#if __has_include(<syslog.h>)
+#include <syslog.h>
+#endif
 #include <Spingalett/Spingalett.h>
 #include <math.h>
 #include <stdio.h>

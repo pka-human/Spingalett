@@ -19,13 +19,13 @@
  *     if (!net) std::cerr << net.error().message << '\n';
  *
  * What it does not cover is a call away: raw() gives the C object, and TrainOptions::raw carries every
- * field of SpingalettTrainArgs. The C header is included without its short names
- * (SPINGALETT_NO_SHORT_NAMES).
+ * field of SpingalettTrainArgs. The short names of the C header (Spingalett.Short.h) would replace
+ * the methods of the same names (train(), predict()), so this header does not go with them.
  */
 #pragma once
 
-#if !defined(SPINGALETT_NO_SHORT_NAMES)
-#define SPINGALETT_NO_SHORT_NAMES
+#if defined(SPINGALETT_SHORT_NAMES)
+#error "Spingalett.hpp cannot be used with the short names of Spingalett.Short.h (SPINGALETT_SHORT_NAMES)"
 #endif
 #include "Spingalett.h"
 

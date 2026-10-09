@@ -6,13 +6,20 @@
 /*
  * The names of Spingalett 0.x, without the library's prefix: NeuralNetwork for SpingalettNetwork,
  * ACT_RELU for SPINGALETT_ACT_RELU, layer() for spingalett_layer(), train() for spingalett_train() and
- * so on, so that programs written for them keep compiling. Spingalett.h includes this header unless
- * SPINGALETT_NO_SHORT_NAMES is defined; the engine's names (ActivationFunction, ACT_*, LOSS_*,
- * LAYER_*, UPSAMPLE_*, PRECISION_*) come with Spingalett.Inference.h.
+ * so on, so that programs written for them keep compiling: include this header in place of
+ * Spingalett.h, or define SPINGALETT_SHORT_NAMES before including that. The engine's names
+ * (ActivationFunction, ACT_*, LOSS_*, LAYER_*, UPSAMPLE_*, PRECISION_*) come with
+ * Spingalett.Inference.h when SPINGALETT_SHORT_NAMES is defined. They are macros and typedefs in the
+ * global namespace (LOG_DEBUG is also <syslog.h>'s, and a function of the program named train() or
+ * layer() would be replaced), which is why Spingalett.h leaves them out unless asked.
  */
 #pragma once
 
+#if !defined(SPINGALETT_SHORT_NAMES)
+#define SPINGALETT_SHORT_NAMES
+#endif
 #include "Spingalett.h"
+#include "Spingalett.Inference.h"   /* its short names, when it was included before this header */
 
 /* types */
 typedef SpingalettNetwork NeuralNetwork;
