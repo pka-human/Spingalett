@@ -142,12 +142,16 @@ static struct {
     bool profile;                   /* SPINGALETT_GPU_PROFILE: time every dispatch */
     struct { char label[48]; double ms; uint64_t calls; } stats[256];
     uint32_t stat_count;
+    double busy_ms;                 /* profiling: first to last timestamp of every submission */
+    uint64_t submissions;
 } gpu;
 
 /* ------------------------------------------------------------------------- profiling */
 
-/* With SPINGALETT_GPU_PROFILE set, every dispatch is timed (timestamps around it) and the time per
-   kernel and modes is printed when the process exits. */
+/* With SPINGALETT_GPU_PROFILE set, every dispatch and copy is timed (timestamps around it) and the
+   time per kernel and modes is printed when the process exits, with the time from the first
+   timestamp of each submission to its last (what the device spent on it, gaps between dispatches
+   included). */
 #define PROFILE_QUERIES 8192u
 
 static void profile_report(void) {
@@ -162,7 +166,8 @@ static void profile_report(void) {
                 gpu.stats[a] = gpu.stats[b];
                 gpu.stats[b] = t;
             }
-    fprintf(stderr, "GPU time by kernel (%.1f ms in all):\n", total);
+    fprintf(stderr, "GPU time by kernel (%.1f ms in all, %.1f ms from first to last timestamp of %llu submissions):\n",
+            total, gpu.busy_ms, (unsigned long long)gpu.submissions);
     for (uint32_t k = 0; k < gpu.stat_count; k++)
         fprintf(stderr, "  %-46s %10.2f ms %5.1f%% %9llu calls %8.1f us each\n", gpu.stats[k].label, gpu.stats[k].ms,
                 100.0 * gpu.stats[k].ms / total, (unsigned long long)gpu.stats[k].calls,
@@ -600,7 +605,13 @@ void spg_gpu_copy(SpgGpuCommands *c, const SpgGpuBuffer *src, size_t src_offset,
                   size_t dst_offset, size_t bytes) {
     if (bytes == 0) return;
     VkBufferCopy region = {src_offset, dst_offset, bytes};
+    const bool timed = c->queries && c->timed < PROFILE_QUERIES && bytes >= 4096u;
+    if (timed) {
+        snprintf(c->labels[c->timed], 48, "copy%s", src->mapped ? " from host" : dst->mapped ? " to host" : "");
+        vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->queries, 2u * c->timed);
+    }
     vkCmdCopyBuffer(c->cb, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, 1, &region);
+    if (timed) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->queries, 2u * c->timed++ + 1u);
 }
 
 void spg_gpu_fill(SpgGpuCommands *c, const SpgGpuBuffer *dst, size_t offset, size_t bytes, uint32_t value) {
@@ -634,6 +645,8 @@ bool spg_gpu_wait(SpgGpuCommands *c) {
             spg_lock(gpu.lock);
             for (uint32_t k = 0; k < c->timed; k++)
                 profile_add(c->labels[k], (double)(ticks[2u * k + 1] - ticks[2u * k]) * gpu.tick_ns * 1e-6);
+            gpu.busy_ms += (double)(ticks[2u * c->timed - 1u] - ticks[0]) * gpu.tick_ns * 1e-6;
+            gpu.submissions++;
             spg_unlock(gpu.lock);
         }
         free(ticks);
