@@ -29,6 +29,9 @@ changes, which are listed under **Changed**.
   `SPINGALETT_SHORT_NAMES`, whose macros would replace its methods.
 - The CMake package accepts any 1.x of at least the version asked for (`SameMajorVersion`); the
   library exports nothing but its functions (an OpenMP lock was exported).
+- Python: the bindings load the library by its soname of 1.x (`libspingalett.so.1`,
+  `libspingalett.1.dylib`) and accept a library of their major version and at least their minor one,
+  where they needed the same major.minor version.
 
 ## [0.14.0] - 2026-10-09
 

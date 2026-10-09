@@ -677,6 +677,11 @@ w = up.get_weights(1); up.set_weights(1, w); check(np.array_equal(up.get_weights
 ups = sg.Network(sg.Loss.MSE, [sg.Input(2, 3, 1), sg.Upsample2D(2), sg.Upsample2D(3, sg.Upsample.BILINEAR)])
 check(ups.layers[-1].shape == (12, 18, 1) and ups.forward(np.ones(6)).shape == (216,), "upsampling shapes")
 
+# the library versions the bindings accept: major.minor before 1.0, then the major and a minor at least theirs
+check(sg._compatible("0.14.2", "0.14.0") and not sg._compatible("0.13.1", "0.14.0"), "versions of 0.x")
+check(sg._compatible("1.0.0", "1.0.0") and sg._compatible("1.3.0", "1.2.5") and not sg._compatible("1.1.0", "1.2.0")
+      and not sg._compatible("2.0.0", "1.2.0"), "versions of 1.x")
+
 # lifetime
 net = sg.Network(sg.Loss.MSE, [2, 3]); net.close(); net.close()
 try: net.forward([0, 0]); check(False, "closed network usable")
