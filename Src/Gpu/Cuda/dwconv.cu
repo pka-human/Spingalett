@@ -27,9 +27,15 @@
 #define EPI_DERIV    4u
 #define PX 4u
 #define ANY 255u                /* a template parameter taken from the spec */
+#define PRO_NONE 1u             /* PRO: 1 + the normalization's activation (none, ReLU) */
+#define PRO_RELU 3u
 
 /* What a dispatch's spec gives, with the window and stride (constants when the template has them). */
-template <uint32_t HALF_>
+/* the activations of the epilogues that are no slope, out of line (each kernel's code would hold them for
+   every value it finishes) */
+static __device__ __attribute__((noinline)) float4_ activate4_call(float4_ v, uint32_t act) { return activate4(v, act); }
+
+template <uint32_t HALF_, uint32_t PRO_>
 struct Dw {
     const SpgDwconvPush &p;
     uint32_t MODE, EPI, ACT, VEC, PW, PRO, SUMS, HALF;
@@ -51,8 +57,12 @@ struct Dw {
         return pro != 0u ? ((const float4_ *)p.bn)[(3u * p.in_c + c) >> 2] : float4_{0.0f, 0.0f, 0.0f, 0.0f};
     }
     MEMBER float4_ normalized(float4_ v, float4_ a, float4_ b) const {
-        if (PRO == 0u) return v;
-        return activate4s(add4(mul4(v, a), b), PRO - 1u, pro_slope);
+        if (PRO_ == 0u || PRO == 0u) return v;
+        const float4_ t = add4(mul4(v, a), b);
+        if (PRO_ == PRO_NONE) return t;
+        if (PRO_ == PRO_RELU)
+            return float4_{t.x > 0.0f ? t.x : 0.0f, t.y > 0.0f ? t.y : 0.0f, t.z > 0.0f ? t.z : 0.0f, t.w > 0.0f ? t.w : 0.0f};
+        return activate4s(t, PRO - 1u, pro_slope);
     }
 
     /* the epilogue of value i of the result */
@@ -70,8 +80,8 @@ struct Dw {
     template <bool SPREADS>
     MEMBER void finish4(uint32_t i, uint32_t channel, float4_ v) {
         if (EPI == EPI_BIAS_ACT) {
-            v = activate4s(add4(v, float4_{F(p.e0)[channel], F(p.e0)[channel + 1u], F(p.e0)[channel + 2u], F(p.e0)[channel + 3u]}),
-                           ACT, slope);
+            v = add4(v, float4_{F(p.e0)[channel], F(p.e0)[channel + 1u], F(p.e0)[channel + 2u], F(p.e0)[channel + 3u]});
+            v = slope >= 0.0f ? sloped4(v, slope) : activate4_call(v, ACT);
         } else {
             if (p.beta != 0.0f) v = add4(v, scale4(ld4(p.y, i, 2u, HALF), p.beta));
             if (EPI == EPI_DERIV) {
@@ -102,17 +112,17 @@ struct Dw {
 
 /* The kernel body for window KH x KW and stride SH x SW (constants), or any (KH = 0: from the spec, the
    filters kept in arrays of the largest window, which spill), and MODE, VEC and PW (or ANY). */
-template <uint32_t KH_, uint32_t KW_, uint32_t SH_, uint32_t SW_, uint32_t MODE_, uint32_t VEC_, uint32_t PW_, uint32_t HALF_>
-DEVICE void dwconv(const SpgDwconvPush &p, const Spec &spec) {
+template <uint32_t KH_, uint32_t KW_, uint32_t SH_, uint32_t SW_, uint32_t MODE_, uint32_t VEC_, uint32_t PW_, uint32_t HALF_,
+          uint32_t PRO_>
+DEVICE void dwconv(const SpgDwconvPush &p, const Spec &spec, float4_ *red, float4_ *red2) {
     const uint32_t KH = KH_ ? KH_ : spec.v[3], KW = KW_ ? KW_ : spec.v[4];
     const uint32_t SH = SH_ ? SH_ : spec.v[5], SW = SW_ ? SW_ : spec.v[6];
     const uint32_t MODE = MODE_ != ANY ? MODE_ : spec.v[0], VEC = VEC_ != ANY ? VEC_ : spec.v[7];
     const uint32_t PW = PW_ != ANY ? PW_ : spec.v[8];
     constexpr uint32_t TAPS = KH_ ? KH_ * KW_ : SPG_DW_TAPS;
     constexpr uint32_t ROWMAX = KW_ ? KW_ : SPG_DW_TAPS;      /* a window's row */
-    Dw<HALF_> d(p, spec);
+    Dw<HALF_, PRO_> d(p, spec);
     const uint32_t taps = KH * KW;
-    __shared__ float4_ red[256], red2[256];
     const uint32_t tid = thread_x();
 
     if (MODE == WEIGHTS) {
@@ -352,10 +362,23 @@ DEVICE void dwconv(const SpgDwconvPush &p, const Spec &spec) {
 template <uint32_t KH, uint32_t KW, uint32_t SH, uint32_t SW, uint32_t MODE, uint32_t VEC, uint32_t PW>
 struct Occupancy {
     static constexpr uint32_t BLOCKS = MODE == APPLY || MODE == SPREAD ? 4u : 2u;
+    static constexpr uint32_t MAPS = MODE == SPREAD ? 13u : 5u;     /* HALF of maps kept as bfloat16 */
 };
 
 extern "C" __global__ void __attribute__((launch_bounds(256, Occupancy<WINDOW>::BLOCKS)))
 SPG_ENTRY(const SpgDwconvPush p, const Spec spec) {
-    if (spec.v[11] == 0u) dwconv<WINDOW, 0u>(p, spec);      /* single precision: loads without a branch */
-    else dwconv<WINDOW, ANY>(p, spec);
+    /* WEIGHTS' and SUMS' sums of the block's threads */
+    __shared__ float4_ red[256], red2[256];
+    /* single precision and the maps of training in bfloat16 (x and y; with SPREAD also e0), without a normalization
+       or with one without an activation or with ReLU, as instances of their own: loads without a branch,
+       normalizations without the other activations' code at every load */
+    const uint32_t half = spec.v[11], pro = spec.v[9];
+    constexpr uint32_t MAPS = Occupancy<WINDOW>::MAPS;
+    if (half == 0u && pro == 0u) dwconv<WINDOW, 0u, 0u>(p, spec, red, red2);
+    else if (half == 0u && pro == PRO_NONE) dwconv<WINDOW, 0u, PRO_NONE>(p, spec, red, red2);
+    else if (half == 0u && pro == PRO_RELU) dwconv<WINDOW, 0u, PRO_RELU>(p, spec, red, red2);
+    else if (half == MAPS && pro == 0u) dwconv<WINDOW, MAPS, 0u>(p, spec, red, red2);
+    else if (half == MAPS && pro == PRO_NONE) dwconv<WINDOW, MAPS, PRO_NONE>(p, spec, red, red2);
+    else if (half == MAPS && pro == PRO_RELU) dwconv<WINDOW, MAPS, PRO_RELU>(p, spec, red, red2);
+    else dwconv<WINDOW, ANY, ANY>(p, spec, red, red2);
 }
