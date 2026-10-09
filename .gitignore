@@ -16,3 +16,6 @@ Bindings/Python/build/
 Bindings/Python/dist/
 !Tests/Data/*.nn
 data/
+
+# Package recipes: what Conan writes next to them
+CMakeUserPresets.json

@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.14.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -540,7 +540,8 @@ class _LRScheduleParams(Structure):
 def _library_names() -> List[str]:
     if sys.platform.startswith("win"):
         return ["spingalett.dll", "libspingalett.dll"]
-    abi = ".".join(__version__.split(".")[:2])     # the soname carries major.minor before 1.0
+    major, minor = __version__.split(".")[:2]
+    abi = major if major != "0" else major + "." + minor     # the soname: major from 1.0, major.minor before
     if sys.platform == "darwin":
         return ["libspingalett.dylib", f"libspingalett.{abi}.dylib"]
     return ["libspingalett.so", f"libspingalett.so.{abi}"]
@@ -575,8 +576,20 @@ def _load_library() -> ctypes.CDLL:
 
 _lib = _load_library()
 
-# The bindings mirror C struct layouts, which may change between minor releases before 1.0:
-# refuse to run against a library of another major.minor version instead of corrupting memory.
+
+def _compatible(library: str, bindings: str) -> bool:
+    """The bindings mirror the library's structs and call its functions: before 1.0 they need its
+    major.minor version, from 1.0 its major version and at least their own minor one (a later 1.x
+    keeps the ABI and adds to it)."""
+    try:
+        lib = [int(x) for x in library.split(".")[:2]]
+        own = [int(x) for x in bindings.split(".")[:2]]
+    except ValueError:
+        return False
+    return lib == own if own[0] == 0 else lib[0] == own[0] and lib[1] >= own[1]
+
+
+# Refuse to run against a library whose structs may differ, instead of corrupting memory.
 try:
     _version_fn = _lib.spingalett_version
 except AttributeError:
@@ -584,9 +597,11 @@ except AttributeError:
 _version_fn.restype = c_char_p
 _version_fn.argtypes = []
 _LIBRARY_VERSION = _version_fn().decode()
-if _LIBRARY_VERSION.split(".")[:2] != __version__.split(".")[:2]:
-    raise ImportError(f"spingalett bindings {__version__} require library version "
-                      f"{'.'.join(__version__.split('.')[:2])}.x, but {_lib._name} is {_LIBRARY_VERSION}")
+if not _compatible(_LIBRARY_VERSION, __version__):
+    _major, _minor = __version__.split(".")[:2]
+    _needed = f"{_major}.{_minor}.x" if _major == "0" else f"{_major}.x from {_major}.{_minor}"
+    raise ImportError(f"spingalett bindings {__version__} require library version {_needed}, "
+                      f"but {_lib._name} is {_LIBRARY_VERSION}")
 
 
 def _bind(name, restype, argtypes):

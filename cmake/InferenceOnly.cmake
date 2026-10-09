@@ -19,7 +19,13 @@ set(SPINGALETT_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/Spingalett)
 install(EXPORT SpingalettTargets NAMESPACE Spingalett:: DESTINATION ${SPINGALETT_CMAKE_DIR})
 configure_package_config_file(${PROJECT_SOURCE_DIR}/cmake/SpingalettConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake INSTALL_DESTINATION ${SPINGALETT_CMAKE_DIR})
+# as the full library's: within a major version from 1.0, within a minor one before
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(SPINGALETT_COMPATIBILITY SameMinorVersion)
+else()
+    set(SPINGALETT_COMPATIBILITY SameMajorVersion)
+endif()
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
-    COMPATIBILITY SameMinorVersion)
+    COMPATIBILITY ${SPINGALETT_COMPATIBILITY})
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
         DESTINATION ${SPINGALETT_CMAKE_DIR})

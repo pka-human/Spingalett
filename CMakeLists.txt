@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 0.14.0 LANGUAGES C)
+project(Spingalett VERSION 1.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -176,6 +176,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 
     if(NOT WIN32)
         target_compile_options(spingalett PRIVATE -fvisibility=hidden)
+    endif()
+    # ELF: the exported functions carry the symbol versions of Src/Spingalett.map
+    if(UNIX AND NOT APPLE)
+        target_link_options(spingalett PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.map)
+        set_property(TARGET spingalett APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.map)
     endif()
 
     target_compile_options(spingalett PRIVATE
@@ -480,7 +485,29 @@ if(BUILD_TESTS)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/docs/make_reference.py --check)
     endif()
 
-    # A program of the prefixed names only (SPINGALETT_NO_SHORT_NAMES), the names of 0.x its own.
+    # The ABI of the last release (Tests/Data/abi.txt): layouts, values and declarations kept, the
+    # exported functions those of Src/Spingalett.map (Tests/check_abi.py).
+    if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
+        set(abi_headers ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.h
+                        ${CMAKE_CURRENT_SOURCE_DIR}/Include/Spingalett/Spingalett.Inference.h)
+        add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/abi_dump.c
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/check_abi.py source
+                    ${CMAKE_CURRENT_BINARY_DIR}/abi_dump.c
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/Tests/check_abi.py ${CMAKE_CURRENT_SOURCE_DIR}/docs/make_reference.py
+                    ${abi_headers}
+            COMMENT "Writing the ABI dump program")
+        add_executable(SpingalettAbi ${CMAKE_CURRENT_BINARY_DIR}/abi_dump.c)
+        target_include_directories(SpingalettAbi PRIVATE $<TARGET_PROPERTY:spingalett,INTERFACE_INCLUDE_DIRECTORIES>)
+        set(abi_symbols)
+        if(UNIX AND NOT APPLE AND CMAKE_NM)
+            set(abi_symbols ${CMAKE_NM} $<TARGET_FILE:spingalett>)
+        endif()
+        add_test(NAME api.abi
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/check_abi.py check
+                         $<TARGET_FILE:SpingalettAbi> ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Data/abi.txt ${abi_symbols})
+    endif()
+
+    # A program of the prefixed names only, the names of 0.x (and <syslog.h>'s) its own.
     add_executable(SpingalettPrefixed ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Prefixed.c)
     target_link_libraries(SpingalettPrefixed PRIVATE spingalett)
     if(UNIX AND NOT APPLE)
@@ -590,11 +617,32 @@ configure_package_config_file(
     ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
     INSTALL_DESTINATION ${SPINGALETT_CMAKE_DIR}
 )
-# Before 1.0 a minor release may change the API, so only the same major.minor is compatible.
+# 1.x keeps the API and ABI of 1.0, so any 1.x of at least the version asked for will do (before 1.0 a
+# minor release could change them, and only the same major.minor was compatible).
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(SPINGALETT_COMPATIBILITY SameMinorVersion)
+else()
+    set(SPINGALETT_COMPATIBILITY SameMajorVersion)
+endif()
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
-    COMPATIBILITY SameMinorVersion
+    COMPATIBILITY ${SPINGALETT_COMPATIBILITY}
 )
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
         DESTINATION ${SPINGALETT_CMAKE_DIR})
+
+# pkg-config (spingalett.pc), relocatable: the prefix is found from the file's own directory.
+set(SPINGALETT_PC_DIR ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+cmake_path(ABSOLUTE_PATH SPINGALETT_PC_DIR BASE_DIRECTORY ${CMAKE_INSTALL_PREFIX} OUTPUT_VARIABLE pc_dir)
+file(RELATIVE_PATH SPINGALETT_PC_PREFIX ${pc_dir} ${CMAKE_INSTALL_PREFIX})
+string(REGEX REPLACE "/$" "" SPINGALETT_PC_PREFIX "${SPINGALETT_PC_PREFIX}")
+foreach(dir LIBDIR INCLUDEDIR)
+    if(IS_ABSOLUTE "${CMAKE_INSTALL_${dir}}")
+        set(SPINGALETT_PC_${dir} "${CMAKE_INSTALL_${dir}}")
+    else()
+        set(SPINGALETT_PC_${dir} "\${prefix}/${CMAKE_INSTALL_${dir}}")
+    endif()
+endforeach()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/spingalett.pc.in ${CMAKE_CURRENT_BINARY_DIR}/spingalett.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/spingalett.pc DESTINATION ${SPINGALETT_PC_DIR})

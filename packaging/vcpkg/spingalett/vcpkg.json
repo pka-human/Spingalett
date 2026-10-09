@@ -1,0 +1,36 @@
+{
+  "name": "spingalett",
+  "version-semver": "1.0.0",
+  "description": "Neural networks in C: training on the CPU and on GPUs through Vulkan, deployment models from FP32 down to INT2, an inference engine for microcontrollers",
+  "homepage": "https://github.com/pka-human/Spingalett",
+  "license": "MIT",
+  "supports": "(x64 | arm64) & (linux | osx | mingw)",
+  "dependencies": [
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    },
+    {
+      "name": "vcpkg-cmake-config",
+      "host": true
+    }
+  ],
+  "default-features": [
+    "openmp"
+  ],
+  "features": {
+    "openmp": {
+      "description": "Training and inference on every core through OpenMP (the compiler's runtime)"
+    },
+    "vulkan": {
+      "description": "The GPU backend through Vulkan compute (the loader is opened at run time)",
+      "dependencies": [
+        {
+          "name": "shaderc",
+          "host": true
+        },
+        "vulkan-headers"
+      ]
+    }
+  }
+}

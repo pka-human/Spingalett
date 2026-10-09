@@ -56,7 +56,9 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 
 - GCC and Clang, minimal (no OpenMP) and full (`-DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON`);
 - a baseline build (`-DSPINGALETT_NATIVE_ARCH=OFF`), which runs the portable and dispatched kernels;
-- AddressSanitizer and UndefinedBehaviorSanitizer (Debug, `-fsanitize=address,undefined`);
+- AddressSanitizer and UndefinedBehaviorSanitizer (Debug, `-fsanitize=address,undefined`), with GCC
+  and with Clang, whose UBSan also catches offsets applied to null pointers
+  (`LSAN_OPTIONS=suppressions=Tests/lsan.supp`: LLVM's OpenMP runtime keeps memory until exit);
 - the engine alone: `cc -std=c99 -Wall -Wextra -Wpedantic -Werror -DSPINGALETT_INFERENCE_ONLY -IInclude -ISrc -c Src/Spingalett.Inference.c`;
 - for SIMD changes, every instruction set the code has a path for. AArch64 cross builds run under
   `qemu-aarch64` (`QEMU_CPU=cortex-a53` for no dot product, `max` for all features); MinGW builds
@@ -85,6 +87,13 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.
+- **ABI.** From 1.0 a release keeps the ABI of the one before (semantic versioning): `api.abi`
+  compares the public structs' layouts, the enumerators, the integer constants and the functions'
+  declarations with `Tests/Data/abi.txt` (`Tests/check_abi.py`). A new field takes reserved space
+  (the `reserved` array shrinks by what it uses), a new function goes into a new node of
+  `Src/Spingalett.map` (the symbol versions; the test checks that it lists the headers' functions and
+  that the library exports them), and the baseline is recorded again at each release
+  (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`).
 - **ABI with Python.** `Tests/Spingalett.Layout.c` and `test_python_layout.py` check that the
   ctypes structures match the C ones; a new field in a public struct needs both sides.
 - **Engine scratch.** The engine's workspace size comes from `slett_conv_scratch()`; kernels may
@@ -176,21 +185,23 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   columns, `snake_case` with the `spingalett_` prefix for public functions and builders,
   `Spingalett` for public types, `SPINGALETT_` for enumerators and macros, `slett_` for format
   helpers, file-local names without a prefix. A new public name gets its short alias of 0.x only if
-  it renames one (`Spingalett.Short.h`); the library's sources may use the short names, which
-  `Spingalett.h` includes, but its exported symbols are the prefixed ones.
+  it renames one (`Spingalett.Short.h`); the library's sources use the short names (the internal
+  headers define `SPINGALETT_SHORT_NAMES`), but its exported symbols are the prefixed ones.
 - Every file starts with the SPDX header (`MIT`, copyright pka_human).
 - Comments say what a block computes and why, in full sentences; match the density of the code
   around them. Documentation is formal English and states facts, not intentions.
 - Public API changes go to `Spingalett.h` with a comment, the README, the Python bindings and their
-  README, and the CHANGELOG (breaking changes under **Changed**). Before 1.0 a minor release may
-  break the API; the soname carries the minor version.
+  README, and the CHANGELOG. From 1.0 the API and ABI follow semantic versioning (README,
+  **Compatibility**): a 1.x release only adds, and the soname carries the major version.
 - Commits are small and topical, with a subject line in the imperative and a body that says what
   changed and why (with measurements for performance work).
 
 ## Releases
 
-The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`
-and `Bindings/Python/spingalett/__init__.py`. `.github/workflows/release.yml` builds packages for Linux
+The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`,
+`Bindings/Python/spingalett/__init__.py` and `packaging/vcpkg/spingalett/vcpkg.json`. A release records
+its ABI (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`), and one that adds
+functions gives them a new node in `Src/Spingalett.map`. `.github/workflows/release.yml` builds packages for Linux
 (x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), trains the DigitPad model
 (2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip. The
 maintainer merges pull requests and pushes tags.

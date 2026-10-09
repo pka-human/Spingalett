@@ -28,7 +28,8 @@
  * pixel as such dot products of the filters with the window it reads; pooling and batch
  * normalization run in float, and so do the layers that add or concatenate the outputs of others.
  */
-#pragma once
+#ifndef SPINGALETT_INFERENCE_H
+#define SPINGALETT_INFERENCE_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -52,7 +53,7 @@ extern "C" {
 #  endif
 #endif
 
-/* Newest version of the .slett model format. save_spingalett writes the oldest version that holds
+/* Newest version of the .slett model format. spingalett_save() writes the oldest version that holds
    the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch
    normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one
    before them, add or concatenate several, or pool globally), 7 with transposed convolutions,
@@ -63,7 +64,7 @@ extern "C" {
 /* Most inputs a layer can have (SPINGALETT_LAYER_ADD and SPINGALETT_LAYER_CONCAT read several). */
 #define SPINGALETT_MAX_INPUTS 16
 
-/* File name extensions: models (save_spingalett appends it when the name has none) and data sets. */
+/* File name extensions: models (spingalett_save() appends it when the name has none) and data sets. */
 #define SPINGALETT_MODEL_EXTENSION   ".slett"
 #define SPINGALETT_DATASET_EXTENSION ".slettd"
 
@@ -216,9 +217,18 @@ SPINGALETT_API int spingalett_model_run(const SpingalettModel *model, const floa
    range. */
 SPINGALETT_API bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, SpingalettLayerInfo *info);
 
-/* The engine's names of 0.x, without the prefix, unless SPINGALETT_NO_SHORT_NAMES is defined
-   (Spingalett.Short.h has the rest of the library's). */
-#if !defined(SPINGALETT_NO_SHORT_NAMES)
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SPINGALETT_INFERENCE_H */
+
+/* The engine's names of 0.x, without the prefix, when SPINGALETT_SHORT_NAMES is defined (by
+   Spingalett.Short.h, which has the rest of the library's). Outside the include guard, so that the
+   header gives them when it is included again after that. */
+#if defined(SPINGALETT_SHORT_NAMES) && !defined(SPINGALETT_INFERENCE_SHORT_NAMES)
+#define SPINGALETT_INFERENCE_SHORT_NAMES
 typedef SpingalettActivationFunction ActivationFunction;
 typedef SpingalettLossFunction LossFunction;
 typedef SpingalettLayerType LayerType;
@@ -257,8 +267,4 @@ typedef SpingalettPrecisionMode PrecisionMode;
 #define PRECISION_INT4 SPINGALETT_PRECISION_INT4
 #define PRECISION_INT2 SPINGALETT_PRECISION_INT2
 #define PRECISION_COUNT SPINGALETT_PRECISION_COUNT
-#endif
-
-#ifdef __cplusplus
-}
 #endif

@@ -5,6 +5,10 @@
 
 #pragma once
 
+/* The library's sources use the names of 0.x (Spingalett.Short.h). */
+#if !defined(SPINGALETT_SHORT_NAMES)
+#define SPINGALETT_SHORT_NAMES
+#endif
 #include "Spingalett/Spingalett.h"
 #include "Spingalett.Engine.h"
 #include "Spingalett.Network.h"

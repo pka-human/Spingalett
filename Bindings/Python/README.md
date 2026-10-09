@@ -151,6 +151,7 @@ the memory of float32, and converts them a batch at a time, with the same result
 `x / 255` in float32.
 
 Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bindings check on import
-that the library has the same major.minor version (`library_version()`), because they mirror its
-struct layouts. A `Network` is not thread-safe: use one per thread. A `Model` is read-only and can
-be shared between threads.
+that the library can serve them (`library_version()`), because they mirror its struct layouts: the
+same major version and at least their own minor one (before 1.0, the same major.minor version). A
+`Network` is not thread-safe: use one per thread. A `Model` is read-only and can be shared between
+threads.

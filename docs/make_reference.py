@@ -110,7 +110,7 @@ def render():
     parsed = []
     for header, title in HEADERS:
         text = open(os.path.join(ROOT, 'Include', 'Spingalett', header)).read()
-        text = text.split('#if !defined(SPINGALETT_NO_SHORT_NAMES)')[0]     # the short names: not listed
+        text = text.split('#if defined(SPINGALETT_SHORT_NAMES)')[0]     # the short names: not listed
         parsed.append((header, title, items(text)))
     # an index of the names, each linking to its entry (GitHub's anchors: the heading's text, lower case,
     # without the punctuation)

@@ -38,6 +38,7 @@ the library inside) are included.
 - [DigitPad demo](#digitpad-demo)
 - [Performance](#performance)
 - [Project layout](#project-layout)
+- [Compatibility](#compatibility)
 - [Status and roadmap](#status-and-roadmap)
 - [Contributing](#contributing)
 - [License](#license)
@@ -69,9 +70,9 @@ the library inside) are included.
 
 Prebuilt libraries for Linux (x86-64 and ARM64), Windows and macOS are attached to every
 [release](https://github.com/pka-human/Spingalett/releases): each archive contains the headers,
-the shared library, a CMake package, `DatasetTool` and `ModelTool`. Extract one and point CMake at it with
-`-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with `-I<dir>/include -L<dir>/lib
--lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
+the shared library, a CMake package, a pkg-config file, `DatasetTool` and `ModelTool`. Extract one
+and point CMake at it with `-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with
+`-I<dir>/include -L<dir>/lib -lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
 `-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
 when the processor has them, and the `-v3` build also compiles the rest of the library
 (activations, optimizers, the inference engine) for AVX2. The Windows DLL ships with import
@@ -130,8 +131,23 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 which carries the include paths:
 
 ```cmake
-find_package(Spingalett 0.14 REQUIRED)        # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 1.0 REQUIRED)         # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
+```
+
+pkg-config finds it as `spingalett` (`cc app.c $(pkg-config --cflags --libs spingalett)`); the file
+locates the installation from its own directory, so an extracted release archive serves too, through
+`PKG_CONFIG_PATH=<dir>/lib/pkgconfig`.
+
+The repository carries a [Conan](https://conan.io) recipe and a [vcpkg](https://vcpkg.io) port that
+build the library of the checkout (shared, with OpenMP, kernels chosen at run time; the GPU backend
+as an option, with `glslc` and the Vulkan headers from the package manager). Both give
+`find_package(Spingalett)` and pkg-config's `spingalett`; they build with GCC or Clang (MinGW on
+Windows):
+
+```bash
+conan create packaging/conan --build=missing                  # -o "&:vulkan=True": the GPU backend
+vcpkg install spingalett --overlay-ports=packaging/vcpkg      # "spingalett[vulkan]": the GPU backend
 ```
 
 Programs that compile the library's sources into themselves, or link it statically, define
@@ -186,8 +202,9 @@ selects the documented default.
 Every public name carries the library's prefix: `spingalett_` for functions and builders,
 `Spingalett` for types, `SPINGALETT_` for constants. The names of 0.x without it (`layer()`,
 `train()`, `NeuralNetwork`, `ACT_RELU`, `WEIGHT_INITIALIZATION_HE`, ...) stay available from
-`Spingalett/Spingalett.Short.h`, which `Spingalett.h` includes unless `SPINGALETT_NO_SHORT_NAMES` is
-defined, so programs written for them compile unchanged; define it to keep such names for your own.
+`Spingalett/Spingalett.Short.h`: a program written for them includes it in place of `Spingalett.h` (or
+defines `SPINGALETT_SHORT_NAMES` before including that) and compiles unchanged. `Spingalett.h` leaves
+them out, so that names such as `train()` and `LOG_DEBUG` (also `<syslog.h>`'s) stay the program's.
 
 The `Examples/` directory contains this XOR program, an MNIST classifier
 (`Examples/download_mnist.sh data/mnist && Bin/MNIST data/mnist`), a convolutional one
@@ -1347,18 +1364,46 @@ Bindings/Python/      Python bindings
 cmake/                CMake package and inference-only build helpers
 ```
 
+## Compatibility
+
+From 1.0 on, Spingalett follows [semantic versioning](https://semver.org/): a 1.x release keeps
+what 1.0 gave, and only 2.0 may take anything away.
+
+- **Source:** a program written for 1.x compiles against every later 1.y. No function, type, struct
+  field, enumerator or constant of the headers (`Spingalett.h`, `Spingalett.Inference.h`,
+  `Spingalett.Short.h`, `Spingalett.hpp`) is removed, renamed or given another meaning; releases add
+  them. A new field takes the place of reserved words and means, at zero, what a program that does
+  not know it expects, so the designated initializers of 1.0 keep their meaning.
+- **Binary:** a program built against 1.x runs with every later 1.y without being built again: the
+  shared library keeps the soname `libspingalett.so.1` (`libspingalett.1.dylib` on macOS), the structs
+  keep their size and the offsets of their fields, enumerators keep their values, and functions keep
+  their parameters. On ELF platforms the functions carry symbol versions (`SPINGALETT_1.0`, then one
+  per release that adds some), so that the loader refuses a library older than the program needs.
+  The test `api.abi` compares every release with the one before.
+- **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7)
+  and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
+  later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
+  that uses only what it knows.
+- **Python:** the `spingalett` package keeps its functions, classes and keyword arguments in the
+  same way.
+- **Not held:** the values of the `*_COUNT` enumerators and of `SPINGALETT_FORMAT_VERSION`, which
+  grow with what a release adds; the text of messages; speed; and the last bits of results. Training
+  repeats its bits on one version (on any number of threads, and on one GPU), but a release whose
+  kernels add in another order may round differently. Everything outside `Include/` is internal.
+- **Deprecation:** what is to go in 2.0 is marked deprecated in a 1.x release, in the header and the
+  CHANGELOG, and keeps working until then.
+
 ## Status and roadmap
 
-Spingalett is at version 0.14.0, the release candidate for 1.0: its API (prefixed names, structs
-that can grow, zero as every field's default) and its formats (`.slett` 7, `.slettd` 2) are those
-1.0 is to keep, unless testing it shows otherwise. Until 1.0 the shared library's soname carries the
-minor version (`libspingalett.so.0.14`). Since 0.7 the network is an opaque handle, so its internal
-layout can change without breaking programs. Saved models are versioned and remain loadable.
+Spingalett is at version 1.0.0. Its API (prefixed names, structs that can grow, zero as every
+field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 7, `.slettd` 2)
+are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
+handle, so its internal layout can change without breaking programs; saved models are versioned and
+remain loadable.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- 1.0: the API and ABI of 0.14 frozen
-- Before and after 1.0, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
+- Any release of 1.x, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
   the single-precision kernel for convolutions of few channels, products in FP16, Winograd
   convolutions
 - 1.1: a CUDA backend of its own kernels (no cuDNN), next to Vulkan

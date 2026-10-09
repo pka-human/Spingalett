@@ -1,0 +1,111 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 pka_human (pka_human@proton.me)
+ *
+ * Symbol versions of libspingalett.so (ELF platforms): the functions the public headers declare, the
+ * library's ABI. A node, once released, never changes; a 1.x release that adds functions lists them
+ * in a node of its own (SPINGALETT_1.1 { global: ...; } SPINGALETT_1.0;), so that a program built
+ * against it names the version it needs and the loader refuses an older library. Everything else
+ * stays local. Tests/check_abi.py checks that these are the headers' functions, and on Linux that
+ * they are what the library exports.
+ */
+SPINGALETT_1.0 {
+    global:
+        spingalett_activate;
+        spingalett_append_layer;
+        spingalett_clear_error;
+        spingalett_cpu_kernels;
+        spingalett_dataset_class_name;
+        spingalett_dataset_close;
+        spingalett_dataset_free;
+        spingalett_dataset_generator;
+        spingalett_dataset_info;
+        spingalett_dataset_open;
+        spingalett_dataset_open_ex;
+        spingalett_dataset_open_u8;
+        spingalett_dataset_read;
+        spingalett_dataset_set_class_names;
+        spingalett_dataset_shuffle;
+        spingalett_dataset_split;
+        spingalett_dataset_target_set_name;
+        spingalett_dataset_target_set_size;
+        spingalett_derivative;
+        spingalett_device_data_count;
+        spingalett_device_data_free;
+        spingalett_device_data_new;
+        spingalett_device_data_read;
+        spingalett_device_data_size;
+        spingalett_evaluate_args;
+        spingalett_export_c_header;
+        spingalett_forward_args;
+        spingalett_free;
+        spingalett_get_compute_mode;
+        spingalett_get_gpu_precision;
+        spingalett_get_num_threads;
+        spingalett_get_parameters;
+        spingalett_get_verbose;
+        spingalett_gpu_device;
+        spingalett_import_onnx;
+        spingalett_import_onnx_from_memory;
+        spingalett_input_size;
+        spingalett_last_error_code;
+        spingalett_last_error_message;
+        spingalett_layer_count;
+        spingalett_load;
+        spingalett_load_cifar;
+        spingalett_load_csv;
+        spingalett_load_dataset;
+        spingalett_load_dataset_from_memory;
+        spingalett_load_dataset_from_memory_targets;
+        spingalett_load_dataset_targets;
+        spingalett_load_from_memory;
+        spingalett_load_idx;
+        spingalett_load_pytorch;
+        spingalett_load_pytorch_from_memory;
+        spingalett_lr_cosine_decay;
+        spingalett_lr_linear_warmup;
+        spingalett_lr_step_decay;
+        spingalett_lr_warmup_cosine;
+        spingalett_model_evaluate;
+        spingalett_model_free;
+        spingalett_model_from_memory;
+        spingalett_model_from_network;
+        spingalett_model_init;
+        spingalett_model_layer;
+        spingalett_model_load;
+        spingalett_model_predict;
+        spingalett_model_run;
+        spingalett_network_free;
+        spingalett_network_layer;
+        spingalett_network_loss;
+        spingalett_network_new_args;
+        spingalett_optimizer_steps;
+        spingalett_output_size;
+        spingalett_parameter_count;
+        spingalett_predict_args;
+        spingalett_print_network;
+        spingalett_save_args;
+        spingalett_save_dataset;
+        spingalett_save_to_memory;
+        spingalett_seed;
+        spingalett_set_compute_mode;
+        spingalett_set_gpu_precision;
+        spingalett_set_log_callback;
+        spingalett_set_log_level;
+        spingalett_set_num_threads;
+        spingalett_set_parameters;
+        spingalett_set_verbose;
+        spingalett_train_args;
+        spingalett_train_on_batch;
+        spingalett_trainer_backward;
+        spingalett_trainer_backward_output_grads;
+        spingalett_trainer_forward;
+        spingalett_trainer_free;
+        spingalett_trainer_new;
+        spingalett_trainer_set_label_smoothing;
+        spingalett_trainer_step;
+        spingalett_trainer_zero_grad;
+        spingalett_version;
+    local:
+        *;
+};

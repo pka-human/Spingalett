@@ -746,15 +746,15 @@ static void gpu_fill(Trainer *t, const float *inputs, const float *targets_in, c
     SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, work) && n > 1,
         for (int64_t s = 0; s < (int64_t)n; s++) {
             uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
-            const float *src = inputs + (size_t)idx * in_sz;
-            if (!host_in)
-                ;
-            else if (x16)
-                spingalett_round_bf16(x16 + (size_t)s * in_sz, src, in_sz);
-            else if (t->augment)
-                augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
-            else
-                memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
+            if (host_in) {                              /* inputs: NULL when they are on the GPU */
+                const float *src = inputs + (size_t)idx * in_sz;
+                if (x16)
+                    spingalett_round_bf16(x16 + (size_t)s * in_sz, src, in_sz);
+                else if (t->augment)
+                    augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
+                else
+                    memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
+            }
             if (host_out)
                 memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
         }

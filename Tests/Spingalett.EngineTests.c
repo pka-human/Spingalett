@@ -10,6 +10,7 @@
  * SPINGALETT_TEST_HEADERS the models exported as C headers by the full library run as well.
  */
 
+#define SPINGALETT_SHORT_NAMES     /* the names of 0.x */
 #include <Spingalett/Spingalett.Inference.h>
 #include <math.h>
 #include <stdio.h>

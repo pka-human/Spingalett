@@ -1024,7 +1024,7 @@ SpingalettNetwork *spingalett_load(const char *filename);
 
 ### `spingalett_save_to_memory()`
 
-The bytes save_spingalett writes, in memory (aligned to 64 bytes, so they also serve as a model image for spingalett_model_init). *size receives their count. Release with spingalett_free. Returns NULL on error.
+The bytes spingalett_save() writes, in memory (aligned to 64 bytes, so they also serve as a model image for spingalett_model_init). *size receives their count. Release with spingalett_free. Returns NULL on error.
 
 ```c
 void *spingalett_save_to_memory(const SpingalettNetwork *net, SpingalettPrecisionMode precision, bool save_optimizer, size_t *size);
@@ -1400,7 +1400,7 @@ void spingalett_print_network(const SpingalettNetwork *net);
 void spingalett_network_free(SpingalettNetwork *net);
 ```
 
-The names of 0.x, without the prefix (layer(), train(), NeuralNetwork, ACT_RELU, ...), for programs written for them; define SPINGALETT_NO_SHORT_NAMES before including this header to leave them out.
+The names of 0.x, without the prefix (layer(), train(), NeuralNetwork, ACT_RELU, ...), for programs written for them: Spingalett.Short.h, which this header includes when SPINGALETT_SHORT_NAMES is defined.
 
 ## Spingalett.Inference.h
 
@@ -1416,7 +1416,7 @@ Layers whose weights are stored as INT8, INT4 or INT2 run in integer arithmetic:
 
 ### `SPINGALETT_FORMAT_VERSION`
 
-Newest version of the .slett model format. save_spingalett writes the oldest version that holds the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one before them, add or concatenate several, or pool globally), 7 with transposed convolutions, upsampling or layer normalization, so that engines of earlier releases still run what they can; versions 1 and 2 still load.
+Newest version of the .slett model format. spingalett_save() writes the oldest version that holds the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one before them, add or concatenate several, or pool globally), 7 with transposed convolutions, upsampling or layer normalization, so that engines of earlier releases still run what they can; versions 1 and 2 still load.
 
 ```c
 #define SPINGALETT_FORMAT_VERSION 7
@@ -1432,7 +1432,7 @@ Most inputs a layer can have (SPINGALETT_LAYER_ADD and SPINGALETT_LAYER_CONCAT r
 
 ### `SPINGALETT_MODEL_EXTENSION`
 
-File name extensions: models (save_spingalett appends it when the name has none) and data sets.
+File name extensions: models (spingalett_save() appends it when the name has none) and data sets.
 
 ```c
 #define SPINGALETT_MODEL_EXTENSION   ".slett"
@@ -1640,4 +1640,4 @@ Describes weight layer `index` (0 is the first hidden layer). Returns false when
 bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, SpingalettLayerInfo *info);
 ```
 
-The engine's names of 0.x, without the prefix, unless SPINGALETT_NO_SHORT_NAMES is defined (Spingalett.Short.h has the rest of the library's).
+The engine's names of 0.x, without the prefix, when SPINGALETT_SHORT_NAMES is defined (by Spingalett.Short.h, which has the rest of the library's). Outside the include guard, so that the header gives them when it is included again after that.

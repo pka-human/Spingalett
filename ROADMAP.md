@@ -1,6 +1,6 @@
 # Roadmap
 
-Where Spingalett is going after 0.13, roughly in order. Plans change as the work shows what is
+Where Spingalett is going after 1.0, roughly in order. Plans change as the work shows what is
 worth doing; the [CHANGELOG](CHANGELOG.md) records what was actually done. Every release keeps the
 project's rule: nothing gets slower, and new kernels are measured against the previous release and
 against PyTorch on the same machine.
@@ -21,6 +21,7 @@ against PyTorch on the same machine.
 | 0.13 | "Layers": transposed convolutions, upsampling and layer normalization on the CPU and the GPU, in `.slett` format 7, the engine and deployment models in every precision; their import from ONNX (ConvTranspose, Resize, LayerNormalization) and PyTorch; a U-Net segmentation example; the GPU's loss kernel for wide outputs |
 | 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling, weight gradients split only where it pays: ahead of PyTorch with cuDNN in every workload but the MLP's inference with PyTorch's data already in GPU memory |
 | 0.14 | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.14 times at least in every workload, its data in GPU memory or not |
+| 1.0 | "Stability": the API, ABI and formats of 0.14 kept by semantic versioning (symbol versions, the `api.abi` test against the last release), the names of 0.x only on request, pkg-config, Conan and vcpkg recipes |
 
 ## 0.14: the release candidate (released)
 
@@ -52,16 +53,25 @@ else.
   falls back to the CPU until 1.1). The device layer under the GPU executor changes no API and comes
   with the CUDA backend.
 
-## 1.0: stability
+## 1.0: stability (released)
 
 0.14 with what its users find fixed: the C API and ABI follow semantic versioning from then on, the
 soname becomes `libspingalett.so.1`, and a CMake package, pkg-config file, vcpkg and Conan recipes
 ship with it.
 
+- **The names of 0.x only on request** (done): `Spingalett.h` leaves out `Spingalett.Short.h`, whose
+  macros clashed with `<syslog.h>` and replaced programs' own `train()` and `layer()`.
+- **The ABI held by tests** (done): symbol versions (`Src/Spingalett.map`, `SPINGALETT_1.0`) and
+  `api.abi`, which compares the structs' layouts, the enumerators, the constants and the functions'
+  declarations with those of the last release (`Tests/Data/abi.txt`).
+- **Packages** (done): `spingalett.pc` (relocatable), the CMake package compatible within a major
+  version, a Conan recipe and a vcpkg port of the source tree (`packaging/`, tested in CI); the
+  rules of compatibility in the README.
+
 ## Any time: work that changes no API
 
-Performance and backends that programs only notice by their speed land in whichever release is
-next, before or after 1.0.
+Performance and backends that programs only notice by their speed land in whichever release of 1.x
+is next.
 
 ### The GPU against PyTorch
 

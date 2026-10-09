@@ -17,7 +17,7 @@
  * results are deterministic.
  */
 
-#include <Spingalett/Spingalett.h>
+#include <Spingalett/Spingalett.Short.h>    /* the names of 0.x, and Spingalett.h */
 #include "Spingalett.Network.h"      /* white-box: the network's arrays */
 #include <stdio.h>
 #include <stdlib.h>
