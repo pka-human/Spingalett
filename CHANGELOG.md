@@ -13,6 +13,12 @@ network's inference included (1.19 times as fast in single precision, 1.3 times 
 RTX 4050 Laptop GPU; README).
 
 ### Added
+- **A C++ interface**, header-only: `#include <Spingalett/Spingalett.hpp>` (C++23). The library's objects as
+  move-only owners (`spingalett::Network`, `Model`, `Dataset`, `DeviceData`), data as `std::span`,
+  errors as `std::expected<T, spingalett::Error>` (the library's code and message; nothing throws),
+  scoped enums, `TrainOptions` (and every other field of `SpingalettTrainArgs` through its `raw`), and
+  a fluent `Builder` that makes the network in `build()`, reporting the first layer the library
+  refuses. `raw()` gives the C object for what the wrapper does not cover.
 - Data sets in the GPU's memory: `spingalett_device_data_new(values, count, size)` copies rows of
   floats to the device once (`spingalett_device_data_free()`, `_count()`, `_size()`, `_read()`), and the
   new fields `device_inputs` and `device_targets` of `TrainArgs` (with `device_val_inputs` and
