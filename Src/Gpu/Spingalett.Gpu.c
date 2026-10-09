@@ -151,8 +151,8 @@ const char *spingalett_gpu_name(void) {
 
 bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
     for (uint32_t l = 0; l < net->layers; l++)
-        if ((uint64_t)net->topology[l] * SPINGALETT_BATCH_CHUNK > UINT32_MAX) {
-            if (why) *why = "layers of over 2^32 / 2048 values a sample";
+        if ((uint64_t)net->topology[l] * 64u > INT32_MAX) {
+            if (why) *why = "layers of over 2^25 values a sample";
             return false;
         }
     for (uint32_t l = 1; l < net->layers; l++) {
@@ -206,6 +206,10 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
     /* inference in chunks that keep to the cache, of 64 samples at least */
     const uint64_t cached = INFERENCE_BYTES / inference_bytes(net);
     if (!training && cap > cached) cap = cached < 64u ? 64u : cached;
+    /* a layer's values of a chunk indexed by kernels with signed 32-bit integers, as SPIR-V indexes */
+    uint32_t widest = 1;
+    for (uint32_t l = 0; l < net->layers; l++) widest = net->topology[l] > widest ? net->topology[l] : widest;
+    if (cap > INT32_MAX / widest) cap = INT32_MAX / widest;
     return cap < want ? (uint32_t)cap : want;
 }
 
@@ -510,7 +514,10 @@ bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTrain
         }
     g->cfg = *training;
     g->step_loss = g->total_loss = 0.0f;
-    g->slots[0].staged = g->slots[1].staged = false;
+    for (uint32_t k = 0; k < 2; k++) {
+        g->slots[k].staged = g->slots[k].in_place = false;
+        g->slots[k].gathered = 0;
+    }
     return true;
 }
 
@@ -1579,7 +1586,8 @@ static const SpgGpuBuffer *data_half(const SpingalettDeviceData *cd) {
     const uint64_t values = (uint64_t)d->count * d->size;
     if (d->half_state == 0) {
         d->half_state = -1;
-        if (values <= UINT32_MAX && spg_gpu_bf16_storage() && (d->half_arena = spg_gpu_arena_create())) {
+        /* (the conversion indexes the values with signed 32-bit integers, as SPIR-V does) */
+        if (values <= INT32_MAX && spg_gpu_bf16_storage() && (d->half_arena = spg_gpu_arena_create())) {
             spg_gpu_arena_add(d->half_arena, &d->half, values * 2u, SPG_MEMORY_DEVICE);
             SpgGpuCommands *c = spg_gpu_arena_commit(d->half_arena) ? spg_gpu_commands_create() : NULL;
             SpgEltwisePush p = {d->half.address, d->buffer.address, 0, 0, 0, (uint32_t)values, 1, 0, 0, 0.0f, 0, 0};
@@ -1702,6 +1710,11 @@ void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) {
 void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows) {
     if (rows) g->rows = *rows;
     else memset(&g->rows, 0, sizeof g->rows);
+    /* (a chunk filled ahead for a step that did not come takes nothing from them) */
+    for (uint32_t k = 0; k < 2; k++) {
+        g->slots[k].gathered = 0;
+        g->slots[k].in_place = false;
+    }
 }
 
 uint32_t *spingalett_gpu_chunk_rows(SpgGpuNet *g) {
