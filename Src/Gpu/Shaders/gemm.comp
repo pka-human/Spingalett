@@ -35,6 +35,7 @@
  */
 
 #version 460
+#extension GL_EXT_control_flow_attributes : require
 #include "common.glsl"
 
 layout(constant_id = 0) const uint BM = 128;
@@ -63,14 +64,14 @@ void put_a(uint k, uint m, float v) { As[k * SA + (m >> 2)][m & 3u] = v; }
 void put_b(uint k, uint n, float v) { Bs[k * SB + (n >> 2)][n & 3u] = v; }
 
 void store_tiles() {
-    for (uint i = 0; i < LA; i++) {
+    [[unroll]] for (uint i = 0; i < LA; i++) {
         if (!a_live(i)) continue;
         uint k = a_k(i), m = a_row(i);
         if (!VA) put_a(k, m, fa[i].x);
         else if (A_KFAST) { put_a(k, m, fa[i].x); put_a(k + 1u, m, fa[i].y); put_a(k + 2u, m, fa[i].z); put_a(k + 3u, m, fa[i].w); }
         else As[k * SA + (m >> 2)] = fa[i];
     }
-    for (uint i = 0; i < LB; i++) {
+    [[unroll]] for (uint i = 0; i < LB; i++) {
         if (!b_live(i)) continue;
         uint k = b_k(i), n = b_col(i);
         if (!VB) put_b(k, n, fb[i].x);
@@ -95,31 +96,31 @@ void main() {
     /* acc[i * TN / 4 + j]: row i, columns 4j .. 4j + 3; precise, so that every fma() stays fused (the
        same chain of fused multiply-adds whatever the tile) */
     precise vec4 acc[TM * TN / 4];
-    for (uint i = 0; i < TM * TN / 4u; i++) acc[i] = vec4(0.0);
+    [[unroll]] for (uint i = 0; i < TM * TN / 4u; i++) acc[i] = vec4(0.0);
 
     if (kbeg < kend) fetch(kbeg);
     for (uint k0 = kbeg; k0 < kend; k0 += BK) {
         store_tiles();
         barrier();
         if (k0 + BK < kend) fetch(k0 + BK);
-        for (uint kk = 0; kk < BK; kk++) {
+        [[unroll]] for (uint kk = 0; kk < BK; kk++) {
             vec4 av[TM / 4], bv[TN / 4];
-            for (uint i = 0; i < TM / 4u; i++) av[i] = As[kk * SA + tr * (TM / 4u) + i];
-            for (uint j = 0; j < TN / 4u; j++) bv[j] = Bs[kk * SB + tc * (TN / 4u) + j];
-            for (uint i = 0; i < TM; i++) {
+            [[unroll]] for (uint i = 0; i < TM / 4u; i++) av[i] = As[kk * SA + tr * (TM / 4u) + i];
+            [[unroll]] for (uint j = 0; j < TN / 4u; j++) bv[j] = Bs[kk * SB + tc * (TN / 4u) + j];
+            [[unroll]] for (uint i = 0; i < TM; i++) {
                 float a = av[i >> 2][i & 3u];
-                for (uint j = 0; j < TN / 4u; j++) acc[i * (TN / 4u) + j] = fma(vec4(a), bv[j], acc[i * (TN / 4u) + j]);
+                [[unroll]] for (uint j = 0; j < TN / 4u; j++) acc[i * (TN / 4u) + j] = fma(vec4(a), bv[j], acc[i * (TN / 4u) + j]);
             }
         }
         barrier();
     }
 
     const uint coff = g * p.c_group;
-    for (uint i = 0; i < TM; i++) {
+    [[unroll]] for (uint i = 0; i < TM; i++) {
         uint m = m0 + tr * TM + i;
         if (m >= p.M) break;
         const uint row = c_row(m);
-        for (uint j = 0; j < TN; j++) {
+        [[unroll]] for (uint j = 0; j < TN; j++) {
             uint n = n0 + tc * TN + j;
             if (n >= p.N) break;
             store_c(z, coff, m, row, n, acc[i * (TN / 4u) + (j >> 2)][j & 3u]);

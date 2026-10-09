@@ -13,7 +13,8 @@
  *                                 precision and (with matrix units) in bfloat16 on them
  *   SpingalettGpuTests all        with every tile
  *   SpingalettGpuTests bench      times every tile on the products of ResNet-20 at 128 samples
- *   SpingalettGpuTests bench bf16 the same on the matrix units
+ *   SpingalettGpuTests bench bf16 the same on the matrix units ("dense" after either: the MLP's
+ *                                 products only)
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -388,14 +389,14 @@ static void bench_report(const char *name, bool mma, double flops, double chosen
         printf("           %7.1f us  %3ux%-3u k%-2u %ux%u\n", times[order[k]] * 1e6, bm, bn, bk, tm, tn);
     }
 }
-static void bench(void) {
+static void bench(bool dense_only) {
     static const Conv shapes[] = {
         {128, 32, 32, 16, 16, 3, 3, 1, 1, 1, 1, 1}, {128, 32, 32, 16, 32, 3, 3, 2, 2, 1, 1, 1},
         {128, 16, 16, 32, 32, 3, 3, 1, 1, 1, 1, 1}, {128, 16, 16, 32, 64, 3, 3, 2, 2, 1, 1, 1},
         {128, 8, 8, 64, 64, 3, 3, 1, 1, 1, 1, 1}, {128, 32, 32, 3, 16, 3, 3, 1, 1, 1, 1, 1},
     };
     static const char *names[] = {"forward", "data", "weights"};
-    for (size_t k = 0; k < sizeof shapes / sizeof shapes[0]; k++) {
+    for (size_t k = 0; !dense_only && k < sizeof shapes / sizeof shapes[0]; k++) {
         const Conv *v = &shapes[k];
         const uint32_t OH = out_h(v), OW = out_w(v), K = v->kh * v->kw * v->c / v->groups;
         const size_t nx = (size_t)v->n * v->h * v->w * v->c, ny = (size_t)v->n * OH * OW * v->out,
@@ -486,8 +487,12 @@ int main(int argc, char **argv) {
     printf("device: %s\n", spg_gpu_device_name());
     printf("matrix units: %s\n", spg_gpu_mma_bf16() ? "bfloat16 cooperative matrices" : "none");
     if (argc > 1 && !strcmp(argv[1], "bench")) {
-        mma = argc > 2 && !strcmp(argv[2], "bf16") && spg_gpu_mma_bf16();
-        bench();
+        bool dense = false;
+        for (int k = 2; k < argc; k++) {
+            if (!strcmp(argv[k], "bf16")) mma = spg_gpu_mma_bf16();
+            if (!strcmp(argv[k], "dense")) dense = true;
+        }
+        bench(dense);
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "all")) tile_step = 1;

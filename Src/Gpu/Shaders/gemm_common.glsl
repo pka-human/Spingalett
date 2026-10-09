@@ -96,7 +96,7 @@ void prepare(uint kbeg) {
         SH = p.geo.v[GEO_SH]; SW = p.geo.v[GEO_SW]; PH = p.geo.v[GEO_PH]; PW = p.geo.v[GEO_PW];
     }
     if (AMODE == A_CONV) {
-        for (uint i = 0; i < LA; i++) {
+        [[unroll]] for (uint i = 0; i < LA; i++) {
             uint m = m0 + a_row(i);
             uint n = m / (RH * RW), r = m % (RH * RW), y = r / RW, x = r % RW;
             abase[i] = int(n * GH * GW * GC);
@@ -106,7 +106,7 @@ void prepare(uint kbeg) {
         }
     }
     if (BMODE == B_CONV) {
-        for (uint i = 0; i < LB; i++) {
+        [[unroll]] for (uint i = 0; i < LB; i++) {
             uint n = n0 + b_col(i);
             uint t = n < p.N ? p.geo.v[GEO_TAPS + n] : 0u;
             btap_h[i] = int(t & 255u);
@@ -128,7 +128,7 @@ vec4 load(F32 x, uint at, bool vec) {
 }
 
 void fetch(uint k0) {
-    for (uint i = 0; i < LA; i++) {
+    [[unroll]] for (uint i = 0; i < LA; i++) {
         uint m = m0 + a_row(i), k = k0 + a_k(i);
         vec4 v = vec4(0.0);
         /* vectors need all four inside: m or k a multiple of four below a multiple-of-four bound */
@@ -146,7 +146,7 @@ void fetch(uint k0) {
         }
         fa[i] = v;
     }
-    for (uint i = 0; i < LB; i++) {
+    [[unroll]] for (uint i = 0; i < LB; i++) {
         uint n = n0 + b_col(i), k = k0 + b_k(i);
         vec4 v = vec4(0.0);
         if (b_live(i) && n < p.N && k < kend) {
