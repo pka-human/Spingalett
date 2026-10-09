@@ -590,6 +590,7 @@ typedef struct {
 
     SpgGpuNet *gpu;             /* COMPUTE_VULKAN: the network on the GPU (no CPU workspaces then) */
     bool gpu_rows_in, gpu_rows_out;     /* the GPU gathers the inputs, the targets from data sets there */
+    bool gpu_in_place;          /* it reads the inputs' rows where they are (in order, few chunks an epoch) */
     float *copies[4];           /* data sets on the GPU copied to the host: inputs, targets, validation's */
     bool gpu_failed;
     bool gpu_ahead;             /* fill the next step's first chunk at the end of this one (it is known) */
@@ -731,11 +732,12 @@ static void gpu_fill(Trainer *t, const float *inputs, const float *targets_in, c
                      uint32_t c0, uint32_t n, uint64_t step) {
     const NeuralNetwork *net = t->net;
     const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
-    if (t->gpu_rows_in || t->gpu_rows_out) {
+    const bool in_place = t->gpu_in_place && spingalett_gpu_chunk_in_place(t->gpu, start + c0);
+    if ((t->gpu_rows_in && !in_place) || t->gpu_rows_out) {
         uint32_t *index = spingalett_gpu_chunk_rows(t->gpu);
         for (uint32_t s = 0; s < n; s++) index[s] = order ? order[start + c0 + s] : start + c0 + s;
-        if (t->gpu_rows_in && t->gpu_rows_out) return;
     }
+    if (t->gpu_rows_in && t->gpu_rows_out) return;
     const bool host_in = !t->gpu_rows_in, host_out = !t->gpu_rows_out;
     float *targets;
     uint16_t *x16 = t->augment || !host_in ? NULL : spingalett_gpu_chunk_inputs_bf16(t->gpu, &targets);
@@ -1228,6 +1230,12 @@ TrainReport train_struct_arguments(TrainArgs args) {
     /* STRATEGY_SAMPLE walks the whole set in one call and steps after every sample. */
     uint32_t step_size = (training_strategy == STRATEGY_SAMPLE) ? sample_count : t.batch_size;
     uint32_t steps_per_epoch = step_size ? (sample_count + step_size - 1) / step_size : 0;
+    /* the inputs' rows on the GPU read where they are when the chunks of an epoch are the same every
+       epoch and few enough for their commands, recorded for their rows, to stay recorded */
+    if (t.gpu_rows_in && !t.order && !t.augment) {
+        const uint32_t cap = spingalett_gpu_net_capacity(t.gpu);
+        t.gpu_in_place = (uint64_t)steps_per_epoch * ((step_size + cap - 1) / cap) <= 16u;
+    }
 
     flush_denormals_begin(effective_mode);
 

@@ -20,6 +20,7 @@
 
 #include "Spingalett.Gpu.h"
 #include "Spingalett.GpuKernels.h"
+#include "Spingalett.Thread.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,7 +40,9 @@ typedef struct {
     float *host_inputs;             /* inputs kept as bfloat16: the host's floats, rounded on submission */
     bool staged;                    /* the chunk's inputs are on the device already (rounded or written) */
     uint32_t gathered;              /* the chunk's inputs (1), targets (2) gathered from data sets on the GPU */
-    struct { uint64_t key, where; SpgGpuCommands *commands; } cache[8];   /* where: the inputs read in place */
+    bool in_place;                  /* its inputs read where they are: rows first.. of the inputs' data set */
+    uint32_t first;
+    struct { uint64_t key, where; SpgGpuCommands *commands; } cache[16];  /* where: the inputs read in place */
     uint32_t used;                  /* entries of cache */
     SpgGpuCommands *pending;        /* submitted and not yet harvested */
     uint32_t n;                     /* samples of the pending chunk */
@@ -90,8 +93,6 @@ struct SpgGpuNet {
     uint32_t next;                  /* the slot of the next chunk */
     SpgGpuRows rows;                /* data sets on the GPU the training chunks' rows come from */
     uint64_t version;               /* the network's host_version whose parameters it has (the caller's) */
-    bool direct;                    /* inference may read the inputs where they are (a data set on the GPU) */
-    uint64_t stand_lo, stand_hi;    /* inputs read where they are, standing for bfloat16 ones, while recording */
     float step_loss, total_loss;    /* losses harvested so far: of the open step, of closed steps */
 };
 
@@ -491,20 +492,6 @@ static bool kept_half(const SpgGpuNet *g, uint32_t l) {
     return l == 0 || net->act_func[l - 1] != ACT_SOFTMAX;
 }
 
-/* Whether inference may read the network's inputs where they are, in single precision: when they are not
-   kept as bfloat16, or when only products read them, which round them to bfloat16 as they load them
-   (the passes between products would read the values unrounded). */
-static bool reads_inputs_in_place(const SpgGpuNet *g) {
-    const NeuralNetwork *net = g->net;
-    if (!g->half[0]) return true;
-    for (uint32_t l = 1; l < g->layers; l++)
-        for (uint32_t k = 0; k < spingalett_input_count(net, l); k++)
-            if (spingalett_inputs(net, l)[k] == 0 && net->shapes[l].type != LAYER_DENSE &&
-                !spingalett_filters(net->shapes[l].type))
-                return false;
-    return true;
-}
-
 bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training) {
     const OptimizerType o = training->optimizer;
     if (!g->training || g->lost || g->capacity != capacity || !spingalett_gpu_net_current(g) ||
@@ -594,7 +581,6 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
         g->half[l] = kept_half(g, l);
         g->dhalf[l] = training && l > 0 && g->half[l];
     }
-    g->direct = reads_inputs_in_place(g);
     /* every layer's weights at a multiple of eight floats (a bfloat16 copy's start at 16 bytes), its
        biases at one of four: the same layout in every copy of the network */
     const bool wh = g->bf16 && spg_gpu_bf16_storage() && capacity >= 256u;
@@ -815,11 +801,8 @@ static void product(Recorder *r, const Access *a, SpgGemmPush *p, const SpgGemmM
     }
     /* the matrix units multiply blocks of 16 x 16 (32 values of k a step): products smaller than that in
        a dimension would mostly multiply padding, and stay in single precision unless they read or write
-       bfloat16 (a rule of the network's shape, so that a product always runs the same way); inputs read
-       where they are count as the bfloat16 values they stand for */
-    const SpgGpuNet *g = r->g;
-    const bool stand_in = g && ((p->a >= g->stand_lo && p->a < g->stand_hi) || (p->b >= g->stand_lo && p->b < g->stand_hi));
-    mode.bf16 = m->bf16 && (mode.half || stand_in || (p->K >= 32u && p->M >= 16u && p->N >= 16u));
+       bfloat16 (a rule of the network's shape, so that a product always runs the same way) */
+    mode.bf16 = m->bf16 && (mode.half || (p->K >= 32u && p->M >= 16u && p->N >= 16u));
     spg_gemm(r->c, p, &mode);
 }
 
@@ -1525,6 +1508,12 @@ struct SpingalettDeviceData {
     SpgGpuArena *arena;
     SpgGpuBuffer buffer;            /* count rows of size floats */
     uint32_t count, size;
+    /* the rows as bfloat16, rounded as the host rounds inputs kept as such (made on first use, under the
+       lock: a set may serve several networks and threads) */
+    SpgSignal *lock;
+    SpgGpuArena *half_arena;
+    SpgGpuBuffer half;
+    int half_state;                 /* 0: not made yet, 1: made, -1: could not be */
 };
 
 /* One copy between a device buffer and host memory, through a host-visible buffer of its own. */
@@ -1550,7 +1539,8 @@ static bool data_copy(const SpgGpuBuffer *device, size_t offset, void *host, siz
 SpingalettDeviceData *spingalett_gpu_data_create(const float *values, uint32_t count, uint32_t size) {
     if (!spg_gpu_open() || count == 0 || size == 0) return NULL;
     SpingalettDeviceData *d = (SpingalettDeviceData *)calloc(1, sizeof *d);
-    if (!d || !(d->arena = spg_gpu_arena_create())) {
+    if (!d || !(d->lock = spg_signal_create()) || !(d->arena = spg_gpu_arena_create())) {
+        if (d) spg_signal_free(d->lock);
         free(d);
         return NULL;
     }
@@ -1574,8 +1564,41 @@ uint32_t spingalett_gpu_data_size(const SpingalettDeviceData *d) { return d ? d-
 
 void spingalett_gpu_data_free(SpingalettDeviceData *d) {
     if (!d) return;
+    spg_gpu_arena_free(d->half_arena);
     spg_gpu_arena_free(d->arena);
+    spg_signal_free(d->lock);
     free(d);
+}
+
+/* The set's rows as bfloat16 (NULL when they cannot be made: no memory, or more values than the
+   conversion indexes), for networks that keep their inputs as such: read where they are, as the host's
+   rounded inputs would be, by every kind of layer. */
+static const SpgGpuBuffer *data_half(const SpingalettDeviceData *cd) {
+    SpingalettDeviceData *d = (SpingalettDeviceData *)cd;      /* a cache of the values it holds */
+    spg_lock(d->lock);
+    const uint64_t values = (uint64_t)d->count * d->size;
+    if (d->half_state == 0) {
+        d->half_state = -1;
+        if (values <= UINT32_MAX && spg_gpu_bf16_storage() && (d->half_arena = spg_gpu_arena_create())) {
+            spg_gpu_arena_add(d->half_arena, &d->half, values * 2u, SPG_MEMORY_DEVICE);
+            SpgGpuCommands *c = spg_gpu_arena_commit(d->half_arena) ? spg_gpu_commands_create() : NULL;
+            SpgEltwisePush p = {d->half.address, d->buffer.address, 0, 0, 0, (uint32_t)values, 1, 0, 0, 0.0f, 0, 0};
+            const uint32_t spec[3] = {SPG_ELT_COPY, ACT_NONE, 1u};    /* y kept as bfloat16 */
+            if (c && spg_gpu_record_begin(c)) {
+                spg_gpu_barrier(c);
+                spg_gpu_dispatch(c, SPG_KERNEL_eltwise_h, spec, 3, &p, sizeof p, groups(values, 256u), 1, 1);
+                spg_gpu_barrier(c);
+                if (spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c)) d->half_state = 1;
+            }
+            spg_gpu_commands_free(c);
+        }
+        if (d->half_state < 0) {
+            spg_gpu_arena_free(d->half_arena);
+            d->half_arena = NULL;
+        }
+    }
+    spg_unlock(d->lock);
+    return d->half_state > 0 ? &d->half : NULL;
 }
 
 bool spingalett_gpu_data_read(const SpingalettDeviceData *d, uint32_t first, uint32_t count, float *dst) {
@@ -1683,8 +1706,16 @@ void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows) {
 
 uint32_t *spingalett_gpu_chunk_rows(SpgGpuNet *g) {
     Slot *s = next_slot(g);
-    s->gathered = (g->rows.inputs ? 1u : 0u) | (g->rows.targets ? 2u : 0u);
+    s->gathered = (g->rows.inputs && !s->in_place ? 1u : 0u) | (g->rows.targets ? 2u : 0u);
     return (uint32_t *)((char *)s->staging.mapped + s->indices);
+}
+
+bool spingalett_gpu_chunk_in_place(SpgGpuNet *g, uint32_t first) {
+    if (!g->rows.inputs || g->rows.shift || g->rows.flip || (g->half[0] && !data_half(g->rows.inputs))) return false;
+    Slot *s = next_slot(g);
+    s->in_place = true;
+    s->first = first;
+    return true;
 }
 
 /* Drops the slot's cache entry of commands whose recording failed; NULL. */
@@ -1761,20 +1792,14 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
     g->act[0] = direct ? *direct : s->input;
     g->header = s->header;
     g->targets = s->target;
-    const bool half_in = g->half[0];
-    if (direct) {
-        g->half[0] = false;
-        if (half_in) {
-            g->stand_lo = direct->address;
-            g->stand_hi = direct->address + direct->size;
-        }
-    }
     /* inputs and targets from staging, or gathered from the GPU's data sets after the header, or read
        where they are */
-    copy_in(c, s, gathered & 1u || direct ? 0 : (size_t)n * in * (half_in ? 2u : 4u));
+    copy_in(c, s, gathered & 1u || direct ? 0 : (size_t)n * in * (g->half[0] ? 2u : 4u));
     if (train && !(gathered & 2u)) spg_gpu_copy(c, &s->staging, s->targets, &s->target, 0, (size_t)n * out * 4u);
+    /* the gather reads the indices and the header the host wrote, and writes the slot's buffers: while the
+       other slot's chunk still runs, unless the header is copied first */
     if (gathered) {
-        barrier(r);
+        if (!s->header.mapped) barrier(r);
         gather_rows(g, r, s, n, gathered);
     }
     barrier(r);
@@ -1801,9 +1826,19 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
     spg_gpu_barrier_host(c);
     free(r);
     g->act[0] = s->input;
-    g->half[0] = half_in;
-    g->stand_lo = g->stand_hi = 0;
     return spg_gpu_record_end(c) ? c : forget(s, c);
+}
+
+/* Rows first .. first + n - 1 of a data set on the GPU (of its bfloat16 copy with half), as a buffer of
+   their own. */
+static SpgGpuBuffer rows_view(const SpingalettDeviceData *d, uint32_t first, uint32_t n, bool half) {
+    SpgGpuBuffer view = half ? d->half : d->buffer;
+    const size_t value = half ? 2u : sizeof(float), at = (size_t)first * d->size * value;
+    view.address += at;
+    view.offset += at;
+    view.size = (size_t)n * d->size * value;
+    if (view.mapped) view.mapped = (char *)view.mapped + at;
+    return view;
 }
 
 /* The data sets on the GPU the chunks' rows come from and what is done to them (STEP_INPUTS to
@@ -1848,11 +1883,13 @@ bool spingalett_gpu_train_chunk(SpgGpuNet *g, uint32_t n, uint32_t count, uint32
        its step */
     const uint64_t key = (uint64_t)n | (uint64_t)count << 24 | (first ? 1ull << 56 : 0) | (last ? 1ull << 57 : 0) |
                          (uint64_t)s->gathered << 59;
-    SpgGpuCommands *c = chunk_commands(g, s, key, n, count, first, last, true, s->gathered, NULL);
+    const SpgGpuBuffer view = s->in_place ? rows_view(g->rows.inputs, s->first, n, g->half[0]) : (SpgGpuBuffer){0};
+    SpgGpuCommands *c = chunk_commands(g, s, key, n, count, first, last, true, s->gathered, s->in_place ? &view : NULL);
     if (!c) return false;
     memcpy(header_of(s), header, sizeof header);
-    if (!(s->gathered & 1u)) stage_inputs(g, s, n);
+    if (!(s->gathered & 1u) && !s->in_place) stage_inputs(g, s, n);
     s->gathered = 0;
+    s->in_place = false;
     if (!spg_gpu_submit(c)) return false;
     s->pending = c;
     s->n = n;
@@ -1891,25 +1928,21 @@ bool spingalett_gpu_predict_rows(SpgGpuNet *g, const float *inputs, const Spinga
         /* the rows of a data set on the GPU read where they are (products round them to bfloat16 as they
            load them), the commands recorded for them kept for the next call; or gathered (and rounded)
            into the slot's inputs */
-        SpgGpuBuffer view = rows ? rows->buffer : (SpgGpuBuffer){0};
-        if (rows && g->direct) {
-            const size_t at = (size_t)(first + start) * in * sizeof(float);
-            view.address += at;
-            view.offset += at;
-            view.size = (size_t)m * in * sizeof(float);
-            if (view.mapped) view.mapped = (char *)view.mapped + at;
-        } else if (rows) {
+        const bool gather = rows && g->half[0] && !data_half(rows);
+        const SpgGpuBuffer view = rows && !gather ? rows_view(rows, first + start, m, g->half[0]) : (SpgGpuBuffer){0};
+        if (gather) {
             uint32_t *index = (uint32_t *)((char *)s->staging.mapped + s->indices), header[SPG_STEP_HEADER] = {0};
             for (uint32_t k = 0; k < m; k++) index[k] = first + start + k;
             rows_header(&(SpgGpuRows){.inputs = rows}, header);
             memcpy(header_of(s), header, sizeof header);
+        } else if (rows) {
+            /* read where they are */
         } else if (s->host_inputs) {    /* rounded straight from the caller's floats */
             spingalett_round_bf16((uint16_t *)(s->input.mapped ? s->input.mapped : (char *)s->staging.mapped + s->inputs),
                                   inputs + (size_t)start * in, (size_t)m * in);
         } else {
             memcpy(dst, inputs + (size_t)start * in, (size_t)m * in * sizeof(float));
         }
-        const bool gather = rows && !g->direct;
         SpgGpuCommands *c = chunk_commands(g, s, (uint64_t)m | 1ull << 63 | (gather ? 1ull << 59 : 0), m, m, false,
                                            false, false, gather ? 1u : 0u, rows && !gather ? &view : NULL);
         if (!c || !spg_gpu_submit(c)) {

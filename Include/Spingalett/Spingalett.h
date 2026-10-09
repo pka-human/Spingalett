@@ -512,12 +512,13 @@ SPINGALETT_API TrainReport train_struct_arguments(TrainArgs args);
 
 /*
  * Data sets in the GPU's memory: count rows of size floats copied to the device once, for the
- * device_* fields of train(), predict() and evaluate(). With COMPUTE_VULKAN those calls gather their
- * chunks on the device, and train() augments and smooths them there, instead of copying samples from
- * the host for every pass; on the CPU they copy the rows back first. A set's row size is the network's
- * input (or output) size, and it holds at least the call's samples. NULL without a usable GPU, or
- * when its memory runs out. A set may serve several networks and threads at once, and is freed once
- * no call uses it.
+ * device_* fields of train(), predict() and evaluate(). With COMPUTE_VULKAN those calls read their
+ * chunks on the device, where train() gathers, augments and smooths them, instead of copying samples
+ * from the host for every pass; on the CPU they copy the rows back first. With PRECISION_BFLOAT16 a set
+ * makes a copy of its rows as bfloat16 on first use (half its size again), which networks read as the
+ * inputs they keep as such. A set's row size is the network's input (or output) size, and it holds at
+ * least the call's samples. NULL without a usable GPU, or when its memory runs out. A set may serve
+ * several networks and threads at once, and is freed once no call uses it.
  */
 SPINGALETT_API SpingalettDeviceData *spingalett_device_data_new(const float *values, uint32_t count, uint32_t size);
 SPINGALETT_API void spingalett_device_data_free(SpingalettDeviceData *data);

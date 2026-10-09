@@ -4586,11 +4586,12 @@ static void gpu_threads(void) {
 #endif
 }
 
-typedef struct { NeuralNetwork *net; const float *x; float *y; uint32_t n; } GpuPredictJob;
+typedef struct { NeuralNetwork *net; const float *x; float *y; uint32_t n; const SpingalettDeviceData *dx; } GpuPredictJob;
 
 static void *gpu_predict_job(void *arg) {
     GpuPredictJob *job = (GpuPredictJob *)arg;
-    predict(.net = job->net, .inputs = job->x, .outputs = job->y, .sample_count = job->n);
+    predict(.net = job->net, .inputs = job->dx ? NULL : job->x, .device_inputs = job->dx, .outputs = job->y,
+            .sample_count = job->n);
     return NULL;
 }
 
@@ -4612,7 +4613,7 @@ static void gpu_kept_threads(void) {
     pthread_t threads[4];
     int started = 0;
     for (int k = 0; k < 4; k++) {
-        jobs[k] = (GpuPredictJob){net, x, (float *)malloc((size_t)n * out * sizeof(float)), n};
+        jobs[k] = (GpuPredictJob){net, x, (float *)malloc((size_t)n * out * sizeof(float)), n, NULL};
         if (pthread_create(&threads[k], NULL, gpu_predict_job, &jobs[k]) == 0) started++;
     }
     for (int k = 0; k < started; k++) pthread_join(threads[k], NULL);
@@ -4625,6 +4626,41 @@ static void gpu_kept_threads(void) {
     for (int k = 0; k < 4; k++) free(jobs[k].y);
     free(alone); free(x); free(t);
     free_network(net);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+#endif
+}
+
+/* predict() on four threads at once from one data set on the GPU, in bfloat16 (the first calls make the
+   set's bfloat16 copy, under its lock): the outputs of one call from the host's array, bit for bit. */
+static void gpu_device_data_threads(void) {
+#if !defined(_WIN32)
+    if (!spingalett_set_gpu_precision(PRECISION_BFLOAT16)) return;
+    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    NeuralNetwork *net = gpu_net(2);
+    const uint32_t n = 300, in = net->topology[0], out = net->topology[net->layers - 1];
+    float *x = (float *)malloc((size_t)n * in * sizeof(float));
+    lcg_state = 19;
+    for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+    SpingalettDeviceData *dx = spingalett_device_data_new(x, n, in);
+    GpuPredictJob jobs[4];
+    pthread_t threads[4];
+    int started = 0;
+    for (int k = 0; dx && k < 4; k++) {
+        jobs[k] = (GpuPredictJob){net, x, (float *)malloc((size_t)n * out * sizeof(float)), n, dx};
+        if (pthread_create(&threads[k], NULL, gpu_predict_job, &jobs[k]) == 0) started++;
+    }
+    for (int k = 0; k < started; k++) pthread_join(threads[k], NULL);
+    float *alone = (float *)malloc((size_t)n * out * sizeof(float));
+    predict(.net = net, .inputs = x, .outputs = alone, .sample_count = n);
+    bool same = started == 4;
+    for (int k = 0; same && k < 4; k++) same = !memcmp(jobs[k].y, alone, (size_t)n * out * sizeof(float));
+    CHECK(same, "gpu: predict() from a data set on four threads at once differs from the host's array");
+    printf("  gpu: predict() from a data set on four threads at once %s\n", same ? "ok" : "FAILED");
+    for (int k = 0; k < started; k++) free(jobs[k].y);
+    spingalett_device_data_free(dx);
+    free(alone); free(x);
+    free_network(net);
+    spingalett_set_gpu_precision(PRECISION_FLOAT32);
     spingalett_set_compute_mode(COMPUTE_OPENMP);
 #endif
 }
@@ -5372,6 +5408,7 @@ int main(int argc, char **argv) {
             gpu_kept_copy();
             gpu_predict_cached();
             gpu_device_data();
+            gpu_device_data_threads();
             gpu_bf16();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);

@@ -118,6 +118,10 @@ uint32_t spingalett_gpu_data_size(const SpingalettDeviceData *data);
    then gives the rest. */
 void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows);
 uint32_t *spingalett_gpu_chunk_rows(SpgGpuNet *g);
+/* The next chunk's inputs read where they are, rows first .. of the inputs' data set (called before
+   spingalett_gpu_chunk_rows(), which then gives indices for the targets' set only): false when they
+   cannot be (a pass other than a product reads them, or they are augmented), then they are gathered. */
+bool spingalett_gpu_chunk_in_place(SpgGpuNet *g, uint32_t first);
 
 /* outputs = the network's outputs for n samples (inference: batch normalization with the running
    statistics, no dropout), in chunks of up to `capacity` that overlap with the copies. */
@@ -208,6 +212,7 @@ static inline uint32_t spingalett_gpu_data_count(const SpingalettDeviceData *dat
 static inline uint32_t spingalett_gpu_data_size(const SpingalettDeviceData *data) { (void)data; return 0; }
 static inline void spingalett_gpu_set_rows(SpgGpuNet *g, const SpgGpuRows *rows) { (void)g; (void)rows; }
 static inline uint32_t *spingalett_gpu_chunk_rows(SpgGpuNet *g) { (void)g; return NULL; }
+static inline bool spingalett_gpu_chunk_in_place(SpgGpuNet *g, uint32_t first) { (void)g; (void)first; return false; }
 static inline bool spingalett_gpu_predict(SpgGpuNet *g, const float *inputs, float *outputs, uint32_t n) {
     (void)g; (void)inputs; (void)outputs; (void)n;
     return false;
