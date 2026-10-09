@@ -19,8 +19,8 @@
  *
  * An output's products are added 16 values of k at a time, in the order of k, by the same instruction
  * whatever the tile: tiles change the speed only. The results go to the epilogue through shared memory,
- * four outputs of a row a thread: inline for the activations that are a slope (act_slope()), through
- * store_one() for the others.
+ * four outputs of a row a thread, for the activations (and derivatives) that are a slope only
+ * (act_slope()): Spingalett.Cuda.c runs the others as EPI_STORE and the pass of epi.cu.
  */
 
 #include "gemm_common.cuh"
@@ -44,38 +44,36 @@ DEVICE void st_shared64(uint32_t at, uint32_t a, uint32_t b) {
     asm volatile("st.shared.v2.u32 [%0], {%1, %2};" ::"r"(at), "r"(a), "r"(b) : "memory");
 }
 
-/* What the epilogue needs, by value (store_one() is a call). */
+/* What the epilogue needs. */
 struct Epi {
     uint64_t c, e0, e1;
     uint32_t M, N, ldc, epi, act, flags, half;
     float alpha, beta;
 };
 
-/* Output (m, n) of block z's product, v, through the epilogue (row: the row of C it goes to). */
-static __device__ __attribute__((noinline)) void store_one(Epi e, uint32_t z, uint32_t coff, uint32_t m, uint32_t row,
-                                                           uint32_t n, float v) {
+/* Output (m, n) of block z's product, v, through the epilogue of a sloped activation or derivative (row: the row
+   of C it goes to). */
+DEVICE void store_one(const Epi &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row, uint32_t n,
+                      float v) {
     if (e.epi == EPI_PARTIAL) {
         F(e.c)[(z * e.M + m) * e.N + n] = v;
         return;
     }
     const uint32_t at = coff + row * e.ldc + n;
-    if (e.epi == EPI_STORE) {
-        v *= e.alpha;
-        if (e.beta != 0.0f) v += e.beta * ld(e.c, at, 2u, e.half);
-    } else if (e.epi == EPI_BIAS_ACT) {
+    if (e.epi == EPI_BIAS_ACT) {
         if (e.flags & FLAG_BIAS) v += F(e.e0)[coff + n];
-        v = activate(v, e.act);
+        v = sloped(v, slope);
     } else if (e.epi == EPI_SCALE_ACT) {
-        v = activate(v * F(e.e0)[coff + n] + F(e.e1)[coff + n], e.act);
-    } else if (e.epi == EPI_DERIV) {
+        v = sloped(v * F(e.e0)[coff + n] + F(e.e1)[coff + n], slope);
+    } else {
         v *= e.alpha;
         if (e.beta != 0.0f) v += e.beta * ld(e.c, at, 2u, e.half);
-        v *= derivative(ld(e.e0, at, 3u, e.half), e.act);
+        if (e.epi == EPI_DERIV) v *= sloped_derivative(ld(e.e0, at, 3u, e.half), slope);
     }
     st(e.c, at, 2u, e.half, v);
 }
 
-/* Outputs n .. n + 3 of row m through the epilogue of a sloped activation (EPI_SCALE_ACT not among them). */
+/* and outputs n .. n + 3 of row m at once */
 DEVICE void store_four(const Epi &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row, uint32_t n,
                        float4_ v) {
     if (e.epi == EPI_PARTIAL) {
@@ -86,6 +84,8 @@ DEVICE void store_four(const Epi &e, float slope, uint32_t z, uint32_t coff, uin
     if (e.epi == EPI_BIAS_ACT) {
         if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
         v = sloped4(v, slope);
+    } else if (e.epi == EPI_SCALE_ACT) {
+        v = sloped4(add4(mul4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]), ((const float4_ *)e.e1)[(coff + n) >> 2]), slope);
     } else {
         v = scale4(v, e.alpha);
         if (e.beta != 0.0f) v = add4(v, scale4(ld4(e.c, at, 2u, e.half), e.beta));
@@ -384,13 +384,14 @@ struct Mma {
            rows of 16 bytes a warp; read back, a thread finishes four consecutive outputs of a row */
         const uint32_t coff = g * p.c_group;
         const Epi e = {p.c, p.e0, p.e1, p.M, p.N, p.ldc, EPI, ACT, p.flags, HALF, p.alpha, p.beta};
-        const float slope = act_slope(ACT);
-        const bool sloped_epi = EPI == EPI_PARTIAL || EPI == EPI_STORE || (EPI != EPI_SCALE_ACT && slope >= 0.0f);
+        /* (the epilogues whose activation or derivative is no slope run as EPI_STORE and epi.cu's pass) */
+        const float slope = EPI == EPI_DERIV ? act_slope(ACT) : act_slope_forward(ACT);
         /* four outputs at once: at indices of C (and of e0 with it) that are multiples of four, at 16 bytes */
-        const bool fours = sloped_epi && (p.c % 16u) == 0u &&
+        const bool fours = (p.c % 16u) == 0u &&
                            (EPI == EPI_PARTIAL ? p.N % 4u == 0u
                                                : (p.ldc % 4u) == 0u && (coff % 4u) == 0u &&
-                                                 (EPI == EPI_STORE || p.e0 % 16u == 0u));
+                                                 (EPI == EPI_STORE || p.e0 % 16u == 0u) &&
+                                                 (EPI != EPI_SCALE_ACT || p.e1 % 16u == 0u));
         float *Cs = (float *)__builtin_assume_aligned(cs_base, 16);
 #pragma unroll
         for (uint32_t r0 = 0; r0 < BM; r0 += RCH) {
@@ -420,7 +421,7 @@ struct Mma {
                     store_four(e, slope, z, coff, m, row, n, v);
                     continue;
                 }
-                for (uint32_t k = 0; k < 4u && n + k < p.N; k++) store_one(e, z, coff, m, row, n + k, get4(v, k));
+                for (uint32_t k = 0; k < 4u && n + k < p.N; k++) store_one(e, slope, z, coff, m, row, n + k, get4(v, k));
             }
         }
     }

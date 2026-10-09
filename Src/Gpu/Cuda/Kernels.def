@@ -22,6 +22,7 @@ SPG_CUDA_UNIT(sumsq, sumsq, "")
 SPG_CUDA_UNIT(upsample, upsample, "")
 SPG_CUDA_UNIT(ln, ln, "")
 SPG_CUDA_UNIT(rows, rows, "")
+SPG_CUDA_UNIT(epi, epi, "")         /* the products' epilogues that gemm.cu and gemm_mma.cu do not hold */
 
 /* depthwise convolutions: any window, stride, mode, VEC and padding, and the common windows (KH, KW, SH, SW),
    padded (KW - 1) / 2, for every mode (0 APPLY, 1 SPREAD, 2 WEIGHTS) and VEC (1, 4) as constants: units

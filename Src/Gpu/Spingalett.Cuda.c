@@ -21,6 +21,7 @@
 #include "Spingalett.Thread.h"
 #include "Spingalett.GpuPush.h"
 #include "Spingalett.Gunzip.h"
+#include <Spingalett/Spingalett.Inference.h>     /* the activations */
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"   /* the PTX, a string a unit */
 #endif
@@ -332,6 +333,15 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     for (uint32_t u = 0; u < UNIT_COUNT; u++)
         if (!strcmp(spg_cuda_units[u].name, name)) return (int)u;
     return -1;
+}
+
+/* The unit of the products' other epilogues (epi.cu). */
+static int epi_unit(void) {
+    static atomic_int unit = -1;
+    int u = atomic_load(&unit);
+    for (uint32_t k = 0; u < 0 && k < UNIT_COUNT; k++)
+        if (!strcmp(spg_cuda_units[k].name, "epi")) atomic_store(&unit, u = (int)k);
+    return u;
 }
 
 /* The unit's function, its module given to the driver on first use. */
@@ -648,10 +658,47 @@ static bool cub_record_begin(void *commands) {
     return true;
 }
 
+/* Whether a product's epilogue is one gemm.cu and gemm_mma.cu hold: its activation (or with EPI_DERIV its
+   derivative) a slope below zero, or none (softmax, which the output pass applies, leaves the outputs as they are). */
+static bool sloped_epilogue(uint32_t epi, uint32_t act) {
+    const bool sloped = act == SPINGALETT_ACT_NONE || act == SPINGALETT_ACT_RELU || act == SPINGALETT_ACT_LEAKY_RELU;
+    if (epi == SPG_EPI_BIAS_ACT || epi == SPG_EPI_SCALE_ACT) return sloped || act == SPINGALETT_ACT_SOFTMAX;
+    return epi != SPG_EPI_DERIV || sloped;
+}
+
+static int epi_unit(void);
+
 static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const void *push,
                          uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
     CuCommands *c = (CuCommands *)commands;
     if (gx == 0 || gy == 0 || gz == 0) return;
+    /* the other epilogues (sigmoid, tanh, ...): the product with EPI_STORE (and with EPI_DERIV its alpha and beta),
+       then epi.cu's pass over its outputs, in the groups in z (such epilogues have no slices) */
+    if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 9 && spec_count <= SPG_SPEC_MAX &&
+        push_size == sizeof(SpgGemmPush) && !sloped_epilogue(spec[7], spec[8])) {
+        uint32_t linear[SPG_SPEC_MAX];
+        SpgGemmPush q;
+        memcpy(linear, spec, spec_count * sizeof(uint32_t));
+        memcpy(&q, push, sizeof q);
+        linear[7] = SPG_EPI_STORE;
+        linear[8] = SPINGALETT_ACT_NONE;
+        if (spec[7] != SPG_EPI_DERIV) q.alpha = 1.0f, q.beta = 0.0f;
+        cub_dispatch(commands, kernel, linear, spec_count, &q, push_size, gx, gy, gz);
+        const SpgGemmPush *p = (const SpgGemmPush *)push;
+        const uint64_t blocks = ((uint64_t)p->M * p->N + 255u) / 256u;
+        const CUfunction f = unit_function(epi_unit());
+        Op *op = f ? add_op(c, OP_LAUNCH) : NULL;
+        if (!op) { c->ok = false; return; }
+        op->function = f;
+        op->grid[0] = blocks < 8u * cu.sms ? (uint32_t)blocks : 8u * cu.sms;
+        op->grid[1] = 1u;
+        op->grid[2] = gz;
+        op->block = 256u;
+        memcpy(op->push, push, push_size);
+        memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
+        if (cu.profile) snprintf(op->label, sizeof op->label, "epi %u %u", spec[7], spec[8]);
+        return;
+    }
     const CUfunction f = spec_count <= SPG_SPEC_MAX && push_size <= SPG_PUSH_BYTES
                        ? unit_function(unit_of(kernel, spec, spec_count)) : NULL;
     const uint32_t threads = block_threads(kernel, spec, spec_count);

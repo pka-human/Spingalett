@@ -17,7 +17,9 @@
  *   SpingalettGpuTests bench bf16 the same on the matrix units ("dense" after either: the MLP's
  *                                 products only; "half" with bf16: their operands and results kept
  *                                 as bfloat16, as training in bfloat16 keeps them; "fw" with half: the
- *                                 MLP's weights as floats, as training keeps them)
+ *                                 MLP's weights as floats, as training keeps them; SPINGALETT_BENCH_CONV
+ *                                 = "n h w c out kh kw sh sw ph pw groups" times that convolution instead
+ *                                 of ResNet-20's)
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -402,8 +404,13 @@ static void bench(bool dense_only) {
         {128, 8, 8, 64, 64, 3, 3, 1, 1, 1, 1, 1}, {128, 32, 32, 3, 16, 3, 3, 1, 1, 1, 1, 1},
     };
     static const char *names[] = {"forward", "data", "weights"};
-    for (size_t k = 0; !dense_only && k < sizeof shapes / sizeof shapes[0]; k++) {
-        const Conv *v = &shapes[k];
+    /* SPINGALETT_BENCH_CONV="n h w c out kh kw sh sw ph pw groups": that convolution only */
+    Conv only;
+    const char *one = getenv("SPINGALETT_BENCH_CONV");
+    const bool single = one && sscanf(one, "%u %u %u %u %u %u %u %u %u %u %u %u", &only.n, &only.h, &only.w, &only.c, &only.out,
+                                      &only.kh, &only.kw, &only.sh, &only.sw, &only.ph, &only.pw, &only.groups) == 12;
+    for (size_t k = 0; !dense_only && k < (single ? 1u : sizeof shapes / sizeof shapes[0]); k++) {
+        const Conv *v = single ? &only : &shapes[k];
         const uint32_t OH = out_h(v), OW = out_w(v), K = v->kh * v->kw * v->c / v->groups;
         const size_t nx = (size_t)v->n * v->h * v->w * v->c, ny = (size_t)v->n * OH * OW * v->out,
                      nw = (size_t)v->out * K;

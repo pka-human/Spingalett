@@ -184,6 +184,10 @@ DEVICE float act_slope(uint32_t act) {
     return act == ACT_NONE ? 1.0f : act == ACT_RELU ? 0.0f : act == ACT_LEAKY_RELU ? 0.01f : -1.0f;
 }
 
+/* act_slope() of an activation applied (not its derivative): softmax, which the output pass applies, leaves the
+   products' outputs as they are */
+DEVICE float act_slope_forward(uint32_t act) { return act == ACT_SOFTMAX ? 1.0f : act_slope(act); }
+
 /* activate() and derivative() of such an activation (ReLU's zero a zero, not x times zero) */
 DEVICE float sloped(float x, float slope) { return x > 0.0f ? x : slope == 0.0f ? 0.0f : x * slope; }
 DEVICE float sloped_derivative(float y, float slope) { return y > 0.0f ? 1.0f : slope; }

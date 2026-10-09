@@ -22,75 +22,24 @@
  * TM, TN, AMODE, BMODE, EPI, ACT, THREADS, PHASED, VEC. Its shared memory is dynamic:
  * SPG_CUDA_GEMM_SHARED(BM, BN, BK) bytes (Spingalett.GpuPush.h).
  *
- * The epilogues of the activations that are a slope below zero (none, ReLU and leaky ReLU; all of
- * EPI_STORE and EPI_PARTIAL) are written inline for every output; the others, and the outputs at the
- * edge of C, call store_c4() and store_c(), whose code is in the kernel once.
+ * The epilogues are inline for every output, of the activations (and derivatives) that are a slope
+ * below zero only (act_slope(): none, ReLU, leaky ReLU): Spingalett.Cuda.c runs the others as EPI_STORE
+ * and the pass of epi.cu.
  */
 
 #include "gemm_common.cuh"
 
-/* What the epilogue needs, by value: store_c4() and store_c() are calls (inlined for every output of a
-   thread they would be most of the kernel's code), which must not take the kernel's state by address. */
+/* What the epilogue needs. */
 struct Epilogue {
     uint64_t c, e0, e1;
     uint32_t M, N, ldc, epi, act, flags;
     float alpha, beta;
 };
 
-/* Output (m, n) of block z's product, v, through the epilogue (row: the row of C it goes to). */
-static __device__ __attribute__((noinline)) void store_c(Epilogue e, uint32_t z, uint32_t coff, uint32_t m, uint32_t row,
-                                                         uint32_t n, float v) {
-    float *C = F(e.c);
-    if (e.epi == EPI_PARTIAL) {
-        C[(z * e.M + m) * e.N + n] = v;
-        return;
-    }
-    const uint32_t at = coff + row * e.ldc + n;
-    if (e.epi == EPI_STORE) {
-        v *= e.alpha;
-        if (e.beta != 0.0f) v += e.beta * C[at];
-    } else if (e.epi == EPI_BIAS_ACT) {
-        if (e.flags & FLAG_BIAS) v += F(e.e0)[coff + n];
-        v = activate(v, e.act);
-    } else if (e.epi == EPI_SCALE_ACT) {
-        v = activate(v * F(e.e0)[coff + n] + F(e.e1)[coff + n], e.act);
-    } else if (e.epi == EPI_DERIV) {
-        v *= e.alpha;
-        if (e.beta != 0.0f) v += e.beta * C[at];
-        v *= derivative(F(e.e0)[at], e.act);
-    }
-    C[at] = v;
-}
-
-/* Outputs n .. n + 3 of row m at once (C and what the epilogue reads with it aligned for it). */
-static __device__ __attribute__((noinline)) void store_c4(Epilogue e, uint32_t z, uint32_t coff, uint32_t m, uint32_t row,
-                                                          uint32_t n, float4_ v) {
-    float4_ *C4 = (float4_ *)e.c;
-    if (e.epi == EPI_PARTIAL) {
-        C4[((z * e.M + m) * e.N + n) >> 2] = v;
-        return;
-    }
-    const uint32_t at = coff + row * e.ldc + n;
-    if (e.epi == EPI_STORE) {
-        v = scale4(v, e.alpha);
-        if (e.beta != 0.0f) v = add4(v, scale4(C4[at >> 2], e.beta));
-    } else if (e.epi == EPI_BIAS_ACT) {
-        if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
-        v = activate4(v, e.act);
-    } else if (e.epi == EPI_SCALE_ACT) {
-        v = activate4(add4(mul4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]), ((const float4_ *)e.e1)[(coff + n) >> 2]), e.act);
-    } else if (e.epi == EPI_DERIV) {
-        v = scale4(v, e.alpha);
-        if (e.beta != 0.0f) v = add4(v, scale4(C4[at >> 2], e.beta));
-        const float4_ d = ((const float4_ *)e.e0)[at >> 2];
-        v = mul4(v, float4_{derivative(d.x, e.act), derivative(d.y, e.act), derivative(d.z, e.act), derivative(d.w, e.act)});
-    }
-    C4[at >> 2] = v;
-}
-
-/* store_c4() inline for the sloped activations (slope at least zero; EPI_SCALE_ACT not among them) */
-DEVICE void store_sloped(const Epilogue &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row,
-                         uint32_t n, float4_ v) {
+/* Outputs n .. n + 3 of row m of block z's product (row: the row of C they go to) through the epilogue, its
+   activation (or derivative) a slope (C and what the epilogue reads with it aligned for vectors) */
+DEVICE void store_c4(const Epilogue &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row, uint32_t n,
+                     float4_ v) {
     float4_ *C4 = (float4_ *)e.c;
     if (e.epi == EPI_PARTIAL) {
         C4[((z * e.M + m) * e.N + n) >> 2] = v;
@@ -100,6 +49,8 @@ DEVICE void store_sloped(const Epilogue &e, float slope, uint32_t z, uint32_t co
     if (e.epi == EPI_BIAS_ACT) {
         if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
         v = sloped4(v, slope);
+    } else if (e.epi == EPI_SCALE_ACT) {
+        v = sloped4(add4(mul4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]), ((const float4_ *)e.e1)[(coff + n) >> 2]), slope);
     } else {
         v = scale4(v, e.alpha);
         if (e.beta != 0.0f) v = add4(v, scale4(C4[at >> 2], e.beta));
@@ -110,6 +61,28 @@ DEVICE void store_sloped(const Epilogue &e, float slope, uint32_t z, uint32_t co
         }
     }
     C4[at >> 2] = v;
+}
+
+/* and output (m, n) alone (the outputs at the edge of C, or of rows not in fours) */
+DEVICE void store_c(const Epilogue &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row, uint32_t n,
+                    float v) {
+    float *C = F(e.c);
+    if (e.epi == EPI_PARTIAL) {
+        C[(z * e.M + m) * e.N + n] = v;
+        return;
+    }
+    const uint32_t at = coff + row * e.ldc + n;
+    if (e.epi == EPI_BIAS_ACT) {
+        if (e.flags & FLAG_BIAS) v += F(e.e0)[coff + n];
+        v = sloped(v, slope);
+    } else if (e.epi == EPI_SCALE_ACT) {
+        v = sloped(v * F(e.e0)[coff + n] + F(e.e1)[coff + n], slope);
+    } else {
+        v *= e.alpha;
+        if (e.beta != 0.0f) v += e.beta * C[at];
+        if (e.epi == EPI_DERIV) v *= sloped_derivative(F(e.e0)[at], slope);
+    }
+    C[at] = v;
 }
 
 template <uint32_t BM, uint32_t BN, uint32_t BK, uint32_t TM, uint32_t TN, uint32_t AMODE, uint32_t BMODE, uint32_t VEC>
@@ -424,8 +397,8 @@ struct Gemm {
 
         const uint32_t coff = g * p.c_group;
         const Epilogue e = {p.c, p.e0, p.e1, p.M, p.N, p.ldc, EPI, ACT, p.flags, p.alpha, p.beta};
-        const float slope = act_slope(ACT);
-        const bool sloped = EPI == EPI_PARTIAL || EPI == EPI_STORE || (EPI != EPI_SCALE_ACT && slope >= 0.0f);
+        /* (the epilogues whose activation or derivative is no slope run as EPI_STORE and epi.cu's pass) */
+        const float slope = EPI == EPI_DERIV ? act_slope(ACT) : act_slope_forward(ACT);
 #pragma unroll
         for (uint32_t i = 0; i < TM; i++) {
             const uint32_t m = m0 + 4u * tr + RS * (i >> 2) + (i & 3u);
@@ -435,13 +408,12 @@ struct Gemm {
             for (uint32_t q = 0; q < TN / 4u; q++) {
                 const uint32_t n = n0 + 4u * tc + CS * q;
                 if (VC && n + 3u < p.N) {
-                    if (sloped) store_sloped(e, slope, z, coff, m, row, n, acc[i * (TN / 4u) + q]);
-                    else store_c4(e, z, coff, m, row, n, acc[i * (TN / 4u) + q]);
+                    store_c4(e, slope, z, coff, m, row, n, acc[i * (TN / 4u) + q]);
                     continue;
                 }
 #pragma unroll
                 for (uint32_t j = 0; j < 4u; j++)
-                    if (n + j < p.N) store_c(e, z, coff, m, row, n + j, get4(acc[i * (TN / 4u) + q], j));
+                    if (n + j < p.N) store_c(e, slope, z, coff, m, row, n + j, get4(acc[i * (TN / 4u) + q], j));
             }
         }
     }
