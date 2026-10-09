@@ -967,7 +967,8 @@ static bool convert_conv_transpose(Importer *im, const Node *n) {
     if (ap && ap->s.n && !str_is(ap->s, "NOTSET") && !str_is(ap->s, "VALID"))
         return fail(im, "ONNX import: ConvTranspose node '%.*s' pads by auto_pad, which is not supported%.*s", n->name,
                     (Str){"", 0});
-    const uint32_t sh = st && st->nints == 2 ? (uint32_t)st->ints[0] : 1u, sw = st && st->nints == 2 ? (uint32_t)st->ints[1] : 1u;
+    const bool strided = st && st->nints == 2, padded_out = op && op->nints == 2;
+    const uint32_t sh = strided ? (uint32_t)st->ints[0] : 1u, sw = strided ? (uint32_t)st->ints[1] : 1u;
     uint32_t ph = 0, pw = 0;
     if (pd && pd->nints == 4) {
         if (pd->ints[0] != pd->ints[2] || pd->ints[1] != pd->ints[3])
@@ -976,9 +977,10 @@ static bool convert_conv_transpose(Importer *im, const Node *n) {
         ph = (uint32_t)pd->ints[0];
         pw = (uint32_t)pd->ints[1];
     }
-    const uint32_t oph = op && op->nints == 2 ? (uint32_t)op->ints[0] : 0u, opw = op && op->nints == 2 ? (uint32_t)op->ints[1] : 0u;
+    const uint32_t oph = padded_out ? (uint32_t)op->ints[0] : 0u, opw = padded_out ? (uint32_t)op->ints[1] : 0u;
     /* an output shape: only the one the strides, padding and output padding give */
-    const int64_t oh = ((int64_t)x->h - 1) * sh - 2 * (int64_t)ph + kh + oph, ow = ((int64_t)x->w - 1) * sw - 2 * (int64_t)pw + kw + opw;
+    const int64_t oh = ((int64_t)x->h - 1) * sh - 2 * (int64_t)ph + kh + oph;
+    const int64_t ow = ((int64_t)x->w - 1) * sw - 2 * (int64_t)pw + kw + opw;
     if (os && !(os->nints >= 2 && os->ints[os->nints - 2] == oh && os->ints[os->nints - 1] == ow))
         return fail(im, "ONNX import: ConvTranspose node '%.*s' asks for an output shape (output_shape) its padding "
                     "does not give%.*s", n->name, (Str){"", 0});
@@ -990,7 +992,8 @@ static bool convert_conv_transpose(Importer *im, const Node *n) {
     float *scratch = (float *)malloc(spingalett_transposed_filters_scratch(OG, kh, kw) * sizeof(float));
     if (!src || !scratch) {
         free(scratch);
-        return fail(im, "ONNX import: the weights of ConvTranspose node '%.*s' cannot be read%.*s", n->name, (Str){"", 0});
+        return fail(im, "ONNX import: the weights of ConvTranspose node '%.*s' cannot be read%.*s", n->name,
+                    (Str){"", 0});
     }
     uint32_t l = conv_transpose2d(.net = im->net, .inputs = {x->layer}, .input_count = 1, .filters = OC, .kernel_h = kh,
                                   .kernel_w = kw, .stride_h = sh, .stride_w = sw, .padding_h = ph, .padding_w = pw,
@@ -1070,8 +1073,9 @@ static bool convert_resize(Importer *im, const Node *n) {
         fits = str_is(nm, "floor") || (str_is(nm, "round_prefer_floor") && most <= 2) || most == 1;
     else fits = most == 1;
     if (!fits)
-        return fail(im, "ONNX import: %.*s node '%.*s' maps coordinates other than as the upsampling layer does (nearest: "
-                    "floor of asymmetric or rounded half-pixel coordinates; linear: half-pixel)", n->op, n->name);
+        return fail(im, "ONNX import: %.*s node '%.*s' maps coordinates other than as the upsampling layer does "
+                    "(nearest: floor of asymmetric or rounded half-pixel coordinates; linear: half-pixel)", n->op,
+                    n->name);
     if (fh == 1 && fw == 1) return view(im, n, x, false);
     uint32_t l = upsample2d(.net = im->net, .inputs = {x->layer}, .input_count = 1, .stride_h = fh, .stride_w = fw,
                             .upsample = linear ? UPSAMPLE_BILINEAR : UPSAMPLE_NEAREST);

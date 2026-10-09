@@ -230,7 +230,8 @@ static void swap_filters(const NeuralNetwork *net, uint32_t l, float *host, floa
         for (uint32_t o = 0; o < OG; o++)
             for (uint32_t t = 0; t < taps; t++)
                 for (uint32_t i = 0; i < IG; i++) {
-                    const size_t h = (((size_t)k * OG + o) * taps + t) * IG + i, d = (((size_t)k * IG + i) * taps + t) * OG + o;
+                    const size_t h = (((size_t)k * OG + o) * taps + t) * IG + i;
+                    const size_t d = (((size_t)k * IG + i) * taps + t) * OG + o;
                     if (down) host[h] = dev[d];
                     else dev[d] = host[h];
                 }
@@ -246,7 +247,8 @@ static void pack(const SpgGpuNet *g, float *host, uint64_t base, bool weights, b
         uint64_t from = weights ? net->weight_offsets[l] : net->bias_offsets[l];
         uint64_t to = base + (weights ? g->woff[l] : g->boff[l]);
         if (count == 0) continue;
-        if (weights && net->shapes[l + 1].type == LAYER_CONV_TRANSPOSE2D) swap_filters(net, l, host + from, image + to, down);
+        if (weights && net->shapes[l + 1].type == LAYER_CONV_TRANSPOSE2D)
+            swap_filters(net, l, host + from, image + to, down);
         else if (down) memcpy(host + from, image + to, count * sizeof(float));
         else memcpy(image + to, host + from, count * sizeof(float));
     }
