@@ -66,6 +66,12 @@ extern "C" {
 #define SPINGALETT_MODEL_EXTENSION   ".slett"
 #define SPINGALETT_DATASET_EXTENSION ".slettd"
 
+/* Every public struct ends with SPINGALETT_RESERVED 64-bit words of reserved space, zero: room for the
+   fields of later 1.x releases, which programs built before them leave zero (the builders' designated
+   initializers zero what they do not name), so that their meaning then is what zero means. Structs the
+   library fills have them zeroed. */
+#define SPINGALETT_RESERVED 8
+
 #define SPINGALETT_OK                   0
 #define SPINGALETT_ERR_ALLOC            1   /* out of memory */
 #define SPINGALETT_ERR_INVALID          2   /* invalid argument or file contents */
@@ -164,6 +170,7 @@ typedef struct {
     size_t conv_scratch_;           /* private: bytes of convolution scratch */
     void *owner_;                   /* private: memory released by spingalett_model_free */
     size_t activations_;            /* private: bytes of the layers' outputs in the workspace */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettModel;
 
 typedef struct {
@@ -182,6 +189,7 @@ typedef struct {
                                        i + 1 the output of weight layer i; in_height, in_width and
                                        in_channels describe the first */
     SpingalettUpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettLayerInfo;
 
 /*

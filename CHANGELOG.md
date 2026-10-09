@@ -29,6 +29,14 @@ RTX 4050 Laptop GPU; README).
   against 5.00 M).
 
 ### Changed
+- **Public structs can grow:** every one ends with `uint64_t reserved[SPINGALETT_RESERVED]` (8 words,
+  zero), so that 1.x releases add fields without changing the layout: programs built before leave them
+  zero through the builders, and zero means a new field's default. Structs the library fills have them
+  zeroed. The Python bindings mirror them.
+- **One way of reporting errors:** a function that fails returns false, NULL, NaN, `SPINGALETT_NO_LAYER`
+  or `SPINGALETT_TRAIN_FAILED` and sets the thread's error code and message (stated in `Spingalett.h`).
+  `spingalett_save()` and `spingalett_set_compute_mode()` returned nothing and now return whether they
+  succeeded (the latter is false for a value of no mode, which it ignored).
 - **Every public name has the library's prefix.** Types are `Spingalett*` (`SpingalettNetwork`,
   `SpingalettTrainArgs`, `SpingalettActivationFunction`, ...), enumerators `SPINGALETT_*`
   (`SPINGALETT_ACT_RELU`, `SPINGALETT_LAYER_CONV2D`, ...), and the builders and functions `spingalett_*`:

@@ -103,6 +103,7 @@ typedef struct {
     uint32_t input_count;           /* layers it reads (0 for the input layer) */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* their indices, all below `index` */
     SpingalettUpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -130,6 +131,7 @@ typedef struct {
     float loss;                     /* mean over samples of the network's loss (see spingalett_evaluate()) */
     float accuracy;                 /* fraction of samples whose output argmax matches the target's
                                        argmax; with a single output, both on the same side of 0.5 */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettEvalMetrics;
 
 /* State of a spingalett_train() call, passed to the epoch callback. */
@@ -144,6 +146,7 @@ typedef struct {
     size_t best_epoch;              /* epoch with the best monitored value so far */
     float best_value;
     bool improved;                  /* this epoch is the new best */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettTrainProgress;
 
 /* Called after every callback_interval epochs (and the last one); returning true stops training. */
@@ -169,6 +172,7 @@ typedef struct {
     size_t best_epoch;              /* 0 when no epoch was monitored */
     float best_value;
     bool restored_best;             /* parameters were reset to those of best_epoch */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettTrainReport;
 
 /*
@@ -194,10 +198,12 @@ typedef struct {
     size_t step_size;       /* step_decay: epochs between decays; 0 = a third of the run */
     float  gamma;           /* step_decay: decay factor; 0 = 0.1 */
     float  min_lr;          /* cosine_decay, warmup_cosine: final learning rate; default 0 */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettLRScheduleParams;
 
 typedef struct {
     SpingalettLossFunction loss_func;
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettNetworkArgs;
 
 typedef struct {
@@ -240,11 +246,13 @@ typedef struct {
     uint32_t output_padding;        /* transposed convolution: cells added to the output's bottom and
                                        right (less than the stride), to reach sizes the stride skips */
     uint32_t output_padding_h, output_padding_w;    /* per-axis overrides (0 = unset) */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettLayerArgs;
 
 typedef struct {
     SpingalettNetwork *net;
     const float *input;
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettForwardArgs;
 
 typedef struct {
@@ -334,6 +342,7 @@ typedef struct {
     float lr_plateau_factor;
     size_t lr_plateau_patience;
     float lr_plateau_min_lr;
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettTrainArgs;
 
 typedef struct {
@@ -342,6 +351,7 @@ typedef struct {
     const SpingalettDeviceData *device_inputs;       /* or in the GPU's memory (its first rows) */
     uint32_t sample_count;
     float *outputs;                 /* [sample_count x output size] */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettPredictArgs;
 
 typedef struct {
@@ -351,6 +361,7 @@ typedef struct {
     const SpingalettDeviceData *device_inputs;       /* either or both in the GPU's memory instead */
     const SpingalettDeviceData *device_targets;
     uint32_t sample_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettEvaluateArgs;
 
 typedef struct {
@@ -358,6 +369,7 @@ typedef struct {
     const char *filename;
     bool do_not_save_optimizer;
     SpingalettPrecisionMode precision;
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettSaveArgs;
 
 /* Optimizer settings for the low-level training API; zero fields take the spingalett_train() defaults. */
@@ -370,6 +382,7 @@ typedef struct {
     float beta2;                    /* 0 = 0.999 */
     float epsilon;                  /* 0 = 1e-8 */
     float max_grad_norm;            /* clip the global L2 norm of the step's gradient; 0 = off */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettOptimizerArgs;
 
 /* Holds the activations of one batch between the calls of the low-level training API. */
@@ -386,11 +399,17 @@ typedef struct {
                                            images, CIFAR and .slettd files that record it; else 0 */
     char **class_names;             /* target_size class names when known, else NULL (owned by the
                                        data set: see spingalett_dataset_set_class_names) */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettDataset;
 
 /* Library version (the header's SPINGALETT_VERSION_* macros describe the headers in use). */
 SPINGALETT_API const char *spingalett_version(void);
 
+/* Errors. A function that fails returns false, NULL, NaN (losses and metrics), SPINGALETT_NO_LAYER or a
+   report whose status is SPINGALETT_TRAIN_FAILED, and sets the calling thread's error: its code
+   (SPINGALETT_ERR_*) and a message saying what failed. A call that succeeds leaves the error as it was,
+   so a program checks the result, then the error; spingalett_clear_error() resets it. The engine's
+   functions (Spingalett.Inference.h), which keep no state, return the code instead. */
 SPINGALETT_API int spingalett_last_error_code(void);
 SPINGALETT_API const char *spingalett_last_error_message(void);
 SPINGALETT_API void spingalett_clear_error(void);
@@ -402,7 +421,8 @@ SPINGALETT_API void spingalett_clear_error(void);
 SPINGALETT_API const char *spingalett_cpu_kernels(void);
 
 SPINGALETT_API SpingalettComputeMode spingalett_get_compute_mode(void);
-SPINGALETT_API void spingalett_set_compute_mode(SpingalettComputeMode mode);
+/* Returns false (the error set) for a value of no mode. */
+SPINGALETT_API bool spingalett_set_compute_mode(SpingalettComputeMode mode);
 /* The name of the GPU that SPINGALETT_COMPUTE_VULKAN uses (opening the device on first call), or NULL when the
    library was built without the Vulkan backend or no device is usable: Vulkan 1.2 with buffer device
    addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
@@ -565,7 +585,8 @@ SPINGALETT_API float spingalett_train_on_batch(SpingalettTrainer *trainer, const
                                               uint32_t count, const SpingalettOptimizerArgs *optimizer);
 
 #define spingalett_save(...) spingalett_save_args((SpingalettSaveArgs){__VA_ARGS__})
-SPINGALETT_API void spingalett_save_args(SpingalettSaveArgs args);
+/* Writes a .slett file (SPINGALETT_MODEL_EXTENSION appended to a name without one); false on error. */
+SPINGALETT_API bool spingalett_save_args(SpingalettSaveArgs args);
 
 /* Reads a .slett file of any format version (1 to SPINGALETT_FORMAT_VERSION). Quantized weights are
    expanded to float. */
@@ -711,6 +732,7 @@ typedef struct {
     const float *targets;           /* [count x size] */
     const char *const *class_names; /* size names, or NULL */
     SpingalettDatasetEncoding encoding;       /* AUTO: the smallest lossless one */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettTargetSet;
 
 typedef struct {
@@ -720,6 +742,7 @@ typedef struct {
     const char *target_name;        /* name of the data set's own targets (e.g. "fine"), or NULL */
     const SpingalettTargetSet *extra_targets;   /* further sets of targets, or NULL */
     uint32_t extra_target_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettDatasetSaveOptions;
 
 typedef struct {
@@ -732,6 +755,7 @@ typedef struct {
     uint32_t target_set_count;      /* sets of targets in the file (at least 1) */
     uint32_t target_set;            /* the set this reader serves: target_size and target_encoding
                                        describe it */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettDatasetInfo;
 
 typedef struct {
@@ -747,6 +771,7 @@ typedef struct {
                                        set, chunks decode when they are needed, several at a time on
                                        the OpenMP threads. The samples come in the same order. */
     uint32_t target_set;            /* which set of targets to serve (0: the data set's own) */
+    uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettDatasetReaderOptions;
 
 /* Streams the samples of a .slettd file chunk by chunk. */

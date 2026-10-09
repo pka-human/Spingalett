@@ -193,6 +193,10 @@ _MODE_GENERATOR = 1
 _NetPtr = c_void_p      # NeuralNetwork is opaque
 
 
+# SPINGALETT_RESERVED: the zeroed 64-bit words every public struct ends with (room for fields of 1.x).
+_RESERVED = 8
+
+
 class _NetworkLayer(Structure):
     _fields_ = [
         ("type", c_int),
@@ -216,11 +220,12 @@ class _NetworkLayer(Structure):
         ("input_count", c_uint32),
         ("inputs", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
 class _EvalMetrics(Structure):
-    _fields_ = [("loss", c_float), ("accuracy", c_float)]
+    _fields_ = [("loss", c_float), ("accuracy", c_float), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _TrainProgress(Structure):
@@ -235,6 +240,7 @@ class _TrainProgress(Structure):
         ("best_epoch", c_size_t),
         ("best_value", c_float),
         ("improved", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -249,6 +255,7 @@ class _TrainReport(Structure):
         ("best_epoch", c_size_t),
         ("best_value", c_float),
         ("restored_best", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -259,7 +266,7 @@ _DataGeneratorFn = CFUNCTYPE(c_uint32, POINTER(c_float), POINTER(c_float), c_uin
 
 
 class _NeuralNetworkArgs(Structure):
-    _fields_ = [("loss_func", c_int)]
+    _fields_ = [("loss_func", c_int), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _LayerArgs(Structure):
@@ -292,6 +299,7 @@ class _LayerArgs(Structure):
         ("output_padding", c_uint32),
         ("output_padding_h", c_uint32),
         ("output_padding_w", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -301,7 +309,7 @@ _FloatArray = c_void_p
 
 
 class _ForwardArgs(Structure):
-    _fields_ = [("net", _NetPtr), ("input", _FloatArray)]
+    _fields_ = [("net", _NetPtr), ("input", _FloatArray), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _TrainArgs(Structure):
@@ -356,6 +364,7 @@ class _TrainArgs(Structure):
         ("lr_plateau_factor", c_float),
         ("lr_plateau_patience", c_size_t),
         ("lr_plateau_min_lr", c_float),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -366,6 +375,7 @@ class _PredictArgs(Structure):
         ("device_inputs", c_void_p),
         ("sample_count", c_uint32),
         ("outputs", _FloatArray),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -377,6 +387,7 @@ class _EvaluateArgs(Structure):
         ("device_inputs", c_void_p),
         ("device_targets", c_void_p),
         ("sample_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -390,6 +401,7 @@ class _OptimizerArgs(Structure):
         ("beta2", c_float),
         ("epsilon", c_float),
         ("max_grad_norm", c_float),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -404,6 +416,7 @@ class _Dataset(Structure):
         ("width", c_uint32),
         ("channels", c_uint32),
         ("class_names", POINTER(c_char_p)),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -414,6 +427,7 @@ class _TargetSet(Structure):
         ("targets", POINTER(c_float)),
         ("class_names", POINTER(c_char_p)),
         ("encoding", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -425,6 +439,7 @@ class _DatasetSaveOptions(Structure):
         ("target_name", c_char_p),
         ("extra_targets", POINTER(_TargetSet)),
         ("extra_target_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -443,11 +458,12 @@ class _DatasetInfo(Structure):
         ("channels", c_uint32),
         ("target_set_count", c_uint32),
         ("target_set", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
 class _DatasetReaderOptions(Structure):
-    _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32)]
+    _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32), ("reserved", c_uint64 * _RESERVED)]
 
 
 class _SaveArgs(Structure):
@@ -456,6 +472,7 @@ class _SaveArgs(Structure):
         ("filename", c_char_p),
         ("do_not_save_optimizer", c_bool),
         ("precision", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -473,6 +490,7 @@ class _Model(Structure):
         ("conv_scratch_", c_size_t),
         ("owner_", c_void_p),
         ("activations_", c_size_t),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -503,6 +521,7 @@ class _LayerInfo(Structure):
         ("input_count", c_uint32),
         ("input_layers", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -512,6 +531,7 @@ class _LRScheduleParams(Structure):
         ("step_size", c_size_t),
         ("gamma", c_float),
         ("min_lr", c_float),
+        ("reserved", c_uint64 * _RESERVED),
     ]
 
 
@@ -620,7 +640,7 @@ _dataset_target_set_size = _bind("spingalett_dataset_target_set_size", c_uint32,
 _dataset_close = _bind("spingalett_dataset_close", None, [c_void_p])
 _dataset_info = _bind("spingalett_dataset_info", _DatasetInfo, [c_void_p])
 _dataset_generator = _DataGeneratorFn(ctypes.cast(_lib.spingalett_dataset_generator, c_void_p).value)
-_save = _bind("spingalett_save_args", None, [_SaveArgs])
+_save = _bind("spingalett_save_args", c_bool, [_SaveArgs])
 _save_to_memory = _bind("spingalett_save_to_memory", c_void_p, [_NetPtr, c_int, c_bool, POINTER(c_size_t)])
 _load_from_memory = _bind("spingalett_load_from_memory", _NetPtr, [c_char_p, c_size_t])
 _free_memory = _bind("spingalett_free", None, [c_void_p])
@@ -646,7 +666,7 @@ _last_error_message = _bind("spingalett_last_error_message", c_char_p, [])
 _clear_error = _bind("spingalett_clear_error", None, [])
 
 _get_compute_mode = _bind("spingalett_get_compute_mode", c_int, [])
-_set_compute_mode = _bind("spingalett_set_compute_mode", None, [c_int])
+_set_compute_mode = _bind("spingalett_set_compute_mode", c_bool, [c_int])
 _get_num_threads = _bind("spingalett_get_num_threads", ctypes.c_uint, [])
 _cpu_kernels = _bind("spingalett_cpu_kernels", c_char_p, [])
 _gpu_device = _bind("spingalett_gpu_device", c_char_p, [])

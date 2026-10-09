@@ -443,10 +443,10 @@ static const char *find_last_separator(const char *path) {
     return slash ? slash : backslash;
 }
 
-void spingalett_save_args(SaveArgs args) {
+bool spingalett_save_args(SaveArgs args) {
     if (!args.net || !args.filename) {
         set_error(SPINGALETT_ERR_INVALID, "save: net or filename is NULL");
-        return;
+        return false;
     }
 
     char *allocated_filename = NULL;
@@ -458,7 +458,7 @@ void spingalett_save_args(SaveArgs args) {
         allocated_filename = (char *)malloc(len + sizeof SPINGALETT_MODEL_EXTENSION);
         if (!allocated_filename) {
             set_error(SPINGALETT_ERR_ALLOC, "save: filename allocation failed");
-            return;
+            return false;
         }
         memcpy(allocated_filename, target_filename, len);
         memcpy(allocated_filename + len, SPINGALETT_MODEL_EXTENSION, sizeof SPINGALETT_MODEL_EXTENSION);
@@ -469,14 +469,15 @@ void spingalett_save_args(SaveArgs args) {
     void *img = spingalett_save_to_memory(args.net, args.precision, !args.do_not_save_optimizer, &size);
     if (!img) {
         free(allocated_filename);
-        return;
+        return false;
     }
 
+    bool ok = false;
     FILE *fp = fopen(target_filename, "wb");
     if (!fp) {
         set_error(SPINGALETT_ERR_FILE_IO, "save: cannot open file for writing");
     } else {
-        bool ok = fwrite(img, 1, size, fp) == size;
+        ok = fwrite(img, 1, size, fp) == size;
         if (fclose(fp) != 0) ok = false;
         if (!ok) {
             set_error(SPINGALETT_ERR_FILE_IO, "save: write error (disk full?)");
@@ -491,6 +492,7 @@ void spingalett_save_args(SaveArgs args) {
     }
     spingalett_free(img);
     free(allocated_filename);
+    return ok;
 }
 
 /* ------------------------------------------------------------------------- reading */

@@ -30,9 +30,13 @@ ComputeMode spingalett_get_compute_mode(void) {
     return atomic_load(&s_compute_mode);
 }
 
-void spingalett_set_compute_mode(ComputeMode mode) {
-    if ((unsigned)mode < COMPUTE_COUNT)
-        atomic_store(&s_compute_mode, mode);
+bool spingalett_set_compute_mode(ComputeMode mode) {
+    if ((unsigned)mode >= COMPUTE_COUNT) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_set_compute_mode: unknown mode");
+        return false;
+    }
+    atomic_store(&s_compute_mode, mode);
+    return true;
 }
 
 unsigned spingalett_get_num_threads(void) {
