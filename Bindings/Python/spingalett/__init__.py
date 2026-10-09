@@ -1309,9 +1309,9 @@ class Network:
             raise IndexError(f"connection index {index} out of range for {count} weight sets")
         i = index % count + 1
         info = self.layer(i)
-        if info.type == LayerType.CONV2D:
+        if info.type in (LayerType.CONV2D, LayerType.CONV_TRANSPOSE2D):
             shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(info.inputs[0]).shape[2] // info.groups)
-        elif info.type == LayerType.BATCH_NORM:
+        elif info.type in (LayerType.BATCH_NORM, LayerType.LAYER_NORM):
             shape = (info.bias_count,)
         else:
             shape = (info.bias_count, info.weight_count // info.bias_count if info.bias_count else 0)
@@ -1332,8 +1332,9 @@ class Network:
 
     def get_weights(self, index: int) -> np.ndarray:
         """Copy of the weights feeding layer ``index + 1``: shape (outputs, inputs) for a dense layer,
-        (filters, kernel_h, kernel_w, input channels / groups) for a convolution, gamma (channels,)
-        for batch normalization, empty for pooling."""
+        (filters, kernel_h, kernel_w, input channels / groups) for a convolution or a transposed one
+        (filter j's weights by which each input channel reaches output channel j), gamma (channels,)
+        for batch and layer normalization, empty for pooling and upsampling."""
         return self._get(index, _PARAM_WEIGHTS, True)
 
     def set_weights(self, index: int, values) -> None:
