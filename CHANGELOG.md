@@ -7,12 +7,13 @@ changes, which are listed under **Changed**.
 
 ## [0.13.1] - 2026-10-09
 
-"GPU": the GPU backend faster in every workload, ahead of PyTorch with cuDNN on all but the
-fully connected network's full batches and inference with PyTorch's data already in GPU memory.
-On an RTX 4050 Laptop GPU against 0.13.0 (`Bin/Benchmark gpu`, medians of three interleaved runs):
-ResNet-20 trains 1.19 times as fast in single precision and 1.77 times in bfloat16, the U-Net 1.2
-and 1.77 times and infers 1.6 and 2.4 times as fast, the MNIST CNN trains 1.39 and 1.85 times as
-fast, and the MLP trains full batches 1.8 and 2.9 times as fast. No API changes.
+"GPU": the GPU backend faster in every workload, ahead of PyTorch with cuDNN in all but the fully
+connected network's inference with PyTorch's data already in GPU memory (which skips the copy over
+the bus that Spingalett's host arrays take). On an RTX 4050 Laptop GPU against 0.13.0
+(`Bin/Benchmark gpu`, medians of three interleaved runs): ResNet-20 trains 1.2 times as fast in
+single precision and 1.84 times in bfloat16, the U-Net 1.2 and 1.8 times and infers 1.55 and 2.5
+times as fast, the MNIST CNN trains 1.4 and 1.9 times as fast, and the MLP trains full batches 1.9
+and 3.3 times as fast. No API changes.
 
 ### Changed
 - The network keeps its copy on the GPU: `train()` keeps the parameters on the device between
@@ -47,6 +48,9 @@ fast, and the MLP trains full batches 1.8 and 2.9 times as fast. No API changes.
   long (the 255 products of `Bin/Benchmark gpu`: 10.7 to 5.4 s, once per process). Larger tiles on
   the matrix units (2 x 2 to 4 x 2 accumulators a subgroup, their loops unrolled so that the
   accumulators stay in registers) and threads of `gemm.comp` grouped over 4 x 8 blocks.
+- Weight gradients split their sums over the batch into slices only where the slices' partial sums
+  cost little against the operands: the MLP's run unsplit (13% faster full batches in bfloat16),
+  convolutions' split as before.
 - Inference on the GPU runs in chunks of at most 32 MB of activations (at least 64 samples), whose
   layers' outputs stay in the GPU's cache from one layer to the next: the U-Net infers 1.57 times as
   fast in single precision.

@@ -19,7 +19,7 @@ against PyTorch on the same machine.
 | 0.11 | "GPU": training, `predict()` and `evaluate()` on a GPU through Vulkan compute (NVIDIA, AMD, Intel, Apple through MoltenVK), every kind of layer, deterministic; one matrix kernel for dense layers, convolutions and their gradients with tiles chosen by timing; the backend in every package and wheel, tested on lavapipe in CI |
 | 0.12 | "Tensor cores": matrix products in bfloat16 on the GPU's matrix units (opt-in, faster than single precision), the custom-loop API on the GPU, fixes from a review of the GPU backend; ONNX import and PyTorch weights ten to a hundred times as fast (mapped files, one pass per tensor, external data files); gradients and optimizer state allocated when a network first trains; the first wheels on PyPI |
 | 0.13 | "Layers": transposed convolutions, upsampling and layer normalization on the CPU and the GPU, in `.slett` format 7, the engine and deployment models in every precision; their import from ONNX (ConvTranspose, Resize, LayerNormalization) and PyTorch; a U-Net segmentation example; the GPU's loss kernel for wide outputs |
-| 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling: ahead of PyTorch with cuDNN in every workload but the MLP's full batches and inference with PyTorch's data already in GPU memory |
+| 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling, weight gradients split only where it pays: ahead of PyTorch with cuDNN in every workload but the MLP's inference with PyTorch's data already in GPU memory |
 
 ## 0.14: the release candidate
 
@@ -62,19 +62,17 @@ next, before or after 1.0.
 0.13.1 on an RTX 4050 Laptop GPU against PyTorch 2.14 with cuDNN (`Bin/Benchmark gpu` against
 `benchmark_pytorch.py --cuda`, `--cuda-fp32`, `--cuda-bf16` and `--host-data`, README): Spingalett
 trains and runs ResNet-20, the MNIST CNN (with and without batch normalization) and the U-Net 1.2
-to 2 times as fast as PyTorch in single precision and 1.3 to 1.8 times as fast as its autocast in
-bfloat16, and trains mini-batches of the 784-512-1000-10 MLP 2.8 to 6 times as fast. Given the same
-task, data in host memory, it is ahead everywhere. With PyTorch's data in GPU memory from the
-start, two places remain:
+to 2.1 times as fast as PyTorch in single precision and 1.3 to 1.8 times as fast as its autocast in
+bfloat16, trains the 784-512-1000-10 MLP's full batches 1.05 to 1.09 times as fast and its
+mini-batches 2.9 to 5.9 times. Given the same task, data in host memory, it is ahead everywhere.
+With PyTorch's data in GPU memory from the start, one place remains, and the margins are thin:
 
-- **The MLP's full batches in bfloat16** train at 95% of PyTorch's speed (2.37 against 2.50 million
-  samples per second; single precision as fast). The products on the matrix units reach 15 to 17
-  TFLOPS on the MLP's shapes where cuBLAS reaches 17.4 to 19.5 (single precision: both 6.3 to 6.5,
-  the device's limit), and each epoch spends 0.7 ms between the last chunk and the next epoch's
-  first.
 - **The MLP's inference** runs at 60% (46% in bfloat16), bound by the bus: Spingalett copies the
   20,000 samples (63 MB, 31 MB as bfloat16) from host memory at 9.5 GB/s, which PyTorch's data
   skips.
+- **The products on the matrix units** reach 15 to 17 TFLOPS on the MLP's shapes where cuBLAS
+  reaches 17.4 to 19.5 (single precision: both 6.3 to 6.5, the device's limit), and a full-batch
+  epoch spends 0.7 ms between its last chunk and the next epoch's first.
 
 Done in 0.13.1: the tile choice (steps of the old list's 1), activations and gradients in bfloat16
 (2), the pooling backward pass (part of 3), larger tiles on the matrix units (part of 4). The next

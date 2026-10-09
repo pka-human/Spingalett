@@ -1126,32 +1126,32 @@ inference copied back (`--host-data`):
 
 | On the GPU | Spingalett | Spingalett (bf16) | PyTorch (TF32) | PyTorch (FP32) | PyTorch (bf16) | PyTorch, host data (TF32 / bf16) |
 |---|---:|---:|---:|---:|---:|---:|
-| ResNet-20, training | 10,370 | 17,680 | 8,490 | 7,650 | 12,270 | 8,370 / 12,100 |
-| ResNet-20, inference | 32,430 | 55,600 | 19,770 | 19,570 | 31,420 | 19,310 / 30,200 |
-| Convolutional network, training | 102,700 | 159,000 | 56,710 | 60,010 | 98,820 | 53,970 / 71,340 |
-| Convolutional network, inference | 268,100 | 393,300 | 132,100 | 142,800 | 237,200 | 126,400 / 223,300 |
-| With batch normalization, training | 72,510 | 117,300 | 48,010 | 48,570 | 83,430 | 47,690 / 61,410 |
-| With batch normalization, inference | 197,100 | 250,500 | 107,300 | 114,300 | 197,300 | 103,300 / 185,600 |
-| Fully connected network, mini-batch 64 | 281,300 | 433,100 | 100,900 | 80,570 | 70,320 | 78,320 / 70,000 |
-| Fully connected network, full batch | 1,071,600 | 2,370,400 | 1,098,800 | 1,042,300 | 2,496,200 | 840,100 / 1,572,600 |
-| Fully connected network, inference | 1,784,200 | 2,832,800 | 2,967,500 | 2,965,500 | 6,217,400 | 1,705,800 / 2,470,100 |
-| U-Net, training | 3,945 | 6,561 | 3,330 | 3,100 | 5,004 | 3,210 / 4,396 |
-| U-Net, inference | 10,740 | 16,620 | 6,391 | 6,645 | 11,920 | 6,041 / 10,950 |
+| ResNet-20, training | 10,530 | 18,330 | 8,437 | 7,521 | 12,210 | 8,373 / 12,050 |
+| ResNet-20, inference | 32,680 | 55,770 | 19,730 | 19,440 | 31,390 | 19,270 / 30,160 |
+| Convolutional network, training | 102,800 | 162,200 | 56,600 | 59,680 | 98,600 | 53,630 / 81,150 |
+| Convolutional network, inference | 270,200 | 389,700 | 131,800 | 141,400 | 236,900 | 127,400 / 225,900 |
+| With batch normalization, training | 72,510 | 119,600 | 48,010 | 48,410 | 84,500 | 47,770 / 61,000 |
+| With batch normalization, inference | 201,700 | 259,500 | 106,400 | 113,300 | 194,900 | 103,200 / 187,200 |
+| Fully connected network, mini-batch 64 | 288,500 | 427,200 | 100,800 | 84,350 | 72,540 | 75,840 / 75,660 |
+| Fully connected network, full batch | 1,134,000 | 2,665,000 | 1,066,000 | 1,038,000 | 2,542,000 | 840,300 / 1,570,000 |
+| Fully connected network, inference | 1,778,000 | 2,827,000 | 2,959,000 | 2,969,000 | 6,137,000 | 1,704,000 / 2,479,000 |
+| U-Net, training | 3,945 | 6,666 | 3,305 | 3,114 | 4,988 | 3,207 / 4,338 |
+| U-Net, inference | 10,140 | 17,320 | 6,389 | 6,598 | 11,830 | 6,037 / 10,970 |
 
-In single precision Spingalett trains ResNet-20 on the GPU 6.5 times as fast as on the eight
-threads of the CPU, 1.22 times as fast as PyTorch with TF32 and 1.36 times as fast as PyTorch in
-single precision, and runs it 1.6 times as fast; it trains the convolutional networks 1.5 to 1.8
-times as fast as PyTorch and runs them 1.7 to 2 times as fast, the U-Net 1.2 to 1.3 and 1.6 to 1.7
-times, and trains mini-batches of the fully connected network 2.8 to 3.5 times as fast. In bfloat16,
-against PyTorch's autocast, it trains ResNet-20 1.44 times as fast and runs it 1.77 times as fast,
-the convolutional networks 1.4 to 1.6 and 1.3 to 1.7 times, the U-Net 1.3 and 1.4 times. Full
-batches of the fully connected network train as fast as in PyTorch in single precision and at 95%
-of its speed in bfloat16, and its inference runs at 60% and 46%: most of that time goes to copying
-the 20,000 samples (63 MB; 31 MB as bfloat16) over the bus, which PyTorch's data, already in GPU
-memory, skips. Given the same task, data in host memory, Spingalett trains those full batches 1.3
-and 1.5 times as fast as PyTorch and infers 1.05 and 1.15 times as fast. Against 0.13.0 on the same
-machine, Spingalett trains ResNet-20 1.19 times as fast in single precision and 1.77 times in
-bfloat16, and infers the U-Net 1.6 and 2.4 times as fast (see the [CHANGELOG](CHANGELOG.md)).
+In single precision Spingalett trains ResNet-20 on the GPU 6.6 times as fast as on the eight
+threads of the CPU, 1.25 times as fast as PyTorch with TF32 and 1.4 times as fast as PyTorch in
+single precision, and runs it 1.7 times as fast; it trains the convolutional networks 1.5 to 1.8
+times as fast as PyTorch and runs them 1.8 to 2.1 times as fast, the U-Net 1.2 to 1.3 and 1.5 to
+1.6 times, and trains the fully connected network 1.06 to 1.09 times as fast in full batches and
+2.9 to 3.4 times in mini-batches. In bfloat16, against PyTorch's autocast, it trains ResNet-20 1.5
+times as fast and runs it 1.8 times as fast, the convolutional networks 1.4 to 1.6 and 1.3 to 1.6
+times, the U-Net 1.3 and 1.5 times, full batches of the fully connected network 1.05 times. Its
+inference runs at 60% of PyTorch's speed and 46% in bfloat16: most of that time goes to copying the
+20,000 samples (63 MB; 31 MB as bfloat16) over the bus, which PyTorch's data, already in GPU memory,
+skips. Given the same task, data in host memory, Spingalett trains those full batches 1.35 and 1.7
+times as fast as PyTorch and infers 1.04 and 1.14 times as fast. Against 0.13.0 on the same machine,
+Spingalett trains ResNet-20 1.2 times as fast in single precision and 1.84 times in bfloat16, and
+infers the U-Net 1.55 and 2.5 times as fast (see the [CHANGELOG](CHANGELOG.md)).
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
