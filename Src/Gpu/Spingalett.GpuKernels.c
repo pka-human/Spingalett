@@ -39,11 +39,15 @@ static const Tile mma_tiles[] = {
 };
 
 /* The tiles of the CUDA backend's product in single precision (Src/Gpu/Cuda/gemm.cu): those of
-   Src/Gpu/Cuda/Kernels.def, which compiles each for every pair of operand modes the executor uses. */
+   Src/Gpu/Cuda/Kernels.def, which compiles each for every operand mode the executor uses. */
 static const Tile cuda_fp32_tiles[] = {
-    {128, 128, 16, 8, 8}, {128, 64, 16, 8, 4}, {64, 128, 16, 4, 8}, {64, 64, 16, 4, 4}, {128, 32, 16, 4, 4},
-    {32, 128, 16, 4, 4}, {64, 32, 16, 4, 4}, {32, 64, 16, 4, 4}, {128, 16, 16, 4, 4}, {64, 16, 16, 4, 4},
-    {32, 32, 16, 4, 4}, {16, 64, 16, 4, 4},
+#define SPG_CUDA_UNIT(name, source, defines)
+#define SPG_CUDA_GEMM_MODES(a, b, vec)
+#define SPG_CUDA_GEMM_TILE(bm, bn, bk, tm, tn) {bm, bn, bk, tm, tn},
+#include "Cuda/Kernels.def"
+#undef SPG_CUDA_UNIT
+#undef SPG_CUDA_GEMM_MODES
+#undef SPG_CUDA_GEMM_TILE
 };
 
 typedef struct { const Tile *list; uint32_t count; } Table;

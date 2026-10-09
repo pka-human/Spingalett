@@ -15,11 +15,16 @@
  * output is the same chain of fused multiply-adds in the order of k whatever the tile, so the tile
  * changes the speed only.
  *
- * The tile and the operand modes are template parameters (SPG_ENTRY and GEMM name the instance,
- * cmake/Cuda.cmake compiles one a unit; the convolution modes that read four channels at once are
- * instances of their own, A_CONV4 and B_CONV4); the epilogue, the activation, PHASED and the other
- * vector loads come from the spec: BM, BN, BK, TM, TN, AMODE, BMODE, EPI, ACT, THREADS, PHASED, VEC.
- * Its shared memory is dynamic: SPG_CUDA_GEMM_SHARED(BM, BN, BK) bytes (Spingalett.GpuPush.h).
+ * The tile, the operand modes and the vector loads are template parameters (SPG_ENTRY and GEMM name the
+ * instance, cmake/Cuda.cmake compiles one a unit): the convolution modes that read four channels at once
+ * are modes of their own, A_CONV4 and B_CONV4, and VEC says that the other operands read four values at
+ * once. The epilogue, the activation, PHASED and the vector stores of C come from the spec: BM, BN, BK,
+ * TM, TN, AMODE, BMODE, EPI, ACT, THREADS, PHASED, VEC. Its shared memory is dynamic:
+ * SPG_CUDA_GEMM_SHARED(BM, BN, BK) bytes (Spingalett.GpuPush.h).
+ *
+ * The epilogues of the activations that are a slope below zero (none, ReLU and leaky ReLU; all of
+ * EPI_STORE and EPI_PARTIAL) are written inline for every output; the others, and the outputs at the
+ * edge of C, call store_c4() and store_c(), whose code is in the kernel once.
  */
 
 #include "common.cuh"
@@ -71,8 +76,8 @@ DEVICE void copies_commit() { asm volatile("cp.async.commit_group;" ::: "memory"
 template <uint32_t N>
 DEVICE void copies_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
 
-/* What the epilogue needs, by value: its stores are calls (inlined for every output of a thread they would
-   be most of the kernel's code), which must not take the kernel's state by address. */
+/* What the epilogue needs, by value: store_c4() and store_c() are calls (inlined for every output of a
+   thread they would be most of the kernel's code), which must not take the kernel's state by address. */
 struct Epilogue {
     uint64_t c, e0, e1;
     uint32_t M, N, ldc, epi, act, flags;
@@ -130,7 +135,41 @@ static __device__ __attribute__((noinline)) void store_c4(Epilogue e, uint32_t z
     C4[at >> 2] = v;
 }
 
-template <uint32_t BM, uint32_t BN, uint32_t BK, uint32_t TM, uint32_t TN, uint32_t AMODE, uint32_t BMODE>
+/* The activations that are a slope below zero: none, ReLU and leaky ReLU (their slope); -1 for the others. */
+DEVICE float act_slope(uint32_t act) {
+    return act == ACT_NONE ? 1.0f : act == ACT_RELU ? 0.0f : act == ACT_LEAKY_RELU ? 0.01f : -1.0f;
+}
+
+/* activate() and derivative() of such an activation (ReLU's zero a zero, not x times zero) */
+DEVICE float sloped(float x, float slope) { return x > 0.0f ? x : slope == 0.0f ? 0.0f : x * slope; }
+DEVICE float sloped_derivative(float y, float slope) { return y > 0.0f ? 1.0f : slope; }
+DEVICE float4_ sloped4(float4_ v, float s) { return float4_{sloped(v.x, s), sloped(v.y, s), sloped(v.z, s), sloped(v.w, s)}; }
+
+/* store_c4() inline for the sloped activations (slope at least zero; EPI_SCALE_ACT not among them) */
+DEVICE void store_sloped(const Epilogue &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t row,
+                         uint32_t n, float4_ v) {
+    float4_ *C4 = (float4_ *)e.c;
+    if (e.epi == EPI_PARTIAL) {
+        C4[((z * e.M + m) * e.N + n) >> 2] = v;
+        return;
+    }
+    const uint32_t at = coff + row * e.ldc + n;
+    if (e.epi == EPI_BIAS_ACT) {
+        if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
+        v = sloped4(v, slope);
+    } else {
+        v = scale4(v, e.alpha);
+        if (e.beta != 0.0f) v = add4(v, scale4(C4[at >> 2], e.beta));
+        if (e.epi == EPI_DERIV) {
+            const float4_ d = ((const float4_ *)e.e0)[at >> 2];
+            v = mul4(v, float4_{sloped_derivative(d.x, slope), sloped_derivative(d.y, slope),
+                                sloped_derivative(d.z, slope), sloped_derivative(d.w, slope)});
+        }
+    }
+    C4[at >> 2] = v;
+}
+
+template <uint32_t BM, uint32_t BN, uint32_t BK, uint32_t TM, uint32_t TN, uint32_t AMODE, uint32_t BMODE, uint32_t VEC>
 struct Gemm {
     static constexpr uint32_t THREADS = (BM / TM) * (BN / TN);
     static constexpr uint32_t SA = BM + 4u, SB = BN + 4u;           /* floats a shared row: [k][m], [k][n] */
@@ -146,9 +185,13 @@ struct Gemm {
     static constexpr uint32_t GA = AMODE == A_CONV ? LA : AMODE == A_CONV4 ? LA4 : 1u;     /* conv state */
     static constexpr uint32_t GB = BMODE == B_CONV ? LB : BMODE == B_CONV4 ? LB4 : 1u;
 
+    /* four values a load: the modes A_CONV4 and B_CONV4, and with VEC the operands that are no convolutions */
+    static constexpr bool VA = AMODE == A_CONV4 || (VEC && (AMODE == A_ROW || AMODE == A_COL));
+    static constexpr bool VB = BMODE == B_CONV4 || (VEC && (BMODE == B_ROW || BMODE == B_COL));
+
     const SpgGemmPush &p;
     uint32_t EPI, ACT, PHASED;
-    bool VA, VB, VC;
+    bool VC;
     uint32_t tid, m0, n0, kbeg, kend, aoff, boff;
     uint32_t RH, RW, GH, GW, GC, SH, SW, PH, PW;
     const uint32_t *geo;
@@ -161,10 +204,7 @@ struct Gemm {
 
     MEMBER Gemm(const SpgGemmPush &push, const Spec &s) : p(push) {
         EPI = s.v[7]; ACT = s.v[8]; PHASED = s.v[10];
-        const uint32_t vec = s.v[11];
-        VA = AMODE == A_CONV4 || (AMODE != A_CONV && (vec & 1u));
-        VB = BMODE == B_CONV4 || (BMODE != B_CONV && (vec & 2u));
-        VC = (vec & 16u) != 0u;
+        VC = (s.v[11] & 16u) != 0u;
         geo = U(p.geo);
     }
 
@@ -441,6 +481,8 @@ struct Gemm {
 
         const uint32_t coff = g * p.c_group;
         const Epilogue e = {p.c, p.e0, p.e1, p.M, p.N, p.ldc, EPI, ACT, p.flags, p.alpha, p.beta};
+        const float slope = act_slope(ACT);
+        const bool sloped = EPI == EPI_PARTIAL || EPI == EPI_STORE || (EPI != EPI_SCALE_ACT && slope >= 0.0f);
 #pragma unroll
         for (uint32_t i = 0; i < TM; i++) {
             const uint32_t m = m0 + 4u * tr + RS * (i >> 2) + (i & 3u);
@@ -450,7 +492,8 @@ struct Gemm {
             for (uint32_t q = 0; q < TN / 4u; q++) {
                 const uint32_t n = n0 + 4u * tc + CS * q;
                 if (VC && n + 3u < p.N) {
-                    store_c4(e, z, coff, m, row, n, acc[i * (TN / 4u) + q]);
+                    if (sloped) store_sloped(e, slope, z, coff, m, row, n, acc[i * (TN / 4u) + q]);
+                    else store_c4(e, z, coff, m, row, n, acc[i * (TN / 4u) + q]);
                     continue;
                 }
 #pragma unroll
@@ -461,10 +504,10 @@ struct Gemm {
     }
 };
 
-/* the unit's instance: SPG_ENTRY and GEMM (BM, BN, BK, TM, TN, AMODE, BMODE) from cmake/Cuda.cmake */
+/* the unit's instance: SPG_ENTRY and GEMM (BM, BN, BK, TM, TN, AMODE, BMODE, VEC) from cmake/Cuda.cmake */
 #if !defined(SPG_ENTRY)
-#define SPG_ENTRY spg_gemm_128x64x16_8x4_a0b1
-#define GEMM 128, 64, 16, 8, 4, 0, 1
+#define SPG_ENTRY spg_gemm_128x64x16_8x4_a0b1v
+#define GEMM 128, 64, 16, 8, 4, 0, 1, 1
 #endif
 
 /* (at most 128 registers a thread: two blocks of 256 threads an SM, whose warps hide each other's waits) */

@@ -20,6 +20,7 @@
 #include "Spingalett.Device.h"
 #include "Spingalett.Thread.h"
 #include "Spingalett.GpuPush.h"
+#include "Spingalett.Gunzip.h"
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"   /* the PTX, a string a unit */
 #endif
@@ -277,10 +278,18 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     snprintf(name, sizeof name, "%.*s", (int)len, base);
     if (kernel == SPG_KERNEL_gemm) {
         if (count < 12) return -1;
-        /* the convolution modes read four channels at once in instances of their own (A 3, B 3) */
-        const uint32_t a = spec[5] == SPG_A_CONV && (spec[11] & 1u) ? 3u : spec[5];
-        const uint32_t b = spec[6] == SPG_B_CONV && (spec[11] & 2u) ? 3u : spec[6];
-        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u", spec[0], spec[1], spec[2], spec[3], spec[4], a, b);
+        /* the instances of Kernels.def: the convolution modes that read four channels at once are modes of
+           their own (A 3, B 3), whose other operand reads four values at once too (v); the scalar ones'
+           (A 2, B 2) reads one; the dense modes come with v and without */
+        const bool va = (spec[11] & 1u) != 0, vb = (spec[11] & 2u) != 0;
+        uint32_t a = spec[5], b = spec[6];
+        const bool conv_a = a == SPG_A_CONV, conv_b = b == SPG_B_CONV;
+        bool v = (conv_a || va) && (conv_b || vb);
+        if (conv_a) a = va && v ? 3u : 2u;
+        if (conv_b) b = vb && v ? 3u : 2u;
+        v = v && a != 2u && b != 2u;
+        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u%s", spec[0], spec[1], spec[2], spec[3], spec[4], a, b,
+                 v ? "v" : "");
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 7) {
             char window[64];
@@ -307,8 +316,11 @@ static CUfunction unit_function(int u) {
         int options[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE};
         void *values[] = {log, (void *)(uintptr_t)sizeof log};
         snprintf(entry, sizeof entry, "spg_%s", spg_cuda_units[u].name);
-        bool ok = cuModuleLoadDataEx(&unit->module, spg_cuda_units[u].ptx, 2, options, values) == 0 &&
+        char *ptx = spg_gunzip(spg_cuda_units[u].gz, spg_cuda_units[u].size, NULL);
+        bool ok = ptx && cuModuleLoadDataEx(&unit->module, ptx, 2, options, values) == 0 &&
                   cuModuleGetFunction(&unit->function, unit->module, entry) == 0;
+        if (!ptx) snprintf(log, sizeof log, "its PTX does not expand");
+        free(ptx);
         int fixed = 0;              /* (dynamic shared memory up to what the device allows a block) */
         if (ok && cuFuncGetAttribute(&fixed, CU_FUNC_SHARED_BYTES, unit->function) == 0)
             cuFuncSetAttribute(unit->function, CU_FUNC_MAX_DYNAMIC_SHARED, (int)cu.shared_optin - fixed);
