@@ -524,7 +524,7 @@ if(BUILD_TESTS)
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuKernels.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c)
         target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_BINARY_DIR}/Gpu
-                                   ${SPINGALETT_VULKAN_INCLUDE})
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/Include ${SPINGALETT_VULKAN_INCLUDE})
         add_dependencies(SpingalettGpuTests spingalett_shaders)
         target_link_libraries(SpingalettGpuTests PRIVATE ${CMAKE_DL_LIBS})
         if(NOT WIN32)
