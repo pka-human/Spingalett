@@ -313,6 +313,12 @@ void spingalett_decode(float *dst, const uint8_t *src, int dtype, size_t n);
 size_t spingalett_filters_scratch(uint32_t CG, uint32_t KH, uint32_t KW);
 void spingalett_import_filters(float *dst, const uint8_t *src, int dtype, uint32_t OC, uint32_t CG, uint32_t KH,
                                uint32_t KW, float *scratch);
+/* Transposed convolution filters [IC][OG][KH][KW] at src (PyTorch's and ONNX's layout: each input
+   channel's weights to the OG outputs of its group, of G) as rows per output channel, [G OG][KH][KW][IG],
+   with spingalett_transposed_filters_scratch() floats of scratch. */
+size_t spingalett_transposed_filters_scratch(uint32_t OG, uint32_t KH, uint32_t KW);
+void spingalett_import_transposed_filters(float *dst, const uint8_t *src, int dtype, uint32_t IC, uint32_t OG,
+                                          uint32_t G, uint32_t KH, uint32_t KW, float *scratch);
 /* Dense weights [out][in] (transposed: [in][out] at src) times alpha, the columns of a map of C
    channels and HW cells read flat reordered from (c, p) to (p, c); spingalett_dense_scratch() floats
    of scratch. */

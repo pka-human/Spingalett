@@ -6,10 +6,11 @@ PyTorch's outputs for them:
 
 ONNX models exported from PyTorch: NAME.onnx (onnx_external.onnx: onnx_cnn's weights in
 onnx_external.data). State dicts: torch_cnn.pt (torch.save; torch_cnn_strided.pt with tensors that
-are views) and torch_cnn.safetensors, of the network the test builds by hand. For each, NAME.bin holds "SPGT", then
-as 32-bit little-endian integers the sample count, the floats per input and per output, then the
-inputs (channels last, as Spingalett reads them) and the expected outputs as floats. The models are
-small, seeded and fixed, so the files only change when this script does.
+are views) and torch_cnn.safetensors, and torch_transposed.pt, of the networks the tests build by
+hand. For each, NAME.bin holds "SPGT", then as 32-bit little-endian integers the sample count, the
+floats per input and per output, then the inputs and the expected outputs as floats (maps channels
+last, as Spingalett reads and writes them). The models are small, seeded and fixed, so the files only
+change when this script does.
 """
 import io
 import os
@@ -55,14 +56,56 @@ class Affine(nn.Module):
 
 
 class Upsampled(nn.Module):
-    """An operator the importer does not have (Resize), for the error message."""
+    """A Resize the importer does not have (corners aligned), for the error message."""
 
     def __init__(self):
         super().__init__()
         self.conv = nn.Conv2d(2, 2, 1)
 
     def forward(self, x):
-        return nn.functional.interpolate(self.conv(x), scale_factor=2.0, mode="nearest")
+        return nn.functional.interpolate(self.conv(x), scale_factor=2.0, mode="bilinear", align_corners=True)
+
+
+class UNet(nn.Module):
+    """Down by pooling, up by transposed convolutions (one grouped, with padding and output padding)
+    concatenated with the maps on the way down, nearest and bilinear Resize; maps out."""
+
+    def __init__(self):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Conv2d(3, 6, 3, padding=1), nn.ReLU())
+        self.down = nn.Sequential(nn.MaxPool2d(2), nn.Conv2d(6, 8, 3, padding=1), nn.ReLU())
+        self.up = nn.ConvTranspose2d(8, 6, 2, stride=2)
+        self.up2 = nn.ConvTranspose2d(8, 4, 3, stride=2, padding=1, output_padding=1, groups=2)
+        self.mix = nn.Conv2d(16, 4, 3, padding=1)
+        self.head = nn.Conv2d(4, 2, 1)
+
+    def forward(self, x):
+        e = self.enc(x)
+        d = self.down(e)
+        z = torch.cat([e, torch.relu(self.up(d)), torch.tanh(self.up2(d))], 1)
+        y = self.mix(z)
+        near = nn.functional.interpolate(nn.functional.max_pool2d(y, 2), scale_factor=2, mode="nearest")
+        lin = nn.functional.interpolate(nn.functional.avg_pool2d(y, 2), scale_factor=2, mode="bilinear",
+                                        align_corners=False)
+        return torch.sigmoid(self.head(near + lin))
+
+
+class Normed(nn.Module):
+    """Layer normalization over a map's channels (between permutations, as LayerNorm2d does it) and
+    over a vector."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 8, 3, padding=1)
+        self.ln2d = nn.LayerNorm(8)
+        self.fc = nn.Linear(8 * 6 * 6, 16)
+        self.ln = nn.LayerNorm(16)
+        self.out = nn.Linear(16, 4)
+
+    def forward(self, x):
+        y = self.ln2d(self.conv(x).permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        y = torch.tanh(self.ln(self.fc(torch.flatten(torch.relu(y), 1))))
+        return torch.softmax(self.out(y), 1)
 
 
 def models():
@@ -76,6 +119,10 @@ def models():
     yield "onnx_resnet_dynamo", Residual(), (3, 8, 8), dict(dynamo=True)
     yield "onnx_matmul", Affine(), (7,), dict(dynamo=False)
     yield "onnx_unsupported", Upsampled(), (2, 4, 4), dict(dynamo=False)
+    yield "onnx_unet", UNet(), (3, 8, 8), dict(dynamo=False)
+    yield "onnx_unet_dynamo", UNet(), (3, 8, 8), dict(dynamo=True)
+    yield "onnx_layernorm", Normed(), (3, 6, 6), dict(dynamo=False, opset_version=17)
+    yield "onnx_layernorm_dynamo", Normed(), (3, 6, 6), dict(dynamo=True)
 
 
 class Weights(nn.Module):
@@ -92,9 +139,26 @@ class Weights(nn.Module):
         return self.body(x)
 
 
+class Transposed(nn.Module):
+    """The network of the second state dict test: a grouped transposed convolution with padding and
+    output padding, layer normalization over the channels."""
+
+    def __init__(self):
+        super().__init__()
+        self.down = nn.Conv2d(3, 8, 3, stride=2, padding=1)
+        self.up = nn.ConvTranspose2d(8, 6, 3, stride=2, padding=1, output_padding=1, groups=2)
+        self.norm = nn.LayerNorm(6)
+        self.head = nn.Linear(6, 4)
+
+    def forward(self, x):
+        y = self.up(torch.relu(self.down(x)))
+        y = torch.tanh(self.norm(y.permute(0, 2, 3, 1)))
+        return self.head(y.mean((1, 2)))
+
+
 def write_expected(name, x, y):
     inputs = x.numpy().transpose(0, 2, 3, 1) if x.dim() == 4 else x.numpy()
-    outputs = y.numpy().reshape(x.shape[0], -1)
+    outputs = (y.numpy().transpose(0, 2, 3, 1) if y.dim() == 4 else y.numpy()).reshape(x.shape[0], -1)
     with open(os.path.join(OUT, name + ".bin"), "wb") as f:
         f.write(b"SPGT" + struct.pack("<3I", x.shape[0], inputs[0].size, outputs.shape[1]))
         f.write(np.ascontiguousarray(inputs, dtype="<f4").tobytes())
@@ -140,6 +204,19 @@ def main():
     torch.save(state, os.path.join(OUT, "torch_cnn_strided.pt"))
     write_expected("torch_cnn", x, y)
     print("torch_cnn: .pt, .safetensors and strided .pt")
+
+    torch.manual_seed(13)
+    model = Transposed().eval()
+    for m in model.modules():
+        if isinstance(m, nn.LayerNorm):             # parameters other than the initial ones
+            m.weight.data.uniform_(0.5, 1.5)
+            m.bias.data.uniform_(-0.2, 0.2)
+    x = torch.rand(3, 3, 8, 8)
+    with torch.no_grad():
+        y = model(x)
+    torch.save(model.state_dict(), os.path.join(OUT, "torch_transposed.pt"))
+    write_expected("torch_transposed", x, y)
+    print("torch_transposed: .pt")
 
     # the CNN with its weights in a file of their own (external data), and one naming a file outside
     # its folder

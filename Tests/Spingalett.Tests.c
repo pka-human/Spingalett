@@ -3958,6 +3958,8 @@ static void onnx_models(void) {
     static const struct { const char *name; uint32_t layers; LossFunction loss; } cases[] = {
         {"onnx_mlp", 4, LOSS_CROSS_ENTROPY}, {"onnx_cnn", 6, LOSS_MSE}, {"onnx_resnet", 15, LOSS_CROSS_ENTROPY},
         {"onnx_resnet_dynamo", 0, LOSS_CROSS_ENTROPY}, {"onnx_matmul", 2, LOSS_CROSS_ENTROPY},
+        {"onnx_unet", 14, LOSS_CROSS_ENTROPY}, {"onnx_unet_dynamo", 14, LOSS_CROSS_ENTROPY},
+        {"onnx_layernorm", 6, LOSS_CROSS_ENTROPY}, {"onnx_layernorm_dynamo", 6, LOSS_CROSS_ENTROPY},
     };
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         char path[512];
@@ -4025,7 +4027,7 @@ static void onnx_models(void) {
     snprintf(path, sizeof path, "%s/onnx_unsupported.onnx", SPINGALETT_TEST_DATA_DIR);
     spingalett_clear_error();
     CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Resize"),
-          "an unsupported operator: %s", spingalett_last_error_message());
+          "an unsupported Resize: %s", spingalett_last_error_message());
     static const unsigned char junk[] = {0x0a, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x12};
     CHECK(!spingalett_import_onnx_from_memory(junk, sizeof junk) && !spingalett_import_onnx_from_memory(junk, 0) &&
           !spingalett_import_onnx_from_memory(NULL, 4), "junk accepted as an ONNX model");
@@ -4101,6 +4103,47 @@ static void pytorch_weights(void) {
     }
     CHECK(accepted == 0, "%d truncated state dicts loaded", accepted);
     free(file);
+    free(data);
+}
+
+/* A grouped transposed convolution and layer normalization over the channels from a state dict. */
+static void pytorch_transposed(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/torch_transposed.bin", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *data = read_file(path, &size);
+    CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+    if (!data) return;
+    uint32_t n = rd32(data + 4), in = rd32(data + 8), out = rd32(data + 12);
+    const float *x = (const float *)(const void *)(data + 16), *expected = x + (size_t)n * in;
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .stride = 2, .padding = 1, .act_func = ACT_RELU);
+    conv_transpose2d(.net = net, .filters = 6, .kernel = 3, .stride = 2, .padding = 1, .output_padding = 1, .groups = 2,
+                     .act_func = ACT_NONE);
+    layer_norm(.net = net, .act_func = ACT_TANH);
+    global_avg_pool2d(.net = net);
+    layer(.net = net, .neurons_amount = 4, .act_func = ACT_NONE);
+    snprintf(path, sizeof path, "%s/torch_transposed.pt", SPINGALETT_TEST_DATA_DIR);
+    CHECK(spingalett_load_pytorch(net, path, NULL, 0), "torch_transposed.pt: %s", spingalett_last_error_message());
+    float *y = malloc((size_t)n * out * sizeof(float)), worst = 0.0f;
+    predict(.net = net, .inputs = x, .sample_count = n, .outputs = y);
+    for (size_t i = 0; i < (size_t)n * out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
+    CHECK(worst < 1e-5f && in == spingalett_input_size(net) && out == spingalett_output_size(net),
+          "torch_transposed.pt: outputs differ from PyTorch's by %g", worst);
+    printf("  %-22s |outputs - PyTorch| %.1e\n", "torch_transposed.pt", worst);
+    free_network(net);
+    /* a batch normalization where the network has a layer normalization: refused */
+    net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+    layer_norm(.net = net, .act_func = ACT_RELU);
+    snprintf(path, sizeof path, "%s/torch_cnn.pt", SPINGALETT_TEST_DATA_DIR);
+    static const char *const two[] = {"body.0", "body.1"};
+    CHECK(!spingalett_load_pytorch(net, path, two, 2) && strstr(spingalett_last_error_message(), "batch normalization"),
+          "a batch normalization for a layer normalization: %s", spingalett_last_error_message());
+    free_network(net);
+    free(y);
     free(data);
 }
 
@@ -4739,6 +4782,7 @@ int main(int argc, char **argv) {
         printf("[ONNX import, PyTorch weights]\n");
         onnx_models();
         pytorch_weights();
+        pytorch_transposed();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");

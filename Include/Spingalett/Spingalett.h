@@ -551,16 +551,19 @@ SPINGALETT_API NeuralNetwork *load_spingalett_from_memory(const void *data, size
 SPINGALETT_API void spingalett_free(void *ptr);
 
 /*
- * ONNX import: a model of the operators Spingalett has (Conv with groups, Gemm, MatMul with a
- * constant right operand, MaxPool, AveragePool, GlobalAveragePool (or ReduceMean over the height and
- * width), BatchNormalization, Add, Concat along the channels, Relu, Sigmoid, Tanh, LeakyRelu with
- * slope 0.01, Softmax over vectors,
- * Flatten, Reshape that flattens, Identity, Dropout, Constant), as a network to train further, save
- * or deploy. The network takes channels-last samples: an input of shape [N, C, H, W] becomes an
- * input layer of H x W x C, so images in NCHW order must be transposed to H, W, C; a dense layer
- * after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy when
- * the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator or
- * node that cannot be imported; the model's weights must be inside the file (no external data).
+ * ONNX import: a model of the operators Spingalett has (Conv and ConvTranspose with groups, Gemm,
+ * MatMul with a constant right operand, MaxPool, AveragePool, GlobalAveragePool (or ReduceMean over
+ * the height and width), BatchNormalization, LayerNormalization over a vector or over a map's
+ * channels (between Transposes to channels last and back), Resize and Upsample by integer factors
+ * (nearest, or linear between the cells' centres), Add, Concat along the channels, Relu, Sigmoid,
+ * Tanh, LeakyRelu with slope 0.01, Softmax over vectors, Flatten, Reshape that flattens, Identity,
+ * Dropout, Constant), as a network to train further, save or deploy. The network takes
+ * channels-last samples: an input of shape [N, C, H, W] becomes an input layer of H x W x C, so
+ * images in NCHW order must be transposed to H, W, C, and maps come out channels last too; a dense
+ * layer after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy
+ * when the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator
+ * or node that cannot be imported. Weights in external data files are read when the model comes
+ * from a path (the files in its folder), not from memory.
  */
 SPINGALETT_API NeuralNetwork *spingalett_import_onnx(const char *path);
 SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
@@ -572,8 +575,10 @@ SPINGALETT_API NeuralNetwork *spingalett_import_onnx_from_memory(const void *dat
  * of it: only dictionaries of tensors are recognized. The tensors of each module (the name up to
  * its last dot: "features.0" for "features.0.weight") go, module by module, to the layers with
  * parameters in their order: dense layers take weight [out, in] and bias, convolutions weight
- * [out, in / groups, kh, kw] and bias, batch normalizations weight, bias, running_mean and
- * running_var. The modules come in the order of the state dict (torch.save files keep it) or, in
+ * [out, in / groups, kh, kw] and bias, transposed convolutions (ConvTranspose2d) weight
+ * [in, out / groups, kh, kw] and bias, batch normalizations weight, bias, running_mean and
+ * running_var, layer normalizations (LayerNorm over the channels) weight and bias. The modules come
+ * in the order of the state dict (torch.save files keep it) or, in
  * safetensors files, which sort names, in natural order of their names ("2" before "10", as
  * nn.Sequential numbers them); `modules` (module_count names, or NULL) gives the order explicitly.
  * Weights are reordered for channels-last data as spingalett_import_onnx() does. On error (a shape
