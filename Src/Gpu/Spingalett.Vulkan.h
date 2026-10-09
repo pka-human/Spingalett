@@ -21,13 +21,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* A buffer of device memory; host-visible ones are mapped for their whole life. */
+/* A buffer of device memory; host-visible ones are mapped for their whole life. The buffers of an
+   arena are ranges of a VkBuffer they share, from `offset` on (their memory belongs to the arena). */
 typedef struct {
-    void *buffer, *memory;          /* VkBuffer, VkDeviceMemory */
+    void *buffer, *memory;          /* VkBuffer, VkDeviceMemory (NULL in an arena) */
     uint64_t address;               /* VkDeviceAddress */
     void *mapped;                   /* host-visible buffers */
-    size_t size;
+    size_t size, offset;
 } SpgGpuBuffer;
+
+/* Where a buffer's memory is: on the device; visible to the host and cached where the device has
+   such (results read back); or on the device and visible to the host, for data the host writes and
+   never reads, which the device then reads at its own memory's speed (only where
+   spg_gpu_host_writes()). */
+typedef enum { SPG_MEMORY_DEVICE, SPG_MEMORY_HOST, SPG_MEMORY_HOST_WRITES } SpgMemory;
+
+/* Buffers made together, in a few allocations: spg_gpu_arena_add() asks for one, whose struct
+   spg_gpu_arena_commit() fills, and spg_gpu_arena_free() frees them all. An allocation of its own per
+   buffer costs a vkAllocateMemory and a vkFreeMemory, about 0.15 ms each on some drivers, and a
+   network on the GPU has dozens of buffers. */
+typedef struct SpgGpuArena SpgGpuArena;
 
 /* The kernels (Src/Gpu/Shaders/<name>.comp). */
 typedef enum {
@@ -56,9 +69,18 @@ uint32_t spg_gpu_subgroup_size(void);
 uint32_t spg_gpu_max_workgroups(uint32_t axis);
 /* Whether the device multiplies bfloat16 cooperative matrices (16 x 16 x 16, sums in float). */
 bool spg_gpu_mma_bf16(void);
+/* Whether the host can write into all of the device's memory (resizable BAR, unified memory), for
+   SPG_MEMORY_HOST_WRITES: the largest device-local heap's memory is host-visible too. */
+bool spg_gpu_host_writes(void);
 
 bool spg_gpu_buffer_create(SpgGpuBuffer *buffer, size_t bytes, bool host_visible);
 void spg_gpu_buffer_free(SpgGpuBuffer *buffer);
+SpgGpuArena *spg_gpu_arena_create(void);
+/* bytes 0 asks for nothing (the buffer stays empty) */
+void spg_gpu_arena_add(SpgGpuArena *arena, SpgGpuBuffer *buffer, size_t bytes, SpgMemory memory);
+/* false when memory ran out (no buffer is made then) */
+bool spg_gpu_arena_commit(SpgGpuArena *arena);
+void spg_gpu_arena_free(SpgGpuArena *arena);
 
 /* A command buffer of dispatches; record, end, then submit as often as needed. */
 SpgGpuCommands *spg_gpu_commands_create(void);

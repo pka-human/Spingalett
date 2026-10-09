@@ -14,6 +14,14 @@ changes, which are listed under **Changed**.
   The 784-512-1000-10 MLP of `Examples/Benchmark.c` trains full batches 22% faster on an RTX 4050
   Laptop GPU (5 epochs: 553,000 to 673,000 samples per second).
 
+- A network on the GPU takes its buffers from a few allocations instead of one each, uploads and
+  downloads its arrays in one submission instead of one per array, and, where the host can write
+  into all of the device's memory (resizable BAR, unified memory), the host writes each chunk's
+  inputs and the parameters straight into it instead of the device copying them over from host
+  memory. The MLP trains full batches 1.2 times as fast again (5 epochs: 673,000 to 831,000-876,000
+  samples per second; an epoch 25.6 to 21.7 ms) and infers 1.5 times as fast (1,150,000 to
+  1,800,000 samples per second). `SPINGALETT_GPU_NO_HOST_WRITES=1` keeps the copies.
+
 ### Fixed
 - Parameters a training callback wrote on the GPU (`spingalett_set_parameters()`) were ignored by
   the epochs after it: they now go to the device before the next epoch.

@@ -127,6 +127,7 @@ static struct {
     uint32_t family;
     VkPhysicalDeviceMemoryProperties memory;
     uint64_t heap;
+    bool host_writes;               /* the largest device-local heap has host-visible memory */
     uint32_t shared;
     uint32_t max_groups[3];         /* workgroups a dispatch may have in x, y and z */
     uint32_t subgroup;              /* the subgroup size */
@@ -248,9 +249,19 @@ static bool open_device(void) {
     gpu.shared = props.limits.maxComputeSharedMemorySize;
     memcpy(gpu.max_groups, props.limits.maxComputeWorkGroupCount, sizeof gpu.max_groups);
     vkGetPhysicalDeviceMemoryProperties(gpu.physical, &gpu.memory);
+    uint32_t largest = 0;
     for (uint32_t h = 0; h < gpu.memory.memoryHeapCount; h++)
-        if ((gpu.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && gpu.memory.memoryHeaps[h].size > gpu.heap)
+        if ((gpu.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && gpu.memory.memoryHeaps[h].size > gpu.heap) {
             gpu.heap = gpu.memory.memoryHeaps[h].size;
+            largest = h;
+        }
+    /* resizable BAR or unified memory: not the window of 256 MB into device memory some have */
+    const VkMemoryPropertyFlags writable = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t t = 0; gpu.heap && t < gpu.memory.memoryTypeCount; t++)
+        if (gpu.memory.memoryTypes[t].heapIndex == largest &&
+            (gpu.memory.memoryTypes[t].propertyFlags & writable) == writable)
+            gpu.host_writes = !getenv("SPINGALETT_GPU_NO_HOST_WRITES");
 
     VkQueueFamilyProperties families[32];
     uint32_t nf = 32;
@@ -394,6 +405,10 @@ bool spg_gpu_mma_bf16(void) {
     return spg_gpu_open() && gpu.mma_bf16;
 }
 
+bool spg_gpu_host_writes(void) {
+    return spg_gpu_open() && gpu.host_writes;
+}
+
 /* The pipeline of a kernel with these specialization constants, made on first use. */
 static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     VkPipeline found = VK_NULL_HANDLE;
@@ -447,11 +462,13 @@ static int32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     return -1;
 }
 
-bool spg_gpu_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) {
+/* A buffer with memory of its own of the given kind (SPG_MEMORY_HOST_WRITES: false without such). */
+static bool create_buffer(SpgGpuBuffer *b, size_t bytes, SpgMemory kind) {
     memset(b, 0, sizeof *b);
     if (!spg_gpu_open()) return false;
     if (bytes == 0) bytes = 16;
     bytes = (bytes + 15u) & ~(size_t)15u;
+    const bool host_visible = kind != SPG_MEMORY_DEVICE;
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bytes,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -462,9 +479,10 @@ bool spg_gpu_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) {
     vkGetBufferMemoryRequirements(gpu.device, buffer, &req);
     /* host-visible memory is cached where the device has such, for reading results back */
     const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    int32_t type = host_visible ? memory_type(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+    int32_t type = kind == SPG_MEMORY_HOST_WRITES ? memory_type(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                 : host_visible ? memory_type(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
                                 : memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type < 0) type = memory_type(req.memoryTypeBits, host_visible ? visible : 0);
+    if (type < 0 && kind != SPG_MEMORY_HOST_WRITES) type = memory_type(req.memoryTypeBits, host_visible ? visible : 0);
     VkMemoryAllocateFlagsInfo flags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL,
                                        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, req.size, (uint32_t)type};
@@ -489,11 +507,101 @@ bool spg_gpu_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) {
     return true;
 }
 
+bool spg_gpu_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) {
+    return create_buffer(b, bytes, host_visible ? SPG_MEMORY_HOST : SPG_MEMORY_DEVICE);
+}
+
 void spg_gpu_buffer_free(SpgGpuBuffer *b) {
     if (!b || !b->buffer) return;
-    vkDestroyBuffer(gpu.device, (VkBuffer)b->buffer, NULL);
-    vkFreeMemory(gpu.device, (VkDeviceMemory)b->memory, NULL);   /* unmaps it too */
+    if (b->memory) {                    /* an arena's buffers leave their memory to it */
+        vkDestroyBuffer(gpu.device, (VkBuffer)b->buffer, NULL);
+        vkFreeMemory(gpu.device, (VkDeviceMemory)b->memory, NULL);   /* unmaps it too */
+    }
     memset(b, 0, sizeof *b);
+}
+
+/* ------------------------------------------------------------------------- arenas */
+
+/* An arena's buffers are 256-byte ranges of blocks of up to ARENA_BLOCK bytes, one block per run of
+   buffers of a kind in the order they were asked for (a larger buffer is a block of its own). */
+#define ARENA_BLOCK (256ull << 20)
+#define ARENA_ALIGN 256u
+
+typedef struct { SpgGpuBuffer *buffer; size_t bytes, offset; SpgMemory kind; uint32_t block; } ArenaAsk;
+
+struct SpgGpuArena {
+    ArenaAsk *asks;
+    uint32_t count, cap;
+    SpgGpuBuffer *blocks;
+    uint32_t block_count;
+    bool failed;                        /* an ask could not be kept */
+};
+
+SpgGpuArena *spg_gpu_arena_create(void) {
+    return (SpgGpuArena *)calloc(1, sizeof(SpgGpuArena));
+}
+
+void spg_gpu_arena_add(SpgGpuArena *a, SpgGpuBuffer *buffer, size_t bytes, SpgMemory kind) {
+    memset(buffer, 0, sizeof *buffer);
+    if (bytes == 0) return;
+    if (a->count == a->cap) {
+        uint32_t cap = a->cap ? 2u * a->cap : 64u;
+        ArenaAsk *grown = (ArenaAsk *)realloc(a->asks, cap * sizeof *grown);
+        if (!grown) { a->failed = true; return; }
+        a->asks = grown;
+        a->cap = cap;
+    }
+    a->asks[a->count++] = (ArenaAsk){buffer, (bytes + 15u) & ~(size_t)15u, 0, kind, 0};
+}
+
+bool spg_gpu_arena_commit(SpgGpuArena *a) {
+    if (a->failed || !spg_gpu_open()) return false;
+    /* the blocks (at most one per ask): their kinds and the bytes they need */
+    const uint32_t most = a->count ? a->count : 1u;
+    a->blocks = (SpgGpuBuffer *)calloc(most, sizeof(SpgGpuBuffer));
+    size_t *need = (size_t *)calloc(most, sizeof(size_t));
+    SpgMemory *kinds = (SpgMemory *)calloc(most, sizeof(SpgMemory));
+    bool ok = a->blocks && need && kinds;
+    for (int kind = SPG_MEMORY_DEVICE; ok && kind <= SPG_MEMORY_HOST_WRITES; kind++) {
+        uint32_t open = UINT32_MAX;     /* the block being filled */
+        for (uint32_t k = 0; k < a->count; k++) {
+            ArenaAsk *ask = &a->asks[k];
+            if ((int)ask->kind != kind) continue;
+            const size_t bytes = (ask->bytes + ARENA_ALIGN - 1u) & ~(size_t)(ARENA_ALIGN - 1u);
+            if (open == UINT32_MAX || need[open] + bytes > ARENA_BLOCK) {
+                open = a->block_count++;
+                kinds[open] = (SpgMemory)kind;
+            }
+            ask->block = open;
+            ask->offset = need[open];
+            need[open] += bytes;
+        }
+    }
+    uint32_t made = 0;
+    while (ok && made < a->block_count) {
+        ok = create_buffer(&a->blocks[made], need[made], kinds[made]);
+        made += ok;
+    }
+    a->block_count = made;              /* the blocks to free */
+    free(need);
+    free(kinds);
+    if (!ok) return false;
+    for (uint32_t k = 0; k < a->count; k++) {
+        const ArenaAsk *ask = &a->asks[k];
+        const SpgGpuBuffer *block = &a->blocks[ask->block];
+        *ask->buffer = (SpgGpuBuffer){block->buffer, NULL, block->address + ask->offset,
+                                      block->mapped ? (char *)block->mapped + ask->offset : NULL, ask->bytes,
+                                      ask->offset};
+    }
+    return true;
+}
+
+void spg_gpu_arena_free(SpgGpuArena *a) {
+    if (!a) return;
+    for (uint32_t b = 0; b < a->block_count; b++) spg_gpu_buffer_free(&a->blocks[b]);
+    free(a->blocks);
+    free(a->asks);
+    free(a);
 }
 
 /* ------------------------------------------------------------------------- commands */
@@ -604,7 +712,7 @@ void spg_gpu_barrier_host(SpgGpuCommands *c) {
 void spg_gpu_copy(SpgGpuCommands *c, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
                   size_t dst_offset, size_t bytes) {
     if (bytes == 0) return;
-    VkBufferCopy region = {src_offset, dst_offset, bytes};
+    VkBufferCopy region = {src->offset + src_offset, dst->offset + dst_offset, bytes};
     const bool timed = c->queries && c->timed < PROFILE_QUERIES && bytes >= 4096u;
     if (timed) {
         snprintf(c->labels[c->timed], 48, "copy%s", src->mapped ? " from host" : dst->mapped ? " to host" : "");
@@ -616,7 +724,7 @@ void spg_gpu_copy(SpgGpuCommands *c, const SpgGpuBuffer *src, size_t src_offset,
 
 void spg_gpu_fill(SpgGpuCommands *c, const SpgGpuBuffer *dst, size_t offset, size_t bytes, uint32_t value) {
     if (bytes == 0) return;
-    vkCmdFillBuffer(c->cb, (VkBuffer)dst->buffer, offset, bytes, value);
+    vkCmdFillBuffer(c->cb, (VkBuffer)dst->buffer, dst->offset + offset, bytes, value);
 }
 
 bool spg_gpu_record_end(SpgGpuCommands *c) {
