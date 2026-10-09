@@ -187,15 +187,24 @@ static uint64_t sample_floats(const NeuralNetwork *net, bool training) {
    RTX 4050 Laptop GPU) and takes less memory to make. */
 #define INFERENCE_BYTES (32ull << 20)
 
+/* Bytes of a sample's activations in inference: bfloat16 but the output layer's where products are in
+   bfloat16 (kept_half()). */
+static uint64_t inference_bytes(const NeuralNetwork *net) {
+    const bool half = spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16() && spg_gpu_bf16_storage();
+    uint64_t bytes = 0;
+    for (uint32_t l = 0; l < net->layers; l++) bytes += (uint64_t)net->topology[l] * (half && l + 1 < net->layers ? 2u : 4u);
+    return bytes ? bytes : 1u;
+}
+
 uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool training) {
     uint64_t memory = spg_gpu_memory();
     if (memory == 0 || want == 0) return 0;
     /* half the device's memory for the chunk's buffers (the parameters and scratch are smaller) */
     uint64_t per = sample_floats(net, training) * 4u, cap = memory / 2u / (per ? per : 1u);
-    if (cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
+    if (training && cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
     /* inference in chunks that keep to the cache, of 64 samples at least */
-    const uint64_t cached = INFERENCE_BYTES / (per ? per : 1u) < 64u ? 64u : INFERENCE_BYTES / (per ? per : 1u);
-    if (!training && cap > cached) cap = cached;
+    const uint64_t cached = INFERENCE_BYTES / inference_bytes(net);
+    if (!training && cap > cached) cap = cached < 64u ? 64u : cached;
     return cap < want ? (uint32_t)cap : want;
 }
 
@@ -1869,9 +1878,13 @@ bool spingalett_gpu_predict_rows(SpgGpuNet *g, const float *inputs, const Spinga
     const NeuralNetwork *net = g->net;
     const uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
     /* chunk after chunk, each filled while the device runs the one before, its outputs taken when
-       its slot comes round again: from the caller's floats, or gathered on the device from rows */
-    for (uint32_t start = 0; start < n; start += g->capacity) {
-        const uint32_t m = n - start < g->capacity ? n - start : g->capacity;
+       its slot comes round again: the caller's floats in chunks of at most 2,048 samples, so that their
+       copies overlap with the work on the chunk before (the MLP of Examples/Benchmark.c infers 1.1 times
+       as fast in bfloat16 from host arrays in chunks of 2,048 as of 7,168), a data set's rows in whole
+       chunks */
+    const uint32_t most = rows || g->capacity < SPINGALETT_BATCH_CHUNK ? g->capacity : SPINGALETT_BATCH_CHUNK;
+    for (uint32_t start = 0; start < n; start += most) {
+        const uint32_t m = n - start < most ? n - start : most;
         float *dst = spingalett_gpu_chunk_inputs(g, NULL);
         Slot *s = &g->slots[g->next];
         s->staged = false;

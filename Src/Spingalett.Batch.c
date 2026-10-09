@@ -483,7 +483,7 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
     if (!source) spingalett_network_sync(net);
     /* chunks of a power of two (at least 64) samples, so that calls of nearby sizes share one */
     uint32_t want = 64;
-    while (want < count && want < SPINGALETT_BATCH_CHUNK) want *= 2;
+    while (want < count && want < (1u << 24)) want *= 2;
     uint32_t capacity = spingalett_gpu_capacity(net, want, false);
     SpgGpuNet *gpu = atomic_exchange(&net->gpu_predict, NULL);
     /* the parameters as they are now: those it has when the arrays have not changed since (nor the
