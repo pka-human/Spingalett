@@ -7,6 +7,18 @@ changes, which are listed under **Changed**.
 
 ## [Unreleased]
 
+### Added
+- **Packages:** a pkg-config file, `spingalett.pc`, which finds the installation from its own
+  directory (an extracted release archive too); a Conan recipe (`conan create packaging/conan`) and a
+  vcpkg port (`vcpkg install spingalett --overlay-ports=packaging/vcpkg`) that build the library of
+  the checkout with OpenMP and, as an option, the GPU backend; CI builds both and a program against
+  them.
+- **The ABI held by tests:** the exported functions carry symbol versions on ELF platforms
+  (`SPINGALETT_1.0`, `Src/Spingalett.map`), and the `api.abi` test compares the public structs'
+  sizes and fields, the enumerators, the constants and the functions' declarations with those of the
+  last release (`Tests/Data/abi.txt`): additions pass, changes fail. The README states what 1.x keeps
+  (**Compatibility**).
+
 ### Changed
 - **The names of 0.x only on request:** `Spingalett.h` no longer includes `Spingalett.Short.h`. A
   program written for 0.x includes `<Spingalett/Spingalett.Short.h>` in place of `Spingalett.h`, or
@@ -15,6 +27,8 @@ changes, which are listed under **Changed**.
   are also `<syslog.h>`'s, and a program's own `train()`, `layer()` or `predict()` was replaced by
   the library's. `SPINGALETT_NO_SHORT_NAMES` is no longer needed; `Spingalett.hpp` refuses
   `SPINGALETT_SHORT_NAMES`, whose macros would replace its methods.
+- The CMake package accepts any 1.x of at least the version asked for (`SameMajorVersion`); the
+  library exports nothing but its functions (an OpenMP lock was exported).
 
 ## [0.14.0] - 2026-10-09
 

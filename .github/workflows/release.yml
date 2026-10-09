@@ -229,6 +229,13 @@ jobs:
           cmake --build consumer/build
           export PATH="$PWD/$ARCHIVE/bin:$PATH"
           (cd consumer/build && ./xor | grep "Passed: 4/4")
+          if [ "$RUNNER_OS" != Windows ] && command -v pkg-config > /dev/null; then   # spingalett.pc, relocated
+            export PKG_CONFIG_PATH="$PWD/$ARCHIVE/lib/pkgconfig"
+            test "$(pkg-config --modversion spingalett)" = "${{ needs.version.outputs.version }}"
+            cc -o consumer/xor_pc consumer/xor.c $(pkg-config --cflags --libs spingalett) -lm \
+               -Wl,-rpath,"$PWD/$ARCHIVE/lib"
+            (cd consumer && ./xor_pc | grep "Passed: 4/4")
+          fi
           { "$ARCHIVE/bin/DatasetTool" || true; } 2>&1 | grep -q usage      # no arguments: usage, exit 2
           { "$ARCHIVE/bin/ModelTool" || true; } 2>&1 | grep -q usage
 

@@ -137,6 +137,34 @@ jobs:
           cmake --build consumer/build
           consumer/build/c
 
+  packages:
+    name: Conan and vcpkg recipes
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Conan
+        run: |
+          pipx install conan
+          conan profile detect
+          conan create packaging/conan --build=missing
+
+      - name: vcpkg (overlay port)
+        run: |
+          vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg"
+          "$vcpkg" install spingalett --triplet x64-linux-dynamic --overlay-ports=packaging/vcpkg
+          mkdir consumer
+          cp packaging/conan/test_package/test_package.c consumer/
+          printf '%s\n' 'cmake_minimum_required(VERSION 3.21)' 'project(consumer C)' \
+            'find_package(Spingalett CONFIG REQUIRED)' 'add_executable(c test_package.c)' \
+            'target_link_libraries(c PRIVATE Spingalett::spingalett)' > consumer/CMakeLists.txt
+          cmake -S consumer -B consumer/build -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake --build consumer/build
+          consumer/build/c
+          PKG_CONFIG_PATH="$VCPKG_INSTALLATION_ROOT/installed/x64-linux-dynamic/lib/pkgconfig" \
+            pkg-config --exists --print-errors spingalett
+
   embedded:
     name: Cortex-M4 (QEMU)
     runs-on: ubuntu-24.04

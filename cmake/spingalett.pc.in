@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/@SPINGALETT_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@SPINGALETT_PC_LIBDIR@
+includedir=@SPINGALETT_PC_INCLUDEDIR@
+
+Name: Spingalett
+Description: Neural networks in C: training on the CPU and on GPUs, deployment down to INT2
+URL: https://github.com/pka-human/Spingalett
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lspingalett
+Cflags: -I${includedir}

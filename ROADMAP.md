@@ -58,6 +58,15 @@ else.
 soname becomes `libspingalett.so.1`, and a CMake package, pkg-config file, vcpkg and Conan recipes
 ship with it.
 
+- **The names of 0.x only on request** (done): `Spingalett.h` leaves out `Spingalett.Short.h`, whose
+  macros clashed with `<syslog.h>` and replaced programs' own `train()` and `layer()`.
+- **The ABI held by tests** (done): symbol versions (`Src/Spingalett.map`, `SPINGALETT_1.0`) and
+  `api.abi`, which compares the structs' layouts, the enumerators, the constants and the functions'
+  declarations with those of the last release (`Tests/Data/abi.txt`).
+- **Packages** (done): `spingalett.pc` (relocatable), the CMake package compatible within a major
+  version, a Conan recipe and a vcpkg port of the source tree (`packaging/`, tested in CI); the
+  rules of compatibility in the README.
+
 ## Any time: work that changes no API
 
 Performance and backends that programs only notice by their speed land in whichever release is

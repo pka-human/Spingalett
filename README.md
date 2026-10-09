@@ -38,6 +38,7 @@ the library inside) are included.
 - [DigitPad demo](#digitpad-demo)
 - [Performance](#performance)
 - [Project layout](#project-layout)
+- [Compatibility](#compatibility)
 - [Status and roadmap](#status-and-roadmap)
 - [Contributing](#contributing)
 - [License](#license)
@@ -132,6 +133,21 @@ which carries the include paths:
 ```cmake
 find_package(Spingalett 0.14 REQUIRED)        # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)
+```
+
+pkg-config finds it as `spingalett` (`cc app.c $(pkg-config --cflags --libs spingalett)`); the file
+locates the installation from its own directory, so an extracted release archive serves too, through
+`PKG_CONFIG_PATH=<dir>/lib/pkgconfig`.
+
+The repository carries a [Conan](https://conan.io) recipe and a [vcpkg](https://vcpkg.io) port that
+build the library of the checkout (shared, with OpenMP, kernels chosen at run time; the GPU backend
+as an option, with `glslc` and the Vulkan headers from the package manager). Both give
+`find_package(Spingalett)` and pkg-config's `spingalett`; they build with GCC or Clang (MinGW on
+Windows):
+
+```bash
+conan create packaging/conan --build=missing                  # -o "&:vulkan=True": the GPU backend
+vcpkg install spingalett --overlay-ports=packaging/vcpkg      # "spingalett[vulkan]": the GPU backend
 ```
 
 Programs that compile the library's sources into themselves, or link it statically, define
@@ -1347,6 +1363,35 @@ Tests/                Test suite (CTest) and fixtures
 Bindings/Python/      Python bindings
 cmake/                CMake package and inference-only build helpers
 ```
+
+## Compatibility
+
+From 1.0 on, Spingalett follows [semantic versioning](https://semver.org/): a 1.x release keeps
+what 1.0 gave, and only 2.0 may take anything away.
+
+- **Source:** a program written for 1.x compiles against every later 1.y. No function, type, struct
+  field, enumerator or constant of the headers (`Spingalett.h`, `Spingalett.Inference.h`,
+  `Spingalett.Short.h`, `Spingalett.hpp`) is removed, renamed or given another meaning; releases add
+  them. A new field takes the place of reserved words and means, at zero, what a program that does
+  not know it expects, so the designated initializers of 1.0 keep their meaning.
+- **Binary:** a program built against 1.x runs with every later 1.y without being built again: the
+  shared library keeps the soname `libspingalett.so.1` (`libspingalett.1.dylib` on macOS), the structs
+  keep their size and the offsets of their fields, enumerators keep their values, and functions keep
+  their parameters. On ELF platforms the functions carry symbol versions (`SPINGALETT_1.0`, then one
+  per release that adds some), so that the loader refuses a library older than the program needs.
+  The test `api.abi` compares every release with the one before.
+- **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7)
+  and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
+  later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
+  that uses only what it knows.
+- **Python:** the `spingalett` package keeps its functions, classes and keyword arguments in the
+  same way.
+- **Not held:** the values of the `*_COUNT` enumerators and of `SPINGALETT_FORMAT_VERSION`, which
+  grow with what a release adds; the text of messages; speed; and the last bits of results. Training
+  repeats its bits on one version (on any number of threads, and on one GPU), but a release whose
+  kernels add in another order may round differently. Everything outside `Include/` is internal.
+- **Deprecation:** what is to go in 2.0 is marked deprecated in a 1.x release, in the header and the
+  CHANGELOG, and keeps working until then.
 
 ## Status and roadmap
 

@@ -617,11 +617,32 @@ configure_package_config_file(
     ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
     INSTALL_DESTINATION ${SPINGALETT_CMAKE_DIR}
 )
-# Before 1.0 a minor release may change the API, so only the same major.minor is compatible.
+# 1.x keeps the API and ABI of 1.0, so any 1.x of at least the version asked for will do (before 1.0 a
+# minor release could change them, and only the same major.minor was compatible).
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(SPINGALETT_COMPATIBILITY SameMinorVersion)
+else()
+    set(SPINGALETT_COMPATIBILITY SameMajorVersion)
+endif()
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
-    COMPATIBILITY SameMinorVersion
+    COMPATIBILITY ${SPINGALETT_COMPATIBILITY}
 )
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfig.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/SpingalettConfigVersion.cmake
         DESTINATION ${SPINGALETT_CMAKE_DIR})
+
+# pkg-config (spingalett.pc), relocatable: the prefix is found from the file's own directory.
+set(SPINGALETT_PC_DIR ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+cmake_path(ABSOLUTE_PATH SPINGALETT_PC_DIR BASE_DIRECTORY ${CMAKE_INSTALL_PREFIX} OUTPUT_VARIABLE pc_dir)
+file(RELATIVE_PATH SPINGALETT_PC_PREFIX ${pc_dir} ${CMAKE_INSTALL_PREFIX})
+string(REGEX REPLACE "/$" "" SPINGALETT_PC_PREFIX "${SPINGALETT_PC_PREFIX}")
+foreach(dir LIBDIR INCLUDEDIR)
+    if(IS_ABSOLUTE "${CMAKE_INSTALL_${dir}}")
+        set(SPINGALETT_PC_${dir} "${CMAKE_INSTALL_${dir}}")
+    else()
+        set(SPINGALETT_PC_${dir} "\${prefix}/${CMAKE_INSTALL_${dir}}")
+    endif()
+endforeach()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/spingalett.pc.in ${CMAKE_CURRENT_BINARY_DIR}/spingalett.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/spingalett.pc DESTINATION ${SPINGALETT_PC_DIR})
