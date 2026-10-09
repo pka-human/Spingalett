@@ -19,6 +19,11 @@ changes, which are listed under **Changed**.
   last release (`Tests/Data/abi.txt`): additions pass, changes fail. The README states what 1.x keeps
   (**Compatibility**).
 
+### Fixed
+- Offsets applied to null pointers, undefined behaviour that Clang's UndefinedBehaviorSanitizer
+  reports (GCC's does not): the data gradient of grouped convolutions without an activation, and
+  training on inputs in the GPU's memory. CI runs the sanitizers with Clang too.
+
 ### Changed
 - **The names of 0.x only on request:** `Spingalett.h` no longer includes `Spingalett.Short.h`. A
   program written for 0.x includes `<Spingalett/Spingalett.Short.h>` in place of `Spingalett.h`, or

@@ -750,7 +750,7 @@ static void conv_backward_data_shapes(const LayerShape *in, const LayerShape *ou
     if (spingalett_conv_direct(in, out, mode)) {
         const uint64_t work = (uint64_t)n * in->height * in->width * KH * KW * CG * OG;
         for (uint32_t g = 0; g < G; g++) {
-            Derivative epilogue = {x + (size_t)g * CG, 0, act};
+            Derivative epilogue = {x ? x + (size_t)g * CG : NULL, 0, act};     /* x: NULL without activation */
             SpingalettGemmHooks hooks = {NULL, NULL, act == ACT_NONE ? NULL : multiply_derivative, &epilogue};
             spingalett_conv_direct_backward_data(in, out, g, Wt, dy, dx, n, scratch, &hooks,
                                                  mode == COMPUTE_OPENMP && work >= SPINGALETT_GEMM_PARALLEL_WORK,
@@ -763,7 +763,7 @@ static void conv_backward_data_shapes(const LayerShape *in, const LayerShape *ou
     for (uint32_t g = 0; g < G; g++) {
         const float *Wg = Wt + (size_t)g * OG * K;
         float *dxg = dx + (size_t)g * CG;
-        Derivative epilogue = {x + (size_t)g * CG, 0, act};
+        Derivative epilogue = {x ? x + (size_t)g * CG : NULL, 0, act};
         SpingalettGemmHooks hooks = {NULL, NULL, act == ACT_NONE ? NULL : multiply_derivative, &epilogue};
 
         if (pointwise(out)) {       /* dx = dy * W */

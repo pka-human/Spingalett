@@ -1,0 +1,3 @@
+# LeakSanitizer suppressions for the sanitizer builds (LSAN_OPTIONS=suppressions=Tests/lsan.supp).
+# LLVM's OpenMP runtime keeps its thread team's descriptors until the process ends.
+leak:libomp.so

@@ -78,21 +78,29 @@ jobs:
           for f in Build/Gpu/*.spv.inc; do grep -q 0x07230203 "$f" || { echo "::error::$f is empty"; exit 1; }; done
 
   sanitizers:
-    name: gcc / ASan + UBSan
+    name: ${{ matrix.cc }} / ASan + UBSan
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: gcc, cxx: g++ }
+          - { cc: clang, cxx: clang++ }       # Clang's UBSan also checks offsets applied to null pointers
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopenblas-dev
+          sudo apt-get install -y libopenblas-dev libomp-dev
 
       - name: Configure
         run: >
-          cmake -S . -B Build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=gcc
+          cmake -S . -B Build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON
           "-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all"
           "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined"
           "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
 
@@ -100,7 +108,7 @@ jobs:
         run: cmake --build Build --parallel
 
       - name: Test
-        run: ctest --test-dir Build --output-on-failure
+        run: LSAN_OPTIONS=suppressions=$PWD/Tests/lsan.supp ctest --test-dir Build --output-on-failure
 
   inference-only:
     name: inference engine alone

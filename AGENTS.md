@@ -56,7 +56,9 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 
 - GCC and Clang, minimal (no OpenMP) and full (`-DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON`);
 - a baseline build (`-DSPINGALETT_NATIVE_ARCH=OFF`), which runs the portable and dispatched kernels;
-- AddressSanitizer and UndefinedBehaviorSanitizer (Debug, `-fsanitize=address,undefined`);
+- AddressSanitizer and UndefinedBehaviorSanitizer (Debug, `-fsanitize=address,undefined`), with GCC
+  and with Clang, whose UBSan also catches offsets applied to null pointers
+  (`LSAN_OPTIONS=suppressions=Tests/lsan.supp`: LLVM's OpenMP runtime keeps memory until exit);
 - the engine alone: `cc -std=c99 -Wall -Wextra -Wpedantic -Werror -DSPINGALETT_INFERENCE_ONLY -IInclude -ISrc -c Src/Spingalett.Inference.c`;
 - for SIMD changes, every instruction set the code has a path for. AArch64 cross builds run under
   `qemu-aarch64` (`QEMU_CPU=cortex-a53` for no dot product, `max` for all features); MinGW builds
