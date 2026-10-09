@@ -35,8 +35,6 @@ layout(push_constant) uniform Push {
 
 #include "half.glsl"
 
-layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
-
 /* The address of value j of row `row` of the set at base: its byte offset has 64 bits, as a set may hold
    more than 2^32 floats. */
 uvec2 address(uvec2 base, uint row, uint j) {

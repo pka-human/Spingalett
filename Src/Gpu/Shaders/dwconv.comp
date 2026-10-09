@@ -1,0 +1,221 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Depthwise convolutions (a group a channel: CG = 1 in Spingalett.Gpu.c's conv_view()), which the matrix
+ * kernels would multiply as products of k = taps: a thread an output value, over channels-last maps x
+ * (in_h x in_w x in_c) and y (out_h x out_w x out_c, out_c = in_c og), filters w [out_c][KH KW] of the
+ * convolution, stride and padding.
+ *
+ *   APPLY    y = conv(x): output channel o reads input channel o / og, taps in order (a convolution's
+ *            forward pass, a transposed convolution's data gradient)
+ *   SPREAD   its transpose: input channel c gathers its og output channels' taps, in order of channel
+ *            then tap, from the gradient at x into the result at y (a convolution's data gradient, a
+ *            transposed convolution's forward pass)
+ *   WEIGHTS  w[slice][o][tap] = the sum over output pixels slice rows .. + rows of y[pixel][o] times
+ *            x[the tap's input pixel][o / og], pixels in order: partial sums the reduce kernel adds
+ *
+ * with the epilogues of the products (gemm_common.glsl's store_c()): STORE (+ beta y), BIAS_ACT
+ * (act(v + bias[channel]), the biases in e0), DERIV ((v + beta y) act'(e0)). Every sum runs in a fixed
+ * order, so the results never depend on the dispatch. With VEC 4 (og 1, channels in fours) a thread
+ * computes four channels at once, in vector loads.
+ */
+
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+
+#define APPLY   0u
+#define SPREAD  1u
+#define WEIGHTS 2u
+#define EPI_STORE    0u
+#define EPI_BIAS_ACT 1u
+#define EPI_DERIV    4u
+
+layout(constant_id = 0) const uint MODE = APPLY;
+layout(constant_id = 1) const uint EPI = EPI_STORE;
+layout(constant_id = 2) const uint ACT = 6;
+layout(constant_id = 3) const uint KH = 3;      /* the window and the stride, constants: the divisions by */
+layout(constant_id = 4) const uint KW = 3;      /* the stride cost little then */
+layout(constant_id = 5) const uint SH = 1;
+layout(constant_id = 6) const uint SW = 1;
+layout(constant_id = 7) const uint VEC = 1;
+layout(constant_id = 8) const uint HALF = 0;    /* words: x 0, y 2, e0 3 (half.glsl) */
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    F32 x, w, y, e0;
+    uint total;                     /* threads' outputs: values of the result, or slices x out_c */
+    uint in_h, in_w, in_c, out_h, out_w, out_c, og;
+    uint ph, pw;
+    uint pixels, rows;              /* WEIGHTS: output pixels, and of a slice */
+    float beta;
+} p;
+
+#include "half.glsl"
+
+/* the epilogue of value i of the result */
+void finish(uint i, uint channel, float v) {
+    if (EPI == EPI_BIAS_ACT) {
+        v = activate(v + p.e0.v[channel], ACT);
+    } else {
+        if (p.beta != 0.0) v += p.beta * ld(p.y, i, 2u);
+        if (EPI == EPI_DERIV) v *= derivative(ld(p.e0, i, 3u), ACT);
+    }
+    st(p.y, i, 2u, v);
+}
+
+/* and of values i .. i + 3, channels channel .. + 3 */
+void finish4(uint i, uint channel, vec4 v) {
+    if (EPI == EPI_BIAS_ACT) {
+        [[unroll]] for (uint k = 0u; k < 4u; k++) v[k] = activate(v[k] + p.e0.v[channel + k], ACT);
+    } else {
+        if (p.beta != 0.0) v += p.beta * ld4(p.y, i, 2u);
+        if (EPI == EPI_DERIV) {
+            const vec4 e = ld4(p.e0, i, 3u);
+            [[unroll]] for (uint k = 0u; k < 4u; k++) v[k] *= derivative(e[k], ACT);
+        }
+    }
+    st4(p.y, i, 2u, v);
+}
+
+/* the filters of channels o .. o + 3 at tap t */
+vec4 w4(uint o, uint t) {
+    const uint taps = KH * KW;
+    return vec4(p.w.v[o * taps + t], p.w.v[(o + 1u) * taps + t], p.w.v[(o + 2u) * taps + t], p.w.v[(o + 3u) * taps + t]);
+}
+
+void main4() {
+    const uint stride = gl_NumWorkGroups.x * 256u, taps = KH * KW;
+    for (uint q = gl_GlobalInvocationID.x; q < p.total / 4u; q += stride) {
+        const uint i = 4u * q;
+        if (MODE == APPLY) {
+            const uint o = i % p.out_c, pixel = i / p.out_c, ox = pixel % p.out_w, oy = (pixel / p.out_w) % p.out_h;
+            const uint n = pixel / (p.out_w * p.out_h);
+            const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox * SW) - int(p.pw);
+            vec4 sum = vec4(0.0);
+            [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                const int iy = y0 + int(ky);
+                if (iy < 0 || iy >= int(p.in_h)) continue;
+                [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                    const int ix = x0 + int(kx);
+                    if (ix < 0 || ix >= int(p.in_w)) continue;
+                    sum += ld4(p.x, ((n * p.in_h + uint(iy)) * p.in_w + uint(ix)) * p.in_c + o, 0u) * w4(o, ky * KW + kx);
+                }
+            }
+            finish4(i, o, sum);
+        } else if (MODE == SPREAD) {
+            const uint c = i % p.in_c, pixel = i / p.in_c, ix = pixel % p.in_w, iy = (pixel / p.in_w) % p.in_h;
+            const uint n = pixel / (p.in_w * p.in_h);
+            vec4 sum = vec4(0.0);
+            [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                const int ty = int(iy + p.ph) - int(ky);
+                if (ty < 0 || uint(ty) % SH != 0u || uint(ty) / SH >= p.out_h) continue;
+                const uint oy = uint(ty) / SH;
+                [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                    const int tx = int(ix + p.pw) - int(kx);
+                    if (tx < 0 || uint(tx) % SW != 0u || uint(tx) / SW >= p.out_w) continue;
+                    sum += ld4(p.x, ((n * p.out_h + oy) * p.out_w + uint(tx) / SW) * p.out_c + c, 0u) *
+                           w4(c, ky * KW + kx);
+                }
+            }
+            finish4(i, c, sum);
+        } else {
+            /* (slice, o .. o + 3) */
+            const uint o = i % p.out_c, slice = i / p.out_c;
+            const uint first = slice * p.rows, end = min(first + p.rows, p.pixels);
+            vec4 acc[KH * KW];
+            [[unroll]] for (uint t = 0u; t < taps; t++) acc[t] = vec4(0.0);
+            for (uint pixel = first; pixel < end; pixel++) {
+                const uint ox = pixel % p.out_w, oy = (pixel / p.out_w) % p.out_h, n = pixel / (p.out_w * p.out_h);
+                const vec4 d = ld4(p.y, pixel * p.out_c + o, 2u);
+                const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox * SW) - int(p.pw);
+                [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                    const int iy = y0 + int(ky);
+                    if (iy < 0 || iy >= int(p.in_h)) continue;
+                    [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                        const int ix = x0 + int(kx);
+                        if (ix < 0 || ix >= int(p.in_w)) continue;
+                        acc[ky * KW + kx] += d * ld4(p.x, ((n * p.in_h + uint(iy)) * p.in_w + uint(ix)) * p.in_c + o, 0u);
+                    }
+                }
+            }
+            [[unroll]] for (uint k = 0u; k < 4u; k++)
+                [[unroll]] for (uint t = 0u; t < taps; t++) p.w.v[(slice * p.out_c + o + k) * taps + t] = acc[t][k];
+        }
+    }
+}
+
+void main() {
+    if (VEC == 4u) {
+        main4();
+        return;
+    }
+    const uint stride = gl_NumWorkGroups.x * 256u, taps = KH * KW;
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        if (MODE == APPLY) {
+            const uint o = i % p.out_c, pixel = i / p.out_c, ox = pixel % p.out_w, oy = (pixel / p.out_w) % p.out_h;
+            const uint n = pixel / (p.out_w * p.out_h), c = o / p.og;
+            const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox * SW) - int(p.pw);
+            float sum = 0.0;
+            [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                const int iy = y0 + int(ky);
+                if (iy < 0 || iy >= int(p.in_h)) continue;
+                [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                    const int ix = x0 + int(kx);
+                    if (ix < 0 || ix >= int(p.in_w)) continue;
+                    sum += ld(p.x, ((n * p.in_h + uint(iy)) * p.in_w + uint(ix)) * p.in_c + c, 0u) *
+                           p.w.v[o * taps + ky * KW + kx];
+                }
+            }
+            finish(i, o, sum);
+        } else if (MODE == SPREAD) {
+            /* input pixel (iy, ix) is tap (ky, kx) of output pixel ((iy + ph - ky) / sh, ...) where that
+               divides */
+            const uint c = i % p.in_c, pixel = i / p.in_c, ix = pixel % p.in_w, iy = (pixel / p.in_w) % p.in_h;
+            const uint n = pixel / (p.in_w * p.in_h);
+            float sum = 0.0;
+            for (uint m = 0u; m < p.og; m++) {
+                const uint o = c * p.og + m;
+                [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                    const int ty = int(iy + p.ph) - int(ky);
+                    if (ty < 0 || uint(ty) % SH != 0u || uint(ty) / SH >= p.out_h) continue;
+                    const uint oy = uint(ty) / SH;
+                    [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                        const int tx = int(ix + p.pw) - int(kx);
+                        if (tx < 0 || uint(tx) % SW != 0u || uint(tx) / SW >= p.out_w) continue;
+                        sum += ld(p.x, ((n * p.out_h + oy) * p.out_w + uint(tx) / SW) * p.out_c + o, 0u) *
+                               p.w.v[o * taps + ky * KW + kx];
+                    }
+                }
+            }
+            finish(i, c, sum);
+        } else {
+            /* (slice, o): every tap's sum over the slice's pixels, in order */
+            const uint o = i % p.out_c, slice = i / p.out_c, c = o / p.og;
+            const uint first = slice * p.rows, end = min(first + p.rows, p.pixels);
+            float acc[KH * KW];
+            [[unroll]] for (uint t = 0u; t < taps; t++) acc[t] = 0.0;
+            for (uint pixel = first; pixel < end; pixel++) {
+                const uint ox = pixel % p.out_w, oy = (pixel / p.out_w) % p.out_h, n = pixel / (p.out_w * p.out_h);
+                const float d = ld(p.y, pixel * p.out_c + o, 2u);
+                const int y0 = int(oy * SH) - int(p.ph), x0 = int(ox * SW) - int(p.pw);
+                [[unroll]] for (uint ky = 0u; ky < KH; ky++) {
+                    const int iy = y0 + int(ky);
+                    if (iy < 0 || iy >= int(p.in_h)) continue;
+                    [[unroll]] for (uint kx = 0u; kx < KW; kx++) {
+                        const int ix = x0 + int(kx);
+                        if (ix < 0 || ix >= int(p.in_w)) continue;
+                        acc[ky * KW + kx] += d * ld(p.x, ((n * p.in_h + uint(iy)) * p.in_w + uint(ix)) * p.in_c + c, 0u);
+                    }
+                }
+            }
+            [[unroll]] for (uint t = 0u; t < taps; t++) p.w.v[(slice * p.out_c + o) * taps + t] = acc[t];
+        }
+    }
+}

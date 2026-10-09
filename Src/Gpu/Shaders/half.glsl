@@ -26,3 +26,28 @@ void st(F32 x, uint i, uint w, float v) {
 #endif
     x.v[i] = v;
 }
+
+/* Four consecutive values from index i on (a multiple of four, at 16 bytes): eight bytes of bfloat16, or
+   sixteen of floats. */
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
+
+vec4 ld4(F32 x, uint i, uint w) {
+#ifdef SPG_HALF
+    if (((HALF >> w) & 1u) != 0u) {
+        const uvec2 u = U32x2(x).v[i >> 2];
+        return vec4(uintBitsToFloat(u.x << 16), uintBitsToFloat(u.x & 0xFFFF0000u), uintBitsToFloat(u.y << 16),
+                    uintBitsToFloat(u.y & 0xFFFF0000u));
+    }
+#endif
+    return F32x4(x).v[i >> 2];
+}
+
+void st4(F32 x, uint i, uint w, vec4 v) {
+#ifdef SPG_HALF
+    if (((HALF >> w) & 1u) != 0u) {
+        U32x2(x).v[i >> 2] = uvec2(to_bf16(v.x) | to_bf16(v.y) << 16, to_bf16(v.z) | to_bf16(v.w) << 16);
+        return;
+    }
+#endif
+    F32x4(x).v[i >> 2] = v;
+}
