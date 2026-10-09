@@ -53,10 +53,20 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
 /* The network's parameters on the device, for chunks of up to `capacity` samples; with `training`,
    the gradients, optimizer state and outputs of every layer too. NULL when memory runs out. */
 SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training);
+/* The same, its parameters (and the moments both have) taken from another copy of the network on the
+   device rather than from the host's arrays (which need not be up to date then). */
+SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity, const SpgGpuTraining *training,
+                                          SpgGpuNet *from);
+/* Takes the parameters (and moments) of another copy of the network, on the device. */
+bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from);
 void spingalett_gpu_net_free(SpgGpuNet *g);
 uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g);
 /* Whether it was made for the current GPU precision (spingalett_set_gpu_precision()). */
 bool spingalett_gpu_net_current(const SpgGpuNet *g);
+/* Whether a network made for training can train again with chunks of `capacity` samples and these
+   settings (then taken for them: the commands that record the optimizer are recorded again when
+   they changed); false leaves it as it was. */
+bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training);
 
 /* Copies the network's parameters (weights, biases, running statistics and optimizer moments) to
    the device, or back from it after the work submitted so far. */
@@ -66,6 +76,14 @@ bool spingalett_gpu_download(SpgGpuNet *g);
 /* Where the next chunk's inputs and targets go (rows of the input and output layers), once the
    device is done with the chunk that used that memory before. */
 float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets);
+/* The same, where the network keeps its inputs as bfloat16 in device memory the host writes: the
+   device's buffer, which the caller fills with spingalett_round_bf16() (NULL where it does not). */
+uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets);
+/* The next chunk's inputs, of n samples, filled: rounded to the device's buffer now, rather than when
+   the chunk is submitted (so that a chunk can be made ready ahead). */
+void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n);
+/* Floats rounded to bfloat16, to the nearest, ties to even (as the GPU rounds). */
+void spingalett_round_bf16(uint16_t *dst, const float *src, size_t n);
 /* Trains on the n samples filled in: forward, loss and backward passes, their gradients scaled by
    1 / count and added to the step's (first: the step's first chunk, which replaces them), then with
    `last` the optimizer step. position: the chunk's first sample within its step (dropout). */
@@ -110,10 +128,31 @@ static inline SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t 
     return NULL;
 }
 static inline void spingalett_gpu_net_free(SpgGpuNet *g) { (void)g; }
+static inline SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
+                                                        const SpgGpuTraining *t, SpgGpuNet *from) {
+    (void)net; (void)capacity; (void)t; (void)from;
+    return NULL;
+}
+static inline bool spingalett_gpu_take_parameters(SpgGpuNet *g, SpgGpuNet *from) {
+    (void)g; (void)from;
+    return false;
+}
 static inline uint32_t spingalett_gpu_net_capacity(const SpgGpuNet *g) { (void)g; return 0; }
 static inline bool spingalett_gpu_net_current(const SpgGpuNet *g) { (void)g; return false; }
+static inline bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *t) {
+    (void)g; (void)capacity; (void)t;
+    return false;
+}
 static inline bool spingalett_gpu_upload(SpgGpuNet *g) { (void)g; return false; }
 static inline bool spingalett_gpu_download(SpgGpuNet *g) { (void)g; return false; }
+static inline uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
+    (void)g; (void)targets;
+    return NULL;
+}
+static inline void spingalett_gpu_chunk_ready(SpgGpuNet *g, uint32_t n) { (void)g; (void)n; }
+static inline void spingalett_round_bf16(uint16_t *dst, const float *src, size_t n) {
+    (void)dst; (void)src; (void)n;
+}
 static inline float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets) {
     (void)g; (void)targets;
     return NULL;

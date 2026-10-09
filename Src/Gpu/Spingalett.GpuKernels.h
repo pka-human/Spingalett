@@ -37,6 +37,11 @@ typedef struct {
                                        is chosen by timing the candidates on a scratch copy of C */
     bool bf16;                      /* operands rounded to bfloat16 on the matrix units (when the device
                                        has them; single precision otherwise) */
+    uint32_t half;                  /* with bf16 on the matrix units: A, B, C, e0 (bits 0 to 3) kept in
+                                       memory as bfloat16 (spg_gpu_bf16_storage()) */
+    bool wide_a, wide_b;            /* operands kept as bfloat16: eight values of the contiguous axis at
+                                       once may be read (convolutions: channels a group multiples of
+                                       eight; checked here as vec_a and vec_b are) */
 } SpgGemmMode;
 
 /* Records C = A B (gemm.comp) with the tile that suits M, N and the workgroups in z (no barrier). */
@@ -115,7 +120,7 @@ typedef struct {
     uint64_t z;
 } SpgEltwisePush;
 enum { SPG_ELT_BIAS_ACT, SPG_ELT_DERIV, SPG_ELT_MUL, SPG_ELT_ADD, SPG_ELT_DROPOUT, SPG_ELT_AFFINE, SPG_ELT_BDATA,
-       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD };
+       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD, SPG_ELT_COPY };
 
 /* output.comp */
 typedef struct {
@@ -161,6 +166,7 @@ typedef struct {
     uint64_t w, m, v, g, header;
     uint32_t n;
     float decay, momentum, beta1, beta2, epsilon;
+    uint64_t wh;                    /* the weights' bfloat16 copy, written with them (0: none) */
 } SpgOptimPush;
 
 /* sumsq.comp */

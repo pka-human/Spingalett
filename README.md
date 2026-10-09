@@ -792,10 +792,15 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
       .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);   /* as on the CPU */
 ```
 
-- Parameters, their gradients and the optimizer's moments stay in GPU memory for the whole
-  `train()` call. The host prepares a batch (gathering, augmentation, label smoothing) while the
-  GPU trains on the one before, and gets the losses and the parameters back at the end of every
-  epoch, where validation, callbacks, autosaves and the best weights see them.
+- Parameters, their gradients and the optimizer's moments stay in GPU memory, and so does the
+  network's copy there after `train()` returns: functions that read the parameters
+  (`predict()`, `save_spingalett()`, `spingalett_get_parameters()`, a callback's reads during
+  training, and the others) copy them back first, parameters set on the host go to the device
+  before the next epoch, and the next `train()` of the same batch size and optimizer trains on the
+  copy again without copying anything. The network frees it when it is freed, gains a layer, trains
+  on the CPU or makes a trainer. The host prepares a batch (gathering, augmentation, label smoothing,
+  and writing it into the device's memory where it can) while the GPU trains on the one before, and
+  takes the losses back at the end of every epoch.
 - Every kind of layer, activation, loss and optimizer runs on the GPU, with dropout (the same masks
   as on the CPU), gradient clipping and batch normalization. Per-sample training, `forward()` and
   deployment models run on the CPU.
@@ -807,24 +812,37 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
   go to the GPU before the next forward pass.
 - `spingalett_set_gpu_precision(PRECISION_BFLOAT16)` multiplies matrices in bfloat16 on the GPU's
   matrix units (tensor cores; `VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16`), the
-  products added in single precision; the parameters, the optimizer and batch normalization stay in
-  single precision, and so do products smaller than a block of the matrix units. Runs stay
-  deterministic. On an RTX 4050 Laptop GPU ResNet-20 trains 17 to 18% faster than in single
-  precision, and reaches the same CIFAR-10 test accuracy (91.61% against 91.55%). Devices without
-  the extensions keep single precision.
+  products added in single precision. The layers' outputs, all but the output layer's (and the
+  network's inputs, which the host rounds as it sends them), and their gradients are kept on the GPU
+  as bfloat16, the values the products round them to anyway: half the memory and half the bytes
+  every pass reads and writes. The passes between products (normalizations, pooling, additions,
+  upsampling) compute in single precision, and the parameters, their gradients and the optimizer
+  stay in it, as with PyTorch's autocast; products smaller than a block of the matrix units stay in
+  single precision unless they read or write bfloat16. Runs stay deterministic. On an RTX 4050
+  Laptop GPU ResNet-20 trains 1.7 times as fast as in single precision and reaches the same
+  CIFAR-10 test accuracy (91.80% after 100 epochs, single precision 91.55%). Devices without the
+  extensions keep single precision.
 - Results are deterministic: every sum runs in a fixed order, never through atomics, so a run gives
   the same bits every time on one device. They agree with the CPU's up to rounding: the products
   add in another order, with fused multiply-adds, and batch normalization adds its sums in single
   rather than double precision.
 - The first products of each shape are timed with a few tile sizes, and the fastest is kept for the
-  life of the process: the first `train()` of a process takes about a second longer (ResNet-20 on an
-  RTX 4050 Laptop GPU), and the very first on a machine some ten seconds, while the driver compiles
-  the kernels, which it then keeps on disk. Tiles change the speed, never the results;
+  life of the process: the first `train()` of a process takes a few tenths of a second longer
+  (ResNet-20 on an RTX 4050 Laptop GPU: 0.3 s), and the very first on a machine some ten seconds,
+  while the driver compiles the kernels, which it then keeps on disk (NVIDIA's cache is limited in
+  size, which `__GL_SHADER_DISK_CACHE_SIZE` raises). Tiles change the speed, never the results;
   `SPINGALETT_GPU_TUNE=0` estimates them instead.
-- Samples are processed in chunks of up to 2048 that fit in half the GPU's memory; full-batch
+- Training processes samples in chunks of up to 2048 that fit in half the GPU's memory; full-batch
   training of networks with batch normalization normalizes over each chunk, as on the CPU.
+  Inference runs in chunks of at most 32 MB of activations (64 samples at least), whose layers'
+  outputs stay in the GPU's cache from one layer to the next.
+- Where the host can write into all of the GPU's memory (resizable BAR, unified memory), it writes
+  each chunk's inputs and the parameters straight into it, instead of the GPU copying them from
+  host memory.
 - `SPINGALETT_GPU_DEVICE=n` picks the n-th device of the Vulkan device list instead of the first
-  discrete GPU; `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel when the process exits.
+  discrete GPU; `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel and copy when the process
+  exits; `SPINGALETT_GPU_NO_HOST_WRITES=1` has the GPU copy inputs and parameters from host memory,
+  and `SPINGALETT_GPU_NO_BF16_STORAGE=1` keeps activations in single precision in bfloat16 mode.
 
 In Python: `sg.set_compute_mode(sg.ComputeMode.VULKAN)`, `sg.gpu_device()` and
 `sg.set_gpu_precision(sg.Precision.BFLOAT16)`.
@@ -1096,44 +1114,44 @@ fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast, f
 (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
 and 4,798.
 
-On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 0.12 runs
-the same workloads (0.13 the U-Net; it runs the others within 5% of 0.12, either way) with
-`COMPUTE_VULKAN` (`Bin/Benchmark gpu`), in single precision and with its
-matrix products in bfloat16 (`spingalett_set_gpu_precision()`), against PyTorch 2.14.1 with CUDA
-13.0 and cuDNN (`python Examples/benchmark_pytorch.py --cuda`, with PyTorch's default TF32
-convolutions, `--cuda-fp32`, and `--cuda-bf16`: autocast to bfloat16), medians of three
-interleaved runs. PyTorch's data is in GPU memory from the start; Spingalett takes the host arrays
-and copies every batch to the GPU, overlapped with the work on the batch before:
+On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 0.13.1
+runs the same workloads with `COMPUTE_VULKAN` (`Bin/Benchmark gpu`), in single precision and in
+bfloat16 (`spingalett_set_gpu_precision()`), against PyTorch 2.14.1 with CUDA 13.0 and cuDNN
+(`python Examples/benchmark_pytorch.py --cuda`, with PyTorch's default TF32 convolutions,
+`--cuda-fp32`, and `--cuda-bf16`: autocast to bfloat16), medians of three interleaved runs.
+PyTorch's data is in GPU memory from the start; Spingalett takes the host arrays and copies every
+batch to the GPU, overlapped with the work on the batch before. The last two columns give PyTorch
+the same task: its data in host memory, each batch copied over as it is used, the outputs of
+inference copied back (`--host-data`):
 
-| On the GPU | Spingalett | Spingalett (bf16) | PyTorch (TF32) | PyTorch (FP32) | PyTorch (bf16) |
-|---|---:|---:|---:|---:|---:|
-| ResNet-20, training | 8,750 | 9,960 | 8,130 | 6,880 | 12,160 |
-| ResNet-20, inference | 22,630 | 25,300 | 19,260 | 18,860 | 30,350 |
-| Convolutional network, training | 73,680 | 85,950 | 55,080 | 59,180 | 99,120 |
-| Convolutional network, inference | 219,600 | 257,300 | 130,800 | 142,600 | 233,400 |
-| With batch normalization, training | 56,000 | 65,190 | 48,190 | 47,440 | 83,090 |
-| With batch normalization, inference | 150,000 | 165,800 | 106,700 | 113,200 | 197,700 |
-| Fully connected network, mini-batch 64 | 225,500 | 264,100 | 98,290 | 97,520 | 77,320 |
-| Fully connected network, full batch | 599,600 | 809,000 | 1,032,600 | 1,035,900 | 2,538,500 |
-| Fully connected network, inference | 1,144,000 | 1,329,000 | 2,947,600 | 2,948,200 | 6,187,600 |
-| U-Net, training | 3,279 | 3,707 | 3,283 | 3,059 | 4,950 |
-| U-Net, inference | 6,552 | 6,880 | 6,329 | 6,564 | 11,918 |
+| On the GPU | Spingalett | Spingalett (bf16) | PyTorch (TF32) | PyTorch (FP32) | PyTorch (bf16) | PyTorch, host data (TF32 / bf16) |
+|---|---:|---:|---:|---:|---:|---:|
+| ResNet-20, training | 10,530 | 18,330 | 8,437 | 7,521 | 12,210 | 8,373 / 12,050 |
+| ResNet-20, inference | 32,680 | 55,770 | 19,730 | 19,440 | 31,390 | 19,270 / 30,160 |
+| Convolutional network, training | 102,800 | 162,200 | 56,600 | 59,680 | 98,600 | 53,630 / 81,150 |
+| Convolutional network, inference | 270,200 | 389,700 | 131,800 | 141,400 | 236,900 | 127,400 / 225,900 |
+| With batch normalization, training | 72,510 | 119,600 | 48,010 | 48,410 | 84,500 | 47,770 / 61,000 |
+| With batch normalization, inference | 201,700 | 259,500 | 106,400 | 113,300 | 194,900 | 103,200 / 187,200 |
+| Fully connected network, mini-batch 64 | 288,500 | 427,200 | 100,800 | 84,350 | 72,540 | 75,840 / 75,660 |
+| Fully connected network, full batch | 1,134,000 | 2,665,000 | 1,066,000 | 1,038,000 | 2,542,000 | 840,300 / 1,570,000 |
+| Fully connected network, inference | 1,778,000 | 2,827,000 | 2,959,000 | 2,969,000 | 6,137,000 | 1,704,000 / 2,479,000 |
+| U-Net, training | 3,945 | 6,666 | 3,305 | 3,114 | 4,988 | 3,207 / 4,338 |
+| U-Net, inference | 10,140 | 17,320 | 6,389 | 6,598 | 11,830 | 6,037 / 10,970 |
 
-In single precision Spingalett trains ResNet-20 on the GPU 5.5 times as fast as on the eight
-threads of the CPU, 1.08 times as fast as PyTorch with TF32 and 1.27 times as fast as PyTorch in
-single precision, and runs it 1.2 times as fast; it trains the convolutional networks 1.2 to 1.3
-times as fast as PyTorch, runs them 1.3 to 1.7 times as fast, and trains mini-batches of the fully
-connected network 2.3 times as fast. Products in bfloat16 add 11 to 17% to these workloads (35% to
-full batches). PyTorch's autocast gains more on the convolutional networks: in bfloat16 it trains
-them 1.15 to 1.3 times as fast as Spingalett and runs ResNet-20 and the normalized network 1.2
-times as fast, while Spingalett runs the plain convolutional network 1.1 times as fast and trains
-mini-batches 3.4 times as fast. PyTorch leads on large dense products:
-full batches of the fully connected network train at 60% of its speed in single precision, and
-inference runs at 40%, most of that time spent copying the 20,000 samples (63 MB) from host memory.
-The U-Net trains and runs as fast as in PyTorch in single precision (5.5 and 2.7 times as fast as
-on the CPU), its 64 x 64 maps of 16 to 64 channels bound by memory more than by arithmetic: there
-autocast, which keeps activations in bfloat16, trains 1.3 times and infers 1.7 times as fast as
-Spingalett's bfloat16 products, which read and write single precision.
+In single precision Spingalett trains ResNet-20 on the GPU 6.6 times as fast as on the eight
+threads of the CPU, 1.25 times as fast as PyTorch with TF32 and 1.4 times as fast as PyTorch in
+single precision, and runs it 1.7 times as fast; it trains the convolutional networks 1.5 to 1.8
+times as fast as PyTorch and runs them 1.8 to 2.1 times as fast, the U-Net 1.2 to 1.3 and 1.5 to
+1.6 times, and trains the fully connected network 1.06 to 1.09 times as fast in full batches and
+2.9 to 3.4 times in mini-batches. In bfloat16, against PyTorch's autocast, it trains ResNet-20 1.5
+times as fast and runs it 1.8 times as fast, the convolutional networks 1.4 to 1.6 and 1.3 to 1.6
+times, the U-Net 1.3 and 1.5 times, full batches of the fully connected network 1.05 times. Its
+inference runs at 60% of PyTorch's speed and 46% in bfloat16: most of that time goes to copying the
+20,000 samples (63 MB; 31 MB as bfloat16) over the bus, which PyTorch's data, already in GPU memory,
+skips. Given the same task, data in host memory, Spingalett trains those full batches 1.35 and 1.7
+times as fast as PyTorch and infers 1.04 and 1.14 times as fast. Against 0.13.0 on the same machine,
+Spingalett trains ResNet-20 1.2 times as fast in single precision and 1.84 times in bfloat16, and
+infers the U-Net 1.55 and 2.5 times as fast (see the [CHANGELOG](CHANGELOG.md)).
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
@@ -1184,7 +1202,8 @@ VM. `Examples/MNIST_CNN.c` reaches 98.9% after two epochs of about 9 seconds eac
 Sapphire Rapids VM (760 images per second with augmentation); its INT8 model keeps 87.8%. With
 `resnet20` it reaches 91.55% after 100 epochs (12 threads of the i7-12650H, before the indirect
 kernels: 93 minutes; FP16 model 91.56%, INT8 91.58% in 281 KB), and the same 91.55% trained on the
-RTX 4050 Laptop GPU (`gpu`) in 9 minutes; with `resnet32`, 92.39% (INT8 model 92.43% in 480 KB).
+RTX 4050 Laptop GPU (`gpu`) in 9 minutes, 91.80% in bfloat16 (`bf16`) in 5 minutes (FP16 model
+91.83%, INT8 91.77%); with `resnet32`, 92.39% (INT8 model 92.43% in 480 KB).
 `Examples/Segmentation.c` reaches a mean intersection over union of 0.882 on its test images
 (circles 0.925, squares 0.866, triangles 0.855; 98.5% of the pixels right) after 12 epochs of 4,096
 new images, 15 s on the RTX 4050 and 80 s on the i7-12650H's CPU; its INT8 model keeps 0.878, and
@@ -1209,7 +1228,7 @@ cmake/                CMake package and inference-only build helpers
 
 ## Status and roadmap
 
-Spingalett is at version 0.13; the C API may still change between minor versions (see
+Spingalett is at version 0.13.1; the C API may still change between minor versions (see
 [CHANGELOG.md](CHANGELOG.md)), and the shared library's soname carries the minor version
 (`libspingalett.so.0.13`). Since 0.7 the network is an opaque handle, so its internal layout can
 change without breaking programs. Saved models are versioned and remain loadable; the inference
@@ -1220,8 +1239,8 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 - 0.14, the release candidate: every public name under the library's prefix, structs that can
   grow, the formats frozen, a C++ wrapper
 - 1.0: the API and ABI frozen
-- Before and after 1.0, changing no API: the GPU's gap to PyTorch in bfloat16 and on large dense
-  products closed (tile choice, activations in bfloat16, fewer passes, Winograd convolutions)
+- Before and after 1.0, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
+  products in FP16, Winograd convolutions; data sets kept on the GPU (0.14)
 - 1.1: a CUDA backend of its own kernels (no cuDNN), next to Vulkan
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 

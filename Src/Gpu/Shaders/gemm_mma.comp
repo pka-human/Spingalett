@@ -15,10 +15,14 @@
  */
 
 #version 460
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#define SPG_HALF
 #include "common.glsl"
 
 layout(constant_id = 0) const uint BM = 64;
@@ -34,6 +38,7 @@ layout(constant_id = 9) const uint THREADS = 128;     /* subgroups x SG */
 layout(constant_id = 10) const uint PHASED = 0;
 layout(constant_id = 11) const uint VEC = 0;
 layout(constant_id = 12) const uint SG = 32;          /* the subgroup size */
+layout(constant_id = 13) const uint HALF = 0;         /* operands and results kept as bfloat16 (gemm_common.glsl) */
 layout(local_size_x_id = 9) in;
 
 #include "gemm_common.glsl"
@@ -60,16 +65,25 @@ void put_a(uint k, uint m, float v) { uint i = at_a(k, m); As[i >> 2][i & 3u] = 
 void put_b(uint k, uint n, float v) { uint i = at_b(k, n); Bs[i >> 2][i & 3u] = bfloat16_t(v); }
 
 void store_tiles() {
-    /* a vector load runs along the shared rows, at an index that is a multiple of four */
-    for (uint i = 0; i < LA; i++) {
+    /* a vector load runs along the shared rows, at an index that is a multiple of four (eight raw
+       bfloat16: two vectors, the second four further along the axis the load ran along) */
+    [[unroll]] for (uint i = 0; i < LA; i++) {
         if (!a_live(i)) continue;
-        if (VA) As[at_a(a_k(i), a_row(i)) >> 2] = bf16vec4(fa[i]);
-        else put_a(a_k(i), a_row(i), fa[i].x);
+        const uint k = a_k(i), m = a_row(i);
+        if (RA) {
+            As[at_a(k, m) >> 2] = uintBitsToBFloat16EXT(ra[2u * i]);
+            As[(A_KFAST ? at_a(k + 4u, m) : at_a(k, m + 4u)) >> 2] = uintBitsToBFloat16EXT(ra[2u * i + 1u]);
+        } else if (VA) As[at_a(k, m) >> 2] = bf16vec4(fa[i]);
+        else put_a(k, m, fa[i].x);
     }
-    for (uint i = 0; i < LB; i++) {
+    [[unroll]] for (uint i = 0; i < LB; i++) {
         if (!b_live(i)) continue;
-        if (VB) Bs[at_b(b_k(i), b_col(i)) >> 2] = bf16vec4(fb[i]);
-        else put_b(b_k(i), b_col(i), fb[i].x);
+        const uint k = b_k(i), n = b_col(i);
+        if (RB) {
+            Bs[at_b(k, n) >> 2] = uintBitsToBFloat16EXT(rb[2u * i]);
+            Bs[(B_KFAST ? at_b(k + 4u, n) : at_b(k, n + 4u)) >> 2] = uintBitsToBFloat16EXT(rb[2u * i + 1u]);
+        } else if (VB) Bs[at_b(k, n) >> 2] = bf16vec4(fb[i]);
+        else put_b(k, n, fb[i].x);
     }
 }
 
@@ -89,32 +103,32 @@ void main() {
        shaders of SPIR-V 1.5 run with, and complete where the host can ask for it) */
     const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID, sm = sg % SGM, sn = sg / SGM;
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[WM * WN];
-    for (uint i = 0; i < WM * WN; i++) acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    [[unroll]] for (uint i = 0; i < WM * WN; i++) acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
     if (kbeg < kend) fetch(kbeg);
     for (uint k0 = kbeg; k0 < kend; k0 += BK) {
         store_tiles();
         barrier();
         if (k0 + BK < kend) fetch(k0 + BK);
-        for (uint kk = 0; kk < BK; kk += 16u) {
+        [[unroll]] for (uint kk = 0; kk < BK; kk += 16u) {
             coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[WM];
             coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[WN];
-            for (uint i = 0; i < WM; i++) coopMatLoad(a[i], As, at_a(kk, (sm * WM + i) * 16u) >> 2, SA / 4u, LAYOUT_A);
-            for (uint j = 0; j < WN; j++) coopMatLoad(b[j], Bs, at_b(kk, (sn * WN + j) * 16u) >> 2, SB / 4u, LAYOUT_B);
-            for (uint i = 0; i < WM; i++)
-                for (uint j = 0; j < WN; j++) acc[i * WN + j] = coopMatMulAdd(a[i], b[j], acc[i * WN + j]);
+            [[unroll]] for (uint i = 0; i < WM; i++) coopMatLoad(a[i], As, at_a(kk, (sm * WM + i) * 16u) >> 2, SA / 4u, LAYOUT_A);
+            [[unroll]] for (uint j = 0; j < WN; j++) coopMatLoad(b[j], Bs, at_b(kk, (sn * WN + j) * 16u) >> 2, SB / 4u, LAYOUT_B);
+            [[unroll]] for (uint i = 0; i < WM; i++)
+                [[unroll]] for (uint j = 0; j < WN; j++) acc[i * WN + j] = coopMatMulAdd(a[i], b[j], acc[i * WN + j]);
         }
         barrier();
     }
 
     /* each 16 x 16 accumulator through the subgroup's shared block to the epilogue */
     const uint coff = g * p.c_group, block = sg * 256u;
-    for (uint i = 0; i < WM; i++)
-        for (uint j = 0; j < WN; j++) {
+    [[unroll]] for (uint i = 0; i < WM; i++)
+        [[unroll]] for (uint j = 0; j < WN; j++) {
             coopMatStore(acc[i * WN + j], Cs, block, 16u, gl_CooperativeMatrixLayoutRowMajor);
             subgroupMemoryBarrierShared();
             subgroupBarrier();
-            for (uint e = lane; e < 256u; e += SG) {
+            [[unroll]] for (uint e = lane; e < 256u; e += SG) {
                 uint m = m0 + (sm * WM + i) * 16u + e / 16u, n = n0 + (sn * WN + j) * 16u + e % 16u;
                 if (m < p.M && n < p.N) store_c(z, coff, m, c_row(m), n, Cs[block + e]);
             }

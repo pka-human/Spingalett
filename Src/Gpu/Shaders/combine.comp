@@ -16,11 +16,15 @@
  */
 
 #version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(constant_id = 0) const uint OP = 0;
 layout(constant_id = 1) const uint ACT = 6;
 layout(constant_id = 2) const uint BACKWARD = 0;
+layout(constant_id = 3) const uint HALF = 0;    /* words: x 0, y 1, b 2 (half.glsl) */
 layout(local_size_x = 256) in;
 
 #define ADD   0u
@@ -36,24 +40,26 @@ layout(push_constant) uniform Push {
     uint flags;
 } p;
 
+#include "half.glsl"
+
 void main() {
     const uint stride = gl_NumWorkGroups.x * 256u;
     const bool accumulate = (p.flags & FLAG_ACCUMULATE) != 0u;
     if (OP == ADD) {
         const uint total = p.n * p.cells * p.C;
         for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
-            float v = accumulate ? p.y.v[i] + p.x.v[i] : p.x.v[i] + p.b.v[i];
-            p.y.v[i] = (p.flags & FLAG_LAST) != 0u ? activate(v, ACT) : v;
+            float v = accumulate ? ld(p.y, i, 1u) + ld(p.x, i, 0u) : ld(p.x, i, 0u) + ld(p.b, i, 2u);
+            st(p.y, i, 1u, (p.flags & FLAG_LAST) != 0u ? activate(v, ACT) : v);
         }
     } else if (OP == SLICE) {
         const uint total = p.n * p.cells * p.ck;
         for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
             uint c = i % p.ck, q = i / p.ck, wide = q * p.C + p.c0 + c;
             if (BACKWARD == 0u) {
-                p.y.v[wide] = activate(p.x.v[i], ACT);
+                st(p.y, wide, 1u, activate(ld(p.x, i, 0u), ACT));
             } else {
-                float v = accumulate ? p.x.v[i] + p.y.v[wide] : p.y.v[wide];
-                p.x.v[i] = ACT == ACT_NONE ? v : v * derivative(p.b.v[i], ACT);
+                float v = accumulate ? ld(p.x, i, 0u) + ld(p.y, wide, 1u) : ld(p.y, wide, 1u);
+                st(p.x, i, 0u, ACT == ACT_NONE ? v : v * derivative(ld(p.b, i, 2u), ACT));
             }
         }
     } else if (BACKWARD == 0u) {
@@ -61,18 +67,18 @@ void main() {
         const float inv = 1.0 / float(p.cells);
         for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
             uint c = i % p.C, s = i / p.C, base = s * p.cells * p.C + c;
-            float v = p.x.v[base];
-            for (uint q = 1u; q < p.cells; q++) v += p.x.v[base + q * p.C];
-            p.y.v[i] = activate(v * inv, ACT);
+            float v = ld(p.x, base, 0u);
+            for (uint q = 1u; q < p.cells; q++) v += ld(p.x, base + q * p.C, 0u);
+            st(p.y, i, 1u, activate(v * inv, ACT));
         }
     } else {
         const uint total = p.n * p.cells * p.C;
         const float inv = 1.0 / float(p.cells);
         for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
             uint c = i % p.C, s = i / (p.cells * p.C);
-            float g = p.y.v[s * p.C + c] * inv;
-            float v = accumulate ? p.x.v[i] + g : g;
-            p.x.v[i] = ACT == ACT_NONE ? v : v * derivative(p.b.v[i], ACT);
+            float g = ld(p.y, s * p.C + c, 1u) * inv;
+            float v = accumulate ? ld(p.x, i, 0u) + g : g;
+            st(p.x, i, 0u, ACT == ACT_NONE ? v : v * derivative(ld(p.b, i, 2u), ACT));
         }
     }
 }

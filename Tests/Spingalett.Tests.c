@@ -4182,6 +4182,7 @@ static NeuralNetwork *gpu_net(int which) {
         conv2d(.net = net, .filters = 16, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
         uint32_t d = batch_norm(.net = net, .act_func = ACT_NONE);
         add_layers(.net = net, .inputs = {b, d}, .act_func = ACT_RELU);
+        avg_pool2d(.net = net, .kernel = 2);   /* windows that tile the input (pool.comp's BACKWARD 2) */
         global_avg_pool2d(.net = net);
         layer(.net = net, .neurons_amount = 7, .act_func = ACT_SOFTMAX);
         break;
@@ -4572,6 +4573,93 @@ static void gpu_threads(void) {
 #endif
 }
 
+typedef struct { NeuralNetwork *net; const float *x; float *y; uint32_t n; } GpuPredictJob;
+
+static void *gpu_predict_job(void *arg) {
+    GpuPredictJob *job = (GpuPredictJob *)arg;
+    predict(.net = job->net, .inputs = job->x, .outputs = job->y, .sample_count = job->n);
+    return NULL;
+}
+
+/* predict() on four threads at once on a network whose copy train() left on the GPU (one call takes
+   the copy, the others make their own from the parameters brought back): the outputs of one call
+   on its own, bit for bit. */
+static void gpu_kept_threads(void) {
+#if !defined(_WIN32)
+    spingalett_set_compute_mode(COMPUTE_VULKAN);
+    NeuralNetwork *net = gpu_net(0);
+    const uint32_t n = 300, in = net->topology[0], out = net->topology[net->layers - 1];
+    float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+    lcg_state = 9;
+    for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+    for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+    train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
+          .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0);
+    GpuPredictJob jobs[4];
+    pthread_t threads[4];
+    int started = 0;
+    for (int k = 0; k < 4; k++) {
+        jobs[k] = (GpuPredictJob){net, x, (float *)malloc((size_t)n * out * sizeof(float)), n};
+        if (pthread_create(&threads[k], NULL, gpu_predict_job, &jobs[k]) == 0) started++;
+    }
+    for (int k = 0; k < started; k++) pthread_join(threads[k], NULL);
+    float *alone = (float *)malloc((size_t)n * out * sizeof(float));
+    predict(.net = net, .inputs = x, .outputs = alone, .sample_count = n);
+    bool same = started == 4;
+    for (int k = 0; same && k < 4; k++) same = !memcmp(jobs[k].y, alone, (size_t)n * out * sizeof(float));
+    CHECK(same, "gpu: predict() on four threads at once differs from one call");
+    printf("  gpu: predict() on four threads at once on a kept copy %s\n", same ? "ok" : "FAILED");
+    for (int k = 0; k < 4; k++) free(jobs[k].y);
+    free(alone); free(x); free(t);
+    free_network(net);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+#endif
+}
+
+/* predict() after train() of small chunks, whose kept copy on the GPU gives its parameters to the
+   prediction's own copy on the device: the outputs of a fresh network given the same parameters on
+   the host, bit for bit. */
+static void gpu_kept_copy(void) {
+    static const int nets[] = {1, 2, 6};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
+        spingalett_set_compute_mode(COMPUTE_VULKAN);
+        NeuralNetwork *net = gpu_net(which);
+        const uint32_t n = 40, in = net->topology[0], out = net->topology[net->layers - 1];
+        float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+        float *y[2] = {(float *)malloc((size_t)n * out * sizeof(float)), (float *)malloc((size_t)n * out * sizeof(float))};
+        lcg_state = 77;
+        for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+        for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+        train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .batch_size = 16,
+              .learning_rate = 0.01f, .training_strategy = STRATEGY_SMALL_BATCH, .report_interval = 0);
+        predict(.net = net, .inputs = x, .outputs = y[0], .sample_count = n);
+        /* the same parameters (and running statistics) on the host, in a fresh network */
+        NeuralNetwork *copy = gpu_net(which);
+        for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+            SpingalettNetworkLayer info;
+            spingalett_network_layer(net, l, &info);
+            static const ParameterKind kinds[] = {PARAM_WEIGHTS, PARAM_BIASES, PARAM_RUNNING_MEAN, PARAM_RUNNING_VARIANCE};
+            for (int k = 0; k < 4; k++) {
+                const uint64_t count = k == 0 ? info.weight_count : info.bias_count;
+                if (count == 0 || (k >= 2 && info.type != LAYER_BATCH_NORM)) continue;
+                float *v = (float *)malloc(count * sizeof(float));
+                spingalett_get_parameters(net, l, kinds[k], v, count);
+                spingalett_set_parameters(copy, l, kinds[k], v, count);
+                free(v);
+            }
+        }
+        predict(.net = copy, .inputs = x, .outputs = y[1], .sample_count = n);
+        const bool same = !memcmp(y[0], y[1], (size_t)n * out * sizeof(float));
+        CHECK(same, "gpu kept copy net %d: predict() from the kept copy differs from the host's parameters", which);
+        printf("  gpu kept copy net %d: predict() from the copy on the device %s\n", which, same ? "ok" : "FAILED");
+        free(x); free(t); free(y[0]); free(y[1]);
+        free_network(net);
+        free_network(copy);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+}
+
 /* The step API on the GPU: the same steps as on the CPU (built-in loss with label smoothing, a loss
    of the caller's, two backward passes a step, two optimizers), up to rounding (compared by the
    trained networks' outputs in training: biases before a normalization have no gradient but its
@@ -4657,6 +4745,167 @@ static void gpu_trainer(void) {
                dy, same ? "yes" : "no");
         for (int k = 0; k < 3; k++) { free(p[k]); free(y[k]); }
     }
+}
+
+/* Halves the weights of layer 1 through the public functions. */
+static void gpu_halve_layer(NeuralNetwork *net) {
+    SpingalettNetworkLayer info;
+    spingalett_network_layer(net, 1, &info);
+    float *w = (float *)malloc(info.weight_count * sizeof(float));
+    spingalett_get_parameters(net, 1, PARAM_WEIGHTS, w, info.weight_count);
+    for (uint64_t i = 0; i < info.weight_count; i++) w[i] *= 0.5f;
+    spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, info.weight_count);
+    free(w);
+}
+
+static bool gpu_halve_after_first(NeuralNetwork *net, const TrainProgress *progress, void *data) {
+    (void)data;
+    if (progress->epoch == 1) gpu_halve_layer(net);
+    return false;
+}
+
+/* train() on the GPU keeps the parameters on the device between epochs: a callback that reads a
+   layer's weights after the first epoch and writes them back halved gives the same bits as two calls
+   of train() with the weights halved between them. */
+static void gpu_callback(void) {
+    static const int nets[] = {0, 7};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
+        float *w[2] = {NULL, NULL};
+        size_t count = 0;
+        for (int k = 0; k < 2; k++) {
+            NeuralNetwork *net = gpu_net(which);
+            const uint32_t n = 48, in = net->topology[0], out = net->topology[net->layers - 1];
+            float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+            lcg_state = 99;
+            for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+            for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            TrainArgs a = {.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 2, .learning_rate = 0.01f,
+                           .optimizer_type = OPTIMIZER_MOMENTUM, .momentum = 0.9f, .beta1 = 0.9f, .beta2 = 0.999f,
+                           .epsilon = 1e-8f, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0};
+            if (k == 0) {
+                a.callback = gpu_halve_after_first;
+                a.callback_interval = 1;
+                train_struct_arguments(a);
+            } else {
+                a.epochs = 1;
+                train_struct_arguments(a);
+                gpu_halve_layer(net);
+                train_struct_arguments(a);
+            }
+            count = spingalett_parameter_count(net);
+            w[k] = (float *)malloc(count * sizeof(float));
+            size_t off = 0;
+            for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+                SpingalettNetworkLayer info;
+                spingalett_network_layer(net, l, &info);
+                spingalett_get_parameters(net, l, PARAM_WEIGHTS, w[k] + off, info.weight_count);
+                off += info.weight_count;
+                spingalett_get_parameters(net, l, PARAM_BIASES, w[k] + off, info.bias_count);
+                off += info.bias_count;
+            }
+            free(x); free(t);
+            free_network(net);
+        }
+        const bool same = !memcmp(w[0], w[1], count * sizeof(float));
+        CHECK(same, "gpu callback net %d: weights written by a callback differ from those written between calls", which);
+        printf("  gpu callback net %d: weights written in a callback %s\n", which, same ? "ok" : "FAILED");
+        free(w[0]); free(w[1]);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+}
+
+/* The parameters of every layer, back to back. */
+static float *gpu_params_of(NeuralNetwork *net, size_t *count) {
+    *count = spingalett_parameter_count(net);
+    float *w = (float *)malloc(*count * sizeof(float));
+    size_t off = 0;
+    for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+        SpingalettNetworkLayer info;
+        spingalett_network_layer(net, l, &info);
+        spingalett_get_parameters(net, l, PARAM_WEIGHTS, w + off, info.weight_count);
+        off += info.weight_count;
+        spingalett_get_parameters(net, l, PARAM_BIASES, w + off, info.bias_count);
+        off += info.bias_count;
+    }
+    return w;
+}
+
+/* train() on the GPU leaves its copy in the network, which the next train() takes again: two calls
+   of one epoch give the bits of one call of two, with a predict() and a read of the parameters
+   between them or not; and training on the CPU after the GPU starts from the GPU's parameters. */
+static void gpu_kept(void) {
+    static const int nets[] = {0, 2};
+    /* in single precision, and in bfloat16 (inputs rounded straight into the device's memory, the next
+       epoch's first chunk filled ahead) */
+    for (size_t jp = 0; jp < 2 * (sizeof nets / sizeof nets[0]); jp++) {
+        const size_t j = jp % (sizeof nets / sizeof nets[0]);
+        const bool bf16 = jp >= sizeof nets / sizeof nets[0];
+        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
+        const int which = nets[j];
+        float *w[5] = {NULL};
+        size_t count = 0;
+        for (int k = 0; k < 5; k++) {
+            NeuralNetwork *net = gpu_net(which);
+            const uint32_t n = 40, in = net->topology[0], out = net->topology[net->layers - 1];
+            float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+            float *y = (float *)malloc((size_t)n * out * sizeof(float));
+            lcg_state = 555;
+            for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+            for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            TrainArgs a = {.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .learning_rate = 0.01f,
+                           .optimizer_type = OPTIMIZER_MOMENTUM, .momentum = 0.9f, .beta1 = 0.9f, .beta2 = 0.999f,
+                           .epsilon = 1e-8f, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0};
+            if (k == 0) {                   /* two epochs in one call */
+                a.epochs = 2;
+                train_struct_arguments(a);
+            } else if (k == 1) {            /* in two, the second taking the first's copy */
+                train_struct_arguments(a);
+                train_struct_arguments(a);
+            } else if (k == 2) {            /* with a prediction and a read of the parameters between */
+                train_struct_arguments(a);
+                predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
+                free(gpu_params_of(net, &count));
+                train_struct_arguments(a);
+            } else {                        /* one on the GPU, one on the CPU (k = 3), or the CPU from the
+                                               first's parameters set in a fresh network (k = 4) */
+                train_struct_arguments(a);
+                if (k == 4) {
+                    float *p = gpu_params_of(net, &count);
+                    free_network(net);
+                    net = a.net = gpu_net(which);
+                    size_t off = 0;
+                    for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+                        SpingalettNetworkLayer info;
+                        spingalett_network_layer(net, l, &info);
+                        spingalett_set_parameters(net, l, PARAM_WEIGHTS, p + off, info.weight_count);
+                        off += info.weight_count;
+                        spingalett_set_parameters(net, l, PARAM_BIASES, p + off, info.bias_count);
+                        off += info.bias_count;
+                    }
+                    free(p);
+                }
+                spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+                a.reset_optimizer = true;   /* the moments of the GPU's step are not set in the fresh one */
+                train_struct_arguments(a);
+            }
+            w[k] = gpu_params_of(net, &count);
+            free(x); free(t); free(y);
+            free_network(net);
+        }
+        const bool same = !memcmp(w[0], w[1], count * sizeof(float)) && !memcmp(w[0], w[2], count * sizeof(float));
+        const bool cpu = !memcmp(w[3], w[4], count * sizeof(float));
+        CHECK(same, "gpu kept net %d%s: two calls of train() differ from one of two epochs", which, bf16 ? " bf16" : "");
+        CHECK(cpu, "gpu kept net %d%s: training on the CPU after the GPU did not start from its parameters", which,
+              bf16 ? " bf16" : "");
+        printf("  gpu kept net %d%s: train() again on its copy %s, then on the CPU %s\n", which, bf16 ? " bf16" : "",
+               same ? "ok" : "FAILED", cpu ? "ok" : "FAILED");
+        for (int k = 0; k < 5; k++) free(w[k]);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
 }
 
 /* Products in bfloat16 on the matrix units (where the device has them): predictions within a few
@@ -4913,6 +5162,10 @@ int main(int argc, char **argv) {
             gpu_training_options();
             gpu_threads();
             gpu_trainer();
+            gpu_callback();
+            gpu_kept();
+            gpu_kept_threads();
+            gpu_kept_copy();
             gpu_bf16();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);

@@ -18,11 +18,15 @@
  */
 
 #version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(constant_id = 0) const uint T = 8;
 layout(constant_id = 1) const uint BACKWARD = 0;
 layout(constant_id = 2) const uint ACT = 6;     /* forward: the layer's activation; backward: its input's */
+layout(constant_id = 3) const uint HALF = 0;    /* words: x 0, y 1, dy 2 (half.glsl) */
 layout(local_size_x = 256) in;
 
 #define FLAG_STATS 1u
@@ -32,6 +36,8 @@ layout(push_constant) uniform Push {
     uint cells, C, flags;
     float eps;
 } p;
+
+#include "half.glsl"
 
 shared float s1[256], s2[256];
 
@@ -55,14 +61,14 @@ void main() {
         const bool live = cell < p.cells;
         if (BACKWARD == 0u) {
             float sum = 0.0;
-            if (live) for (uint c = lane; c < C; c += T) sum += p.x.v[at + c];
+            if (live) for (uint c = lane; c < C; c += T) sum += ld(p.x, at + c, 0u);
             s1[tid] = sum;
             tree(tid, lane, false);
             const float mean = s1[first] * inv;
             float var = 0.0;
             if (live)
                 for (uint c = lane; c < C; c += T) {
-                    float d = p.x.v[at + c] - mean;
+                    float d = ld(p.x, at + c, 0u) - mean;
                     var = fma(d, d, var);
                 }
             barrier();                  /* every thread has read the mean */
@@ -71,7 +77,7 @@ void main() {
             const float rstd = 1.0 / sqrt(s1[first] * inv + p.eps);
             if (live) {
                 for (uint c = lane; c < C; c += T)
-                    p.y.v[at + c] = activate((p.x.v[at + c] - mean) * rstd * p.gamma.v[c] + p.beta.v[c], ACT);
+                    st(p.y, at + c, 1u, activate((ld(p.x, at + c, 0u) - mean) * rstd * p.gamma.v[c] + p.beta.v[c], ACT));
                 if ((p.flags & FLAG_STATS) != 0u && lane == 0u) {
                     p.stats.v[2u * cell] = mean;
                     p.stats.v[2u * cell + 1u] = rstd;
@@ -82,9 +88,9 @@ void main() {
             float a = 0.0, b = 0.0;
             if (live)
                 for (uint c = lane; c < C; c += T) {
-                    float gc = p.gamma.v[c] * p.dy.v[at + c];
+                    float gc = p.gamma.v[c] * ld(p.dy, at + c, 2u);
                     a += gc;
-                    b = fma(gc, (p.x.v[at + c] - mean) * rstd, b);
+                    b = fma(gc, (ld(p.x, at + c, 0u) - mean) * rstd, b);
                 }
             s1[tid] = a;
             s2[tid] = b;
@@ -92,9 +98,9 @@ void main() {
             const float sa = s1[first], sb = s2[first];
             if (live)
                 for (uint c = lane; c < C; c += T) {
-                    const float v = p.x.v[at + c], xhat = (v - mean) * rstd;
-                    float d = rstd * (p.gamma.v[c] * p.dy.v[at + c] - (sa + xhat * sb) * inv);
-                    p.y.v[at + c] = ACT == ACT_NONE ? d : d * derivative(v, ACT);
+                    const float v = ld(p.x, at + c, 0u), xhat = (v - mean) * rstd;
+                    float d = rstd * (p.gamma.v[c] * ld(p.dy, at + c, 2u) - (sa + xhat * sb) * inv);
+                    st(p.y, at + c, 1u, ACT == ACT_NONE ? d : d * derivative(v, ACT));
                 }
         }
         barrier();                      /* the sums are read before the next cells write them */

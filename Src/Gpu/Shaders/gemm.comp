@@ -35,6 +35,7 @@
  */
 
 #version 460
+#extension GL_EXT_control_flow_attributes : require
 #include "common.glsl"
 
 layout(constant_id = 0) const uint BM = 128;
@@ -50,6 +51,7 @@ layout(constant_id = 9) const uint THREADS = 256;     /* (BM / TM) * (BN / TN) *
 layout(constant_id = 10) const uint PHASED = 0;       /* rows are a phase of the C grid */
 layout(constant_id = 11) const uint VEC = 0;
 layout(local_size_x_id = 9) in;
+const uint HALF = 0u;                                 /* everything in single precision */
 
 #include "gemm_common.glsl"
 
@@ -63,14 +65,14 @@ void put_a(uint k, uint m, float v) { As[k * SA + (m >> 2)][m & 3u] = v; }
 void put_b(uint k, uint n, float v) { Bs[k * SB + (n >> 2)][n & 3u] = v; }
 
 void store_tiles() {
-    for (uint i = 0; i < LA; i++) {
+    [[unroll]] for (uint i = 0; i < LA; i++) {
         if (!a_live(i)) continue;
         uint k = a_k(i), m = a_row(i);
         if (!VA) put_a(k, m, fa[i].x);
         else if (A_KFAST) { put_a(k, m, fa[i].x); put_a(k + 1u, m, fa[i].y); put_a(k + 2u, m, fa[i].z); put_a(k + 3u, m, fa[i].w); }
         else As[k * SA + (m >> 2)] = fa[i];
     }
-    for (uint i = 0; i < LB; i++) {
+    [[unroll]] for (uint i = 0; i < LB; i++) {
         if (!b_live(i)) continue;
         uint k = b_k(i), n = b_col(i);
         if (!VB) put_b(k, n, fb[i].x);
@@ -90,38 +92,44 @@ void main() {
     boff = g * p.b_group;
     prepare(kbeg);
 
-    /* thread (tr, tc) computes rows tr TM .. + TM and columns tc TN .. + TN of the tile */
-    const uint tc = tid % (BN / TN), tr = tid / (BN / TN);
-    /* acc[i * TN / 4 + j]: row i, columns 4j .. 4j + 3; precise, so that every fma() stays fused (the
-       same chain of fused multiply-adds whatever the tile) */
+    /* thread (tr, tc) computes rows 4 tr + RS i' + (0 .. 3) and columns 4 tc + CS j' + (0 .. 3) of the
+       tile (i' < TM / 4, j' < TN / 4); threads go in groups of 32 that cover 4 x 8 threads' blocks where
+       the tile allows (so that a subgroup's reads of shared memory are 128 bytes of consecutive vectors
+       of B and four of A), else in rows of BN / TN */
+    const bool WARPED = THREADS % 32u == 0u && (BM / TM) % 4u == 0u && (BN / TN) % 8u == 0u;
+    const uint RS = 4u * (BM / TM), CS = 4u * (BN / TN), WCOLS = (BN / TN) / 8u;
+    const uint tr = WARPED ? (tid / 32u / WCOLS) * 4u + (tid % 32u) / 8u : tid / (BN / TN);
+    const uint tc = WARPED ? (tid / 32u % WCOLS) * 8u + tid % 8u : tid % (BN / TN);
+    /* acc[i * TN / 4 + j']: row 4 tr + RS (i / 4) + i % 4, columns 4 tc + CS j' + (0 .. 3); precise, so
+       that every fma() stays fused (the same chain of fused multiply-adds whatever the tile) */
     precise vec4 acc[TM * TN / 4];
-    for (uint i = 0; i < TM * TN / 4u; i++) acc[i] = vec4(0.0);
+    [[unroll]] for (uint i = 0; i < TM * TN / 4u; i++) acc[i] = vec4(0.0);
 
     if (kbeg < kend) fetch(kbeg);
     for (uint k0 = kbeg; k0 < kend; k0 += BK) {
         store_tiles();
         barrier();
         if (k0 + BK < kend) fetch(k0 + BK);
-        for (uint kk = 0; kk < BK; kk++) {
+        [[unroll]] for (uint kk = 0; kk < BK; kk++) {
             vec4 av[TM / 4], bv[TN / 4];
-            for (uint i = 0; i < TM / 4u; i++) av[i] = As[kk * SA + tr * (TM / 4u) + i];
-            for (uint j = 0; j < TN / 4u; j++) bv[j] = Bs[kk * SB + tc * (TN / 4u) + j];
-            for (uint i = 0; i < TM; i++) {
+            [[unroll]] for (uint i = 0; i < TM / 4u; i++) av[i] = As[kk * SA + i * (BM / TM) + tr];
+            [[unroll]] for (uint j = 0; j < TN / 4u; j++) bv[j] = Bs[kk * SB + j * (BN / TN) + tc];
+            [[unroll]] for (uint i = 0; i < TM; i++) {
                 float a = av[i >> 2][i & 3u];
-                for (uint j = 0; j < TN / 4u; j++) acc[i * (TN / 4u) + j] = fma(vec4(a), bv[j], acc[i * (TN / 4u) + j]);
+                [[unroll]] for (uint j = 0; j < TN / 4u; j++) acc[i * (TN / 4u) + j] = fma(vec4(a), bv[j], acc[i * (TN / 4u) + j]);
             }
         }
         barrier();
     }
 
     const uint coff = g * p.c_group;
-    for (uint i = 0; i < TM; i++) {
-        uint m = m0 + tr * TM + i;
-        if (m >= p.M) break;
+    [[unroll]] for (uint i = 0; i < TM; i++) {
+        uint m = m0 + 4u * tr + RS * (i >> 2) + (i & 3u);
+        if (m >= p.M) continue;
         const uint row = c_row(m);
-        for (uint j = 0; j < TN; j++) {
-            uint n = n0 + tc * TN + j;
-            if (n >= p.N) break;
+        [[unroll]] for (uint j = 0; j < TN; j++) {
+            uint n = n0 + 4u * tc + CS * (j >> 2) + (j & 3u);
+            if (n >= p.N) continue;
             store_c(z, coff, m, row, n, acc[i * (TN / 4u) + (j >> 2)][j & 3u]);
         }
     }

@@ -16,14 +16,20 @@
  *   BDATA     y = (a[c] x + (a[C + c] b + a[2C + c])) act'(b)    (its data gradient; x = dy, b = input)
  *   SCALE     y = y a[0]                        (gradient clipping)
  *   AFFINE_ADD  y = act(z + (x a[c] + b[c]))   (a batch normalization added to z: residual blocks)
+ *   COPY      y = x                             (the weights' bfloat16 copy)
  */
 
 #version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(constant_id = 0) const uint OP = 0;
 layout(constant_id = 1) const uint ACT = 6;
+layout(constant_id = 2) const uint HALF = 0;    /* words: y 0, x 1, a 2, b 3, z 8 (half.glsl) */
 layout(local_size_x = 256) in;
+#include "half.glsl"
 
 #define BIAS_ACT 0u
 #define DERIV    1u
@@ -34,6 +40,7 @@ layout(local_size_x = 256) in;
 #define BDATA    6u
 #define SCALE    7u
 #define AFFINE_ADD 8u
+#define COPY     9u
 
 #define FLAG_A   1u
 
@@ -89,35 +96,37 @@ void main() {
     const uint stride = gl_NumWorkGroups.x * 256u;
     for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
         if (OP == BIAS_ACT) {
-            float v = p.y.v[i];
-            if ((p.flags & FLAG_A) != 0u) v += p.a.v[i % p.n];
-            p.y.v[i] = activate(v, ACT);
+            float v = ld(p.y, i, 0u);
+            if ((p.flags & FLAG_A) != 0u) v += ld(p.a, i % p.n, 2u);
+            st(p.y, i, 0u, activate(v, ACT));
         } else if (OP == DERIV) {
-            p.y.v[i] *= derivative(p.x.v[i], ACT);
+            st(p.y, i, 0u, ld(p.y, i, 0u) * derivative(ld(p.x, i, 1u), ACT));
         } else if (OP == MUL) {
-            p.y.v[i] *= p.x.v[i];
+            st(p.y, i, 0u, ld(p.y, i, 0u) * ld(p.x, i, 1u));
         } else if (OP == ADD) {
-            p.y.v[i] += p.x.v[i];
+            st(p.y, i, 0u, ld(p.y, i, 0u) + ld(p.x, i, 1u));
         } else if (OP == DROPOUT) {
             uint s = i / p.n, j = i % p.n;
             uint base = dropout_base(p.header.v[STEP_POSITION] + s);
             float m = hash32(base + j * 0x9E3779B9u) >= p.threshold ? p.keep_scale : 0.0;
-            float y = p.y.v[i];
-            p.x.v[i] = m * derivative(y, ACT);
-            p.y.v[i] = y * m;
+            float y = ld(p.y, i, 0u);
+            st(p.x, i, 1u, m * derivative(y, ACT));
+            st(p.y, i, 0u, y * m);
         } else if (OP == AFFINE) {
             uint c = i % p.n;
-            p.y.v[i] = activate(p.x.v[i] * p.a.v[c] + p.b.v[c], ACT);
+            st(p.y, i, 0u, activate(ld(p.x, i, 1u) * ld(p.a, c, 2u) + ld(p.b, c, 3u), ACT));
         } else if (OP == BDATA) {
             uint c = i % p.n;
-            float xin = p.b.v[i];
-            float v = p.a.v[c] * p.x.v[i] + (p.a.v[p.n + c] * xin + p.a.v[2u * p.n + c]);
-            p.y.v[i] = ACT == ACT_NONE ? v : v * derivative(xin, ACT);
+            float xin = ld(p.b, i, 3u);
+            float v = ld(p.a, c, 2u) * ld(p.x, i, 1u) + (ld(p.a, p.n + c, 2u) * xin + ld(p.a, 2u * p.n + c, 2u));
+            st(p.y, i, 0u, ACT == ACT_NONE ? v : v * derivative(xin, ACT));
         } else if (OP == SCALE) {
-            p.y.v[i] *= p.a.v[0];
+            st(p.y, i, 0u, ld(p.y, i, 0u) * ld(p.a, 0u, 2u));
         } else if (OP == AFFINE_ADD) {
             uint c = i % p.n;
-            p.y.v[i] = activate(p.z.v[i] + (p.x.v[i] * p.a.v[c] + p.b.v[c]), ACT);
+            st(p.y, i, 0u, activate(ld(p.z, i, 8u) + (ld(p.x, i, 1u) * ld(p.a, c, 2u) + ld(p.b, c, 3u)), ACT));
+        } else if (OP == COPY) {
+            st(p.y, i, 0u, ld(p.x, i, 1u));
         }
     }
 }

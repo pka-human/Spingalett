@@ -13,7 +13,9 @@
  *                                 precision and (with matrix units) in bfloat16 on them
  *   SpingalettGpuTests all        with every tile
  *   SpingalettGpuTests bench      times every tile on the products of ResNet-20 at 128 samples
- *   SpingalettGpuTests bench bf16 the same on the matrix units
+ *   SpingalettGpuTests bench bf16 the same on the matrix units ("dense" after either: the MLP's
+ *                                 products only; "half" with bf16: their operands and results kept
+ *                                 as bfloat16, as training in bfloat16 keeps them)
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -25,6 +27,7 @@
 static int failures;
 static uint32_t tile_step = 3;      /* every tile_step-th tile is tried */
 static bool mma;                    /* the products in bfloat16 on the matrix units (gemm_mma.comp) */
+static bool half;                   /* bench: operands and results kept as bfloat16 */
 
 /* x rounded to bfloat16, to the nearest (ties to even), as the matrix kernel converts its operands */
 static float bf16(float x) {
@@ -388,14 +391,14 @@ static void bench_report(const char *name, bool mma, double flops, double chosen
         printf("           %7.1f us  %3ux%-3u k%-2u %ux%u\n", times[order[k]] * 1e6, bm, bn, bk, tm, tn);
     }
 }
-static void bench(void) {
+static void bench(bool dense_only) {
     static const Conv shapes[] = {
         {128, 32, 32, 16, 16, 3, 3, 1, 1, 1, 1, 1}, {128, 32, 32, 16, 32, 3, 3, 2, 2, 1, 1, 1},
         {128, 16, 16, 32, 32, 3, 3, 1, 1, 1, 1, 1}, {128, 16, 16, 32, 64, 3, 3, 2, 2, 1, 1, 1},
         {128, 8, 8, 64, 64, 3, 3, 1, 1, 1, 1, 1}, {128, 32, 32, 3, 16, 3, 3, 1, 1, 1, 1, 1},
     };
     static const char *names[] = {"forward", "data", "weights"};
-    for (size_t k = 0; k < sizeof shapes / sizeof shapes[0]; k++) {
+    for (size_t k = 0; !dense_only && k < sizeof shapes / sizeof shapes[0]; k++) {
         const Conv *v = &shapes[k];
         const uint32_t OH = out_h(v), OW = out_w(v), K = v->kh * v->kw * v->c / v->groups;
         const size_t nx = (size_t)v->n * v->h * v->w * v->c, ny = (size_t)v->n * OH * OW * v->out,
@@ -438,9 +441,18 @@ static void bench(void) {
         SpgGpuBuffer bx, bw, bd, by;
         float *host = malloc((size_t)n * (in > out ? in : out) * 4);
         for (size_t i = 0; i < (size_t)n * (in > out ? in : out); i++) host[i] = uniform();
-        upload(&bx, host, (size_t)n * in * 4);
-        upload(&bw, host, (size_t)out * in * 4);
-        upload(&bd, host, (size_t)n * out * 4);
+        /* (kept as bfloat16: the floats' high halves, the bytes the products read) */
+        const size_t size = half ? 2u : 4u;
+        uint16_t *h16 = malloc((size_t)n * (in > out ? in : out) * 2);
+        for (size_t i = 0; half && i < (size_t)n * (in > out ? in : out); i++) {
+            uint32_t u;
+            memcpy(&u, &host[i], 4);
+            h16[i] = (uint16_t)(u >> 16);
+        }
+        const void *src = half ? (const void *)h16 : (const void *)host;
+        upload(&bx, src, (size_t)n * in * size);
+        upload(&bw, src, (size_t)out * in * size);
+        upload(&bd, src, (size_t)n * out * size);
         spg_gpu_buffer_create(&by, (size_t)(n > out ? n : out) * (in > out ? in : out) * 4, false);
         printf("dense %u x %u -> %u (%.0f MFLOP a product)\n", n, in, out, flops * 1e-6);
         static const char *names[] = {"forward", "data", "weights"};
@@ -465,6 +477,9 @@ static void bench(void) {
                     m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_STORE, 6, 1, false, true, true, tile,
                                       (uint64_t)out * in, mma};
                 }
+                /* kept as bfloat16: A and B, and C but the weight gradients' */
+                m.half = half ? (pass == 2 ? 3u : 7u) : 0u;
+                m.wide_a = m.wide_b = true;
                 run(&p, &m, 2);
                 double t = run(&p, &m, 20);
                 if (tile == 0) chosen = t;
@@ -475,6 +490,7 @@ static void bench(void) {
         SpgGpuBuffer *all[] = {&bx, &bw, &bd, &by};
         for (size_t j = 0; j < 4; j++) spg_gpu_buffer_free(all[j]);
         free(host);
+        free(h16);
     }
 }
 
@@ -486,8 +502,13 @@ int main(int argc, char **argv) {
     printf("device: %s\n", spg_gpu_device_name());
     printf("matrix units: %s\n", spg_gpu_mma_bf16() ? "bfloat16 cooperative matrices" : "none");
     if (argc > 1 && !strcmp(argv[1], "bench")) {
-        mma = argc > 2 && !strcmp(argv[2], "bf16") && spg_gpu_mma_bf16();
-        bench();
+        bool dense = false;
+        for (int k = 2; k < argc; k++) {
+            if (!strcmp(argv[k], "bf16")) mma = spg_gpu_mma_bf16();
+            if (!strcmp(argv[k], "dense")) dense = true;
+            if (!strcmp(argv[k], "half")) half = spg_gpu_mma_bf16() && spg_gpu_bf16_storage();
+        }
+        bench(dense);
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "all")) tile_step = 1;

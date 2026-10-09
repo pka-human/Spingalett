@@ -17,11 +17,16 @@
  */
 
 #version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(constant_id = 0) const uint COLS = 16;
 layout(constant_id = 1) const uint MODE = 0;
+layout(constant_id = 2) const uint HALF = 0;    /* words: x 0, dy 1, k 2 (half.glsl) */
 layout(local_size_x = 256) in;
+#include "half.glsl"
 
 #define SUM     0u
 #define SHIFTED 1u
@@ -42,9 +47,9 @@ void main() {
     const uint r0 = slice * p.slice_rows, r1 = min(p.R, r0 + p.slice_rows);
     float t1 = 0.0, t2 = 0.0;
     if (c < p.C) {
-        float shift = MODE == SHIFTED || MODE == DY ? p.k.v[c] : 0.0;
+        float shift = MODE == SHIFTED || MODE == DY ? ld(p.k, c, 2u) : 0.0;
         for (uint r = r0 + lr; r < r1; r += ROWS) {
-            float v = p.x.v[r * p.C + c];
+            float v = ld(p.x, r * p.C + c, 0u);
             if (MODE == SUM) {
                 t1 += v;
             } else if (MODE == SHIFTED) {
@@ -52,11 +57,11 @@ void main() {
                 t1 += d;
                 t2 = fma(d, d, t2);
             } else if (MODE == DY) {
-                float g = p.dy.v[r * p.C + c];
+                float g = ld(p.dy, r * p.C + c, 1u);
                 t1 += g;
                 t2 = fma(g, v - shift, t2);
             } else {
-                float g = p.dy.v[r * p.C + c];
+                float g = ld(p.dy, r * p.C + c, 1u);
                 t1 += g;
                 t2 = fma(g, (v - p.k.v[2u * r]) * p.k.v[2u * r + 1u], t2);
             }

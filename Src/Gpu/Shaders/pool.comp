@@ -10,15 +10,22 @@
  *
  * Forward: one thread per output. Backward: one thread per input cell, which adds the gradients of
  * the windows that cover it in row order (for max pooling, those whose maximum it is), then
- * multiplies by the derivative of the input layer's activation: no cell is written twice.
+ * multiplies by the derivative of the input layer's activation: no cell is written twice. Windows
+ * that tile the input (stride the window, no padding, the whole image covered) go faster with
+ * BACKWARD = 2: one thread per window, which finds its maximum once and writes every cell of it, as
+ * the general pass would (each cell has the one window).
  */
 
 #version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(constant_id = 0) const uint MAXPOOL = 1;
 layout(constant_id = 1) const uint BACKWARD = 0;
 layout(constant_id = 2) const uint ACT = 6;     /* backward: the input layer's activation */
+layout(constant_id = 3) const uint HALF = 0;    /* words: x 0, y 1, dy 2, dx 3 (half.glsl) */
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform Push {
@@ -26,6 +33,8 @@ layout(push_constant) uniform Push {
     uint n, H, W, C, OH, OW;
     uint KH, KW, SH, SW, PH, PW;
 } p;
+
+#include "half.glsl"
 
 void window(uint oh, uint ow, out uint h0, out uint h1, out uint w0, out uint w1) {
     int hs = int(oh * p.SH) - int(p.PH), ws = int(ow * p.SW) - int(p.PW);
@@ -42,14 +51,39 @@ void main() {
             uint h0, h1, w0, w1;
             window(oh, ow, h0, h1, w0, w1);
             const uint base = s * p.H * p.W * C + c;
-            float acc = p.x.v[base + (h0 * p.W + w0) * C];
+            float acc = ld(p.x, base + (h0 * p.W + w0) * C, 0u);
             for (uint h = h0; h < h1; h++)
                 for (uint w = (h == h0 ? w0 + 1u : w0); w < w1; w++) {
-                    float v = p.x.v[base + (h * p.W + w) * C];
+                    float v = ld(p.x, base + (h * p.W + w) * C, 0u);
                     if (MAXPOOL != 0u) { if (v > acc) acc = v; }
                     else acc += v;
                 }
-            p.y.v[i] = MAXPOOL != 0u ? acc : acc * (1.0 / float((h1 - h0) * (w1 - w0)));
+            st(p.y, i, 1u, MAXPOOL != 0u ? acc : acc * (1.0 / float((h1 - h0) * (w1 - w0))));
+        }
+        return;
+    }
+
+    if (BACKWARD == 2u) {
+        const uint total = p.n * p.OH * p.OW * C;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            uint c = i % C, q = i / C, ow = q % p.OW, oh = (q / p.OW) % p.OH, s = q / (p.OW * p.OH);
+            const uint base = s * p.H * p.W * C + c, h0 = oh * p.KH, w0 = ow * p.KW;
+            const float d = ld(p.dy, i, 2u);
+            uint at_h = h0, at_w = w0;
+            if (MAXPOOL != 0u) {
+                float best = ld(p.x, base + (h0 * p.W + w0) * C, 0u);
+                for (uint h = h0; h < h0 + p.KH; h++)
+                    for (uint w = (h == h0 ? w0 + 1u : w0); w < w0 + p.KW; w++) {
+                        float v = ld(p.x, base + (h * p.W + w) * C, 0u);
+                        if (v > best) { best = v; at_h = h; at_w = w; }
+                    }
+            }
+            for (uint h = h0; h < h0 + p.KH; h++)
+                for (uint w = w0; w < w0 + p.KW; w++) {
+                    const uint at = base + (h * p.W + w) * C;
+                    float g = MAXPOOL == 0u ? d * (1.0 / float(p.KH * p.KW)) : (h == at_h && w == at_w ? d : 0.0);
+                    st(p.dx, at, 3u, ACT == ACT_NONE ? g : g * derivative(ld(p.x, at, 0u), ACT));
+                }
         }
         return;
     }
@@ -67,20 +101,20 @@ void main() {
             for (uint ow = ow0; ow < ow1; ow++) {
                 uint h0, h1, w0, w1;
                 window(oh, ow, h0, h1, w0, w1);
-                float d = p.dy.v[obase + (oh * p.OW + ow) * C];
+                float d = ld(p.dy, obase + (oh * p.OW + ow) * C, 2u);
                 if (MAXPOOL == 0u) {
                     g += d * (1.0 / float((h1 - h0) * (w1 - w0)));
                     continue;
                 }
-                float best = p.x.v[base + (h0 * p.W + w0) * C];
+                float best = ld(p.x, base + (h0 * p.W + w0) * C, 0u);
                 uint at_h = h0, at_w = w0;
                 for (uint h = h0; h < h1; h++)
                     for (uint w = (h == h0 ? w0 + 1u : w0); w < w1; w++) {
-                        float v = p.x.v[base + (h * p.W + w) * C];
+                        float v = ld(p.x, base + (h * p.W + w) * C, 0u);
                         if (v > best) { best = v; at_h = h; at_w = w; }
                     }
                 if (at_h == ih && at_w == iw) g += d;
             }
-        p.dx.v[i] = ACT == ACT_NONE ? g : g * derivative(p.x.v[i], ACT);
+        st(p.dx, i, 3u, ACT == ACT_NONE ? g : g * derivative(ld(p.x, i, 0u), ACT));
     }
 }

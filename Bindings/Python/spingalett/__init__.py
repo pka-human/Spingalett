@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -713,9 +713,10 @@ def gpu_device() -> Optional[str]:
 
 def set_gpu_precision(precision: "Precision") -> bool:
     """Precision of the GPU's matrix products: Precision.FLOAT32 (the default) or Precision.BFLOAT16
-    (operands rounded to bfloat16 on the GPU's matrix units, products added in single precision).
-    Devices without bfloat16 matrix units keep single precision. Returns whether the GPU multiplies
-    in that precision."""
+    (operands rounded to bfloat16 on the GPU's matrix units, products added in single precision;
+    the layers' outputs but the output layer's, and their gradients, kept on the GPU as bfloat16, as
+    PyTorch's autocast keeps them). Devices without bfloat16 matrix units keep single precision.
+    Returns whether the GPU multiplies in that precision."""
     return bool(_set_gpu_precision(int(precision)))
 
 

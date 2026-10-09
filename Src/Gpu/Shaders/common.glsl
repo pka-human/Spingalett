@@ -13,6 +13,19 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer F32x4 { vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
 
+#ifdef SPG_HALF
+/* bfloat16 values in memory (kernels built with SPG_HALF, which enable 16-bit storage) */
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer BF16 { uint16_t v[]; };
+
+float from_bf16(uint h) { return uintBitsToFloat(h << 16); }
+/* to the nearest bfloat16, ties to even (NaN stays NaN), as the host rounds */
+uint to_bf16(float f) {
+    uint u = floatBitsToUint(f);
+    if (isnan(f)) return (u >> 16) | 0x40u;
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+#endif
+
 /* ActivationFunction */
 #define ACT_SIGMOID     0u
 #define ACT_RELU        1u

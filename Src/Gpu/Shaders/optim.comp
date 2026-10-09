@@ -5,13 +5,18 @@
 
 /*
  * One optimizer step over n parameters, element by element as Spingalett.SIMD.c updates them; the
- * learning rate and Adam's bias corrections come from the step header.
+ * learning rate and Adam's bias corrections come from the step header. With bit 8 of HALF, the new
+ * weights are also written to wh as bfloat16, the copy the matrix units read.
  */
 
 #version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(constant_id = 0) const uint TYPE = 0;    /* OptimizerType */
+layout(constant_id = 1) const uint HALF = 0;    /* word: wh 8 (half.glsl) */
 layout(local_size_x = 256) in;
 
 #define SGD      0u
@@ -25,7 +30,10 @@ layout(push_constant) uniform Push {
     U32 header;
     uint n;
     float decay, momentum, beta1, beta2, epsilon;
+    F32 wh;
 } p;
+
+#include "half.glsl"
 
 void main() {
     const uint stride = gl_NumWorkGroups.x * 256u;
@@ -55,5 +63,6 @@ void main() {
             w = w * wd - lr * ((m * m_factor) / (sqrt(v * v_factor) + p.epsilon));
         }
         p.w.v[i] = w;
+        if (((HALF >> 8) & 1u) != 0u) st(p.wh, i, 8u, w);
     }
 }

@@ -584,6 +584,8 @@ typedef struct {
 
     SpgGpuNet *gpu;             /* COMPUTE_VULKAN: the network on the GPU (no CPU workspaces then) */
     bool gpu_failed;
+    bool gpu_ahead;             /* fill the next step's first chunk at the end of this one (it is known) */
+    bool gpu_filled;            /* the first chunk of this step was filled ahead */
 } Trainer;
 
 static void trainer_free(Trainer *t) {
@@ -712,6 +714,34 @@ static void augment_image(const Trainer *t, const float *src, float *dst, uint64
     }
 }
 
+/* Fills the GPU's next chunk with rows order[start + c0 ..] (start + c0.. when order is NULL) of
+   n samples: gathered (augmented) and, where the device keeps its inputs as bfloat16 in memory the host
+   writes, rounded straight into it; the targets smoothed. */
+static void gpu_fill(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order, uint32_t start,
+                     uint32_t c0, uint32_t n, uint64_t step) {
+    const NeuralNetwork *net = t->net;
+    const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
+    float *targets;
+    uint16_t *x16 = t->augment ? NULL : spingalett_gpu_chunk_inputs_bf16(t->gpu, &targets);
+    float *x = x16 ? NULL : spingalett_gpu_chunk_inputs(t->gpu, &targets);
+    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, (uint64_t)n * in_sz * (t->augment ? 4u : 1u)) && n > 1,
+        for (int64_t s = 0; s < (int64_t)n; s++) {
+            uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
+            const float *src = inputs + (size_t)idx * in_sz;
+            if (x16)
+                spingalett_round_bf16(x16 + (size_t)s * in_sz, src, in_sz);
+            else if (t->augment)
+                augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
+            else
+                memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
+            memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
+        }
+    );
+    if (t->args->label_smoothing > 0.0f)
+        smooth_targets(targets, targets, n, out_sz, net->act_func[net->layers - 2], t->args->label_smoothing, t->mode);
+    if (!x16) spingalett_gpu_chunk_ready(t->gpu, n);
+}
+
 /* Trains on rows order[start .. start+count) of inputs/targets (rows start.. directly when order
    is NULL) and performs the optimizer step(s). Returns the summed loss. */
 static float trainer_step(Trainer *t, const float *inputs, const float *targets_in, const uint32_t *order,
@@ -730,25 +760,18 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
         const uint64_t step = net->time_step;
         for (uint32_t c0 = 0; c0 < count && !t->gpu_failed; c0 += cap) {
             uint32_t n = (count - c0 < cap) ? count - c0 : cap;
-            float *targets, *x = spingalett_gpu_chunk_inputs(t->gpu, &targets);
-            SPINGALETT_PARALLEL_FOR(spingalett_use_omp(t->mode, (uint64_t)n * in_sz * (t->augment ? 4u : 1u)) && n > 1,
-                for (int64_t s = 0; s < (int64_t)n; s++) {
-                    uint32_t idx = order ? order[start + c0 + s] : start + c0 + (uint32_t)s;
-                    const float *src = inputs + (size_t)idx * in_sz;
-                    if (t->augment)
-                        augment_image(t, src, x + (size_t)s * in_sz, step, c0 + (uint32_t)s);
-                    else
-                        memcpy(x + (size_t)s * in_sz, src, in_sz * sizeof(float));
-                    memcpy(targets + (size_t)s * out_sz, targets_in + (size_t)idx * out_sz, out_sz * sizeof(float));
-                }
-            );
-            if (args->label_smoothing > 0.0f)
-                smooth_targets(targets, targets, n, out_sz, out_act, args->label_smoothing, t->mode);
+            if (!(c0 == 0 && t->gpu_filled)) gpu_fill(t, inputs, targets_in, order, start, c0, n, step);
+            t->gpu_filled = false;
             bool last = c0 + n == count;
             if (last) trainer_begin_step(t);
             SpgGpuStep st = {t->opt.lr, t->opt.m_factor, t->opt.v_factor, step};
             if (!spingalett_gpu_train_chunk(t->gpu, n, count, c0, c0 == 0, last, &st))
                 t->gpu_failed = true;
+        }
+        /* the next step's first chunk (the same rows), filled while the device trains on this one */
+        if (t->gpu_ahead && !t->gpu_failed) {
+            gpu_fill(t, inputs, targets_in, order, start, 0, count < cap ? count : cap, net->time_step);
+            t->gpu_filled = true;
         }
         return 0.0f;
     }
@@ -861,8 +884,9 @@ static bool check_trainable(NeuralNetwork *net) {
             return false;
         }
     }
-    spingalett_network_sync(net);
-    return spingalett_check_graph(net, "train") && spingalett_training_state(net);
+    /* (a copy train() left on the GPU may train again without coming back) */
+    if (!net->gpu_kept) spingalett_network_sync(net);
+    return spingalett_check_graph(net, "train");
 }
 
 static TrainReport train_failed(const char *message) {
@@ -974,10 +998,13 @@ TrainReport train_struct_arguments(TrainArgs args) {
 #endif
 
     if (args.reset_optimizer) {
-        memset(net->opt_m_weights, 0, net->total_weights * sizeof(float));
-        memset(net->opt_v_weights, 0, net->total_weights * sizeof(float));
-        memset(net->opt_m_biases,  0, net->total_biases  * sizeof(float));
-        memset(net->opt_v_biases,  0, net->total_biases  * sizeof(float));
+        spingalett_network_release_gpu(net);
+        if (net->opt_m_weights) {               /* (none before the network first trains) */
+            memset(net->opt_m_weights, 0, net->total_weights * sizeof(float));
+            memset(net->opt_v_weights, 0, net->total_weights * sizeof(float));
+            memset(net->opt_m_biases,  0, net->total_biases  * sizeof(float));
+            memset(net->opt_v_biases,  0, net->total_biases  * sizeof(float));
+        }
         net->time_step = 0;
         spingalett_log(LOG_INFO, "Optimizer state reset");
     }
@@ -1071,22 +1098,64 @@ TrainReport train_struct_arguments(TrainArgs args) {
             .dropout_seed = t.dropout.seed,
         };
         uint32_t capacity = spingalett_gpu_capacity(net, t.batch_size, true);
-        t.gpu = capacity ? spingalett_gpu_net_create(net, capacity, &cfg) : NULL;
+        /* the copy the last train() left, for chunks of the same size (which keep the results) */
+        if (net->gpu_kept && capacity && spingalett_gpu_net_reuse(net->gpu_trainer, capacity, &cfg)) {
+            t.gpu = net->gpu_trainer;
+            net->gpu_kept = false;                  /* this run's now */
+            if (net->param_version != net->gpu_version) {
+                if (spingalett_gpu_upload(t.gpu)) {
+                    atomic_store(&net->gpu_newer, false);
+                } else {
+                    spingalett_gpu_net_free(t.gpu);
+                    t.gpu = net->gpu_trainer = NULL;
+                    atomic_store(&net->gpu_newer, false);
+                }
+            }
+        }
+        spingalett_network_release_gpu(net);       /* a kept copy that does not fit */
+        if (!t.gpu) t.gpu = capacity ? spingalett_gpu_net_create(net, capacity, &cfg) : NULL;
         if (!t.gpu)
             spingalett_log(LOG_WARNING, "Not enough GPU memory to train the network; training on the CPU");
     }
+    spingalett_network_release_gpu(net);           /* on the CPU: the arrays as the GPU left them */
 
     if (!trainer_alloc(&t)) {
+        if (t.gpu && net->gpu_trainer == t.gpu) {   /* a kept copy taken: its parameters back first */
+            spingalett_network_sync(net);
+            net->gpu_trainer = NULL;
+            atomic_store(&net->gpu_newer, false);
+        }
         trainer_free(&t);
         set_error(SPINGALETT_ERR_ALLOC, "Failed to allocate training buffers");
         spingalett_log(LOG_ERROR, "Failed to allocate training buffers");
         return (TrainReport){.status = TRAIN_FAILED};
     }
 
-    // The accumulating paths add into grad_* and expect it to start at zero; a previous run
-    // on another backend may have left the last batch's gradients there.
-    memset(net->grad_weights, 0, net->total_weights * sizeof(float));
-    memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
+    /* The CPU's accumulating paths add into grad_* and expect it to start at zero; a previous run on
+       another backend may have left the last batch's gradients there. On the GPU the network's
+       gradients and moments need not exist on the host until they are brought back (a fresh
+       network's: 11 MB of pages touched for the MLP of Examples/Benchmark.c, 2.5 ms). */
+    if (!t.gpu && !spingalett_training_state(net)) {
+        trainer_free(&t);
+        return train_failed("Failed to allocate the training state");
+    }
+    if (net->grad_weights) {
+        memset(net->grad_weights, 0, net->total_weights * sizeof(float));
+        memset(net->grad_biases,  0, net->total_biases  * sizeof(float));
+    }
+
+    /* On the GPU the parameters stay on the device: the network's arrays are brought up to date
+       (spingalett_network_sync()) only where they are read, by a callback, an autosave, the NaN check
+       or the copy of the best epoch, and after training, when the network keeps the copy (the next
+       train() takes it again); what a callback writes goes back to the device before the next epoch.
+       A trainer of the step API that has the network keeps it (synced when training began) and gets
+       it back after; the network keeps no copy then. */
+    SpgGpuNet *outer_gpu = net->gpu_trainer != t.gpu ? net->gpu_trainer : NULL;
+    uint64_t seen_version = net->param_version;
+    if (t.gpu) {
+        if (net->gpu_trainer != t.gpu) atomic_store(&net->gpu_newer, false);
+        net->gpu_trainer = t.gpu;
+    }
 
     /* STRATEGY_SAMPLE walks the whole set in one call and steps after every sample. */
     uint32_t step_size = (training_strategy == STRATEGY_SAMPLE) ? sample_count : t.batch_size;
@@ -1170,22 +1239,31 @@ TrainReport train_struct_arguments(TrainArgs args) {
             for (uint32_t bi = 0; bi < steps_per_epoch; bi++) {
                 uint32_t start = bi * step_size;
                 uint32_t count = (sample_count - start < step_size) ? sample_count - start : step_size;
+                /* full batches in order: the next epoch starts with the same chunk, filled ahead (not with
+                   validation, which runs on the GPU's chunks in between) */
+                t.gpu_ahead = t.gpu && steps_per_epoch == 1 && !t.order && !has_validation && epoch < epochs;
                 total_error += trainer_step(&t, args.inputs, args.targets, t.order, start, count);
             }
             epoch_samples = sample_count;
         }
 
-        if (t.gpu && (t.gpu_failed || !spingalett_gpu_take_loss(t.gpu, &total_error) || !spingalett_gpu_download(t.gpu))) {
-            set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
-            spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
-            report.status = TRAIN_FAILED;
-            break;
+        if (t.gpu) {
+            bool lost = t.gpu_failed || !spingalett_gpu_take_loss(t.gpu, &total_error);
+            atomic_store(&net->gpu_newer, true);
+            if (lost) {
+                set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
+                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                report.status = TRAIN_FAILED;
+                break;
+            }
         }
 
         report.epochs_run = epoch;
         report.train_loss = total_error / (float)epoch_samples;
 
-        if (args.nan_check_interval > 0 && (epoch % args.nan_check_interval == 0) && check_nan_inf(net)) {
+        const bool check_nan = args.nan_check_interval > 0 && epoch % args.nan_check_interval == 0;
+        if (check_nan) spingalett_network_sync(net);
+        if (check_nan && check_nan_inf(net)) {
             spingalett_log(LOG_ERROR, "NaN/Inf detected in weights at epoch %zu, stopping training", epoch);
             report.status = TRAIN_DIVERGED;
             break;
@@ -1223,8 +1301,10 @@ TrainReport train_struct_arguments(TrainArgs args) {
                 report.best_epoch = epoch;
                 report.best_value = value;
                 epochs_without_improvement = 0;
-                if (t.best_params)
+                if (t.best_params) {
+                    spingalett_network_sync(net);
                     save_params(t.best_params, net);
+                }
             } else {
                 epochs_without_improvement++;
             }
@@ -1264,6 +1344,17 @@ TrainReport train_struct_arguments(TrainArgs args) {
             }
         }
 
+        /* parameters the callback wrote: to the device for the next epoch */
+        if (t.gpu && net->param_version != seen_version) {
+            seen_version = net->param_version;
+            if (!spingalett_gpu_upload(t.gpu)) {
+                set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
+                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                report.status = TRAIN_FAILED;
+                break;
+            }
+        }
+
         if (args.early_stopping_patience > 0 && epochs_without_improvement >= args.early_stopping_patience) {
             spingalett_log(LOG_INFO, "Early stopping at epoch %zu: no improvement since epoch %zu",
                            epoch, report.best_epoch);
@@ -1272,7 +1363,20 @@ TrainReport train_struct_arguments(TrainArgs args) {
         }
     }
 
+    bool kept = false;
+    if (t.gpu) {
+        if (!outer_gpu && report.status != TRAIN_FAILED) {
+            /* the network keeps the copy, newer than its arrays until they are read */
+            kept = net->gpu_kept = true;
+            t.gpu = NULL;
+        } else {
+            spingalett_network_sync(net);
+            net->gpu_trainer = outer_gpu;
+            atomic_store(&net->gpu_newer, false);
+        }
+    }
     if (t.best_params && report.best_epoch > 0 && report.best_epoch != report.epochs_run) {
+        spingalett_network_sync(net);
         restore_params(net, t.best_params);
         report.restored_best = true;
         spingalett_log(LOG_INFO, "Restored the weights of epoch %zu", report.best_epoch);
@@ -1286,6 +1390,8 @@ TrainReport train_struct_arguments(TrainArgs args) {
     flush_denormals_end(effective_mode);
     trainer_free(&t);
     spingalett_network_written(net);
+    /* the kept copy has these parameters, unless the best epoch's came back to the arrays */
+    if (kept && !report.restored_best) net->gpu_version = net->param_version;
     spingalett_log(LOG_INFO, "Training completed.");
     return report;
 }
@@ -1322,8 +1428,9 @@ SpingalettTrainer *spingalett_trainer_new(NeuralNetwork *net, uint32_t max_batch
         set_error(SPINGALETT_ERR_INVALID, "spingalett_trainer_new: max_batch is 0");
         return NULL;
     }
-    if (!check_trainable(net))
+    if (!check_trainable(net) || !spingalett_training_state(net))
         return NULL;
+    spingalett_network_release_gpu(net);           /* the copy a train() left: the trainer makes its own */
     SpingalettTrainer *tr = (SpingalettTrainer *)calloc(1, sizeof(SpingalettTrainer));
     if (!tr) {
         set_error(SPINGALETT_ERR_ALLOC, "spingalett_trainer_new: allocation failed");

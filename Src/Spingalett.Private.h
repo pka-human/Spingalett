@@ -279,6 +279,12 @@ void spingalett_network_sync(const NeuralNetwork *net);
 /* Notes a write of the parameters on the host (after spingalett_network_sync()), so that a GPU
    trainer copies them to the device again. */
 void spingalett_network_written(NeuralNetwork *net);
+/* Frees the copy on the GPU that train() left in the network (its parameters brought back first). */
+void spingalett_network_release_gpu(NeuralNetwork *net);
+/* Takes the network's kept copy on the GPU for one call (waiting for another to let it go, or
+   failing without `wait`), and lets it go. */
+bool spingalett_network_hold_gpu(NeuralNetwork *net, bool wait);
+void spingalett_network_let_go_gpu(NeuralNetwork *net);
 /* Allocates the gradients and optimizer state (zero) unless they exist: networks get them when they
    first train, so that those used for inference only hold their parameters once. Sets the error. */
 bool spingalett_training_state(NeuralNetwork *net);
