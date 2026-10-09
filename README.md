@@ -194,6 +194,8 @@ The `Examples/` directory contains this XOR program, an MNIST classifier
 (`Bin/MNIST_CNN data/mnist`, about 99% after two epochs), a CIFAR-10 classifier with batch
 normalization and augmentation (`Examples/download_cifar10.sh data/cifar10 && Bin/CIFAR10
 data/cifar10`) and the benchmark described under [Performance](#performance).
+[docs/Tutorial.md](docs/Tutorial.md) goes through these programs in order, and
+[docs/Reference.md](docs/Reference.md) lists every declaration of the headers with its comment.
 
 ## Usage
 

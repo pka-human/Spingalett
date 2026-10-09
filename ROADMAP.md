@@ -39,15 +39,18 @@ else.
   `spingalett_set_compute_mode()` now return whether they succeeded); nothing was deprecated.
 - **Zero means the default** (done): `SPINGALETT_ACT_NONE` is 0, so a layer whose arguments leave
   out `.act_func` has no activation; `.slett` files keep their activation codes.
-- **Formats:** `.slett` version 7 and `.slettd` version 2 frozen as the 1.0 formats (later versions
-  only add kinds of layers or coders, and every 1.x engine reads every 1.x file it can run).
+- **Formats** (done): `.slett` version 7 and `.slettd` version 2 frozen as the 1.0 formats (later
+  versions only add kinds of layers or coders, and every 1.x engine reads every 1.x file it can
+  run), stated in `docs/ModelFormat.md` and `docs/DatasetFormat.md`.
 - **C++ wrapper** (done): the header-only `Spingalett.hpp` (C++23) with move-only owners (`Network`,
   `Model`, `Dataset`, `DeviceData`), `std::span` inputs, `std::expected` for errors, and a fluent
   `Builder`.
-- **Documentation:** a reference generated from the headers and a tutorial path (MNIST, CIFAR-10,
-  a U-Net, deployment to a microcontroller).
-- **Room for CUDA:** `COMPUTE_CUDA` reserved in `ComputeMode` (it falls back to the CPU until 1.1),
-  and a device layer under the GPU executor, so that the CUDA backend of 1.1 changes no API.
+- **Documentation** (done): `docs/Reference.md`, generated from the headers by
+  `docs/make_reference.py` (a test keeps it current), and `docs/Tutorial.md`, a path through the
+  examples (XOR, MNIST, its CNN, CIFAR-10, a U-Net, deployment to a microcontroller).
+- **Room for CUDA** (done for the API): `SPINGALETT_COMPUTE_CUDA` reserved in the compute modes (it
+  falls back to the CPU until 1.1). The device layer under the GPU executor changes no API and comes
+  with the CUDA backend.
 
 ## 1.0: stability
 

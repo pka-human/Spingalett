@@ -28,6 +28,12 @@ biases shifted alike; the layer takes the normalization's activation, and the la
 normalization read it instead). Other normalizations remain layers of their own, so such files can
 still be version 3 or 4.
 
+**Stability.** Version 7 is the format of Spingalett 1.0. Later versions only add what earlier
+ones cannot express (kinds of layers, precisions, activations, fields in space reserved as zero),
+and leave what a version 7 file means unchanged; a 1.x writer writes the oldest version that holds
+the network, as now, and every 1.x engine runs every file whose layers it has. Codes of version 7
+(activations, layer kinds, precisions) keep their values.
+
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 CRC-32 is the IEEE polynomial (0xEDB88320, reflected, initial value and final XOR 0xFFFFFFFF), as
 in zlib and PNG.

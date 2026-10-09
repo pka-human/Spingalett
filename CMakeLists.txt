@@ -473,6 +473,13 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME core.gemm COMMAND SpingalettGemmTests)
 
+    # docs/Reference.md, which docs/make_reference.py writes from the public headers, kept up to date.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME docs.reference
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/docs/make_reference.py --check)
+    endif()
+
     # A program of the prefixed names only (SPINGALETT_NO_SHORT_NAMES), the names of 0.x its own.
     add_executable(SpingalettPrefixed ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Prefixed.c)
     target_link_libraries(SpingalettPrefixed PRIVATE spingalett)

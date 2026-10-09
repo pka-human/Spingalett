@@ -8,8 +8,9 @@
  *
  * Runs a network stored as a .slett image (format version 3; 4 for networks with convolution and
  * pooling layers; 5 for networks with batch normalization or grouped convolutions; 6 for networks
- * whose layers read other layers than the one before them, such as residual connections) in place,
- * in the precision its parameters were saved in. The image can be a file read into memory, a const array
+ * whose layers read other layers than the one before them, such as residual connections; 7 for
+ * transposed convolutions, upsampling and layer normalization) in place, in the precision its
+ * parameters were saved in. The image can be a file read into memory, a const array
  * compiled into the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing,
  * does no I/O and keeps no global state: apart from the image it only needs a workspace from the
  * caller, so it runs on microcontrollers as well as on desktops, and any number of threads can share
@@ -193,7 +194,7 @@ typedef struct {
 } SpingalettLayerInfo;
 
 /*
- * Checks a .slett image (format version 3 to 6: header, layer table, shapes, bounds and CRC-32
+ * Checks a .slett image (format version 3 to 7: header, layer table, shapes, bounds and CRC-32
  * checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in
  * use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region).
  * Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format

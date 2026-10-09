@@ -13,6 +13,11 @@ network's inference included (1.19 times as fast in single precision, 1.3 times 
 RTX 4050 Laptop GPU; README).
 
 ### Added
+- **Documentation:** `docs/Reference.md`, every declaration of the public headers with its comment
+  (written by `docs/make_reference.py`; the `docs.reference` test fails when it falls behind the
+  headers), and `docs/Tutorial.md`, a path through the examples from XOR to a model on a
+  microcontroller. `docs/ModelFormat.md` and `docs/DatasetFormat.md` state that `.slett` version 7 and
+  `.slettd` version 2 are the formats of 1.0, which later versions only extend.
 - **A C++ interface**, header-only: `#include <Spingalett/Spingalett.hpp>` (C++23). The library's objects as
   move-only owners (`spingalett::Network`, `Model`, `Dataset`, `DeviceData`), data as `std::span`,
   errors as `std::expected<T, spingalett::Error>` (the library's code and message; nothing throws),
