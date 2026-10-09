@@ -140,3 +140,8 @@ enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
    memory at once, and the bytes of shared memory a tile of BM x BN, BK a step, takes. */
 #define SPG_CUDA_GEMM_STAGES 2u     /* (two buffers) */
 #define SPG_CUDA_GEMM_SHARED(bm, bn, bk) (SPG_CUDA_GEMM_STAGES * (bk) * ((bm) + 4u + (bn) + 4u) * 4u)
+/* gemm_mma.cu: stages of its pipeline, and bytes of shared memory a tile takes (the larger of an operand's
+   layouts: x rows of bk + 8 bfloat16, or bk rows of x + 8) */
+#define SPG_CUDA_MMA_STAGES 2u
+#define SPG_CUDA_MMA_ROWS(x, bk) ((x) * ((bk) + 8u) > (bk) * ((x) + 8u) ? (x) * ((bk) + 8u) : (bk) * ((x) + 8u))
+#define SPG_CUDA_MMA_SHARED(bm, bn, bk) (SPG_CUDA_MMA_STAGES * (SPG_CUDA_MMA_ROWS(bm, bk) + SPG_CUDA_MMA_ROWS(bn, bk)) * 2u)

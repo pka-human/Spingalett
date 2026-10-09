@@ -44,12 +44,25 @@ static const Tile cuda_fp32_tiles[] = {
 #define SPG_CUDA_UNIT(name, source, defines)
 #define SPG_CUDA_GEMM_MODES(a, b, vec)
 #define SPG_CUDA_DW_WINDOW(kh, kw, sh, sw)
+#define SPG_CUDA_MMA_TILE(bm, bn, bk, tm, tn)
+#define SPG_CUDA_MMA_MODES(a, b, ka, kb)
 #define SPG_CUDA_GEMM_TILE(bm, bn, bk, tm, tn) {bm, bn, bk, tm, tn},
+#include "Cuda/Kernels.def"
+#undef SPG_CUDA_GEMM_TILE
+#undef SPG_CUDA_MMA_TILE
+};
+
+/* and of its product on the matrix units (Src/Gpu/Cuda/gemm_mma.cu): warps of 16 TM x 16 TN outputs */
+static const Tile cuda_mma_tiles[] = {
+#define SPG_CUDA_GEMM_TILE(bm, bn, bk, tm, tn)
+#define SPG_CUDA_MMA_TILE(bm, bn, bk, tm, tn) {bm, bn, bk, tm, tn},
 #include "Cuda/Kernels.def"
 #undef SPG_CUDA_UNIT
 #undef SPG_CUDA_GEMM_MODES
 #undef SPG_CUDA_DW_WINDOW
 #undef SPG_CUDA_GEMM_TILE
+#undef SPG_CUDA_MMA_TILE
+#undef SPG_CUDA_MMA_MODES
 };
 
 typedef struct { const Tile *list; uint32_t count; } Table;
@@ -57,7 +70,8 @@ typedef struct { const Tile *list; uint32_t count; } Table;
 /* The tiles of the calling thread's backend. */
 static Table table(bool mma) {
     if (spg_gpu_using() == SPG_BACKEND_CUDA)
-        return (Table){cuda_fp32_tiles, mma ? 0u : sizeof cuda_fp32_tiles / sizeof cuda_fp32_tiles[0]};
+        return mma ? (Table){cuda_mma_tiles, sizeof cuda_mma_tiles / sizeof cuda_mma_tiles[0]}
+                   : (Table){cuda_fp32_tiles, sizeof cuda_fp32_tiles / sizeof cuda_fp32_tiles[0]};
     return mma ? (Table){mma_tiles, sizeof mma_tiles / sizeof mma_tiles[0]}
                : (Table){fp32_tiles, sizeof fp32_tiles / sizeof fp32_tiles[0]};
 }
@@ -70,7 +84,8 @@ static uint32_t tile_threads(const Tile *t, bool mma) {
 /* Bytes of shared memory a tile takes: gemm.comp's BK rows of BM / 4 + 1 and BN / 4 + 1 vec4;
    gemm_mma.comp's BK rows of BM + 8 and BN + 8 bfloat16, and a 16 x 16 block of floats a subgroup. */
 static uint32_t tile_shared(const Tile *t, bool mma) {
-    if (spg_gpu_using() == SPG_BACKEND_CUDA) return SPG_CUDA_GEMM_SHARED(t->bm, t->bn, t->bk);
+    if (spg_gpu_using() == SPG_BACKEND_CUDA)
+        return mma ? SPG_CUDA_MMA_SHARED(t->bm, t->bn, t->bk) : SPG_CUDA_GEMM_SHARED(t->bm, t->bn, t->bk);
     if (mma) return ((t->bk + 8u) * (t->bm + t->bn) + 8u * 2u * t->bk + t->bk * 16u) * 2u +
                     tile_threads(t, true) / spg_gpu_subgroup_size() * 1024u;       /* the larger of the layouts */
     return t->bk * (t->bm / 4u + 1u + t->bn / 4u + 1u) * 16u;

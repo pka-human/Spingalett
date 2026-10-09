@@ -252,14 +252,15 @@ static uint64_t cub_memory(void) { return cub_open() ? cu.memory : 0; }
 static uint32_t cub_shared_memory(void) { return cub_open() ? cu.shared_optin : 48u * 1024u; }
 static uint32_t cub_subgroup_size(void) { return 32u; }
 static uint32_t cub_max_workgroups(uint32_t axis) { return axis == 0 ? 0x7FFFFFFFu : 65535u; }
-static bool cub_mma_bf16(void) { return false; }
-static bool cub_bf16_storage(void) { return false; }
+static bool cub_mma_bf16(void) { return cub_open(); }          /* (Ampere and later: mma.sync of bfloat16) */
+static bool cub_bf16_storage(void) { return cub_open(); }
 static bool cub_host_writes(void) { return false; }
 
 /* ------------------------------------------------------------------------- kernels */
 
 /* Bytes of dynamic shared memory a kernel takes (the product's stages). */
 static uint32_t dynamic_shared(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
+    if (kernel == SPG_KERNEL_gemm_mma && count >= 3) return SPG_CUDA_MMA_SHARED(spec[0], spec[1], spec[2]);
     return kernel == SPG_KERNEL_gemm && count >= 3 ? SPG_CUDA_GEMM_SHARED(spec[0], spec[1], spec[2]) : 0u;
 }
 
@@ -293,6 +294,20 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         v = v && a != 2u && b != 2u;
         snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u%s", spec[0], spec[1], spec[2], spec[3], spec[4], a, b,
                  v ? "v" : "");
+    } else if (kernel == SPG_KERNEL_gemm_mma) {
+        if (count < 14) return -1;
+        /* each operand: kept as bfloat16 and read eight values at once (w: VEC 4, 8), floats read four at once
+           (f: VEC 1, 2), else o; the instances of Kernels.def, or else the one that reads anything */
+        const uint32_t vec = spec[11], half = spec[13];
+        const char ka = vec & 4u ? 'w' : (vec & 1u) && !(half & 1u) ? 'f' : 'o';
+        const char kb = vec & 8u ? 'w' : (vec & 2u) && !(half & 2u) ? 'f' : 'o';
+        for (int any = 0; any < 2; any++) {
+            snprintf(name, sizeof name, "gemm_mma_%ux%ux%u_%ux%u_a%ub%u_%c%c", spec[0], spec[1], spec[2], spec[3], spec[4],
+                     spec[5], spec[6], any ? 'o' : ka, any ? 'o' : kb);
+            for (uint32_t u = 0; u < UNIT_COUNT; u++)
+                if (!strcmp(spg_cuda_units[u].name, name)) return (int)u;
+        }
+        return -1;
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];
@@ -599,7 +614,7 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
     memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
     if (cu.profile) {
         int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
-        if (kernel == SPG_KERNEL_gemm && spec_count >= 8)
+        if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 8)
             snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7],
                      spec[0], spec[1]);
         else
