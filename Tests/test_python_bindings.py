@@ -276,6 +276,9 @@ if sg.gpu_device() is not None:
         except ValueError:
             pass
     check("closed" in repr(dx), "DeviceData closed by with")
+    with sg.DeviceData(np.array([[0, 51, 255]], dtype=np.uint8)) as du:
+        check(np.array_equal(du.numpy(), np.array([[0, 51, 255]], dtype=np.float32) / np.float32(255)) or
+              np.allclose(du.numpy(), [[0.0, 0.2, 1.0]], rtol=0, atol=1e-7), f"DeviceData of image bytes {du.numpy()}")
 sg.set_compute_mode(sg.ComputeMode.OPENMP)
 
 # generator mode

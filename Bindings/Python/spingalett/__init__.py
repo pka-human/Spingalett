@@ -1084,11 +1084,12 @@ class DeviceData:
     :meth:`Network.evaluate` in place of arrays. With ComputeMode.VULKAN those gather their batches on
     the device (and training augments and smooths them there) instead of copying samples from the host
     for every pass; on the CPU they copy the rows back first. Each sample is a row: an array (n, ...)
-    is flattened to (n, values per sample), a 1-D array is a column. Needs a usable GPU; free it with
+    is flattened to (n, values per sample), a 1-D array is a column; uint8 arrays are image bytes, q
+    read as q / 255, as the network's inputs are everywhere. Needs a usable GPU; free it with
     :meth:`close` or a ``with`` block."""
 
     def __init__(self, values):
-        arr = np.asarray(values, dtype=np.float32)
+        arr = _as_float(values)
         arr = np.ascontiguousarray(arr.reshape(arr.shape[0], -1) if arr.ndim != 1 else arr.reshape(-1, 1))
         if arr.shape[0] == 0 or arr.shape[1] == 0:
             raise ValueError(f"DeviceData: no values in an array of shape {arr.shape}")
