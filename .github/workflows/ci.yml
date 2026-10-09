@@ -41,7 +41,7 @@ jobs:
         run: cmake --build Build --parallel
 
       - name: Test
-        run: ctest --test-dir Build --output-on-failure
+        run: .github/scripts/ctest.sh --test-dir Build
 
       # ctest counts the GPU tests as passed when they find no device: here they must find lavapipe
       - name: GPU tests (lavapipe)
@@ -108,7 +108,7 @@ jobs:
         run: cmake --build Build --parallel
 
       - name: Test
-        run: LSAN_OPTIONS=suppressions=$PWD/Tests/lsan.supp ctest --test-dir Build --output-on-failure
+        run: LSAN_OPTIONS=suppressions=$PWD/Tests/lsan.supp .github/scripts/ctest.sh --test-dir Build
 
   inference-only:
     name: inference engine alone
@@ -129,7 +129,7 @@ jobs:
         run: |
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DSPINGALETT_INFERENCE_ONLY=ON -DCMAKE_INSTALL_PREFIX=$PWD/prefix
           cmake --build Build --parallel
-          ctest --test-dir Build --output-on-failure
+          .github/scripts/ctest.sh --test-dir Build
           cmake --install Build
 
       - name: Consumer (find_package)
@@ -163,7 +163,7 @@ jobs:
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} -DSPINGALETT_RUNTIME_ONLY=ON \
                 -DBUILD_WITH_OPENMP=ON -DSPINGALETT_NATIVE_ARCH=OFF -DCMAKE_INSTALL_PREFIX=$PWD/prefix
           cmake --build Build --parallel
-          ctest --test-dir Build --output-on-failure
+          .github/scripts/ctest.sh --test-dir Build
           cmake --install Build
           find prefix -type f | sort
           test ! -e prefix/include/Spingalett/Spingalett.h && test ! -e prefix/lib/libspingalett.so.1
