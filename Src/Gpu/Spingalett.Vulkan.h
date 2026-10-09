@@ -103,6 +103,9 @@ bool spg_gpu_record_begin(SpgGpuCommands *commands);
    x, y and z (nothing is recorded when one is 0) */
 void spg_gpu_dispatch(SpgGpuCommands *commands, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count,
                       const void *push, uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz);
+/* Makes the pipelines of n sets of specialization constants (specs: n x count) that do not exist yet,
+   on several threads, ahead of the dispatches that will use them. */
+void spg_gpu_prepare(SpgKernel kernel, const uint32_t *specs, uint32_t count, uint32_t n);
 /* Every dispatch and copy recorded before it completes before any recorded after it starts, and
    their results are visible to the host once the commands have run. */
 void spg_gpu_barrier(SpgGpuCommands *commands);

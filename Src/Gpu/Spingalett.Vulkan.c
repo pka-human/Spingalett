@@ -69,6 +69,7 @@ static PFN_vkVoidFunction loader_symbol(void *lib, const char *name) {
     X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
     X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkGetBufferDeviceAddress) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkCreateComputePipelines) \
+    X(vkDestroyPipeline) \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
     X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkResetFences) \
@@ -434,49 +435,91 @@ bool spg_gpu_host_writes(void) {
     return spg_gpu_open() && gpu.host_writes;
 }
 
-/* The pipeline of a kernel with these specialization constants, made on first use. */
-static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
-    VkPipeline found = VK_NULL_HANDLE;
-    spg_lock(gpu.lock);
-    for (size_t k = 0; k < gpu.pipeline_count && !found; k++) {
+/* The pipeline of a kernel with these specialization constants made so far, or VK_NULL_HANDLE (under
+   the lock). */
+static VkPipeline made_pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
+    for (size_t k = 0; k < gpu.pipeline_count; k++) {
         const Pipeline *e = &gpu.pipelines[k];
         if (e->kernel == kernel && e->count == count && (!count || !memcmp(e->spec, spec, count * sizeof(uint32_t))))
-            found = e->pipeline;
+            return e->pipeline;
     }
+    return VK_NULL_HANDLE;
+}
+
+/* The pipeline of a kernel with these specialization constants, made on first use: compiled outside the
+   lock, so that threads make theirs at once (spg_gpu_prepare()); the first made of two alike is kept. */
+static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
+    spg_lock(gpu.lock);
+    VkPipeline found = made_pipeline(kernel, spec, count);
+    if (!found && !gpu.modules[kernel]) {
+        VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0,
+                                        spg_kernel_spirv_size[kernel], spg_kernel_spirv[kernel]};
+        if (vkCreateShaderModule(gpu.device, &mci, NULL, &gpu.modules[kernel]) != VK_SUCCESS)
+            gpu.modules[kernel] = VK_NULL_HANDLE;
+    }
+    const VkShaderModule module = gpu.modules[kernel];
+    spg_unlock(gpu.lock);
+    if (found || !module) return found;
+
+    VkSpecializationMapEntry entries[SPG_SPEC_MAX];
+    for (uint32_t k = 0; k < count; k++) entries[k] = (VkSpecializationMapEntry){k, 4u * k, 4u};
+    VkSpecializationInfo si = {count, entries, count * sizeof(uint32_t), spec};
+    VkComputePipelineCreateInfo cci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL,
+                  kernel == SPG_KERNEL_gemm_mma && gpu.full_subgroups
+                      ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT : 0u,
+                  VK_SHADER_STAGE_COMPUTE_BIT, module, "main", count ? &si : NULL},
+        .layout = gpu.layout,
+    };
+    VkPipeline made;
+    if (vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cci, NULL, &made) != VK_SUCCESS) return VK_NULL_HANDLE;
+
+    spg_lock(gpu.lock);
+    found = made_pipeline(kernel, spec, count);
     if (!found && gpu.pipeline_count == gpu.pipeline_cap) {
         size_t cap = gpu.pipeline_cap ? 2 * gpu.pipeline_cap : 64;
         Pipeline *grown = (Pipeline *)realloc(gpu.pipelines, cap * sizeof *grown);
         if (grown) { gpu.pipelines = grown; gpu.pipeline_cap = cap; }
     }
     if (!found && gpu.pipeline_count < gpu.pipeline_cap) {
-        if (!gpu.modules[kernel]) {
-            VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0,
-                                            spg_kernel_spirv_size[kernel], spg_kernel_spirv[kernel]};
-            if (vkCreateShaderModule(gpu.device, &mci, NULL, &gpu.modules[kernel]) != VK_SUCCESS)
-                gpu.modules[kernel] = VK_NULL_HANDLE;
-        }
-        VkSpecializationMapEntry entries[SPG_SPEC_MAX];
-        for (uint32_t k = 0; k < count; k++) entries[k] = (VkSpecializationMapEntry){k, 4u * k, 4u};
-        VkSpecializationInfo si = {count, entries, count * sizeof(uint32_t), spec};
-        VkComputePipelineCreateInfo cci = {
-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL,
-                      kernel == SPG_KERNEL_gemm_mma && gpu.full_subgroups
-                          ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT : 0u,
-                      VK_SHADER_STAGE_COMPUTE_BIT, gpu.modules[kernel], "main", count ? &si : NULL},
-            .layout = gpu.layout,
-        };
-        VkPipeline made;
-        if (gpu.modules[kernel] && vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cci, NULL, &made) == VK_SUCCESS) {
-            Pipeline *e = &gpu.pipelines[gpu.pipeline_count++];
-            e->kernel = kernel;
-            e->count = count;
-            if (count) memcpy(e->spec, spec, count * sizeof(uint32_t));
-            e->pipeline = found = made;
-        }
+        Pipeline *e = &gpu.pipelines[gpu.pipeline_count++];
+        e->kernel = kernel;
+        e->count = count;
+        if (count) memcpy(e->spec, spec, count * sizeof(uint32_t));
+        e->pipeline = found = made;
+        made = VK_NULL_HANDLE;
     }
     spg_unlock(gpu.lock);
+    if (made) vkDestroyPipeline(gpu.device, made, NULL);         /* another thread's came first */
     return found;
+}
+
+/* spg_gpu_prepare()'s threads: every `step`-th pipeline from `first` on */
+typedef struct { SpgKernel kernel; const uint32_t *specs; uint32_t count, n, first, step; } Prepare;
+
+static void prepare_some(void *arg) {
+    const Prepare *job = (const Prepare *)arg;
+    for (uint32_t i = job->first; i < job->n; i += job->step) (void)pipeline(job->kernel, job->specs + (size_t)i * job->count, job->count);
+}
+
+void spg_gpu_prepare(SpgKernel kernel, const uint32_t *specs, uint32_t count, uint32_t n) {
+    if (!spg_gpu_open() || count > SPG_SPEC_MAX) return;
+    /* the driver compiles a pipeline in tens of milliseconds the first time a machine sees it (then it
+       keeps it on disk): eight threads at most, one share each, the caller's among them */
+    enum { MOST = 8 };
+    const uint32_t threads = n < MOST ? n : MOST;
+    Prepare jobs[MOST];
+    SpgThread *running[MOST] = {NULL};
+    for (uint32_t t = 0; t < threads; t++) {
+        jobs[t] = (Prepare){kernel, specs, count, n, t, threads};
+        if (t > 0) running[t] = spg_thread_start(prepare_some, &jobs[t]);
+    }
+    if (threads) prepare_some(&jobs[0]);
+    for (uint32_t t = 1; t < threads; t++) {
+        if (running[t]) spg_thread_join(running[t]);
+        else prepare_some(&jobs[t]);            /* a thread that did not start: its share here */
+    }
 }
 
 /* ------------------------------------------------------------------------- buffers */

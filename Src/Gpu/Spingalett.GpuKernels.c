@@ -187,11 +187,19 @@ static void make_key(uint32_t *key, const SpgGemmPush *p, const SpgGemmMode *m, 
     memcpy(key, values, sizeof values);
 }
 
+/* The specialization constants of the product with tile t (14 for gemm_mma.comp, the first 12 for
+   gemm.comp). */
+static void tile_spec(uint32_t spec[14], const SpgGemmMode *m, uint32_t vec, const Tile *t, bool mma) {
+    const uint32_t values[14] = {t->bm, t->bn, t->bk, t->tm, t->tn, m->amode, m->bmode, m->epi, m->act,
+                                 tile_threads(t, mma), m->phased ? 1u : 0u, vec, spg_gpu_subgroup_size(), m->half};
+    memcpy(spec, values, sizeof values);
+}
+
 /* Records the product with tile t (gemm_mma.comp with mma). */
 static void dispatch_tile(SpgGpuCommands *c, const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, const Tile *t,
                           bool mma) {
-    uint32_t spec[14] = {t->bm, t->bn, t->bk, t->tm, t->tn, m->amode, m->bmode, m->epi, m->act, tile_threads(t, mma),
-                         m->phased ? 1u : 0u, vec, spg_gpu_subgroup_size(), m->half};
+    uint32_t spec[14];
+    tile_spec(spec, m, vec, t, mma);
     /* tiles of rows in parts of at most what a dispatch may have in x */
     const uint32_t tiles = (p->M + t->bm - 1) / t->bm, most = spg_gpu_max_workgroups(0);
     SpgGemmPush q = *p;
@@ -304,6 +312,16 @@ static int tuned_tile(const SpgGemmPush *p, const SpgGemmMode *m, uint32_t vec, 
                 int to = order[a]; order[a] = order[b]; order[b] = to;
             }
     if (count > 16u) count = 16u;
+    /* the candidates' pipelines made at once, on several threads (the driver's first compilations of
+       them take most of a first training's time on a machine) */
+    const uint32_t constants = mma ? 14u : 12u;
+    uint32_t specs[16 * 14];
+    for (uint32_t k = 0; k < count; k++) {
+        uint32_t spec[14];
+        tile_spec(spec, m, vec, &tab.list[order[k]], mma);
+        memcpy(specs + k * constants, spec, constants * sizeof(uint32_t));
+    }
+    spg_gpu_prepare(mma ? SPG_KERNEL_gemm_mma : SPG_KERNEL_gemm, specs, constants, count);
     double t[64];
     int chosen = -1;
     /* a device idle for a second or more (or never tuned) is kept busy for 25 ms first */
