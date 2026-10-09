@@ -272,28 +272,34 @@ static void image(SpgGpuNet *g, const Item *it, void *at, bool down) {
     }
 }
 
-/* Bytes of the transfer buffer the item takes: uploads into memory the host writes straight into
-   and zeros (filled by the device) take none. */
+/* Whether the host writes the item's upload straight into the device's memory (zeros are filled by
+   the device, which is faster than the host's writes over the bus). */
+static bool direct(const Item *it, bool down) {
+    return !down && it->device->mapped && it->kind != ITEM_ZERO;
+}
+
+/* Bytes of the transfer buffer the item takes: direct uploads and zeros take none. */
 static size_t staged(const Item *it, bool down) {
-    if (!down && (it->device->mapped || it->kind == ITEM_ZERO)) return 0;
+    if (direct(it, down) || (!down && it->kind == ITEM_ZERO)) return 0;
     return (it->bytes + 15u) & ~(size_t)15u;
 }
 
 /* Runs the items, after all chunks submitted so far (which the caller has waited for when it
    uploads into memory the host writes). */
 static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down) {
-    bool staging = false;
+    bool commands = false, staging = false;
     for (uint32_t k = 0; k < count; k++) {
         const Item *it = &items[k];
-        if (!down && it->device->mapped) image(g, it, it->device->mapped, false);
-        else staging = true;
+        if (direct(it, down)) image(g, it, it->device->mapped, false);
+        else commands = true;
+        staging = staging || staged(it, down) > 0;
     }
-    if (!staging) return true;
+    if (!commands) return true;
     /* the transfer buffer, made on first use where uploads need none */
-    if (!g->transfer.buffer && !spg_gpu_buffer_create(&g->transfer, g->transfer_bytes, true)) return false;
+    if (staging && !g->transfer.buffer && !spg_gpu_buffer_create(&g->transfer, g->transfer_bytes, true)) return false;
     for (uint32_t first = 0, last; first < count; first = last) {
         size_t used = 0;
-        for (last = first; last < count && used + staged(&items[last], down) <= g->transfer.size; last++)
+        for (last = first; last < count && used + staged(&items[last], down) <= (staging ? g->transfer.size : 0u); last++)
             used += staged(&items[last], down);
         if (last == first) return false;
         char *base = (char *)g->transfer.mapped;
@@ -306,7 +312,7 @@ static bool transfer(SpgGpuNet *g, const Item *items, uint32_t count, bool down)
         at = 0;
         for (uint32_t k = first; k < last; at += staged(&items[k], down), k++) {
             const Item *it = &items[k];
-            if (!down && it->device->mapped) continue;
+            if (direct(it, down)) continue;
             if (it->kind == ITEM_ZERO) spg_gpu_fill(c, it->device, 0, it->bytes, 0u);
             else if (down) spg_gpu_copy(c, it->device, 0, &g->transfer, at, it->bytes);
             else spg_gpu_copy(c, &g->transfer, at, it->device, 0, it->bytes);
@@ -345,6 +351,9 @@ static bool parameters(SpgGpuNet *g, bool down, bool creating) {
     }
     if (g->moment1.buffer) items[n++] = arrays(&g->moment1, pair, net->opt_m_weights, net->opt_m_biases);
     if (g->moment2.buffer) items[n++] = arrays(&g->moment2, pair, net->opt_v_weights, net->opt_v_biases);
+    /* a network that has taken no step has its moments zero: filled by the device when it is made */
+    for (uint32_t k = n - (g->moment1.buffer != NULL) - (g->moment2.buffer != NULL); creating && !down && k < n; k++)
+        if (net->time_step == 0) items[k].kind = ITEM_ZERO;
     bool ok = transfer(g, items, n, down);
     free(items);
     return ok;
@@ -400,6 +409,27 @@ static bool kept_half(const SpgGpuNet *g, uint32_t l) {
     const NeuralNetwork *net = g->net;
     if (!g->bf16 || !spg_gpu_bf16_storage() || l + 1 >= net->layers || g->uses[l] == 0 || g->fold[l]) return false;
     return l == 0 || net->act_func[l - 1] != ACT_SOFTMAX;
+}
+
+bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training) {
+    const OptimizerType o = training->optimizer;
+    if (!g->training || g->lost || g->capacity != capacity || !spingalett_gpu_net_current(g) ||
+        ((o == OPTIMIZER_MOMENTUM || o == OPTIMIZER_ADAM || o == OPTIMIZER_ADAMW) && !g->moment1.buffer) ||
+        ((o == OPTIMIZER_RMSPROP || o == OPTIMIZER_ADAM || o == OPTIMIZER_ADAMW) && !g->moment2.buffer))
+        return false;
+    drain(g);
+    /* the settings are recorded in the commands of the optimizer (the dropout seed goes in the header) */
+    const SpgGpuTraining *old = &g->cfg;
+    if (old->optimizer != o || old->decay != training->decay || old->momentum != training->momentum ||
+        old->beta1 != training->beta1 || old->beta2 != training->beta2 || old->epsilon != training->epsilon ||
+        old->max_grad_norm != training->max_grad_norm)
+        for (uint32_t k = 0; k < 2; k++) {
+            for (uint32_t e = 0; e < g->slots[k].used; e++) spg_gpu_commands_free(g->slots[k].cache[e].commands);
+            g->slots[k].used = 0;
+        }
+    g->cfg = *training;
+    g->step_loss = g->total_loss = 0.0f;
+    return true;
 }
 
 void spingalett_gpu_net_free(SpgGpuNet *g) {

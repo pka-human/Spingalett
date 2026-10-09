@@ -792,10 +792,15 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
       .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);   /* as on the CPU */
 ```
 
-- Parameters, their gradients and the optimizer's moments stay in GPU memory for the whole
-  `train()` call. The host prepares a batch (gathering, augmentation, label smoothing) while the
-  GPU trains on the one before, and gets the losses and the parameters back at the end of every
-  epoch, where validation, callbacks, autosaves and the best weights see them.
+- Parameters, their gradients and the optimizer's moments stay in GPU memory, and so does the
+  network's copy there after `train()` returns: functions that read the parameters
+  (`predict()`, `save_spingalett()`, `spingalett_get_parameters()`, a callback's reads during
+  training, and the others) copy them back first, parameters set on the host go to the device
+  before the next epoch, and the next `train()` of the same batch size and optimizer trains on the
+  copy again without copying anything. The network frees it when it is freed, gains a layer, trains
+  on the CPU or makes a trainer. The host prepares a batch (gathering, augmentation, label smoothing,
+  and writing it into the device's memory where it can) while the GPU trains on the one before, and
+  takes the losses back at the end of every epoch.
 - Every kind of layer, activation, loss and optimizer runs on the GPU, with dropout (the same masks
   as on the CPU), gradient clipping and batch normalization. Per-sample training, `forward()` and
   deployment models run on the CPU.

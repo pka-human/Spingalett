@@ -9,10 +9,14 @@ changes, which are listed under **Changed**.
 
 ### Changed
 - `train()` on the GPU keeps the network's parameters on the device between epochs instead of
-  copying them (and the gradients and optimizer moments) back after each: they come back where they
-  are read (a callback, an autosave, the NaN check, the best epoch's copy) and when training ends.
-  The 784-512-1000-10 MLP of `Examples/Benchmark.c` trains full batches 22% faster on an RTX 4050
-  Laptop GPU (5 epochs: 553,000 to 673,000 samples per second).
+  copying them (and the gradients and optimizer moments) back after each, and the network keeps its
+  copy on the GPU after `train()` returns: the parameters come back where they are read (a
+  callback, an autosave, the NaN check, the best epoch's copy, and every function that reads them),
+  and the next `train()` with the same batch size and optimizer trains on the copy again. The
+  network frees it when it is freed, gains a layer, trains on the CPU or makes a trainer. The
+  784-512-1000-10 MLP of `Examples/Benchmark.c` trains full batches 22% faster on an RTX 4050 Laptop
+  GPU for the epochs alone (5 epochs: 553,000 to 673,000 samples per second), and a `train()` of one
+  epoch in bfloat16 takes 14.4 ms instead of 25 ms.
 
 - A network on the GPU takes its buffers from a few allocations instead of one each, uploads and
   downloads its arrays in one submission instead of one per array, and, where the host can write

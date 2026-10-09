@@ -291,10 +291,23 @@ bool spingalett_network_reserve(NeuralNetwork *net, uint64_t neurons, uint64_t w
 
 void spingalett_network_sync(const NeuralNetwork *cnet) {
     NeuralNetwork *net = (NeuralNetwork *)cnet;         /* the values the network holds do not change */
-    if (!net || !net->gpu_newer || !net->gpu_trainer) return;
-    if (!spingalett_gpu_download(net->gpu_trainer))
+    if (!net || !atomic_load(&net->gpu_newer)) return;
+    /* readers on several threads (predict() may run concurrently) bring them back once */
+    static atomic_flag busy = ATOMIC_FLAG_INIT;
+    while (atomic_flag_test_and_set_explicit(&busy, memory_order_acquire)) {}
+    if (atomic_load(&net->gpu_newer) && net->gpu_trainer && !spingalett_gpu_download(net->gpu_trainer))
         spingalett_log(LOG_ERROR, "The parameters could not be copied back from the GPU");
-    net->gpu_newer = false;
+    atomic_store(&net->gpu_newer, false);
+    atomic_flag_clear_explicit(&busy, memory_order_release);
+}
+
+void spingalett_network_release_gpu(NeuralNetwork *net) {
+    if (!net || !net->gpu_kept) return;
+    spingalett_network_sync(net);
+    spingalett_gpu_net_free(net->gpu_trainer);
+    net->gpu_trainer = NULL;
+    net->gpu_kept = false;
+    atomic_store(&net->gpu_newer, false);
 }
 
 void spingalett_network_written(NeuralNetwork *net) {
@@ -344,6 +357,7 @@ bool spingalett_add_layer(LayerArgs args) {
     spingalett_batch_workspace_free(net->forward_ws);     /* made for the old layers */
     net->forward_ws = NULL;
     spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));
+    spingalett_network_release_gpu(net);                    /* its parameters back first */
     bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D ||
                    shape.type == LAYER_GLOBAL_AVG_POOL || shape.type == LAYER_UPSAMPLE;
     if (pooling) act_func = ACT_NONE;
@@ -858,6 +872,7 @@ void free_network(NeuralNetwork *net) {
     if (!net) return;
     spingalett_batch_workspace_free(net->forward_ws);
     spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));
+    if (net->gpu_kept) spingalett_gpu_net_free(net->gpu_trainer);
     spingalett_aligned_free(net->neurons);
     spingalett_aligned_free(net->weights);
     spingalett_aligned_free(net->biases);

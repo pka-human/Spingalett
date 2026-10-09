@@ -4729,6 +4729,91 @@ static void gpu_callback(void) {
     spingalett_set_compute_mode(COMPUTE_OPENMP);
 }
 
+/* The parameters of every layer, back to back. */
+static float *gpu_params_of(NeuralNetwork *net, size_t *count) {
+    *count = spingalett_parameter_count(net);
+    float *w = (float *)malloc(*count * sizeof(float));
+    size_t off = 0;
+    for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+        SpingalettNetworkLayer info;
+        spingalett_network_layer(net, l, &info);
+        spingalett_get_parameters(net, l, PARAM_WEIGHTS, w + off, info.weight_count);
+        off += info.weight_count;
+        spingalett_get_parameters(net, l, PARAM_BIASES, w + off, info.bias_count);
+        off += info.bias_count;
+    }
+    return w;
+}
+
+/* train() on the GPU leaves its copy in the network, which the next train() takes again: two calls
+   of one epoch give the bits of one call of two, with a predict() and a read of the parameters
+   between them or not; and training on the CPU after the GPU starts from the GPU's parameters. */
+static void gpu_kept(void) {
+    static const int nets[] = {0, 2};
+    for (size_t j = 0; j < sizeof nets / sizeof nets[0]; j++) {
+        const int which = nets[j];
+        float *w[5] = {NULL};
+        size_t count = 0;
+        for (int k = 0; k < 5; k++) {
+            NeuralNetwork *net = gpu_net(which);
+            const uint32_t n = 40, in = net->topology[0], out = net->topology[net->layers - 1];
+            float *x = (float *)malloc((size_t)n * in * sizeof(float)), *t = (float *)calloc((size_t)n * out, sizeof(float));
+            float *y = (float *)malloc((size_t)n * out * sizeof(float));
+            lcg_state = 555;
+            for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+            for (uint32_t i = 0; i < n; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
+            spingalett_set_compute_mode(COMPUTE_VULKAN);
+            TrainArgs a = {.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .learning_rate = 0.01f,
+                           .optimizer_type = OPTIMIZER_MOMENTUM, .momentum = 0.9f, .beta1 = 0.9f, .beta2 = 0.999f,
+                           .epsilon = 1e-8f, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0};
+            if (k == 0) {                   /* two epochs in one call */
+                a.epochs = 2;
+                train_struct_arguments(a);
+            } else if (k == 1) {            /* in two, the second taking the first's copy */
+                train_struct_arguments(a);
+                train_struct_arguments(a);
+            } else if (k == 2) {            /* with a prediction and a read of the parameters between */
+                train_struct_arguments(a);
+                predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
+                free(gpu_params_of(net, &count));
+                train_struct_arguments(a);
+            } else {                        /* one on the GPU, one on the CPU (k = 3), or the CPU from the
+                                               first's parameters set in a fresh network (k = 4) */
+                train_struct_arguments(a);
+                if (k == 4) {
+                    float *p = gpu_params_of(net, &count);
+                    free_network(net);
+                    net = a.net = gpu_net(which);
+                    size_t off = 0;
+                    for (uint32_t l = 1; l < spingalett_layer_count(net); l++) {
+                        SpingalettNetworkLayer info;
+                        spingalett_network_layer(net, l, &info);
+                        spingalett_set_parameters(net, l, PARAM_WEIGHTS, p + off, info.weight_count);
+                        off += info.weight_count;
+                        spingalett_set_parameters(net, l, PARAM_BIASES, p + off, info.bias_count);
+                        off += info.bias_count;
+                    }
+                    free(p);
+                }
+                spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+                a.reset_optimizer = true;   /* the moments of the GPU's step are not set in the fresh one */
+                train_struct_arguments(a);
+            }
+            w[k] = gpu_params_of(net, &count);
+            free(x); free(t); free(y);
+            free_network(net);
+        }
+        const bool same = !memcmp(w[0], w[1], count * sizeof(float)) && !memcmp(w[0], w[2], count * sizeof(float));
+        const bool cpu = !memcmp(w[3], w[4], count * sizeof(float));
+        CHECK(same, "gpu kept net %d: two calls of train() differ from one of two epochs", which);
+        CHECK(cpu, "gpu kept net %d: training on the CPU after the GPU did not start from its parameters", which);
+        printf("  gpu kept net %d: train() again on its copy %s, then on the CPU %s\n", which, same ? "ok" : "FAILED",
+               cpu ? "ok" : "FAILED");
+        for (int k = 0; k < 5; k++) free(w[k]);
+    }
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+}
+
 /* Products in bfloat16 on the matrix units (where the device has them): predictions within a few
    per cent of single precision (8 bits of mantissa in the operands), training as far along (its
    loss), and repeating bit for bit. */
@@ -4984,6 +5069,7 @@ int main(int argc, char **argv) {
             gpu_threads();
             gpu_trainer();
             gpu_callback();
+            gpu_kept();
             gpu_bf16();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
