@@ -102,9 +102,13 @@ uint64_t spg_gemm_workgroups(uint32_t M, uint32_t N, uint32_t z) {
 
 uint32_t spg_gemm_split(uint32_t M, uint32_t N, uint32_t K, uint32_t G, uint32_t *slice_k) {
     const uint64_t wg = spg_gemm_workgroups(M, N, G), outputs = (uint64_t)G * M * N;
+    /* (the slices' partial sums, written and read, at most an eighth of the operands' floats: the
+       MLP's weight gradients, 401,408 and 512,000 outputs of 2,048 terms, trained 13% faster in
+       bfloat16 unsplit than in four slices, while convolutions' of a few thousand outputs over a
+       hundred thousand pixels split as before) */
     uint32_t slices = 1;
     while (slices < 1024 && wg * slices < 512 && K / (2u * slices) >= 128u &&
-           2u * slices * outputs <= SPG_SPLIT_FLOATS)
+           2u * slices * outputs <= SPG_SPLIT_FLOATS && 16u * slices * outputs <= (uint64_t)(M + N) * K * G)
         slices *= 2;
     *slice_k = ((K + slices - 1) / slices + 7u) & ~7u;
     return (K + *slice_k - 1) / *slice_k;
