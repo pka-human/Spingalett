@@ -222,6 +222,13 @@ static uint64_t sample_floats(const NeuralNetwork *net, bool training) {
     return f + net->topology[net->layers - 1];      /* targets */
 }
 
+/* Samples of a training chunk, at most: products of 4,096 rows run closer to the matrix units' rate than
+   of 2,048, and a step takes half the submissions (full batches of the MLP of Examples/Benchmark.c train
+   5% faster in bfloat16 and 6 to 8% in single precision on an RTX 4050 Laptop GPU; 8,192 are no faster).
+   Batch normalization takes its statistics over each chunk: networks with it keep the CPU's chunks of
+   SPINGALETT_BATCH_CHUNK, and the same groups. */
+#define TRAINING_CHUNK 4096u
+
 /* Bytes of the activations of an inference chunk, at most: a chunk whose layers' outputs stay in the
    GPU's cache from one layer to the next runs faster than a larger one (the U-Net of
    Examples/Benchmark.c infers 1.57 times as fast in chunks of 32 MB as in chunks of 2,048 images on an
@@ -242,7 +249,10 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
     if (memory == 0 || want == 0) return 0;
     /* half the device's memory for the chunk's buffers (the parameters and scratch are smaller) */
     uint64_t per = sample_floats(net, training) * 4u, cap = memory / 2u / (per ? per : 1u);
-    if (training && cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
+    uint32_t chunk = TRAINING_CHUNK;
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_BATCH_NORM) chunk = SPINGALETT_BATCH_CHUNK;
+    if (training && cap > chunk) cap = chunk;
     /* inference in chunks that keep to the cache, of 64 samples at least */
     const uint64_t cached = INFERENCE_BYTES / inference_bytes(net);
     if (!training && cap > cached) cap = cached < 64u ? 64u : cached;

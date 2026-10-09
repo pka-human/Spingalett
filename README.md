@@ -851,8 +851,9 @@ train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,
   while the driver compiles the kernels, which it then keeps on disk (NVIDIA's cache is limited in
   size, which `__GL_SHADER_DISK_CACHE_SIZE` raises). Tiles change the speed, never the results;
   `SPINGALETT_GPU_TUNE=0` estimates them instead.
-- Training processes samples in chunks of up to 2048 that fit in half the GPU's memory; full-batch
-  training of networks with batch normalization normalizes over each chunk, as on the CPU.
+- Training processes samples in chunks of up to 4,096 that fit in half the GPU's memory; networks
+  with batch normalization, which full-batch training normalizes over each chunk, in chunks of up to
+  2,048, as on the CPU.
   Inference runs in chunks of at most 32 MB of activations as they are kept (64 samples at least;
   from host arrays 2,048 at most), whose layers' outputs stay in the GPU's cache from one layer to
   the next.
