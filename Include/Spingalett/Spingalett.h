@@ -204,8 +204,7 @@ typedef struct {
     NeuralNetwork *net;
     uint32_t neurons_amount;        /* dense: outputs; input layer: its size (or give its shape) */
     ActivationFunction act_func;    /* dense, conv, batch normalization, add and concatenation layers
-                                       (pooling layers have none); 0 is ACT_SIGMOID, so give ACT_NONE
-                                       for no activation */
+                                       (pooling layers have none); 0 is ACT_NONE */
     WeightInitialization weight_initialization;
     float dropout_rate;             /* [0, 1): inverted dropout on this layer's outputs during
                                        training; ignored on the input and output layers */

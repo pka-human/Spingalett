@@ -35,6 +35,20 @@ static void put64(uint8_t *p, uint64_t v) { put32(p, (uint32_t)v); put32(p + 4, 
 static void putf(uint8_t *p, float f) { uint32_t u; memcpy(&u, &f, 4); put32(p, u); }
 static size_t align16(size_t x) { return (x + 15) & ~(size_t)15; }
 
+/* An activation's code in .slett files (docs/ModelFormat.md): 0 sigmoid, 1 ReLU, 2 tanh, 3 leaky ReLU,
+   4 FOO52, 5 softmax, 6 none. */
+static uint8_t act_code(ActivationFunction act) {
+    switch (act) {
+        case ACT_SIGMOID:    return 0;
+        case ACT_RELU:       return 1;
+        case ACT_TANH:       return 2;
+        case ACT_LEAKY_RELU: return 3;
+        case ACT_FOO52:      return 4;
+        case ACT_SOFTMAX:    return 5;
+        default:             return 6;
+    }
+}
+
 typedef struct {
     uint32_t in, out;
     ActivationFunction act;
@@ -88,7 +102,7 @@ static uint8_t *build_image(size_t *size) {
         const Spec *s = &specs[l];
         uint8_t *e = img + 64 + 48 * l;
         put32(e, s->in); put32(e + 4, s->out);
-        e[8] = (uint8_t)s->act; e[9] = (uint8_t)s->precision;
+        e[8] = act_code(s->act); e[9] = (uint8_t)s->precision;
         put64(e + 16, off[l][0]); put64(e + 24, off[l][1]); put64(e + 32, off[l][2]);
         for (uint32_t j = 0; j < s->out; j++) {
             putf(img + off[l][2] + 4 * j, s->bias[j]);

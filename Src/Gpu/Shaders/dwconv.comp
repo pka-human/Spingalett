@@ -52,7 +52,7 @@
 
 layout(constant_id = 0) const uint MODE = APPLY;
 layout(constant_id = 1) const uint EPI = EPI_STORE;
-layout(constant_id = 2) const uint ACT = 6;
+layout(constant_id = 2) const uint ACT = ACT_NONE;
 layout(constant_id = 3) const uint KH = 3;      /* the window and the stride, constants: the divisions by */
 layout(constant_id = 4) const uint KW = 3;      /* the stride cost little then */
 layout(constant_id = 5) const uint SH = 1;

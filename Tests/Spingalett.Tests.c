@@ -2884,7 +2884,7 @@ static void model_conv(void) {
     Entry4 e1 = image_layer4(img, 0), e2 = image_layer4(img, 1), e3 = image_layer4(img, 2), e6 = image_layer4(img, 5);
     CHECK(rd32(img + 32) == 9 && rd32(img + 36) == 7 && e1.type == LAYER_CONV2D && e1.oh == 9 && e1.ow == 7 && e1.oc == 6 &&
           e1.kh == 3 && e1.ph == 1 && e1.sh == 1 && e2.type == LAYER_MAX_POOL2D && e2.oh == 4 && e2.ow == 3 && e2.w == 0 &&
-          e2.b == 0 && e2.act == ACT_NONE && e3.kh == 2 && e3.kw == 3 && e3.sw == 2 && e3.pw == 1 && e3.oh == 3 && e3.ow == 2 &&
+          e2.b == 0 && e2.act == 6 /* none */ && e3.kh == 2 && e3.kw == 3 && e3.sw == 2 && e3.pw == 1 && e3.oh == 3 && e3.ow == 2 &&
           e6.type == LAYER_DENSE && e6.oh == 1 && e6.kh == 0, "conv model: layer table");
 
     /* round trip: shapes, parameters, optimizer state */

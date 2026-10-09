@@ -27,13 +27,13 @@ uint to_bf16(float f) {
 #endif
 
 /* ActivationFunction */
-#define ACT_SIGMOID     0u
-#define ACT_RELU        1u
-#define ACT_TANH        2u
-#define ACT_LEAKY_RELU  3u
-#define ACT_FOO52       4u
-#define ACT_SOFTMAX     5u
-#define ACT_NONE        6u
+#define ACT_NONE        0u
+#define ACT_SIGMOID     1u
+#define ACT_RELU        2u
+#define ACT_TANH        3u
+#define ACT_LEAKY_RELU  4u
+#define ACT_FOO52       5u
+#define ACT_SOFTMAX     6u
 
 float activate(float x, uint act) {
     switch (act) {

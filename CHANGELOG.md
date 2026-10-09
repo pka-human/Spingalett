@@ -29,6 +29,13 @@ RTX 4050 Laptop GPU; README).
   against 5.00 M).
 
 ### Changed
+- **A layer without `.act_func` has no activation.** `ACT_NONE` is 0 in `ActivationFunction` (which now
+  reads none, sigmoid, ReLU, tanh, leaky ReLU, FOO52, softmax); before, an activation left out was
+  `ACT_SIGMOID`, so that an addition or concatenation written without `.act_func = ACT_NONE` applied a
+  sigmoid. Programs that relied on the implicit sigmoid give `.act_func = ACT_SIGMOID`. In Python,
+  `Layer` and `Network.add_layer()` default to `Activation.NONE` too, and `Activation`'s values follow
+  the C enum. `.slett` files keep their activation codes (0 is sigmoid there, 6 none): files of every
+  version load as before.
 - `TrainArgs`, `PredictArgs` and `EvaluateArgs` have new fields (above): programs built against 0.13
   need to be built again (the soname carries the minor version).
 - Depthwise convolutions (a group a channel) run on the GPU on a kernel of their own, which the matrix

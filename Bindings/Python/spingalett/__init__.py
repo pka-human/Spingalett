@@ -59,13 +59,13 @@ __all__ = [
 # Values mirror Include/Spingalett/Spingalett.h.
 
 class Activation(enum.IntEnum):
-    SIGMOID = 0
-    RELU = 1
-    TANH = 2
-    LEAKY_RELU = 3
-    FOO52 = 4
-    SOFTMAX = 5
-    NONE = 6
+    NONE = 0
+    SIGMOID = 1
+    RELU = 2
+    TANH = 3
+    LEAKY_RELU = 4
+    FOO52 = 5
+    SOFTMAX = 6
 
 
 class Loss(enum.IntEnum):
@@ -842,7 +842,7 @@ _Inputs = Optional[Union[int, Sequence[int]]]
 class Layer:
     """Dense layer description. Activation, init and dropout are ignored for the input layer."""
     neurons: int
-    activation: Activation = Activation.SIGMOID
+    activation: Activation = Activation.NONE
     init: Init = Init.RANDOM
     dropout: float = 0.0
     inputs: _Inputs = None
@@ -1245,7 +1245,7 @@ class Network:
         ``inputs`` to read it."""
         return len(self) - 1
 
-    def add_layer(self, neurons: int, activation: Activation = Activation.SIGMOID,
+    def add_layer(self, neurons: int, activation: Activation = Activation.NONE,
                   init: Init = Init.RANDOM, dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
         """Append a dense layer; the first layer added is the input layer. Every layer reads the one
         before it unless ``inputs`` names another (an index, negative ones counting back from the new

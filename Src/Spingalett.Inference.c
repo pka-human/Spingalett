@@ -1264,7 +1264,7 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
     memset(layer, 0, sizeof *layer);
     layer->inputs = slett_get32(e);
     layer->outputs = slett_get32(e + 4);
-    layer->activation = (ActivationFunction)e[8];
+    layer->activation = slett_act(e[8]);
     layer->precision = (PrecisionMode)e[9];
     uint32_t d = slett_get32(e + 12);
     memcpy(&layer->dropout, &d, 4);

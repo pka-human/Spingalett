@@ -22,7 +22,7 @@
 #include "common.glsl"
 
 layout(constant_id = 0) const uint OP = 0;
-layout(constant_id = 1) const uint ACT = 6;
+layout(constant_id = 1) const uint ACT = ACT_NONE;
 layout(constant_id = 2) const uint BACKWARD = 0;
 layout(constant_id = 3) const uint HALF = 0;    /* words: x 0, y 1, b 2 (half.glsl) */
 layout(local_size_x = 256) in;

@@ -248,7 +248,7 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
         uint8_t *e = img + SLETT_HEADER_SIZE + (size_t)l * entry_size;
         slett_put32(e, net->topology[spingalett_source(net, l + 1)]);
         slett_put32(e + 4, net->topology[l + 1]);
-        e[8] = (uint8_t)net->act_func[l];
+        e[8] = slett_act_code(net->act_func[l]);
         e[9] = (uint8_t)p;
         uint32_t bits;
         memcpy(&bits, &net->dropout_rates[l + 1], 4);
@@ -782,8 +782,12 @@ static NeuralNetwork *load_legacy(const uint8_t *data, size_t size, PrecisionMod
         if (topology[i] == 0) { set_error(SPINGALETT_ERR_INVALID, "load: invalid topology"); ok = false; }
     for (uint32_t i = 0; ok && i + 1 < layers; i++) {
         uint8_t a;
-        if (!take(&c, &a, 1) || a >= ACT_COUNT) { set_error(SPINGALETT_ERR_INVALID, "load: invalid activation function"); ok = false; }
-        else act[i] = (ActivationFunction)a;
+        if (!take(&c, &a, 1) || slett_act(a) == ACT_COUNT) {
+            set_error(SPINGALETT_ERR_INVALID, "load: invalid activation function");
+            ok = false;
+        } else {
+            act[i] = slett_act(a);
+        }
     }
     if (ok && version >= 2) {                         /* v2: dropout rate of every non-input layer */
         ok = take(&c, dropout + 1, (size_t)(layers - 1) * 4u);

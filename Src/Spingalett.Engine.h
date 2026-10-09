@@ -73,6 +73,16 @@ static inline uint64_t slett_get64(const uint8_t *p) { uint64_t v; memcpy(&v, p,
 static inline void slett_put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 static inline void slett_put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 static inline void slett_put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
+/* Activations as .slett files code them, fixed since format version 1: 0 sigmoid, 1 ReLU, 2 tanh,
+   3 leaky ReLU, 4 FOO52, 5 softmax, 6 none; ActivationFunction has none first, then the same order.
+   slett_act() gives ACT_COUNT for a code that names none. */
+#define SLETT_ACT_NONE 6u
+static inline uint8_t slett_act_code(ActivationFunction act) {
+    return act == ACT_NONE ? (uint8_t)SLETT_ACT_NONE : (uint8_t)(act - 1);
+}
+static inline ActivationFunction slett_act(uint32_t code) {
+    return code == SLETT_ACT_NONE ? ACT_NONE : code < SLETT_ACT_NONE ? (ActivationFunction)(code + 1u) : ACT_COUNT;
+}
 static inline uint64_t slett_align(uint64_t x) { return (x + SLETT_SECTION_ALIGN - 1) & ~(uint64_t)(SLETT_SECTION_ALIGN - 1); }
 
 bool spingalett_host_is_little_endian(void);

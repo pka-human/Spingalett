@@ -197,7 +197,7 @@ one being the input layer. `LayerArgs` fields:
 | Field | Meaning |
 |---|---|
 | `neurons_amount` | Layer width |
-| `act_func` | Activation of this layer (ignored for the input layer) |
+| `act_func` | Activation of this layer (ignored for the input layer); left out, `ACT_NONE` |
 | `weight_initialization` | `RANDOM` (uniform in [-1, 1]), `XAVIER` (Glorot normal, variance 2/(fan_in + fan_out)), `HE` (normal, variance 2/fan_in), `LECUN` (normal, variance 1/fan_in), `NONE` (zeros) |
 | `dropout_rate` | Probability in [0, 1) of zeroing each output of this layer during training |
 
@@ -285,7 +285,7 @@ Every builder returns the index of the layer it adds (`SPINGALETT_NO_LAYER` on e
 `.inputs` names the earlier layers a layer reads; without it a layer reads the one added before it,
 so chains are built as before. Two kinds of layers combine others: `add_layers()` sums layers of
 one shape and `concat_layers()` puts layers of one height and width side by side along the
-channels, each followed by its `.act_func` (0 is `ACT_SIGMOID`: give `ACT_NONE` for none).
+channels, each followed by its `.act_func` (none when left out).
 `global_avg_pool2d()` averages each channel over all cells. A residual block of ResNet:
 
 ```c

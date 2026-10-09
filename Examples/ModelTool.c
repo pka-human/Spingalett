@@ -38,7 +38,7 @@ static const char *precision_name(PrecisionMode p) {
 }
 
 static const char *activation_name(ActivationFunction a) {
-    static const char *names[] = {"sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax", "none"};
+    static const char *names[] = {"none", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax"};
     return (unsigned)a < ACT_COUNT ? names[a] : "?";
 }
 

@@ -72,14 +72,15 @@ extern "C" {
 #define SPINGALETT_ERR_FILE_IO          3   /* file could not be opened, read or written, or is truncated */
 #define SPINGALETT_ERR_FORMAT_VERSION   4   /* model file written by an unsupported format version */
 
+/* Activations (0 is none). .slett files keep codes of their own (docs/ModelFormat.md). */
 typedef enum {
+    ACT_NONE,
     ACT_SIGMOID,
     ACT_RELU,
     ACT_TANH,
-    ACT_LEAKY_RELU,
-    ACT_FOO52,
-    ACT_SOFTMAX,
-    ACT_NONE,
+    ACT_LEAKY_RELU,                 /* slope 0.01 below zero */
+    ACT_FOO52,                      /* slope 0.01 below 0 and above 1, identity between */
+    ACT_SOFTMAX,                    /* over the layer's outputs */
     ACT_COUNT
 } ActivationFunction;
 
