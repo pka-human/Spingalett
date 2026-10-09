@@ -714,9 +714,9 @@ def gpu_device() -> Optional[str]:
 def set_gpu_precision(precision: "Precision") -> bool:
     """Precision of the GPU's matrix products: Precision.FLOAT32 (the default) or Precision.BFLOAT16
     (operands rounded to bfloat16 on the GPU's matrix units, products added in single precision;
-    the layers' outputs but the output layer's kept on the GPU as bfloat16, as PyTorch's autocast
-    keeps them). Devices without bfloat16 matrix units keep single precision. Returns whether the
-    GPU multiplies in that precision."""
+    the layers' outputs but the output layer's, and their gradients, kept on the GPU as bfloat16, as
+    PyTorch's autocast keeps them). Devices without bfloat16 matrix units keep single precision.
+    Returns whether the GPU multiplies in that precision."""
     return bool(_set_gpu_precision(int(precision)))
 
 

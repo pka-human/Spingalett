@@ -75,6 +75,7 @@ struct SpgGpuNet {
     SpgGpuCommands *once;           /* uploads and downloads */
     uint32_t *uses, *pending;       /* consumers of each layer, and those not yet back-propagated */
     uint8_t *half;                  /* outputs kept in memory as bfloat16 (kept_half()) */
+    uint8_t *dhalf;                 /* and their gradients */
     /* batch normalization layers (no activation, no dropout) read only by an addition of two layers,
        which applies them as it adds (their own outputs are never stored, and their gradient is the
        addition's): fold[l] = that addition, or 0 */
@@ -389,10 +390,12 @@ static uint64_t part_floats(const NeuralNetwork *net, uint32_t capacity) {
 }
 
 /* Whether layer l's outputs are kept as bfloat16: with products in bfloat16, those of every layer but
-   the output layer (and a softmax), the network's input among them (rounded by the host). Products
-   round their operands to bfloat16 anyway; the passes between them (normalizations, pooling,
-   additions, concatenations, upsampling, dropout) read and write bfloat16 and compute in single
-   precision, as PyTorch's autocast keeps activations. Gradients stay in single precision. */
+   the output layer (and a softmax), the network's input among them (rounded by the host), and their
+   gradients in training. Products round their operands to bfloat16 anyway; the passes between them
+   (normalizations, pooling, additions, concatenations, upsampling, dropout) read and write bfloat16
+   and compute in single precision, as PyTorch's autocast keeps activations and their gradients. The
+   parameters' gradients (summed in single precision by the products) and the optimizer stay in
+   single precision. */
 static bool kept_half(const SpgGpuNet *g, uint32_t l) {
     const NeuralNetwork *net = g->net;
     if (!g->bf16 || !spg_gpu_bf16_storage() || l + 1 >= net->layers || g->uses[l] == 0 || g->fold[l]) return false;
@@ -410,7 +413,7 @@ void spingalett_gpu_net_free(SpgGpuNet *g) {
     for (uint32_t k = 0; k < 2; k++) spingalett_aligned_free(g->slots[k].host_inputs);
     for (uint32_t l = 0; g->conv && l < g->layers; l++) free(g->conv[l]);
     free(g->act); free(g->delta); free(g->dmask); free(g->geo); free(g->conv); free(g->bn);
-    free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold); free(g->half);
+    free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold); free(g->half); free(g->dhalf);
     free(g);
     spg_gemm_release();
 }
@@ -438,8 +441,9 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
     g->boff = (uint64_t *)calloc(L, sizeof(uint64_t));
     g->fold = (uint32_t *)calloc(L, sizeof(uint32_t));
     g->half = (uint8_t *)calloc(L, 1);
+    g->dhalf = (uint8_t *)calloc(L, 1);
     if (!g->act || !g->delta || !g->dmask || !g->geo || !g->conv || !g->bn || !g->uses || !g->pending ||
-        !g->woff || !g->boff || !g->fold || !g->half)
+        !g->woff || !g->boff || !g->fold || !g->half || !g->dhalf)
         goto fail;
     for (uint32_t l = 1; l < L; l++)
         for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) g->uses[spingalett_inputs(net, l)[k]]++;
@@ -455,7 +459,10 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
             }
         }
     }
-    for (uint32_t l = 0; l < L; l++) g->half[l] = kept_half(g, l);
+    for (uint32_t l = 0; l < L; l++) {
+        g->half[l] = kept_half(g, l);
+        g->dhalf[l] = training && l > 0 && g->half[l];
+    }
     /* every layer's parameters at a multiple of four floats */
     for (uint32_t l = 0; l + 1 < L; l++) {
         uint64_t rows = spingalett_weight_rows(net, l);
@@ -481,7 +488,8 @@ SpgGpuNet *spingalett_gpu_net_create(NeuralNetwork *net, uint32_t capacity, cons
         const LayerShape *s = &net->shapes[l];
         const uint64_t rows = (uint64_t)capacity * net->topology[l] * 4u;
         if (l > 0 && !g->fold[l]) spg_gpu_arena_add(A, &g->act[l], g->half[l] ? rows / 2u : rows, SPG_MEMORY_DEVICE);
-        if (training && l > 0 && !g->fold[l]) spg_gpu_arena_add(A, &g->delta[l], rows, SPG_MEMORY_DEVICE);
+        if (training && l > 0 && !g->fold[l])
+            spg_gpu_arena_add(A, &g->delta[l], g->dhalf[l] ? rows / 2u : rows, SPG_MEMORY_DEVICE);
         if (training && l > 0 && l + 1 < L && net->dropout_rates[l] > 0.0f)
             spg_gpu_arena_add(A, &g->dmask[l], rows, SPG_MEMORY_DEVICE);
         if (l > 0 && g->uses[l] > 1 && net->topology[l] > widest_shared) widest_shared = net->topology[l];
@@ -617,10 +625,13 @@ static void need(Recorder *r, const Access *a) {
     r->group = a->group;
 }
 
-/* Whether address is in the output of a layer kept as bfloat16. */
+/* Whether address is in the output (or the gradient) of a layer kept as bfloat16. */
 static bool in_half(const SpgGpuNet *g, uint64_t address) {
-    for (uint32_t l = 0; address && l < g->layers; l++)
+    for (uint32_t l = 0; address && l < g->layers; l++) {
         if (g->half[l] && address >= g->act[l].address && address < g->act[l].address + g->act[l].size) return true;
+        if (g->dhalf[l] && address >= g->delta[l].address && address < g->delta[l].address + g->delta[l].size)
+            return true;
+    }
     return false;
 }
 

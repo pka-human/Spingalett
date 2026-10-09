@@ -31,18 +31,19 @@ changes, which are listed under **Changed**.
   `Bin/Benchmark gpu`: 10.7 to 5.4 s, once per process).
 
 - With `PRECISION_BFLOAT16`, the GPU keeps the layers' outputs (all but the output layer's, and the
-  network's inputs) as bfloat16, the values the products round them to anyway, as PyTorch's autocast
-  does: half the memory and half the bytes every pass moves. The matrix units' kernel reads them
+  network's inputs) and their gradients as bfloat16, the values the products round them to anyway,
+  as PyTorch's autocast does: half the memory and half the bytes every pass moves. The matrix units' kernel reads them
   eight to a load and moves their bits to shared memory as they are; normalizations, pooling,
   additions, concatenations, upsampling and dropout read and write bfloat16 and compute in single
   precision (variants of their kernels built with 16-bit storage, which only devices with bfloat16
   matrix units are asked for); the host rounds the inputs as it sends them, halving the bytes.
-  Parameters, gradients and the optimizer stay in single precision. On an RTX 4050 Laptop GPU, in
-  bfloat16: ResNet-20 trains at 14,300 samples per second instead of 11,500 and infers at 51,100
-  instead of 29,300, the U-Net 5,260 and 12,500 instead of 4,190 and 7,670, the MLP infers at
-  2,940,000 instead of 1,840,000; CIFAR-10 with `Examples/CIFAR10.c resnet20` reaches the same test
-  accuracy after 10 epochs (85.10% against 85.04%), 24% faster. `SPINGALETT_GPU_NO_BF16_STORAGE=1`
-  keeps them in single precision.
+  Parameters, their gradients and the optimizer stay in single precision. On an RTX 4050 Laptop
+  GPU, in bfloat16: ResNet-20 trains at 16,600 samples per second instead of 11,500 and infers at
+  51,100 instead of 29,300, the U-Net 5,260 and 12,500 instead of 4,190 and 7,670 (before the
+  gradients), the MLP infers at 2,940,000 instead of 1,840,000; CIFAR-10 with `Examples/CIFAR10.c
+  resnet20` reaches the same test accuracy after 10 epochs (85.40%, single precision 85.18%) at
+  15,800 samples per second instead of 9,980 (single precision 8,680).
+  `SPINGALETT_GPU_NO_BF16_STORAGE=1` keeps them in single precision.
 
 - The GPU's pooling backward pass takes windows that tile the input (stride the window, no padding,
   as 2 x 2 max pooling of stride 2) a thread per window: it finds the maximum once and writes the
