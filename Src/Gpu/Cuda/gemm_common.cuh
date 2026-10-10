@@ -26,6 +26,7 @@
 #define EPI_PARTIAL     3u
 #define EPI_DERIV       4u
 #define FLAG_BIAS       1u
+#define FLAG_PRE        2u
 
 #define GEO_RH 0u
 #define GEO_RW 1u

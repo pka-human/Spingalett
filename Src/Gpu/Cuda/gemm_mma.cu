@@ -20,7 +20,10 @@
  * An output's products are added 16 values of k at a time, in the order of k, by the same instruction
  * whatever the tile: tiles change the speed only. The results go to the epilogue through shared memory,
  * four outputs of a row a thread, for the activations (and derivatives) that are a slope only
- * (act_slope()): Spingalett.Cuda.c runs the others as EPI_STORE and the pass of epi.cu.
+ * (act_slope()). Units built with GENERAL (dense layers' modes: Kernels.def) hold the others instead
+ * (GELU, SiLU, ...), and with FLAG_PRE EPI_BIAS_ACT also stores its values before the activation at e1
+ * (kept for those derivatives); Spingalett.Cuda.c runs the others of the other units as EPI_STORE and
+ * the pass of epi.cu.
  */
 
 #include "gemm_common.cuh"
@@ -44,6 +47,10 @@ DEVICE void st_shared64(uint32_t at, uint32_t a, uint32_t b) {
     asm volatile("st.shared.v2.u32 [%0], {%1, %2};" ::"r"(at), "r"(a), "r"(b) : "memory");
 }
 
+#if !defined(GENERAL)
+#define GENERAL 0
+#endif
+
 /* What the epilogue needs. */
 struct Epi {
     uint64_t c, e0, e1;
@@ -60,6 +67,20 @@ DEVICE void store_one(const Epi &e, float slope, uint32_t z, uint32_t coff, uint
         return;
     }
     const uint32_t at = coff + row * e.ldc + n;
+#if GENERAL
+    if (e.epi == EPI_BIAS_ACT) {
+        if (e.flags & FLAG_BIAS) v += F(e.e0)[coff + n];
+        if (e.flags & FLAG_PRE) st(e.e1, at, 2u, e.half, v);
+        v = activate(v, e.act);
+    } else if (e.epi == EPI_SCALE_ACT) {
+        v = activate(v * F(e.e0)[coff + n] + F(e.e1)[coff + n], e.act);
+    } else {
+        v *= e.alpha;
+        if (e.beta != 0.0f) v += e.beta * ld(e.c, at, 2u, e.half);
+        if (e.epi == EPI_DERIV) v *= derivative(ld(e.e0, at, 3u, e.half), e.act);
+    }
+    (void)slope;
+#else
     if (e.epi == EPI_BIAS_ACT) {
         if (e.flags & FLAG_BIAS) v += F(e.e0)[coff + n];
         v = sloped(v, slope);
@@ -70,6 +91,7 @@ DEVICE void store_one(const Epi &e, float slope, uint32_t z, uint32_t coff, uint
         if (e.beta != 0.0f) v += e.beta * ld(e.c, at, 2u, e.half);
         if (e.epi == EPI_DERIV) v *= sloped_derivative(ld(e.e0, at, 3u, e.half), slope);
     }
+#endif
     st(e.c, at, 2u, e.half, v);
 }
 
@@ -81,6 +103,24 @@ DEVICE void store_four(const Epi &e, float slope, uint32_t z, uint32_t coff, uin
         return;
     }
     const uint32_t at = coff + row * e.ldc + n;
+#if GENERAL
+    if (e.epi == EPI_BIAS_ACT) {
+        if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
+        if (e.flags & FLAG_PRE) st4(e.e1, at, 2u, e.half, v);
+        v = activate4(v, e.act);
+    } else if (e.epi == EPI_SCALE_ACT) {
+        v = activate4(add4(mul4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]), ((const float4_ *)e.e1)[(coff + n) >> 2]),
+                      e.act);
+    } else {
+        v = scale4(v, e.alpha);
+        if (e.beta != 0.0f) v = add4(v, scale4(ld4(e.c, at, 2u, e.half), e.beta));
+        if (e.epi == EPI_DERIV) {
+            const float4_ d = ld4(e.e0, at, 3u, e.half);
+            v = mul4(v, float4_{derivative(d.x, e.act), derivative(d.y, e.act), derivative(d.z, e.act), derivative(d.w, e.act)});
+        }
+    }
+    (void)slope;
+#else
     if (e.epi == EPI_BIAS_ACT) {
         if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
         v = sloped4(v, slope);
@@ -95,6 +135,7 @@ DEVICE void store_four(const Epi &e, float slope, uint32_t z, uint32_t coff, uin
                                 sloped_derivative(d.w, slope)});
         }
     }
+#endif
     st4(e.c, at, 2u, e.half, v);
 }
 
@@ -384,7 +425,8 @@ struct Mma {
            rows of 16 bytes a warp; read back, a thread finishes four consecutive outputs of a row */
         const uint32_t coff = g * p.c_group;
         const Epi e = {p.c, p.e0, p.e1, p.M, p.N, p.ldc, EPI, ACT, p.flags, HALF, p.alpha, p.beta};
-        /* (the epilogues whose activation or derivative is no slope run as EPI_STORE and epi.cu's pass) */
+        /* (without GENERAL, the epilogues whose activation or derivative is no slope run as EPI_STORE and epi.cu's
+           pass) */
         const float slope = EPI == EPI_DERIV ? act_slope(ACT) : act_slope_forward(ACT);
         /* four outputs at once: at indices of C (and of e0 with it) that are multiples of four, at 16 bytes */
         const bool fours = (p.c % 16u) == 0u &&

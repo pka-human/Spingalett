@@ -4,9 +4,10 @@
 */
 
 /* The epilogues of the products whose activation (or derivative) is no slope (act_slope()): sigmoid, tanh
-   and the like. The products (gemm.cu, gemm_mma.cu) hold the sloped epilogues only; Spingalett.Cuda.c runs
-   the others as the product with EPI_STORE, then this pass over its outputs in C, with the product's push
-   constants and spec (EPI 7, ACT 8, PHASED 10, HALF 13: C 4, e0 8): block z the group, a grid-stride loop. */
+   and the like. gemm.cu and dconv.cu hold the sloped epilogues only (gemm_mma.cu every one); Spingalett.Cuda.c
+   runs the others as the product with EPI_STORE, then this pass over its outputs in C, with the product's push
+   constants and spec (EPI 7, ACT 8, PHASED 10, HALF 13: C 4, e0 8): block z the group, a grid-stride loop.
+   With FLAG_PRE, EPI_BIAS_ACT also stores the values before the activation at e1. */
 
 #include "gemm_common.cuh"
 
@@ -29,6 +30,7 @@ KERNEL(epi, SpgGemmPush) {
         float v = ld(p.c, at, 2u, HALF);
         if (EPI == EPI_BIAS_ACT) {
             if (p.flags & FLAG_BIAS) v += F(p.e0)[coff + n];
+            if (p.flags & FLAG_PRE) st(p.e1, at, 2u, HALF, v);
             v = activate(v, ACT);
         } else if (EPI == EPI_SCALE_ACT) {
             v = activate(v * F(p.e0)[coff + n] + F(p.e1)[coff + n], ACT);

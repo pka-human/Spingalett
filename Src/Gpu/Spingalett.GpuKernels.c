@@ -46,6 +46,7 @@ static const Tile cuda_fp32_tiles[] = {
 #define SPG_CUDA_DW_WINDOW(kh, kw, sh, sw)
 #define SPG_CUDA_MMA_TILE(bm, bn, bk, tm, tn)
 #define SPG_CUDA_MMA_MODES(a, b, ka, kb)
+#define SPG_CUDA_MMA_GENERAL(a, b, ka, kb)
 #define SPG_CUDA_GEMM_TILE(bm, bn, bk, tm, tn) {bm, bn, bk, tm, tn},
 #include "Cuda/Kernels.def"
 #undef SPG_CUDA_GEMM_TILE
@@ -63,6 +64,7 @@ static const Tile cuda_mma_tiles[] = {
 #undef SPG_CUDA_GEMM_TILE
 #undef SPG_CUDA_MMA_TILE
 #undef SPG_CUDA_MMA_MODES
+#undef SPG_CUDA_MMA_GENERAL
 };
 
 typedef struct { const Tile *list; uint32_t count; } Table;

@@ -105,6 +105,9 @@ struct SpgGpuNet {
        or an attention's backward pass its outputs (an attention with an activation): pre[l], laid out
        and kept (as bfloat16 or not) like act[l] */
     SpgGpuBuffer *pre;
+    /* while a training forward pass is recorded on CUDA: where the product of the layer being recorded stores its
+       values before the activation (SPG_GEMM_PRE: gemm_mma.cu's epilogue or epi.cu's), else NULL */
+    const SpgGpuBuffer *pre_out;
     /* training with embeddings: the stable sort of a chunk's tokens (four arrays of capacity x the
        widest embedding's tokens: keys and positions, read from and written to) */
     SpgGpuBuffer sort;
@@ -1216,6 +1219,15 @@ static bool pointwise(const NeuralNetwork *net, uint32_t l) {
            s->stride_w == 1u && s->pad_h == 0u && s->pad_w == 0u && layer_groups(s) == 1u;
 }
 
+/* A forward product with biases (EPI_BIAS_ACT) of the layer whose values before the activation are being kept
+   (pre_out): it stores them too. */
+static void keep_pre(const SpgGpuNet *g, Access *a, SpgGemmPush *p, bool bias_act) {
+    if (!g->pre_out || !bias_act) return;
+    p->e1 = g->pre_out->address;
+    p->flags |= SPG_GEMM_PRE;
+    writes(a, whole(g->pre_out));
+}
+
 static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *x, const SpgGpuBuffer *y,
                        uint32_t n, uint32_t epi, uint32_t act, uint64_t e0, float beta) {
     if (depthwise(g->net, l)) {
@@ -1238,6 +1250,7 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
         if (bias) reads(a, biases_of(g, l - 1));
         if (epi == SPG_EPI_SCALE_ACT) reads(a, span(e0, 2ull * v.out_c));
         writes(a, whole(y));
+        keep_pre(g, a, &p, bias);
         product(r, a, &p, &m);
         return;
     }
@@ -1260,6 +1273,7 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
     if (epi == SPG_EPI_SCALE_ACT) reads(a, span(e0, 2ull * v.out_c));
     reads(a, whole(&g->geo[l]));
     writes(a, whole(y));
+    keep_pre(g, a, &p, bias);
     product(r, a, &p, &m);
 }
 
@@ -1391,6 +1405,7 @@ static void dense_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const 
     if (scales) reads(a, span(scales, 2ull * N));
     else reads(a, biases_of(g, l - 1));
     writes(a, whole(y));
+    keep_pre(g, a, &p, !scales);
     product(r, a, &p, &m);
 }
 
@@ -1544,9 +1559,15 @@ static void embed_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n) {
     kernel(r, &a, SPG_KERNEL_embed, spec, 1, &p, sizeof p, groups((uint64_t)n * tokens * (d % 4u ? d : d / 4u), 256u), 1, 1);
 }
 
-/* The tiles of attn.comp for a head size: its unit's largest head (DMAX), rows of a tile, threads. */
-static void attn_tiles(uint32_t head, uint32_t *dmax, uint32_t *bq, uint32_t *threads) {
+/* The tiles of a pass of attn.comp for a head size: its unit's largest head (DMAX), rows of a tile, threads;
+   on CUDA, rattn.cu's for heads of up to 128. */
+static void attn_tiles(uint32_t head, uint32_t op, uint32_t *dmax, uint32_t *bq, uint32_t *threads) {
     *dmax = head <= 32u ? 32u : head <= 64u ? 64u : head <= 128u ? 128u : 256u;
+    if (spg_gpu_using() == SPG_BACKEND_CUDA && *dmax <= 128u) {
+        *bq = SPG_RATTN_ROWS(*dmax, op);
+        *threads = SPG_RATTN_THREADS(*dmax, op);
+        return;
+    }
     *bq = *dmax == 32u ? 32u : *dmax == 64u ? 16u : *dmax == 128u ? 8u : 4u;
     *threads = *dmax == 32u ? 128u : *dmax == 256u ? 16u : 64u;
 }
@@ -1558,7 +1579,7 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
     const LayerShape *s = &g->net->shapes[l];
     const uint32_t cells = s->height * s->width, head = s->channels / s->heads;
     uint32_t dmax, bq, threads;
-    attn_tiles(head, &dmax, &bq, &threads);
+    attn_tiles(head, op, &dmax, &bq, &threads);
     SpgAttnPush p = {.x = x, .y = y, .dy = dy, .dx = dx, .stats = g->bn[l].buffer ? g->bn[l].address : 0,
                      .table = g->geo[l].buffer ? g->geo[l].address : 0, .n = n, .cells = cells, .heads = s->heads,
                      .kv = s->kv_heads, .d = head,
@@ -1632,6 +1653,14 @@ static void output_kernel(Recorder *r, const Access *a, uint32_t spec[4], const 
            1);
 }
 
+/* Whether layer l's forward pass is a product that can store its values before the activation as well
+   (SPG_GEMM_PRE: CUDA's dense layers and convolutions but depthwise ones). */
+static bool products_keep_pre(const SpgGpuNet *g, uint32_t l) {
+    const LayerType type = g->net->shapes[l].type;
+    return spg_gpu_using() == SPG_BACKEND_CUDA &&
+           (type == LAYER_DENSE || (type == LAYER_CONV2D && !depthwise(g->net, l)));
+}
+
 static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
     const NeuralNetwork *net = g->net;
     for (uint32_t l = 1; l < net->layers; l++) {
@@ -1640,12 +1669,14 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
         const bool masked = train && g->dmask[l].buffer;
         const uint64_t total = (uint64_t)n * net->topology[l];
         /* softmax runs over whole rows after the layer; every other activation in its kernel, but with
-           values kept before it (pre[], training) the layer writes those, an element-wise pass act[l] */
-        const bool pre = train && g->pre[l].buffer;
+           values kept before it (pre[], training) the layer writes those, an element-wise pass act[l]; on CUDA
+           a dense or convolution layer's product stores both (pre_out) */
+        const bool kept = train && g->pre[l].buffer, both = kept && products_keep_pre(g, l), pre = kept && !both;
         const uint32_t fused = act == ACT_SOFTMAX || pre ? ACT_NONE : act;
         if (!train && g->into[l]) continue;     /* its product runs with the normalization it applies */
         const SpgGpuBuffer outputs = g->act[l];
         if (pre) g->act[l] = g->pre[l];
+        g->pre_out = both ? &g->pre[l] : NULL;
         if (type == LAYER_DENSE) dense_forward(g, r, l, n, fused);
         else if (spingalett_filters(type)) conv_forward(g, r, l, n, fused);
         else if (type == LAYER_BATCH_NORM) bn_forward(g, r, l, n, fused, train);
@@ -1673,6 +1704,7 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
                 eltwise(g, r, &a, SPG_ELT_BIAS_ACT, fused, g->act[l].address, 0, 0, 0, total, net->topology[l]);
             }
         }
+        g->pre_out = NULL;
         if (pre) {
             g->act[l] = outputs;
             Access a = {0};
@@ -1694,7 +1726,7 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
             SpgEltwisePush p = {g->act[l].address, g->dmask[l].address, 0, 0, g->header.address, (uint32_t)total,
                                 net->topology[l], l, (uint32_t)((double)rate * 4294967296.0), 1.0f / (1.0f - rate), 0,
                                 0};
-            uint32_t spec[2] = {SPG_ELT_DROPOUT, pre ? ACT_NONE : act};    /* (with pre[], the mask alone) */
+            uint32_t spec[2] = {SPG_ELT_DROPOUT, kept ? ACT_NONE : act};   /* (with pre[], the mask alone) */
             Access a = {0};
             reads(&a, whole(&g->act[l]));
             reads(&a, whole(&g->header));

@@ -287,6 +287,8 @@ static bool grid_stride(SpgKernel kernel) {
     }
 }
 
+static bool sloped_epilogue(uint32_t epi, uint32_t act);
+
 /* The unit that runs a kernel with these constants: the kernel's own, its tile's or window's. */
 static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     char name[64];
@@ -310,22 +312,25 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
                  v ? "v" : "");
     } else if (kernel == SPG_KERNEL_gemm_mma) {
         if (count < 14) return -1;
+        const bool general = !sloped_epilogue(spec[7], spec[8]);   /* (only the units with GENERAL, else none) */
         /* each operand: kept as bfloat16 and read eight values at once (w: VEC 4, 8), floats read four at once
            (f: VEC 1, 2), else o; the instances of Kernels.def, or else the one that reads anything */
         const uint32_t vec = spec[11], half = spec[13];
         const char ka = vec & 4u ? 'w' : (vec & 1u) && !(half & 1u) ? 'f' : 'o';
         const char kb = vec & 8u ? 'w' : (vec & 2u) && !(half & 2u) ? 'f' : 'o';
-        for (int any = 0; any < 2; any++) {
-            snprintf(name, sizeof name, "gemm_mma_%ux%ux%u_%ux%u_a%ub%u_%c%c", spec[0], spec[1], spec[2], spec[3], spec[4],
-                     spec[5], spec[6], any ? 'o' : ka, any ? 'o' : kb);
+        for (int any = 0; any < (general ? 1 : 2); any++) {
+            snprintf(name, sizeof name, "gemm_mma_%ux%ux%u_%ux%u_a%ub%u_%c%c%s", spec[0], spec[1], spec[2], spec[3], spec[4],
+                     spec[5], spec[6], any ? 'o' : ka, any ? 'o' : kb, general ? "_g" : "");
             for (uint32_t u = 0; u < UNIT_COUNT; u++)
                 if (!strcmp(spg_cuda_units[u].name, name)) return (int)u;
         }
         return -1;
     } else if (kernel == SPG_KERNEL_attn || kernel == SPG_KERNEL_attn_h) {
         if (count < 3) return -1;
-        /* the unit of its head size; with BQ 0 the matrix units' (flash.cu) of its head size and pass */
+        /* the unit of its head size and pass: with BQ 0 the matrix units' (flash.cu), else rattn.cu's (heads of up
+           to 128) or attn.cu's */
         if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], spec[0]);
+        else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u", spec[2], spec[0]);
         else snprintf(name, sizeof name, "attn_d%u", spec[2]);
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
@@ -669,8 +674,9 @@ static bool cub_record_begin(void *commands) {
     return true;
 }
 
-/* Whether a product's epilogue is one gemm.cu and gemm_mma.cu hold: its activation (or with EPI_DERIV its
-   derivative) a slope below zero, or none (softmax, which the output pass applies, leaves the outputs as they are). */
+/* Whether a product's epilogue is one gemm.cu, gemm_mma.cu and dconv.cu hold: its activation (or with EPI_DERIV its
+   derivative) a slope below zero, or none (softmax, which the output pass applies, leaves the outputs as they are).
+   gemm_mma.cu's units built with GENERAL hold the others. */
 static bool sloped_epilogue(uint32_t epi, uint32_t act) {
     const bool sloped = act == SPINGALETT_ACT_NONE || act == SPINGALETT_ACT_RELU || act == SPINGALETT_ACT_LEAKY_RELU;
     if (epi == SPG_EPI_BIAS_ACT || epi == SPG_EPI_SCALE_ACT) return sloped || act == SPINGALETT_ACT_SOFTMAX;
@@ -724,10 +730,13 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
                          uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
     CuCommands *c = (CuCommands *)commands;
     if (gx == 0 || gy == 0 || gz == 0) return;
-    /* the other epilogues (sigmoid, tanh, ...): the product with EPI_STORE (and with EPI_DERIV its alpha and beta),
-       then epi.cu's pass over its outputs, in the groups in z (such epilogues have no slices) */
+    /* the other epilogues (sigmoid, tanh, ...) where no unit with GENERAL runs the product: the product with EPI_STORE
+       (and with EPI_DERIV its alpha and beta), then epi.cu's pass over its outputs, in the groups in z (such epilogues
+       have no slices) */
     if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 9 && spec_count <= SPG_SPEC_MAX &&
-        push_size == sizeof(SpgGemmPush) && !sloped_epilogue(spec[7], spec[8])) {
+        push_size == sizeof(SpgGemmPush) && !sloped_epilogue(spec[7], spec[8]) &&
+        (kernel == SPG_KERNEL_gemm || direct_product(kernel, spec, spec_count, (const SpgGemmPush *)push) ||
+         unit_of(kernel, spec, spec_count) < 0)) {
         uint32_t linear[SPG_SPEC_MAX];
         SpgGemmPush q;
         memcpy(linear, spec, spec_count * sizeof(uint32_t));

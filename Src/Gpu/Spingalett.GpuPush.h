@@ -25,6 +25,8 @@ enum { SPG_A_ROW, SPG_A_COL, SPG_A_CONV };
 enum { SPG_B_ROW, SPG_B_COL, SPG_B_CONV };
 enum { SPG_EPI_STORE, SPG_EPI_BIAS_ACT, SPG_EPI_SCALE_ACT, SPG_EPI_PARTIAL, SPG_EPI_DERIV };
 #define SPG_GEMM_BIAS 1u            /* flags: EPI_BIAS_ACT adds e0 */
+#define SPG_GEMM_PRE  2u            /* EPI_BIAS_ACT also stores its values before the activation at e1 (CUDA's
+                                       gemm_mma.cu and epi.cu: as C, laid out and kept like it) */
 
 /* colsum.comp */
 typedef struct {
@@ -133,6 +135,11 @@ enum { SPG_ATTN_FORWARD, SPG_ATTN_PRE, SPG_ATTN_DQ, SPG_ATTN_DKV };
 #define SPG_ATTN_CAUSAL 1u
 #define SPG_ATTN_ROPE   2u
 #define SPG_ATTN_STATS  4u          /* FORWARD keeps each query's log of the softmax's sum */
+/* rattn.cu (CUDA, single precision, heads up to 128): rows of a block (queries; keys in DKV) and its threads,
+   for a unit's head size d (32, 64, 128) and pass */
+#define SPG_RATTN_ROWS(d, op) ((d) <= 64u || (op) == SPG_ATTN_FORWARD ? 64u : 32u)
+#define SPG_RATTN_THREADS(d, op) \
+    ((op) == SPG_ATTN_PRE ? 256u : (d) > 64u && (op) != SPG_ATTN_FORWARD ? 64u : 128u)
 
 /* rows.comp */
 typedef struct {

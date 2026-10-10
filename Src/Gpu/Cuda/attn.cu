@@ -5,8 +5,9 @@
 
 /* attn.comp: attention in tiles of BQ rows that never store the scores (FORWARD, PRE, DQ, DKV), in single
    precision, reading and writing activations kept as bfloat16 through ld()/st(). A unit per head size at
-   most (DMAX 32, 64, 128, 256 with tiles of 32, 16, 8, 4 rows, THREADS 128, 64, 64, 16): the rows'
-   threads, keys and columns as constants, so that the arrays of a thread's sums stay in registers.
+   most (DMAX 32, 64, 128, 256 with tiles of 32, 16, 8, 4 rows, THREADS 128, 64, 64, 16; Kernels.def builds
+   DMAX 256, the smaller heads run on rattn.cu): the rows' threads, keys and columns as constants, so that
+   the arrays of a thread's sums stay in registers.
    Spec: OP, BQ, DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3). */
 
 #include "common.cuh"

@@ -17,6 +17,10 @@
  *   DKV      per tile of keys, over the group's query heads and tiles of queries in order: S^T = K Q^T,
  *            P^T, dP^T = V dO^T, dS^T, dV += P^T dO, dK += dS^T Q.
  *
+ * Tiles of activations kept as bfloat16 load sixteen bytes a thread at a time (eight values, or a chunk
+ * and its pair of the other half of the vector where rotated), the next tile of the loop into registers
+ * while the block computes on the current one; tiles of floats load a value at a time, as they are needed.
+ *
  * Every product adds its 16 values of k at a time in the order of k, every row's sums are combined in the
  * same pattern: the same bits on every run. A unit per head size D (32, 64, 128) and pass (OPC: each with
  * the registers of its own). Spec: OP, BQ, DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3); the
@@ -37,6 +41,7 @@
 #define NT (BT / 8u)                       /* n-tiles of 8 of a tile of scores */
 #define DT (D / 8u)                        /* n-tiles of 8 of a row of D */
 #define KS (D / 16u)                       /* k-steps of 16 over D */
+#define NCH (BT * (D / 8u) / (32u * WARPS))  /* chunks of eight of a tile of BT rows a thread loads */
 
 #define FORWARD 0u
 #define DQ      2u
@@ -110,6 +115,68 @@ DEVICE void load_tile(const SpgAttnPush &p, uint32_t HALF, uint16_t *tile, uint3
     }
 }
 
+struct uint4_ {
+    uint32_t x, y, z, w;
+} __attribute__((aligned(16)));
+
+/* Eight bfloat16 of a row of a tile (two a word, the first value in the low half), as loaded */
+struct Raw {
+    uint4_ v;
+};
+
+/* A tile of BT rows from r0 of a head kept as bfloat16 into this thread's registers: chunk e of the tile is row
+   e / (D / 8), values 8 (e % (D / 8)) on; rotated (rope) chunk pairs, row e / (D / 16), values c = 8 (e % (D / 16))
+   and c + D / 2, in v[2k] and v[2k + 1]. Zeros past the cells. */
+DEVICE void fetch_tile(const SpgAttnPush &p, uint32_t s, uint32_t r0, uint32_t head, uint32_t stride, uint64_t base,
+                       bool rope, Raw (&v)[NCH]) {
+    const uint4_ zero = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for (uint32_t k = 0; k < NCH; k++) {
+        const uint32_t e = rope ? thread_x() + 32u * WARPS * (k / 2u) : thread_x() + 32u * WARPS * k;
+        const uint32_t row = rope ? e / (D / 16u) : e / (D / 8u);
+        const uint32_t c = rope ? 8u * (e % (D / 16u)) + (k & 1u) * (D / 2u) : 8u * (e % (D / 8u)), pos = r0 + row;
+        v[k].v = pos < p.cells ? *(const uint4_ *)(H(base) + (s * p.cells + pos) * stride + head + c) : zero;
+    }
+}
+
+/* and from the registers into a shared tile [row][SD], rotated with rope (ROPE) as load_tile() rotates */
+DEVICE void put_tile(const SpgAttnPush &p, uint16_t *tile, uint32_t r0, bool rope, const Raw (&v)[NCH]) {
+    if (!(rope && (p.flags & FLAG_ROPE))) {
+#pragma unroll
+        for (uint32_t k = 0; k < NCH; k++) {
+            const uint32_t e = rope ? thread_x() + 32u * WARPS * (k / 2u) : thread_x() + 32u * WARPS * k;
+            const uint32_t row = rope ? e / (D / 16u) : e / (D / 8u);
+            const uint32_t c = rope ? 8u * (e % (D / 16u)) + (k & 1u) * (D / 2u) : 8u * (e % (D / 8u));
+            *(uint4_ *)(tile + row * SD + c) = v[k].v;
+        }
+        return;
+    }
+#pragma unroll
+    for (uint32_t k = 0; k < NCH; k += 2u) {
+        const uint32_t e = thread_x() + 32u * WARPS * (k / 2u), row = e / (D / 16u), c = 8u * (e % (D / 16u));
+        const uint32_t pos = r0 + row;
+        const uint32_t a[4] = {v[k].v.x, v[k].v.y, v[k].v.z, v[k].v.w}, b[4] = {v[k + 1u].v.x, v[k + 1u].v.y,
+                                                                                v[k + 1u].v.z, v[k + 1u].v.w};
+        uint32_t ra[4], rb[4];
+        if (pos < p.cells) {
+            const float *cs = F(p.table) + pos * (D / 2u) + c, *sn = F(p.table) + p.cells * (D / 2u) + pos * (D / 2u) + c;
+#pragma unroll
+            for (uint32_t w = 0; w < 4u; w++) {
+                const float x0 = bits_float(a[w] << 16), x1 = bits_float(a[w] & 0xFFFF0000u);
+                const float y0 = bits_float(b[w] << 16), y1 = bits_float(b[w] & 0xFFFF0000u);
+                const float c0 = cs[2u * w], c1 = cs[2u * w + 1u], s0 = sn[2u * w], s1 = sn[2u * w + 1u];
+                ra[w] = pack2(x0 * c0 - y0 * s0, x1 * c1 - y1 * s1);
+                rb[w] = pack2(y0 * c0 + x0 * s0, y1 * c1 + x1 * s1);
+            }
+        } else {
+#pragma unroll
+            for (uint32_t w = 0; w < 4u; w++) ra[w] = rb[w] = 0u;
+        }
+        *(uint4_ *)(tile + row * SD + c) = uint4_{ra[0], ra[1], ra[2], ra[3]};
+        *(uint4_ *)(tile + row * SD + c + D / 2u) = uint4_{rb[0], rb[1], rb[2], rb[3]};
+    }
+}
+
 /* A operand fragments (16 rows x 16 k) of a warp's rows r0.. of a shared tile, k-step ks */
 DEVICE void frag_a(const uint16_t *tile, uint32_t r0, uint32_t ks, uint32_t (&a)[4]) {
     const uint32_t l = lane_id();
@@ -173,11 +240,26 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
         for (uint32_t j = 0; j < DT; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
         float m_a = NEG, m_b = NEG, l_a = 0.0f, l_b = 0.0f;
         const uint32_t keys = causal ? umin(p.cells, i0 + ROWS) : p.cells;
+        const bool fast = (HALF & 1u) != 0u;        /* (x kept as bfloat16: its tiles a step ahead) */
+        Raw rk[NCH], rv[NCH];
+        if (fast) {
+            fetch_tile(p, s, 0u, (p.heads + kh) * D, C, p.x, true, rk);
+            fetch_tile(p, s, 0u, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+        }
         for (uint32_t j0 = 0; j0 < keys; j0 += BT) {
             barrier();
-            load_tile(p, HALF, sh.t, s, j0, BT, (p.heads + kh) * D, C, p.x, 0u, true, threads);
-            load_tile(p, HALF, sh.u, s, j0, BT, (p.heads + p.kv + kh) * D, C, p.x, 0u, false, threads);
+            if (fast) {
+                put_tile(p, sh.t, j0, true, rk);
+                put_tile(p, sh.u, j0, false, rv);
+            } else {
+                load_tile(p, HALF, sh.t, s, j0, BT, (p.heads + kh) * D, C, p.x, 0u, true, threads);
+                load_tile(p, HALF, sh.u, s, j0, BT, (p.heads + p.kv + kh) * D, C, p.x, 0u, false, threads);
+            }
             barrier();
+            if (fast && j0 + BT < keys) {
+                fetch_tile(p, s, j0 + BT, (p.heads + kh) * D, C, p.x, true, rk);
+                fetch_tile(p, s, j0 + BT, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+            }
             float sc[NT][4];
 #pragma unroll
             for (uint32_t j = 0; j < NT; j++) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.0f;
@@ -341,18 +423,33 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
         dk[j][0] = dk[j][1] = dk[j][2] = dk[j][3] = 0.0f;
         dv[j][0] = dv[j][1] = dv[j][2] = dv[j][3] = 0.0f;
     }
+    const bool fast = (HALF & 5u) == 5u;            /* (x and dy kept as bfloat16: their tiles a step ahead) */
+    Raw rq[NCH], rg[NCH];
     for (uint32_t h = kh * group; h < (kh + 1u) * group; h++) {
-        const uint32_t sa = (s * p.heads + h) * p.cells;
-        for (uint32_t q0 = causal ? (j0 / BT) * BT : 0u; q0 < p.cells; q0 += BT) {
+        const uint32_t sa = (s * p.heads + h) * p.cells, first = causal ? (j0 / BT) * BT : 0u;
+        if (fast) {
+            fetch_tile(p, s, first, h * D, C, p.x, true, rq);
+            fetch_tile(p, s, first, h * D, out_c, p.dy, false, rg);
+        }
+        for (uint32_t q0 = first; q0 < p.cells; q0 += BT) {
             barrier();
-            load_tile(p, HALF, sh.t, s, q0, BT, h * D, C, p.x, 0u, true, threads);
-            load_tile(p, HALF, sh.u, s, q0, BT, h * D, out_c, p.dy, 2u, false, threads);
+            if (fast) {
+                put_tile(p, sh.t, q0, true, rq);
+                put_tile(p, sh.u, q0, false, rg);
+            } else {
+                load_tile(p, HALF, sh.t, s, q0, BT, h * D, C, p.x, 0u, true, threads);
+                load_tile(p, HALF, sh.u, s, q0, BT, h * D, out_c, p.dy, 2u, false, threads);
+            }
             for (uint32_t e = thread_x(); e < BT; e += threads) {
                 const bool live = q0 + e < p.cells;
                 sh.l[e] = live ? F(p.stats)[sa + q0 + e] : 0.0f;
                 sh.d[e] = live ? F(p.stats)[rows_all + sa + q0 + e] : 0.0f;
             }
             barrier();
+            if (fast && q0 + BT < p.cells) {
+                fetch_tile(p, s, q0 + BT, h * D, C, p.x, true, rq);
+                fetch_tile(p, s, q0 + BT, h * D, out_c, p.dy, false, rg);
+            }
             /* S^T = K Q^T and dP^T = V dO^T: the warp's keys against the tile's queries */
             float st_[NT][4], dpt[NT][4];
 #pragma unroll

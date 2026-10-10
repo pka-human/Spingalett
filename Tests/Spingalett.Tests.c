@@ -4853,24 +4853,27 @@ static void gpu_transformer(int which) {
    precision: predictions, one step's change of every parameter, and two runs alike. */
 static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
     const uint32_t T = 80, V = 37, n = 20, heads = 4, d = heads * head;
-    float *pred[2] = {NULL, NULL}, *delta[2] = {NULL, NULL}, *again = NULL;
+    /* runs: the GPU in single precision, the CPU, the GPU in bfloat16 twice */
+    float *pred[3] = {NULL, NULL, NULL}, *delta[3] = {NULL, NULL, NULL}, *again = NULL;
     uint64_t count = 0;
     float *x = (float *)malloc((size_t)n * T * sizeof(float)), *t = (float *)malloc((size_t)n * T * sizeof(float));
     lcg_state = 1234u + head;
     for (uint32_t i = 0; i < n * T; i++) x[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
     for (uint32_t i = 0; i < n * T; i++) t[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
-    for (int run = 0; run < 3; run++) {
-        const int bf16 = run != 0;
+    for (int run = 0; run < 4; run++) {
+        const int bf16 = run >= 2;
         NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
         layer(.net = net, .neurons_amount = T);
         embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = !rope,
                   .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         linear(.net = net, .neurons_amount = (heads + 2u * kv) * head, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         attention(.net = net, .heads = heads, .kv_heads = kv, .causal = true, .rope_theta = rope ? 10000.0f : 0.0f);
+        /* (a GELU kept for its derivative: on CUDA the products' epilogues store both) */
+        linear(.net = net, .neurons_amount = 64, .act_func = ACT_GELU, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         linear(.net = net, .neurons_amount = V, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         lcg_state = 77;
         for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
-        spingalett_set_compute_mode(gpu_mode);
+        spingalett_set_compute_mode(run == 1 ? COMPUTE_OPENMP : gpu_mode);
         if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
             free_network(net);
             break;
@@ -4889,7 +4892,7 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
         spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe, first.weight_count);       /* (brings them back) */
         free(probe);
         for (uint64_t i = 0; i < count; i++) w0[i] -= net->weights[i];
-        if (run < 2) {
+        if (run < 3) {
             pred[run] = y;
             delta[run] = w0;
         } else {
@@ -4899,16 +4902,27 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
         spingalett_set_gpu_precision(PRECISION_FLOAT32);
         free_network(net);
     }
-    if (pred[1]) {
-        const double predicted = gpu_max_scaled(pred[0], pred[1], (size_t)n * V);
-        const double stepped = gpu_max_scaled(delta[0], delta[1], count);
-        const bool same = again && !memcmp(again, delta[1], count * sizeof(float));
+    /* single precision on the GPU against the CPU (tiles of several sizes, the last ones partial) */
+    const double cpu_pred = gpu_max_scaled(pred[0], pred[1], (size_t)n * V);
+    const double cpu_step = gpu_max_scaled(delta[0], delta[1], count);
+    CHECK(cpu_pred < 1e-4 && cpu_step < 1e-3, "gpu attention head %u: predictions %.2e, step %.2e from the CPU's", head,
+          cpu_pred, cpu_step);
+    printf("  gpu attention head %u%s%s: predictions %.1e, step %.1e from the CPU's", head, rope ? ", rotary" : "",
+           kv < 4u ? ", grouped" : "", cpu_pred, cpu_step);
+    if (pred[2]) {
+        const double predicted = gpu_max_scaled(pred[0], pred[2], (size_t)n * V);
+        const double stepped = gpu_max_scaled(delta[0], delta[2], count);
+        const bool same = again && !memcmp(again, delta[2], count * sizeof(float));
         CHECK(predicted < 2e-2 && stepped < 6e-2 && same, "gpu flash head %u: predictions %.2e, step %.2e from single "
               "precision, deterministic %d", head, predicted, stepped, same);
-        printf("  gpu flash head %u%s%s: bf16 predictions %.1e, step %.1e from single precision, deterministic %s\n", head,
-               rope ? ", rotary" : "", kv < 4u ? ", grouped" : "", predicted, stepped, same ? "yes" : "no");
+        printf("; bf16 %.1e, step %.1e from single precision, deterministic %s", predicted, stepped, same ? "yes" : "no");
     }
-    free(pred[0]); free(pred[1]); free(delta[0]); free(delta[1]); free(again); free(x); free(t);
+    printf("\n");
+    for (int k = 0; k < 3; k++) {
+        free(pred[k]);
+        free(delta[k]);
+    }
+    free(again); free(x); free(t);
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
