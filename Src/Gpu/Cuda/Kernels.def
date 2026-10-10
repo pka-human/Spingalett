@@ -94,6 +94,11 @@ SPG_CUDA_GEMM_MODES(2, 0, 0)
 SPG_CUDA_GEMM_MODES(1, 3, 1)        /* weight gradient */
 SPG_CUDA_GEMM_MODES(1, 2, 0)
 
+/* units of the product built with GENERAL (every activation in the epilogue, the values before it with FLAG_PRE):
+   dense layers' forward passes and data gradients, reading four values at once */
+SPG_CUDA_GEMM_GENERAL(0, 1, 1)
+SPG_CUDA_GEMM_GENERAL(0, 0, 1)
+
 /* the matrix product on the matrix units (gemm_mma.cu): every tile (BM, BN, BK, TM, TN: warps of 16 TM x 16 TN
    outputs), which is also the table of Spingalett.GpuKernels.c, for the operand modes and the ways of reading
    them (A, B, KA, KB: 2 kept as bfloat16, eight values at once; 1 floats, four at once; 0 anything, one value

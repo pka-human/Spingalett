@@ -308,8 +308,9 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         if (conv_a) a = va && v ? 3u : 2u;
         if (conv_b) b = vb && v ? 3u : 2u;
         v = v && a != 2u && b != 2u;
-        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u%s", spec[0], spec[1], spec[2], spec[3], spec[4], a, b,
-                 v ? "v" : "");
+        /* (an epilogue of no slope: only the units with GENERAL, else none) */
+        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u%s%s", spec[0], spec[1], spec[2], spec[3], spec[4], a, b,
+                 v ? "v" : "", sloped_epilogue(spec[7], spec[8]) ? "" : "_g");
     } else if (kernel == SPG_KERNEL_gemm_mma) {
         if (count < 14) return -1;
         const bool general = !sloped_epilogue(spec[7], spec[8]);   /* (only the units with GENERAL, else none) */
@@ -676,7 +677,7 @@ static bool cub_record_begin(void *commands) {
 
 /* Whether a product's epilogue is one gemm.cu, gemm_mma.cu and dconv.cu hold: its activation (or with EPI_DERIV its
    derivative) a slope below zero, or none (softmax, which the output pass applies, leaves the outputs as they are).
-   gemm_mma.cu's units built with GENERAL hold the others. */
+   The products' units built with GENERAL hold the others. */
 static bool sloped_epilogue(uint32_t epi, uint32_t act) {
     const bool sloped = act == SPINGALETT_ACT_NONE || act == SPINGALETT_ACT_RELU || act == SPINGALETT_ACT_LEAKY_RELU;
     if (epi == SPG_EPI_BIAS_ACT || epi == SPG_EPI_SCALE_ACT) return sloped || act == SPINGALETT_ACT_SOFTMAX;
@@ -735,8 +736,7 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
        have no slices) */
     if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 9 && spec_count <= SPG_SPEC_MAX &&
         push_size == sizeof(SpgGemmPush) && !sloped_epilogue(spec[7], spec[8]) &&
-        (kernel == SPG_KERNEL_gemm || direct_product(kernel, spec, spec_count, (const SpgGemmPush *)push) ||
-         unit_of(kernel, spec, spec_count) < 0)) {
+        (direct_product(kernel, spec, spec_count, (const SpgGemmPush *)push) || unit_of(kernel, spec, spec_count) < 0)) {
         uint32_t linear[SPG_SPEC_MAX];
         SpgGemmPush q;
         memcpy(linear, spec, spec_count * sizeof(uint32_t));

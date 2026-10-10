@@ -23,11 +23,17 @@
  * SPG_CUDA_GEMM_SHARED(BM, BN, BK) bytes (Spingalett.GpuPush.h).
  *
  * The epilogues are inline for every output, of the activations (and derivatives) that are a slope
- * below zero only (act_slope(): none, ReLU, leaky ReLU): Spingalett.Cuda.c runs the others as EPI_STORE
+ * below zero only (act_slope(): none, ReLU, leaky ReLU). Units built with GENERAL (dense layers' modes:
+ * Kernels.def) hold the others instead (GELU, SiLU, ...), and with FLAG_PRE EPI_BIAS_ACT also stores its
+ * values before the activation at e1; Spingalett.Cuda.c runs the others of the other units as EPI_STORE
  * and the pass of epi.cu.
  */
 
 #include "gemm_common.cuh"
+
+#if !defined(GENERAL)
+#define GENERAL 0
+#endif
 
 /* What the epilogue needs. */
 struct Epilogue {
@@ -46,6 +52,24 @@ DEVICE void store_c4(const Epilogue &e, float slope, uint32_t z, uint32_t coff, 
         return;
     }
     const uint32_t at = coff + row * e.ldc + n;
+#if GENERAL
+    if (e.epi == EPI_BIAS_ACT) {
+        if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
+        if (e.flags & FLAG_PRE) ((float4_ *)e.e1)[at >> 2] = v;
+        v = activate4(v, e.act);
+    } else if (e.epi == EPI_SCALE_ACT) {
+        v = activate4(add4(mul4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]), ((const float4_ *)e.e1)[(coff + n) >> 2]),
+                      e.act);
+    } else {
+        v = scale4(v, e.alpha);
+        if (e.beta != 0.0f) v = add4(v, scale4(C4[at >> 2], e.beta));
+        if (e.epi == EPI_DERIV) {
+            const float4_ d = ((const float4_ *)e.e0)[at >> 2];
+            v = mul4(v, float4_{derivative(d.x, e.act), derivative(d.y, e.act), derivative(d.z, e.act), derivative(d.w, e.act)});
+        }
+    }
+    (void)slope;
+#else
     if (e.epi == EPI_BIAS_ACT) {
         if (e.flags & FLAG_BIAS) v = add4(v, ((const float4_ *)e.e0)[(coff + n) >> 2]);
         v = sloped4(v, slope);
@@ -60,6 +84,7 @@ DEVICE void store_c4(const Epilogue &e, float slope, uint32_t z, uint32_t coff, 
                                 sloped_derivative(d.z, slope), sloped_derivative(d.w, slope)});
         }
     }
+#endif
     C4[at >> 2] = v;
 }
 
@@ -72,6 +97,20 @@ DEVICE void store_c(const Epilogue &e, float slope, uint32_t z, uint32_t coff, u
         return;
     }
     const uint32_t at = coff + row * e.ldc + n;
+#if GENERAL
+    if (e.epi == EPI_BIAS_ACT) {
+        if (e.flags & FLAG_BIAS) v += F(e.e0)[coff + n];
+        if (e.flags & FLAG_PRE) F(e.e1)[at] = v;
+        v = activate(v, e.act);
+    } else if (e.epi == EPI_SCALE_ACT) {
+        v = activate(v * F(e.e0)[coff + n] + F(e.e1)[coff + n], e.act);
+    } else {
+        v *= e.alpha;
+        if (e.beta != 0.0f) v += e.beta * C[at];
+        if (e.epi == EPI_DERIV) v *= derivative(F(e.e0)[at], e.act);
+    }
+    (void)slope;
+#else
     if (e.epi == EPI_BIAS_ACT) {
         if (e.flags & FLAG_BIAS) v += F(e.e0)[coff + n];
         v = sloped(v, slope);
@@ -82,6 +121,7 @@ DEVICE void store_c(const Epilogue &e, float slope, uint32_t z, uint32_t coff, u
         if (e.beta != 0.0f) v += e.beta * C[at];
         if (e.epi == EPI_DERIV) v *= sloped_derivative(F(e.e0)[at], slope);
     }
+#endif
     C[at] = v;
 }
 
