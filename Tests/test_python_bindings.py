@@ -679,6 +679,30 @@ w = up.get_weights(1); up.set_weights(1, w); check(np.array_equal(up.get_weights
 ups = sg.Network(sg.Loss.MSE, [sg.Input(2, 3, 1), sg.Upsample2D(2), sg.Upsample2D(3, sg.Upsample.BILINEAR)])
 check(ups.layers[-1].shape == (12, 18, 1) and ups.forward(np.ones(6)).shape == (216,), "upsampling shapes")
 
+# a transformer: a token file's windows (nanoGPT's uint16), the sequence learned, its continuation generated
+import tempfile
+T, V = 16, 13
+lm = sg.Network(sg.Loss.SPARSE_CROSS_ENTROPY)
+lm.add_layer(T)
+lm.add_embedding(V, 16); h = lm.last
+lm.add_rms_norm(); lm.add_linear(48)
+lm.add_attention(heads=4, kv_heads=2, rope_theta=10000.0, causal=True)
+lm.add_linear(16); lm.add_add([h, lm.last])
+lm.add_linear(V)
+check(lm.target_size == T and lm.output_size == T * V, "language model sizes")
+tokens_path = os.path.join(tempfile.mkdtemp(), "tokens.bin")
+np.array([i % V for i in range(3000)], dtype=np.uint16).tofile(tokens_path)
+sg.seed(3)
+result = lm.train_from_tokens(tokens_path, epochs=12, learning_rate=1e-2, optimizer=sg.Optimizer.ADAM, batch_size=32,
+                              stride=5)
+check(result.status == sg.TrainStatus.COMPLETED and result.train_loss < 0.5, f"train_from_tokens ({result.train_loss:.3f})")
+check(lm.generate([3, 4, 5], 20) == [(6 + i) % V for i in range(20)], "generate: the greedy continuation")
+drawn = lm.generate([3, 4, 5], 20, temperature=1.0, top_p=0.9, seed=8)
+check(drawn == lm.generate([3, 4, 5], 20, temperature=1.0, top_p=0.9, seed=8) and len(drawn) == 20,
+      "generate: draws repeat with their seed")
+check(lm.generate([3, 4, 5], 20, stop=[9]) == [6, 7, 8, 9], "generate: stop tokens")
+os.remove(tokens_path)
+
 # the library versions the bindings accept: major.minor before 1.0, then the major and a minor at least theirs
 check(sg._compatible("0.14.2", "0.14.0") and not sg._compatible("0.13.1", "0.14.0"), "versions of 0.x")
 check(sg._compatible("1.0.0", "1.0.0") and sg._compatible("1.3.0", "1.2.5") and not sg._compatible("1.1.0", "1.2.0")

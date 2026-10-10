@@ -17,6 +17,7 @@ MIRRORS = {
     "DatasetSaveOptions": sg._DatasetSaveOptions, "SpingalettDatasetInfo": sg._DatasetInfo,
     "SpingalettTargetSet": sg._TargetSet, "DatasetReaderOptions": sg._DatasetReaderOptions,
     "SpingalettModel": sg._Model, "SpingalettLayerInfo": sg._LayerInfo,
+    "SpingalettTokenReaderOptions": sg._TokenReaderOptions, "SpingalettGenerateArgs": sg._GenerateArgs,
 }
 
 lines = subprocess.run([sys.argv[1]], check=True, capture_output=True, text=True).stdout.splitlines()

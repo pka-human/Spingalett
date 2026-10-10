@@ -118,5 +118,6 @@ SPINGALETT_1.1 {
 SPINGALETT_1.2 {
     global:
         spingalett_dataset_open_tokens;
+        spingalett_generate_args;
         spingalett_target_size;
 } SPINGALETT_1.1;

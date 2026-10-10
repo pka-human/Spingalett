@@ -111,6 +111,17 @@ int main(void) {
     FIELD(DatasetReaderOptions, shuffle); FIELD(DatasetReaderOptions, in_memory); FIELD(DatasetReaderOptions, no_prefetch);
     FIELD(DatasetReaderOptions, target_set);
 
+    SIZE(SpingalettTokenReaderOptions); FIELD(SpingalettTokenReaderOptions, reserved);
+    FIELD(SpingalettTokenReaderOptions, context); FIELD(SpingalettTokenReaderOptions, token_bytes);
+    FIELD(SpingalettTokenReaderOptions, stride); FIELD(SpingalettTokenReaderOptions, offset);
+    FIELD(SpingalettTokenReaderOptions, shuffle);
+
+    SIZE(SpingalettGenerateArgs); FIELD(SpingalettGenerateArgs, reserved);
+    FIELD(SpingalettGenerateArgs, net); FIELD(SpingalettGenerateArgs, prompt); FIELD(SpingalettGenerateArgs, prompt_length);
+    FIELD(SpingalettGenerateArgs, tokens); FIELD(SpingalettGenerateArgs, count); FIELD(SpingalettGenerateArgs, temperature);
+    FIELD(SpingalettGenerateArgs, top_k); FIELD(SpingalettGenerateArgs, top_p); FIELD(SpingalettGenerateArgs, seed);
+    FIELD(SpingalettGenerateArgs, stop_tokens); FIELD(SpingalettGenerateArgs, stop_count);
+
     SIZE(PredictArgs); FIELD(PredictArgs, reserved);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);
     FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);

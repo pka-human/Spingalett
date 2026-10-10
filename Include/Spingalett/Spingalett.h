@@ -523,6 +523,33 @@ SPINGALETT_API SpingalettEvalMetrics spingalett_evaluate_args(SpingalettEvaluate
 #define spingalett_train(...) spingalett_train_args((SpingalettTrainArgs){__VA_ARGS__})
 SPINGALETT_API SpingalettTrainReport spingalett_train_args(SpingalettTrainArgs args);
 
+typedef struct {
+    SpingalettNetwork *net;         /* a causal language model: inputs a window of context tokens (an
+                                       embedding's), outputs the logits of every token of a vocabulary for
+                                       each of them */
+    const uint32_t *prompt;         /* [prompt_length] the tokens to continue, at least one */
+    uint32_t prompt_length;
+    uint32_t *tokens;               /* [count] the tokens generated */
+    uint32_t count;
+    float temperature;              /* the logits divided by it before the softmax; 0: the most likely
+                                       token each step (the first of equals), no draws */
+    uint32_t top_k;                 /* draws among the top_k most likely tokens only (0: all) */
+    float top_p;                    /* and among the most likely whose probabilities add up to top_p at least
+                                       (0 or 1: all) */
+    uint64_t seed;                  /* the draws' generator; 0: one draw of the library's (spingalett_seed) */
+    const uint32_t *stop_tokens;    /* [stop_count] tokens that end the generation once generated, or NULL */
+    uint32_t stop_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettGenerateArgs;
+
+/* Continues the prompt a token at a time: the network predicts on the window of the last context tokens
+   (the prompt's and those generated, from the window's first position on, the positions after them
+   empty: no token), and the next token comes from the logits of the window's last one. Runs where
+   spingalett_predict() runs (the compute mode). Returns how many tokens it wrote: count, fewer when a stop
+   token came (written as the last one), 0 on error. */
+#define spingalett_generate(...) spingalett_generate_args((SpingalettGenerateArgs){__VA_ARGS__})
+SPINGALETT_API uint32_t spingalett_generate_args(SpingalettGenerateArgs args);
+
 /*
  * Data sets in the GPU's memory: count rows of size floats copied to the device once, for the
  * device_* fields of spingalett_train(), spingalett_predict() and spingalett_evaluate(). A set is made in

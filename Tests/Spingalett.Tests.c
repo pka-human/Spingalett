@@ -4156,6 +4156,23 @@ static void tf_learns(ComputeMode mode) {
     EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y, .sample_count = N);
     printf("  transformer learns (mode %d): loss %.3f, accuracy %.3f\n", mode, m.loss, m.accuracy);
     CHECK(r.status == TRAIN_COMPLETED && m.accuracy > 0.9f, "transformer learns: accuracy %.3f", m.accuracy);
+    /* generation: a prompt continued past the window (rotary embeddings: any window's start), greedy and drawn */
+    const uint32_t prompt[3] = {3, 4, 5}, stop = (6u + 4u) % V;
+    uint32_t greedy[24], top1[24], a[24], b[24], stopped[24];
+    const uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = greedy, .count = 24);
+    bool follows = made == 24;
+    for (uint32_t i = 0; i < 24 && follows; i++) follows = greedy[i] == (6u + i) % V;
+    CHECK(follows, "transformer generates: greedy continuation (%u tokens)", made);
+    spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = top1, .count = 24, .temperature = 1.5f,
+                        .top_k = 1, .seed = 5);
+    spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = a, .count = 24, .temperature = 2.0f,
+                        .top_p = 0.9f, .seed = 11);
+    spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = b, .count = 24, .temperature = 2.0f,
+                        .top_p = 0.9f, .seed = 11);
+    const uint32_t until = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = stopped,
+                                               .count = 24, .stop_tokens = &stop, .stop_count = 1);
+    CHECK(!memcmp(top1, greedy, sizeof greedy) && !memcmp(a, b, sizeof a) && until == 5 && stopped[4] == stop,
+          "transformer generates: top-k 1 as greedy, draws repeat with their seed, stop tokens (%u)", until);
     free(x); free(y);
     free_network(net);
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);

@@ -486,6 +486,34 @@ class _DatasetReaderOptions(Structure):
     _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32), ("reserved", c_uint64 * _RESERVED)]
 
 
+class _TokenReaderOptions(Structure):
+    _fields_ = [
+        ("context", c_uint32),
+        ("token_bytes", c_uint32),
+        ("stride", c_uint32),
+        ("offset", c_uint64),
+        ("shuffle", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _GenerateArgs(Structure):
+    _fields_ = [
+        ("net", _NetPtr),
+        ("prompt", POINTER(c_uint32)),
+        ("prompt_length", c_uint32),
+        ("tokens", POINTER(c_uint32)),
+        ("count", c_uint32),
+        ("temperature", c_float),
+        ("top_k", c_uint32),
+        ("top_p", c_float),
+        ("seed", c_uint64),
+        ("stop_tokens", POINTER(c_uint32)),
+        ("stop_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 class _SaveArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
@@ -674,6 +702,8 @@ _save_dataset = _bind("spingalett_save_dataset", c_bool, [POINTER(_Dataset), c_c
 _load_dataset = _bind("spingalett_load_dataset_targets", c_bool, [c_char_p, c_uint32, POINTER(_Dataset)])
 _dataset_set_class_names = _bind("spingalett_dataset_set_class_names", c_bool, [POINTER(_Dataset), POINTER(c_char_p), c_uint32])
 _dataset_open = _bind("spingalett_dataset_open_ex", c_void_p, [c_char_p, POINTER(_DatasetReaderOptions)])
+_dataset_open_tokens = _bind("spingalett_dataset_open_tokens", c_void_p, [c_char_p, POINTER(_TokenReaderOptions)])
+_generate = _bind("spingalett_generate_args", c_uint32, [_GenerateArgs])
 _dataset_open_u8 = _bind("spingalett_dataset_open_u8", c_void_p,
                          [POINTER(ctypes.c_uint8), POINTER(c_float), c_uint32, c_uint32, c_uint32, c_bool])
 _dataset_target_set_name = _bind("spingalett_dataset_target_set_name", c_char_p, [c_void_p, c_uint32])
@@ -1754,6 +1784,44 @@ class Network:
                              _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
         finally:
             _dataset_close(reader)
+
+    def train_from_tokens(self, path, config: Optional[TrainConfig] = None, token_bytes: int = 0, stride: int = 0,
+                          offset: int = 0, shuffle: bool = True, validation_data=None, **overrides) -> TrainResult:
+        """Train a language model on the windows of a file of token ids (nanoGPT's .bin: uint16; llm.c's,
+        recognized by its header): each sample the network's ``input_size`` tokens from a multiple of
+        ``stride`` (0: the window's length) on, its targets the token after each. ``token_bytes`` 2 or 4
+        (0: 2, or what an llm.c header says); ``offset`` bytes of a header to skip. The file is mapped,
+        not read; ``shuffle`` visits the windows in a new random order every epoch."""
+        cfg = dataclasses.replace(config or TrainConfig(), **overrides)
+        opts = _TokenReaderOptions(self.input_size, int(token_bytes), int(stride), int(offset), bool(shuffle))
+        reader = _call(_dataset_open_tokens, _encode_path(path), ctypes.byref(opts))
+        try:
+            info = _dataset_info(reader)
+            if info.target_size != self.target_size:
+                raise ValueError(f"windows of {info.target_size} tokens, the network takes {self.target_size} targets")
+            return self._run(cfg, _MODE_GENERATOR, None, None, int(info.count),
+                             _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
+        finally:
+            _dataset_close(reader)
+
+    def generate(self, prompt, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
+                 seed: int = 0, stop=()) -> List[int]:
+        """Continue a prompt (token ids) by ``count`` tokens, a token at a time, with a causal language model
+        whose outputs are the logits of every token of its vocabulary for each input token: the most likely
+        token (``temperature`` 0), or a draw from the softmax of the logits over ``temperature`` among the
+        ``top_k`` most likely and those whose probabilities add up to ``top_p``. ``seed`` (0: the library's
+        generator) makes draws repeatable; a token of ``stop`` ends the generation (it is returned last)."""
+        p = np.ascontiguousarray(np.asarray(prompt, dtype=np.uint32).ravel())
+        if p.size == 0:
+            raise ValueError("generate needs a prompt of one token at least")
+        s = np.ascontiguousarray(np.asarray(list(stop), dtype=np.uint32))
+        out = np.zeros(max(int(count), 0), dtype=np.uint32)
+        u32 = POINTER(c_uint32)
+        args = _GenerateArgs(self._ptr, p.ctypes.data_as(u32), p.size, out.ctypes.data_as(u32), out.size,
+                             float(temperature), int(top_k), float(top_p), int(seed),
+                             s.ctypes.data_as(u32) if s.size else None, s.size)
+        made = _call(_generate, args)
+        return out[:made].tolist()
 
     def _run(self, cfg: TrainConfig, mode: int, x, y, sample_count: int, generator,
              validation_data) -> TrainResult:
