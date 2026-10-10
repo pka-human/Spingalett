@@ -1054,8 +1054,8 @@ TrainReport spingalett_train_args(TrainArgs args) {
     }
 #endif
 
-    /* COMPUTE_VULKAN: mini-batch and full-batch training on the GPU (per-sample training of dense
-       networks stays on the CPU) */
+    /* COMPUTE_CUDA and COMPUTE_VULKAN: mini-batch and full-batch training on the GPU (per-sample training
+       of dense networks stays on the CPU) */
     bool use_gpu = false;
     if (spingalett_use_gpu()) {
         const char *why = NULL;
@@ -1069,7 +1069,8 @@ TrainReport spingalett_train_args(TrainArgs args) {
     char compute_name[160];
     snprintf(compute_name, sizeof compute_name, "%s", compute_mode_names[effective_mode < COMPUTE_COUNT ? effective_mode : 0]);
     if (use_gpu)
-        snprintf(compute_name, sizeof compute_name, "VULKAN (%s)", spingalett_gpu_name());
+        snprintf(compute_name, sizeof compute_name, "%s (%s)", compute_mode_names[spingalett_get_compute_mode()],
+                 spingalett_gpu_name());
 
     if (training_strategy == STRATEGY_SMALL_BATCH) {
         spingalett_log(LOG_INFO, "Starting training: loss=%s, strategy=%s, mode=%s, optimizer=%s, compute=%s, batch_size=%u",

@@ -7,6 +7,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+- Training on CUDA logged its compute mode as `VULKAN (the GPU's name)`; it logs `CUDA (...)`.
+
 ## [1.1.0] - 2026-10-10
 
 "CUDA": a GPU backend for NVIDIA GPUs on the library's own kernels (`SPINGALETT_COMPUTE_CUDA`, which
