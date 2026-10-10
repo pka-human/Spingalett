@@ -374,8 +374,10 @@ struct Gemm {
     MEMBER void run(float *smem) {
         tid = thread_x();
         const uint32_t z = block_z(), g = z / p.slices, s = z % p.slices;
-        m0 = (p.m_tile0 + block_x()) * BM;
-        n0 = block_y() * BN;
+        uint32_t tm, tn;
+        swizzled(tm, tn);
+        m0 = (p.m_tile0 + tm) * BM;
+        n0 = tn * BN;
         kbeg = s * p.slice_k;
         kend = umin(p.K, kbeg + p.slice_k);
         aoff = g * p.a_group;

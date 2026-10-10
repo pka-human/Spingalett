@@ -45,6 +45,7 @@ DEVICE uint32_t block_x() { return __nvvm_read_ptx_sreg_ctaid_x(); }
 DEVICE uint32_t block_y() { return __nvvm_read_ptx_sreg_ctaid_y(); }
 DEVICE uint32_t block_z() { return __nvvm_read_ptx_sreg_ctaid_z(); }
 DEVICE uint32_t blocks_x() { return __nvvm_read_ptx_sreg_nctaid_x(); }
+DEVICE uint32_t blocks_y() { return __nvvm_read_ptx_sreg_nctaid_y(); }
 DEVICE uint32_t threads_x() { return __nvvm_read_ptx_sreg_ntid_x(); }
 DEVICE uint32_t global_x() { return block_x() * threads_x() + thread_x(); }
 DEVICE void barrier() { __syncthreads(); }

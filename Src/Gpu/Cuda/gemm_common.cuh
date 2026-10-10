@@ -28,6 +28,19 @@
 #define FLAG_BIAS       1u
 #define FLAG_PRE        2u
 
+/* The tiles of rows and columns (tm, tn) of block (x, y) of a product's dispatch: bands of SWIZZLE tiles of rows,
+   a band's blocks over every tile of columns with its rows fastest. Blocks start roughly in the order of x + y
+   times the blocks in x, so that a band's rows of A stay in L2 while its blocks take every tile of columns,
+   rather than all of A read again from memory for each tile of columns. Which block computes a tile changes
+   nothing in it. */
+#define SWIZZLE 8u
+DEVICE void swizzled(uint32_t &tm, uint32_t &tn) {
+    const uint32_t nx = blocks_x(), ny = blocks_y(), pid = block_y() * nx + block_x();
+    const uint32_t band = SWIZZLE * ny, first = pid / band * SWIZZLE, size = umin(nx - first, SWIZZLE);
+    tm = first + pid % band % size;
+    tn = pid % band / size;
+}
+
 #define GEO_RH 0u
 #define GEO_RW 1u
 #define GEO_GH 2u
