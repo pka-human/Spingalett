@@ -101,6 +101,12 @@ struct SpgGpuNet {
        normalization's coefficients with the layer's biases folded in) and write the normalization's
        outputs, their own never stored; into[l] = that normalization, or 0 */
     uint32_t *into;
+    /* the inference coefficients of every batch normalization (bn.comp's INFER and FOLD, at stats + 2C) are those
+       of the parameters as they are: computed by an inference chunk, the chunks after it need not compute them
+       again, until an upload, a training chunk or a pass writes the parameters or the statistics (ResNet-20 of
+       Examples/Benchmark.c infers 1.03 times as fast without its 21 launches a chunk); recording: whether the
+       commands being recorded compute them */
+    bool coefficients, recording;
 
     Slot slots[SLOTS];
     uint32_t next;                  /* the slot of the next chunk */
@@ -505,6 +511,7 @@ static Item arrays(const SpgGpuBuffer *device, size_t floats, float *w, float *b
    the parameters (and moments both have) come from that copy of the network on the device. */
 static bool parameters(SpgGpuNet *g, bool down, bool creating, const SpgGpuNet *from) {
     NeuralNetwork *net = g->net;
+    g->coefficients = false;
     const uint32_t L = g->layers;
     Item *items = (Item *)malloc((L + 4u) * sizeof(Item));
     if (!items) return false;
@@ -1300,7 +1307,7 @@ static void bn_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32
         writes(&a, span(running_at(g, l - 1, 0), C));
         writes(&a, span(running_at(g, l - 1, 1), C));
     }
-    kernel(r, &a, SPG_KERNEL_bn, &mode, 1, &bp, sizeof bp, (C + 63u) / 64u, 1, 1);
+    if (train || g->recording) kernel(r, &a, SPG_KERNEL_bn, &mode, 1, &bp, sizeof bp, (C + 63u) / 64u, 1, 1);
     if (g->fold[l] || g->pro[l]) return;        /* applied by the addition or the convolution that reads it */
     Access b = {0};
     if (into) {
@@ -2278,6 +2285,7 @@ static bool spingalett_gpu_train_chunk_here(SpgGpuNet *g, uint32_t n, uint32_t c
     const SpgGpuBuffer view = s->in_place ? rows_view(g->rows.inputs, s->first, n, g->half[0]) : (SpgGpuBuffer){0};
     SpgGpuCommands *c = chunk_commands(g, s, key, n, count, first, last, true, s->gathered, s->in_place ? &view : NULL);
     if (!c) return false;
+    g->coefficients = false;
     memcpy(header_of(s), header, sizeof header);
     if (!(s->gathered & 1u) && !s->in_place) stage_inputs(g, s, n);
     s->gathered = 0;
@@ -2368,12 +2376,16 @@ static bool spingalett_gpu_predict_rows_here(SpgGpuNet *g, const float *inputs, 
                 }
             );
         }
-        SpgGpuCommands *c = chunk_commands(g, s, (uint64_t)m | 1ull << 63 | (gather ? 1ull << 59 : 0), m, m, false,
-                                           false, false, gather ? 1u : 0u, rows && !gather ? &view : NULL);
+        g->recording = !g->coefficients;
+        SpgGpuCommands *c = chunk_commands(g, s, (uint64_t)m | 1ull << 63 | (gather ? 1ull << 59 : 0) |
+                                                     (g->recording ? 1ull << 60 : 0), m, m, false, false, false,
+                                           gather ? 1u : 0u, rows && !gather ? &view : NULL);
+        g->recording = false;
         if (!c || !spg_gpu_submit(c)) {
             drain(g);
             return false;
         }
+        g->coefficients = true;
         s->pending = c;
         s->n = m;
         s->train = false;
@@ -2459,6 +2471,7 @@ static SpgGpuCommands *pass_commands(SpgGpuNet *g, uint32_t n, uint32_t kind, bo
 static bool run_pass(SpgGpuNet *g, SpgGpuCommands *c, const uint32_t *header) {
     Slot *s = &g->slots[0];
     if (!c || g->lost) return false;
+    g->coefficients = false;
     if (header) memcpy(header_of(s), header, SPG_STEP_HEADER * sizeof(uint32_t));
     if (!spg_gpu_submit(c)) return false;
     if (!spg_gpu_wait(c)) g->lost = true;
