@@ -23,7 +23,7 @@ against PyTorch on the same machine.
 | 0.14 | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.14 times at least in every workload, its data in GPU memory or not |
 | 1.0 | "Stability": the API, ABI and formats of 0.14 kept by semantic versioning (symbol versions, the `api.abi` test against the last release), the names of 0.x only on request, pkg-config, Conan and vcpkg recipes |
 | 1.1 | "CUDA": a backend for NVIDIA GPUs on the library's own kernels (PTX compiled by Clang, no CUDA toolkit, cuBLAS or cuDNN), ahead of PyTorch with cuDNN by 1.2 to 7.7 times in every workload and of the Vulkan backend; batch normalizations in their product's epilogue at inference on both backends; the runtime library for programs that only run models. Why not cuDNN and cuBLAS: half a gigabyte to a gigabyte of libraries for each CUDA version, backward algorithms that add through atomics (runs would no longer repeat their bits), and the library measures its own kernels rather than wrapping others'; they remain what the backend is measured against |
-| 1.2 | "Transformers": embeddings, multi-head attention (grouped-query, causal, rotary), RMS normalization, products of layers, GELU and SiLU, the sparse cross-entropy, `.slett` format 8, in training on the CPU and both GPU backends, the engine, deployment models and the runtime; token files, text generation, GPT-2 and LLaMA checkpoints in Python, a character-level GPT example; on CUDA flash attention on the tensor cores, register-tiled attention in single precision, GELU and SiLU in the products' epilogues, the weights' bfloat16 copy for sequences and images, block order kept in L2; bindings for Rust, .NET, Go and Java; Debian and RPM packages, AUR, Homebrew, Scoop, Nix, a container image, conda |
+| 1.2 | "Transformers": embeddings, multi-head attention (grouped-query, causal, rotary), RMS normalization, products of layers, GELU and SiLU, the sparse cross-entropy, `.slett` format 8, in training on the CPU and both GPU backends, the engine, deployment models and the runtime; token files, text generation, GPT-2 and LLaMA checkpoints in Python, a character-level GPT example; on CUDA flash attention on the tensor cores, register-tiled attention in single precision, GELU and SiLU in the products' epilogues, the weights' bfloat16 copy for sequences and images, block order kept in L2: ahead of PyTorch at its fastest (`torch.compile` with `max-autotune`) in every workload but the GPT in bfloat16 (0.91 times in training); bindings for Rust, .NET, Go and Java; Debian and RPM packages, AUR, Homebrew, Scoop, Nix, a container image, conda |
 
 ## 1.3: language models in production
 
@@ -43,8 +43,8 @@ weights in.
   and GGUF files.
 - **The matrix units' products at cuBLAS's speed** for language models: 1.2's products of a GPT's
   forward pass and data gradients run at 15 to 17 TFLOPS on the RTX 4050 where cuBLAS reaches 22 to
-  23 (the weight gradients match it), which leaves the GPT's bfloat16 training at 0.94 times
-  PyTorch's `torch.compile` and its inference at 0.85 times; target: ahead of both.
+  23 (the weight gradients match it), which leaves the GPT's bfloat16 training at 0.91 times
+  PyTorch's `torch.compile` and its inference at 0.88 times; target: ahead of both.
 - **Training features of language models**: tied input and output embeddings, activation
   recomputation (checkpointing) to fit longer contexts, gradient accumulation and learning-rate
   schedules by step in `spingalett_train()`, sequences of different lengths in one batch, sliding
@@ -202,6 +202,9 @@ next steps, each measured against the release before and against PyTorch:
 
 - **Integer transposed convolutions in batches**: the phases of the stride as convolutions on the
   integer tile kernels (deployment models run them sample by sample through the engine's pass).
+- **Transformers' training on the CPU**: the GPT of `Examples/Benchmark.c` trains at 0.78 times
+  PyTorch's speed on one thread of an i7-12650H and 0.49 times on eight (it infers 5.5 to 6.3 times as
+  fast); target: ahead at every thread count, as the convolutional networks are.
 - **CPU kernels**: convolution windows as runs of `kernel_w x channels` floats (fast first layers),
   weights packed once per deployment model; per-sample INT8 kernels on AVX-512 VNNI for dense layers
   in the engine and tile kernels for depthwise and grouped integer convolutions.

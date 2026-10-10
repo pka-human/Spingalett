@@ -220,7 +220,11 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   (`grid_stride()`). Products of few k over channels not in fours (a network's first convolution)
   run on `dconv.cu` in place of every tile (`direct_product()`): the same kernel whichever tile
   the tuner picks, so tiles stay alike; in a kernel's unrolled loops, a test of a run-time bound in
-  every iteration keeps the compiler from loading ahead (units for an exact k avoid it).
+  every iteration keeps the compiler from loading ahead (units for an exact k avoid it). The
+  largest tiles of single precision sit at 128 registers: a block's first row and column must stay
+  values the compiler can compute again from the block's index (shifts and masks), or they are kept
+  and spill (bands computed by divisions in the kernel cost the MLP's inference 4%; the backend
+  launches the bands instead, `bands_pay()`), and an early return of a block spills them too.
 - GPU: `SPINGALETT_GPU_PROFILE=1` prints the time of every kernel and mode at exit (timestamps
   around each dispatch; trial runs of the tile choice excluded; with CUDA events around every
   launch, which inflate the times of small kernels: compare backends by wall time);

@@ -12,13 +12,14 @@ All notable changes to this project are documented in this file. The format foll
 "Transformers": the networks of today's language models in every part of the library at once,
 training on the CPU and both GPU backends, the model format, the engine, deployment models and the
 runtime, with what language models need around them (files of tokens, generation, GPT-2 and LLaMA
-checkpoints). On CUDA, attention runs on the tensor cores in bfloat16 and in register tiles in single
-precision, GELU and SiLU in the products' epilogues; the GPT of `Examples/Benchmark.c` trains
-@GPT_FP32_TRAIN@ times as fast as in the first transformer build of this release in single precision and
-@GPT_BF16_TRAIN@ times in bfloat16 (README, **Performance**, against PyTorch with `torch.compile`). And
-more languages and package managers: bindings for Rust, .NET, Go and Java, and Debian, RPM, AUR,
-Homebrew, Scoop, Nix, container and conda packages. Programs of 1.1 build and run unchanged; files of
-1.1 load unchanged.
+checkpoints). On CUDA, attention runs on the tensor cores in bfloat16 and in register tiles in
+single precision, GELU and SiLU in the products' epilogues; the GPT of `Examples/Benchmark.c` trains
+1.97 times as fast as in the first transformer build of this release in single precision and 1.28
+times as fast in bfloat16: as fast as PyTorch with `torch.compile` in single precision and at 0.91
+times its speed in bfloat16, while every other workload runs ahead of PyTorch at its fastest
+(README, **Performance**). And more languages and package managers: bindings for Rust, .NET, Go and
+Java, and Debian, RPM, AUR, Homebrew, Scoop, Nix, container and conda packages. Programs of 1.1
+build and run unchanged; files of 1.1 load unchanged.
 
 ### Added
 - **The layers of transformers**, on the CPU, CUDA and Vulkan, in `.slett` format 8, the engine,
