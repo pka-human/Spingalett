@@ -679,3 +679,28 @@ if(TARGET spingalett_runtime)
     spingalett_runtime_install(OFF)
 endif()
 spingalett_install_package()
+
+# ------------------------------------------------------------------------------
+# Packages of the installed files: cpack -G DEB, cpack -G RPM (the release workflow configures the library
+# directory each wants: lib/<multiarch> for Debian, lib64 for RPM distributions)
+# ------------------------------------------------------------------------------
+set(CPACK_PACKAGE_NAME spingalett)
+set(CPACK_PACKAGE_VENDOR pka_human)
+set(CPACK_PACKAGE_CONTACT "pka_human <pka_human@proton.me>")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Neural networks in C: training on the CPU and GPUs (CUDA, Vulkan), transformers, deployment down to INT2")
+set(CPACK_PACKAGE_HOMEPAGE_URL https://github.com/pka-human/Spingalett)
+set(CPACK_RESOURCE_FILE_LICENSE ${PROJECT_SOURCE_DIR}/LICENSE)
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_SECTION libs)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libgomp1")
+find_program(SPINGALETT_DPKG_SHLIBDEPS dpkg-shlibdeps)
+if(SPINGALETT_DPKG_SHLIBDEPS)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)          # (libc6's version, ... from the binaries, on Debian systems)
+endif()
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+set(CPACK_RPM_PACKAGE_LICENSE MIT)
+set(CPACK_RPM_PACKAGE_GROUP "Development/Libraries")
+set(CPACK_RPM_PACKAGE_URL https://github.com/pka-human/Spingalett)
+include(CPack)

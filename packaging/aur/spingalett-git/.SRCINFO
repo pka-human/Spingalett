@@ -1,0 +1,25 @@
+pkgbase = spingalett-git
+	pkgdesc = Neural networks in C: training on the CPU and GPUs (CUDA, Vulkan), transformers, deployment down to INT2
+	pkgver = 1.2.0.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/pka-human/Spingalett
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = git
+	makedepends = cmake
+	makedepends = ninja
+	makedepends = clang
+	makedepends = shaderc
+	makedepends = vulkan-headers
+	depends = gcc-libs
+	depends = glibc
+	optdepends = vulkan-icd-loader: training and inference on GPUs through Vulkan
+	optdepends = nvidia-utils: training and inference on NVIDIA GPUs through CUDA
+	optdepends = python-numpy: the Python bindings (Bindings/Python)
+	provides = spingalett
+	conflicts = spingalett
+	source = spingalett-git::git+https://github.com/pka-human/Spingalett.git
+	sha256sums = SKIP
+
+pkgname = spingalett-git

@@ -310,12 +310,34 @@ jobs:
           done
           ls -l "$ARCHIVE".* "$RUNTIME_ARCHIVE".*
 
+      # Debian and RPM packages of the library, its runtime and tools (the Linux baseline builds), installed once
+      - name: Debian and RPM packages
+        if: matrix.name == 'linux-x86_64' || matrix.name == 'linux-aarch64'
+        run: |
+          sudo apt-get install -y rpm
+          multiarch=$(gcc -dumpmachine)
+          cmake -S . -B Build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib/$multiarch
+          (cd Build && cpack -G DEB)
+          cmake -S . -B Build -DCMAKE_INSTALL_LIBDIR=lib64
+          (cd Build && cpack -G RPM)
+          mv Build/*.deb Build/*.rpm .
+          ls -l *.deb *.rpm
+          sudo apt-get install -y ./spingalett_*.deb
+          pkg-config --modversion spingalett
+          RunModel 2>&1 | head -2 || true
+          echo '#include <Spingalett/Spingalett.h>
+          #include <stdio.h>
+          int main(void) { return puts(spingalett_version()) < 0; }' > deb-consumer.c
+          cc deb-consumer.c $(pkg-config --cflags --libs spingalett) -o deb-consumer && ./deb-consumer
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
           path: |
             ${{ env.ARCHIVE }}.*
             ${{ env.RUNTIME_ARCHIVE }}.*
+            *.deb
+            *.rpm
           if-no-files-found: error
 
       # Python wheels from the baseline macOS and Windows builds (Linux wheels: the wheels job)
@@ -455,6 +477,61 @@ jobs:
           name: wheel-sdist
           path: dist/*.tar.gz
           if-no-files-found: error
+
+  # the container image (packaging/docker/Dockerfile): built on pull requests and dev branches, pushed to the
+  # GitHub container registry as ghcr.io/<owner>/spingalett:<version> and :latest for releases
+  docker:
+    needs: version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: needs.version.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/spingalett" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          load: ${{ needs.version.outputs.publish != 'true' }}
+          push: ${{ needs.version.outputs.publish == 'true' }}
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ needs.version.outputs.version }}
+            ${{ steps.name.outputs.image }}:latest
+      - name: Smoke test
+        if: needs.version.outputs.publish != 'true'
+        run: docker run --rm ${{ steps.name.outputs.image }}:latest
+
+  # the Nix flake: the package builds (and its library loads)
+  nix:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: cachix/install-nix-action@v31
+      - name: Build
+        run: |
+          nix build -L .#spingalett
+          ls -l result/lib result/include/Spingalett
+          echo '#include <Spingalett/Spingalett.h>
+          #include <stdio.h>
+          int main(void) { return puts(spingalett_version()) < 0; }' > nix-consumer.c
+          # (Nix's compiler and glibc, which the library was built against)
+          nix shell nixpkgs#gcc -c cc nix-consumer.c -Iresult/include -Lresult/lib -lspingalett \
+            -Wl,-rpath,$PWD/result/lib -o nix-consumer
+          ./nix-consumer
 
   # the inference engine's three source files, for firmware projects
   engine:

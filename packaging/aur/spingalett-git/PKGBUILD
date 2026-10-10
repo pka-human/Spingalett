@@ -1,0 +1,50 @@
+# Maintainer: pka_human <pka_human@proton.me>
+# SPDX-License-Identifier: MIT
+
+pkgname=spingalett-git
+pkgver=1.2.0.r0.g0000000
+pkgrel=1
+pkgdesc="Neural networks in C: training on the CPU and GPUs (CUDA, Vulkan), transformers, deployment down to INT2"
+arch=('x86_64' 'aarch64')
+url="https://github.com/pka-human/Spingalett"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('git' 'cmake' 'ninja' 'clang' 'shaderc' 'vulkan-headers')
+provides=('spingalett')
+conflicts=('spingalett')
+optdepends=('vulkan-icd-loader: training and inference on GPUs through Vulkan'
+            'nvidia-utils: training and inference on NVIDIA GPUs through CUDA'
+            'python-numpy: the Python bindings (Bindings/Python)')
+source=("$pkgname::git+https://github.com/pka-human/Spingalett.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$pkgname"
+    git describe --long --tags | sed 's/^v//; s/\([^-]*-g\)/r\1/; s/-/./g'
+}
+
+build() {
+    # the baseline instruction set, with the kernels of later ones chosen at run time; the CUDA kernels compiled
+    # to PTX by clang, the Vulkan shaders by glslc
+    cmake -S $pkgname -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DSPINGALETT_NATIVE_ARCH=OFF \
+        -DBUILD_WITH_OPENMP=ON \
+        -DSPINGALETT_VULKAN=ON \
+        -DSPINGALETT_CUDA=ON \
+        -DBUILD_APPS=OFF \
+        -DSPINGALETT_BIN_DIR="$srcdir/build/Bin" \
+        -DSPINGALETT_LIB_DIR="$srcdir/build/Lib"
+    cmake --build build
+}
+
+check() {
+    # (the GPU groups pass without a device: they find none in a clean chroot)
+    ctest --test-dir build --output-on-failure -E 'python'
+}
+
+package() {
+    DESTDIR="$pkgdir" cmake --install build
+    install -Dm644 $pkgname/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

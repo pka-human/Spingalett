@@ -1,0 +1,8 @@
+# (the build context is the repository; BuildKit reads this file next to the Dockerfile)
+Build
+build
+Bin
+Lib
+data
+*.slett
+*.slettd
