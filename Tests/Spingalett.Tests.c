@@ -4730,6 +4730,164 @@ static void gpu_equivalence(int which) {
     free(pc); free(pg); free(x); free(t);
 }
 
+/* The transformers' networks (tf_net) on the GPU against the CPU: predictions, mini-batch and full-batch
+   training (AdamW, gradient clipping, label smoothing, dropout on a layer whose activation keeps its input),
+   the same bits from two GPU runs, data sets on the GPU, the step API, and bfloat16 close to single
+   precision and repeating itself. */
+static float *gpu_tf_trained(int which, ComputeMode mode, const float *x, const float *t, uint32_t n, uint32_t T,
+                             uint32_t V, TrainingStrategy strategy, bool device, float **params, size_t *count,
+                             TrainReport *report) {
+    NeuralNetwork *net = tf_net(which, T, V);
+    lcg_state = 31u + (unsigned)which;
+    tf_init(net);
+    if (which == 0) net->dropout_rates[8] = 0.1f;          /* the GELU layer */
+    spingalett_set_compute_mode(mode);
+    spingalett_seed(99);
+    SpingalettDeviceData *dx = device ? spingalett_device_data_new(x, n, net->topology[0]) : NULL;
+    SpingalettDeviceData *dt = device ? spingalett_device_data_new(t, n, spingalett_target_size(net)) : NULL;
+    *report = train(.net = net, .inputs = dx ? NULL : x, .targets = dt ? NULL : t, .device_inputs = dx,
+                    .device_targets = dt, .sample_count = n, .epochs = 3, .training_strategy = strategy,
+                    .batch_size = 24, .optimizer_type = OPTIMIZER_ADAMW, .learning_rate = 3e-3f, .weight_decay = 0.01f,
+                    .max_grad_norm = 1.0f, .label_smoothing = 0.05f);
+    spingalett_device_data_free(dx);
+    spingalett_device_data_free(dt);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    const uint32_t out = net->topology[net->layers - 1];
+    float *y = (float *)malloc((size_t)n * out * sizeof(float));
+    predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
+    *count = net->total_weights + net->total_biases;
+    *params = (float *)malloc(*count * sizeof(float) + 4);
+    SpingalettNetworkLayer first;               /* (a read of the parameters brings them back from the GPU) */
+    spingalett_network_layer(net, 1, &first);
+    float *probe = (float *)malloc(first.weight_count * sizeof(float) + 4);
+    spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe, first.weight_count);
+    free(probe);
+    memcpy(*params, net->weights, net->total_weights * sizeof(float));
+    memcpy(*params + net->total_weights, net->biases, net->total_biases * sizeof(float));
+    free_network(net);
+    return y;
+}
+
+/* The largest difference over the largest magnitude (logits near zero make relative errors meaningless). */
+static double gpu_max_scaled(const float *a, const float *b, size_t n) {
+    double worst = 0.0, top = 1e-6;
+    for (size_t i = 0; i < n; i++) {
+        worst = fmax(worst, fabs((double)a[i] - b[i]));
+        top = fmax(top, fabs((double)a[i]));
+    }
+    return worst / top;
+}
+
+static void gpu_transformer(int which) {
+    const uint32_t T = 24, V = 19, n = 120;
+    NeuralNetwork *probe = tf_net(which, T, V);
+    lcg_state = 31u + (unsigned)which;
+    tf_init(probe);
+    float *x, *t;
+    lcg_state = 811u + (unsigned)which;
+    tf_data(probe, n, V, &x, &t);
+    const uint32_t out = probe->topology[probe->layers - 1];
+    float *pc = (float *)malloc((size_t)n * out * sizeof(float)), *pg = (float *)malloc((size_t)n * out * sizeof(float));
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    predict(.net = probe, .inputs = x, .outputs = pc, .sample_count = n);
+    EvalMetrics ec = evaluate(.net = probe, .inputs = x, .targets = t, .sample_count = n);
+    spingalett_set_compute_mode(gpu_mode);
+    predict(.net = probe, .inputs = x, .outputs = pg, .sample_count = n);
+    EvalMetrics eg = evaluate(.net = probe, .inputs = x, .targets = t, .sample_count = n);
+    free_network(probe);
+    const double predicted = gpu_max_scaled(pc, pg, (size_t)n * out);
+
+    float *wc, *wg, *wg2, *wd;
+    size_t count;
+    TrainReport rc, rg, rg2, rd;
+    const TrainingStrategy mini = STRATEGY_SMALL_BATCH;
+    float *oc = gpu_tf_trained(which, COMPUTE_OPENMP, x, t, n, T, V, mini, false, &wc, &count, &rc);
+    float *og = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &wg, &count, &rg);
+    float *og2 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &wg2, &count, &rg2);
+    float *od = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, true, &wd, &count, &rd);
+    const double trained = gpu_max_scaled(oc, og, (size_t)n * out);
+    const bool same = !memcmp(wg, wg2, count * sizeof(float)) && !memcmp(og, og2, (size_t)n * out * sizeof(float));
+    const bool device = !memcmp(wg, wd, count * sizeof(float));
+    float *fc, *fg;
+    TrainReport fr1, fr2;
+    float *ofc = gpu_tf_trained(which, COMPUTE_OPENMP, x, t, n, T, V, STRATEGY_FULL_BATCH, false, &fc, &count, &fr1);
+    float *ofg = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, STRATEGY_FULL_BATCH, false, &fg, &count, &fr2);
+    const double full = gpu_max_scaled(ofc, ofg, (size_t)n * out);
+    CHECK(predicted < 1e-5, "gpu transformer %d: predictions differ by %.2e", which, predicted);
+    CHECK(fabsf(ec.loss - eg.loss) <= 1e-5f * (1.0f + ec.loss) && fabsf(ec.accuracy - eg.accuracy) < 1e-6f,
+          "gpu transformer %d: evaluation %g/%g against %g/%g", which, (double)eg.loss, (double)eg.accuracy,
+          (double)ec.loss, (double)ec.accuracy);
+    CHECK(rg.status == TRAIN_COMPLETED && fr2.status == TRAIN_COMPLETED && rd.status == TRAIN_COMPLETED,
+          "gpu transformer %d: training failed", which);
+    CHECK(trained < 1e-3, "gpu transformer %d: trained outputs differ by %.2e (loss %g / %g)", which, trained,
+          (double)rc.train_loss, (double)rg.train_loss);
+    CHECK(fabsf(rc.train_loss - rg.train_loss) <= 1e-4f * fabsf(rc.train_loss), "gpu transformer %d: losses %g / %g",
+          which, (double)rc.train_loss, (double)rg.train_loss);
+    CHECK(full < 1e-3, "gpu transformer %d: full-batch outputs differ by %.2e", which, full);
+    CHECK(same, "gpu transformer %d: two GPU runs differ", which);
+    CHECK(device, "gpu transformer %d: data sets on the GPU train otherwise than host arrays", which);
+
+    /* bfloat16: close to single precision, deterministic */
+    float *b1 = NULL, *b2 = NULL, *pb = (float *)malloc((size_t)n * out * sizeof(float));
+    bool bf16_same = true;
+    double bf16 = 0.0;
+    if (spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+        TrainReport r1, r2;
+        float *o1 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &b1, &count, &r1);
+        float *o2 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &b2, &count, &r2);
+        bf16_same = !memcmp(b1, b2, count * sizeof(float)) && !memcmp(o1, o2, (size_t)n * out * sizeof(float));
+        bf16 = fabs((double)r1.train_loss - rg.train_loss) / rg.train_loss;
+        CHECK(bf16_same && bf16 < 0.05, "gpu transformer %d: bfloat16 loss %.3g against %.3g, deterministic %d", which,
+              (double)r1.train_loss, (double)rg.train_loss, bf16_same);
+        free(o1); free(o2);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    }
+    printf("  gpu transformer %d: predict %.1e, trained %.1e, full batch %.1e, deterministic %s, device data %s, "
+           "bf16 loss %.1e\n", which, predicted, trained, full, same ? "yes" : "no", device ? "alike" : "differ", bf16);
+    free(oc); free(og); free(og2); free(od); free(ofc); free(ofg); free(wc); free(wg); free(wg2); free(wd); free(fc);
+    free(fg); free(b1); free(b2); free(pb); free(pc); free(pg); free(x); free(t);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* The step API on a transformer, on the GPU against the CPU: forward, the sparse loss's backward pass with
+   label smoothing, two passes a step. */
+static void gpu_transformer_trainer(void) {
+    const uint32_t T = 16, V = 11, n = 32;
+    float out_loss[2] = {0, 0}, *params[2] = {NULL, NULL};
+    size_t count = 0;
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = tf_net(1, T, V);
+        lcg_state = 5;
+        tf_init(net);
+        float *x, *t;
+        tf_data(net, n, V, &x, &t);
+        spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_OPENMP);
+        SpingalettTrainer *tr = spingalett_trainer_new(net, n / 2);
+        spingalett_trainer_set_label_smoothing(tr, 0.1f);
+        OptimizerArgs o = {.type = OPTIMIZER_ADAM, .learning_rate = 1e-3f};
+        for (int step = 0; step < 3; step++) {
+            for (uint32_t h = 0; h < 2; h++) {
+                spingalett_trainer_forward(tr, x + (size_t)h * (n / 2) * T, n / 2);
+                out_loss[k] = spingalett_trainer_backward(tr, t + (size_t)h * (n / 2) * T);
+            }
+            spingalett_trainer_step(tr, &o);
+        }
+        spingalett_trainer_free(tr);            /* (brings the parameters back) */
+        count = net->total_weights + net->total_biases;
+        params[k] = (float *)malloc(count * sizeof(float));
+        memcpy(params[k], net->weights, net->total_weights * sizeof(float));
+        memcpy(params[k] + net->total_weights, net->biases, net->total_biases * sizeof(float));
+        free(x); free(t);
+        free_network(net);
+    }
+    double worst = gpu_max_rel(params[0], params[1], count);
+    CHECK(worst < 1e-3 && fabsf(out_loss[0] - out_loss[1]) <= 1e-4f * out_loss[0],
+          "gpu transformer trainer: parameters %.2e apart, losses %g / %g", worst, (double)out_loss[0], (double)out_loss[1]);
+    printf("  gpu transformer trainer: parameters %.1e from the CPU's\n", worst);
+    free(params[0]); free(params[1]);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 /* The training loss of a sigmoid output saturated at 1, on the CPU and the GPU: finite, the same. */
 static void gpu_saturated(void) {
     L ls[] = {{2, ACT_NONE}, {1, ACT_SIGMOID}};
@@ -5862,6 +6020,8 @@ int main(int argc, char **argv) {
             gpu_device_data();
             gpu_device_data_threads();
             gpu_bf16();
+            for (int k = 0; k < 4; k++) gpu_transformer(k);
+            gpu_transformer_trainer();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }

@@ -1,0 +1,256 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Attention (Spingalett.Transformer.c computes the same), in tiles of BQ rows that never store the scores:
+ *
+ *   FORWARD   a workgroup a tile of queries of a head of a sample: the keys and values a tile at a time,
+ *             the softmax online (the row's maximum and sum, the outputs rescaled when the maximum grows);
+ *             y = the outputs, and with STATS each query's log of the sum (stats[(s heads + h) cells + i])
+ *   PRE       a thread a query: stats[rows + ...] = rowsum(dy o) of its outputs o (x: the outputs)
+ *   DQ        a workgroup a tile of queries: the scores again from the log sums, dP = dO V^T, dS = P (dP -
+ *             rowsum(dO o)), the queries' gradient dS K / sqrt(d) into dx
+ *   DKV       a workgroup a tile of keys of a key and value head: the gradients of its keys (dS^T Q /
+ *             sqrt(d)) and values (P^T dO) summed over the group's query heads and the tiles of queries
+ *
+ * x holds a cell's queries, keys and values side by side ((heads + 2 kv) d floats), y and dy the heads'
+ * outputs (heads d floats a cell). With ROPE, queries and keys are rotated by their cell's position first
+ * (table: cells x d/2 cosines, then as many sines), their gradients rotated back. Each thread of a row's
+ * TPR = THREADS / BQ threads takes the keys (and the columns) q, q + TPR, ...; what a row sums over keys
+ * is combined across its threads in their order: every sum in a fixed order, the same bits on every run.
+ * Shared memory: 4 BQ DMAX + 2 BQ BQ + 2 BQ + THREADS floats, within 32 KB for the tiles the host
+ * picks (DMAX 32, 64, 128, 256 with BQ 32, 16, 8, 4).
+ */
+
+#version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint BQ = 32;         /* rows of a tile of queries or keys */
+layout(constant_id = 2) const uint DMAX = 64;       /* the head size, at most (a multiple of THREADS / BQ) */
+layout(constant_id = 3) const uint THREADS = 128;
+layout(constant_id = 4) const uint HALF = 0;        /* words: x 0, y 1, dy 2, dx 3 (half.glsl) */
+layout(local_size_x_id = 3) in;
+
+#define FORWARD 0u
+#define PRE     1u
+#define DQ      2u
+#define DKV     3u
+
+#define FLAG_CAUSAL 1u
+#define FLAG_ROPE   2u
+#define FLAG_STATS  4u
+
+layout(push_constant) uniform Push {
+    F32 x, y, dy, dx, stats, table;
+    uint n, cells, heads, kv, d, flags;
+    float scale;
+} p;
+
+#include "half.glsl"
+
+const uint TPR = THREADS / BQ, KPT = BQ / TPR, CPT = DMAX / TPR;
+
+shared float sA[BQ * DMAX], sB[BQ * DMAX], sK[BQ * DMAX], sV[BQ * DMAX];
+shared float sP[BQ * BQ], sS[BQ * BQ], sL[BQ], sD[BQ], red[THREADS];
+
+/* Value c of a query (or key) vector at x's float `at`, of the cell at position pos: rotated by it with
+   ROPE (the halves of the vector paired) */
+float rotated(uint at, uint pos, uint c) {
+    const float v = ld(p.x, at + c, 0u);
+    if ((p.flags & FLAG_ROPE) == 0u) return v;
+    const uint half_ = p.d / 2u, i = c < half_ ? c : c - half_;
+    const float cs = p.table.v[pos * half_ + i], sn = p.table.v[p.cells * half_ + pos * half_ + i];
+    return c < half_ ? v * cs - ld(p.x, at + c + half_, 0u) * sn : v * cs + ld(p.x, at + c - half_, 0u) * sn;
+}
+
+/* the maximum (or the sum) of v over a row's threads, in their order */
+float row_combine(uint tid, uint r, float v, bool maximum) {
+    red[tid] = v;
+    barrier();
+    float acc = red[r * TPR];
+    for (uint k = 1u; k < TPR; k++) acc = maximum ? max(acc, red[r * TPR + k]) : acc + red[r * TPR + k];
+    barrier();
+    return acc;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, r = tid / TPR, q = tid % TPR, d = p.d;
+    const uint C = (p.heads + 2u * p.kv) * d, out_c = p.heads * d, group = p.heads / p.kv;
+    const bool causal = (p.flags & FLAG_CAUSAL) != 0u;
+    const float NEG = -3.402823466e38;
+    if (OP == PRE) {
+        const uint rows = p.n * p.heads * p.cells;
+        for (uint e = gl_GlobalInvocationID.x; e < rows; e += gl_NumWorkGroups.x * THREADS) {
+            const uint i = e % p.cells, h = (e / p.cells) % p.heads, s = e / (p.cells * p.heads);
+            const uint at = (s * p.cells + i) * out_c + h * d;
+            float dot = 0.0;
+            for (uint c = 0u; c < d; c++) dot = fma(ld(p.dy, at + c, 2u), ld(p.x, at + c, 0u), dot);
+            p.stats.v[rows + e] = dot;
+        }
+        return;
+    }
+    const uint s = gl_WorkGroupID.z, rows = p.n * p.heads * p.cells;
+    if (OP == FORWARD || OP == DQ) {
+        const uint h = gl_WorkGroupID.y, g = h / group, i0 = gl_WorkGroupID.x * BQ, i = i0 + r;
+        /* the queries (times the scale) in sA, with DQ the outputs' gradient in sB and their sums */
+        for (uint e = tid; e < BQ * d; e += THREADS) {
+            const uint rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * C + h * d;
+            sA[rr * DMAX + c] = ii < p.cells ? rotated(at, ii, c) * p.scale : 0.0;
+            if (OP == DQ) sB[rr * DMAX + c] = ii < p.cells ? ld(p.dy, (s * p.cells + ii) * out_c + h * d + c, 2u) : 0.0;
+        }
+        const uint stat = (s * p.heads + h) * p.cells + i;
+        const float lse = OP == DQ && i < p.cells ? p.stats.v[stat] : 0.0;
+        const float delta = OP == DQ && i < p.cells ? p.stats.v[rows + stat] : 0.0;
+        float m = NEG, l = 0.0, acc[CPT];
+        for (uint k = 0u; k < CPT; k++) acc[k] = 0.0;
+        const uint keys = causal ? min(p.cells, i0 + BQ) : p.cells;
+        for (uint j0 = 0u; j0 < keys; j0 += BQ) {
+            barrier();                  /* the last tile's keys and values are no longer read */
+            for (uint e = tid; e < BQ * d; e += THREADS) {
+                const uint jj = e / d, c = e % d, j = j0 + jj, at = (s * p.cells + j) * C;
+                sK[jj * DMAX + c] = j < p.cells ? rotated(at + (p.heads + g) * d, j, c) : 0.0;
+                sV[jj * DMAX + c] = j < p.cells ? ld(p.x, at + (p.heads + p.kv + g) * d + c, 0u) : 0.0;
+            }
+            barrier();
+            /* this thread's scores: keys q, q + TPR, ... of the tile */
+            float sc[KPT], dp[KPT], top = NEG;
+            for (uint k = 0u; k < KPT; k++) {
+                const uint jj = q + TPR * k, j = j0 + jj;
+                float dot = 0.0, dot2 = 0.0;
+                for (uint c = 0u; c < d; c++) {
+                    dot = fma(sA[r * DMAX + c], sK[jj * DMAX + c], dot);
+                    if (OP == DQ) dot2 = fma(sB[r * DMAX + c], sV[jj * DMAX + c], dot2);
+                }
+                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
+                sc[k] = valid ? dot : NEG;
+                dp[k] = dot2;
+                top = max(top, sc[k]);
+            }
+            if (OP == FORWARD) {
+                const float mt = row_combine(tid, r, top, true), mnew = max(m, mt);
+                const float alpha = mnew == NEG ? 1.0 : exp(m - mnew);
+                float sum = 0.0;
+                for (uint k = 0u; k < KPT; k++) {
+                    const float pk = sc[k] == NEG ? 0.0 : exp(sc[k] - mnew);
+                    sP[r * BQ + q + TPR * k] = pk;
+                    sum += pk;
+                }
+                l = l * alpha + row_combine(tid, r, sum, false);    /* (its barrier publishes sP) */
+                m = mnew;
+                for (uint k = 0u; k < CPT; k++) acc[k] *= alpha;
+                for (uint jj = 0u; jj < BQ; jj++) {
+                    const float pj = sP[r * BQ + jj];
+                    for (uint k = 0u; k < CPT; k++) acc[k] = fma(pj, sV[jj * DMAX + q + TPR * k], acc[k]);
+                }
+            } else {
+                for (uint k = 0u; k < KPT; k++) {
+                    const float pk = sc[k] == NEG ? 0.0 : exp(sc[k] - lse);
+                    sP[r * BQ + q + TPR * k] = pk * (dp[k] - delta);
+                }
+                barrier();
+                for (uint jj = 0u; jj < BQ; jj++) {
+                    const float ds = sP[r * BQ + jj];
+                    for (uint k = 0u; k < CPT; k++) acc[k] = fma(ds, sK[jj * DMAX + q + TPR * k], acc[k]);
+                }
+            }
+        }
+        if (OP == FORWARD) {
+            const float inv = 1.0 / l;
+            if (i < p.cells) {
+                for (uint k = 0u; k < CPT; k++) {
+                    const uint c = q + TPR * k;
+                    if (c < d) st(p.y, (s * p.cells + i) * out_c + h * d + c, 1u, acc[k] * inv);
+                }
+                if ((p.flags & FLAG_STATS) != 0u && q == 0u) p.stats.v[stat] = m + log(l);
+            }
+            return;
+        }
+        /* dQ = dS K / sqrt(d), rotated back through shared memory (a column's pair may be another thread's) */
+        barrier();
+        for (uint k = 0u; k < CPT; k++) sA[r * DMAX + q + TPR * k] = acc[k] * p.scale;
+        barrier();
+        if (i < p.cells)
+            for (uint k = 0u; k < CPT; k++) {
+                const uint c = q + TPR * k;
+                if (c >= d) continue;
+                float v = sA[r * DMAX + c];
+                if ((p.flags & FLAG_ROPE) != 0u) {
+                    const uint half_ = d / 2u, ii = c < half_ ? c : c - half_;
+                    const float cs = p.table.v[i * half_ + ii], sn = p.table.v[p.cells * half_ + i * half_ + ii];
+                    v = c < half_ ? v * cs + sA[r * DMAX + c + half_] * sn : v * cs - sA[r * DMAX + c - half_] * sn;
+                }
+                st(p.dx, (s * p.cells + i) * C + h * d + c, 3u, v);
+            }
+        return;
+    }
+    /* DKV: a tile of keys and values of head g; this thread's key r, its columns q, q + TPR, ... */
+    const uint g = gl_WorkGroupID.y, j0 = gl_WorkGroupID.x * BQ, j = j0 + r;
+    for (uint e = tid; e < BQ * d; e += THREADS) {
+        const uint jj = e / d, c = e % d, jk = j0 + jj, at = (s * p.cells + jk) * C;
+        sK[jj * DMAX + c] = jk < p.cells ? rotated(at + (p.heads + g) * d, jk, c) : 0.0;
+        sV[jj * DMAX + c] = jk < p.cells ? ld(p.x, at + (p.heads + p.kv + g) * d + c, 0u) : 0.0;
+    }
+    float dk[CPT], dv[CPT];
+    for (uint k = 0u; k < CPT; k++) dk[k] = dv[k] = 0.0;
+    for (uint h = g * group; h < (g + 1u) * group; h++)
+        for (uint i0 = causal ? j0 : 0u; i0 < p.cells; i0 += BQ) {
+            barrier();                  /* the last tile of queries is no longer read */
+            for (uint e = tid; e < BQ * d; e += THREADS) {
+                const uint rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * C + h * d;
+                sA[rr * DMAX + c] = ii < p.cells ? rotated(at, ii, c) * p.scale : 0.0;
+                sB[rr * DMAX + c] = ii < p.cells ? ld(p.dy, (s * p.cells + ii) * out_c + h * d + c, 2u) : 0.0;
+            }
+            if (tid < BQ) {
+                const uint ii = i0 + tid, stat = (s * p.heads + h) * p.cells + ii;
+                sL[tid] = ii < p.cells ? p.stats.v[stat] : 0.0;
+                sD[tid] = ii < p.cells ? p.stats.v[rows + stat] : 0.0;
+            }
+            barrier();
+            /* queries q, q + TPR, ... of the tile against this thread's key r */
+            for (uint k = 0u; k < KPT; k++) {
+                const uint rr = q + TPR * k, ii = i0 + rr;
+                float dot = 0.0, dot2 = 0.0;
+                for (uint c = 0u; c < d; c++) {
+                    dot = fma(sA[rr * DMAX + c], sK[r * DMAX + c], dot);
+                    dot2 = fma(sB[rr * DMAX + c], sV[r * DMAX + c], dot2);
+                }
+                const bool valid = ii < p.cells && j < p.cells && (!causal || j <= ii);
+                const float pk = valid ? exp(dot - sL[rr]) : 0.0;
+                sP[rr * BQ + r] = pk;
+                sS[rr * BQ + r] = pk * (dot2 - sD[rr]);
+            }
+            barrier();
+            for (uint rr = 0u; rr < BQ; rr++) {
+                const float pk = sP[rr * BQ + r], ds = sS[rr * BQ + r];
+                for (uint k = 0u; k < CPT; k++) {
+                    const uint c = q + TPR * k;
+                    dv[k] = fma(pk, sB[rr * DMAX + c], dv[k]);
+                    dk[k] = fma(ds, sA[rr * DMAX + c], dk[k]);
+                }
+            }
+        }
+    /* the keys' gradient rotated back through shared memory; the values' as it is */
+    barrier();
+    for (uint k = 0u; k < CPT; k++) sK[r * DMAX + q + TPR * k] = dk[k];
+    barrier();
+    if (j >= p.cells) return;
+    const uint at = (s * p.cells + j) * C;
+    for (uint k = 0u; k < CPT; k++) {
+        const uint c = q + TPR * k;
+        if (c >= d) continue;
+        float v = sK[r * DMAX + c];
+        if ((p.flags & FLAG_ROPE) != 0u) {
+            const uint half_ = d / 2u, ii = c < half_ ? c : c - half_;
+            const float cs = p.table.v[j * half_ + ii], sn = p.table.v[p.cells * half_ + j * half_ + ii];
+            v = c < half_ ? v * cs + sK[r * DMAX + c + half_] * sn : v * cs - sK[r * DMAX + c - half_] * sn;
+        }
+        st(p.dx, at + (p.heads + g) * d + c, 3u, v);
+        st(p.dx, at + (p.heads + p.kv + g) * d + c, 3u, dv[k]);
+    }
+}

@@ -28,6 +28,11 @@ SPG_CUDA_UNIT(dconv16, dconv, "-DKMAX=16")              /* KMAX (EXACT), or up t
 SPG_CUDA_UNIT(dconv27, dconv, "-DKMAX=27 -DEXACT=1")
 SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
 SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
+SPG_CUDA_UNIT(embed, embed, "")
+SPG_CUDA_UNIT(attn_d32, attn, "-DDMAX=32u")       /* attention: a unit per head size, at most */
+SPG_CUDA_UNIT(attn_d64, attn, "-DDMAX=64u")
+SPG_CUDA_UNIT(attn_d128, attn, "-DDMAX=128u")
+SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")
 
 /* depthwise convolutions: any window, stride, mode, VEC and padding, and the common windows (KH, KW, SH, SW),
    padded (KW - 1) / 2, for every mode (0 APPLY, 1 SPREAD, 2 WEIGHTS) and VEC (1, 4) as constants: units

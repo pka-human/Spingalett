@@ -1,0 +1,135 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Token embeddings (Spingalett.Transformer.c's passes):
+ *
+ *   FORWARD   y[s][p] = row t of the table w (zeros for t outside it) + pos[p] (with FLAG_POS), t the
+ *             value of x at the cell; n samples of `tokens` cells of d channels
+ *   KEYS      for the `total` positions of the batch: keys[i] = its token (the vocabulary for none),
+ *             keys[total + i] = i
+ *   HIST      a block of 256 keys: part[digit blocks + block] = how many of them have that value of the
+ *             digit (eight bits of the key from `shift`)
+ *   SCAN      part, digit-major, into where each digit's keys of each block start
+ *   SCATTER   each key of a block (and its position) to where its digit's start plus the block's keys of
+ *             that digit before it: a stable sort by the digit (the arrays from keys[2 total] on, or back
+ *             with FLAG_FROM)
+ *   GRAD      the first position of each token's run of sorted keys: gw[t] = beta gw[t] + scale (the
+ *             rows of dy at the run's positions, in their order)
+ *
+ * Every count and sum is taken in a fixed order: no atomics, the same bits on every run.
+ */
+
+#version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint HALF = 0;    /* words: y 2, dy 6 (half.glsl) */
+layout(local_size_x = 256) in;
+
+#define FORWARD 0u
+#define KEYS    1u
+#define HIST    2u
+#define SCAN    3u
+#define SCATTER 4u
+#define GRAD    5u
+#define BLOCK   256u
+
+#define FLAG_FROM 1u
+#define FLAG_POS  2u
+
+layout(push_constant) uniform Push {
+    F32 x, w, y, pos;
+    U32 keys, part;
+    F32 dy, gw;
+    uint total, tokens, d, vocab, n, shift, blocks, flags;
+    float scale, beta;
+} p;
+
+#include "half.glsl"
+
+shared uint sk[BLOCK], counts[BLOCK];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, stride = gl_NumWorkGroups.x * 256u;
+    if (OP == FORWARD) {
+        const uint d = p.d, total = p.n * p.tokens * d;
+        const bool positions = (p.flags & FLAG_POS) != 0u;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+            const uint cell = i / d, c = i % d;
+            const float t = p.x.v[cell];
+            float v = t >= 0.0 && t < float(p.vocab) ? p.w.v[uint(t) * d + c] : 0.0;
+            if (positions) v += p.pos.v[(cell % p.tokens) * d + c];
+            st(p.y, i, 2u, v);
+        }
+        return;
+    }
+    if (OP == KEYS) {
+        for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+            const float t = p.x.v[i];
+            p.keys.v[i] = t >= 0.0 && t < float(p.vocab) ? uint(t) : p.vocab;
+            p.keys.v[p.total + i] = i;
+        }
+        return;
+    }
+    if (OP == HIST || OP == SCATTER) {
+        const uint from = (p.flags & FLAG_FROM) != 0u ? 2u : 0u, b = gl_WorkGroupID.x, i = b * BLOCK + tid;
+        const bool live = i < p.total;
+        const uint key = live ? p.keys.v[from * p.total + i] : 0u, digit = live ? (key >> p.shift) & 255u : 256u;
+        sk[tid] = digit;
+        barrier();
+        if (OP == HIST) {
+            uint count = 0u;
+            for (uint k = 0u; k < BLOCK; k++) count += sk[k] == tid ? 1u : 0u;
+            p.part.v[tid * p.blocks + b] = count;
+            return;
+        }
+        if (!live) return;
+        uint rank = 0u;
+        for (uint k = 0u; k < tid; k++) rank += sk[k] == digit ? 1u : 0u;
+        const uint at = p.part.v[digit * p.blocks + b] + rank;
+        p.keys.v[(2u - from) * p.total + at] = key;
+        p.keys.v[(3u - from) * p.total + at] = p.keys.v[(from + 1u) * p.total + i];
+        return;
+    }
+    if (OP == SCAN) {
+        const uint total = 256u * p.blocks, run = (total + BLOCK - 1u) / BLOCK, lo = tid * run;
+        const uint hi = min(lo + run, total);
+        uint sum = 0u;
+        for (uint k = lo; k < hi; k++) sum += p.part.v[k];
+        counts[tid] = sum;
+        barrier();
+        if (tid == 0u) {
+            uint acc = 0u;
+            for (uint k = 0u; k < BLOCK; k++) {
+                const uint v = counts[k];
+                counts[k] = acc;
+                acc += v;
+            }
+        }
+        barrier();
+        uint acc = counts[tid];
+        for (uint k = lo; k < hi; k++) {
+            const uint v = p.part.v[k];
+            p.part.v[k] = acc;
+            acc += v;
+        }
+        return;
+    }
+    /* GRAD */
+    const uint from = (p.flags & FLAG_FROM) != 0u ? 2u : 0u, d = p.d, total = p.total * d;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        const uint j = i / d, c = i % d, t = p.keys.v[from * p.total + j];
+        if (t >= p.vocab || (j > 0u && p.keys.v[from * p.total + j - 1u] == t)) continue;
+        float sum = 0.0;
+        for (uint k = j; k < p.total && p.keys.v[from * p.total + k] == t; k++)
+            sum += ld(p.dy, p.keys.v[(from + 1u) * p.total + k] * d + c, 6u);
+        const uint at = t * d + c;
+        p.gw.v[at] = p.beta != 0.0 ? p.beta * p.gw.v[at] + p.scale * sum : p.scale * sum;
+    }
+}

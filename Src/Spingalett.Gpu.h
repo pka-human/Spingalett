@@ -31,6 +31,7 @@ typedef struct {
     float decay, momentum, beta1, beta2, epsilon;
     float max_grad_norm;
     uint64_t dropout_seed;
+    float smoothing;                /* LOSS_SPARSE_CROSS_ENTROPY: label smoothing of its targets */
 } SpgGpuTraining;
 
 /* Per optimizer step. */
@@ -91,6 +92,8 @@ void spingalett_gpu_net_set_version(SpgGpuNet *g, uint64_t version);
    they changed); false leaves it as it was. */
 bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTraining *training);
 
+/* The label smoothing of the sparse cross-entropy from the next chunk or pass on. */
+void spingalett_gpu_set_smoothing(SpgGpuNet *g, float smoothing);
 /* Copies the network's parameters (weights, biases, running statistics and optimizer moments) to
    the device, or back from it after the work submitted so far. */
 bool spingalett_gpu_upload(SpgGpuNet *g);
@@ -196,6 +199,7 @@ static inline bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, con
     (void)g; (void)capacity; (void)t;
     return false;
 }
+static inline void spingalett_gpu_set_smoothing(SpgGpuNet *g, float smoothing) { (void)g; (void)smoothing; }
 static inline bool spingalett_gpu_upload(SpgGpuNet *g) { (void)g; return false; }
 static inline bool spingalett_gpu_download(SpgGpuNet *g) { (void)g; return false; }
 static inline uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {

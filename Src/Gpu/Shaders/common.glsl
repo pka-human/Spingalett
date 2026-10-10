@@ -34,34 +34,51 @@ uint to_bf16(float f) {
 #define ACT_LEAKY_RELU  4u
 #define ACT_FOO52       5u
 #define ACT_SOFTMAX     6u
+#define ACT_GELU        7u      /* these three: functions of their input, whose derivative needs it */
+#define ACT_GELU_TANH   8u
+#define ACT_SILU        9u
+
+/* tanh() of some drivers overflows to NaN for large arguments: (1 - e) / (1 + e), e = exp(-2|x|),
+   which loses relative precision below |x| = 0.3, where an odd Taylor polynomial takes over, as the
+   CPU's vector kernel has (Spingalett.SIMD.c) */
+float tanh_(float x) {
+    float a = abs(x), t;
+    if (a < 0.3) {
+        float a2 = a * a, q = fma(-8.86323552990219656e-3, a2, 2.18694885361552028e-2);
+        q = fma(q, a2, -5.39682539682539683e-2);
+        q = fma(q, a2, 1.33333333333333333e-1);
+        q = fma(q, a2, -3.33333333333333333e-1);
+        t = fma(a * a2, q, a);
+    } else {
+        float e = exp(-2.0 * a);
+        t = (1.0 - e) / (1.0 + e);
+    }
+    return x < 0.0 ? -t : t;
+}
+
+/* erf (GLSL has none): Abramowitz and Stegun 7.1.26, within 1.5e-7 of it */
+float erf_(float x) {
+    float a = abs(x), t = 1.0 / fma(0.3275911, a, 1.0);
+    float q = fma(fma(fma(fma(1.061405429, t, -1.453152027), t, 1.421413741), t, -0.284496736), t, 0.254829592);
+    float r = 1.0 - q * t * exp(-a * a);
+    return x < 0.0 ? -r : r;
+}
 
 float activate(float x, uint act) {
     switch (act) {
         case ACT_RELU:          return x > 0.0 ? x : 0.0;
         case ACT_LEAKY_RELU:    return x > 0.0 ? x : 0.01 * x;
         case ACT_SIGMOID:       return 1.0 / (1.0 + exp(-x));
-        case ACT_TANH: {        /* tanh() of some drivers overflows to NaN for large arguments */
-            /* (1 - e) / (1 + e), e = exp(-2|x|), loses relative precision below |x| = 0.3: an odd
-               Taylor polynomial there, as the CPU's vector kernel has (Spingalett.SIMD.c) */
-            float a = abs(x), t;
-            if (a < 0.3) {
-                float a2 = a * a, q = fma(-8.86323552990219656e-3, a2, 2.18694885361552028e-2);
-                q = fma(q, a2, -5.39682539682539683e-2);
-                q = fma(q, a2, 1.33333333333333333e-1);
-                q = fma(q, a2, -3.33333333333333333e-1);
-                t = fma(a * a2, q, a);
-            } else {
-                float e = exp(-2.0 * a);
-                t = (1.0 - e) / (1.0 + e);
-            }
-            return x < 0.0 ? -t : t;
-        }
+        case ACT_TANH:          return tanh_(x);
         case ACT_FOO52:         return x > 1.0 ? 1.0 + 0.01 * (x - 1.0) : (x < 0.0 ? 0.01 * x : x);
+        case ACT_GELU:          return 0.5 * x * (1.0 + erf_(x * 0.70710678118654752));
+        case ACT_GELU_TANH:     return 0.5 * x * (1.0 + tanh_(0.79788456080286536 * (x + 0.044715 * x * x * x)));
+        case ACT_SILU:          return x / (1.0 + exp(-x));
         default:                return x;
     }
 }
 
-/* The derivative of the activation, from its output y. */
+/* The derivative of the activation, from its output y, or for GELU and SiLU from its input. */
 float derivative(float y, uint act) {
     switch (act) {
         case ACT_RELU:          return y > 0.0 ? 1.0 : 0.0;
@@ -70,6 +87,15 @@ float derivative(float y, uint act) {
         case ACT_SOFTMAX:       return y * (1.0 - y);
         case ACT_TANH:          return 1.0 - y * y;
         case ACT_FOO52:         return (y > 1.0 || y < 0.0) ? 0.01 : 1.0;
+        case ACT_GELU:          return 0.5 * (1.0 + erf_(y * 0.70710678118654752)) + y * 0.39894228040143268 * exp(-0.5 * y * y);
+        case ACT_GELU_TANH: {
+            float k = 0.79788456080286536, t = tanh_(k * (y + 0.044715 * y * y * y));
+            return 0.5 * (1.0 + t) + 0.5 * y * (1.0 - t * t) * k * (1.0 + 3.0 * 0.044715 * y * y);
+        }
+        case ACT_SILU: {
+            float s = 1.0 / (1.0 + exp(-y));
+            return s * (1.0 + y * (1.0 - s));
+        }
         default:                return 1.0;
     }
 }

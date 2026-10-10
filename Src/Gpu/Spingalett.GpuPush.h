@@ -59,14 +59,19 @@ typedef struct {
     uint64_t z;
 } SpgEltwisePush;
 enum { SPG_ELT_BIAS_ACT, SPG_ELT_DERIV, SPG_ELT_MUL, SPG_ELT_ADD, SPG_ELT_DROPOUT, SPG_ELT_AFFINE, SPG_ELT_BDATA,
-       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD, SPG_ELT_COPY };
+       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD, SPG_ELT_COPY, SPG_ELT_ACT, SPG_ELT_PRODUCT };
+#define SPG_ELT_FLAG_A   1u         /* BIAS_ACT adds a */
+#define SPG_ELT_FLAG_ADD 2u         /* PRODUCT adds to y */
 
 /* output.comp */
 typedef struct {
-    uint64_t y, t, delta, loss;
-    uint32_t rows, n;
+    uint64_t y, t, delta, loss, part;
+    uint32_t rows, n, cells;
+    float smoothing;
+    uint32_t flags, pad;
 } SpgOutputPush;
-enum { SPG_OUT_SOFTMAX, SPG_OUT_LOSS, SPG_OUT_GRADS };
+enum { SPG_OUT_SOFTMAX, SPG_OUT_LOSS, SPG_OUT_GRADS, SPG_OUT_COUNT, SPG_OUT_SUM };
+#define SPG_OUT_ACCURACY 1u         /* SUM: the samples' accuracies too, after their losses */
 
 /* pool.comp */
 typedef struct {
@@ -86,6 +91,8 @@ typedef struct {
     uint32_t cells, C, flags;
     float eps;
 } SpgLnPush;
+#define SPG_LN_STATS 1u             /* flags: keep each cell's statistics (training) */
+#define SPG_LN_RMS   2u             /* RMS normalization */
 
 /* combine.comp */
 typedef struct {
@@ -103,6 +110,29 @@ typedef struct {
 } SpgDwconvPush;
 enum { SPG_DW_APPLY, SPG_DW_SPREAD, SPG_DW_WEIGHTS };
 #define SPG_DW_TAPS 49u             /* taps at most */
+
+/* embed.comp */
+typedef struct {
+    uint64_t x, w, y, pos, keys, part, dy, gw;
+    uint32_t total, tokens, d, vocab, n, shift, blocks, flags;
+    float scale, beta;
+} SpgEmbedPush;
+enum { SPG_EMBED_FORWARD, SPG_EMBED_KEYS, SPG_EMBED_HIST, SPG_EMBED_SCAN, SPG_EMBED_SCATTER, SPG_EMBED_GRAD };
+#define SPG_EMBED_FROM 1u           /* the sort's keys in its second pair of arrays */
+#define SPG_EMBED_POS  2u           /* FORWARD adds the positions' vectors */
+#define SPG_EMBED_BLOCK 256u        /* keys a block of HIST and SCATTER */
+
+/* attn.comp */
+typedef struct {
+    uint64_t x, y, dy, dx, stats, table;
+    uint32_t n, cells, heads, kv, d, flags;
+    float scale;
+    uint32_t pad;
+} SpgAttnPush;
+enum { SPG_ATTN_FORWARD, SPG_ATTN_PRE, SPG_ATTN_DQ, SPG_ATTN_DKV };
+#define SPG_ATTN_CAUSAL 1u
+#define SPG_ATTN_ROPE   2u
+#define SPG_ATTN_STATS  4u          /* FORWARD keeps each query's log of the softmax's sum */
 
 /* rows.comp */
 typedef struct {

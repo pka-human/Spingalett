@@ -9,6 +9,7 @@
 #include "common.cuh"
 
 #define FLAG_STATS 1u
+#define FLAG_RMS   2u          /* RMS normalization: mean 0, no beta, no a in the backward pass (ln.comp) */
 
 /* s[the cell's first thread] = the sum of its T threads' values */
 DEVICE void tree(float *s1, float *s2, uint32_t T, uint32_t tid, uint32_t lane, bool both) {
@@ -32,9 +33,10 @@ KERNEL(ln, SpgLnPush) {
     for (uint32_t base = block_x() * per; base < p.cells; base += blocks_x() * per) {
         const uint32_t cell = base + tid / T, at = cell * C;
         const bool live = cell < p.cells;
+        const bool rms = (p.flags & FLAG_RMS) != 0u;
         if (BACKWARD == 0u) {
             float sum = 0.0f;
-            if (live) for (uint32_t c = lane; c < C; c += T) sum += ld(p.x, at + c, 0u, HALF);
+            if (live && !rms) for (uint32_t c = lane; c < C; c += T) sum += ld(p.x, at + c, 0u, HALF);
             s1[tid] = sum;
             tree(s1, s2, T, tid, lane, false);
             const float mean = s1[first] * inv;
@@ -50,7 +52,8 @@ KERNEL(ln, SpgLnPush) {
             const float rstd = 1.0f / sqrt_(s1[first] * inv + p.eps);
             if (live) {
                 for (uint32_t c = lane; c < C; c += T)
-                    st(p.y, at + c, 1u, HALF, activate((ld(p.x, at + c, 0u, HALF) - mean) * rstd * gamma[c] + beta[c], ACT));
+                    st(p.y, at + c, 1u, HALF,
+                       activate((ld(p.x, at + c, 0u, HALF) - mean) * rstd * gamma[c] + (rms ? 0.0f : beta[c]), ACT));
                 if ((p.flags & FLAG_STATS) && lane == 0u) {
                     stats[2u * cell] = mean;
                     stats[2u * cell + 1u] = rstd;
@@ -68,7 +71,7 @@ KERNEL(ln, SpgLnPush) {
             s1[tid] = a;
             s2[tid] = b;
             tree(s1, s2, T, tid, lane, true);
-            const float sa = s1[first], sb = s2[first];
+            const float sa = rms ? 0.0f : s1[first], sb = s2[first];
             if (live)
                 for (uint32_t c = lane; c < C; c += T) {
                     const float v = ld(p.x, at + c, 0u, HALF), xhat = (v - mean) * rstd;

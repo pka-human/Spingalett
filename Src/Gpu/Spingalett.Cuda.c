@@ -270,6 +270,7 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
     switch (kernel) {
         case SPG_KERNEL_bn: case SPG_KERNEL_bn_h: case SPG_KERNEL_output: return 64u;
         case SPG_KERNEL_gemm: case SPG_KERNEL_gemm_mma: return count > 9 ? spec[9] : 0u;
+        case SPG_KERNEL_attn: case SPG_KERNEL_attn_h: return count > 3 ? spec[3] : 0u;
         default: return 256u;
     }
 }
@@ -321,6 +322,9 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
                 if (!strcmp(spg_cuda_units[u].name, name)) return (int)u;
         }
         return -1;
+    } else if (kernel == SPG_KERNEL_attn || kernel == SPG_KERNEL_attn_h) {
+        if (count < 3) return -1;
+        snprintf(name, sizeof name, "attn_d%u", spec[2]);                /* the unit of its head size */
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];

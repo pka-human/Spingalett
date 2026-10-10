@@ -135,32 +135,49 @@ DEVICE void set4(float4_ &v, uint32_t k, float f) {
 #define ACT_LEAKY_RELU  4u
 #define ACT_FOO52       5u
 #define ACT_SOFTMAX     6u
+#define ACT_GELU        7u      /* these three: functions of their input, whose derivative needs it */
+#define ACT_GELU_TANH   8u
+#define ACT_SILU        9u
+
+/* as common.glsl: an odd polynomial below |x| = 0.3, through exp above */
+DEVICE float tanh_(float x) {
+    float a = abs_(x), t;
+    if (a < 0.3f) {
+        float a2 = a * a, q = fma_(-8.86323552990219656e-3f, a2, 2.18694885361552028e-2f);
+        q = fma_(q, a2, -5.39682539682539683e-2f);
+        q = fma_(q, a2, 1.33333333333333333e-1f);
+        q = fma_(q, a2, -3.33333333333333333e-1f);
+        t = fma_(a * a2, q, a);
+    } else {
+        float e = exp_(-2.0f * a);
+        t = (1.0f - e) / (1.0f + e);
+    }
+    return x < 0.0f ? -t : t;
+}
+
+/* erf as common.glsl's: Abramowitz and Stegun 7.1.26, within 1.5e-7 of it */
+DEVICE float erf_(float x) {
+    float a = abs_(x), t = 1.0f / fma_(0.3275911f, a, 1.0f);
+    float q = fma_(fma_(fma_(fma_(1.061405429f, t, -1.453152027f), t, 1.421413741f), t, -0.284496736f), t, 0.254829592f);
+    float r = 1.0f - q * t * exp_(-a * a);
+    return x < 0.0f ? -r : r;
+}
 
 DEVICE float activate(float x, uint32_t act) {
     switch (act) {
         case ACT_RELU:          return x > 0.0f ? x : 0.0f;
         case ACT_LEAKY_RELU:    return x > 0.0f ? x : 0.01f * x;
         case ACT_SIGMOID:       return 1.0f / (1.0f + exp_(-x));
-        case ACT_TANH: {        /* as common.glsl: an odd polynomial below |x| = 0.3, through exp above */
-            float a = abs_(x), t;
-            if (a < 0.3f) {
-                float a2 = a * a, q = fma_(-8.86323552990219656e-3f, a2, 2.18694885361552028e-2f);
-                q = fma_(q, a2, -5.39682539682539683e-2f);
-                q = fma_(q, a2, 1.33333333333333333e-1f);
-                q = fma_(q, a2, -3.33333333333333333e-1f);
-                t = fma_(a * a2, q, a);
-            } else {
-                float e = exp_(-2.0f * a);
-                t = (1.0f - e) / (1.0f + e);
-            }
-            return x < 0.0f ? -t : t;
-        }
+        case ACT_TANH:          return tanh_(x);
         case ACT_FOO52:         return x > 1.0f ? 1.0f + 0.01f * (x - 1.0f) : (x < 0.0f ? 0.01f * x : x);
+        case ACT_GELU:          return 0.5f * x * (1.0f + erf_(x * 0.70710678118654752f));
+        case ACT_GELU_TANH:     return 0.5f * x * (1.0f + tanh_(0.79788456080286536f * (x + 0.044715f * x * x * x)));
+        case ACT_SILU:          return x / (1.0f + exp_(-x));
         default:                return x;
     }
 }
 
-/* The derivative of the activation, from its output y. */
+/* The derivative of the activation, from its output y, or for GELU and SiLU from its input. */
 DEVICE float derivative(float y, uint32_t act) {
     switch (act) {
         case ACT_RELU:          return y > 0.0f ? 1.0f : 0.0f;
@@ -169,6 +186,16 @@ DEVICE float derivative(float y, uint32_t act) {
         case ACT_SOFTMAX:       return y * (1.0f - y);
         case ACT_TANH:          return 1.0f - y * y;
         case ACT_FOO52:         return (y > 1.0f || y < 0.0f) ? 0.01f : 1.0f;
+        case ACT_GELU:
+            return 0.5f * (1.0f + erf_(y * 0.70710678118654752f)) + y * 0.39894228040143268f * exp_(-0.5f * y * y);
+        case ACT_GELU_TANH: {
+            float k = 0.79788456080286536f, t = tanh_(k * (y + 0.044715f * y * y * y));
+            return 0.5f * (1.0f + t) + 0.5f * y * (1.0f - t * t) * k * (1.0f + 3.0f * 0.044715f * y * y);
+        }
+        case ACT_SILU: {
+            float s = 1.0f / (1.0f + exp_(-y));
+            return s * (1.0f + y * (1.0f - s));
+        }
         default:                return 1.0f;
     }
 }

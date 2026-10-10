@@ -17,6 +17,8 @@
  *   SCALE     y = y a[0]                        (gradient clipping)
  *   AFFINE_ADD  y = act(z + (x a[c] + b[c]))   (a batch normalization added to z: residual blocks)
  *   COPY      y = x                             (the weights' bfloat16 copy)
+ *   ACT       y = act(x)                        (a layer's activation of the values kept before it)
+ *   PRODUCT   y = x a, y + x a with FLAG_ADD     (products of layers and their gradients; a by element)
  */
 
 #version 460
@@ -41,8 +43,11 @@ layout(local_size_x = 256) in;
 #define SCALE    7u
 #define AFFINE_ADD 8u
 #define COPY     9u
+#define ACT_OP   10u
+#define PRODUCT  11u
 
 #define FLAG_A   1u
+#define FLAG_ADD 2u
 
 layout(push_constant) uniform Push {
     F32 y, x, a, b;
@@ -106,6 +111,11 @@ void main() {
             st(p.y, i, 0u, activate(ld(p.z, i, 8u) + (ld(p.x, i, 1u) * ld(p.a, c, 2u) + ld(p.b, c, 3u)), ACT));
         } else if (OP == COPY) {
             st(p.y, i, 0u, ld(p.x, i, 1u));
+        } else if (OP == ACT_OP) {
+            st(p.y, i, 0u, activate(ld(p.x, i, 1u), ACT));
+        } else if (OP == PRODUCT) {
+            float v = ld(p.x, i, 1u) * ld(p.a, i, 2u);
+            st(p.y, i, 0u, (p.flags & FLAG_ADD) != 0u ? ld(p.y, i, 0u) + v : v);
         }
     }
 }

@@ -1181,6 +1181,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             .optimizer = args.optimizer_type, .decay = args.weight_decay, .momentum = args.momentum,
             .beta1 = args.beta1, .beta2 = args.beta2, .epsilon = args.epsilon, .max_grad_norm = args.max_grad_norm,
             .dropout_seed = t.dropout.seed,
+            .smoothing = net->loss_func == LOSS_SPARSE_CROSS_ENTROPY ? args.label_smoothing : 0.0f,
         };
         uint32_t capacity = spingalett_gpu_capacity(net, t.batch_size, true);
         /* the copy the last train() left, for chunks of the same size (which keep the results) */
@@ -1251,7 +1252,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             .inputs = t.gpu_rows_in ? args.device_inputs : NULL, .targets = t.gpu_rows_out ? args.device_targets : NULL,
             .seed = t.augment_seed, .shift = args.augment_shift, .flip = args.augment_flip,
         };
-        if (args.label_smoothing > 0.0f)
+        if (args.label_smoothing > 0.0f && net->loss_func != LOSS_SPARSE_CROSS_ENTROPY)
             smoothing(out_size, net->act_func[net->layers - 2], args.label_smoothing, &rows.keep, &rows.share);
         spingalett_gpu_set_rows(t.gpu, &rows);
     }
@@ -1624,6 +1625,7 @@ bool spingalett_trainer_set_label_smoothing(SpingalettTrainer *tr, float label_s
     }
     if (tr->net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) {        /* smoothed by the loss */
         if (tr->ws) tr->ws->smoothing = label_smoothing;
+        if (tr->gpu) spingalett_gpu_set_smoothing(tr->gpu, label_smoothing);
         tr->label_smoothing = label_smoothing;
         return true;
     }
