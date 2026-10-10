@@ -6,12 +6,13 @@ documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; 
 
 ## What the project is
 
-Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch
-normalization, adding and concatenating layers, as chains or graphs), deployment models in FP32 down
-to INT2, the runtime (a library of the deployment models alone), a standalone inference engine for
+Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch,
+layer and RMS normalization, adding, concatenating and multiplying layers, embeddings and attention
+for transformers, as chains or graphs), deployment models in FP32 down to INT2, the runtime (a library of the deployment models alone), a standalone inference engine for
 microcontrollers (one C file, no heap), ONNX and PyTorch import, GPU backends through CUDA (its own
-kernels) and Vulkan compute, Python bindings over ctypes (wheels with the library inside), and the
-DigitPad demo app.
+kernels) and Vulkan compute, language-model tooling (token files, generation), bindings for Python
+(ctypes, wheels with the library inside), C++, Rust, .NET, Go and Java, packages for the usual
+managers, and the DigitPad demo app.
 Its promise is speed: **a change must not make anything slower**, and kernels are measured, not
 assumed (see [Performance work](#performance-work)).
 
@@ -32,10 +33,13 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Onnx.c`, `Src/Spingalett.Torch.c` | ONNX import (own protocol buffer reader, external data files); PyTorch state dicts (zip, a pickle interpreter that runs nothing) and safetensors |
 | `Src/Spingalett.Import.c` | What the importers share: files mapped into memory, tensors decoded and reordered to channels-last in one pass |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
-| `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer) layers |
+| `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer, RMS) layers |
+| `Src/Spingalett.Transformer.c`, `Generate.c` | Embeddings and attention over batches on the CPU (blocked products a thread per sample and group of heads, the backward pass recomputing the probabilities); text generation |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
 | `Src/Gpu/` | The GPU backends under one executor: `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as commands), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use, a table a backend; convolution geometries), `Spingalett.Device.h`/`.c` (the device interface: `SpgGpuOps` a backend, the calling thread's backend), `Spingalett.Vulkan.c` (the loader opened at run time; `Shaders/*.comp`, GLSL listed in `Spingalett.Kernels.def`, `SPG_KERNEL_H` ones built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`), `Spingalett.Cuda.c` (the driver opened at run time; commands captured as CUDA graphs; `Cuda/*.cu` compiled to PTX by Clang, units listed in `Cuda/Kernels.def`, gzip-compressed into the library and expanded by `Spingalett.Gunzip.c`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
+| `Bindings/Rust`, `CSharp`, `Go`, `Java` | Bindings over the shared library; their tests compare their structures with `Bin/SpingalettLayout` through `SPINGALETT_LAYOUT` (CI job `bindings`) |
+| `packaging/`, `Formula/`, `bucket/`, `flake.nix` | Conan, vcpkg, AUR, conda, the container image; Homebrew, Scoop, Nix; CPack (DEB, RPM) in `CMakeLists.txt` |
 | `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), `RuntimeTests.c` (the runtime alone, C99), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
 | `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools (`Examples/Runtime/`: programs of the runtime), the demo app, the bindings (a package; `setup.py` builds wheels) |
 
@@ -45,8 +49,8 @@ assumed (see [Performance work](#performance-work)).
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
-Bin/SpingalettTests model                           # one group: grad conv norm graph onnx equiv cont optim
-                                                    # sched dropout gen predict valid step data io model gpu cuda xor
+Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx equiv cont
+                                                    # optim sched dropout gen predict valid step data io model gpu cuda xor
 ```
 
 Executables go to `Bin/` and static libraries to `Lib/` in the source tree. Point extra build
@@ -88,9 +92,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   produce the same 32-bit sums; tests compare with `== 0`, not with a tolerance.
 - **IEEE order in inference.** `Inference.c` and `Model.c` are compiled without reassociation or
   contraction; epilogues use `spingalett_int_output()` so every path rounds alike.
-- **Formats.** `.slett` versions 3 to 7 stay loadable; the writer picks the lowest version that
+- **Formats.** `.slett` versions 3 to 8 stay loadable; the writer picks the lowest version that
   can hold the network (chains 3 to 5, graphs 6, transposed convolutions, upsampling and layer
-  normalization 7). Any change to the format updates `docs/ModelFormat.md` and adds a version.
+  normalization 7, embeddings, attention, RMS normalization, products of layers, GELU and SiLU, the
+  sparse cross-entropy 8). Any change to the format updates `docs/ModelFormat.md` and adds a version.
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.
@@ -146,6 +151,11 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   them, with inputs, targets or both on the GPU). Rows read where they are (inference, and training
   chunks that repeat every epoch) are of the precision the network keeps its inputs in: the set's
   floats, or its bfloat16 copy (`data_half()`), never floats in place of bfloat16.
+- **Values before the activation.** GELU's and SiLU's derivatives take the layer's values before
+  its activation, which training keeps in `pre[]` (`keeps_pre()`; with dropout the mask then holds
+  the mask alone). On CUDA the product of a dense or convolution layer stores them itself
+  (`pre_out`, `SPG_GEMM_PRE`, honoured by the units built with `GENERAL` and by `epi.cu`); elsewhere
+  the layer writes `pre[]` and an element-wise pass the activation.
 - **Activations as bfloat16.** With `PRECISION_BFLOAT16` the executor keeps layers' outputs and
   gradients as bfloat16 (`kept_half()`): products find which operands are such by address
   (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push
@@ -193,6 +203,11 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   watch the temperature and frequency (`/proc/cpuinfo`) and let a long run finish before measuring.
 - `-DSPINGALETT_NO_DIRECT_CONV` builds the library without the indirect convolution kernels, for
   comparisons with the products of gathered windows.
+- A change to the products' epilogues (`gemm.cu`, `gemm_mma.cu`) changes the code the compiler
+  makes of their main loops: 1.2's first version, every activation inline in every unit, reordered
+  the loops and cost the MLP 2% in bfloat16. Epilogues of other activations go into separate units
+  (`GENERAL`, `_g`, listed in Kernels.def) and the other units' PTX must stay byte-identical (compare
+  `Build/Cuda/*.ptx` with a build of the previous commit).
 - CUDA kernels take their modes as template parameters wherever a loop's arrays or loads depend on
   them (the products' tiles, operand modes and ways of reading each operand; the depthwise
   convolutions' windows, modes, padding and maps kept as bfloat16): a mode read from the spec at run

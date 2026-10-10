@@ -7,8 +7,103 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-11
+
+"Transformers": the networks of today's language models in every part of the library at once,
+training on the CPU and both GPU backends, the model format, the engine, deployment models and the
+runtime, with what language models need around them (files of tokens, generation, GPT-2 and LLaMA
+checkpoints). On CUDA, attention runs on the tensor cores in bfloat16 and in register tiles in single
+precision, GELU and SiLU in the products' epilogues; the GPT of `Examples/Benchmark.c` trains
+@GPT_FP32_TRAIN@ times as fast as in the first transformer build of this release in single precision and
+@GPT_BF16_TRAIN@ times in bfloat16 (README, **Performance**, against PyTorch with `torch.compile`). And
+more languages and package managers: bindings for Rust, .NET, Go and Java, and Debian, RPM, AUR,
+Homebrew, Scoop, Nix, container and conda packages. Programs of 1.1 build and run unchanged; files of
+1.1 load unchanged.
+
+### Added
+- **The layers of transformers**, on the CPU, CUDA and Vulkan, in `.slett` format 8, the engine,
+  deployment models of every precision and the runtime; a sequence is a layer of `1 x n` cells, the
+  input layer holding token ids:
+  - `spingalett_embedding()` (`SPINGALETT_LAYER_EMBEDDING`): a table of `vocabulary` rows of
+    `neurons_amount` values, with `positions` a learned vector per position (its biases); its
+    gradient summed per token in the batch's order (on the GPU through a stable radix sort of the
+    tokens, without atomics);
+  - `spingalett_attention()` (`SPINGALETT_LAYER_ATTENTION`): multi-head attention over the queries,
+    keys and values a linear layer packs before it, `heads` query heads and `kv_heads` key and value
+    heads (grouped-query and multi-query attention), a causal mask (`causal`), rotary position
+    embeddings (`rope_theta`, the `rotate_half` form of GPT-NeoX and Hugging Face's LLaMA); the
+    scores never stored (the backward pass recomputes them from each query's log-sum-exp); on the CPU
+    as blocked matrix products a thread per sample and group of heads, on the GPU in tiles;
+  - `spingalett_rms_norm()` (`SPINGALETT_LAYER_RMS_NORM`), `spingalett_multiply_layers()`
+    (`SPINGALETT_LAYER_MULTIPLY`, the element-wise product of layers: SwiGLU's gate) and
+    `spingalett_linear()` (a 1 x 1 convolution: a linear map of each position);
+  - the activations `SPINGALETT_ACT_GELU`, `SPINGALETT_ACT_GELU_TANH` and `SPINGALETT_ACT_SILU`, whose
+    derivatives take the values before the activation (training keeps those of such layers);
+  - the loss `SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY`: a softmax over each cell's channels against one
+    class index a cell (an index outside the classes leaves the cell out), label smoothing applied
+    within the loss; `spingalett_target_size()` gives the targets a sample.
+  The layers' new arguments (`vocabulary`, `heads`, `kv_heads`, `rope_theta`, `causal`, `positions`)
+  take reserved words of `SpingalettLayerArgs`, `SpingalettNetworkLayer` and `SpingalettLayerInfo`.
+  Tests: the group `transformer` (gradients against finite differences, determinism, a model that
+  learns, every precision of deployment models, validation), and the GPU groups against the CPU.
+- **Language models:** `spingalett_dataset_open_tokens()` reads the windows of a file of token ids
+  (nanoGPT's `.bin` of uint16, llm.c's with its header, uint16 or uint32) as a data set reader:
+  each sample a context of tokens and the tokens after them, a pass in an order of its seed, the file
+  mapped; `spingalett_generate()` continues a prompt a token at a time (greedy, temperature, top-k,
+  top-p, stop tokens, a seed). `Examples/CharGPT.c` trains a character-level GPT on any text file and
+  samples it. In Python, `Network.train_from_tokens()`, `Network.generate()`,
+  `gpt2_from_state_dict()` (GPT-2 from Hugging Face's or nanoGPT's state dict) and
+  `llama_from_state_dict()` (LLaMA, Mistral, Qwen2 in Hugging Face's names), compared with references
+  written in PyTorch.
+- New functions `spingalett_target_size()`, `spingalett_dataset_open_tokens()` and
+  `spingalett_generate_args()` (`spingalett_generate()`), in the symbol version `SPINGALETT_1.2`; new
+  types `SpingalettTokenReaderOptions` and `SpingalettGenerateArgs`.
+- **CUDA:** flash attention on the tensor cores for networks in bfloat16 (`mma.sync` in bfloat16 with
+  single-precision sums, heads of 32, 64 and 128, a unit per head size and pass, tiles of activations
+  loaded sixteen bytes a thread and the next tile into registers during the current one's products);
+  in single precision attention in register tiles (`rattn.cu`: a thread four rows and its share of the
+  other side's tile, its scores and sums in registers): 7.3 ms to 0.72 ms for the GPT's forward pass,
+  8.5 to 0.90 ms and 8.9 to 1.19 ms for its two backward passes on the RTX 4050.
+- **Bindings** for Rust (`Bindings/Rust`: the crates `spingalett-sys` and `spingalett`), .NET 8 and
+  later (`Bindings/CSharp`: the package `Spingalett`, `LibraryImport`), Go (`Bindings/Go`: cgo,
+  pkg-config) and Java 22 and later (`Bindings/Java`: the foreign function and memory API, Maven):
+  networks of every kind of layer, training on arrays or token files, prediction, evaluation,
+  generation, parameters, files and deployment models; their tests compare every structure they lay
+  out with the C compiler's layout (`SpingalettLayout`), and CI runs them against the installed
+  library. Releases attach the `.nupkg` and the `.jar`.
+- **Packages:** Debian and RPM packages of the library, its runtime and tools (CPack, built and
+  installed by the release workflow), PKGBUILDs for Arch Linux (`packaging/aur`: `spingalett`,
+  `spingalett-git`), a Homebrew formula and a Scoop manifest served from this repository
+  (`Formula/`, `bucket/`), a Nix flake, a container image (`ghcr.io/pka-human/spingalett`, both GPU
+  backends, the tools, headers and Python bindings) and a recipe for conda-forge.
+- C++ (`Spingalett.hpp`): `Builder::linear()`, `embedding()`, `attention()`, `rms_norm()`,
+  `multiply_layers()`; `Network::target_size()`, `train_tokens()`, `generate()` with `Sampling`; the
+  new activations, the sparse cross-entropy and `Compute::Cuda`.
+- `Examples/Benchmark.c`: a GPT (nanoGPT's character-level configuration, 10.9M parameters) in tokens
+  per second; workloads and the GPU's precisions chosen by name (`gpt`, `fp32`, `bf16`, ...).
+  `benchmark_pytorch.py --max` runs PyTorch at its fastest (`torch.compile` with `max-autotune` and
+  CUDA graphs, `cudnn.benchmark`, channels-last tensors, fused optimizers), `--gpt` the GPT alone.
+
+### Changed
+- CUDA, bfloat16: the weights' bfloat16 copy that the products read is made where products take 256
+  rows of a layer (samples times its cells), not only for chunks of 256 samples, so that sequences
+  and images use it: ResNet-20 trains 1.04 times as fast and infers 1.14 times as fast, the U-Net 1.03
+  and 1.10 times, the MNIST CNN infers 1.2 times as fast, the MobileNet-style network 1.03 and 1.07 to
+  1.11 times, the GPT 1.11 and 1.14 times.
+- CUDA: the products' units built with `GENERAL` (dense layers' modes, 74 units) hold every
+  activation and derivative in their epilogue, and store the values before the activation where
+  training keeps them (`SPG_GEMM_PRE`), in place of a pass over the product's outputs; the other
+  units are unchanged.
+- CUDA: a product's blocks take its tiles in bands of eight tiles of rows over every tile of columns,
+  so that a band's rows of A stay in L2 (the same bits).
+- GPU: 1 x 1 convolutions of stride 1 (transformers' linear layers, pointwise convolutions) read their
+  maps as matrices in all three products: the MobileNet-style network infers 6% faster on CUDA.
+
 ### Fixed
 - Training on CUDA logged its compute mode as `VULKAN (the GPU's name)`; it logs `CUDA (...)`.
+- Built by Clang, the host's label smoothing made a fused multiply-add of `keep * t + share`, while
+  the GPU's smoothing of data sets in its memory rounds the product first: training on device data
+  sets differed in the last bits from training on host arrays. The product is rounded first on both.
 
 ## [1.1.0] - 2026-10-10
 
