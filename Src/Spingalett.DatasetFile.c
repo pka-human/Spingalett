@@ -1619,6 +1619,12 @@ struct SpingalettDatasetReader {
     SpgThread *thread;                  /* NULL: requested chunks decode together on the caller's threads */
     SpgSignal *signal;
     bool stop;
+
+    /* token windows (spingalett_dataset_open_tokens): sample i the tokens from i x stride on, a pass in the
+       order of `order` */
+    SpgFileView token_file;
+    const uint8_t *tokens;
+    uint32_t token_bytes, stride;
 };
 
 /* Shuffles v with a generator seeded by the reader's seed and an index (2 x pass for the order of
@@ -1673,6 +1679,7 @@ void spingalett_dataset_close(SpingalettDatasetReader *r) {
     stop_thread(r);
     spg_signal_free(r->signal);
     if (r->file) fclose(r->file);
+    if (r->tokens) spingalett_file_close(&r->token_file);
     layout_free(&r->layout);
     for (int k = 0; k < 2; k++) compact_free(&r->values[k]);
     free(r->order);
@@ -2025,6 +2032,64 @@ SpingalettDatasetReader *spingalett_dataset_open_u8(const uint8_t *inputs, const
     return r;
 }
 
+/* llm.c's token files: 256 int32 (magic 20240520, version 1 for uint16 or 2 for uint32 tokens, the token count),
+   then the tokens */
+#define LLMC_MAGIC 20240520u
+#define LLMC_HEADER 1024u
+
+SpingalettDatasetReader *spingalett_dataset_open_tokens(const char *path, const SpingalettTokenReaderOptions *options) {
+    const SpingalettTokenReaderOptions o = options ? *options : (SpingalettTokenReaderOptions){0};
+    if (!path || o.context == 0 || (o.token_bytes != 0 && o.token_bytes != 2 && o.token_bytes != 4)) {
+        fail(SPINGALETT_ERR_INVALID, "spingalett_dataset_open_tokens: no path, no context, or tokens of neither 2 nor 4 bytes");
+        return NULL;
+    }
+    SpingalettDatasetReader *r = reader_new(o.shuffle);
+    if (!r) return NULL;
+    if (!spingalett_file_open(&r->token_file, path)) {
+        free(r);
+        return NULL;
+    }
+    const uint8_t *data = r->token_file.data;
+    const size_t size = r->token_file.size;
+    uint64_t offset = o.offset, available = 0;
+    uint32_t bytes = o.token_bytes;
+    if (offset == 0 && size >= LLMC_HEADER && get32(data) == LLMC_MAGIC) {
+        const uint32_t version = get32(data + 4);
+        offset = LLMC_HEADER;
+        if (bytes == 0) bytes = version == 2 ? 4u : 2u;
+        available = get32(data + 8);
+    }
+    if (bytes == 0) bytes = 2;
+    r->tokens = data;           /* (owned by token_file: closed with the reader from here on) */
+    const uint64_t in_file = size > offset ? (size - offset) / bytes : 0;
+    if (available == 0 || available > in_file) available = in_file;
+    const uint32_t stride = o.stride ? o.stride : o.context;
+    if (available < (uint64_t)o.context + 1u || (available - o.context - 1u) / stride + 1u > UINT32_MAX - 1u) {
+        char message[256];
+        snprintf(message, sizeof message, "spingalett_dataset_open_tokens: %.120s holds %llu tokens, too few for windows "
+                 "of %u", path, (unsigned long long)available, o.context);
+        fail(SPINGALETT_ERR_INVALID, message);
+        spingalett_dataset_close(r);
+        return NULL;
+    }
+    r->tokens = data + offset;
+    r->token_bytes = bytes;
+    r->stride = stride;
+    r->in_memory = true;
+    r->count = (uint32_t)((available - o.context - 1u) / stride + 1u);
+    r->input_size = r->target_size = o.context;
+    r->info.file_size = size;
+    if (!(r->order = (uint32_t *)malloc(((size_t)r->count + 1) * sizeof(uint32_t)))) {
+        fail(SPINGALETT_ERR_ALLOC, "spingalett_dataset_open_tokens: out of memory");
+        spingalett_dataset_close(r);
+        return NULL;
+    }
+    reader_start_memory_pass(r);
+    reader_info(r);
+    r->info.file_size = size;
+    return r;
+}
+
 SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDatasetReader *r) {
     SpingalettDatasetInfo info = {0};
     return r ? r->info : info;
@@ -2060,8 +2125,28 @@ static void convert_samples(const ValueForm *f, const uint8_t *base, size_t samp
         (void)decode_sample(f, base + (size_t)idx[k] * sample, step, plane, dst + (size_t)k * f->size);
 }
 
+/* Token windows: sample k's inputs and targets from the tokens at idx[k] x stride */
+static void convert_tokens(const SpingalettDatasetReader *r, const uint32_t *idx, uint32_t n, float *inputs,
+                           float *targets) {
+    const uint32_t T = r->input_size;
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *at = r->tokens + (size_t)idx[k] * r->stride * r->token_bytes;
+        for (uint32_t j = 0; j <= T; j++) {
+            const uint8_t *t = at + (size_t)j * r->token_bytes;
+            const float v = (float)(r->token_bytes == 2 ? (uint32_t)t[0] | (uint32_t)t[1] << 8 : get32(t));
+            if (j < T) inputs[(size_t)k * T + j] = v;
+            if (j > 0) targets[(size_t)k * T + j - 1] = v;
+        }
+    }
+}
+
 static uint32_t read_memory(SpingalettDatasetReader *r, float *inputs, float *targets, uint32_t max_samples) {
     uint32_t n = r->count - r->next < max_samples ? r->count - r->next : max_samples;
+    if (r->tokens) {
+        convert_tokens(r, r->order + r->next, n, inputs, targets);
+        r->next += n;
+        return n;
+    }
     for (int k = 0; k < 2; k++) {
         const Compact *v = &r->values[k];
         convert_samples(&v->form, v->data, compact_sample(v), v->form.vw, 1, r->order + r->next, n, k ? targets : inputs);

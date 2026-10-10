@@ -780,6 +780,26 @@ SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open_ex(const char *p
 SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open_u8(const uint8_t *inputs, const float *targets,
                                                                    uint32_t count, uint32_t input_size,
                                                                    uint32_t target_size, bool shuffle);
+/* Options of spingalett_dataset_open_tokens(). */
+typedef struct {
+    uint32_t context;               /* tokens a sample: its inputs, and as its targets the tokens after them */
+    uint32_t token_bytes;           /* 2 (uint16, nanoGPT's .bin files) or 4 (uint32), little-endian; 0: 2,
+                                       or what an llm.c header says */
+    uint32_t stride;                /* tokens from one sample's start to the next one's (0: context) */
+    uint64_t offset;                /* bytes before the first token (a header); 0: none, or llm.c's header
+                                       of 256 int32 when the file starts with one */
+    bool shuffle;                   /* every pass in a new random order (drawn when the reader opens) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettTokenReaderOptions;
+
+/* A reader of the windows of a file of token ids, as language models train on: nanoGPT's .bin files
+   (uint16, nothing else) and llm.c's (a header, then uint16 or uint32). Sample i holds the `context`
+   tokens from i x stride on as inputs and the token after each as its target, both as floats (the
+   inputs of an embedding, the class indices of SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY); the file holds
+   (count - 1) x stride + context + 1 tokens at least. The file is mapped, not read; the reader's
+   dataset info gives count and the context as input and target size. */
+SPINGALETT_API SpingalettDatasetReader *spingalett_dataset_open_tokens(const char *path,
+                                                                       const SpingalettTokenReaderOptions *options);
 /* Names recorded in the file: the name of a set of targets, class `index` of a set, or NULL. */
 SPINGALETT_API const char *spingalett_dataset_target_set_name(const SpingalettDatasetReader *reader,
                                                               uint32_t target_set);

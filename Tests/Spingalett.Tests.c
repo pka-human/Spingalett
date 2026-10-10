@@ -2013,6 +2013,71 @@ static void dataset_crafted(const char *path, const SpingalettDataset *ph) {
     remove("spingalett_test_many.slettd");
 }
 
+/* Windows of token files: nanoGPT's (uint16, nothing else) and llm.c's (a header, then uint32 here), every
+   window once a pass, in the order its seed gives. */
+static void token_files(void) {
+    const char *paths[] = {"spingalett_test_tokens.bin", "spingalett_test_tokens_llmc.bin"};
+    const uint32_t n = 103, context = 8, stride = 3;
+    for (int file = 0; file < 2; file++) {
+        FILE *f = fopen(paths[file], "wb");
+        if (file) {         /* llm.c: magic, version 2 (uint32 tokens), the count, then 253 more int32 */
+            uint32_t header[256] = {20240520u, 2u, n};
+            fwrite(header, sizeof header, 1, f);
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t t = (i * 37u + 5u) % 50000u;
+            const uint8_t b[4] = {(uint8_t)t, (uint8_t)(t >> 8), (uint8_t)(t >> 16), (uint8_t)(t >> 24)};
+            fwrite(b, 1, file ? 4 : 2, f);
+        }
+        fclose(f);
+        for (int shuffled = 0; shuffled < 2; shuffled++) {
+            spingalett_seed(77);
+            SpingalettTokenReaderOptions o = {.context = context, .stride = stride, .shuffle = shuffled};
+            SpingalettDatasetReader *r = spingalett_dataset_open_tokens(paths[file], &o);
+            const uint32_t count = (n - context - 1) / stride + 1;
+            CHECK(r && spingalett_dataset_info(r).count == count && spingalett_dataset_info(r).input_size == context &&
+                  spingalett_dataset_info(r).target_size == context, "tokens %d: reader info", file);
+            if (!r) continue;
+            float x[5 * 8], t[5 * 8];
+            bool *seen = calloc(count, sizeof(bool)), ok = true, ordered = true;
+            uint32_t total = 0, got, first[2] = {0, 0};
+            for (int pass = 0; pass < 2; pass++) {
+                total = 0;
+                memset(seen, 0, count * sizeof(bool));
+                while ((got = spingalett_dataset_read(r, x, t, 5)) > 0) {
+                    for (uint32_t k = 0; k < got; k++) {
+                        uint32_t start = 0;     /* the window's start: the token whose value it holds first */
+                        while (start < n && (start * 37u + 5u) % 50000u != (uint32_t)x[k * context]) start++;
+                        ok = ok && start % stride == 0 && start / stride < count && !seen[start / stride];
+                        if (start / stride < count) seen[start / stride] = true;
+                        if (total + k == 0) first[pass] = start;
+                        ordered = ordered && start == (total + k) * stride;
+                        for (uint32_t j = 0; j < context; j++)
+                            ok = ok && x[k * context + j] == (float)(((start + j) * 37u + 5u) % 50000u) &&
+                                 t[k * context + j] == (float)(((start + j + 1u) * 37u + 5u) % 50000u);
+                    }
+                    total += got;
+                }
+            }
+            CHECK(ok && total == count, "tokens %d: windows (%u of %u)", file, total, count);
+            CHECK(shuffled ? !ordered && first[0] != first[1] : ordered, "tokens %d: order of a pass (shuffled %d)", file,
+                  shuffled);
+            free(seen);
+            spingalett_dataset_close(r);
+        }
+        remove(paths[file]);
+    }
+    /* too few tokens for a window */
+    SpingalettTokenReaderOptions o = {.context = 1000};
+    FILE *f = fopen(paths[0], "wb");
+    fwrite(paths[0], 1, 20, f);
+    fclose(f);
+    CHECK(!spingalett_dataset_open_tokens(paths[0], &o) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "tokens: a file too short for its windows");
+    remove(paths[0]);
+    printf("  token files: nanoGPT's and llm.c's windows ok\n");
+}
+
 static void dataset_files_v2(void) {
     /* dense 8-bit "photographs" (smooth colour fields with noise), 32 x 32 x 3; the first two
        values of a sample encode its index */
@@ -6047,6 +6112,7 @@ int main(int argc, char **argv) {
         cifar_files();
         dataset_files();
         dataset_files_v2();
+        token_files();
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");
