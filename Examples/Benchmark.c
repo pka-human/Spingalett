@@ -541,7 +541,7 @@ int main(int argc, char **argv) {
     generate_synthetic_data(&inputs, &targets);
 
     /* More threads than cores oversubscribes the CPU and slows training down. */
-    bool cpu = true, vulkan = true, cuda = true;
+    bool cpu = true, vulkan = true, cuda = true, fp32 = true, half = true;
     /* workloads: all, or those named */
     static const char *const workloads[] = {"mlp", "cnn", "resnet", "unet", "mobilenet", "gpt"};
     bool run[6] = {false}, named = false;
@@ -553,6 +553,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "gpu")) cpu = false;
         else if (!strcmp(argv[i], "vulkan")) cuda = false;
         else if (!strcmp(argv[i], "cuda")) vulkan = false;
+        else if (!strcmp(argv[i], "fp32")) half = false;           /* the GPU's rows of one precision */
+        else if (!strcmp(argv[i], "bf16")) fp32 = false;
         else spingalett_set_num_threads((unsigned)strtoul(argv[i], NULL, 10));
     }
     for (int w = 0; !named && w < 6; w++) run[w] = true;
@@ -563,8 +565,8 @@ int main(int argc, char **argv) {
         spingalett_set_compute_mode(mode);
         const bool bf16 = spingalett_set_gpu_precision(PRECISION_BFLOAT16);
         spingalett_set_gpu_precision(PRECISION_FLOAT32);
-        gpu_rows[gpu_row_count++] = (GpuRow){b ? "CUDA" : "Vulkan", mode, false};
-        if (bf16) gpu_rows[gpu_row_count++] = (GpuRow){b ? "CUDA" : "Vulkan", mode, true};
+        if (fp32) gpu_rows[gpu_row_count++] = (GpuRow){b ? "CUDA" : "Vulkan", mode, false};
+        if (bf16 && half) gpu_rows[gpu_row_count++] = (GpuRow){b ? "CUDA" : "Vulkan", mode, true};
     }
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 
