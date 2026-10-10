@@ -661,6 +661,94 @@ if torch is not None:
                                               sg.BatchNorm(sg.Activation.RELU), sg.Layer(5, sg.Activation.SOFTMAX)])
     check(np.abs(same.load_pytorch(tm.state_dict()).forward(hwc) - ty).max() < 1e-5, "load_pytorch(state_dict)")
 
+# GPT-2 (Hugging Face's Conv1D state dict, nanoGPT's nn.Linear one) and LLaMA-like models (grouped queries, rotary
+# embeddings, SwiGLU, Qwen2's biases) against references written in PyTorch
+if torch is not None:
+    import torch.nn.functional as tf
+
+    def ref_gpt2(sd, tokens, heads, conv1d, act):
+        T, d = len(tokens), sd["transformer.wte.weight"].shape[1]
+        lin = lambda x, n: x @ sd[n + ".weight"] + sd[n + ".bias"] if conv1d else x @ sd[n + ".weight"].T + sd[n + ".bias"]
+        x = sd["transformer.wte.weight"][tokens] + sd["transformer.wpe.weight"][:T]
+        layers = 1 + max(int(k.split(".")[2]) for k in sd if k.startswith("transformer.h."))
+        for i in range(layers):
+            h = f"transformer.h.{i}."
+            y = tf.layer_norm(x, (d,), sd[h + "ln_1.weight"], sd[h + "ln_1.bias"], 1e-5)
+            q, k, v = lin(y, h + "attn.c_attn").split(d, -1)
+            q, k, v = (t.view(T, heads, d // heads).transpose(0, 1) for t in (q, k, v))
+            a = tf.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(0, 1).reshape(T, d)
+            x = x + lin(a, h + "attn.c_proj")
+            y = tf.layer_norm(x, (d,), sd[h + "ln_2.weight"], sd[h + "ln_2.bias"], 1e-5)
+            x = x + lin(act(lin(y, h + "mlp.c_fc")), h + "mlp.c_proj")
+        x = tf.layer_norm(x, (d,), sd["transformer.ln_f.weight"], sd["transformer.ln_f.bias"], 1e-5)
+        return x @ sd["transformer.wte.weight"].T
+
+    def ref_llama(sd, tokens, heads, kv, theta, eps):
+        T, d = len(tokens), sd["model.embed_tokens.weight"].shape[1]
+        hd = d // heads
+        rms = lambda x, w: x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
+        inv = 1.0 / theta ** (torch.arange(0, hd, 2, dtype=torch.float64) / hd)
+        f = torch.outer(torch.arange(T, dtype=torch.float64), inv)
+        cos, sin = torch.cat([f, f], -1).cos().float(), torch.cat([f, f], -1).sin().float()
+        rot = lambda x: torch.cat([-x[..., hd // 2:], x[..., :hd // 2]], -1)
+        lin = lambda x, n: x @ sd[n + ".weight"].T + (sd[n + ".bias"] if n + ".bias" in sd else 0)
+        x = sd["model.embed_tokens.weight"][tokens]
+        layers = 1 + max(int(k.split(".")[2]) for k in sd if k.startswith("model.layers."))
+        for i in range(layers):
+            h = f"model.layers.{i}."
+            y = rms(x, sd[h + "input_layernorm.weight"])
+            q = lin(y, h + "self_attn.q_proj").view(T, heads, hd).transpose(0, 1)
+            k = lin(y, h + "self_attn.k_proj").view(T, kv, hd).transpose(0, 1)
+            v = lin(y, h + "self_attn.v_proj").view(T, kv, hd).transpose(0, 1)
+            q, k = q * cos + rot(q) * sin, k * cos + rot(k) * sin
+            k, v = k.repeat_interleave(heads // kv, 0), v.repeat_interleave(heads // kv, 0)
+            a = tf.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(0, 1).reshape(T, d)
+            x = x + lin(a, h + "self_attn.o_proj")
+            y = rms(x, sd[h + "post_attention_layernorm.weight"])
+            x = x + lin(tf.silu(lin(y, h + "mlp.gate_proj")) * lin(y, h + "mlp.up_proj"), h + "mlp.down_proj")
+        return rms(x, sd["model.norm.weight"]) @ sd["lm_head.weight"].T
+
+    torch.manual_seed(11)
+    V, T, d, heads = 50, 12, 32, 4
+    for conv1d in (True, False):
+        r = lambda *shape: torch.randn(*shape) * 0.2
+        sd = {"transformer.wte.weight": r(V, d), "transformer.wpe.weight": r(20, d),
+              "transformer.ln_f.weight": 1 + r(d), "transformer.ln_f.bias": r(d)}
+        for i in range(2):
+            h = f"transformer.h.{i}."
+            for name, (a, b) in {"attn.c_attn": (d, 3 * d), "attn.c_proj": (d, d), "mlp.c_fc": (d, 4 * d),
+                                 "mlp.c_proj": (4 * d, d)}.items():
+                sd[h + name + ".weight"] = r(a, b) if conv1d else r(b, a)
+                sd[h + name + ".bias"] = r(b)
+            for n in ("ln_1", "ln_2"):
+                sd[h + n + ".weight"], sd[h + n + ".bias"] = 1 + r(d), r(d)
+        tokens = torch.randint(0, V, (T,))
+        act = (lambda x: tf.gelu(x, approximate="tanh")) if conv1d else tf.gelu
+        want = ref_gpt2(sd, tokens, heads, conv1d, act).numpy()
+        gpt = sg.gpt2_from_state_dict(sd, heads, context=T)
+        got = gpt.forward(tokens.numpy().astype(np.float32)).reshape(T, V)
+        check(np.abs(got - want).max() < 2e-4, f"gpt2_from_state_dict ({'Conv1D' if conv1d else 'Linear'}): "
+              f"{np.abs(got - want).max():.2e} from PyTorch")
+    for qwen in (False, True):
+        kv, ff, theta = 2, 48, 500000.0
+        sd = {"model.embed_tokens.weight": r(V, d), "model.norm.weight": 1 + r(d), "lm_head.weight": r(V, d)}
+        for i in range(2):
+            h = f"model.layers.{i}."
+            sd.update({h + "self_attn.q_proj.weight": r(d, d), h + "self_attn.k_proj.weight": r(kv * d // heads, d),
+                       h + "self_attn.v_proj.weight": r(kv * d // heads, d), h + "self_attn.o_proj.weight": r(d, d),
+                       h + "mlp.gate_proj.weight": r(ff, d), h + "mlp.up_proj.weight": r(ff, d),
+                       h + "mlp.down_proj.weight": r(d, ff), h + "input_layernorm.weight": 1 + r(d),
+                       h + "post_attention_layernorm.weight": 1 + r(d)})
+            if qwen:
+                for n, m in (("q", d), ("k", kv * d // heads), ("v", kv * d // heads)):
+                    sd[h + f"self_attn.{n}_proj.bias"] = r(m)
+        tokens = torch.randint(0, V, (T,))
+        want = ref_llama(sd, tokens, heads, kv, theta, 1e-6).numpy()
+        lm = sg.llama_from_state_dict(sd, heads, kv, context=T, rope_theta=theta)
+        got = lm.forward(tokens.numpy().astype(np.float32)).reshape(T, V)
+        check(np.abs(got - want).max() < 2e-4, f"llama_from_state_dict ({'with' if qwen else 'no'} biases): "
+              f"{np.abs(got - want).max():.2e} from PyTorch")
+
 # transposed convolutions, upsampling and layer normalization: shapes, weights, a state dict
 up = sg.Network(sg.Loss.MSE, [sg.Input(8, 8, 3), sg.Conv2D(8, 3, stride=2, padding=1),
                               sg.ConvTranspose2D(6, 3, stride=2, padding=1, output_padding=1, groups=2,

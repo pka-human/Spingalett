@@ -52,6 +52,7 @@ __all__ = [
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
+    "gpt2_from_state_dict", "llama_from_state_dict",
 ]
 
 
@@ -2327,6 +2328,152 @@ class Trainer:
 
 
 # --------------------------------------------------------------------------- data sets
+
+# --------------------------------------------------------------------------- language models from PyTorch
+
+def _tensor(value) -> np.ndarray:
+    """A state dict's tensor (PyTorch's, any precision, on any device; or an array) as float32."""
+    if hasattr(value, "detach"):
+        value = value.detach().to("cpu").float().numpy()
+    return np.ascontiguousarray(value, dtype=np.float32)
+
+
+def _prefix(state, suffix: str) -> str:
+    for key in state:
+        if key.endswith(suffix):
+            return key[:-len(suffix)]
+    raise KeyError(f"the state dict has no ...{suffix}")
+
+
+def gpt2_from_state_dict(state, heads: int, context: Optional[int] = None,
+                         activation: Optional[Activation] = None) -> "Network":
+    """A GPT-2 from its state dict: Hugging Face's (GPT2LMHeadModel, GPT2Model: Conv1D weights stored
+    [in, out]) or nanoGPT's (nn.Linear weights [out, in]), told apart by the shape of the queries', keys' and
+    values' weights. ``heads`` is the model's attention heads (12 for GPT-2 small); ``context`` the window of
+    the network (tokens a sample; at most the model's positions, all of them when None); ``activation`` the
+    MLP's GELU (default: Hugging Face's tanh approximation, nanoGPT's erf). The language model head is
+    ``lm_head.weight`` when the state dict has one, else tied to the token embeddings, as GPT-2's is. The
+    network's input is a window of token ids, its outputs each position's logits; it trains on, generates
+    with and saves like any other (the weights are copied, the head no longer tied)."""
+    p = _prefix(state, "wte.weight")
+    wte, wpe = _tensor(state[p + "wte.weight"]), _tensor(state[p + "wpe.weight"])
+    vocabulary, width = wte.shape
+    layers = 1 + max(int(k[len(p) + 2:].split(".")[0]) for k in state if k.startswith(p + "h."))
+    context = int(context or wpe.shape[0])
+    if not 0 < context <= wpe.shape[0] or width % heads:
+        raise ValueError(f"a context of 1 to {wpe.shape[0]} tokens and heads dividing {width}")
+    conv1d = _tensor(state[p + "h.0.attn.c_attn.weight"]).shape == (width, 3 * width)
+    act = activation if activation is not None else (Activation.GELU_TANH if conv1d else Activation.GELU)
+
+    def weight(name):
+        w = _tensor(state[name])
+        return w.T if conv1d else w
+
+    def bias(name, size):
+        return _tensor(state[name]) if name in state else np.zeros(size, dtype=np.float32)
+
+    net = Network(Loss.SPARSE_CROSS_ENTROPY)
+    sets = []          # (weight set index, weights, biases) once the layers exist
+    net.add_layer(context)
+    net.add_embedding(vocabulary, width, positions=True)
+    sets.append((net.last - 1, wte, wpe[:context]))
+    x = net.last
+    for i in range(layers):
+        h = f"{p}h.{i}."
+        net.add_layer_norm()
+        sets.append((net.last - 1, _tensor(state[h + "ln_1.weight"]), bias(h + "ln_1.bias", width)))
+        net.add_linear(3 * width)
+        sets.append((net.last - 1, weight(h + "attn.c_attn.weight"), bias(h + "attn.c_attn.bias", 3 * width)))
+        net.add_attention(heads=heads, causal=True)
+        net.add_linear(width)
+        sets.append((net.last - 1, weight(h + "attn.c_proj.weight"), bias(h + "attn.c_proj.bias", width)))
+        net.add_add([x, net.last])
+        x = net.last
+        net.add_layer_norm()
+        sets.append((net.last - 1, _tensor(state[h + "ln_2.weight"]), bias(h + "ln_2.bias", width)))
+        hidden = _tensor(state[h + "mlp.c_fc.weight"]).size // width
+        net.add_linear(hidden, activation=act)
+        sets.append((net.last - 1, weight(h + "mlp.c_fc.weight"), bias(h + "mlp.c_fc.bias", hidden)))
+        net.add_linear(width)
+        sets.append((net.last - 1, weight(h + "mlp.c_proj.weight"), bias(h + "mlp.c_proj.bias", width)))
+        net.add_add([x, net.last])
+        x = net.last
+    net.add_layer_norm()
+    sets.append((net.last - 1, _tensor(state[p + "ln_f.weight"]), bias(p + "ln_f.bias", width)))
+    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else wte
+    net.add_linear(vocabulary)
+    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    for index, w, b in sets:
+        net.set_weights(index, w)
+        net.set_biases(index, b)
+    return net
+
+
+def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, context: int = 2048,
+                          rope_theta: float = 10000.0, epsilon: float = 1e-6) -> "Network":
+    """A LLaMA-like model from its state dict in Hugging Face's names (LlamaForCausalLM, and the models of its
+    form: Mistral, Qwen2 with its queries', keys' and values' biases, ...): RMS normalization, grouped-query
+    attention with rotary embeddings (rotate_half, as Hugging Face stores the weights), a SwiGLU MLP. ``heads``
+    and ``kv_heads`` are the config's num_attention_heads and num_key_value_heads (None: as many), ``rope_theta``
+    and ``epsilon`` its rope_theta and rms_norm_eps; ``context`` the network's window of tokens. The language
+    model head is lm_head.weight, else tied to the token embeddings."""
+    p = _prefix(state, "embed_tokens.weight")
+    embed = _tensor(state[p + "embed_tokens.weight"])
+    vocabulary, width = embed.shape
+    kv_heads = int(kv_heads or heads)
+    head_size = width // heads
+    layers = 1 + max(int(k[len(p) + 7:].split(".")[0]) for k in state if k.startswith(p + "layers."))
+
+    def bias(name, size):
+        return _tensor(state[name]) if name in state else np.zeros(size, dtype=np.float32)
+
+    net = Network(Loss.SPARSE_CROSS_ENTROPY)
+    sets = []
+    net.add_layer(int(context))
+    net.add_embedding(vocabulary, width)
+    sets.append((net.last - 1, embed, None))
+    x = net.last
+    for i in range(layers):
+        h = f"{p}layers.{i}."
+        net.add_rms_norm(epsilon=epsilon)
+        sets.append((net.last - 1, _tensor(state[h + "input_layernorm.weight"]), None))
+        qkv = [_tensor(state[h + f"self_attn.{n}_proj.weight"]) for n in "qkv"]
+        sizes = [w.shape[0] for w in qkv]
+        net.add_linear(sum(sizes))
+        sets.append((net.last - 1, np.concatenate(qkv),
+                     np.concatenate([bias(h + f"self_attn.{n}_proj.bias", m) for n, m in zip("qkv", sizes)])))
+        net.add_attention(heads=heads, kv_heads=kv_heads, rope_theta=rope_theta, causal=True)
+        net.add_linear(width)
+        sets.append((net.last - 1, _tensor(state[h + "self_attn.o_proj.weight"]), bias(h + "self_attn.o_proj.bias", width)))
+        net.add_add([x, net.last])
+        x = net.last
+        net.add_rms_norm(epsilon=epsilon)
+        normed = net.last
+        sets.append((normed - 1, _tensor(state[h + "post_attention_layernorm.weight"]), None))
+        gate = _tensor(state[h + "mlp.gate_proj.weight"])
+        net.add_linear(gate.shape[0], activation=Activation.SILU)
+        sets.append((net.last - 1, gate, np.zeros(gate.shape[0], dtype=np.float32)))
+        g = net.last
+        net.add_linear(gate.shape[0], inputs=normed)
+        sets.append((net.last - 1, _tensor(state[h + "mlp.up_proj.weight"]), np.zeros(gate.shape[0], dtype=np.float32)))
+        net.add_multiply([g, net.last])
+        net.add_linear(width)
+        sets.append((net.last - 1, _tensor(state[h + "mlp.down_proj.weight"]), np.zeros(width, dtype=np.float32)))
+        net.add_add([x, net.last])
+        x = net.last
+    net.add_rms_norm(epsilon=epsilon)
+    sets.append((net.last - 1, _tensor(state[p + "norm.weight"]), None))
+    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else embed
+    net.add_linear(vocabulary)
+    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    for index, w, b in sets:
+        net.set_weights(index, w)
+        if b is not None:
+            net.set_biases(index, b)
+    if head_size * heads != width:
+        raise ValueError(f"{heads} heads do not divide the width {width}")
+    return net
+
 
 def _take_dataset(ds: _Dataset):
     try:
