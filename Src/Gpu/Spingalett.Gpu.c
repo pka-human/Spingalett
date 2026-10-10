@@ -245,14 +245,16 @@ bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
 }
 
 /* Floats a sample takes on the device: outputs of every layer, and while training their gradients
-   and dropout masks. */
+   and dropout masks; the targets; and the inputs and targets of the slots beyond the second (the
+   estimate of 1.0 counted those of one slot, its capacities stay where memory does not bound them). */
 static uint64_t sample_floats(const NeuralNetwork *net, bool training) {
     uint64_t f = 0;
     for (uint32_t l = 0; l < net->layers; l++) {
         f += net->topology[l];
         if (training && l > 0) f += net->topology[l] * (net->dropout_rates[l] > 0.0f ? 2u : 1u);
     }
-    return f + net->topology[net->layers - 1];      /* targets */
+    const uint64_t out = net->topology[net->layers - 1];
+    return f + out + (SLOTS - 2u) * (net->topology[0] + (training ? out : 0u));
 }
 
 /* Samples of a training chunk, at most: products of 4,096 rows run closer to the matrix units' rate than
