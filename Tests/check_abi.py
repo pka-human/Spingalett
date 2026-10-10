@@ -7,6 +7,9 @@
     check_abi.py check DUMP BASELINE [NM LIB]    # compare with Tests/Data/abi.txt (and, with nm, the
                                                  # library's exported symbols with Src/Spingalett.map)
     check_abi.py update DUMP BASELINE            # record the ABI of a release
+    check_abi.py runtime [NM LIB]                # the runtime's functions: Spingalett.Runtime.h's and
+                                                 # the engine's, in Src/Spingalett.Runtime.map with the
+                                                 # versions of Src/Spingalett.map (and exported by LIB)
 
 The baseline holds every struct's size and fields (offset and size), every enumerator's value, the
 integer constants and every function's declaration, as the newest release has them. A later 1.x may
@@ -25,13 +28,15 @@ sys.path.insert(0, os.path.join(ROOT, 'docs'))
 import make_reference  # noqa: E402  (the headers' parser)
 
 MAP = os.path.join(ROOT, 'Src', 'Spingalett.map')
+RUNTIME_MAP = os.path.join(ROOT, 'Src', 'Spingalett.Runtime.map')
+RUNTIME_HEADERS = ('Spingalett.Runtime.h', 'Spingalett.Inference.h')
 GROWING = re.compile(r'(_COUNT$|^SPINGALETT_FORMAT_VERSION$)')
 
 
-def declarations():
-    """(kind, name, declaration) of the public headers, the short names left out."""
+def declarations(headers=None):
+    """(kind, name, declaration) of the public headers (or of those named), the short names left out."""
     out = []
-    for header, _ in make_reference.HEADERS:
+    for header in headers or [h for h, _ in make_reference.HEADERS]:
         text = open(os.path.join(ROOT, 'Include', 'Spingalett', header)).read()
         text = text.split('#if defined(SPINGALETT_SHORT_NAMES)')[0]
         out += [(k, n, d) for k, n, d, _ in make_reference.items(text)]
@@ -64,10 +69,10 @@ def enumerators(decl):
     return [re.match(r'\s*(\w+)', e).group(1) for e in body(decl).split(',') if e.strip()]
 
 
-def functions():
+def functions(headers=None):
     """name -> declaration, whitespace normalized."""
     out = {}
-    for kind, name, decl in declarations():
+    for kind, name, decl in declarations(headers):
         if kind == 'function':
             decl = re.sub(r'\s+', ' ', decl).replace('( ', '(').replace(' )', ')')
             out[name] = decl
@@ -126,9 +131,29 @@ def read_baseline(path):
     return out
 
 
-def map_symbols():
-    text = strip_comments(open(MAP).read())
-    return set(re.findall(r'\b(spingalett_\w+);', text))
+def map_symbols(path=MAP):
+    return set(map_nodes(path))
+
+
+def map_nodes(path):
+    """name -> the version node of a version script that lists it."""
+    out = {}
+    for node, body in re.findall(r'(SPINGALETT_[\d.]+)\s*\{(.*?)\}', strip_comments(open(path).read()), re.S):
+        for name in re.findall(r'\b(spingalett_\w+);', body):
+            out[name] = node
+    return out
+
+
+def exports(nm, library):
+    """name -> symbol version of the functions a shared library exports (ELF)."""
+    out = subprocess.run([nm, '-D', '--defined-only', library], check=True, capture_output=True, text=True).stdout
+    exported = {}
+    for line in out.splitlines():
+        symbol = line.split()[-1]
+        if symbol.startswith('spingalett_'):
+            name, _, version = symbol.partition('@@')
+            exported[name] = version
+    return exported
 
 
 def check(dump, baseline, nm=None, library=None):
@@ -153,14 +178,7 @@ def check(dump, baseline, nm=None, library=None):
     for name in sorted(mapped - declared):
         errors.append('in Src/Spingalett.map but not declared: %s' % name)
     if nm and library:
-        out = subprocess.run([nm, '-D', '--defined-only', library], check=True, capture_output=True,
-                             text=True).stdout
-        exported = {}
-        for line in out.splitlines():
-            symbol = line.split()[-1]
-            if symbol.startswith('spingalett_'):
-                name, _, version = symbol.partition('@@')
-                exported[name] = version
+        exported = exports(nm, library)
         for name in sorted(mapped - set(exported)):
             errors.append('not exported by the library: %s' % name)
         for name in sorted(set(exported) - mapped):
@@ -175,6 +193,35 @@ def check(dump, baseline, nm=None, library=None):
         print(e)
     print('check_abi: %d entries of the baseline, %d added since, %d errors' % (len(before), len(added),
                                                                                 len(errors)))
+    return 1 if errors else 0
+
+
+def check_runtime(nm=None, library=None):
+    """The runtime exports the functions of its header and the engine's, with the full library's
+    symbol versions."""
+    errors = []
+    declared, nodes, full = set(functions(RUNTIME_HEADERS)), map_nodes(RUNTIME_MAP), map_nodes(MAP)
+    for name in sorted(declared - set(nodes)):
+        errors.append('declared but not in Src/Spingalett.Runtime.map: %s' % name)
+    for name in sorted(set(nodes) - declared):
+        errors.append('in Src/Spingalett.Runtime.map but not declared by the runtime\'s headers: %s' % name)
+    for name, node in sorted(nodes.items()):
+        if full.get(name) != node:
+            errors.append('%s: version %s in the runtime, %s in the library' % (name, node, full.get(name)))
+    if nm and library:
+        exported = exports(nm, library)
+        for name in sorted(set(nodes) - set(exported)):
+            errors.append('not exported by the runtime: %s' % name)
+        for name in sorted(set(exported) - set(nodes)):
+            errors.append('exported by the runtime but not in Src/Spingalett.Runtime.map: %s' % name)
+        if any(exported.values()):
+            for name, version in sorted(exported.items()):
+                if name in nodes and version != nodes[name]:
+                    errors.append('%s: exported as version %s, not %s' % (name, version or 'none', nodes[name]))
+    for e in errors:
+        print(e)
+    print('check_abi: the runtime has %d functions%s, %d errors' % (len(nodes), ', checked in %s' % library
+                                                                   if library else '', len(errors)))
     return 1 if errors else 0
 
 
@@ -199,5 +246,7 @@ if __name__ == '__main__':
         sys.exit(check(*args[1:]))
     elif len(args) == 3 and args[0] == 'update':
         update(args[1], args[2])
+    elif len(args) in (1, 3) and args[0] == 'runtime':
+        sys.exit(check_runtime(*args[1:]))
     else:
         sys.exit(__doc__)

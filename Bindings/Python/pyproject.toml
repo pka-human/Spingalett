@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spingalett"
-version = "1.0.0"
+version = "1.1.0"
 description = "Neural networks in C23 from Python: training, graphs, ONNX and PyTorch import, INT8 to INT2 deployment"
 readme = "README.md"
 license = "MIT"

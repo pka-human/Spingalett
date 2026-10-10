@@ -235,29 +235,31 @@ with tempfile.TemporaryDirectory() as d:
 check(sg.library_version() == sg.__version__, f"library {sg.library_version()} vs bindings {sg.__version__}")
 check(sg.cpu_kernels() in ("AVX-512", "AVX2", "AVX", "SSE2", "NEON", "C"), f"cpu kernels {sg.cpu_kernels()!r}")
 check(sg.gpu_device() is None or isinstance(sg.gpu_device(), str), f"gpu device {sg.gpu_device()!r}")
+check(sg.cuda_device() is None or isinstance(sg.cuda_device(), str), f"cuda device {sg.cuda_device()!r}")
 sg.set_gpu_precision(sg.Precision.BFLOAT16)
 check(sg.get_gpu_precision() == sg.Precision.BFLOAT16, "gpu precision bfloat16")
 sg.set_gpu_precision(sg.Precision.FLOAT32)
 
-# the GPU (or, without one, the CPU it falls back to) trains and predicts as the CPU does
+# the GPUs (or, without one, the CPU they fall back to) train and predict as the CPU does
 gx = np.random.default_rng(3).normal(size=(64, 6)).astype(np.float32)
 gy = np.eye(3, dtype=np.float32)[np.arange(64) % 3]
 results = []
-for mode in (sg.ComputeMode.OPENMP, sg.ComputeMode.VULKAN):
+for mode in (sg.ComputeMode.OPENMP, sg.ComputeMode.CUDA, sg.ComputeMode.VULKAN):
     sg.set_compute_mode(mode)
     sg.seed(4)
     with sg.Network(sg.Loss.CROSS_ENTROPY, [6, sg.Layer(8, sg.Activation.RELU), sg.Layer(3, sg.Activation.SOFTMAX)]) as gn:
         gn.train(gx, gy, epochs=3, strategy=sg.Strategy.MINI_BATCH, batch_size=16, shuffle=False)
         results.append(gn.forward(gx))
 check(sg.get_compute_mode() == sg.ComputeMode.VULKAN, "compute mode VULKAN")
-check(np.allclose(results[0], results[1], rtol=1e-4, atol=1e-6), "GPU training == CPU training")
+check(all(np.allclose(results[0], r, rtol=1e-4, atol=1e-6) for r in results[1:]), "GPU training == CPU training")
 
-# data sets in the GPU's memory: the same bits as arrays, on the GPU and on the CPU
+# data sets in the GPU's memory: the same bits as arrays, on the GPUs (a Vulkan device's set copied through the
+# host for CUDA) and on the CPU
 if sg.gpu_device() is not None:
     with sg.DeviceData(gx) as dx, sg.DeviceData(gy) as dy:
         check(len(dx) == 64 and dx.shape == (64, 6) and np.array_equal(dx.numpy(), gx)
               and np.array_equal(dy.numpy(5, 2), gy[5:7]), f"device data {dx!r}")
-        for mode in (sg.ComputeMode.VULKAN, sg.ComputeMode.OPENMP):
+        for mode in (sg.ComputeMode.VULKAN, sg.ComputeMode.CUDA, sg.ComputeMode.OPENMP):
             sg.set_compute_mode(mode)
             outs, metrics = [], []
             for xs, ys in ((gx, gy), (dx, dy), (dx, gy)):

@@ -26,6 +26,7 @@ cat <<EOF
 | \`spingalett-$version-windows-x86_64.zip\` | 64-bit Windows (AVX2 and AVX-512 matrix kernels chosen at run time); the MinGW and OpenMP runtime DLLs are included |
 | \`spingalett-$version-windows-x86_64-v3.zip\` | the same for CPUs with AVX2 and FMA |
 | \`spingalett-$version-macos-universal.tar.gz\` | macOS 11 or newer, Apple silicon and Intel, with LLVM's OpenMP runtime next to the library |
+| \`spingalett-runtime-$version-*\` | the runtime alone, for each platform above: \`libspingalett-runtime\` (deployment models without training), \`Spingalett.Runtime.h\`, its CMake package and pkg-config file, \`bin/RunModel\` |
 | \`spingalett-$version-py3-none-*.whl\` | the Python package with the library inside, for any Python 3: manylinux 2.28 x86-64 and AArch64, Windows x86-64, macOS universal; \`pip install spingalett\` installs the same from PyPI |
 | \`spingalett-$version-inference-engine.zip\` | the standalone inference engine for firmware: three C files, see its README |
 | \`DigitPad-$version-x86_64.AppImage\` | the digit-drawing demo with a trained model, for x86-64 Linux with glibc 2.34+ |
@@ -33,9 +34,12 @@ cat <<EOF
 | \`SHA256SUMS\` | checksums of all files |
 
 Every archive holds \`include/\`, \`lib/\` (with a CMake package: \`find_package(Spingalett $(echo "$version" | cut -d. -f1-2))\`
-with \`CMAKE_PREFIX_PATH\` pointing at the extracted directory), \`bin/DatasetTool\`,
-\`bin/ModelTool\` (quantize, evaluate, import ONNX models and export models as C headers), LICENSE and CHANGELOG. The Windows archives contain \`bin/libspingalett.dll\` with import libraries for MinGW
-(\`lib/libspingalett.dll.a\`) and MSVC (\`lib/spingalett.lib\`). Python users install a wheel
+with \`CMAKE_PREFIX_PATH\` pointing at the extracted directory, and pkg-config files), LICENSE and CHANGELOG;
+the library's archives \`bin/DatasetTool\`, \`bin/ModelTool\` (quantize, evaluate, import ONNX models and
+export models as C headers) and the runtime next to the library (\`Spingalett::runtime\`), the runtime's
+\`bin/RunModel\`. The Windows archives contain \`bin/libspingalett.dll\` (and
+\`bin/libspingalett-runtime.dll\`) with import libraries for MinGW (\`lib/libspingalett.dll.a\`) and MSVC
+(\`lib/spingalett.lib\`, \`lib/spingalett-runtime.lib\`). Python users install a wheel
 (\`pip install spingalett\`, or one of the files above); the bindings of a source checkout find the
 library through \`SPINGALETT_LIBRARY\`. DigitPad is not signed: on Windows, SmartScreen may ask for
 **More info**, then **Run anyway**.

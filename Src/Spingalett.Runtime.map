@@ -1,0 +1,36 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 pka_human (pka_human@proton.me)
+ *
+ * Symbol versions of libspingalett-runtime.so (ELF platforms): the functions of Spingalett.Runtime.h
+ * and Spingalett.Inference.h, with the versions Src/Spingalett.map gives them in the full library.
+ * A function added to those headers goes into both files, in the node of the release that adds it.
+ * Tests/check_abi.py checks that these are those headers' functions, and on Linux that they are what
+ * the runtime exports.
+ */
+SPINGALETT_1.0 {
+    global:
+        spingalett_clear_error;
+        spingalett_cpu_kernels;
+        spingalett_get_compute_mode;
+        spingalett_get_num_threads;
+        spingalett_get_verbose;
+        spingalett_last_error_code;
+        spingalett_last_error_message;
+        spingalett_model_evaluate;
+        spingalett_model_free;
+        spingalett_model_from_memory;
+        spingalett_model_init;
+        spingalett_model_layer;
+        spingalett_model_load;
+        spingalett_model_predict;
+        spingalett_model_run;
+        spingalett_set_compute_mode;
+        spingalett_set_log_callback;
+        spingalett_set_log_level;
+        spingalett_set_num_threads;
+        spingalett_set_verbose;
+        spingalett_version;
+    local:
+        *;
+};

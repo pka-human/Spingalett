@@ -497,37 +497,6 @@ bool spingalett_save_args(SaveArgs args) {
 
 /* ------------------------------------------------------------------------- reading */
 
-void *spingalett_read_file(const char *path, size_t *size) {
-    *size = 0;
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        set_error(SPINGALETT_ERR_FILE_IO, "load: cannot open file for reading");
-        return NULL;
-    }
-    long length = -1;
-    if (fseek(fp, 0, SEEK_END) == 0) length = ftell(fp);
-    if (length < 0 || fseek(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
-        set_error(SPINGALETT_ERR_FILE_IO, "load: cannot determine the file size");
-        return NULL;
-    }
-    void *data = spingalett_aligned_alloc((size_t)length);
-    if (!data) {
-        fclose(fp);
-        set_error(SPINGALETT_ERR_ALLOC, "load: file buffer allocation failed");
-        return NULL;
-    }
-    bool ok = fread(data, 1, (size_t)length, fp) == (size_t)length;
-    fclose(fp);
-    if (!ok) {
-        spingalett_aligned_free(data);
-        set_error(SPINGALETT_ERR_FILE_IO, "load: read error");
-        return NULL;
-    }
-    *size = (size_t)length;
-    return data;
-}
-
 /* Builds an empty network of the given shape (weights zero). */
 static NeuralNetwork *make_network(LossFunction loss, uint32_t layers, const uint32_t *topology,
                                    const ActivationFunction *act, const float *dropout) {

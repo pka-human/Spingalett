@@ -4,7 +4,7 @@
 */
 
 /*
- * Vulkan compute for the GPU backend (Spingalett.Vulkan.h). The loader (libvulkan.so.1,
+ * The GPU through Vulkan compute (spg_vulkan_ops, Spingalett.Device.h). The loader (libvulkan.so.1,
  * vulkan-1.dll, libvulkan.1.dylib or MoltenVK) is opened at run time and every function is fetched
  * through vkGetInstanceProcAddr / vkGetDeviceProcAddr, so nothing links against Vulkan. The first
  * discrete GPU with Vulkan 1.2, a compute queue and buffer device addresses is used, else an
@@ -15,9 +15,9 @@
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
-#include "Spingalett.Vulkan.h"
+#include "Spingalett.Device.h"
 #include "Spingalett.Thread.h"
-#include "Spingalett.Kernels.h"         /* spg_kernel_spirv[], spg_kernel_spirv_size[], spg_kernel_names[] */
+#include "Spingalett.Kernels.h"         /* spg_kernel_spirv[], spg_kernel_spirv_size[] */
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,7 +143,7 @@ static struct {
     Pipeline *pipelines;            /* made so far, in the order they were */
     size_t pipeline_count, pipeline_cap;
     SpgSignal *lock;                /* the pipelines, the queue and the spare command buffers */
-    struct SpgGpuCommands *spare[SPARE_COMMANDS];   /* freed, for the next spg_gpu_commands_create() */
+    struct VkbCommands *spare[SPARE_COMMANDS];   /* freed, for the next vkb_commands_create() */
     uint32_t spare_count;
     struct { SpgGpuBuffer block; SpgMemory kind; } spare_blocks[SPARE_BLOCKS];  /* for the next arenas */
     uint32_t spare_block_count;
@@ -391,7 +391,7 @@ static bool open_device(void) {
     return gpu.lock != NULL;
 }
 
-bool spg_gpu_open(void) {
+static bool vkb_open(void) {
     int state = atomic_load(&gpu.state);
     if (state == 2) return true;
     if (state == 3) return false;
@@ -405,38 +405,38 @@ bool spg_gpu_open(void) {
     return state == 2;
 }
 
-const char *spg_gpu_device_name(void) {
-    return spg_gpu_open() ? gpu.name : NULL;
+static const char *vkb_device_name(void) {
+    return vkb_open() ? gpu.name : NULL;
 }
 
-uint64_t spg_gpu_memory(void) {
-    return spg_gpu_open() ? gpu.heap : 0;
+static uint64_t vkb_memory(void) {
+    return vkb_open() ? gpu.heap : 0;
 }
 
-uint32_t spg_gpu_shared_memory(void) {
-    return spg_gpu_open() ? gpu.shared : 0;
+static uint32_t vkb_shared_memory(void) {
+    return vkb_open() ? gpu.shared : 0;
 }
 
-uint32_t spg_gpu_max_workgroups(uint32_t axis) {
-    return spg_gpu_open() && axis < 3 ? gpu.max_groups[axis] : 0;
+static uint32_t vkb_max_workgroups(uint32_t axis) {
+    return vkb_open() && axis < 3 ? gpu.max_groups[axis] : 0;
 }
 
-uint32_t spg_gpu_subgroup_size(void) {
-    return spg_gpu_open() ? gpu.subgroup : 32u;
+static uint32_t vkb_subgroup_size(void) {
+    return vkb_open() ? gpu.subgroup : 32u;
 }
 
-bool spg_gpu_mma_bf16(void) {
-    return spg_gpu_open() && gpu.mma_bf16;
+static bool vkb_mma_bf16(void) {
+    return vkb_open() && gpu.mma_bf16;
 }
 
-bool spg_gpu_bf16_storage(void) {
+static bool vkb_bf16_storage(void) {
     static int off = -1;                /* SPINGALETT_GPU_NO_BF16_STORAGE=1: single precision in memory */
     if (off < 0) off = getenv("SPINGALETT_GPU_NO_BF16_STORAGE") != NULL;
-    return spg_gpu_open() && gpu.storage16 && !off;
+    return vkb_open() && gpu.storage16 && !off;
 }
 
-bool spg_gpu_host_writes(void) {
-    return spg_gpu_open() && gpu.host_writes;
+static bool vkb_host_writes(void) {
+    return vkb_open() && gpu.host_writes;
 }
 
 /* The pipeline of a kernel with these specialization constants made so far, or VK_NULL_HANDLE (under
@@ -451,7 +451,7 @@ static VkPipeline made_pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t
 }
 
 /* The pipeline of a kernel with these specialization constants, made on first use: compiled outside the
-   lock, so that threads make theirs at once (spg_gpu_prepare()); the first made of two alike is kept. */
+   lock, so that threads make theirs at once (vkb_prepare()); the first made of two alike is kept. */
 static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     spg_lock(gpu.lock);
     VkPipeline found = made_pipeline(kernel, spec, count);
@@ -499,7 +499,12 @@ static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t coun
     return found;
 }
 
-/* spg_gpu_prepare()'s threads: every `step`-th pipeline from `first` on */
+/* vkb_prepare()'s threads: every `step`-th pipeline from `first` on */
+typedef struct VkbCommands VkbCommands;
+typedef struct VkbArena VkbArena;
+static void vkb_commands_free(void *c_);
+static bool vkb_wait(void *c_);
+
 typedef struct { SpgKernel kernel; const uint32_t *specs; uint32_t count, n, first, step; } Prepare;
 
 static void prepare_some(void *arg) {
@@ -507,8 +512,8 @@ static void prepare_some(void *arg) {
     for (uint32_t i = job->first; i < job->n; i += job->step) (void)pipeline(job->kernel, job->specs + (size_t)i * job->count, job->count);
 }
 
-void spg_gpu_prepare(SpgKernel kernel, const uint32_t *specs, uint32_t count, uint32_t n) {
-    if (!spg_gpu_open() || count > SPG_SPEC_MAX) return;
+static void vkb_prepare(SpgKernel kernel, const uint32_t *specs, uint32_t count, uint32_t n) {
+    if (!vkb_open() || count > SPG_SPEC_MAX) return;
     /* the driver compiles a pipeline in tens of milliseconds the first time a machine sees it (then it
        keeps it on disk): eight threads at most, one share each, the caller's among them */
     enum { MOST = 8 };
@@ -537,7 +542,7 @@ static int32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
 /* A buffer with memory of its own of the given kind (SPG_MEMORY_HOST_WRITES: false without such). */
 static bool create_buffer(SpgGpuBuffer *b, size_t bytes, SpgMemory kind) {
     memset(b, 0, sizeof *b);
-    if (!spg_gpu_open()) return false;
+    if (!vkb_open()) return false;
     if (bytes == 0) bytes = 16;
     bytes = (bytes + 15u) & ~(size_t)15u;
     const bool host_visible = kind != SPG_MEMORY_DEVICE;
@@ -579,11 +584,11 @@ static bool create_buffer(SpgGpuBuffer *b, size_t bytes, SpgMemory kind) {
     return true;
 }
 
-bool spg_gpu_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) {
+static bool vkb_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) {
     return create_buffer(b, bytes, host_visible ? SPG_MEMORY_HOST : SPG_MEMORY_DEVICE);
 }
 
-void spg_gpu_buffer_free(SpgGpuBuffer *b) {
+static void vkb_buffer_free(SpgGpuBuffer *b) {
     if (!b || !b->buffer) return;
     if (b->memory) {                    /* an arena's buffers leave their memory to it */
         vkDestroyBuffer(gpu.device, (VkBuffer)b->buffer, NULL);
@@ -601,7 +606,7 @@ void spg_gpu_buffer_free(SpgGpuBuffer *b) {
 
 typedef struct { SpgGpuBuffer *buffer; size_t bytes, offset; SpgMemory kind; uint32_t block; } ArenaAsk;
 
-struct SpgGpuArena {
+struct VkbArena {
     ArenaAsk *asks;
     uint32_t count, cap;
     SpgGpuBuffer *blocks;
@@ -635,7 +640,7 @@ static bool block_create(SpgGpuBuffer *b, size_t bytes, SpgMemory kind) {
     if (create_buffer(b, bytes, kind)) return true;
     spg_lock(gpu.lock);
     const uint32_t kept = gpu.spare_block_count;
-    for (uint32_t k = 0; k < kept; k++) spg_gpu_buffer_free(&gpu.spare_blocks[k].block);
+    for (uint32_t k = 0; k < kept; k++) vkb_buffer_free(&gpu.spare_blocks[k].block);
     gpu.spare_block_count = 0;
     gpu.spare_bytes = 0;
     spg_unlock(gpu.lock);
@@ -651,15 +656,16 @@ static void block_free(SpgGpuBuffer *b, SpgMemory kind) {
         gpu.spare_bytes += b->size;
     }
     spg_unlock(gpu.lock);
-    if (!kept) spg_gpu_buffer_free(b);
+    if (!kept) vkb_buffer_free(b);
     memset(b, 0, sizeof *b);
 }
 
-SpgGpuArena *spg_gpu_arena_create(void) {
-    return (SpgGpuArena *)calloc(1, sizeof(SpgGpuArena));
+static void *vkb_arena_create(void) {
+    return (VkbArena *)calloc(1, sizeof(VkbArena));
 }
 
-void spg_gpu_arena_add(SpgGpuArena *a, SpgGpuBuffer *buffer, size_t bytes, SpgMemory kind) {
+static void vkb_arena_add(void *a_, SpgGpuBuffer *buffer, size_t bytes, SpgMemory kind) {
+    VkbArena *a = (VkbArena *)a_;
     memset(buffer, 0, sizeof *buffer);
     if (bytes == 0) return;
     if (a->count == a->cap) {
@@ -672,8 +678,9 @@ void spg_gpu_arena_add(SpgGpuArena *a, SpgGpuBuffer *buffer, size_t bytes, SpgMe
     a->asks[a->count++] = (ArenaAsk){buffer, (bytes + 15u) & ~(size_t)15u, 0, kind, 0};
 }
 
-bool spg_gpu_arena_commit(SpgGpuArena *a) {
-    if (a->failed || !spg_gpu_open()) return false;
+static bool vkb_arena_commit(void *a_) {
+    VkbArena *a = (VkbArena *)a_;
+    if (a->failed || !vkb_open()) return false;
     /* the blocks (at most one per ask): their kinds and the bytes they need */
     const uint32_t most = a->count ? a->count : 1u;
     a->blocks = (SpgGpuBuffer *)calloc(most, sizeof(SpgGpuBuffer));
@@ -714,7 +721,8 @@ bool spg_gpu_arena_commit(SpgGpuArena *a) {
     return true;
 }
 
-void spg_gpu_arena_free(SpgGpuArena *a) {
+static void vkb_arena_free(void *a_) {
+    VkbArena *a = (VkbArena *)a_;
     if (!a) return;
     for (uint32_t b = 0; b < a->block_count; b++) block_free(&a->blocks[b], a->kinds[b]);
     free(a->blocks);
@@ -727,7 +735,7 @@ void spg_gpu_arena_free(SpgGpuArena *a) {
 
 /* Each command buffer has a pool of its own: recording into buffers of one pool needs the pool
    synchronized, and networks may record on several threads at once. */
-struct SpgGpuCommands {
+struct VkbCommands {
     VkCommandPool pool;
     VkCommandBuffer cb;
     VkFence fence;
@@ -736,19 +744,19 @@ struct SpgGpuCommands {
     VkQueryPool queries;            /* profiling: two timestamps per dispatch */
     uint32_t timed;
     char (*labels)[48];
-    VkQueryPool stamps;             /* spg_gpu_commands_stamps() */
+    VkQueryPool stamps;             /* vkb_commands_stamps() */
     uint32_t stamp_count;
 };
 
-SpgGpuCommands *spg_gpu_commands_create(void) {
-    if (!spg_gpu_open()) return NULL;
+static void *vkb_commands_create(void) {
+    if (!vkb_open()) return NULL;
     /* a command buffer freed before, which a fresh one would take a third of a millisecond to make (its
        pool, buffer and fence, on NVIDIA's driver): recorded again from the start, as a fresh one */
     spg_lock(gpu.lock);
-    SpgGpuCommands *c = gpu.spare_count ? gpu.spare[--gpu.spare_count] : NULL;
+    VkbCommands *c = gpu.spare_count ? gpu.spare[--gpu.spare_count] : NULL;
     spg_unlock(gpu.lock);
     if (c) return c;
-    c = (SpgGpuCommands *)calloc(1, sizeof *c);
+    c = (VkbCommands *)calloc(1, sizeof *c);
     if (!c) return NULL;
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
                                    VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, gpu.family};
@@ -759,7 +767,7 @@ SpgGpuCommands *spg_gpu_commands_create(void) {
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0};
     ok = ok && vkAllocateCommandBuffers(gpu.device, &ai, &c->cb) == VK_SUCCESS;
     if (!ok || vkCreateFence(gpu.device, &fci, NULL, &c->fence) != VK_SUCCESS) {
-        spg_gpu_commands_free(c);
+        vkb_commands_free(c);
         return NULL;
     }
     if (gpu.profile) {
@@ -771,12 +779,14 @@ SpgGpuCommands *spg_gpu_commands_create(void) {
     return c;
 }
 
-void spg_gpu_commands_untimed(SpgGpuCommands *c) {
+static void vkb_commands_untimed(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (c->queries) vkDestroyQueryPool(gpu.device, c->queries, NULL);
     c->queries = VK_NULL_HANDLE;
 }
 
-bool spg_gpu_commands_stamps(SpgGpuCommands *c, uint32_t count) {
+static bool vkb_commands_stamps(void *c_, uint32_t count) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (gpu.stamp_bits == 0 || gpu.tick_ns <= 0.0f || count == 0) return false;
     VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, count, 0};
     if (vkCreateQueryPool(gpu.device, &qci, NULL, &c->stamps) != VK_SUCCESS) {
@@ -787,12 +797,14 @@ bool spg_gpu_commands_stamps(SpgGpuCommands *c, uint32_t count) {
     return true;
 }
 
-void spg_gpu_timestamp(SpgGpuCommands *c, uint32_t index) {
+static void vkb_timestamp(void *c_, uint32_t index) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (c->stamps && index < c->stamp_count)
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->stamps, index);
 }
 
-bool spg_gpu_timestamps(SpgGpuCommands *c, double *ns, uint32_t count) {
+static bool vkb_timestamps(void *c_, double *ns, uint32_t count) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (!c->stamps || count > c->stamp_count) return false;
     uint64_t *ticks = (uint64_t *)malloc(count * sizeof(uint64_t));
     bool ok = ticks && vkGetQueryPoolResults(gpu.device, c->stamps, 0, count, count * sizeof(uint64_t), ticks,
@@ -802,13 +814,14 @@ bool spg_gpu_timestamps(SpgGpuCommands *c, double *ns, uint32_t count) {
     return ok;
 }
 
-void spg_gpu_commands_free(SpgGpuCommands *c) {
+static void vkb_commands_free(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (!c) return;
-    if (c->pending) spg_gpu_wait(c);
+    if (c->pending) vkb_wait(c);
     if (c->stamps) vkDestroyQueryPool(gpu.device, c->stamps, NULL);
     c->stamps = VK_NULL_HANDLE;
     c->stamp_count = 0;
-    /* kept for the next spg_gpu_commands_create() while there is room (with its profiling queries) */
+    /* kept for the next vkb_commands_create() while there is room (with its profiling queries) */
     if (c->cb && c->fence && (c->queries || !gpu.profile)) {
         spg_lock(gpu.lock);
         const bool kept = gpu.spare_count < SPARE_COMMANDS;
@@ -823,8 +836,9 @@ void spg_gpu_commands_free(SpgGpuCommands *c) {
     free(c);
 }
 
-bool spg_gpu_record_begin(SpgGpuCommands *c) {
-    if (c->pending && !spg_gpu_wait(c)) return false;
+static bool vkb_record_begin(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
+    if (c->pending && !vkb_wait(c)) return false;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, 0, NULL};
     c->ok = vkBeginCommandBuffer(c->cb, &bi) == VK_SUCCESS;
     c->timed = 0;
@@ -833,8 +847,9 @@ bool spg_gpu_record_begin(SpgGpuCommands *c) {
     return c->ok;
 }
 
-void spg_gpu_dispatch(SpgGpuCommands *c, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const void *push,
+static void vkb_dispatch(void *c_, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const void *push,
                       uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (gx == 0 || gy == 0 || gz == 0) return;
     VkPipeline p = spec_count <= SPG_SPEC_MAX && push_size <= SPG_PUSH_BYTES ? pipeline(kernel, spec, spec_count)
                                                                               : VK_NULL_HANDLE;
@@ -857,7 +872,8 @@ void spg_gpu_dispatch(SpgGpuCommands *c, SpgKernel kernel, const uint32_t *spec,
     if (timed) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->queries, 2u * c->timed++ + 1u);
 }
 
-void spg_gpu_barrier(SpgGpuCommands *c) {
+static void vkb_barrier(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
                           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
@@ -867,15 +883,17 @@ void spg_gpu_barrier(SpgGpuCommands *c) {
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-void spg_gpu_barrier_host(SpgGpuCommands *c) {
+static void vkb_barrier_host(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_HOST_READ_BIT};
     vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-void spg_gpu_copy(SpgGpuCommands *c, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
+static void vkb_copy(void *c_, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
                   size_t dst_offset, size_t bytes) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (bytes == 0) return;
     VkBufferCopy region = {src->offset + src_offset, dst->offset + dst_offset, bytes};
     const bool timed = c->queries && c->timed < PROFILE_QUERIES && bytes >= 4096u;
@@ -887,17 +905,20 @@ void spg_gpu_copy(SpgGpuCommands *c, const SpgGpuBuffer *src, size_t src_offset,
     if (timed) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->queries, 2u * c->timed++ + 1u);
 }
 
-void spg_gpu_fill(SpgGpuCommands *c, const SpgGpuBuffer *dst, size_t offset, size_t bytes, uint32_t value) {
+static void vkb_fill(void *c_, const SpgGpuBuffer *dst, size_t offset, size_t bytes, uint32_t value) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (bytes == 0) return;
     vkCmdFillBuffer(c->cb, (VkBuffer)dst->buffer, dst->offset + offset, bytes, value);
 }
 
-bool spg_gpu_record_end(SpgGpuCommands *c) {
+static bool vkb_record_end(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
     return vkEndCommandBuffer(c->cb) == VK_SUCCESS && c->ok;
 }
 
-bool spg_gpu_submit(SpgGpuCommands *c) {
-    if (c->pending && !spg_gpu_wait(c)) return false;
+static bool vkb_submit(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
+    if (c->pending && !vkb_wait(c)) return false;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &c->cb, 0, NULL};
     spg_lock(gpu.lock);
     bool ok = vkResetFences(gpu.device, 1, &c->fence) == VK_SUCCESS &&
@@ -907,7 +928,8 @@ bool spg_gpu_submit(SpgGpuCommands *c) {
     return ok;
 }
 
-bool spg_gpu_wait(SpgGpuCommands *c) {
+static bool vkb_wait(void *c_) {
+    VkbCommands *c = (VkbCommands *)c_;
     if (!c->pending) return true;
     c->pending = false;
     bool ok = vkWaitForFences(gpu.device, 1, &c->fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
@@ -926,3 +948,11 @@ bool spg_gpu_wait(SpgGpuCommands *c) {
     }
     return ok;
 }
+
+const SpgGpuOps spg_vulkan_ops = {
+    vkb_open, vkb_device_name, vkb_memory, vkb_shared_memory, vkb_subgroup_size, vkb_max_workgroups, vkb_mma_bf16,
+    vkb_bf16_storage, vkb_host_writes, vkb_buffer_create, vkb_buffer_free, vkb_arena_create, vkb_arena_add,
+    vkb_arena_commit, vkb_arena_free, vkb_commands_create, vkb_commands_free, vkb_commands_untimed,
+    vkb_commands_stamps, vkb_timestamp, vkb_timestamps, vkb_record_begin, vkb_dispatch, vkb_prepare, vkb_barrier,
+    vkb_barrier_host, vkb_copy, vkb_fill, vkb_record_end, vkb_submit, vkb_wait,
+};

@@ -23,7 +23,7 @@
  * P is fp32, fp16, bf16, int8, int4 or int2; by default the precision the model is stored in.
  */
 
-#include <Spingalett/Spingalett.h>
+#include <Spingalett/Spingalett.Short.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,20 +32,20 @@
 #include <windows.h>
 #endif
 
-static const char *precision_name(SpingalettPrecisionMode p) {
+static const char *precision_name(PrecisionMode p) {
     static const char *names[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
-    return (unsigned)p < SPINGALETT_PRECISION_COUNT ? names[p] : "?";
+    return (unsigned)p < PRECISION_COUNT ? names[p] : "?";
 }
 
-static const char *activation_name(SpingalettActivationFunction a) {
+static const char *activation_name(ActivationFunction a) {
     static const char *names[] = {"none", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax"};
-    return (unsigned)a < SPINGALETT_ACT_COUNT ? names[a] : "?";
+    return (unsigned)a < ACT_COUNT ? names[a] : "?";
 }
 
-static bool parse_precision(const char *s, SpingalettPrecisionMode *p) {
+static bool parse_precision(const char *s, PrecisionMode *p) {
     static const char *names[][2] = {{"fp32", "float32"}, {"fp16", "half"}, {"bf16", "bfloat16"}, {"int8", "i8"}, {"int4", "i4"}, {"int2", "ternary"}};
-    for (int i = 0; i < SPINGALETT_PRECISION_COUNT; i++)
-        if (!strcmp(s, names[i][0]) || !strcmp(s, names[i][1])) { *p = (SpingalettPrecisionMode)i; return true; }
+    for (int i = 0; i < PRECISION_COUNT; i++)
+        if (!strcmp(s, names[i][0]) || !strcmp(s, names[i][1])) { *p = (PrecisionMode)i; return true; }
     return false;
 }
 
@@ -70,10 +70,10 @@ static int fail(const char *what) {
 }
 
 /* The model as stored, its network (float) and the precision of its first layer. */
-static bool open_model(const char *path, SpingalettModel **model, SpingalettNetwork **net,
-                       SpingalettPrecisionMode *stored) {
+static bool open_model(const char *path, SpingalettModel **model, NeuralNetwork **net,
+                       PrecisionMode *stored) {
     *model = spingalett_model_load(path);
-    *net = *model ? spingalett_load(path) : NULL;
+    *net = *model ? load_spingalett(path) : NULL;
     if (!*model || !*net) {
         spingalett_model_free(*model);
         return false;
@@ -86,8 +86,8 @@ static bool open_model(const char *path, SpingalettModel **model, SpingalettNetw
 
 static int info(const char *path) {
     SpingalettModel *m;
-    SpingalettNetwork *net;
-    SpingalettPrecisionMode stored;
+    NeuralNetwork *net;
+    PrecisionMode stored;
     if (!open_model(path, &m, &net, &stored)) return fail(path);
     printf("%s\n  %u inputs, %u outputs, %u layers, %llu parameters\n  image %zu bytes, workspace %zu bytes\n",
            path, m->input_size, m->output_size, m->layer_count,
@@ -102,57 +102,57 @@ static int info(const char *path) {
         SpingalettLayerInfo l;
         spingalett_model_layer(m, i, &l);
         char shape[128] = "", groups[24] = "", from[96] = "";
-        if (l.type == SPINGALETT_LAYER_CONV2D && l.groups > 1)
+        if (l.type == LAYER_CONV2D && l.groups > 1)
             snprintf(groups, sizeof groups, ", %u groups", l.groups);
-        if (l.type == SPINGALETT_LAYER_BATCH_NORM)
+        if (l.type == LAYER_BATCH_NORM)
             snprintf(shape, sizeof shape, "  %u x %u x %u, epsilon %g", l.height, l.width, l.channels, (double)l.epsilon);
-        else if (l.type == SPINGALETT_LAYER_CONV2D || l.type == SPINGALETT_LAYER_MAX_POOL2D ||
-                 l.type == SPINGALETT_LAYER_AVG_POOL2D)
+        else if (l.type == LAYER_CONV2D || l.type == LAYER_MAX_POOL2D ||
+                 l.type == LAYER_AVG_POOL2D)
             snprintf(shape, sizeof shape, "  %u x %u x %u, window %u x %u, stride %u x %u, padding %u x %u%s", l.height,
                      l.width, l.channels, l.kernel_h, l.kernel_w, l.stride_h, l.stride_w, l.padding_h, l.padding_w, groups);
-        else if (l.type != SPINGALETT_LAYER_DENSE)
+        else if (l.type != LAYER_DENSE)
             snprintf(shape, sizeof shape, "  %u x %u x %u", l.height, l.width, l.channels);
         /* the layers it reads, unless it reads the one before it */
         if (l.input_count != 1 || l.input_layers[0] != i)
             for (uint32_t k = 0, used = 0; k < l.input_count && used + 12 < sizeof from; k++)
                 used += (uint32_t)snprintf(from + used, sizeof from - used, "%s%u", k ? ", " : "  reads ", l.input_layers[k]);
-        bool parameterless = l.type != SPINGALETT_LAYER_DENSE && l.type != SPINGALETT_LAYER_CONV2D &&
-                             l.type != SPINGALETT_LAYER_BATCH_NORM;
+        bool parameterless = l.type != LAYER_DENSE && l.type != LAYER_CONV2D &&
+                             l.type != LAYER_BATCH_NORM;
         printf("  layer %u: %-10s %7u -> %-7u %-10s %s%s%s\n", i + 1, kinds[l.type], l.inputs, l.outputs,
                activation_name(l.activation), parameterless ? "-" : precision_name(l.precision), shape, from);
     }
     spingalett_model_free(m);
-    spingalett_network_free(net);
+    free_network(net);
     return 0;
 }
 
-static int convert(const char *in, const char *out, bool have_precision, SpingalettPrecisionMode precision,
+static int convert(const char *in, const char *out, bool have_precision, PrecisionMode precision,
                    bool optimizer) {
     SpingalettModel *m;
-    SpingalettNetwork *net;
-    SpingalettPrecisionMode stored;
+    NeuralNetwork *net;
+    PrecisionMode stored;
     if (!open_model(in, &m, &net, &stored)) return fail(in);
     spingalett_model_free(m);
     /* files saved without optimizer state record no optimizer steps */
-    spingalett_save(.net = net, .filename = out, .precision = have_precision ? precision : stored,
+    save_spingalett(.net = net, .filename = out, .precision = have_precision ? precision : stored,
                     .do_not_save_optimizer = !optimizer || spingalett_optimizer_steps(net) == 0);
-    spingalett_network_free(net);
+    free_network(net);
     if (spingalett_last_error_code() != SPINGALETT_OK) return fail(out);
     printf("wrote %s (%s)\n", out, precision_name(have_precision ? precision : stored));
     return 0;
 }
 
 static int header(const char *in, const char *out, const char *name, bool have_precision,
-                  SpingalettPrecisionMode precision) {
+                  PrecisionMode precision) {
     SpingalettModel *m;
-    SpingalettNetwork *net;
-    SpingalettPrecisionMode stored;
+    NeuralNetwork *net;
+    PrecisionMode stored;
     if (!open_model(in, &m, &net, &stored)) return fail(in);
     spingalett_model_free(m);
-    SpingalettPrecisionMode p = have_precision ? precision : stored;
+    PrecisionMode p = have_precision ? precision : stored;
     bool ok = spingalett_export_c_header(net, out, name, p);
     SpingalettModel *q = ok ? spingalett_model_from_network(net, p) : NULL;
-    spingalett_network_free(net);
+    free_network(net);
     if (!ok || !q) return fail(out);
     printf("wrote %s: %s, %zu bytes of model, %zu bytes of workspace\n", out, precision_name(p), q->image_size, q->workspace_size);
     spingalett_model_free(q);
@@ -160,54 +160,54 @@ static int header(const char *in, const char *out, const char *name, bool have_p
 }
 
 static int eval(const char *path, const char *data, const char *labels, bool have_precision,
-                SpingalettPrecisionMode precision) {
+                PrecisionMode precision) {
     SpingalettModel *m;
-    SpingalettNetwork *net;
-    SpingalettPrecisionMode stored;
+    NeuralNetwork *net;
+    PrecisionMode stored;
     if (!open_model(path, &m, &net, &stored)) return fail(path);
     spingalett_model_free(m);
     SpingalettDataset d;
     bool loaded = labels ? spingalett_load_idx(data, labels, spingalett_output_size(net), &d) : spingalett_load_dataset(data, &d);
     if (!loaded) {
-        spingalett_network_free(net);
+        free_network(net);
         return fail(data);
     }
     if (d.input_size != spingalett_input_size(net) || d.target_size != spingalett_output_size(net)) {
         fprintf(stderr, "%s: %u inputs and %u targets per sample; the model has %u and %u\n", data, d.input_size,
                 d.target_size, spingalett_input_size(net), spingalett_output_size(net));
         spingalett_dataset_free(&d);
-        spingalett_network_free(net);
+        free_network(net);
         return 1;
     }
     printf("%u samples\n  precision     bytes    accuracy      loss\n", d.count);
     int rc = 0;
-    for (int p = 0; p < SPINGALETT_PRECISION_COUNT; p++) {
+    for (int p = 0; p < PRECISION_COUNT; p++) {
         if (have_precision && p != (int)precision) continue;
-        SpingalettModel *q = spingalett_model_from_network(net, (SpingalettPrecisionMode)p);
-        if (!q) { rc = fail(precision_name((SpingalettPrecisionMode)p)); continue; }
-        SpingalettEvalMetrics e = spingalett_model_evaluate(q, d.inputs, d.targets, d.count);
-        printf("  %-6s %13zu    %7.2f%%  %8.4f%s\n", precision_name((SpingalettPrecisionMode)p), q->image_size,
-               100.0 * (double)e.accuracy, (double)e.loss, (SpingalettPrecisionMode)p == stored ? "   (stored)" : "");
+        SpingalettModel *q = spingalett_model_from_network(net, (PrecisionMode)p);
+        if (!q) { rc = fail(precision_name((PrecisionMode)p)); continue; }
+        EvalMetrics e = spingalett_model_evaluate(q, d.inputs, d.targets, d.count);
+        printf("  %-6s %13zu    %7.2f%%  %8.4f%s\n", precision_name((PrecisionMode)p), q->image_size,
+               100.0 * (double)e.accuracy, (double)e.loss, (PrecisionMode)p == stored ? "   (stored)" : "");
         spingalett_model_free(q);
     }
     spingalett_dataset_free(&d);
-    spingalett_network_free(net);
+    free_network(net);
     return rc;
 }
 
-static int bench(const char *path, bool have_precision, SpingalettPrecisionMode precision) {
+static int bench(const char *path, bool have_precision, PrecisionMode precision) {
     SpingalettModel *m;
-    SpingalettNetwork *net;
-    SpingalettPrecisionMode stored;
+    NeuralNetwork *net;
+    PrecisionMode stored;
     if (!open_model(path, &m, &net, &stored)) return fail(path);
     spingalett_model_free(m);
     uint32_t n = 4096, in = spingalett_input_size(net), out = spingalett_output_size(net);
     float *x = malloc((size_t)n * in * sizeof(float)), *y = malloc((size_t)n * out * sizeof(float));
     for (size_t i = 0; i < (size_t)n * in; i++) x[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
     printf("  precision     bytes   one sample     batched\n");
-    for (int p = 0; p < SPINGALETT_PRECISION_COUNT; p++) {
+    for (int p = 0; p < PRECISION_COUNT; p++) {
         if (have_precision && p != (int)precision) continue;
-        SpingalettModel *q = spingalett_model_from_network(net, (SpingalettPrecisionMode)p);
+        SpingalettModel *q = spingalett_model_from_network(net, (PrecisionMode)p);
         if (!q) continue;
         void *ws = malloc(q->workspace_size);
         uint32_t runs = 0;
@@ -220,33 +220,33 @@ static int bench(const char *path, bool have_precision, SpingalettPrecisionMode 
         t0 = now();
         spingalett_model_predict(q, x, n, y);
         double batched = (now() - t0) / n;
-        printf("  %-6s %13zu  %8.2f us  %8.2f us/sample\n", precision_name((SpingalettPrecisionMode)p), q->image_size,
+        printf("  %-6s %13zu  %8.2f us  %8.2f us/sample\n", precision_name((PrecisionMode)p), q->image_size,
                single * 1e6, batched * 1e6);
         free(ws);
         spingalett_model_free(q);
     }
     free(x);
     free(y);
-    spingalett_network_free(net);
+    free_network(net);
     return 0;
 }
 
-static int import(const char *in, const char *out, bool have_precision, SpingalettPrecisionMode precision) {
-    SpingalettNetwork *net = spingalett_import_onnx(in);
+static int import(const char *in, const char *out, bool have_precision, PrecisionMode precision) {
+    NeuralNetwork *net = spingalett_import_onnx(in);
     if (!net) return fail(in);
     SpingalettNetworkLayer input;
     spingalett_network_layer(net, 0, &input);
-    spingalett_save(.net = net, .filename = out, .do_not_save_optimizer = true,
-                    .precision = have_precision ? precision : SPINGALETT_PRECISION_FLOAT32);
+    save_spingalett(.net = net, .filename = out, .do_not_save_optimizer = true,
+                    .precision = have_precision ? precision : PRECISION_FLOAT32);
     if (spingalett_last_error_code() != SPINGALETT_OK) {
-        spingalett_network_free(net);
+        free_network(net);
         return fail(out);
     }
     printf("wrote %s: %u layers, %llu parameters, input %u x %u x %u (channels last), %u outputs, %s\n", out,
            spingalett_layer_count(net), (unsigned long long)spingalett_parameter_count(net), input.height, input.width,
            input.channels, spingalett_output_size(net),
-           precision_name(have_precision ? precision : SPINGALETT_PRECISION_FLOAT32));
-    spingalett_network_free(net);
+           precision_name(have_precision ? precision : PRECISION_FLOAT32));
+    free_network(net);
     return 0;
 }
 
@@ -265,12 +265,12 @@ static int usage(void) {
 int main(int argc, char **argv) {
     spingalett_set_verbose(false);
 #if defined(SPINGALETT_HAS_OPENMP)
-    spingalett_set_compute_mode(SPINGALETT_COMPUTE_OPENMP);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
 #endif
     const char *args[4] = {0};
     int nargs = 0;
     bool have_precision = false, optimizer = true;
-    SpingalettPrecisionMode precision = SPINGALETT_PRECISION_FLOAT32;
+    PrecisionMode precision = PRECISION_FLOAT32;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--precision") && i + 1 < argc) {
             if (!parse_precision(argv[++i], &precision)) return usage();

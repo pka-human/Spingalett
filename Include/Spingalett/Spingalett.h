@@ -8,21 +8,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "Spingalett.Config.h"
-#include "Spingalett.Inference.h"   /* SPINGALETT_API, shared enums, error codes, the inference engine */
+#include "Spingalett.Runtime.h"     /* versions, errors, settings, deployment models; the inference engine */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef enum {
-    SPINGALETT_LOG_DEBUG,
-    SPINGALETT_LOG_INFO,
-    SPINGALETT_LOG_WARNING,
-    SPINGALETT_LOG_ERROR,
-    SPINGALETT_LOG_NONE
-} SpingalettLogLevel;
-
-typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *message);
+/* The log levels, the compute modes, SpingalettEvalMetrics: in Spingalett.Runtime.h. */
 
 typedef enum {
     SPINGALETT_INIT_RANDOM,   /* uniform in [-1, 1] */
@@ -54,16 +46,6 @@ typedef enum {
     SPINGALETT_OPTIMIZER_ADAMW,
     SPINGALETT_OPTIMIZER_COUNT
 } SpingalettOptimizerType;
-
-typedef enum {
-    SPINGALETT_COMPUTE_SINGLE_THREADED,
-    SPINGALETT_COMPUTE_OPENMP,
-    SPINGALETT_COMPUTE_OPENBLAS,
-    SPINGALETT_COMPUTE_CUDA,                   /* reserved: falls back to the CPU */
-    SPINGALETT_COMPUTE_VULKAN,                 /* the GPU through Vulkan compute (spingalett_gpu_device()); the CPU
-                                       parts of training run as with SPINGALETT_COMPUTE_OPENMP */
-    SPINGALETT_COMPUTE_COUNT
-} SpingalettComputeMode;
 
 typedef enum {
     SPINGALETT_AUTOSAVE_OFF,
@@ -125,14 +107,6 @@ typedef enum {
     SPINGALETT_MONITOR_VAL_ACCURACY,
     SPINGALETT_MONITOR_COUNT
 } SpingalettMonitorMetric;
-
-/* Result of spingalett_evaluate() and of the per-epoch validation pass. */
-typedef struct {
-    float loss;                     /* mean over samples of the network's loss (see spingalett_evaluate()) */
-    float accuracy;                 /* fraction of samples whose output argmax matches the target's
-                                       argmax; with a single output, both on the same side of 0.5 */
-    uint64_t reserved[SPINGALETT_RESERVED];
-} SpingalettEvalMetrics;
 
 /* State of a spingalett_train() call, passed to the epoch callback. */
 typedef struct {
@@ -402,32 +376,20 @@ typedef struct {
     uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettDataset;
 
-/* Library version (the header's SPINGALETT_VERSION_* macros describe the headers in use). */
-SPINGALETT_API const char *spingalett_version(void);
+/* The version, errors, the compute mode, threads and logging: in Spingalett.Runtime.h. */
 
-/* Errors. A function that fails returns false, NULL, NaN (losses and metrics), SPINGALETT_NO_LAYER or a
-   report whose status is SPINGALETT_TRAIN_FAILED, and sets the calling thread's error: its code
-   (SPINGALETT_ERR_*) and a message saying what failed. A call that succeeds leaves the error as it was,
-   so a program checks the result, then the error; spingalett_clear_error() resets it. The engine's
-   functions (Spingalett.Inference.h), which keep no state, return the code instead. */
-SPINGALETT_API int spingalett_last_error_code(void);
-SPINGALETT_API const char *spingalett_last_error_message(void);
-SPINGALETT_API void spingalett_clear_error(void);
-
-/* Instruction set of the matrix-multiplication kernels that training and batched inference use:
-   "AVX-512", "AVX2", "AVX", "SSE2", "NEON" or "C". x86-64 libraries built without
-   SPINGALETT_NATIVE_ARCH (such as the release binaries) choose AVX-512 or AVX2 kernels at run time
-   when the processor has them. */
-SPINGALETT_API const char *spingalett_cpu_kernels(void);
-
-SPINGALETT_API SpingalettComputeMode spingalett_get_compute_mode(void);
-/* Returns false (the error set) for a value of no mode. */
-SPINGALETT_API bool spingalett_set_compute_mode(SpingalettComputeMode mode);
 /* The name of the GPU that SPINGALETT_COMPUTE_VULKAN uses (opening the device on first call), or NULL when the
    library was built without the Vulkan backend or no device is usable: Vulkan 1.2 with buffer device
    addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
    SPINGALETT_GPU_DEVICE picks one by its index in the Vulkan device list. */
 SPINGALETT_API const char *spingalett_gpu_device(void);
+/* The name of the GPU that SPINGALETT_COMPUTE_CUDA uses (opening it on first call), or NULL when the library
+   was built without the CUDA backend or no device is usable: an NVIDIA GPU of compute capability 8.0 or
+   later (Ampere and newer) with a driver of CUDA 11.0 or later, which the library opens at run time.
+   SPINGALETT_CUDA_DEVICE picks one by its index in the driver's list. Networks and data sets on the GPU
+   stay on the backend they were made on: a data set made under SPINGALETT_COMPUTE_VULKAN is copied
+   through the host to train a network on CUDA, and the other way. */
+SPINGALETT_API const char *spingalett_cuda_device(void);
 /* Precision of the GPU's matrix products: SPINGALETT_PRECISION_FLOAT32 (the default: single precision, as on
    the CPU) or SPINGALETT_PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
    multiplied on the GPU's matrix units with the products added in single precision: faster; the
@@ -437,21 +399,14 @@ SPINGALETT_API const char *spingalett_gpu_device(void);
    autocast). Devices without bfloat16
    cooperative matrices keep single precision. Applies from the next spingalett_train(), spingalett_predict() or
    spingalett_evaluate() call, or the next trainer; results stay deterministic. Returns whether the GPU
-   multiplies in that precision (false without a device, or for bfloat16 without its matrix units);
-   other values are ignored and return false. */
+   of the compute mode (SPINGALETT_COMPUTE_CUDA's, else SPINGALETT_COMPUTE_VULKAN's) multiplies in that
+   precision (false without a device, or for bfloat16 without its matrix units); other values are
+   ignored and return false. */
 SPINGALETT_API bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
 SPINGALETT_API SpingalettPrecisionMode spingalett_get_gpu_precision(void);
-SPINGALETT_API unsigned spingalett_get_num_threads(void);
-SPINGALETT_API void spingalett_set_num_threads(unsigned n);
-
-SPINGALETT_API void spingalett_set_log_callback(SpingalettLogCallback cb);
-SPINGALETT_API void spingalett_set_log_level(SpingalettLogLevel level);
 
 /* Seeds the calling thread's generator (weight init, shuffling, dropout) for reproducible runs. */
 SPINGALETT_API void spingalett_seed(uint64_t seed);
-
-SPINGALETT_API void spingalett_set_verbose(bool enabled);
-SPINGALETT_API bool spingalett_get_verbose(void);
 
 #define spingalett_network_new(...) spingalett_network_new_args((SpingalettNetworkArgs){__VA_ARGS__})
 SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkArgs args);
@@ -531,9 +486,11 @@ SPINGALETT_API SpingalettTrainReport spingalett_train_args(SpingalettTrainArgs a
 
 /*
  * Data sets in the GPU's memory: count rows of size floats copied to the device once, for the
- * device_* fields of spingalett_train(), spingalett_predict() and spingalett_evaluate(). With SPINGALETT_COMPUTE_VULKAN those calls read their
- * chunks on the device, where spingalett_train() gathers, augments and smooths them, instead of copying samples
- * from the host for every pass; on the CPU they copy the rows back first. With SPINGALETT_PRECISION_BFLOAT16 a set
+ * device_* fields of spingalett_train(), spingalett_predict() and spingalett_evaluate(). A set is made in
+ * the memory of the compute mode's GPU (SPINGALETT_COMPUTE_CUDA's, else SPINGALETT_COMPUTE_VULKAN's).
+ * On that backend those calls read their chunks on the device, where spingalett_train() gathers,
+ * augments and smooths them, instead of copying samples from the host for every pass; on the CPU, or
+ * the other backend, they copy the rows through the host first. With SPINGALETT_PRECISION_BFLOAT16 a set
  * makes a copy of its rows as bfloat16 on first use (half its size again), which networks read as the
  * inputs they keep as such. A set's row size is the network's input (or output) size, and it holds at
  * least the call's samples. NULL without a usable GPU, or when its memory runs out. A set may serve
@@ -642,28 +599,11 @@ SPINGALETT_API bool spingalett_load_pytorch(SpingalettNetwork *net, const char *
 SPINGALETT_API bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size,
                                                         const char *const *modules, uint32_t module_count);
 
-/*
- * Deployment. A SpingalettModel (Spingalett.Inference.h) is a read-only network that computes in the
- * precision its weights are stored in: INT8, INT4 and INT2 layers use integer kernels. The functions
- * below create models that own their image; release them with spingalett_model_free. Models made by
- * spingalett_model_init over a caller's image need no release.
- */
+/* Deployment: models loaded from files, prediction and evaluation in Spingalett.Runtime.h. */
 
-/* A network quantized (or converted) to precision for inference. */
+/* A network quantized (or converted) to precision for inference, as a model that owns its image
+   (release it with spingalett_model_free). */
 SPINGALETT_API SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
-/* Reads a .slett file. Images of format version 3 are used as stored; older ones are converted
-   in the precision they were saved in. */
-SPINGALETT_API SpingalettModel *spingalett_model_load(const char *path);
-/* Same, from an image in memory, which is copied. */
-SPINGALETT_API SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
-SPINGALETT_API void spingalett_model_free(SpingalettModel *model);
-/* Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all
-   threads in SPINGALETT_COMPUTE_OPENMP mode. Returns false on error. */
-SPINGALETT_API bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count,
-                                             float *outputs);
-/* Mean loss (the model's loss function, as spingalett_evaluate() computes it) and accuracy over a data set. */
-SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs,
-                                                     const float *targets, uint32_t count);
 
 /*
  * Writes net, in precision and without optimizer state, as a C header for compiling the model into

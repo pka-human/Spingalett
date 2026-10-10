@@ -4,10 +4,11 @@
 */
 
 /*
- * The GPU's matrix product (Src/Gpu/Shaders/gemm.comp) against a reference in double precision:
- * dense layers, convolutions (groups, strides, padding, rectangular windows) and their data and
- * weight gradients, with every tile and with and without vector loads. Without a usable Vulkan device
- * the tests are skipped (exit code 77).
+ * The GPU's matrix product (Src/Gpu/Shaders/gemm.comp on Vulkan, Src/Gpu/Cuda/gemm.cu on CUDA) against a
+ * reference in double precision: dense layers, convolutions (groups, strides, padding, rectangular
+ * windows) and their data and weight gradients, with every tile and with and without vector loads.
+ * Without a usable device the tests are skipped (exit code 77). SPINGALETT_GPU_BACKEND=cuda tests the
+ * CUDA backend.
  *
  *   SpingalettGpuTests            the tests, with the tile chosen and a third of the others, in single
  *                                 precision and (with matrix units) in bfloat16 on them
@@ -15,7 +16,10 @@
  *   SpingalettGpuTests bench      times every tile on the products of ResNet-20 at 128 samples
  *   SpingalettGpuTests bench bf16 the same on the matrix units ("dense" after either: the MLP's
  *                                 products only; "half" with bf16: their operands and results kept
- *                                 as bfloat16, as training in bfloat16 keeps them)
+ *                                 as bfloat16, as training in bfloat16 keeps them; "fw" with half: the
+ *                                 MLP's weights as floats, as training keeps them; SPINGALETT_BENCH_CONV
+ *                                 = "n h w c out kh kw sh sw ph pw groups" times that convolution instead
+ *                                 of ResNet-20's)
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -29,6 +33,7 @@ static int failures;
 static uint32_t tile_step = 3;      /* every tile_step-th tile is tried */
 static bool mma;                    /* the products in bfloat16 on the matrix units (gemm_mma.comp) */
 static bool half;                   /* bench: operands and results kept as bfloat16 */
+static bool float_weights;          /* and with "fw" the MLP's weights as floats, as in training */
 
 /* x rounded to bfloat16, to the nearest (ties to even), as the matrix kernel converts its operands */
 static float bf16(float x) {
@@ -399,8 +404,13 @@ static void bench(bool dense_only) {
         {128, 8, 8, 64, 64, 3, 3, 1, 1, 1, 1, 1}, {128, 32, 32, 3, 16, 3, 3, 1, 1, 1, 1, 1},
     };
     static const char *names[] = {"forward", "data", "weights"};
-    for (size_t k = 0; !dense_only && k < sizeof shapes / sizeof shapes[0]; k++) {
-        const Conv *v = &shapes[k];
+    /* SPINGALETT_BENCH_CONV="n h w c out kh kw sh sw ph pw groups": that convolution only */
+    Conv only;
+    const char *one = getenv("SPINGALETT_BENCH_CONV");
+    const bool single = one && sscanf(one, "%u %u %u %u %u %u %u %u %u %u %u %u", &only.n, &only.h, &only.w, &only.c, &only.out,
+                                      &only.kh, &only.kw, &only.sh, &only.sw, &only.ph, &only.pw, &only.groups) == 12;
+    for (size_t k = 0; !dense_only && k < (single ? 1u : sizeof shapes / sizeof shapes[0]); k++) {
+        const Conv *v = single ? &only : &shapes[k];
         const uint32_t OH = out_h(v), OW = out_w(v), K = v->kh * v->kw * v->c / v->groups;
         const size_t nx = (size_t)v->n * v->h * v->w * v->c, ny = (size_t)v->n * OH * OW * v->out,
                      nw = (size_t)v->out * K;
@@ -410,6 +420,21 @@ static void bench(bool dense_only) {
         for (size_t i = 0; i < ny; i++) dy[i] = uniform();
         ConvBuffers b = {0};
         conv_setup(v, &b, x, w, dy);
+        /* with "half": the maps kept as bfloat16 (the floats' high halves), the filters as floats, as in training */
+        for (int map = 0; half && map < 2; map++) {
+            const float *src = map ? dy : x;
+            const size_t count = map ? ny : nx;
+            uint16_t *h16 = malloc(count * 2);
+            for (size_t i = 0; i < count; i++) {
+                uint32_t u;
+                memcpy(&u, &src[i], 4);
+                h16[i] = (uint16_t)(u >> 16);
+            }
+            SpgGpuBuffer *dst = map ? &b.dy : &b.x;
+            spg_gpu_buffer_free(dst);
+            upload(dst, h16, count * 2);
+            free(h16);
+        }
         const double flops = 2.0 * (double)ny * K;
         printf("conv %ux%ux%u -> %ux%ux%u, %ux%u window, stride %u (%.0f MFLOP a product)\n", v->h, v->w, v->c, OH, OW,
                v->out, v->kh, v->kw, v->sh, flops * 1e-6);
@@ -423,7 +448,15 @@ static void bench(bool dense_only) {
                     slices = spg_gemm_split(v->out / v->groups, K, v->n * OH * OW, v->groups, &slice_k);
                 /* tile 0: chosen by timing (as in training); the others forced */
                 uint32_t count = conv_push(v, &b, pass, slices, p, m, true, tile == 0);
-                for (uint32_t j = 0; j < count; j++) m[j].tile = tile;
+                const uint32_t CG = v->c / v->groups, OG = v->out / v->groups;
+                for (uint32_t j = 0; j < count; j++) {
+                    m[j].tile = tile;
+                    if (!half) continue;
+                    /* A, and C of the forward pass and data gradient, as bfloat16; with the weight gradient's B */
+                    m[j].half = pass == 2 ? 3u : 5u;
+                    m[j].wide_a = pass == 0 ? CG % 8u == 0 && v->c % 8u == 0 : pass == 1 ? OG % 8u == 0 && v->out % 8u == 0 : true;
+                    m[j].wide_b = pass == 2 ? CG % 8u == 0 && v->c % 8u == 0 : true;
+                }
                 run_many(p, m, count, 2);
                 double t = run_many(p, m, count, 20);
                 if (tile == 0) chosen = t;
@@ -452,7 +485,8 @@ static void bench(bool dense_only) {
         }
         const void *src = half ? (const void *)h16 : (const void *)host;
         upload(&bx, src, (size_t)n * in * size);
-        upload(&bw, src, (size_t)out * in * size);
+        if (float_weights) upload(&bw, host, (size_t)out * in * 4u);
+        else upload(&bw, src, (size_t)out * in * size);
         upload(&bd, src, (size_t)n * out * size);
         spg_gpu_buffer_create(&by, (size_t)(n > out ? n : out) * (in > out ? in : out) * 4, false);
         printf("dense %u x %u -> %u (%.0f MFLOP a product)\n", n, in, out, flops * 1e-6);
@@ -479,7 +513,7 @@ static void bench(bool dense_only) {
                                       (uint64_t)out * in, mma};
                 }
                 /* kept as bfloat16: A and B, and C but the weight gradients' */
-                m.half = half ? (pass == 2 ? 3u : 7u) : 0u;
+                m.half = half ? (pass == 2 ? 3u : float_weights ? 5u : 7u) : 0u;
                 m.wide_a = m.wide_b = true;
                 run(&p, &m, 2);
                 double t = run(&p, &m, 20);
@@ -496,11 +530,14 @@ static void bench(bool dense_only) {
 }
 
 int main(int argc, char **argv) {
+    const char *backend = getenv("SPINGALETT_GPU_BACKEND");
+    const bool cuda = backend && !strcmp(backend, "cuda");
+    spg_gpu_use(cuda ? SPG_BACKEND_CUDA : SPG_BACKEND_VULKAN);
     if (!spg_gpu_open()) {
-        printf("no usable Vulkan device: GPU tests skipped\n");
+        printf("no usable %s device: GPU tests skipped\n", cuda ? "CUDA" : "Vulkan");
         return 77;
     }
-    printf("device: %s\n", spg_gpu_device_name());
+    printf("device: %s (%s)\n", spg_gpu_device_name(), cuda ? "CUDA" : "Vulkan");
     printf("matrix units: %s\n", spg_gpu_mma_bf16() ? "bfloat16 cooperative matrices" : "none");
     if (argc > 1 && !strcmp(argv[1], "bench")) {
         bool dense = false;
@@ -508,6 +545,7 @@ int main(int argc, char **argv) {
             if (!strcmp(argv[k], "bf16")) mma = spg_gpu_mma_bf16();
             if (!strcmp(argv[k], "dense")) dense = true;
             if (!strcmp(argv[k], "half")) half = spg_gpu_mma_bf16() && spg_gpu_bf16_storage();
+            if (!strcmp(argv[k], "fw")) float_weights = true;
         }
         bench(dense);
         return 0;

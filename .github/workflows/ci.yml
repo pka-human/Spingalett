@@ -41,7 +41,7 @@ jobs:
         run: cmake --build Build --parallel
 
       - name: Test
-        run: ctest --test-dir Build --output-on-failure
+        run: .github/scripts/ctest.sh --test-dir Build
 
       # ctest counts the GPU tests as passed when they find no device: here they must find lavapipe
       - name: GPU tests (lavapipe)
@@ -108,7 +108,7 @@ jobs:
         run: cmake --build Build --parallel
 
       - name: Test
-        run: LSAN_OPTIONS=suppressions=$PWD/Tests/lsan.supp ctest --test-dir Build --output-on-failure
+        run: LSAN_OPTIONS=suppressions=$PWD/Tests/lsan.supp .github/scripts/ctest.sh --test-dir Build
 
   inference-only:
     name: inference engine alone
@@ -129,7 +129,7 @@ jobs:
         run: |
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DSPINGALETT_INFERENCE_ONLY=ON -DCMAKE_INSTALL_PREFIX=$PWD/prefix
           cmake --build Build --parallel
-          ctest --test-dir Build --output-on-failure
+          .github/scripts/ctest.sh --test-dir Build
           cmake --install Build
 
       - name: Consumer (find_package)
@@ -145,6 +145,45 @@ jobs:
           cmake --build consumer/build
           consumer/build/c
 
+  runtime:
+    name: ${{ matrix.cc }} / runtime alone
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+
+      - name: Configure, build, test, install (SPINGALETT_RUNTIME_ONLY)
+        run: |
+          cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} -DSPINGALETT_RUNTIME_ONLY=ON \
+                -DBUILD_WITH_OPENMP=ON -DSPINGALETT_NATIVE_ARCH=OFF -DCMAKE_INSTALL_PREFIX=$PWD/prefix
+          cmake --build Build --parallel
+          .github/scripts/ctest.sh --test-dir Build
+          cmake --install Build
+          find prefix -type f | sort
+          test ! -e prefix/include/Spingalett/Spingalett.h && test ! -e prefix/lib/libspingalett.so.1
+
+      - name: Consumer (find_package, pkg-config)
+        run: |
+          mkdir consumer
+          cp Examples/Runtime/RunModel.c consumer/
+          printf '%s\n' 'cmake_minimum_required(VERSION 3.21)' 'project(consumer C)' \
+            'find_package(Spingalett 1.1 REQUIRED)' 'add_executable(run RunModel.c)' \
+            'target_link_libraries(run PRIVATE Spingalett::runtime)' > consumer/CMakeLists.txt
+          cmake -S consumer -B consumer/build -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_PREFIX_PATH=$PWD/prefix
+          cmake --build consumer/build
+          consumer/build/run Tests/Data/runtime/resnet_int8.slett
+          prefix/bin/RunModel Tests/Data/runtime/graph7_bf16.slett | tail -1
+          export PKG_CONFIG_PATH=$PWD/prefix/lib/pkgconfig
+          ${{ matrix.cc }} -std=c99 -Wall -Wextra -Wpedantic -Werror -o consumer/pc packaging/conan/test_package/test_runtime.c \
+            $(pkg-config --cflags --libs spingalett-runtime) -Wl,-rpath,$PWD/prefix/lib
+          consumer/pc
+
   packages:
     name: Conan and vcpkg recipes
     runs-on: ubuntu-24.04
@@ -156,6 +195,7 @@ jobs:
           pipx install conan
           conan profile detect
           conan create packaging/conan --build=missing
+          conan create packaging/conan --build=missing -o "&:runtime_only=True"
 
       - name: vcpkg (overlay port)
         run: |
@@ -163,15 +203,17 @@ jobs:
           "$vcpkg" install spingalett --triplet x64-linux-dynamic --overlay-ports=packaging/vcpkg
           mkdir consumer
           cp packaging/conan/test_package/test_package.c consumer/
+          cp packaging/conan/test_package/test_runtime.c consumer/
           printf '%s\n' 'cmake_minimum_required(VERSION 3.21)' 'project(consumer C)' \
             'find_package(Spingalett CONFIG REQUIRED)' 'add_executable(c test_package.c)' \
-            'target_link_libraries(c PRIVATE Spingalett::spingalett)' > consumer/CMakeLists.txt
+            'target_link_libraries(c PRIVATE Spingalett::spingalett)' 'add_executable(r test_runtime.c)' \
+            'target_link_libraries(r PRIVATE Spingalett::runtime)' > consumer/CMakeLists.txt
           cmake -S consumer -B consumer/build -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           cmake --build consumer/build
-          consumer/build/c
+          (cd consumer && build/c && build/r xor.slett)
           PKG_CONFIG_PATH="$VCPKG_INSTALLATION_ROOT/installed/x64-linux-dynamic/lib/pkgconfig" \
-            pkg-config --exists --print-errors spingalett
+            pkg-config --exists --print-errors spingalett spingalett-runtime
 
   embedded:
     name: Cortex-M4 (QEMU)

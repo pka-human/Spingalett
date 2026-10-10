@@ -1,0 +1,105 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* The units of PTX of the CUDA backend: SPG_CUDA_UNIT(name, source, "defines") is Src/Gpu/Cuda/<source>.cu
+   compiled by cmake/Cuda.cmake with -DSPG_ENTRY=spg_<name> and the defines, a module of its own whose
+   kernel is spg_<name>, given to the driver (and compiled by it) when first dispatched. The units of the
+   matrix product are the tiles times the modes below: gemm_<BM>x<BN>x<BK>_<TM>x<TN>_a<A>b<B>, followed by v
+   with VEC, compiled with -DGEMM=BM,BN,BK,TM,TN,A,B,VEC. */
+
+SPG_CUDA_UNIT(reduce, reduce, "")
+SPG_CUDA_UNIT(colsum, colsum, "")
+SPG_CUDA_UNIT(bn, bn, "")
+SPG_CUDA_UNIT(eltwise, eltwise, "")
+SPG_CUDA_UNIT(output, output, "")
+SPG_CUDA_UNIT(pool, pool, "")
+SPG_CUDA_UNIT(combine, combine, "")
+SPG_CUDA_UNIT(wtrans, wtrans, "")
+SPG_CUDA_UNIT(optim, optim, "")
+SPG_CUDA_UNIT(sumsq, sumsq, "")
+SPG_CUDA_UNIT(upsample, upsample, "")
+SPG_CUDA_UNIT(ln, ln, "")
+SPG_CUDA_UNIT(rows, rows, "")
+SPG_CUDA_UNIT(epi, epi, "")         /* the products' epilogues that gemm.cu and gemm_mma.cu do not hold */
+SPG_CUDA_UNIT(dconv9, dconv, "-DKMAX=9 -DEXACT=1")     /* products of few k over convolutions' windows: k of */
+SPG_CUDA_UNIT(dconv16, dconv, "-DKMAX=16")              /* KMAX (EXACT), or up to it */
+SPG_CUDA_UNIT(dconv27, dconv, "-DKMAX=27 -DEXACT=1")
+SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
+SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
+
+/* depthwise convolutions: any window, stride, mode, VEC and padding, and the common windows (KH, KW, SH, SW),
+   padded (KW - 1) / 2, for every mode (0 APPLY, 1 SPREAD, 2 WEIGHTS) and VEC (1, 4) as constants: units
+   dwconv_k<KH><KW>s<SH><SW>_m<MODE>v<VEC> */
+SPG_CUDA_UNIT(dwconv, dwconv, "-DWINDOW=0,0,0,0,ANY,ANY,ANY")
+SPG_CUDA_DW_WINDOW(3, 3, 1, 1)
+SPG_CUDA_DW_WINDOW(3, 3, 2, 2)
+SPG_CUDA_DW_WINDOW(5, 5, 1, 1)
+SPG_CUDA_DW_WINDOW(5, 5, 2, 2)
+SPG_CUDA_DW_WINDOW(7, 7, 1, 1)
+SPG_CUDA_DW_WINDOW(7, 7, 2, 2)
+
+/* the matrix product in single precision (gemm.cu): every tile (BM, BN, BK, TM, TN), which is also the table
+   of Spingalett.GpuKernels.c, for every operand mode the executor uses (A, B, VEC: A_CONV and B_CONV 2, or 3
+   reading four channels at once; VEC 1 when the other operands read four values at once) */
+SPG_CUDA_GEMM_TILE(128, 128, 16, 8, 8)
+SPG_CUDA_GEMM_TILE(128, 64, 16, 8, 4)
+SPG_CUDA_GEMM_TILE(64, 128, 16, 4, 8)
+SPG_CUDA_GEMM_TILE(64, 64, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(128, 32, 16, 8, 4)
+SPG_CUDA_GEMM_TILE(128, 32, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(32, 128, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(64, 32, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(32, 64, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(128, 16, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(64, 16, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(32, 32, 16, 4, 4)
+SPG_CUDA_GEMM_TILE(16, 64, 16, 4, 4)
+
+SPG_CUDA_GEMM_MODES(0, 1, 1)        /* dense layers: forward */
+SPG_CUDA_GEMM_MODES(0, 1, 0)
+SPG_CUDA_GEMM_MODES(0, 0, 1)        /* data gradient */
+SPG_CUDA_GEMM_MODES(0, 0, 0)
+SPG_CUDA_GEMM_MODES(1, 0, 1)        /* weight gradient */
+SPG_CUDA_GEMM_MODES(1, 0, 0)
+SPG_CUDA_GEMM_MODES(3, 1, 1)        /* convolutions: forward (and data gradients of transposed ones) */
+SPG_CUDA_GEMM_MODES(2, 1, 0)
+SPG_CUDA_GEMM_MODES(3, 0, 1)        /* data gradient (and forward of transposed ones) */
+SPG_CUDA_GEMM_MODES(2, 0, 0)
+SPG_CUDA_GEMM_MODES(1, 3, 1)        /* weight gradient */
+SPG_CUDA_GEMM_MODES(1, 2, 0)
+
+/* the matrix product on the matrix units (gemm_mma.cu): every tile (BM, BN, BK, TM, TN: warps of 16 TM x 16 TN
+   outputs), which is also the table of Spingalett.GpuKernels.c, for the operand modes and the ways of reading
+   them (A, B, KA, KB: 2 kept as bfloat16, eight values at once; 1 floats, four at once; 0 anything, one value
+   at once) the executor uses: units gemm_mma_<BM>x<BN>x<BK>_<TM>x<TN>_a<A>b<B>_<ka><kb>, w f o for 2 1 0 */
+SPG_CUDA_MMA_TILE(128, 128, 32, 2, 4)
+SPG_CUDA_MMA_TILE(128, 64, 32, 4, 2)
+SPG_CUDA_MMA_TILE(64, 64, 32, 2, 2)
+SPG_CUDA_MMA_TILE(128, 32, 32, 2, 1)
+SPG_CUDA_MMA_TILE(128, 16, 32, 2, 1)
+SPG_CUDA_MMA_TILE(64, 32, 32, 2, 1)
+SPG_CUDA_MMA_TILE(32, 64, 32, 1, 2)
+SPG_CUDA_MMA_TILE(64, 16, 32, 2, 1)
+SPG_CUDA_MMA_TILE(32, 32, 32, 1, 1)
+SPG_CUDA_MMA_TILE(16, 64, 32, 1, 1)
+SPG_CUDA_MMA_TILE(32, 16, 32, 1, 1)
+SPG_CUDA_MMA_TILE(16, 32, 32, 1, 1)
+
+SPG_CUDA_MMA_MODES(0, 1, 2, 1)      /* dense layers: forward (activations kept as bfloat16, weights as floats) */
+SPG_CUDA_MMA_MODES(0, 1, 2, 2)      /* (the weights' bfloat16 copy) */
+SPG_CUDA_MMA_MODES(0, 1, 0, 0)
+SPG_CUDA_MMA_MODES(0, 0, 2, 1)      /* data gradient */
+SPG_CUDA_MMA_MODES(0, 0, 2, 2)
+SPG_CUDA_MMA_MODES(0, 0, 0, 0)
+SPG_CUDA_MMA_MODES(1, 0, 2, 2)      /* weight gradient */
+SPG_CUDA_MMA_MODES(1, 0, 0, 0)
+SPG_CUDA_MMA_MODES(2, 1, 2, 1)      /* convolutions: forward */
+SPG_CUDA_MMA_MODES(2, 1, 2, 2)
+SPG_CUDA_MMA_MODES(2, 1, 0, 0)
+SPG_CUDA_MMA_MODES(2, 0, 2, 1)      /* data gradient */
+SPG_CUDA_MMA_MODES(2, 0, 2, 2)
+SPG_CUDA_MMA_MODES(2, 0, 0, 0)
+SPG_CUDA_MMA_MODES(1, 2, 2, 2)      /* weight gradient */
+SPG_CUDA_MMA_MODES(1, 2, 0, 0)

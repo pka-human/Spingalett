@@ -4,15 +4,19 @@
 */
 
 /*
- * The GPU through Vulkan compute, as the rest of the library sees it: a device opened on first use
- * (the Vulkan loader is opened at run time, so the library needs no Vulkan to load or to run on the
- * CPU), buffers in device memory known to shaders by their addresses, and command buffers of
- * kernel dispatches that can be recorded once and submitted again and again.
+ * The GPU as the rest of the library sees it, through either backend: Vulkan compute
+ * (Spingalett.Vulkan.c) or CUDA (Spingalett.Cuda.c). A device is opened on first use (the Vulkan loader
+ * and the CUDA driver are opened at run time, so the library needs neither to load or to run on the
+ * CPU); buffers live in device memory and are known to kernels by their addresses; command buffers
+ * of kernel dispatches can be recorded once and submitted again and again.
  *
- * Kernels take their parameters as push constants: buffer addresses (64-bit, through
- * VK_KHR_buffer_device_address, core in Vulkan 1.2) and sizes, so no descriptor sets are needed.
- * Tile sizes, modes and activations are specialization constants: each set of them is a pipeline
- * of its own, made when first dispatched and kept for the life of the process.
+ * Kernels take their parameters as push constants: buffer addresses (64-bit) and sizes, laid out as
+ * the structs of Spingalett.GpuKernels.h. Tile sizes, modes and activations are specialization
+ * constants: on Vulkan each set of them is a pipeline of its own, made when first dispatched; on CUDA
+ * they select a compiled kernel or go to it as an argument.
+ *
+ * The functions below act on the backend the calling thread uses (spg_gpu_use()), or, for those
+ * given a buffer, an arena or commands, on the backend that made it.
  */
 
 #pragma once
@@ -21,13 +25,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The backends. */
+typedef enum { SPG_BACKEND_VULKAN, SPG_BACKEND_CUDA, SPG_BACKEND_COUNT } SpgBackend;
+
+/* Directs the calling thread's GPU work to a backend (Vulkan until set); the backend it uses. */
+void spg_gpu_use(SpgBackend backend);
+SpgBackend spg_gpu_using(void);
+/* Whether the library was built with the backend. */
+bool spg_gpu_built(SpgBackend backend);
+
 /* A buffer of device memory; host-visible ones are mapped for their whole life. The buffers of an
-   arena are ranges of a VkBuffer they share, from `offset` on (their memory belongs to the arena). */
+   arena are ranges of a buffer they share, from `offset` on (their memory belongs to the arena). */
 typedef struct {
-    void *buffer, *memory;          /* VkBuffer, VkDeviceMemory (NULL in an arena) */
-    uint64_t address;               /* VkDeviceAddress */
+    void *buffer, *memory;          /* Vulkan: VkBuffer, VkDeviceMemory (NULL in an arena); CUDA: the
+                                       allocation (NULL in an arena) */
+    uint64_t address;               /* the address kernels read it at */
     void *mapped;                   /* host-visible buffers */
     size_t size, offset;
+    SpgBackend backend;             /* the backend that made it */
 } SpgGpuBuffer;
 
 /* Where a buffer's memory is: on the device; visible to the host and cached where the device has
@@ -59,18 +74,21 @@ typedef enum {
 
 typedef struct SpgGpuCommands SpgGpuCommands;
 
-/* Opens the device on first use (thread-safe); false when there is no usable Vulkan device. */
+/* The kernels' names (spg_kernel_names[SPG_KERNEL_bn_h] is "bn_h"). */
+extern const char *const spg_kernel_names[SPG_KERNEL_COUNT];
+
+/* Opens the device on first use (thread-safe); false when the backend has no usable device. */
 bool spg_gpu_open(void);
 /* The device's name, or NULL without one. */
 const char *spg_gpu_device_name(void);
 /* Bytes of the device's largest device-local memory heap (0 without a device). */
 uint64_t spg_gpu_memory(void);
-/* Bytes of shared memory a workgroup may use; the subgroup size. */
+/* Bytes of shared memory a workgroup may use; the subgroup size (CUDA: the warp's). */
 uint32_t spg_gpu_shared_memory(void);
 uint32_t spg_gpu_subgroup_size(void);
 /* Workgroups a dispatch may have along axis 0 (x), 1 (y) or 2 (z): 65535 at least. */
 uint32_t spg_gpu_max_workgroups(uint32_t axis);
-/* Whether the device multiplies bfloat16 cooperative matrices (16 x 16 x 16, sums in float). */
+/* Whether the device multiplies bfloat16 matrices on matrix units (sums in float). */
 bool spg_gpu_mma_bf16(void);
 /* Whether kernels may keep bfloat16 values in memory (the matrix units, and 16-bit storage). */
 bool spg_gpu_bf16_storage(void);
@@ -122,3 +140,44 @@ bool spg_gpu_record_end(SpgGpuCommands *commands);
    submitted again only after its previous run finished (submit waits for it). */
 bool spg_gpu_submit(SpgGpuCommands *commands);
 bool spg_gpu_wait(SpgGpuCommands *commands);
+
+/* A backend: the functions above, for the objects it makes (Device.c keeps which backend made an arena
+   or commands; buffers say it themselves). */
+typedef struct {
+    bool (*open)(void);
+    const char *(*device_name)(void);
+    uint64_t (*memory)(void);
+    uint32_t (*shared_memory)(void);
+    uint32_t (*subgroup_size)(void);
+    uint32_t (*max_workgroups)(uint32_t axis);
+    bool (*mma_bf16)(void);
+    bool (*bf16_storage)(void);
+    bool (*host_writes)(void);
+    bool (*buffer_create)(SpgGpuBuffer *buffer, size_t bytes, bool host_visible);
+    void (*buffer_free)(SpgGpuBuffer *buffer);
+    void *(*arena_create)(void);
+    void (*arena_add)(void *arena, SpgGpuBuffer *buffer, size_t bytes, SpgMemory memory);
+    bool (*arena_commit)(void *arena);
+    void (*arena_free)(void *arena);
+    void *(*commands_create)(void);
+    void (*commands_free)(void *commands);
+    void (*commands_untimed)(void *commands);
+    bool (*commands_stamps)(void *commands, uint32_t count);
+    void (*timestamp)(void *commands, uint32_t index);
+    bool (*timestamps)(void *commands, double *ns, uint32_t count);
+    bool (*record_begin)(void *commands);
+    void (*dispatch)(void *commands, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const void *push,
+                     uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz);
+    void (*prepare)(SpgKernel kernel, const uint32_t *specs, uint32_t count, uint32_t n);
+    void (*barrier)(void *commands);
+    void (*barrier_host)(void *commands);
+    void (*copy)(void *commands, const SpgGpuBuffer *src, size_t src_offset, const SpgGpuBuffer *dst,
+                 size_t dst_offset, size_t bytes);
+    void (*fill)(void *commands, const SpgGpuBuffer *dst, size_t offset, size_t bytes, uint32_t value);
+    bool (*record_end)(void *commands);
+    bool (*submit)(void *commands);
+    bool (*wait)(void *commands);
+} SpgGpuOps;
+
+/* The backends' functions (Spingalett.Vulkan.c, Spingalett.Cuda.c), where built. */
+extern const SpgGpuOps spg_vulkan_ops, spg_cuda_ops;

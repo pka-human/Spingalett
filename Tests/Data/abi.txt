@@ -1,10 +1,5 @@
-# The ABI of Spingalett 1.0.0, written by Tests/check_abi.py update: later releases keep every
+# The ABI of Spingalett 1.1.0, written by Tests/check_abi.py update: later releases keep every
 # entry (layouts on 64-bit platforms). Recorded again at each release, with what it added.
-enum SPINGALETT_LOG_DEBUG 0
-enum SPINGALETT_LOG_INFO 1
-enum SPINGALETT_LOG_WARNING 2
-enum SPINGALETT_LOG_ERROR 3
-enum SPINGALETT_LOG_NONE 4
 enum SPINGALETT_INIT_RANDOM 0
 enum SPINGALETT_INIT_XAVIER 1
 enum SPINGALETT_INIT_HE 2
@@ -20,11 +15,6 @@ enum SPINGALETT_OPTIMIZER_MOMENTUM 1
 enum SPINGALETT_OPTIMIZER_RMSPROP 2
 enum SPINGALETT_OPTIMIZER_ADAM 3
 enum SPINGALETT_OPTIMIZER_ADAMW 4
-enum SPINGALETT_COMPUTE_SINGLE_THREADED 0
-enum SPINGALETT_COMPUTE_OPENMP 1
-enum SPINGALETT_COMPUTE_OPENBLAS 2
-enum SPINGALETT_COMPUTE_CUDA 3
-enum SPINGALETT_COMPUTE_VULKAN 4
 enum SPINGALETT_AUTOSAVE_OFF 0
 enum SPINGALETT_AUTOSAVE_OVERWRITE 1
 enum SPINGALETT_AUTOSAVE_NEW_FILES 2
@@ -60,9 +50,6 @@ enum SPINGALETT_MONITOR_AUTO 0
 enum SPINGALETT_MONITOR_TRAIN_LOSS 1
 enum SPINGALETT_MONITOR_VAL_LOSS 2
 enum SPINGALETT_MONITOR_VAL_ACCURACY 3
-struct SpingalettEvalMetrics size 72
-field SpingalettEvalMetrics.loss offset 0 size 4
-field SpingalettEvalMetrics.accuracy offset 4 size 4
 struct SpingalettTrainProgress size 192
 field SpingalettTrainProgress.epoch offset 0 size 8
 field SpingalettTrainProgress.epochs offset 8 size 8
@@ -257,6 +244,19 @@ field SpingalettDatasetReaderOptions.shuffle offset 0 size 1
 field SpingalettDatasetReaderOptions.in_memory offset 1 size 1
 field SpingalettDatasetReaderOptions.no_prefetch offset 2 size 1
 field SpingalettDatasetReaderOptions.target_set offset 4 size 4
+enum SPINGALETT_LOG_DEBUG 0
+enum SPINGALETT_LOG_INFO 1
+enum SPINGALETT_LOG_WARNING 2
+enum SPINGALETT_LOG_ERROR 3
+enum SPINGALETT_LOG_NONE 4
+enum SPINGALETT_COMPUTE_SINGLE_THREADED 0
+enum SPINGALETT_COMPUTE_OPENMP 1
+enum SPINGALETT_COMPUTE_OPENBLAS 2
+enum SPINGALETT_COMPUTE_CUDA 3
+enum SPINGALETT_COMPUTE_VULKAN 4
+struct SpingalettEvalMetrics size 72
+field SpingalettEvalMetrics.loss offset 0 size 4
+field SpingalettEvalMetrics.accuracy offset 4 size 4
 constant SPINGALETT_MAX_INPUTS 16
 constant SPINGALETT_RESERVED 8
 constant SPINGALETT_OK 0
@@ -328,23 +328,11 @@ field SpingalettLayerInfo.epsilon offset 72 size 4
 field SpingalettLayerInfo.input_count offset 76 size 4
 field SpingalettLayerInfo.input_layers offset 80 size 64
 field SpingalettLayerInfo.upsample offset 144 size 4
-function spingalett_version const char *spingalett_version(void);
-function spingalett_last_error_code int spingalett_last_error_code(void);
-function spingalett_last_error_message const char *spingalett_last_error_message(void);
-function spingalett_clear_error void spingalett_clear_error(void);
-function spingalett_cpu_kernels const char *spingalett_cpu_kernels(void);
-function spingalett_get_compute_mode SpingalettComputeMode spingalett_get_compute_mode(void);
-function spingalett_set_compute_mode bool spingalett_set_compute_mode(SpingalettComputeMode mode);
 function spingalett_gpu_device const char *spingalett_gpu_device(void);
+function spingalett_cuda_device const char *spingalett_cuda_device(void);
 function spingalett_set_gpu_precision bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
 function spingalett_get_gpu_precision SpingalettPrecisionMode spingalett_get_gpu_precision(void);
-function spingalett_get_num_threads unsigned spingalett_get_num_threads(void);
-function spingalett_set_num_threads void spingalett_set_num_threads(unsigned n);
-function spingalett_set_log_callback void spingalett_set_log_callback(SpingalettLogCallback cb);
-function spingalett_set_log_level void spingalett_set_log_level(SpingalettLogLevel level);
 function spingalett_seed void spingalett_seed(uint64_t seed);
-function spingalett_set_verbose void spingalett_set_verbose(bool enabled);
-function spingalett_get_verbose bool spingalett_get_verbose(void);
 function spingalett_network_new_args SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkArgs args);
 function spingalett_append_layer uint32_t spingalett_append_layer(SpingalettLayerArgs args);
 function spingalett_layer_count uint32_t spingalett_layer_count(const SpingalettNetwork *net); /* input layer included */
@@ -390,11 +378,6 @@ function spingalett_import_onnx_from_memory SpingalettNetwork *spingalett_import
 function spingalett_load_pytorch bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const char *const *modules, uint32_t module_count);
 function spingalett_load_pytorch_from_memory bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size, const char *const *modules, uint32_t module_count);
 function spingalett_model_from_network SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
-function spingalett_model_load SpingalettModel *spingalett_model_load(const char *path);
-function spingalett_model_from_memory SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
-function spingalett_model_free void spingalett_model_free(SpingalettModel *model);
-function spingalett_model_predict bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs);
-function spingalett_model_evaluate SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs, const float *targets, uint32_t count);
 function spingalett_export_c_header bool spingalett_export_c_header(const SpingalettNetwork *net, const char *path, const char *name, SpingalettPrecisionMode precision);
 function spingalett_load_idx bool spingalett_load_idx(const char *images_path, const char *labels_path, uint32_t num_classes, SpingalettDataset *dataset);
 function spingalett_load_csv bool spingalett_load_csv(const char *path, uint32_t target_columns, uint32_t num_classes, SpingalettDataset *dataset);
@@ -420,6 +403,24 @@ function spingalett_dataset_read uint32_t spingalett_dataset_read(SpingalettData
 function spingalett_dataset_generator uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader);
 function spingalett_print_network void spingalett_print_network(const SpingalettNetwork *net);
 function spingalett_network_free void spingalett_network_free(SpingalettNetwork *net);
+function spingalett_version const char *spingalett_version(void);
+function spingalett_last_error_code int spingalett_last_error_code(void);
+function spingalett_last_error_message const char *spingalett_last_error_message(void);
+function spingalett_clear_error void spingalett_clear_error(void);
+function spingalett_cpu_kernels const char *spingalett_cpu_kernels(void);
+function spingalett_get_compute_mode SpingalettComputeMode spingalett_get_compute_mode(void);
+function spingalett_set_compute_mode bool spingalett_set_compute_mode(SpingalettComputeMode mode);
+function spingalett_get_num_threads unsigned spingalett_get_num_threads(void);
+function spingalett_set_num_threads void spingalett_set_num_threads(unsigned n);
+function spingalett_set_log_callback void spingalett_set_log_callback(SpingalettLogCallback cb);
+function spingalett_set_log_level void spingalett_set_log_level(SpingalettLogLevel level);
+function spingalett_set_verbose void spingalett_set_verbose(bool enabled);
+function spingalett_get_verbose bool spingalett_get_verbose(void);
+function spingalett_model_load SpingalettModel *spingalett_model_load(const char *path);
+function spingalett_model_from_memory SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
+function spingalett_model_free void spingalett_model_free(SpingalettModel *model);
+function spingalett_model_predict bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs);
+function spingalett_model_evaluate SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs, const float *targets, uint32_t count);
 function spingalett_model_init int spingalett_model_init(SpingalettModel *model, const void *image, size_t size);
 function spingalett_model_run int spingalett_model_run(const SpingalettModel *model, const float *input, float *output, void *workspace);
 function spingalett_model_layer bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, SpingalettLayerInfo *info);

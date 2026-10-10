@@ -80,17 +80,33 @@ static SpingalettModel *adopt_image(void *image, size_t size) {
     return model;
 }
 
+#if !defined(SPINGALETT_RUNTIME)
 SpingalettModel *spingalett_model_from_network(const NeuralNetwork *net, PrecisionMode precision) {
     size_t size = 0;
     void *image = spingalett_save_deployment(net, precision, &size);
     return image ? adopt_image(image, size) : NULL;
 }
+#endif
 
-/* Takes ownership of data (an aligned buffer): format 3 is used as it is, older formats are
-   converted in their own precision. */
+/* Takes ownership of data (an aligned buffer): images (versions 3 to 7) are used as they are, files
+   of versions 1 and 2 converted in their own precision. */
 static SpingalettModel *model_from_buffer(void *data, size_t size) {
     if (size >= 6 && memcmp(data, SLETT_MAGIC, 6) == 0)
         return adopt_image(data, size);
+#if defined(SPINGALETT_RUNTIME)
+    /* the runtime builds no networks, which is what files of versions 1 and 2 hold */
+    uint16_t version = 0;
+    if (size >= 2) memcpy(&version, data, 2);
+    spingalett_aligned_free(data);
+    if (size < 2)
+        set_error(SPINGALETT_ERR_FILE_IO, "model: failed to read format version");
+    else if (version == 1 || version == 2)
+        set_error(SPINGALETT_ERR_FORMAT_VERSION, "model: a file of format version 1 or 2 (Spingalett 0.4 and earlier), "
+                  "which the runtime does not read: \"ModelTool convert\" rewrites it");
+    else
+        set_error(SPINGALETT_ERR_FORMAT_VERSION, "model: unsupported format version");
+    return NULL;
+#else
     PrecisionMode precision = PRECISION_FLOAT32;
     NeuralNetwork *net = spingalett_load_from_memory_ex(data, size, &precision);
     spingalett_aligned_free(data);
@@ -98,6 +114,7 @@ static SpingalettModel *model_from_buffer(void *data, size_t size) {
     SpingalettModel *model = spingalett_model_from_network(net, precision);
     free_network(net);
     return model;
+#endif
 }
 
 SpingalettModel *spingalett_model_from_memory(const void *data, size_t size) {
@@ -904,6 +921,8 @@ EvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float 
 
 /* ------------------------------------------------------------------------- C header export */
 
+#if !defined(SPINGALETT_RUNTIME)
+
 static bool is_identifier(const char *s) {
     if (!s || !(isalpha((unsigned char)*s) || *s == '_')) return false;
     for (; *s; s++)
@@ -986,3 +1005,4 @@ bool spingalett_export_c_header(const NeuralNetwork *net, const char *path, cons
     if (!ok) set_error(SPINGALETT_ERR_FILE_IO, "export: write error");
     return ok;
 }
+#endif

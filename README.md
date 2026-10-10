@@ -15,16 +15,18 @@
 
 Spingalett is a neural-network library written in C23 for training and running fully connected
 and convolutional networks, chains of layers or graphs of them (residual connections, concatenated
-branches), on the CPU and on GPUs through Vulkan compute. It depends only on the C standard library
-(the Vulkan loader is opened at run time where there is one): on the CPU, batch
+branches), on the CPU and on GPUs: NVIDIA's through CUDA, with kernels of its own (no CUDA toolkit,
+cuBLAS or cuDNN), and others through Vulkan compute. It depends only on the C standard library (the
+CUDA driver and the Vulkan loader are opened at run time where there are some): on the CPU, batch
 training and inference run as matrix-matrix products on built-in AVX-512, AVX2, NEON or portable kernels (on
 x86-64, chosen for the processor at run time), with OpenMP and OpenBLAS as optional build-time
 accelerators; results are the same bits on one thread and many. Networks are declared with C23
 designated initializers and all parameters live in flat contiguous arrays. For deployment, a trained network becomes a read-only
 model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
-alike. Models come in from ONNX files and PyTorch weights, and Python bindings (wheels with
-the library inside) are included.
+alike; programs that only run models link the runtime, a library of that part alone. Models come in
+from ONNX files and PyTorch weights, and Python bindings (wheels with the library inside) are
+included.
 
 ## Contents
 
@@ -59,8 +61,8 @@ the library inside) are included.
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy) |
-| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; a standalone engine for microcontrollers (one C file, no heap) |
-| Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic |
+| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap) |
+| Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
@@ -70,20 +72,24 @@ the library inside) are included.
 
 Prebuilt libraries for Linux (x86-64 and ARM64), Windows and macOS are attached to every
 [release](https://github.com/pka-human/Spingalett/releases): each archive contains the headers,
-the shared library, a CMake package, a pkg-config file, `DatasetTool` and `ModelTool`. Extract one
+the shared library, a CMake package, a pkg-config file, `DatasetTool` and `ModelTool`, with the
+runtime library next to them; the `spingalett-runtime-*` archives hold the [runtime](#the-runtime)
+alone, for programs that only run models. Extract one
 and point CMake at it with `-DCMAKE_PREFIX_PATH=<directory>`, or compile directly with
 `-I<dir>/include -L<dir>/lib -lspingalett`. The x86-64 archives come in a baseline build that runs on any x86-64 CPU and a
 `-v3` build for processors with AVX2 and FMA; both pick AVX2 or AVX-512 matrix kernels at run time
 when the processor has them, and the `-v3` build also compiles the rest of the library
 (activations, optimizers, the inference engine) for AVX2. The Windows DLL ships with import
-libraries for MinGW and MSVC. Every package is built with OpenMP and the Vulkan GPU backend; the
-macOS one (a universal library for Apple silicon and Intel, macOS 11 or newer) carries LLVM's
+libraries for MinGW and MSVC. Every package is built with OpenMP and the Vulkan GPU backend, those for
+Linux and Windows with the CUDA backend too; the macOS one (a universal library for Apple silicon and Intel, macOS 11 or newer) carries LLVM's
 OpenMP runtime, `libomp.dylib`, next to the library, since Apple's compilers come without one.
 
 To build from source: requirements: CMake 3.21 or newer and a compiler with C23 support. GCC 13 and Clang 18 are tested
 in CI; MSVC 19.36 or newer is expected to work but is not tested. OpenMP and OpenBLAS are
-optional, and so is the GPU backend, which needs the Vulkan headers and `glslc` (shaderc) to build
-(not Vulkan itself: the library opens it at run time).
+optional, and so are the GPU backends: the Vulkan one needs the Vulkan headers and `glslc` (shaderc) to
+build, the CUDA one a Clang with the NVPTX target, which compiles its kernels to PTX (no CUDA toolkit:
+the driver compiles the PTX on first use); neither needs the GPU's runtime to build, since the library
+opens it when a GPU mode is first used.
 
 ```bash
 # Dependency-free build
@@ -94,8 +100,9 @@ cmake --build Build --parallel
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON -DBUILD_WITH_OPENBLAS=ON
 cmake --build Build --parallel
 
-# The GPU backend is built when glslc and the Vulkan headers are found
-# (Debian/Ubuntu: apt install glslc libvulkan-dev; macOS: brew install shaderc vulkan-headers)
+# The GPU backends are built when their compilers are found: Vulkan with glslc and the Vulkan headers
+# (Debian/Ubuntu: apt install glslc libvulkan-dev; macOS: brew install shaderc vulkan-headers),
+# CUDA with a Clang that targets NVPTX (Debian/Ubuntu: apt install clang)
 
 # Run the test suite
 ctest --test-dir Build --output-on-failure
@@ -118,35 +125,41 @@ the processor supports (`spingalett_cpu_kernels()` names it).
 | `BUILD_EXAMPLE` | `ON` | Build the programs in `Examples/` |
 | `BUILD_TESTS` | `ON` | Build the test suite and register it with CTest |
 | `BUILD_APPS` | `OFF` | Build the DigitPad demo (needs SDL2) and its trainer |
+| `SPINGALETT_RUNTIME` | `ON` | Build the [runtime](#the-runtime) library next to the library |
+| `SPINGALETT_RUNTIME_ONLY` | `OFF` | Build only the runtime library (`Spingalett.Runtime.h`): deployment models on the CPU, without training, importers or the GPU backend (no `glslc` needed) |
 | `SPINGALETT_INFERENCE_ONLY` | `OFF` | Build only the inference engine (`Spingalett.Inference.h`) as a static library: no training, file I/O, OpenMP or heap |
 | `SPINGALETT_NATIVE_ARCH` | `ON` | Compile with `-march=native`; turn off for binaries that must run on other machines |
 | `SPINGALETT_CPU_DISPATCH` | `ON` | Without `-march=native` (GCC, Clang): on x86-64 also build AVX2 and AVX-512 matrix kernels and AVX-512 VNNI and AVX-VNNI integer kernels, on AArch64 Linux integer kernels for the dot product instructions, and choose at run time |
 | `SPINGALETT_VULKAN` | `AUTO` | The Vulkan GPU backend: `AUTO` builds it when `glslc` and the Vulkan headers are found, `ON` requires them, `OFF` leaves it out |
 | `SPINGALETT_SPIRV_DIR` | | Compiled shaders (`<kernel>.spv.inc` from another build's `Gpu/` directory) to use where there is no `glslc` |
+| `SPINGALETT_CUDA` | `AUTO` | The CUDA GPU backend: `AUTO` builds it when a Clang with the NVPTX target is found (`SPINGALETT_CUDA_CLANG` names one), `ON` requires it, `OFF` leaves it out |
+| `SPINGALETT_PTX_DIR` | | Compiled CUDA kernels (`<unit>.ptx.inc` from another build's `Cuda/` directory) to use where there is no such Clang |
 | `SPINGALETT_BIN_DIR` | `<source>/Bin` | Output directory for executables and shared libraries |
 | `SPINGALETT_LIB_DIR` | `<source>/Lib` | Output directory for static and import libraries |
 
 An installed Spingalett is found with CMake's `find_package`; projects that vendor the
 repository can use `add_subdirectory()` instead. Both provide the target `Spingalett::spingalett`,
-which carries the include paths:
+and `Spingalett::runtime` for the runtime, which carry the include paths:
 
 ```cmake
-find_package(Spingalett 1.0 REQUIRED)         # or: add_subdirectory(external/Spingalett)
-target_link_libraries(my_app PRIVATE Spingalett::spingalett)
+find_package(Spingalett 1.1 REQUIRED)         # or: add_subdirectory(external/Spingalett)
+target_link_libraries(my_app PRIVATE Spingalett::spingalett)    # or Spingalett::runtime
 ```
 
-pkg-config finds it as `spingalett` (`cc app.c $(pkg-config --cflags --libs spingalett)`); the file
+pkg-config finds it as `spingalett` (`cc app.c $(pkg-config --cflags --libs spingalett)`), and the
+runtime as `spingalett-runtime`; the file
 locates the installation from its own directory, so an extracted release archive serves too, through
 `PKG_CONFIG_PATH=<dir>/lib/pkgconfig`.
 
 The repository carries a [Conan](https://conan.io) recipe and a [vcpkg](https://vcpkg.io) port that
-build the library of the checkout (shared, with OpenMP, kernels chosen at run time; the GPU backend
-as an option, with `glslc` and the Vulkan headers from the package manager). Both give
-`find_package(Spingalett)` and pkg-config's `spingalett`; they build with GCC or Clang (MinGW on
-Windows):
+build the library of the checkout (shared, with OpenMP, kernels chosen at run time, the runtime
+next to it; the GPU backend as an option, with `glslc` and the Vulkan headers from the package
+manager). Both give `find_package(Spingalett)` and pkg-config's `spingalett` and
+`spingalett-runtime`; they build with GCC or Clang (MinGW on Windows):
 
 ```bash
 conan create packaging/conan --build=missing                  # -o "&:vulkan=True": the GPU backend
+                                                              # -o "&:runtime_only=True": the runtime alone
 vcpkg install spingalett --overlay-ports=packaging/vcpkg      # "spingalett[vulkan]": the GPU backend
 ```
 
@@ -159,52 +172,56 @@ The headers define `SPINGALETT_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `_STRING`;
 ## Quick start
 
 ```c
-#include <Spingalett/Spingalett.h>
+#include <Spingalett/Spingalett.Short.h>
 #include <stdio.h>
 
 int main(void) {
     float inputs[4][2]  = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
     float targets[4][1] = {{0}, {1}, {1}, {0}};
 
-    SpingalettNetwork *net = spingalett_network_new(SPINGALETT_LOSS_MSE);
-    spingalett_layer(net, 2);                                   /* input layer */
-    spingalett_layer(net, 8, SPINGALETT_ACT_TANH, SPINGALETT_INIT_XAVIER);
-    spingalett_layer(net, 1, SPINGALETT_ACT_SIGMOID, SPINGALETT_INIT_XAVIER);
+    NeuralNetwork *net = new_spingalett(LOSS_MSE);
+    layer(net, 2);                                              /* input layer */
+    layer(net, 8, ACT_TANH, WEIGHT_INITIALIZATION_XAVIER);
+    layer(net, 1, ACT_SIGMOID, WEIGHT_INITIALIZATION_XAVIER);
 
-    spingalett_train(
+    train(
         .net = net,
         .inputs = &inputs[0][0],
         .targets = &targets[0][0],
         .sample_count = 4,
         .epochs = 5000,
-        .training_strategy = SPINGALETT_STRATEGY_FULL_BATCH,
-        .optimizer_type = SPINGALETT_OPTIMIZER_ADAM,
+        .training_strategy = STRATEGY_FULL_BATCH,
+        .optimizer_type = OPTIMIZER_ADAM,
         .learning_rate = 0.02f,
         .report_interval = 1000
     );
 
     for (int i = 0; i < 4; i++) {
-        float *out = spingalett_forward(net, inputs[i]);
+        float *out = forward(net, inputs[i]);
         printf("%.0f XOR %.0f = %.4f\n", inputs[i][0], inputs[i][1], out[0]);
     }
 
-    spingalett_save(.net = net, .filename = "xor");             /* writes xor.slett */
-    spingalett_network_free(net);
+    save_spingalett(.net = net, .filename = "xor");             /* writes xor.slett */
+    free_network(net);
     return 0;
 }
 ```
 
 Every function that takes many parameters is a macro over a struct, so arguments can be given
-positionally (`spingalett_layer(net, 8, SPINGALETT_ACT_TANH)`) or by name
-(`spingalett_layer(.net = net, .neurons_amount = 8)`). Fields that are not mentioned are zero, which
-selects the documented default.
+positionally (`layer(net, 8, ACT_TANH)`) or by name (`layer(.net = net, .neurons_amount = 8)`).
+Fields that are not mentioned are zero, which selects the documented default.
 
-Every public name carries the library's prefix: `spingalett_` for functions and builders,
-`Spingalett` for types, `SPINGALETT_` for constants. The names of 0.x without it (`layer()`,
-`train()`, `NeuralNetwork`, `ACT_RELU`, `WEIGHT_INITIALIZATION_HE`, ...) stay available from
-`Spingalett/Spingalett.Short.h`: a program written for them includes it in place of `Spingalett.h` (or
-defines `SPINGALETT_SHORT_NAMES` before including that) and compiles unchanged. `Spingalett.h` leaves
-them out, so that names such as `train()` and `LOG_DEBUG` (also `<syslog.h>`'s) stay the program's.
+**Names.** The examples here and in `Examples/` use the short names of
+`Spingalett/Spingalett.Short.h` (`NeuralNetwork`, `layer()`, `train()`, `ACT_RELU`, ...), which read
+more easily. The library declares every name with its prefix (`spingalett_` for functions and
+builders, `Spingalett` for types, `SPINGALETT_` for constants), and so do the descriptions in this
+document and [docs/Reference.md](docs/Reference.md): C has one namespace for everything a program
+includes, and names such as `train()`, `layer()` or `LOG_DEBUG` (also `<syslog.h>`'s) would collide
+with the program's own and with other libraries'. The short names are macros and typedefs over the
+prefixed ones, so a program compiles to the same calls either way: it includes `Spingalett.Short.h`
+in place of `Spingalett.h` (or defines `SPINGALETT_SHORT_NAMES` before including that) to use them,
+and `Spingalett.h` alone leaves them out. Functions whose names had the prefix in 0.x keep it
+(`spingalett_model_load()`, `spingalett_load_idx()`, `spingalett_set_compute_mode()`).
 
 The `Examples/` directory contains this XOR program, an MNIST classifier
 (`Examples/download_mnist.sh data/mnist && Bin/MNIST data/mnist`), a convolutional one
@@ -244,16 +261,16 @@ with `spingalett_conv2d()`, `spingalett_max_pool2d()` and `spingalett_avg_pool2d
 reads whatever precedes it as a flat vector, so no flattening layer is needed:
 
 ```c
-SpingalettNetwork *net = spingalett_network_new(SPINGALETT_LOSS_CROSS_ENTROPY);
-spingalett_layer(.net = net, .height = 28, .width = 28, .channels = 1);         /* input */
-spingalett_conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,         /* 28 x 28 x 32 */
-                  .act_func = SPINGALETT_ACT_RELU, .weight_initialization = SPINGALETT_INIT_HE);
-spingalett_max_pool2d(.net = net, .kernel = 2);                                 /* 14 x 14 x 32 */
-spingalett_conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,         /* 14 x 14 x 64 */
-                  .act_func = SPINGALETT_ACT_RELU, .weight_initialization = SPINGALETT_INIT_HE);
-spingalett_max_pool2d(.net = net, .kernel = 2);                                 /* 7 x 7 x 64 */
-spingalett_layer(net, 128, SPINGALETT_ACT_RELU, SPINGALETT_INIT_HE, .dropout_rate = 0.3f);
-spingalett_layer(net, 10, SPINGALETT_ACT_SOFTMAX, SPINGALETT_INIT_XAVIER);
+NeuralNetwork *net = new_spingalett(LOSS_CROSS_ENTROPY);
+layer(.net = net, .height = 28, .width = 28, .channels = 1);                    /* input */
+conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,                    /* 28 x 28 x 32 */
+       .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+max_pool2d(.net = net, .kernel = 2);                                            /* 14 x 14 x 32 */
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,                    /* 14 x 14 x 64 */
+       .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+max_pool2d(.net = net, .kernel = 2);                                            /* 7 x 7 x 64 */
+layer(net, 128, ACT_RELU, WEIGHT_INITIALIZATION_HE, .dropout_rate = 0.3f);
+layer(net, 10, ACT_SOFTMAX, WEIGHT_INITIALIZATION_XAVIER);
 ```
 
 | Field | Meaning |
@@ -295,9 +312,9 @@ weight decay leaves them alone. The convolution or dense layer before a normaliz
 no activation:
 
 ```c
-spingalett_conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
-                  .weight_initialization = SPINGALETT_INIT_HE);                 /* no activation */
-spingalett_batch_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);   /* .epsilon 1e-5, .momentum 0.1 */
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
+       .weight_initialization = WEIGHT_INITIALIZATION_HE);                      /* no activation */
+batch_norm(.net = net, .act_func = ACT_RELU);                         /* .epsilon 1e-5, .momentum 0.1 */
 ```
 
 Such a pair costs no more than the convolution alone at inference: `spingalett_predict()` and
@@ -317,33 +334,33 @@ the channels, each followed by its `.act_func` (none when left out).
 `spingalett_global_avg_pool2d()` averages each channel over all cells. A residual block of ResNet:
 
 ```c
-uint32_t block(SpingalettNetwork *net, uint32_t x, uint32_t filters, uint32_t stride) {
-    spingalett_conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 3, .padding = 1,
-                      .stride = stride, .weight_initialization = SPINGALETT_INIT_HE);
-    spingalett_batch_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);
-    spingalett_conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1,
-                      .weight_initialization = SPINGALETT_INIT_HE);
-    uint32_t y = spingalett_batch_norm(.net = net);
+uint32_t block(NeuralNetwork *net, uint32_t x, uint32_t filters, uint32_t stride) {
+    conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 3, .padding = 1,
+           .stride = stride, .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    batch_norm(.net = net, .act_func = ACT_RELU);
+    conv2d(.net = net, .filters = filters, .kernel = 3, .padding = 1,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE);
+    uint32_t y = batch_norm(.net = net);
     uint32_t shortcut = x;
     if (stride != 1) {                      /* the shortcut changes shape too: a 1 x 1 projection */
-        spingalett_conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride,
-                          .weight_initialization = SPINGALETT_INIT_HE);
-        shortcut = spingalett_batch_norm(.net = net);
+        conv2d(.net = net, .inputs = {x}, .filters = filters, .kernel = 1, .stride = stride,
+               .weight_initialization = WEIGHT_INITIALIZATION_HE);
+        shortcut = batch_norm(.net = net);
     }
-    return spingalett_add_layers(.net = net, .inputs = {shortcut, y}, .act_func = SPINGALETT_ACT_RELU);
+    return add_layers(.net = net, .inputs = {shortcut, y}, .act_func = ACT_RELU);
 }
 ```
 
 and Inception-style branches, concatenated:
 
 ```c
-uint32_t x = spingalett_layer(.net = net, .height = 32, .width = 32, .channels = 16);
-uint32_t a = spingalett_conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 1,
-                               .act_func = SPINGALETT_ACT_RELU);
-uint32_t b = spingalett_conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 3, .padding = 1,
-                               .act_func = SPINGALETT_ACT_RELU);
-uint32_t c = spingalett_max_pool2d(.net = net, .inputs = {x}, .kernel = 3, .stride = 1, .padding = 1);
-spingalett_concat_layers(.net = net, .inputs = {a, b, c});                      /* 32 x 32 x 32 */
+uint32_t x = layer(.net = net, .height = 32, .width = 32, .channels = 16);
+uint32_t a = conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 1,
+                    .act_func = ACT_RELU);
+uint32_t b = conv2d(.net = net, .inputs = {x}, .filters = 8, .kernel = 3, .padding = 1,
+                    .act_func = ACT_RELU);
+uint32_t c = max_pool2d(.net = net, .inputs = {x}, .kernel = 3, .stride = 1, .padding = 1);
+concat_layers(.net = net, .inputs = {a, b, c});                                 /* 32 x 32 x 32 */
 ```
 
 `.input_count` gives the number of inputs; left 0 it counts `.inputs` up to the last nonzero entry,
@@ -370,17 +387,17 @@ concatenations they make U-Nets, the expanding path joined to the maps of the sa
 down:
 
 ```c
-uint32_t e = spingalett_conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,
-                               .act_func = SPINGALETT_ACT_RELU);                /* 64 x 64 x 32 */
-spingalett_max_pool2d(.net = net, .kernel = 2);                                 /* 32 x 32 x 32 */
-spingalett_conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
-                  .act_func = SPINGALETT_ACT_RELU);                             /* 32 x 32 x 64 */
-uint32_t u = spingalett_conv_transpose2d(.net = net, .filters = 32, .kernel = 2, .stride = 2,
-                                         .act_func = SPINGALETT_ACT_RELU);      /* 64 x 64 x 32 */
-spingalett_concat_layers(.net = net, .inputs = {e, u});                         /* 64 x 64 x 64 */
-spingalett_upsample2d(.net = net, .stride = 2,                                  /* 128 x 128 x 64 */
-                      .upsample = SPINGALETT_UPSAMPLE_BILINEAR);
-spingalett_layer_norm(.net = net, .act_func = SPINGALETT_ACT_RELU);             /* 128 x 128 x 64 */
+uint32_t e = conv2d(.net = net, .filters = 32, .kernel = 3, .padding = 1,
+                    .act_func = ACT_RELU);                                      /* 64 x 64 x 32 */
+max_pool2d(.net = net, .kernel = 2);                                            /* 32 x 32 x 32 */
+conv2d(.net = net, .filters = 64, .kernel = 3, .padding = 1,
+       .act_func = ACT_RELU);                                                   /* 32 x 32 x 64 */
+uint32_t u = conv_transpose2d(.net = net, .filters = 32, .kernel = 2, .stride = 2,
+                              .act_func = ACT_RELU);                            /* 64 x 64 x 32 */
+concat_layers(.net = net, .inputs = {e, u});                                    /* 64 x 64 x 64 */
+upsample2d(.net = net, .stride = 2,                                             /* 128 x 128 x 64 */
+           .upsample = UPSAMPLE_BILINEAR);
+layer_norm(.net = net, .act_func = ACT_RELU);                                   /* 128 x 128 x 64 */
 ```
 
 | Builder | Arguments | Output, along each axis |
@@ -449,9 +466,9 @@ any of it: only dictionaries of tensors are understood (tensors that are views, 
 transposed weight, load as well).
 
 ```c
-SpingalettNetwork *net = spingalett_import_onnx("resnet.onnx");  /* NULL on error */
+NeuralNetwork *net = spingalett_import_onnx("resnet.onnx");      /* NULL on error */
 float out[10];
-spingalett_predict(.net = net, .inputs = image_hwc, .sample_count = 1, .outputs = out);
+predict(.net = net, .inputs = image_hwc, .sample_count = 1, .outputs = out);
 ```
 
 ### Inspecting a network
@@ -464,8 +481,8 @@ SpingalettNetworkLayer d;
 spingalett_network_layer(net, 1, &d);   /* type, shape, outputs, activation, dropout, window, counts */
 
 float *w = malloc(d.weight_count * sizeof(float));
-spingalett_get_parameters(net, 1, SPINGALETT_PARAM_WEIGHTS, w, d.weight_count);    /* feeding layer 1 */
-spingalett_set_parameters(net, 1, SPINGALETT_PARAM_WEIGHTS, w, d.weight_count);
+spingalett_get_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count);               /* feeding layer 1 */
+spingalett_set_parameters(net, 1, PARAM_WEIGHTS, w, d.weight_count);
 ```
 
 Parameters come as `SPINGALETT_PARAM_WEIGHTS`, `SPINGALETT_PARAM_BIASES`,
@@ -533,17 +550,17 @@ best epoch however training ended (completion, early stopping, the callback or d
 parameters are kept in memory, which costs one copy of the weights and biases.
 
 ```c
-static bool on_epoch(SpingalettNetwork *net, const SpingalettTrainProgress *p, void *log) {
+static bool on_epoch(NeuralNetwork *net, const TrainProgress *p, void *log) {
     fprintf(log, "epoch %zu: loss %.4f, val accuracy %.2f%%%s\n", p->epoch, p->train_loss,
             100 * p->validation.accuracy, p->improved ? " (best)" : "");
     return false;
 }
 
-SpingalettTrainReport r = spingalett_train(
+TrainReport r = train(
     .net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 100,
-    .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH, .optimizer_type = SPINGALETT_OPTIMIZER_ADAMW,
+    .training_strategy = STRATEGY_SMALL_BATCH, .optimizer_type = OPTIMIZER_ADAMW,
     .val_inputs = xv, .val_targets = yv, .val_count = nv,
-    .monitor = SPINGALETT_MONITOR_VAL_ACCURACY, .early_stopping_patience = 5,
+    .monitor = MONITOR_VAL_ACCURACY, .early_stopping_patience = 5,
     .restore_best_weights = true, .callback = on_epoch, .callback_data = stdout);
 printf("stopped after %zu epochs, kept epoch %zu\n", r.epochs_run, r.best_epoch);
 ```
@@ -555,7 +572,7 @@ the same side of 0.5.
 ### Learning-rate schedules
 
 ```c
-typedef float (*SpingalettLRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr,
+typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr,
                                         void *user_data);
 ```
 
@@ -564,9 +581,9 @@ first). Four schedules are built in and take an optional `SpingalettLRSchedulePa
 `user_data`:
 
 ```c
-SpingalettLRScheduleParams schedule = {.warmup_epochs = 10, .min_lr = 1e-5f};
-spingalett_train(.net = net, /* ... */ .learning_rate = 1e-3f,
-                 .lr_scheduler = spingalett_lr_warmup_cosine, .lr_scheduler_data = &schedule);
+LRScheduleParams schedule = {.warmup_epochs = 10, .min_lr = 1e-5f};
+train(.net = net, /* ... */ .learning_rate = 1e-3f,
+      .lr_scheduler = spingalett_lr_warmup_cosine, .lr_scheduler_data = &schedule);
 ```
 
 | Function | Parameters used |
@@ -589,8 +606,8 @@ For datasets that do not fit in memory, or data produced on the fly, set
 `.training_mode = SPINGALETT_MODE_GENERATOR_FUNCTION` and supply a generator:
 
 ```c
-typedef uint32_t (*SpingalettDataGeneratorFn)(float *inputs, float *targets, uint32_t requested,
-                                              void *user_data);
+typedef uint32_t (*DataGeneratorFn)(float *inputs, float *targets, uint32_t requested,
+                                    void *user_data);
 ```
 
 The generator writes up to `requested` samples (row-major) and returns how many it wrote;
@@ -612,7 +629,7 @@ several backward passes:
 
 ```c
 SpingalettTrainer *tr = spingalett_trainer_new(net, 64);          /* up to 64 samples per pass */
-SpingalettOptimizerArgs adam = {.type = SPINGALETT_OPTIMIZER_ADAM, .learning_rate = 1e-3f};
+OptimizerArgs adam = {.type = OPTIMIZER_ADAM, .learning_rate = 1e-3f};
 for (size_t s = 0; s < n; s += 64) {
     const float *out = spingalett_trainer_forward(tr, x + s * in_size, 64);
     for (size_t i = 0; i < 64 * out_size; i++)                    /* e.g. a weighted MSE */
@@ -635,7 +652,7 @@ SpingalettDataset train_set, val_set;
 spingalett_load_idx("train-images-idx3-ubyte", "train-labels-idx1-ubyte", 10, &train_set);
 spingalett_dataset_shuffle(&train_set);                 /* optional, uses spingalett_seed() */
 spingalett_dataset_split(&train_set, 5000, &val_set);   /* last 5,000 samples -> val_set */
-/* ... spingalett_train(.inputs = train_set.inputs, .targets = train_set.targets,
+/* ... train(.inputs = train_set.inputs, .targets = train_set.targets,
                         .sample_count = train_set.count, ...) */
 spingalett_dataset_free(&train_set);
 spingalett_dataset_free(&val_set);
@@ -668,9 +685,9 @@ SpingalettDataset d = {0};
 spingalett_load_dataset("mnist-train.slettd", &d);                 /* bit-identical to train_set */
 
 SpingalettDatasetReader *r = spingalett_dataset_open("mnist-train.slettd", true);   /* shuffled */
-spingalett_train(.net = net, .training_mode = SPINGALETT_MODE_GENERATOR_FUNCTION,
-                 .generator = spingalett_dataset_generator, .generator_data = r, .epochs = 10,
-                 .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH, .batch_size = 128);
+train(.net = net, .training_mode = MODE_GENERATOR_FUNCTION,
+      .generator = spingalett_dataset_generator, .generator_data = r, .epochs = 10,
+      .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);
 spingalett_dataset_close(r);
 ```
 
@@ -739,16 +756,16 @@ inputs:
 
 ```c
 float *outputs = malloc(count * output_size * sizeof(float));
-spingalett_predict(.net = net, .inputs = inputs, .sample_count = count,          /* false on error */
-                   .outputs = outputs);
+predict(.net = net, .inputs = inputs, .sample_count = count,                     /* false on error */
+        .outputs = outputs);
 ```
 
 `spingalett_evaluate()` returns the mean loss (as reported by training) and the accuracy over a data
 set:
 
 ```c
-SpingalettEvalMetrics m = spingalett_evaluate(.net = net, .inputs = x, .targets = y,
-                                              .sample_count = n);
+EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y,
+                         .sample_count = n);
 ```
 
 Both take data sets in the GPU's memory (`device_inputs`, and `device_targets` for
@@ -758,9 +775,9 @@ inference.
 ### Saving and loading
 
 ```c
-spingalett_save(.net = net, .filename = "model.slett", .precision = SPINGALETT_PRECISION_FP16,
+save_spingalett(.net = net, .filename = "model.slett", .precision = PRECISION_FP16,
                 .do_not_save_optimizer = true);
-SpingalettNetwork *net = spingalett_load("model.slett");
+NeuralNetwork *net = load_spingalett("model.slett");
 ```
 
 Models are stored in `.slett` files; the extension is appended when the filename has none, and
@@ -778,9 +795,9 @@ The same bytes can be produced and read in memory:
 
 ```c
 size_t size;
-void *image = spingalett_save_to_memory(net, SPINGALETT_PRECISION_INT8, false, &size);
+void *image = spingalett_save_to_memory(net, PRECISION_INT8, false, &size);
                                                               /* released by spingalett_free() */
-SpingalettNetwork *copy = spingalett_load_from_memory(image, size);
+NeuralNetwork *copy = load_spingalett_from_memory(image, size);
 ```
 
 The file format is versioned and specified in [docs/ModelFormat.md](docs/ModelFormat.md):
@@ -794,7 +811,7 @@ or corrupt files and for files with an invalid header.
 ### Backends and threading
 
 ```c
-spingalett_set_compute_mode(SPINGALETT_COMPUTE_OPENBLAS);  /* or SINGLE_THREADED, OPENMP, VULKAN */
+spingalett_set_compute_mode(COMPUTE_OPENBLAS);             /* or SINGLE_THREADED, OPENMP, CUDA, VULKAN */
 spingalett_set_num_threads(8);                             /* 0 = runtime default */
 ```
 
@@ -814,12 +831,11 @@ kernels.
   single OpenBLAS thread when each call is too small to amortize threading and the configured thread
   count otherwise, and restores the caller's setting afterwards; outside `spingalett_train()`,
   OpenBLAS uses its own thread configuration (`OPENBLAS_NUM_THREADS`).
--  `SPINGALETT_COMPUTE_VULKAN` runs training, the custom-loop API, `spingalett_predict()` and
-  `spingalett_evaluate()` on a GPU ([The GPU](#the-gpu)); what stays on the CPU runs as with
-  `SPINGALETT_COMPUTE_OPENMP`.
+-  `SPINGALETT_COMPUTE_CUDA` (an NVIDIA GPU) and `SPINGALETT_COMPUTE_VULKAN` (any GPU) run training,
+  the custom-loop API, `spingalett_predict()` and `spingalett_evaluate()` on a GPU
+  ([The GPU](#the-gpu)); what stays on the CPU runs as with `SPINGALETT_COMPUTE_OPENMP`.
 -  A requested backend that was not compiled in falls back to single-threaded with a one-time
-  warning (`SPINGALETT_COMPUTE_VULKAN` without a usable device: to the CPU, as above).
-  `SPINGALETT_COMPUTE_CUDA` is reserved and currently falls back as well.
+  warning (a GPU mode without a usable device: to the CPU, as above).
 
 Results agree across backends up to floating-point rounding. For the duration of
 `spingalett_train()`, denormal floats are flushed to zero on the calling thread and the OpenMP
@@ -830,20 +846,34 @@ logging settings are process-wide; the random generator and the error state are 
 
 ### The GPU
 
-With `SPINGALETT_COMPUTE_VULKAN`, `spingalett_train()` (full-batch and mini-batch strategies), the
-custom-loop API (`spingalett_trainer_*`), `spingalett_predict()` and `spingalett_evaluate()` run on
-a GPU through Vulkan compute: NVIDIA, AMD and Intel GPUs on Linux and Windows, Apple GPUs through
-MoltenVK (from the Vulkan SDK, or `brew install molten-vk vulkan-loader`). The library opens the
-Vulkan loader when the mode is first used, so it needs no Vulkan to load or to run on the CPU.
-`spingalett_gpu_device()` names the device it uses, or returns `NULL` when there is none (it needs
-Vulkan 1.2 with buffer device addresses); the mode then falls back to the CPU with a warning.
+With `SPINGALETT_COMPUTE_CUDA` or `SPINGALETT_COMPUTE_VULKAN`, `spingalett_train()` (full-batch and
+mini-batch strategies), the custom-loop API (`spingalett_trainer_*`), `spingalett_predict()` and
+`spingalett_evaluate()` run on a GPU. The two modes share one executor, and what follows holds for
+both:
+
+-  `SPINGALETT_COMPUTE_CUDA` runs on NVIDIA GPUs of compute capability 8.0 or later (Ampere and
+  newer: GeForce RTX 30 to 50, A100, H100) with a driver of CUDA 11.0 or later, on the library's own
+  kernels (`Src/Gpu/Cuda`): matrix products in single precision and, in bfloat16, on the tensor
+  cores, convolutions as implicit products, depthwise convolutions, normalizations, pooling. They are
+  compiled to PTX when the library is built and kept in it compressed; the driver compiles a kernel
+  for the GPU when it is first used and keeps it in its cache (`~/.nv/ComputeCache`). Neither the
+  CUDA toolkit nor cuBLAS or cuDNN is needed to build or to run. `spingalett_cuda_device()` names the
+  GPU, or returns `NULL` without one.
+-  `SPINGALETT_COMPUTE_VULKAN` runs through Vulkan compute: NVIDIA, AMD and Intel GPUs on Linux and
+  Windows, Apple GPUs through MoltenVK (from the Vulkan SDK, or
+  `brew install molten-vk vulkan-loader`). `spingalett_gpu_device()` names the device, or returns
+  `NULL` when there is none (it needs Vulkan 1.2 with buffer device addresses).
+
+The library opens the CUDA driver or the Vulkan loader when a mode is first used, so it needs
+neither to load or to run on the CPU; without a usable device the mode falls back to the CPU with a
+warning. On an NVIDIA GPU the CUDA mode is the faster ([Performance](#performance)).
 
 ```c
-spingalett_set_compute_mode(SPINGALETT_COMPUTE_VULKAN);
-const char *gpu = spingalett_gpu_device();
+spingalett_set_compute_mode(COMPUTE_CUDA);                 /* or COMPUTE_VULKAN */
+const char *gpu = spingalett_cuda_device();               /* spingalett_gpu_device() for Vulkan */
 printf("training on %s\n", gpu ? gpu : "the CPU");
-spingalett_train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,  /* as on the CPU */
-                 .training_strategy = SPINGALETT_STRATEGY_SMALL_BATCH, .batch_size = 128);
+train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 30,             /* as on the CPU */
+      .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128);
 ```
 
 -  Parameters, their gradients and the optimizer's moments stay in GPU memory, and so does the
@@ -876,15 +906,15 @@ spingalett_train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epoc
 -  Every kind of layer, activation, loss and optimizer runs on the GPU, with dropout (the same masks
   as on the CPU), gradient clipping and batch normalization. Per-sample training,
   `spingalett_forward()` and deployment models run on the CPU.
--  A trainer (`spingalett_trainer_new()`) made with `SPINGALETT_COMPUTE_VULKAN` runs its passes on
+-  A trainer (`spingalett_trainer_new()`) made with a GPU mode runs its passes on
   the GPU, one at a time: the forward pass's outputs come back for the caller's loss, and backward
   passes from targets or from the caller's dL/d(output) add up on the device until the step. The
   parameters stay there between passes; functions that read the network (`spingalett_predict()`,
   `spingalett_save()`, `spingalett_get_parameters()` and the others) copy them back first, and
   parameters set on the host go to the GPU before the next forward pass.
 -  `spingalett_set_gpu_precision(SPINGALETT_PRECISION_BFLOAT16)` multiplies matrices in bfloat16 on
-  the GPU's matrix units (tensor cores; `VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16`),
-  the products added in single precision. The layers' outputs, all but the output layer's (and the
+  the GPU's matrix units (tensor cores: `mma.sync` with CUDA, `VK_KHR_cooperative_matrix` with
+  `VK_KHR_shader_bfloat16` with Vulkan), the products added in single precision. The layers' outputs, all but the output layer's (and the
   network's inputs, which the host rounds as it sends them), and their gradients are kept on the GPU
   as bfloat16, the values the products round them to anyway: half the memory and half the bytes
   every pass reads and writes. The passes between products (normalizations, pooling, additions,
@@ -892,12 +922,12 @@ spingalett_train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epoc
   stay in it, as with PyTorch's autocast; products smaller than a block of the matrix units stay in
   single precision unless they read or write bfloat16. Runs stay deterministic. On an RTX 4050
   Laptop GPU ResNet-20 trains 1.7 times as fast as in single precision and reaches the same CIFAR-10
-  test accuracy (91.80% after 100 epochs, single precision 91.55%). Devices without the extensions
-  keep single precision.
+  test accuracy (91.80% after 100 epochs, single precision 91.55%). Vulkan devices without the
+  extensions keep single precision.
 - Results are deterministic: every sum runs in a fixed order, never through atomics, so a run gives
-  the same bits every time on one device. They agree with the CPU's up to rounding: the products
-  add in another order, with fused multiply-adds, and batch normalization adds its sums in single
-  rather than double precision.
+  the same bits every time on one device and backend. They agree with the CPU's up to rounding: the
+  products add in another order, with fused multiply-adds, and batch normalization adds its sums in
+  single rather than double precision (the two backends agree with each other the same way).
 -  The first products of each shape are timed with a few tile sizes, and the fastest is kept for the
   life of the process: the first `spingalett_train()` of a process takes a few tenths of a second
   longer (ResNet-20 on an RTX 4050 Laptop GPU: 0.3 s), and the very first on a machine some ten
@@ -910,16 +940,20 @@ spingalett_train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epoc
   Inference runs in chunks of at most 32 MB of activations as they are kept (64 samples at least;
   from host arrays 2,048 at most), whose layers' outputs stay in the GPU's cache from one layer to
   the next.
-- Where the host can write into all of the GPU's memory (resizable BAR, unified memory), it writes
-  each chunk's inputs and the parameters straight into it, instead of the GPU copying them from
-  host memory.
-- `SPINGALETT_GPU_DEVICE=n` picks the n-th device of the Vulkan device list instead of the first
-  discrete GPU; `SPINGALETT_GPU_PROFILE=1` prints the GPU time per kernel and copy when the process
-  exits; `SPINGALETT_GPU_NO_HOST_WRITES=1` has the GPU copy inputs and parameters from host memory,
-  and `SPINGALETT_GPU_NO_BF16_STORAGE=1` keeps activations in single precision in bfloat16 mode.
+- Where Vulkan lets the host write into all of the GPU's memory (resizable BAR, unified memory), it
+  writes each chunk's inputs and the parameters straight into it, instead of the GPU copying them
+  from host memory; with CUDA a chunk's inputs are copied on a stream of their own while the GPU
+  works on the chunks before. Three chunks are in flight: the host fills one while the GPU works on
+  the two before it.
+- `SPINGALETT_CUDA_DEVICE=n` picks the n-th device of the CUDA driver's list, `SPINGALETT_GPU_DEVICE=n`
+  the n-th of the Vulkan device list instead of the first discrete GPU; `SPINGALETT_GPU_PROFILE=1`
+  prints the GPU time per kernel and copy when the process exits (with CUDA timed by events around
+  every launch, which add some microseconds to each); `SPINGALETT_GPU_NO_HOST_WRITES=1` has Vulkan
+  copy inputs and parameters from host memory, and `SPINGALETT_GPU_NO_BF16_STORAGE=1` keeps
+  activations in single precision in its bfloat16 mode.
 
-In Python: `sg.set_compute_mode(sg.SpingalettComputeMode.VULKAN)`, `sg.gpu_device()`,
-`sg.set_gpu_precision(sg.Precision.BFLOAT16)` and `sg.DeviceData(array)`, which
+In Python: `sg.set_compute_mode(sg.ComputeMode.CUDA)` (or `ComputeMode.VULKAN`), `sg.cuda_device()`,
+`sg.gpu_device()`, `sg.set_gpu_precision(sg.Precision.BFLOAT16)` and `sg.DeviceData(array)`, which
 `spingalett_train()`, `validation_data`, `spingalett_forward()` and `spingalett_evaluate()` take in
 place of arrays.
 
@@ -938,7 +972,7 @@ whose status is `SPINGALETT_TRAIN_FAILED`, and sets the calling thread's error c
 
 ```c
 spingalett_clear_error();
-SpingalettNetwork *net = spingalett_load("model.slett");
+NeuralNetwork *net = load_spingalett("model.slett");
 if (!net)
     fprintf(stderr, "%s (code %d)\n", spingalett_last_error_message(),
             spingalett_last_error_code());
@@ -967,10 +1001,10 @@ parameters once). To run a trained network, turn it into a model, a read-only ne
 they are stored in and computes with them:
 
 ```c
-SpingalettModel *model = spingalett_model_from_network(net, SPINGALETT_PRECISION_INT8);
+SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);
                                                   /* or spingalett_model_load("model.slett") */
 spingalett_model_predict(model, inputs, count, outputs);         /* batched, multi-threaded */
-SpingalettEvalMetrics m = spingalett_model_evaluate(model, inputs, targets, count);
+EvalMetrics m = spingalett_model_evaluate(model, inputs, targets, count);
 spingalett_model_free(model);
 ```
 
@@ -1034,6 +1068,59 @@ Sapphire Rapids), one sample at a time and batched:
 | Microseconds per sample | 161 | 150 | 86 | 85 | 28 | 31 | 20 |
 | Batched samples per second | | 50,600 | 48,500 | 57,400 | 184,600 | 172,200 | 195,900 |
 | Weights | 3.7 MB | 3.7 MB | 1.9 MB | 1.9 MB | 0.9 MB | 0.5 MB | 0.2 MB |
+
+### The runtime
+
+Programs that only run trained models can link the runtime instead of the library.
+`libspingalett-runtime`, declared by `Spingalett.Runtime.h`, holds what this section describes:
+`.slett` files loaded as models, `spingalett_model_predict()` and `spingalett_model_evaluate()` with
+the library's kernels, threads and choice of instruction sets at run time, the engine of
+`Spingalett.Inference.h`, errors, logging and the thread settings. It has no networks, training,
+data sets, importers or GPU backend, which leaves 510 KB of the full library's 2.0 MB without the
+CUDA backend's kernels and 12.6 MB with them (the x86-64 release builds, with the kernels for AVX2 and
+AVX-512), and needs only the C library, threads and
+OpenMP. It computes the same bits as the library, as fast: its functions are the library's
+(`Spingalett.h` declares them through `Spingalett.Runtime.h`), compiled from the same sources with
+the same flags; the tests compare the two on models of every kind of layer in every precision, and
+alternated in one process on an Intel Core i7-12650H they predict batches of the benchmark's MLP,
+the MNIST CNN and ResNet-20, in FP32 and INT8, within 1.5% of each other either way on one thread
+and on eight (2.5% on all sixteen, which mix the processor's two kinds of cores). A program written
+for the runtime also builds and runs with the full library.
+
+```c
+#define SPINGALETT_SHORT_NAMES                         /* COMPUTE_OPENMP, PRECISION_INT8, ... */
+#include <Spingalett/Spingalett.Runtime.h>
+
+SpingalettModel *model = spingalett_model_load("model.slett");
+if (!model) { fprintf(stderr, "%s\n", spingalett_last_error_message()); return 1; }
+spingalett_set_compute_mode(COMPUTE_OPENMP);           /* every core */
+spingalett_model_predict(model, inputs, count, outputs);
+spingalett_model_free(model);
+```
+
+A build with `-DSPINGALETT_RUNTIME_ONLY=ON` makes the runtime alone, without `glslc` or the Vulkan
+headers; other builds make it next to the library (`SPINGALETT_RUNTIME`). It installs as the CMake
+target `Spingalett::runtime` and the pkg-config package `spingalett-runtime`, with `RunModel`
+(`Examples/Runtime/RunModel.c`), which describes a model and times it, or predicts the samples of a
+file of floats:
+
+```
+RunModel model.slett                        the layers, then the time of one sample and of batches
+RunModel model.slett inputs.f32 out.f32     the outputs of raw float samples (classes without out.f32)
+```
+
+The runtime reads `.slett` files of format versions 3 to 7, everything Spingalett 0.5 and later
+writes. Files of versions 1 and 2 (0.4 and earlier) hold networks rather than images; it refuses
+them with `SPINGALETT_ERR_FORMAT_VERSION`, and `ModelTool convert` rewrites them.
+
+| | Library | Runtime | Engine |
+|---|---|---|---|
+| Header | `Spingalett.h` | `Spingalett.Runtime.h` | `Spingalett.Inference.h` |
+| Training, networks, data sets, importers, the GPU | yes | | |
+| `.slett` models from FP32 to INT2 | yes | yes | yes |
+| Batches, threads, kernels chosen at run time | yes | yes | one sample at a time |
+| Heap, files | yes | yes | |
+| Size | 12.6 MB (x86-64; 2.0 MB without CUDA) | 510 KB (x86-64) | about 12 KB of code on a Cortex-M4 |
 
 ### Running in place
 
@@ -1245,51 +1332,57 @@ fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast, f
 (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
 and 4,798.
 
-On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 0.14 runs
-the same workloads with `SPINGALETT_COMPUTE_VULKAN` (`Bin/Benchmark gpu`), in single precision and
-in bfloat16 (`spingalett_set_gpu_precision()`), against PyTorch 2.14.1 with CUDA 13.0 and cuDNN
-(`python Examples/benchmark_pytorch.py --cuda`, with PyTorch's default TF32 convolutions,
-`--cuda-fp32`, and `--cuda-bf16`: autocast to bfloat16), medians of three interleaved runs. The
-first two columns keep the data in GPU memory from the start: PyTorch's tensors, Spingalett's data
-sets (`spingalett_device_data_new()`). The last two take it from host memory: Spingalett's arrays,
-each batch copied over while the GPU works on the one before, and PyTorch's pinned tensors, each
-batch copied as it is used and the outputs of inference copied back (`--host-data`). Inference is
-timed after a first call (Spingalett) or a warm-up step (PyTorch):
+On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 1.1 runs
+the same workloads with `SPINGALETT_COMPUTE_CUDA` and `SPINGALETT_COMPUTE_VULKAN` (`Bin/Benchmark
+gpu`), in single precision and in bfloat16 (`spingalett_set_gpu_precision()`), against PyTorch 2.14.1
+with CUDA 13.0, cuBLAS and cuDNN 9.24 (`python Examples/benchmark_pytorch.py --cuda`, with PyTorch's
+default TF32 convolutions, `--cuda-fp32`, and `--cuda-bf16`: autocast to bfloat16), medians of three
+interleaved runs. The first three columns keep the data in GPU memory from the start: Spingalett's
+data sets (`spingalett_device_data_new()`), PyTorch's tensors. The last two take it from host memory:
+Spingalett's arrays, each chunk copied over while the GPU works on the ones before, and PyTorch's
+pinned tensors, each batch copied as it is used and the outputs of inference copied back
+(`--host-data`). Inference is timed after a first call (Spingalett) or a warm-up step (PyTorch):
 
-| On the GPU, samples/s | Spingalett, data on GPU (FP32 / bf16) | PyTorch, data on GPU (TF32 / FP32 / bf16) | Spingalett, host data (FP32 / bf16) | PyTorch, host data (TF32 / bf16) |
-|---|---:|---:|---:|---:|
-| ResNet-20, training | 10,320 / 17,710 | 8,423 / 7,112 / 12,220 | 10,450 / 17,600 | 8,380 / 12,110 |
-| ResNet-20, inference | 34,220 / 58,940 | 19,600 / 19,350 / 31,400 | 34,580 / 59,640 | 19,260 / 30,020 |
-| Convolutional network, training | 108,100 / 163,200 | 56,680 / 59,620 / 99,440 | 108,600 / 164,500 | 55,480 / 74,420 |
-| Convolutional network, inference | 309,900 / 504,500 | 130,900 / 142,000 / 236,900 | 307,700 / 486,300 | 127,500 / 225,400 |
-| With batch normalization, training | 74,960 / 119,300 | 47,730 / 47,860 / 81,050 | 75,100 / 119,800 | 48,010 / 77,500 |
-| With batch normalization, inference | 221,000 / 354,400 | 106,500 / 113,900 / 198,000 | 228,200 / 349,800 | 104,300 / 187,700 |
-| Fully connected network, mini-batch 64 | 324,100 / 433,200 | 83,570 / 87,640 / 69,840 | 306,600 / 435,100 | 65,970 / 76,320 |
-| Fully connected network, full batch | 1,201,000 / 2,950,000 | 1,055,000 / 1,048,000 / 2,541,000 | 1,149,000 / 3,024,000 | 846,100 / 1,572,000 |
-| Fully connected network, inference | 3,612,000 / 8,002,000 | 2,939,000 / 2,957,000 / 6,189,000 | 2,640,000 / 5,117,000 | 1,709,000 / 2,457,000 |
-| U-Net, training | 3,910 / 6,690 | 3,203 / 2,994 / 5,001 | 3,935 / 6,484 | 3,234 / 4,783 |
-| U-Net, inference | 11,650 / 20,980 | 6,219 / 6,389 / 11,900 | 12,210 / 21,000 | 6,075 / 11,000 |
-| MobileNet-style network, training | 14,260 / 28,870 | 9,837 / 8,635 / 22,960 | 14,090 / 28,730 | 9,810 / 22,250 |
-| MobileNet-style network, inference | 88,160 / 116,000 | 19,470 / 17,790 / 38,500 | 85,940 / 117,500 | 19,210 / 37,070 |
+| On the GPU, samples/s | CUDA, data on GPU (FP32 / bf16) | Vulkan, data on GPU (FP32 / bf16) | PyTorch, data on GPU (TF32 / FP32 / bf16) | CUDA, host data (FP32 / bf16) | PyTorch, host data (TF32 / bf16) |
+|---|---:|---:|---:|---:|---:|
+| ResNet-20, training | 11,440 / 22,020 | 10,330 / 18,310 | 8,402 / 7,222 / 12,210 | 11,560 / 22,000 | 8,337 / 12,020 |
+| ResNet-20, inference | 40,570 / 76,220 | 37,140 / 65,100 | 19,630 / 19,260 / 31,160 | 41,060 / 77,170 | 19,100 / 30,180 |
+| Convolutional network, training | 114,700 / 208,800 | 108,300 / 165,800 | 56,000 / 59,150 / 98,210 | 114,900 / 209,600 | 54,690 / 69,970 |
+| Convolutional network, inference | 375,700 / 978,300 | 331,300 / 501,600 | 130,600 / 141,400 / 236,800 | 380,600 / 964,200 | 126,400 / 223,200 |
+| With batch normalization, training | 79,330 / 150,300 | 74,770 / 119,700 | 47,870 / 48,000 / 83,760 | 79,740 / 151,800 | 47,760 / 62,950 |
+| With batch normalization, inference | 374,900 / 775,400 | 312,300 / 462,100 | 106,500 / 113,300 / 195,700 | 368,400 / 784,900 | 103,500 / 184,900 |
+| Fully connected network, mini-batch 64 | 361,700 / 531,400 | 313,100 / 443,900 | 76,060 / 80,250 / 68,910 | 380,900 / 546,800 | 67,440 / 56,700 |
+| Fully connected network, full batch | 1,255,000 / 3,188,000 | 1,158,000 / 2,864,000 | 1,045,000 / 1,045,000 / 2,541,000 | 1,157,000 / 2,972,000 | 833,800 / 1,551,000 |
+| Fully connected network, inference | 3,808,000 / 9,100,000 | 3,272,000 / 8,061,000 | 2,887,000 / 2,952,000 / 6,211,000 | 2,806,000 / 6,549,000 | 1,680,000 / 2,445,000 |
+| U-Net, training | 4,243 / 7,925 | 4,008 / 6,855 | 3,289 / 2,998 / 4,975 | 4,143 / 7,633 | 3,232 / 4,345 |
+| U-Net, inference | 14,260 / 29,010 | 14,420 / 23,480 | 6,317 / 6,296 / 11,660 | 14,990 / 28,430 | 5,905 / 10,860 |
+| MobileNet-style network, training | 14,860 / 32,800 | 14,210 / 29,830 | 9,780 / 8,573 / 22,680 | 14,760 / 32,260 | 9,679 / 22,050 |
+| MobileNet-style network, inference | 111,700 / 158,700 | 101,300 / 128,200 | 19,410 / 17,780 / 37,630 | 116,000 / 158,900 | 19,130 / 36,500 |
 
-Spingalett is ahead of PyTorch in every workload, in either setting. With the data in GPU memory, in
-single precision, it trains ResNet-20 1.23 times as fast as PyTorch with TF32 (1.45 times as fast as
-PyTorch in single precision) and runs it 1.75 times as fast, trains the convolutional networks 1.6
-to 1.9 times as fast and runs them 2.1 to 2.4 times as fast, the U-Net 1.2 to 1.3 and 1.8 to 1.9
-times, the MobileNet-style network (PyTorch in channels-last, its faster layout for it) 1.45 and 4.5
-times, and the fully connected network 1.14 times as fast in full batches, 3.7 to 3.9 times in
-mini-batches, and infers 1.23 times as fast. In bfloat16, against PyTorch's autocast: ResNet-20 1.45
-and 1.9 times, the convolutional networks 1.5 to 1.6 and 1.8 to 2.1 times, the U-Net 1.3 and 1.8
-times, the MobileNet-style network 1.26 and 3 times, the fully connected network 1.16 times in full
-batches, 6.2 times in mini-batches and 1.3 times in inference.
-In single precision Spingalett trains ResNet-20 on the GPU 6.6 times as fast as on the eight threads
-of the CPU. Data sets on the GPU pay most for the fully connected network's inference, which host
-arrays bind to the bus (63 MB of samples, 31 MB as bfloat16): 1.37 times as fast in single precision
-and 1.56 times in bfloat16. Against 0.13.1 on the same machine (see the [CHANGELOG](CHANGELOG.md)),
-Spingalett infers the convolutional networks 1.12 to 1.14 times as fast in bfloat16, trains the
-MobileNet-style network 3.4 and 12 times as fast and infers it 4 and 13 times as fast (its depthwise
-convolutions on a kernel of their own, which applies the batch normalization before it), and
-predict() no longer copies the parameters of a network that has not changed.
+Spingalett is ahead of PyTorch in every workload, on either backend and in either setting. With the
+data in GPU memory, on CUDA in single precision, it trains ResNet-20 1.36 times as fast as PyTorch
+with TF32 (1.58 times as fast as PyTorch in single precision) and runs it 2.1 times as fast, trains
+the convolutional networks 1.7 to 2 times as fast and runs them 2.9 to 3.5 times as fast, the U-Net
+1.3 and 2.3 times, the MobileNet-style network (PyTorch in channels-last, its faster layout for it)
+1.5 and 5.8 times, and the fully connected network 1.2 times as fast in full batches, 4.8 times in
+mini-batches, and infers 1.3 times as fast. In bfloat16, against PyTorch's autocast: ResNet-20 1.8
+and 2.45 times, the convolutional networks 1.8 to 2.1 and 4 to 4.1 times, the U-Net 1.6 and 2.5
+times, the MobileNet-style network 1.45 and 4.2 times, the fully connected network 1.25 times in full
+batches, 7.7 times in mini-batches and 1.5 times in inference. From host arrays the margins are as
+wide or wider (PyTorch copies each batch as it uses it; Spingalett copies a chunk while the GPU works
+on the ones before): the fully connected network, whose inference the bus binds, infers 1.7 times as
+fast in single precision and 2.7 times in bfloat16.
+
+The CUDA backend is the faster on this GPU: against the Vulkan backend (1.1, the same executor) it
+trains 1.05 to 1.16 times as fast in single precision and 1.1 to 1.26 times in bfloat16, and infers
+1.1 to 1.2 times as fast in single precision (the U-Net alike) and 1.13 to 1.95 times in bfloat16,
+where its products of the tensor cores, its kernel for a network's first convolution (`dconv.cu`)
+and its depthwise convolutions pull ahead. Against 0.14 (the Vulkan backend, see the
+[CHANGELOG](CHANGELOG.md)), both backends infer networks with batch normalization faster since the
+normalization runs in the epilogue of the product it reads (the convolutional network with batch
+normalization 1.3 times as fast in bfloat16 on Vulkan), and inference from host arrays keeps three
+chunks in flight. In single precision Spingalett trains ResNet-20 on the GPU 7.2 times as fast as
+on the eight threads of the CPU.
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
@@ -1350,18 +1443,21 @@ predicts 3,400 images a second on the CPU against 3,100 for the FP32 model.
 ## Project layout
 
 ```
-Include/Spingalett/   Public headers (Spingalett.h, the inference engine's Spingalett.Inference.h)
-                      and the CMake-generated configuration header template
+Include/Spingalett/   Public headers (Spingalett.h, the runtime's Spingalett.Runtime.h, the inference
+                      engine's Spingalett.Inference.h) and the CMake-generated configuration header
+                      template
 Src/                  Library sources (network, training, kernels, serialization, inference engine, ...)
-Src/Gpu/              The Vulkan GPU backend: device layer, network executor and compute shaders
+Src/Gpu/              The GPU backends: device layer, network executor, Vulkan's compute shaders
+                      (Shaders/) and the CUDA kernels (Cuda/)
 Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, throughput
                       benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
+Examples/Runtime/     RunModel, a program of the runtime alone
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets)
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
 Bindings/Python/      Python bindings
-cmake/                CMake package and inference-only build helpers
+cmake/                CMake package, pkg-config, runtime and inference-only build helpers
 ```
 
 ## Compatibility
@@ -1370,12 +1466,14 @@ From 1.0 on, Spingalett follows [semantic versioning](https://semver.org/): a 1.
 what 1.0 gave, and only 2.0 may take anything away.
 
 - **Source:** a program written for 1.x compiles against every later 1.y. No function, type, struct
-  field, enumerator or constant of the headers (`Spingalett.h`, `Spingalett.Inference.h`,
-  `Spingalett.Short.h`, `Spingalett.hpp`) is removed, renamed or given another meaning; releases add
+  field, enumerator or constant of the headers (`Spingalett.h`, `Spingalett.Runtime.h`,
+  `Spingalett.Inference.h`, `Spingalett.Short.h`, `Spingalett.hpp`) is removed, renamed or given
+  another meaning (a declaration may move to a header that `Spingalett.h` includes); releases add
   them. A new field takes the place of reserved words and means, at zero, what a program that does
   not know it expects, so the designated initializers of 1.0 keep their meaning.
 - **Binary:** a program built against 1.x runs with every later 1.y without being built again: the
-  shared library keeps the soname `libspingalett.so.1` (`libspingalett.1.dylib` on macOS), the structs
+  shared library keeps the soname `libspingalett.so.1` (`libspingalett.1.dylib` on macOS), and the
+  runtime `libspingalett-runtime.so.1` with the same symbol versions, the structs
   keep their size and the offsets of their fields, enumerators keep their values, and functions keep
   their parameters. On ELF platforms the functions carry symbol versions (`SPINGALETT_1.0`, then one
   per release that adds some), so that the loader refuses a library older than the program needs.
@@ -1395,7 +1493,7 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.0.0. Its API (prefixed names, structs that can grow, zero as every
+Spingalett is at version 1.1.0. Its API (prefixed names, structs that can grow, zero as every
 field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 7, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and
@@ -1403,10 +1501,10 @@ remain loadable.
 
 Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
-- Any release of 1.x, changing no API: the matrix units' kernel to cuBLAS's speed, fewer passes,
-  the single-precision kernel for convolutions of few channels, products in FP16, Winograd
-  convolutions
-- 1.1: a CUDA backend of its own kernels (no cuDNN), next to Vulkan
+- 1.1 (released): the runtime, and the CUDA backend of the library's own kernels (no CUDA toolkit,
+  cuBLAS or cuDNN), next to Vulkan
+- Any release of 1.x, changing no API: the single-precision kernel for convolutions of few
+  channels, fewer passes, products in FP16, Winograd convolutions, deployment models on the GPU
 - Later: quantization-aware training, NEON kernels for training, further language bindings
 
 ## Contributing

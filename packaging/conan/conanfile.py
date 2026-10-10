@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 pka_human (pka_human@proton.me)
-"""Conan 2 recipe for the library of this source tree (the shared library and its headers):
+"""Conan 2 recipe for the library of this source tree (the shared libraries and their headers):
 
-    conan create packaging/conan --build=missing                       # OpenMP, no GPU backend
-    conan create packaging/conan --build=missing -o "&:vulkan=True"     # with the Vulkan backend
+    conan create packaging/conan --build=missing                         # OpenMP, no GPU backend
+    conan create packaging/conan --build=missing -o "&:vulkan=True"       # with the Vulkan backend
+    conan create packaging/conan --build=missing -o "&:runtime_only=True" # the runtime alone
 
-Consumers use find_package(Spingalett) and Spingalett::spingalett (CMakeDeps), or pkg-config's
-spingalett (PkgConfigDeps). The kernels are chosen at run time (SPINGALETT_NATIVE_ARCH off), so the
-package runs on any processor of its architecture.
+Consumers use find_package(Spingalett) and Spingalett::spingalett or Spingalett::runtime (CMakeDeps),
+or pkg-config's spingalett and spingalett-runtime (PkgConfigDeps). The kernels are chosen at run time
+(SPINGALETT_NATIVE_ARCH off), so the package runs on any processor of its architecture.
 """
 import os
 import re
@@ -30,8 +31,8 @@ class SpingalettConan(ConanFile):
     topics = ("neural-network", "deep-learning", "machine-learning", "inference", "quantization", "vulkan")
     package_type = "shared-library"
     settings = "os", "arch", "compiler", "build_type"
-    options = {"openmp": [True, False], "vulkan": [True, False]}
-    default_options = {"openmp": True, "vulkan": False}
+    options = {"openmp": [True, False], "vulkan": [True, False], "runtime_only": [True, False]}
+    default_options = {"openmp": True, "vulkan": False, "runtime_only": False}
 
     @property
     def _root(self):
@@ -49,6 +50,8 @@ class SpingalettConan(ConanFile):
         # a C library
         self.settings.rm_safe("compiler.libcxx")
         self.settings.rm_safe("compiler.cppstd")
+        if self.options.runtime_only:
+            self.options.rm_safe("vulkan")      # the runtime computes on the CPU
 
     def layout(self):
         cmake_layout(self)
@@ -59,12 +62,12 @@ class SpingalettConan(ConanFile):
                 "the library is C23 built with GCC or Clang (MinGW on Windows); MSVC programs link its DLL")
 
     def requirements(self):
-        if self.options.vulkan:
+        if self.options.get_safe("vulkan"):
             self.requires("vulkan-headers/[>=1.3.290.0 <2]")
 
     def build_requirements(self):
         self.tool_requires("cmake/[>=3.21 <5]")
-        if self.options.vulkan:
+        if self.options.get_safe("vulkan"):
             # glslc compiles the kernels to SPIR-V; 2025 on knows bfloat16 (the matrix units' kernel)
             self.tool_requires("shaderc/[>=2025.3]")
 
@@ -75,7 +78,8 @@ class SpingalettConan(ConanFile):
         tc.cache_variables["BUILD_TESTS"] = False
         tc.cache_variables["BUILD_APPS"] = False
         tc.cache_variables["BUILD_WITH_OPENMP"] = bool(self.options.openmp)
-        tc.cache_variables["SPINGALETT_VULKAN"] = "ON" if self.options.vulkan else "OFF"
+        tc.cache_variables["SPINGALETT_VULKAN"] = "ON" if self.options.get_safe("vulkan") else "OFF"
+        tc.cache_variables["SPINGALETT_RUNTIME_ONLY"] = bool(self.options.runtime_only)
         # the build tree's outputs stay in the build folder (by default they go to Bin/ and Lib/ of the sources)
         tc.cache_variables["SPINGALETT_BIN_DIR"] = os.path.join(self.build_folder, "Bin").replace("\\", "/")
         tc.cache_variables["SPINGALETT_LIB_DIR"] = os.path.join(self.build_folder, "Lib").replace("\\", "/")
@@ -95,6 +99,14 @@ class SpingalettConan(ConanFile):
 
     def package_info(self):
         self.cpp_info.set_property("cmake_file_name", "Spingalett")
-        self.cpp_info.set_property("cmake_target_name", "Spingalett::spingalett")
-        self.cpp_info.set_property("pkg_config_name", "spingalett")
-        self.cpp_info.libs = ["spingalett"]
+        if not self.options.runtime_only:
+            library = self.cpp_info.components["library"]
+            library.set_property("cmake_target_name", "Spingalett::spingalett")
+            library.set_property("pkg_config_name", "spingalett")
+            library.libs = ["spingalett"]
+            if self.options.get_safe("vulkan"):
+                library.requires = ["vulkan-headers::vulkan-headers"]
+        runtime = self.cpp_info.components["runtime"]
+        runtime.set_property("cmake_target_name", "Spingalett::runtime")
+        runtime.set_property("pkg_config_name", "spingalett-runtime")
+        runtime.libs = ["spingalett-runtime"]
