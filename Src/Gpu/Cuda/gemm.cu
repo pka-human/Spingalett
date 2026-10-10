@@ -375,7 +375,7 @@ struct Gemm {
         tid = thread_x();
         const uint32_t z = block_z(), g = z / p.slices, s = z % p.slices;
         uint32_t tm, tn;
-        swizzled(tm, tn);
+        band_tile(p.flags, tm, tn);
         m0 = (p.m_tile0 + tm) * BM;
         n0 = tn * BN;
         kbeg = s * p.slice_k;

@@ -95,7 +95,10 @@ Homebrew, Scoop, Nix, container and conda packages. Programs of 1.1 build and ru
   training keeps them (`SPG_GEMM_PRE`), in place of a pass over the product's outputs; the other
   units are unchanged.
 - CUDA: a product's blocks take its tiles in bands of eight tiles of rows over every tile of columns,
-  so that a band's rows of A stay in L2 (the same bits).
+  so that a band's rows of A stay in L2 (the same bits): on the matrix units always (the MLP infers
+  1.1 times as fast in bfloat16), in single precision where A and C do not fit in L2 together, the
+  backend launching the blocks so (the GPT infers 1.1 times as fast; with the bands computed in the
+  kernel, its largest tiles spilled registers).
 - GPU: 1 x 1 convolutions of stride 1 (transformers' linear layers, pointwise convolutions) read their
   maps as matrices in all three products: the MobileNet-style network infers 6% faster on CUDA.
 

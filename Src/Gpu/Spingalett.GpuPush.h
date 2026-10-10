@@ -27,6 +27,8 @@ enum { SPG_EPI_STORE, SPG_EPI_BIAS_ACT, SPG_EPI_SCALE_ACT, SPG_EPI_PARTIAL, SPG_
 #define SPG_GEMM_BIAS 1u            /* flags: EPI_BIAS_ACT adds e0 */
 #define SPG_GEMM_PRE  2u            /* EPI_BIAS_ACT also stores its values before the activation at e1 (CUDA's
                                        gemm_mma.cu and epi.cu: as C, laid out and kept like it) */
+#define SPG_GEMM_BAND_SHIFT 8u      /* CUDA's gemm.cu: bits 8 to 11, the log of the tiles of rows a band of blocks
+                                       takes (gemm_common.cuh's band_tile()), which the backend sets */
 
 /* colsum.comp */
 typedef struct {

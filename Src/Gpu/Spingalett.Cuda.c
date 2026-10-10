@@ -64,6 +64,7 @@ typedef unsigned long long CUdeviceptr;
 #define CU_ATTRIBUTE_COMPUTE_MINOR            76
 #define CU_ATTRIBUTE_UNIFIED_ADDRESSING       41
 #define CU_ATTRIBUTE_SHARED_PER_BLOCK_OPTIN   97
+#define CU_ATTRIBUTE_L2_CACHE_SIZE            38
 #define CU_FUNC_MAX_DYNAMIC_SHARED            8
 #define CU_FUNC_NUM_REGS                      4
 #define CU_FUNC_SHARED_BYTES                  1
@@ -141,6 +142,7 @@ static struct {
     char name[256];
     uint64_t memory;
     uint32_t sms, shared_optin;
+    uint64_t l2;                    /* the L2 cache's bytes (0: unknown) */
     Unit units[UNIT_COUNT];
     SpgSignal *lock;                /* loading units, submitting, capturing, the profile */
     bool profile;
@@ -224,6 +226,8 @@ static bool open_device(void) {
         cu.memory = total;
         cu.sms = (uint32_t)sms;
         cu.shared_optin = (uint32_t)shared;
+        int l2 = 0;
+        cu.l2 = cuDeviceGetAttribute(&l2, CU_ATTRIBUTE_L2_CACHE_SIZE, d) == 0 && l2 > 0 ? (uint64_t)l2 : 0u;
         make_current();
         if (cuStreamCreate(&cu.stream, CU_STREAM_NON_BLOCKING) != 0 ||
             cuStreamCreate(&cu.capture, CU_STREAM_NON_BLOCKING) != 0 ||
@@ -727,6 +731,18 @@ static void dispatch_direct(CuCommands *c, SpgKernel kernel, const uint32_t *spe
     if (cu.profile) snprintf(op->label, sizeof op->label, "%s E%u", names[which], spec[7]);
 }
 
+/* Whether gemm.cu's blocks of a product take its tiles in bands of 2^BAND_LOG tiles of rows (gemm_common.cuh's
+   band_tile()): a product of matrices (not of a convolution's windows) whose A and C do not fit in L2 together, so
+   that a band's rows of A stay in L2 while its blocks take every tile of columns, rather than all of A read from
+   memory again for each (a GPT's products of 16,384 rows and more: its training 1.02 to 1.08 times as fast, its
+   inference 1.1 times). Where they fit, the blocks take the tiles of rows fastest, as before: in bands the MLP's
+   products of 4,096 rows ran 5% slower. (gemm_mma.cu takes its tiles in bands always: swizzled().) */
+#define BAND_LOG 3u
+static bool bands_pay(const uint32_t *spec, uint32_t spec_count, const SpgGemmPush *p) {
+    if (spec_count < 7 || spec[5] >= SPG_A_CONV || spec[6] >= SPG_B_CONV) return false;
+    return ((uint64_t)p->M * p->K + (uint64_t)p->M * p->N) * 4u > cu.l2;
+}
+
 static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const void *push,
                          uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
     CuCommands *c = (CuCommands *)commands;
@@ -767,31 +783,51 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
     const CUfunction f = spec_count <= SPG_SPEC_MAX && push_size <= SPG_PUSH_BYTES
                        ? unit_function(unit_of(kernel, spec, spec_count)) : NULL;
     const uint32_t threads = block_threads(kernel, spec, spec_count);
-    Op *op = f && threads ? add_op(c, OP_LAUNCH) : NULL;
-    if (!op) { c->ok = false; return; }
+    if (!f || !threads) { c->ok = false; return; }
     /* the kernels that run a grid-stride loop: a wave of blocks (eight of 256 threads an SM), each looping, rather
        than a block for every 256 values (blocks with little to do cost their launch: 3 us for 1,024 on an RTX
        4050; ResNet-20 inference in bfloat16 6% faster) */
     if (grid_stride(kernel) && gx > 8u * cu.sms) gx = 8u * cu.sms;
-    op->function = f;
-    op->grid[0] = gx; op->grid[1] = gy; op->grid[2] = gz;
-    op->block = threads;
-    op->shared = dynamic_shared(kernel, spec, spec_count);
-    memcpy(op->push, push, push_size);
-    memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
-    if (cu.profile) {
-        int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
-        if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {      /* (its unit's ways of reading A and B, _g) */
-            const char *unit = spg_cuda_units[unit_of(kernel, spec, spec_count)].name, *ways = strrchr(unit, '_');
-            if (ways && !strcmp(ways, "_g")) for (ways--; ways > unit && *ways != '_'; ways--) {}
-            snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %s", spec[5], spec[6], spec[7],
-                     spec[0], spec[1], ways ? ways + 1 : "");
-        } else if (kernel == SPG_KERNEL_gemm && spec_count >= 8)
-            snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7],
-                     spec[0], spec[1]);
-        else
-            for (uint32_t k = 0; k < spec_count && k < 2 && len < 40; k++)
-                len += snprintf(op->label + len, sizeof op->label - (size_t)len, " %u", spec[k]);
+    const bool banded = kernel == SPG_KERNEL_gemm && push_size == sizeof(SpgGemmPush) &&
+                        bands_pay(spec, spec_count, (const SpgGemmPush *)push);
+    SpgGemmPush q;
+    if (banded) memcpy(&q, push, sizeof q);
+    const uint32_t first = banded ? q.m_tile0 : 0u;
+    for (uint32_t done = 0; done < gx;) {
+        uint32_t lx = gx, ly = gy;
+        if (banded) {       /* whole bands, at most 65,535 a launch; the tiles of rows after them as they are */
+            const uint32_t log = gx - done >= 1u << BAND_LOG ? BAND_LOG : 0u;
+            const uint32_t count = log ? ((gx - done) >> log < 65535u ? (gx - done) >> log : 65535u) : gx - done;
+            q.m_tile0 = first + done;
+            q.flags = (q.flags & ~(15u << SPG_GEMM_BAND_SHIFT)) | log << SPG_GEMM_BAND_SHIFT;
+            lx = log ? gy << log : count;
+            ly = log ? count : gy;
+            done += count << log;
+        } else {
+            done = gx;
+        }
+        Op *op = add_op(c, OP_LAUNCH);
+        if (!op) { c->ok = false; return; }
+        op->function = f;
+        op->grid[0] = lx; op->grid[1] = ly; op->grid[2] = gz;
+        op->block = threads;
+        op->shared = dynamic_shared(kernel, spec, spec_count);
+        memcpy(op->push, banded ? (const void *)&q : push, push_size);
+        memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
+        if (cu.profile) {
+            int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
+            if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {  /* (its unit's ways of reading A and B, _g) */
+                const char *unit = spg_cuda_units[unit_of(kernel, spec, spec_count)].name, *ways = strrchr(unit, '_');
+                if (ways && !strcmp(ways, "_g")) for (ways--; ways > unit && *ways != '_'; ways--) {}
+                snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %s", spec[5], spec[6],
+                         spec[7], spec[0], spec[1], ways ? ways + 1 : "");
+            } else if (kernel == SPG_KERNEL_gemm && spec_count >= 8)
+                snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7],
+                         spec[0], spec[1]);
+            else
+                for (uint32_t k = 0; k < spec_count && k < 2 && len < 40; k++)
+                    len += snprintf(op->label + len, sizeof op->label - (size_t)len, " %u", spec[k]);
+        }
     }
 }
 
