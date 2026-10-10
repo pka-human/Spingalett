@@ -202,7 +202,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   (`noinline`) pass structs through the stack and cost the caller registers: keep them off every
   output's path (the products hold the sloped epilogues only; `Spingalett.Cuda.c` runs the others as
   a pass of `epi.cu`). Kernels whose threads loop with the grid's stride get a wave of blocks
-  (`grid_stride()`).
+  (`grid_stride()`). Products of few k over channels not in fours (a network's first convolution)
+  run on `dconv.cu` in place of every tile (`direct_product()`): the same kernel whichever tile
+  the tuner picks, so tiles stay alike; in a kernel's unrolled loops, a test of a run-time bound in
+  every iteration keeps the compiler from loading ahead (units for an exact k avoid it).
 - GPU: `SPINGALETT_GPU_PROFILE=1` prints the time of every kernel and mode at exit (timestamps
   around each dispatch; trial runs of the tile choice excluded; with CUDA events around every
   launch, which inflate the times of small kernels: compare backends by wall time);

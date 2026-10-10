@@ -335,13 +335,18 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     return -1;
 }
 
+/* The unit of this name, looked up once. */
+static int named_unit(atomic_int *unit, const char *name) {
+    int u = atomic_load(unit);
+    for (uint32_t k = 0; u < 0 && k < UNIT_COUNT; k++)
+        if (!strcmp(spg_cuda_units[k].name, name)) atomic_store(unit, u = (int)k);
+    return u;
+}
+
 /* The unit of the products' other epilogues (epi.cu). */
 static int epi_unit(void) {
     static atomic_int unit = -1;
-    int u = atomic_load(&unit);
-    for (uint32_t k = 0; u < 0 && k < UNIT_COUNT; k++)
-        if (!strcmp(spg_cuda_units[k].name, "epi")) atomic_store(&unit, u = (int)k);
-    return u;
+    return named_unit(&unit, "epi");
 }
 
 /* The unit's function, its module given to the driver on first use. */
@@ -668,6 +673,47 @@ static bool sloped_epilogue(uint32_t epi, uint32_t act) {
 
 static int epi_unit(void);
 
+#define DCONV_K 48u                 /* k of the products dconv.cu takes, at most */
+
+/* Whether dconv.cu runs this product (gemm.cu's or gemm_mma.cu's constants and push constants): a convolution's
+   windows by its filters, of few k over channels that do not come in fours (which the tiles read a value at a
+   time through the geometry), at most 128 columns, without slices or phases. */
+static bool direct_product(SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const SpgGemmPush *p) {
+    return (kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 12 && spec[5] == SPG_A_CONV &&
+           spec[6] == SPG_B_COL && spec[7] != SPG_EPI_PARTIAL && spec[10] == 0u && p->slices == 1u && p->K <= DCONV_K &&
+           p->a_group % 4u != 0u && p->N <= 128u;
+}
+
+/* Records dconv.cu in place of the tiles of rows m_tile0 .. + gx (of spec[0] rows) of such a product: a row of
+   C a thread. The first convolution of Examples/MNIST_CNN.c over 128 images takes 32 us instead of 55 in single
+   precision, 34 instead of 61 in bfloat16 (an RTX 4050 Laptop GPU; its training in bfloat16 is 1.14 times as
+   fast, its inference 1.46 times). */
+static void dispatch_direct(CuCommands *c, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count,
+                            const SpgGemmPush *p, uint32_t gx, uint32_t gz) {
+    static atomic_int units[5] = {-1, -1, -1, -1, -1};
+    static const char *names[5] = {"dconv9", "dconv16", "dconv27", "dconv32", "dconv48"};
+    const uint32_t which = p->K == 9u ? 0u : p->K <= 16u ? 1u : p->K == 27u ? 2u : p->K <= 32u ? 3u : 4u;
+    const CUfunction f = unit_function(named_unit(&units[which], names[which]));
+    Op *op = f ? add_op(c, OP_LAUNCH) : NULL;
+    if (!op) { c->ok = false; return; }
+    /* (dconv.cu's T threads a block, a row each, and TP floats a row of its outputs in shared memory) */
+    const uint32_t chunks = (p->N + 15u) / 16u, first = p->m_tile0 * spec[0], T = 128u, TP = 20u;
+    const uint32_t last = (uint64_t)(p->m_tile0 + gx) * spec[0] < p->M ? (p->m_tile0 + gx) * spec[0] : p->M;
+    const bool mma = kernel == SPG_KERNEL_gemm_mma;
+    const uint32_t direct[7] = {spec[7], spec[8], mma && spec_count >= 14 ? spec[13] : 0u, mma ? 1u : 0u, first, last,
+                                chunks};
+    op->function = f;
+    op->grid[0] = (last - first + T - 1u) / T;
+    op->grid[1] = 1u;
+    op->grid[2] = gz;
+    op->block = T;
+    op->shared = (T * TP + p->K * 16u * chunks) * 4u;
+    memcpy(op->push, p, sizeof *p);
+    memset(op->spec, 0, sizeof op->spec);
+    memcpy(op->spec, direct, sizeof direct);
+    if (cu.profile) snprintf(op->label, sizeof op->label, "%s E%u", names[which], spec[7]);
+}
+
 static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const void *push,
                          uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
     CuCommands *c = (CuCommands *)commands;
@@ -697,6 +743,10 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
         memcpy(op->push, push, push_size);
         memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
         if (cu.profile) snprintf(op->label, sizeof op->label, "epi %u %u", spec[7], spec[8]);
+        return;
+    }
+    if (push_size == sizeof(SpgGemmPush) && direct_product(kernel, spec, spec_count, (const SpgGemmPush *)push)) {
+        dispatch_direct(c, kernel, spec, spec_count, (const SpgGemmPush *)push, gx, gz);
         return;
     }
     const CUfunction f = spec_count <= SPG_SPEC_MAX && push_size <= SPG_PUSH_BYTES
