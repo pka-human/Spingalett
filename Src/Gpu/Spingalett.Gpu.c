@@ -30,6 +30,7 @@
 #define SUMSQ_SLICE 4096u           /* sumsq.comp */
 #define DW_RUN      4u              /* adjacent pixels a thread of dwconv.comp computes (its PX) */
 #define DW_SUMS     128u            /* workgroups, at most, of a depthwise data gradient that sums (SUMS) */
+#define SLOTS       3u              /* chunks in flight (Slot): the host fills one while two keep the device busy */
 
 /* ------------------------------------------------------------------------- the network */
 
@@ -37,7 +38,7 @@ typedef struct {
     SpgGpuBuffer staging;           /* header | inputs | targets | losses | outputs | indices, host-visible */
     size_t inputs, targets, losses, outputs, indices;   /* their byte offsets */
     /* the chunk's header, inputs (the outputs of layer 0) and targets on the device: a slot's own,
-       so that they are copied while the other slot's chunk runs */
+       so that they are copied while the other slots' chunks run */
     SpgGpuBuffer header, input, target;
     float *host_inputs;             /* inputs kept as bfloat16: the host's floats, rounded on submission */
     bool staged;                    /* the chunk's inputs are on the device already (rounded or written) */
@@ -96,7 +97,7 @@ struct SpgGpuNet {
        the readers read their inputs (outputs_of()); pro[l] = that convolution, or 0 */
     uint32_t *pro;
 
-    Slot slots[2];
+    Slot slots[SLOTS];
     uint32_t next;                  /* the slot of the next chunk */
     SpgGpuRows rows;                /* data sets on the GPU the training chunks' rows come from */
     uint64_t version;               /* the network's host_version whose parameters it has (the caller's) */
@@ -373,8 +374,8 @@ static void harvest(SpgGpuNet *g, Slot *s);
 
 /* Waits for every chunk in flight, oldest first, and takes their losses. */
 static void drain(SpgGpuNet *g) {
-    for (uint32_t k = 0; k < 2; k++) {
-        Slot *s = &g->slots[(g->next + k) % 2];
+    for (uint32_t k = 0; k < SLOTS; k++) {
+        Slot *s = &g->slots[(g->next + k) % SLOTS];
         if (s->pending) harvest(g, s);
     }
 }
@@ -681,13 +682,13 @@ static bool spingalett_gpu_net_reuse_here(SpgGpuNet *g, uint32_t capacity, const
     if (old->optimizer != o || old->decay != training->decay || old->momentum != training->momentum ||
         old->beta1 != training->beta1 || old->beta2 != training->beta2 || old->epsilon != training->epsilon ||
         old->max_grad_norm != training->max_grad_norm)
-        for (uint32_t k = 0; k < 2; k++) {
+        for (uint32_t k = 0; k < SLOTS; k++) {
             for (uint32_t e = 0; e < g->slots[k].used; e++) spg_gpu_commands_free(g->slots[k].cache[e].commands);
             g->slots[k].used = 0;
         }
     g->cfg = *training;
     g->step_loss = g->total_loss = 0.0f;
-    for (uint32_t k = 0; k < 2; k++) {
+    for (uint32_t k = 0; k < SLOTS; k++) {
         g->slots[k].staged = g->slots[k].in_place = false;
         g->slots[k].gathered = 0;
     }
@@ -705,12 +706,12 @@ bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, const SpgGpuTrain
 static void spingalett_gpu_net_free_here(SpgGpuNet *g) {
     if (!g) return;
     drain(g);
-    for (uint32_t k = 0; k < 2; k++)
+    for (uint32_t k = 0; k < SLOTS; k++)
         for (uint32_t e = 0; e < g->slots[k].used; e++) spg_gpu_commands_free(g->slots[k].cache[e].commands);
     spg_gpu_commands_free(g->once);
     spg_gpu_arena_free(g->arena);       /* every buffer but */
     spg_gpu_buffer_free(&g->transfer);
-    for (uint32_t k = 0; k < 2; k++) spingalett_aligned_free(g->slots[k].host_inputs);
+    for (uint32_t k = 0; k < SLOTS; k++) spingalett_aligned_free(g->slots[k].host_inputs);
     for (uint32_t l = 0; g->conv && l < g->layers; l++) free(g->conv[l]);
     free(g->act); free(g->delta); free(g->dmask); free(g->geo); free(g->conv); free(g->bn);
     free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold); free(g->pro); free(g->half); free(g->dhalf);
@@ -866,7 +867,7 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
        targets, losses and outputs of a chunk, 16-byte aligned; inputs kept as bfloat16 come from
        floats of the host's */
     const uint64_t in = net->topology[0], input_bytes = (uint64_t)capacity * in * (g->half[0] ? 2u : 4u);
-    for (uint32_t k = 0; k < 2; k++) {
+    for (uint32_t k = 0; k < SLOTS; k++) {
         Slot *s = &g->slots[k];
         if (g->half[0] && !(s->host_inputs = (float *)spingalett_aligned_alloc((size_t)capacity * in * sizeof(float))))
             goto fail;
@@ -1933,8 +1934,10 @@ static void harvest(SpgGpuNet *g, Slot *s) {
     }
 }
 
-/* The slot of the next chunk, its previous chunk finished: the older of the two in flight, so that the
-   newer one keeps the device busy while the host fills the slot (chunks are harvested in order). */
+/* The slot of the next chunk, its previous chunk finished: the oldest of those in flight, so that the
+   newer ones keep the device busy while the host fills the slot (chunks are harvested in order). With
+   two slots the device waited for the host to fill each chunk: the MLP of Examples/Benchmark.c infers
+   1.2 times as fast from host arrays with three (an RTX 4050 Laptop GPU, both backends). */
 static Slot *next_slot(SpgGpuNet *g) {
     Slot *s = &g->slots[g->next];
     if (s->pending) harvest(g, s);
@@ -2027,7 +2030,7 @@ static void spingalett_gpu_set_rows_here(SpgGpuNet *g, const SpgGpuRows *rows) {
     if (rows) g->rows = *rows;
     else memset(&g->rows, 0, sizeof g->rows);
     /* (a chunk filled ahead for a step that did not come takes nothing from them) */
-    for (uint32_t k = 0; k < 2; k++) {
+    for (uint32_t k = 0; k < SLOTS; k++) {
         g->slots[k].gathered = 0;
         g->slots[k].in_place = false;
     }
@@ -2139,8 +2142,8 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
     if (!r) return forget(s, c);
     r->c = c;
     r->g = g;
-    /* the chunk's header, inputs and targets from staging into the slot's buffers, which the chunk in
-       the other slot does not use: copied while it still runs; then everything after it */
+    /* the chunk's header, inputs and targets from staging into the slot's buffers, which the chunks in
+       the other slots do not use: copied while they still run; then everything after it */
     g->act[0] = direct ? *direct : s->input;
     g->header = s->header;
     g->targets = s->target;
@@ -2149,7 +2152,7 @@ static SpgGpuCommands *chunk_commands(SpgGpuNet *g, Slot *s, uint64_t key, uint3
     copy_in(c, s, gathered & 1u || direct ? 0 : (size_t)n * in * (g->half[0] ? 2u : 4u));
     if (train && !(gathered & 2u)) spg_gpu_copy(c, &s->staging, s->targets, &s->target, 0, (size_t)n * out * 4u);
     /* the gather reads the indices and the header the host wrote, and writes the slot's buffers: while the
-       other slot's chunk still runs, unless the header is copied first */
+       other slots' chunks still run, unless the header is copied first */
     if (gathered) {
         if (!s->header.mapped) barrier(r);
         gather_rows(g, r, s, n, gathered);
@@ -2247,7 +2250,7 @@ static bool spingalett_gpu_train_chunk_here(SpgGpuNet *g, uint32_t n, uint32_t c
     s->n = n;
     s->train = true;
     s->last = last;
-    g->next = 1 - g->next;
+    g->next = (g->next + 1u) % SLOTS;
     return true;
 }
 
@@ -2291,11 +2294,11 @@ static bool spingalett_gpu_predict_rows_here(SpgGpuNet *g, const float *inputs, 
                                  float *outputs, uint32_t n) {
     const NeuralNetwork *net = g->net;
     const uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
-    /* chunk after chunk, each filled while the device runs the one before, its outputs taken when
+    /* chunk after chunk, each filled while the device runs those before, its outputs taken when
        its slot comes round again: the caller's floats in chunks of at most 2,048 samples, so that their
-       copies overlap with the work on the chunk before (the MLP of Examples/Benchmark.c infers 1.1 times
-       as fast in bfloat16 from host arrays in chunks of 2,048 as of 7,168), a data set's rows in whole
-       chunks */
+       copies overlap with the work on the chunks before (the MLP of Examples/Benchmark.c infers 1.1 times
+       as fast in bfloat16 from host arrays in chunks of 2,048 as of 3,637, which its memory allows), a
+       data set's rows in whole chunks */
     const uint32_t most = rows || g->capacity < SPINGALETT_BATCH_CHUNK ? g->capacity : SPINGALETT_BATCH_CHUNK;
     for (uint32_t start = 0; start < n; start += most) {
         const uint32_t m = n - start < most ? n - start : most;
@@ -2338,7 +2341,7 @@ static bool spingalett_gpu_predict_rows_here(SpgGpuNet *g, const float *inputs, 
         s->n = m;
         s->train = false;
         s->dest = outputs + (size_t)start * out;
-        g->next = 1 - g->next;
+        g->next = (g->next + 1u) % SLOTS;
     }
     drain(g);
     return !g->lost;
