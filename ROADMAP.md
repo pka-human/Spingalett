@@ -22,6 +22,7 @@ against PyTorch on the same machine.
 | 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling, weight gradients split only where it pays: ahead of PyTorch with cuDNN in every workload but the MLP's inference with PyTorch's data already in GPU memory |
 | 0.14 | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.14 times at least in every workload, its data in GPU memory or not |
 | 1.0 | "Stability": the API, ABI and formats of 0.14 kept by semantic versioning (symbol versions, the `api.abi` test against the last release), the names of 0.x only on request, pkg-config, Conan and vcpkg recipes |
+| 1.1 | "CUDA": a backend for NVIDIA GPUs on the library's own kernels (PTX compiled by Clang, no CUDA toolkit, cuBLAS or cuDNN), ahead of PyTorch with cuDNN by 1.2 to 7.7 times in every workload and of the Vulkan backend; batch normalizations in their product's epilogue at inference on both backends; the runtime library for programs that only run models |
 
 ## 0.14: the release candidate (released)
 
@@ -68,7 +69,7 @@ ship with it.
   version, a Conan recipe and a vcpkg port of the source tree (`packaging/`, tested in CI); the
   rules of compatibility in the README.
 
-## 1.1: the runtime and a CUDA backend
+## 1.1: the runtime and a CUDA backend (released)
 
 Programs that only run trained models get a library of that part alone, and NVIDIA GPUs a backend
 of their own (below).
@@ -84,37 +85,42 @@ of their own (below).
 - **Examples in the short names** (done): the examples, DigitPad and the README's code use the
   names of `Spingalett.Short.h`, which read more easily.
 
-### The CUDA backend
+### The CUDA backend (done)
 
-The first large work of 1.x, now that the Vulkan backend's steps (under **Any time**) have shown how
-far Vulkan goes. What it cannot reach lies in what CUDA exposes and Vulkan does not: asynchronous copies into shared
-memory (`cp.async`), TF32 on the matrix units, `ldmatrix`, control of registers and shared memory.
-`COMPUTE_CUDA` (reserved in 0.14) runs on NVIDIA GPUs; Vulkan stays the backend for AMD, Intel and
-Apple GPUs, and for NVIDIA ones where CUDA is not built.
+The first large work of 1.x, now that the Vulkan backend's steps (under **Any time**) had shown how
+far Vulkan goes. `COMPUTE_CUDA` (reserved in 0.14) runs on NVIDIA GPUs of compute capability 8.0 or
+later; Vulkan stays the backend for AMD, Intel and Apple GPUs, and for NVIDIA ones where CUDA is not
+built.
 
-- **Own kernels, no cuDNN or cuBLAS.** The CUDA driver (libcuda, which NVIDIA's driver installs)
-  is opened at run time, as the Vulkan loader is, so the library still loads and runs without it.
-  The kernels are CUDA C, compiled when the library is built to PTX (and to cubins for current
-  architectures), which the driver compiles for GPUs that come later: running needs no CUDA
-  toolkit, and packages stay a few megabytes.
+- **Own kernels, no cuDNN or cuBLAS** (done): the CUDA driver (libcuda, which NVIDIA's driver
+  installs) is opened at run time, as the Vulkan loader is, so the library still loads and runs
+  without it. The kernels are CUDA C compiled by Clang to PTX (no CUDA toolkit: `-nocudainc`, the
+  thread indices and math as builtins), gzip-compressed into the library and expanded when first
+  used; the driver compiles them for the GPU at hand and caches them. Packages take 10.6 MB of PTX.
 - **Why not cuDNN and cuBLAS:** they are half a gigabyte to a gigabyte of libraries for each CUDA
   version; their fastest backward algorithms add through atomics, so runs would no longer repeat
-  their bits (PyTorch's deterministic mode gives those algorithms up, and their speed with them);
-  and the library measures its own kernels rather than wrapping others'. They remain what the
-  backend is measured against (`benchmark_pytorch.py --cuda`).
-- **The executor of the Vulkan backend, on the device layer of 0.14:** the batch path recorded
-  once per kind of chunk as a CUDA graph and replayed, as command buffers are now; the same fixed
-  orders of summation (no atomics, fixed slices), so CUDA runs repeat their bits too, and agree
-  with the CPU up to rounding.
-- **Kernels:** matrix products on `mma.sync` (TF32, bfloat16, FP16) fed by multi-stage `cp.async`
-  pipelines and `ldmatrix`, tiles chosen by timing; convolutions as implicit products over the tap
-  tables the Vulkan kernels use; activations in bfloat16, as the Vulkan executor keeps them; deployment models on the
-  GPU.
-- **Targets on the RTX 4050:** PyTorch's speed with cuDNN in each precision on ResNet-20, the MNIST
-  CNN and the U-Net, and within 10% of it on the MLP's full batches.
-- **Tests** as for Vulkan: the GPU against the CPU up to rounding, two runs bit for bit, the matrix
-  kernel's tiles bit for bit; CI compiles the kernels (nvcc in a container), and the GPU tests run
-  on an NVIDIA GPU before each release.
+  their bits; and the library measures its own kernels rather than wrapping others'. They remain
+  what the backend is measured against (`benchmark_pytorch.py --cuda`).
+- **The executor of the Vulkan backend** (done): the batch path recorded once per kind of chunk and
+  replayed as a CUDA graph, the head of each submission (its copies) on a stream of its own; the
+  same fixed orders of summation, so CUDA runs repeat their bits too, and agree with the CPU up to
+  rounding.
+- **Kernels** (done): single-precision products as tiles chosen by timing (operand modes, vector
+  loads and tiles as template instances, two buffers filled by `cp.async`, epilogues inline);
+  bfloat16 products on `mma.sync` m16n8k16 with `ldmatrix`, results through shared memory to
+  coalesced stores; a direct kernel for products of few k over a convolution's windows (first
+  layers); depthwise convolutions with their windows, strides, modes and bfloat16 maps as instances;
+  normalization, pooling, additions and optimizer steps four values a thread. Not done: TF32 and
+  FP16 products (a precision of their own: step 5 below), deployment models on the GPU.
+- **Targets on the RTX 4050** (met): PyTorch's speed with cuDNN in each precision on ResNet-20, the
+  MNIST CNN and the U-Net, and within 10% of it on the MLP's full batches. 1.1 trains them 1.3 to
+  2.1 times as fast as PyTorch and infers them 2.1 to 4.1 times as fast, the MLP's full batches 1.2
+  and 1.25 times; it is ahead of the Vulkan backend in every workload but the single-precision
+  U-Net's inference (even).
+- **Tests** (done) as for Vulkan: the GPU against the CPU up to rounding, two runs bit for bit, the
+  matrix kernels' tiles bit for bit (`SPINGALETT_GPU_BACKEND=cuda Bin/SpingalettGpuTests all`, the
+  `cuda` group); CI builds the kernels with Clang (no NVIDIA GPU there: the tests skip), and they
+  run on the RTX 4050 before each release.
 
 ## Any time: work that changes no API
 
@@ -142,8 +148,12 @@ kernel of its own for depthwise convolutions, four pixels a thread with the filt
 which applies the batch normalization it reads and sums that normalization's backward pass in its
 data gradient (part of 3: the MobileNet-style network trains 3.4 and 12 times as fast as in 0.13.1);
 training chunks of 4,096 samples where no batch normalization groups them; networks made on the GPU
-in freed memory, their parameters' upload not waited for. The next steps, each measured against the
-release before and against PyTorch:
+in freed memory, their parameters' upload not waited for. Done in 1.1: the CUDA backend (above),
+whose margins over PyTorch are wider in every workload (1.2 to 7.7 times; README); on both backends
+a batch normalization applied in the epilogue of the product it reads at inference (part of 3), its
+coefficients computed once until the parameters change, and three chunks in flight; on CUDA a
+kernel of its own for a first layer's few channels (part of 3). The next steps, each measured
+against the release before and against PyTorch:
 
 1. **The matrix units' kernel:** stores to shared memory without bank conflicts (a swizzled
    layout), the epilogue writing four results a thread at once, split sums of weight gradients

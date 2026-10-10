@@ -7,12 +7,43 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
-"Runtime": programs that only run trained models link `libspingalett-runtime`, the library's
-deployment models without its networks, training, data sets, importers or GPU backend: 510 KB
-where the library takes 2.0 MB (x86-64 release builds), and the same bits. The examples use the short names again.
-Programs of 1.0 run unchanged; no kernel changed.
+"CUDA": a GPU backend for NVIDIA GPUs on the library's own kernels (`SPINGALETT_COMPUTE_CUDA`, which
+1.0 reserved), compiled to PTX by Clang and carried in the library: neither the CUDA toolkit nor
+cuBLAS or cuDNN is needed to build or to run. On an RTX 4050 Laptop GPU it trains every workload of
+`Examples/Benchmark.c` 1.2 to 2.1 times as fast as PyTorch 2.14 with cuDNN in single precision
+(against PyTorch's TF32 convolutions) and 1.25 to 2.1 times in bfloat16 (mini-batches of the MLP 4.8
+and 7.7 times), infers 1.3 to 5.8 and 1.5 to 4.2 times as fast, and is ahead of the Vulkan backend
+everywhere but in single-precision U-Net inference, where they are even (README, **Performance**).
+And "Runtime": programs that only run trained models link `libspingalett-runtime`, the library's
+deployment models without its networks, training, data sets, importers or GPU backends: 510 KB
+where the library takes 2.0 MB without the CUDA backend's kernels (x86-64 release builds), and the
+same bits. Programs of
+1.0 run unchanged; the CPU's kernels did not change.
 
 ### Added
+- **The CUDA backend:** `SPINGALETT_COMPUTE_CUDA` (`ComputeMode.CUDA` in Python) runs
+  `spingalett_train()` (full batch and mini-batches), the trainer's passes, `spingalett_predict()`
+  and `spingalett_evaluate()` on NVIDIA GPUs of compute capability 8.0 or later (Ampere and newer)
+  with a driver of CUDA 11.0 or later, which the library opens at run time. It runs the Vulkan
+  backend's executor (every kind of layer, activation, loss and optimizer; data sets in GPU memory;
+  bfloat16 on the tensor cores with `spingalett_set_gpu_precision()`; the network's copy kept
+  between calls), with the same determinism: every sum in a fixed order, the same bits on every run.
+  `spingalett_cuda_device()` (a new function, in the symbol version `SPINGALETT_1.1`; `cuda_device()`
+  in Python) names the GPU, or returns `NULL` without one; `SPINGALETT_CUDA_DEVICE=n` picks one.
+  Its kernels (`Src/Gpu/Cuda`): matrix products in single precision as tiles chosen by timing (two
+  buffers of shared memory filled by asynchronous copies, operand modes and vector loads as
+  instances, the convolutions' windows read through their tap tables, epilogues inline); products on
+  the tensor cores (`mma.sync` in bfloat16 with `ldmatrix`, results through shared memory to
+  coalesced stores); a direct kernel for products of few k over a convolution's windows, which a
+  network's first convolution has; depthwise convolutions whose windows, strides, modes and
+  bfloat16 maps are instances, applying the normalization before them as they read; normalization,
+  pooling, additions and optimizer steps four values a thread. Each is a unit of PTX, compressed in
+  the library and inflated when first used, when the driver compiles it and keeps it in its cache;
+  commands run as CUDA graphs, a chunk's inputs copied on a stream of their own. CMake builds it
+  where Clang compiles CUDA (`SPINGALETT_CUDA`), or from another build's PTX (`SPINGALETT_PTX_DIR`).
+  The Linux and Windows packages and the wheels have it; macOS builds do not. Its PTX takes 10.6 MB
+  of the library's 12.6 MB on x86-64. Tests: `SpingalettGpuTests` and the `cuda` group, which
+  compare the kernels with references and the tiles bit for bit, and the GPU with the CPU.
 - **The runtime:** `Spingalett.Runtime.h` declares what it has: `spingalett_model_load()`,
   `spingalett_model_from_memory()`, `spingalett_model_predict()`, `spingalett_model_evaluate()`,
   `spingalett_model_free()`, the engine of `Spingalett.Inference.h`, the version, errors, logging,
@@ -32,6 +63,18 @@ Programs of 1.0 run unchanged; no kernel changed.
   time of one sample and of batches, or the outputs of a file of raw float samples.
 
 ### Changed
+- GPU inference (both backends): a batch normalization that a dense or convolution layer without
+  activation feeds alone runs in that layer's product, in its epilogue (`SPG_EPI_SCALE_ACT`; for a
+  depthwise convolution in its kernel's), with the layer's biases folded into its coefficients, and
+  the layer's own outputs are never written; the normalizations' coefficients are computed once
+  until the parameters change rather than in every chunk. The convolutional network with batch
+  normalization infers 1.3 times as fast in bfloat16 on Vulkan, the MobileNet-style network 1.2 to 1.3
+  times, ResNet-20 and the U-Net 1.1 times.
+- GPU: three chunks in flight instead of two, so that the host fills one while the device works on
+  the two before it: the MLP of `Examples/Benchmark.c` infers 1.2 times as fast from host arrays.
+- GPU: inputs kept as bfloat16 are rounded from the caller's floats straight into the memory they
+  are copied from, on the OpenMP threads, where they were rounded on one thread at submission
+  (backends that cannot write into device memory, such as CUDA).
 - The examples, DigitPad and the code in the README use the short names of `Spingalett.Short.h`
   (`NeuralNetwork`, `layer()`, `train()`, `ACT_RELU`), which read more easily; the descriptions and
   `docs/Reference.md` keep the prefixed names that the library declares and exports. The README says
