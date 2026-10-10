@@ -152,7 +152,7 @@ static struct {
 
 /* Every thread that calls the driver makes the device's context current first. */
 static _Thread_local CUcontext bound;
-static void bind(void) {
+static void make_current(void) {
     if (bound != cu.context) {
         cuCtxSetCurrent(cu.context);
         bound = cu.context;
@@ -224,7 +224,7 @@ static bool open_device(void) {
         cu.memory = total;
         cu.sms = (uint32_t)sms;
         cu.shared_optin = (uint32_t)shared;
-        bind();
+        make_current();
         if (cuStreamCreate(&cu.stream, CU_STREAM_NON_BLOCKING) != 0 ||
             cuStreamCreate(&cu.capture, CU_STREAM_NON_BLOCKING) != 0 ||
             cuStreamCreate(&cu.side, CU_STREAM_NON_BLOCKING) != 0)
@@ -243,7 +243,7 @@ static bool cub_open(void) {
     if (atomic_compare_exchange_strong(&cu.state, &expected, 1)) atomic_store(&cu.state, open_device() ? 2 : 3);
     while (atomic_load(&cu.state) == 1) {}
     if (atomic_load(&cu.state) != 2) return false;
-    bind();
+    make_current();
     return true;
 }
 
@@ -382,7 +382,7 @@ typedef struct { SpgKernel kernel; const uint32_t *specs; uint32_t count, n, fir
 
 static void prepare_some(void *arg) {
     const Prepare *p = (const Prepare *)arg;
-    bind();
+    make_current();
     for (uint32_t k = p->first; k < p->n; k += p->step) unit_function(unit_of(p->kernel, p->specs + k * p->count, p->count));
 }
 
@@ -469,7 +469,7 @@ static bool cub_buffer_create(SpgGpuBuffer *b, size_t bytes, bool host_visible) 
 static void cub_buffer_free(SpgGpuBuffer *b) {
     if (!b || !b->buffer) return;
     if (b->memory) {                                    /* an arena's buffers leave their memory to it */
-        bind();
+        make_current();
         if (b->buffer == (void *)2) host_free(b->memory, b->size);
         else cuMemFree((CUdeviceptr)(uintptr_t)b->memory);
     }
@@ -588,7 +588,7 @@ static void drop_graph(CuCommands *c) {
 static void cub_commands_free(void *commands) {
     CuCommands *c = (CuCommands *)commands;
     if (!c) return;
-    bind();
+    make_current();
     if (c->pending) cub_wait(c);
     drop_graph(c);
     for (uint32_t k = 0; k < c->stamp_count; k++) cuEventDestroy(c->stamps[k]);
@@ -608,7 +608,7 @@ static void cub_commands_untimed(void *commands) {
 
 static bool cub_commands_stamps(void *commands, uint32_t count) {
     CuCommands *c = (CuCommands *)commands;
-    bind();
+    make_current();
     c->stamps = (CUevent *)calloc(count, sizeof(CUevent));
     if (!c->stamps) return false;
     for (uint32_t k = 0; k < count; k++)
@@ -644,7 +644,7 @@ static void cub_timestamp(void *commands, uint32_t index) {
 static bool cub_timestamps(void *commands, double *ns, uint32_t count) {
     CuCommands *c = (CuCommands *)commands;
     if (count > c->stamp_count || count == 0) return false;
-    bind();
+    make_current();
     ns[0] = 0.0;
     for (uint32_t k = 1; k < count; k++) {
         float ms = 0.0f;
@@ -823,7 +823,7 @@ static bool run_op(CuCommands *c, uint32_t k, CUstream s) {
 static bool cub_record_end(void *commands) {
     CuCommands *c = (CuCommands *)commands;
     if (!c->ok) return false;
-    bind();
+    make_current();
     /* a graph of the list, unless it has timestamps or is profiled */
     bool stamped = false;
     for (uint32_t k = 0; k < c->count && !stamped; k++) stamped = c->ops[k].kind == OP_STAMP;
@@ -848,7 +848,7 @@ static bool cub_record_end(void *commands) {
 static bool cub_submit(void *commands) {
     CuCommands *c = (CuCommands *)commands;
     if (c->pending && !cub_wait(c)) return false;
-    bind();
+    make_current();
     spg_lock(cu.lock);
     bool ok = true;
     for (uint32_t k = 0; ok && k < c->head; k++) ok = run_op(c, k, cu.side);
@@ -884,7 +884,7 @@ static bool cub_wait(void *commands) {
     CuCommands *c = (CuCommands *)commands;
     if (!c->pending) return true;
     c->pending = false;
-    bind();
+    make_current();
     const bool ok = cuEventSynchronize(c->done) == 0;
     if (ok && cu.profile && !c->untimed && !c->exec && c->timed_count) {
         spg_lock(cu.lock);
