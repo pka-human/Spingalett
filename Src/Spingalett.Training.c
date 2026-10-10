@@ -266,8 +266,13 @@ static void smooth_targets(const float *t, float *dst, uint32_t n, uint32_t outp
     float keep, share;
     smoothing(outputs, act, eps, &keep, &share);
     const uint64_t total = (uint64_t)n * outputs;
+    /* (the product rounded before the sum, in a statement of its own: as rows.comp's precise smoothing, not a
+       fused multiply-add, which Clang makes of a product and a sum in one expression) */
     SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, total) && n > 1,
-        for (int64_t i = 0; i < (int64_t)total; i++) dst[i] = keep * t[i] + share;
+        for (int64_t i = 0; i < (int64_t)total; i++) {
+            const float kept = keep * t[i];
+            dst[i] = kept + share;
+        }
     );
     (void)mode;
 }
