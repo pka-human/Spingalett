@@ -629,6 +629,11 @@ if(BUILD_TESTS)
     spingalett_engine_library(SpingalettEngine)
     spingalett_engine_tests(SpingalettEngine SpingalettTests)
 
+    # The public structures' layout as the C compiler lays them out, which the bindings' tests compare with
+    # theirs (Python here, the others' through SPINGALETT_LAYOUT)
+    add_executable(SpingalettLayout ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Layout.c)
+    target_link_libraries(SpingalettLayout PRIVATE spingalett)
+
     # A sanitizer-instrumented library cannot be loaded into an uninstrumented Python.
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND AND NOT CMAKE_C_FLAGS MATCHES "-fsanitize" AND NOT CMAKE_CROSSCOMPILING)
@@ -641,8 +646,6 @@ if(BUILD_TESTS)
                              PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/Bindings/Python
                              ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/test_python_bindings.py)
 
-            add_executable(SpingalettLayout ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Layout.c)
-            target_link_libraries(SpingalettLayout PRIVATE spingalett)
             add_test(NAME python.layout
                      COMMAND ${CMAKE_COMMAND} -E env
                              SPINGALETT_LIBRARY=$<TARGET_FILE:spingalett>

@@ -110,6 +110,55 @@ jobs:
       - name: Test
         run: LSAN_OPTIONS=suppressions=$PWD/Tests/lsan.supp .github/scripts/ctest.sh --test-dir Build
 
+  # the bindings of other languages against the library, installed: their tests, and their structures' layout
+  # against the C compiler's (SpingalettLayout)
+  bindings:
+    name: bindings (Rust, .NET, Go, Java)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: The library
+        run: |
+          cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON \
+            -DBUILD_APPS=OFF -DCMAKE_INSTALL_PREFIX=$PWD/prefix
+          cmake --build Build --parallel
+          cmake --install Build
+          echo "LD_LIBRARY_PATH=$PWD/prefix/lib" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$PWD/prefix/lib/pkgconfig" >> $GITHUB_ENV
+          echo "SPINGALETT_LIB_DIR=$PWD/prefix/lib" >> $GITHUB_ENV
+          echo "SPINGALETT_LAYOUT=$PWD/Bin/SpingalettLayout" >> $GITHUB_ENV
+
+      - name: Rust
+        working-directory: Bindings/Rust
+        run: cargo test
+
+      - name: .NET
+        working-directory: Bindings/CSharp
+        run: dotnet run --project Spingalett.Tests -c Release
+
+      - name: Go
+        working-directory: Bindings/Go
+        run: go vet ./... && go test ./...
+
+      - name: Java
+        working-directory: Bindings/Java
+        run: mvn -B -q test
+
   inference-only:
     name: inference engine alone
     runs-on: ubuntu-24.04
