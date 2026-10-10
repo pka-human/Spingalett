@@ -2236,7 +2236,7 @@ void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads,
                                  bool causal, const float *table, float *y, float *scratch) {
     const uint32_t C = (heads + 2u * kv) * head, out_c = heads * head, group = heads / kv, half = head / 2u;
     const float scale = 1.0f / sqrtf((float)head);
-    float *keys = scratch, *q = scratch + (size_t)cells * kv * head;
+    float *keys = scratch, *q = table ? scratch + (size_t)cells * kv * head : NULL;     /* (scratch: with a table) */
     /* the keys rotated once (kv heads a cell, side by side), a query rotated as it is used */
     if (table)
         for (uint32_t p = 0; p < cells; p++)

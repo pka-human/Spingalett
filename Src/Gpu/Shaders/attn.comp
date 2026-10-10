@@ -31,8 +31,9 @@
 #include "common.glsl"
 
 layout(constant_id = 0) const uint OP = 0;
+/* (the defaults are the tiles of the most shared memory: some drivers size it before specialization) */
 layout(constant_id = 1) const uint BQ = 32;         /* rows of a tile of queries or keys */
-layout(constant_id = 2) const uint DMAX = 64;       /* the head size, at most (a multiple of THREADS / BQ) */
+layout(constant_id = 2) const uint DMAX = 32;       /* the head size, at most (a multiple of THREADS / BQ) */
 layout(constant_id = 3) const uint THREADS = 128;
 layout(constant_id = 4) const uint HALF = 0;        /* words: x 0, y 1, dy 2, dx 3 (half.glsl) */
 layout(local_size_x_id = 3) in;
