@@ -57,7 +57,9 @@ typedef enum {
 typedef struct {
     float loss;                     /* mean over samples of the network's loss (see spingalett_evaluate()) */
     float accuracy;                 /* fraction of samples whose output argmax matches the target's
-                                       argmax; with a single output, both on the same side of 0.5 */
+                                       argmax; with a single output, both on the same side of 0.5; with
+                                       SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY the mean over samples of the
+                                       fraction of their cells with targets whose argmax is the target */
     uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettEvalMetrics;
 

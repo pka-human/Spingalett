@@ -583,7 +583,7 @@ if(BUILD_TESTS)
         endif()
     endif()
 
-    foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
+    foreach(group grad conv norm graph transformer onnx equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

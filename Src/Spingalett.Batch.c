@@ -32,6 +32,13 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->ln_flat);
     spingalett_aligned_free(ws->ln_scratch);
     spingalett_aligned_free(ws->gtmp);
+    spingalett_aligned_free(ws->pre_flat);
+    spingalett_aligned_free(ws->rope_flat);
+    spingalett_aligned_free(ws->attn);
+    for (int t = 0; ws->attn_gemm && t < ws->attn_threads; t++) spingalett_gemm_scratch_free(ws->attn_gemm[t]);
+    free(ws->attn_gemm);
+    free(ws->pre);
+    free(ws->rope);
     spingalett_gemm_scratch_free(ws->gemm);
     free(ws->uses);
     free(ws->pending);
@@ -41,6 +48,16 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     free(ws->bn_stats);
     free(ws->bn_sums);
     free(ws);
+}
+
+/* Floats a training workspace keeps for layer l's backward pass beside its output: a layer
+   normalization each cell's mean and 1 / std, an RMS normalization each cell's 1 / rms, attention each
+   query's log of the softmax's sum. */
+static size_t ln_stats_floats(const NeuralNetwork *net, uint32_t l, uint32_t capacity) {
+    const LayerShape *s = &net->shapes[l];
+    const size_t cells = (size_t)capacity * s->height * s->width;
+    return s->type == LAYER_LAYER_NORM ? 2u * cells : s->type == LAYER_RMS_NORM ? cells
+         : s->type == LAYER_ATTENTION ? cells * s->heads : 0u;
 }
 
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count) {
@@ -121,7 +138,7 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
 
     if (gather) {
         ws->inputs  = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[0] * sizeof(float));
-        ws->targets = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
+        ws->targets = (float *)spingalett_aligned_alloc((size_t)capacity * spingalett_targets_of(net) * sizeof(float));
         if (!ws->inputs || !ws->targets) goto fail;
     }
 
@@ -155,19 +172,67 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
         }
     }
 
-    /* layer normalization: each cell's statistics, for the backward pass */
+    /* layer normalization: each cell's statistics, for the backward pass; RMS normalization each cell's
+       1 / rms; attention each query's log sum */
     size_t ln_floats = 0;
-    for (uint32_t l = 1; training && l < net->layers; l++)
-        if (net->shapes[l].type == LAYER_LAYER_NORM) ln_floats += 2u * (size_t)capacity * net->shapes[l].height * net->shapes[l].width;
+    for (uint32_t l = 1; training && l < net->layers; l++) ln_floats += ln_stats_floats(net, l, capacity);
     if (ln_floats > 0) {
         ws->ln_flat = (float *)spingalett_aligned_alloc(ln_floats * sizeof(float));
         ws->ln_scratch = (double *)spingalett_aligned_alloc((spingalett_ln_scratch_doubles(net, capacity) + 1) * sizeof(double));
         if (!ws->ln_flat || !ws->ln_scratch) goto fail;
         for (uint32_t l = 1, off = 0; l < net->layers; l++)
-            if (net->shapes[l].type == LAYER_LAYER_NORM) {
+            if (ln_stats_floats(net, l, capacity)) {
                 ws->bn_stats[l] = ws->ln_flat + off;
-                off += 2u * capacity * net->shapes[l].height * net->shapes[l].width;
+                off += ln_stats_floats(net, l, capacity);
             }
+    }
+
+    /* the values before GELU and SiLU, for their derivatives */
+    ws->pre = (float **)calloc(net->layers, sizeof(float *));
+    ws->rope = (float **)calloc(net->layers, sizeof(float *));
+    if (!ws->pre || !ws->rope) goto fail;
+    size_t pre_floats = 0;
+    for (uint32_t l = 1; training && l < net->layers; l++)
+        if (spingalett_act_needs_input(net->act_func[l - 1])) pre_floats += (size_t)capacity * net->topology[l];
+    if (pre_floats > 0) {
+        if (!(ws->pre_flat = (float *)spingalett_aligned_alloc(pre_floats * sizeof(float)))) goto fail;
+        for (uint32_t l = 1, off = 0; l < net->layers; l++)
+            if (spingalett_act_needs_input(net->act_func[l - 1])) {
+                ws->pre[l] = ws->pre_flat + off;
+                off += capacity * net->topology[l];
+            }
+    }
+
+    /* attention: the rotary embeddings' tables, scratch and a matrix product scratch for every thread */
+    size_t rope_floats = 0, attn_floats = 0;
+    for (uint32_t l = 1; l < net->layers; l++) {
+        const LayerShape *a = &net->shapes[l];
+        if (a->type != LAYER_ATTENTION) continue;
+        if (a->theta > 0.0f) rope_floats += (size_t)a->height * a->width * (a->channels / a->heads);
+        const size_t need = spingalett_attention_scratch(net, l - 1, training);
+        if (need > attn_floats) attn_floats = need;
+    }
+    if (rope_floats > 0) {
+        if (!(ws->rope_flat = (float *)spingalett_aligned_alloc(rope_floats * sizeof(float)))) goto fail;
+        for (uint32_t l = 1, off = 0; l < net->layers; l++) {
+            const LayerShape *a = &net->shapes[l];
+            if (a->type != LAYER_ATTENTION || a->theta <= 0.0f) continue;
+            ws->rope[l] = ws->rope_flat + off;
+            spingalett_engine_rope_table(a->height * a->width, a->channels / a->heads, a->theta, ws->rope[l]);
+            off += a->height * a->width * (a->channels / a->heads);
+        }
+    }
+    if (attn_floats > 0) {
+        int threads = 1;
+#if defined(_OPENMP)
+        if (mode == COMPUTE_OPENMP) threads = omp_get_max_threads();
+#endif
+        ws->attn_gemm = (SpingalettGemmScratch **)calloc((size_t)threads, sizeof(SpingalettGemmScratch *));
+        ws->attn = (float *)spingalett_aligned_alloc((size_t)threads * attn_floats * sizeof(float));
+        if (!ws->attn_gemm || !ws->attn) goto fail;
+        ws->attn_threads = threads;
+        for (int t = 0; t < threads; t++)
+            if (!(ws->attn_gemm[t] = spingalett_gemm_scratch_create(1))) goto fail;
     }
 
     if (mode != COMPUTE_OPENBLAS) {
@@ -199,11 +264,72 @@ static void combine_forward(const NeuralNetwork *net, const BatchWorkspace *ws, 
     }
     if (s->type == LAYER_ADD) {
         spingalett_add_forward(x, count, y, N, net->topology[l], act, mode);
+    } else if (s->type == LAYER_MULTIPLY) {
+        spingalett_multiply_forward(x, count, y, N, net->topology[l], act, mode);
     } else if (s->type == LAYER_CONCAT) {
         spingalett_concat_forward(x, channels, count, y, N, (uint64_t)s->height * s->width, act, mode);
     } else {
         const LayerShape *i = &net->shapes[in[0]];
         spingalett_global_pool_forward(x[0], y, N, (uint64_t)i->height * i->width, i->channels, act, mode);
+    }
+}
+
+/* Layer l's output y from its input x over N samples, the bias (of dense layers too) and an element-wise
+   act applied (ACT_NONE: none; never softmax). */
+static void batch_layer(NeuralNetwork *net, BatchWorkspace *ws, uint32_t l, const float *X, float *y, uint32_t N,
+                        ActivationFunction act, ComputeMode mode) {
+    const uint32_t src = spingalett_source(net, l), prev_size = net->topology[src], curr_size = net->topology[l];
+    switch (net->shapes[l].type) {
+        case LAYER_DENSE: {
+            SpingalettBiasActivation epilogue = {net->biases + net->bias_offsets[l - 1], act};
+            SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
+            spingalett_gemm_ex(ws->gemm, mode, false, true, N, curr_size, prev_size, 1.0f, X, prev_size,
+                               SPINGALETT_WEIGHT_MTX_PTR(net, l - 1), prev_size, 0.0f, y, curr_size, &hooks);
+            break;
+        }
+        case LAYER_CONV2D:
+            spingalett_conv_forward(net, l - 1, X, y, N, act, ws->conv, ws->gemm, mode);
+            break;
+        case LAYER_CONV_TRANSPOSE2D:
+            spingalett_conv_transpose_forward(net, l - 1, X, y, N, act, ws->conv, ws->gemm, mode);
+            break;
+        case LAYER_BATCH_NORM:
+            if (ws->training)
+                spingalett_bn_forward_train(net, l - 1, X, y, N, act, ws->bn_stats[l], ws->bn_scratch, mode);
+            else
+                spingalett_bn_forward(net, l - 1, X, y, N, act, ws->bn_coef, mode);
+            break;
+        case LAYER_LAYER_NORM:
+            spingalett_ln_forward(net, l - 1, X, y, N, act, ws->training ? ws->bn_stats[l] : NULL, mode);
+            break;
+        case LAYER_RMS_NORM:
+            spingalett_rms_forward(net, l - 1, X, y, N, act, ws->training ? ws->bn_stats[l] : NULL, mode);
+            break;
+        case LAYER_EMBEDDING:
+            spingalett_embedding_forward(net, l - 1, X, y, N, act, mode);
+            break;
+        case LAYER_ATTENTION:
+            spingalett_attention_forward(net, l - 1, X, y, N, ws->training ? ws->bn_stats[l] : NULL, ws->rope[l], ws,
+                                         mode);
+            if (act != ACT_NONE) apply_activation_bulk(y, (uint64_t)N * curr_size, act);
+            break;
+        case LAYER_ADD:
+        case LAYER_CONCAT:
+        case LAYER_MULTIPLY:
+        case LAYER_GLOBAL_AVG_POOL:
+            combine_forward(net, ws, l, y, N, act, mode);
+            break;
+        case LAYER_UPSAMPLE: {
+            const LayerShape *i = &net->shapes[src], *o = &net->shapes[l];
+            spingalett_upsample_forward(X, y, N, i->height, i->width, i->channels, o->stride_h, o->stride_w, o->mode,
+                                        mode);
+            if (act != ACT_NONE) apply_activation_bulk(y, (uint64_t)N * curr_size, act);
+            break;
+        }
+        default:
+            spingalett_pool_forward(net, l - 1, X, y, N, mode);
+            if (act != ACT_NONE) apply_activation_bulk(y, (uint64_t)N * curr_size, act);
+            break;
     }
 }
 
@@ -215,7 +341,10 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         uint32_t curr_size = net->topology[l];
         const float *bias = net->biases + net->bias_offsets[l - 1];
         ActivationFunction act = net->act_func[l - 1];
-        float *C = ws->act[l];
+        /* a layer whose activation's derivative needs its input (training): the layer into pre[l], then
+           its activation into act[l] */
+        float *const pre = ws->pre ? ws->pre[l] : NULL;
+        float *C = pre ? pre : ws->act[l];
         const float *X = ws->act[src];
         bool masked = dropout && ws->dmask[l];
         LayerType type = net->shapes[l].type;
@@ -245,7 +374,10 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
             continue;
         }
 
-        if (type == LAYER_DENSE) {
+        if (pre) {
+            /* the layer without its activation, then (below) the activation into act[l] */
+            batch_layer(net, ws, l, X, pre, N, ACT_NONE, mode);
+        } else if (type == LAYER_DENSE) {
             /* act[l] = act[l-1] * W^T, W stored [curr x prev]; the bias and an element-wise
                activation follow as the product's tiles complete */
             done = act != ACT_SOFTMAX && !masked;
@@ -279,6 +411,10 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
             spingalett_upsample_forward(X, C, N, i->height, i->width, i->channels, o->stride_h, o->stride_w, o->mode,
                                         mode);
             done = act == ACT_NONE && !masked;
+        } else if (type == LAYER_EMBEDDING || type == LAYER_ATTENTION || type == LAYER_RMS_NORM ||
+                   type == LAYER_MULTIPLY) {
+            done = act != ACT_SOFTMAX && !masked;
+            batch_layer(net, ws, l, X, C, N, done ? act : ACT_NONE, mode);
         } else {
             spingalett_pool_forward(net, l - 1, X, C, N, mode);
             done = act == ACT_NONE && !masked;
@@ -286,11 +422,21 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
         if (done)
             continue;
 
+        float *Y = ws->act[l];
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * curr_size))
 #endif
         for (int64_t s = 0; s < (int64_t)N; s++) {
-            float *row = C + (size_t)s * curr_size;
+            float *row = Y + (size_t)s * curr_size;
+            if (pre) {
+                /* the activation of the values kept; a dropout mask alone, the derivative from them */
+                memcpy(row, pre + (size_t)s * curr_size, (size_t)curr_size * sizeof(float));
+                apply_activation_batch(row, curr_size, act);
+                if (masked)
+                    spingalett_dropout_apply(row, ws->dmask[l] + (size_t)s * curr_size, curr_size, ACT_NONE,
+                                             net->dropout_rates[l], dropout, l, position_offset + (uint32_t)s);
+                continue;
+            }
             if (type == LAYER_DENSE)
                 spingalett_vec_axpy(row, bias, curr_size, 1.0f);
             apply_activation_batch(row, curr_size, act);
@@ -431,20 +577,20 @@ bool spingalett_predict_args(PredictArgs args) {
 
 void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
                                const float *inputs, const float *targets, uint32_t n, ComputeMode mode,
-                               double *loss_sum, uint32_t *correct) {
-    uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
+                               double *loss_sum, double *correct) {
+    uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1], t_sz = spingalett_targets_of(net);
+    const uint32_t cells = net->shapes[net->layers - 1].height * net->shapes[net->layers - 1].width;
     ActivationFunction out_act = net->act_func[net->layers - 2];
-    double loss = 0.0;
-    uint32_t hits = 0;
+    double loss = 0.0, hits = 0.0;
     for (uint32_t start = 0; start < n; start += ws->capacity) {
         uint32_t count = n - start < ws->capacity ? n - start : ws->capacity;
         ws->act[0] = (float *)(inputs + (size_t)start * in_sz);              /* read only */
         ws->act[net->layers - 1] = out_buf;
         spingalett_batch_forward(net, ws, count, NULL, 0, mode);
         for (uint32_t s = 0; s < count; s++) {
-            const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * out_sz;
-            loss += compute_sample_loss(o, t, out_sz, net->loss_func, out_act);
-            hits += spingalett_sample_correct(o, t, out_sz);
+            const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * t_sz;
+            loss += compute_sample_loss(o, t, out_sz, cells, net->loss_func, out_act);
+            hits += spingalett_sample_correct(o, t, out_sz, cells, net->loss_func);
         }
     }
     *loss_sum = loss;
@@ -512,22 +658,22 @@ void spingalett_gpu_done(NeuralNetwork *net, SpgGpuNet *gpu) {
 }
 
 bool spingalett_gpu_evaluate(SpgGpuNet *gpu, NeuralNetwork *net, const float *inputs, const SpingalettDeviceData *rows,
-                             const float *targets, uint32_t n, double *loss_sum, uint32_t *correct) {
-    const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1];
+                             const float *targets, uint32_t n, double *loss_sum, double *correct) {
+    const uint32_t in_sz = net->topology[0], out_sz = net->topology[net->layers - 1], t_sz = spingalett_targets_of(net);
+    const uint32_t cells = net->shapes[net->layers - 1].height * net->shapes[net->layers - 1].width;
     /* blocks of up to eight chunks, predicted in one go so that they overlap with the copies */
     const uint32_t block = 8u * spingalett_gpu_net_capacity(gpu) < n ? 8u * spingalett_gpu_net_capacity(gpu) : n;
     const ActivationFunction out_act = net->act_func[net->layers - 2];
     float *out_buf = (float *)spingalett_aligned_alloc((size_t)block * out_sz * sizeof(float));
-    double loss = 0.0;
-    uint32_t hits = 0;
+    double loss = 0.0, hits = 0.0;
     bool ok = out_buf != NULL;
     for (uint32_t start = 0; ok && start < n; start += block) {
         uint32_t count = n - start < block ? n - start : block;
         ok = spingalett_gpu_predict_rows(gpu, rows ? NULL : inputs + (size_t)start * in_sz, rows, start, out_buf, count);
         for (uint32_t s = 0; ok && s < count; s++) {
-            const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * out_sz;
-            loss += compute_sample_loss(o, t, out_sz, net->loss_func, out_act);
-            hits += spingalett_sample_correct(o, t, out_sz);
+            const float *o = out_buf + (size_t)s * out_sz, *t = targets + ((size_t)start + s) * t_sz;
+            loss += compute_sample_loss(o, t, out_sz, cells, net->loss_func, out_act);
+            hits += spingalett_sample_correct(o, t, out_sz, cells, net->loss_func);
         }
     }
     spingalett_aligned_free(out_buf);
@@ -551,7 +697,7 @@ EvalMetrics spingalett_evaluate_args(EvaluateArgs args) {
         !spingalett_device_check(args.inputs, args.device_inputs, args.sample_count, net->topology[0], "evaluate",
                                  "inputs") ||
         !spingalett_device_check(args.targets, args.device_targets, args.sample_count,
-                                 net->topology[net->layers - 1], "evaluate", "targets"))
+                                 spingalett_targets_of(net), "evaluate", "targets"))
         return m;
 
     /* the targets on the host, where the losses are added up */
@@ -562,8 +708,7 @@ EvalMetrics spingalett_evaluate_args(EvaluateArgs args) {
 
     SpgGpuNet *gpu = spingalett_gpu_for(net, args.sample_count);
     if (gpu) {
-        double loss;
-        uint32_t correct;
+        double loss, correct;
         /* a data set in the other GPU backend's memory comes through the host */
         float *copy = args.device_inputs && !spingalett_gpu_data_on(args.device_inputs, gpu)
                     ? spingalett_device_rows(args.device_inputs, args.sample_count, "evaluate") : NULL;
@@ -594,8 +739,7 @@ EvalMetrics spingalett_evaluate_args(EvaluateArgs args) {
     BatchWorkspace *ws = spingalett_batch_workspace_create(net, capacity, false, false, mode);
     float *out = (float *)spingalett_aligned_alloc((size_t)capacity * net->topology[net->layers - 1] * sizeof(float));
     if (ws && out) {
-        double loss;
-        uint32_t correct;
+        double loss, correct;
         spingalett_batch_evaluate(net, ws, out, args.inputs, args.targets, args.sample_count, mode, &loss, &correct);
         m.loss = (float)(loss / args.sample_count);
         m.accuracy = (float)correct / (float)args.sample_count;

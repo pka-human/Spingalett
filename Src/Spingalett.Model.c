@@ -279,8 +279,8 @@ static bool prepare_tiles(const uint8_t *image, const SlettLayer *L, const int8_
 static bool prepare_layer(const uint8_t *image, const SlettLayer *L, PreparedLayer *p) {
     /* pooling, normalizations, and integer transposed convolutions, which read the image as the engine does */
     const bool transposed = L->type == LAYER_CONV_TRANSPOSE2D;
-    if (L->rows == 0 || L->type == LAYER_BATCH_NORM || L->type == LAYER_LAYER_NORM ||
-        (transposed && spingalett_precision_is_int(L->precision)))
+    if (L->rows == 0 || L->type == LAYER_BATCH_NORM || L->type == LAYER_LAYER_NORM || L->type == LAYER_RMS_NORM ||
+        L->type == LAYER_EMBEDDING || (transposed && spingalett_precision_is_int(L->precision)))
         return true;
     const size_t n = (size_t)L->rows * L->row_len;
     const uint8_t *src = image + L->weights;
@@ -376,6 +376,12 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
         SlettLayer L;
         spingalett_slett_layer(image, i, &L);
         if (L.type == LAYER_BATCH_NORM && L.out_c > norm_channels) norm_channels = L.out_c;
+        if (L.type == LAYER_ATTENTION) {
+            /* the engine's pass, sample by sample: its scratch per thread */
+            if (slett_conv_scratch(&L) > transposed_window) transposed_window = (uint32_t)slett_conv_scratch(&L);
+            continue;
+        }
+        if (L.type == LAYER_EMBEDDING || L.type == LAYER_RMS_NORM) continue;
         if (L.type == LAYER_CONV_TRANSPOSE2D && spingalett_precision_is_int(L.precision)) {
             /* the engine's pass, sample by sample: a window per thread, the quantized input */
             if (slett_conv_scratch(&L) > transposed_window) transposed_window = (uint32_t)slett_conv_scratch(&L);
@@ -618,7 +624,7 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const Pr
     activate_samples(y, n, out, L->activation, mode);
 }
 
-/* An addition, concatenation or global pooling over n samples, sample by sample with the engine's
+/* An addition, product, concatenation or global pooling over n samples, sample by sample with the engine's
    functions, so that the results are the engine's (x[k]: input k, units[k] per sample). */
 static void predict_combine(const SlettLayer *L, const float *const *x, const uint32_t *units, const uint32_t *channels,
                             float *y, uint32_t n, ComputeMode mode) {
@@ -628,6 +634,7 @@ static void predict_combine(const SlettLayer *L, const float *const *x, const ui
             for (uint32_t k = 0; k < L->input_count; k++) xs[k] = x[k] + (size_t)s * units[k];
             float *ys = y + (size_t)s * L->outputs;
             if (L->type == LAYER_ADD) spingalett_engine_add(xs, L->input_count, ys, L->outputs);
+            else if (L->type == LAYER_MULTIPLY) spingalett_engine_multiply(xs, L->input_count, ys, L->outputs);
             else if (L->type == LAYER_CONCAT) spingalett_engine_concat(xs, channels, L->input_count, ys, L->out_h * L->out_w);
             else spingalett_engine_global_pool(xs[0], ys, L->in_h * L->in_w, L->in_c);
             spingalett_engine_activate(ys, L->outputs, L->activation);
@@ -644,17 +651,33 @@ static void predict_layer(const uint8_t *image, const SlettLayer *L, const Prepa
     const float *dequant = prep->dequant;
     const float *bias = (const float *)(const void *)(image + L->biases);
 
-    if (L->type == LAYER_LAYER_NORM || L->type == LAYER_UPSAMPLE) {
+    if (L->type == LAYER_LAYER_NORM || L->type == LAYER_UPSAMPLE || L->type == LAYER_RMS_NORM ||
+        L->type == LAYER_EMBEDDING || L->type == LAYER_ATTENTION) {
         /* sample by sample, as the engine computes them */
         const float *gamma = (const float *)(const void *)(image + L->weights);
-        SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, (uint64_t)n * out),
+        const uint64_t work = L->type == LAYER_ATTENTION ? (uint64_t)n * out * L->out_h * L->out_w : (uint64_t)n * out;
+        SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, work),
             for (int64_t s = 0; s < (int64_t)n; s++) {
                 const float *xs = x + (size_t)s * in;
                 float *ys = y + (size_t)s * out;
-                if (L->type == LAYER_UPSAMPLE)
+                if (L->type == LAYER_UPSAMPLE) {
                     spingalett_engine_upsample(xs, L->in_h, L->in_w, L->in_c, L->stride_h, L->stride_w, L->mode, ys);
-                else
+                } else if (L->type == LAYER_RMS_NORM) {
+                    spingalett_engine_rms_norm(xs, L->out_h * L->out_w, L->out_c, gamma, L->eps, ys, NULL);
+                } else if (L->type == LAYER_EMBEDDING) {
+                    spingalett_engine_embedding(image, L, xs, ys);
+                } else if (L->type == LAYER_ATTENTION) {
+                    const uint32_t cells = L->out_h * L->out_w, head = L->out_c / L->heads;
+                    float *scratch = (float *)(void *)(w->window + (size_t)spingalett_thread_num() * w->window_stride);
+                    float *table = NULL;
+                    if (L->theta > 0.0f) {
+                        table = scratch + (size_t)cells * L->kv_heads * head + head;
+                        spingalett_engine_rope_table(cells, head, L->theta, table);
+                    }
+                    spingalett_engine_attention(xs, cells, L->heads, L->kv_heads, head, L->causal, table, ys, scratch);
+                } else {
                     spingalett_engine_layer_norm(xs, L->out_h * L->out_w, L->out_c, gamma, bias, L->eps, ys, NULL);
+                }
                 spingalett_engine_activate(ys, out, L->activation);
             }
         );
@@ -872,7 +895,8 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
                 channels[k] = units[k] / (h * wd);
                 xs[k] = j == 0 ? x : w->act[0] + spingalett_slett_act_offset(image, j) / 4u * chunk;
             }
-            if (L.type == LAYER_ADD || L.type == LAYER_CONCAT || L.type == LAYER_GLOBAL_AVG_POOL)
+            if (L.type == LAYER_ADD || L.type == LAYER_CONCAT || L.type == LAYER_GLOBAL_AVG_POOL ||
+                L.type == LAYER_MULTIPLY)
                 predict_combine(&L, xs, units, channels, y, n, mode);
             else
                 predict_layer(image, &L, &layers[i], dense_tiles, xs[0], y, n, w, mode);
@@ -899,8 +923,9 @@ EvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float 
     }
     SlettLayer last;
     spingalett_slett_layer((const uint8_t *)model->image, model->layer_count - 1, &last);
-    double loss = 0.0;
-    uint32_t correct = 0;
+    /* targets: one a cell for the sparse cross-entropy */
+    const uint32_t cells = last.out_h * last.out_w, t_sz = model->loss == LOSS_SPARSE_CROSS_ENTROPY ? cells : out;
+    double loss = 0.0, correct = 0.0;
     for (uint32_t start = 0; start < count; start += chunk) {
         uint32_t n = count - start < chunk ? count - start : chunk;
         if (!spingalett_model_predict(model, inputs + (size_t)start * model->input_size, n, buf)) {
@@ -908,9 +933,9 @@ EvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float 
             return m;
         }
         for (uint32_t s = 0; s < n; s++) {
-            const float *o = buf + (size_t)s * out, *t = targets + ((size_t)start + s) * out;
-            loss += compute_sample_loss(o, t, out, model->loss, last.activation);
-            correct += spingalett_sample_correct(o, t, out);
+            const float *o = buf + (size_t)s * out, *t = targets + ((size_t)start + s) * t_sz;
+            loss += compute_sample_loss(o, t, out, cells, model->loss, last.activation);
+            correct += spingalett_sample_correct(o, t, out, cells, model->loss);
         }
     }
     spingalett_aligned_free(buf);

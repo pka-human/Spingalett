@@ -85,7 +85,13 @@ typedef struct {
     uint32_t input_count;           /* layers it reads (0 for the input layer) */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* their indices, all below `index` */
     SpingalettUpsampleMode upsample;          /* upsampling: how cells are filled (stride_h x stride_w each) */
-    uint64_t reserved[SPINGALETT_RESERVED];
+    uint32_t vocabulary;            /* embedding: rows of its table (weight_count is vocabulary x channels,
+                                       bias_count the positions' cells x channels, or 0) */
+    uint32_t heads, kv_heads;       /* attention: query heads, key and value heads */
+    float rope_theta;               /* attention: base of the rotary position embeddings, 0 for none */
+    bool causal;                    /* attention: each cell attends to itself and the cells before it */
+    bool positions;                 /* embedding: a learned vector added a cell */
+    uint64_t reserved[SPINGALETT_RESERVED - 2];     /* (vocabulary took the padding before them) */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -191,10 +197,11 @@ typedef struct {
     SpingalettLayerType type;                 /* SPINGALETT_LAYER_DENSE unless set; see spingalett_conv2d(), spingalett_max_pool2d(),
                                        spingalett_avg_pool2d(), spingalett_batch_norm(), spingalett_add_layers(), spingalett_concat_layers(),
                                        spingalett_global_avg_pool2d(), spingalett_conv_transpose2d(), spingalett_upsample2d(),
-                                       spingalett_layer_norm() */
+                                       spingalett_layer_norm(), spingalett_linear(), spingalett_embedding(),
+                                       spingalett_attention(), spingalett_rms_norm(), spingalett_multiply_layers() */
     uint32_t height, width, channels;   /* input layer: the shape of a sample (channels-last), e.g.
                                        28 x 28 x 1 for MNIST; omitted: 1 x 1 x neurons_amount */
-    uint32_t filters;               /* conv and transposed conv: output channels */
+    uint32_t filters;               /* conv and transposed conv: output channels (0 = neurons_amount) */
     uint32_t kernel;                /* conv and pooling: square window size */
     uint32_t stride;                /* 0 = 1 for conv, the window size for pooling; upsampling: the
                                        factor (cells per input cell along an axis), 0 = 2 */
@@ -206,21 +213,33 @@ typedef struct {
     uint32_t groups;                /* conv: split input and output channels into this many groups,
                                        each filter seeing the input channels of its group (0 = 1;
                                        the input channels give depthwise convolution) */
-    float epsilon;                  /* batch and layer normalization: added to the variance; 0 = 1e-5 */
+    float epsilon;                  /* batch, layer and RMS normalization: added to the variance (the mean
+                                       square); 0 = 1e-5 */
     float momentum;                 /* batch normalization: running statistics move this far towards
                                        each training batch's; 0 = 0.1 */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* the earlier layers this one reads, by index (as
                                        spingalett_layer() returns it; 0 is the input layer); none: the layer
                                        added just before. Dense, convolution, pooling and batch
-                                       normalization layers read one, spingalett_add_layers() and
-                                       spingalett_concat_layers() one or more. */
+                                       normalization layers read one, spingalett_add_layers(),
+                                       spingalett_concat_layers() and spingalett_multiply_layers() one or
+                                       more. */
     uint32_t input_count;           /* entries of inputs; 0 counts them up to the last nonzero one,
                                        so give it when the last input is the input layer */
     SpingalettUpsampleMode upsample;          /* upsampling: copies (SPINGALETT_UPSAMPLE_NEAREST, the default) or bilinear */
     uint32_t output_padding;        /* transposed convolution: cells added to the output's bottom and
                                        right (less than the stride), to reach sizes the stride skips */
     uint32_t output_padding_h, output_padding_w;    /* per-axis overrides (0 = unset) */
-    uint64_t reserved[SPINGALETT_RESERVED];
+    uint32_t vocabulary;            /* embedding: rows of its table (tokens); neurons_amount is a row's size */
+    uint32_t heads;                 /* attention: query heads (0 = 1) */
+    uint32_t kv_heads;              /* attention: key and value heads, dividing heads (0 = heads; fewer:
+                                       grouped-query attention, 1: multi-query attention) */
+    float rope_theta;               /* attention: rotary position embeddings of base rope_theta (10000 is
+                                       usual) applied to the queries and keys; 0 = none */
+    bool causal;                    /* attention: each cell attends to itself and the cells before it only
+                                       (language models) */
+    bool positions;                 /* embedding: a learned vector added to each cell (absolute position
+                                       embeddings, as GPT-2's) */
+    uint64_t reserved[SPINGALETT_RESERVED - 3];
 } SpingalettLayerArgs;
 
 typedef struct {
@@ -436,6 +455,21 @@ SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkA
 #define spingalett_upsample2d(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_UPSAMPLE, __VA_ARGS__})
 /* Layer normalization over each cell's channels (a dense layer's outputs). */
 #define spingalett_layer_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_LAYER_NORM, __VA_ARGS__})
+/* The layers of transformers. A sequence of n tokens is a layer of 1 x n cells, each of its channels
+   (the input layer: n values, the tokens' indices as floats). */
+/* A dense layer of .neurons_amount outputs applied to each cell alike: a 1 x 1 convolution, the linear
+   layers of transformers over their tokens. */
+#define spingalett_linear(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_CONV2D, .kernel = 1, __VA_ARGS__})
+/* Token embeddings: each input value the index of a row of .vocabulary rows of .neurons_amount values;
+   .positions adds a learned vector a cell. */
+#define spingalett_embedding(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_EMBEDDING, __VA_ARGS__})
+/* Multi-head attention over the cells of a layer of queries, keys and values side by side (a linear layer
+   of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta. */
+#define spingalett_attention(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_ATTENTION, __VA_ARGS__})
+/* RMS normalization over each cell's channels. */
+#define spingalett_rms_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_RMS_NORM, __VA_ARGS__})
+/* The element-wise product of .inputs (layers of one shape), then .act_func. */
+#define spingalett_multiply_layers(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_MULTIPLY, __VA_ARGS__})
 SPINGALETT_API uint32_t spingalett_append_layer(SpingalettLayerArgs args);
 
 /* Describing a network. Layers are numbered in the order they were added, every layer after its
@@ -444,6 +478,9 @@ SPINGALETT_API uint32_t spingalett_layer_count(const SpingalettNetwork *net);   
 SPINGALETT_API bool spingalett_network_layer(const SpingalettNetwork *net, uint32_t index, SpingalettNetworkLayer *layer);
 SPINGALETT_API uint32_t spingalett_input_size(const SpingalettNetwork *net);
 SPINGALETT_API uint32_t spingalett_output_size(const SpingalettNetwork *net);
+/* Targets a sample has: the output size, or for SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY the output's cells
+   (one class index each). The rows of targets that training and evaluation take are this long. */
+SPINGALETT_API uint32_t spingalett_target_size(const SpingalettNetwork *net);
 SPINGALETT_API uint64_t spingalett_parameter_count(const SpingalettNetwork *net);   /* weights and biases */
 SPINGALETT_API SpingalettLossFunction spingalett_network_loss(const SpingalettNetwork *net);
 SPINGALETT_API uint64_t spingalett_optimizer_steps(const SpingalettNetwork *net);   /* steps taken (Adam's t) */
@@ -459,6 +496,8 @@ SPINGALETT_API bool spingalett_set_parameters(SpingalettNetwork *net, uint32_t i
                                               const float *values, uint64_t count);
 
 SPINGALETT_API float spingalett_activate(float x, SpingalettActivationFunction act_func);
+/* The activation's derivative, from its output x (y(1 - y) for sigmoid), or for GELU and SiLU from its
+   input x. */
 SPINGALETT_API float spingalett_derivative(float x, SpingalettActivationFunction act_func);
 
 #define spingalett_forward(...) spingalett_forward_args((SpingalettForwardArgs){__VA_ARGS__})

@@ -101,8 +101,12 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
 
 /* The oldest format version that holds the network: 3 for dense layers only, 4 with convolution or
    pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs, 7 with
-   transposed convolutions, upsampling or layer normalization. */
+   transposed convolutions, upsampling or layer normalization, 8 with the layers, activations or the
+   loss of transformers. */
 static uint16_t format_version(const NeuralNetwork *net) {
+    if (net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) return 8u;
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].type > LAYER_LAYER_NORM || net->act_func[l - 1] >= ACT_GELU) return 8u;
     for (uint32_t l = 1; l < net->layers; l++)
         if (net->shapes[l].type > LAYER_GLOBAL_AVG_POOL) return 7u;
     if (net->graph) return 6u;
@@ -166,7 +170,7 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
     uint32_t L = net->layers - 1;              /* weight layers */
     for (uint32_t l = 0; l < L; l++)
         if (spingalett_precision_is_int(layer_precision(net, l, precision)) &&
-            spingalett_weight_row_len(net, l) > SLETT_MAX_INT_INPUTS) {
+            net->shapes[l + 1].type != LAYER_EMBEDDING && spingalett_weight_row_len(net, l) > SLETT_MAX_INT_INPUTS) {
             set_error(SPINGALETT_ERR_INVALID, "save: integer precisions allow at most 131072 weights per output");
             return NULL;
         }
@@ -200,6 +204,7 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             pos = slett_align(pos + 4u * (uint64_t)spingalett_input_count(net, l + 1));
         }
         if (rows == 0) continue;                /* pooling, adding, concatenating: no parameters */
+        const uint64_t biases = spingalett_bias_count(net, l);
         off[4 * l] = pos;
         pos = slett_align(pos + spingalett_slett_row_bytes(p, row_len) * rows);
         if (spingalett_precision_is_int(p) || net->shapes[l + 1].type == LAYER_BATCH_NORM) {
@@ -207,11 +212,13 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             off[4 * l + 1] = pos;
             pos = slett_align(pos + (uint64_t)rows * (spingalett_precision_is_int(p) ? 4u : 8u));
         }
-        off[4 * l + 2] = pos;
-        pos = slett_align(pos + (uint64_t)rows * 4u);
+        if (biases) {                           /* (none for RMS normalization, embeddings without positions) */
+            off[4 * l + 2] = pos;
+            pos = slett_align(pos + biases * 4u);
+        }
         if (save_optimizer) {
             off[4 * l + 3] = pos;
-            pos = slett_align(pos + ((uint64_t)rows * row_len * 2u + (uint64_t)rows * 2u) * 4u);
+            pos = slett_align(pos + ((uint64_t)rows * row_len * 2u + biases * 2u) * 4u);
         }
     }
     if (pos > (uint64_t)SIZE_MAX - SPINGALETT_ALIGNMENT) {
@@ -261,13 +268,23 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             for (int k = 0; k < 8; k++) slett_put16(e + 48 + 2 * k, (uint16_t)fields[k]);
         }
         if (version >= 5u) {
-            slett_put32(e + 64, spingalett_filters(shape->type) ? shape->groups : 0u);
+            /* groups; an attention's heads, an embedding's vocabulary (version 8) */
+            slett_put32(e + 64, spingalett_filters(shape->type) ? shape->groups : shape->type == LAYER_ATTENTION
+                                ? shape->heads : shape->type == LAYER_EMBEDDING ? shape->vocabulary : 0u);
             memcpy(&bits, &shape->eps, 4);
             slett_put32(e + 68, bits);
             memcpy(&bits, &shape->momentum, 4);
             slett_put32(e + 72, bits);
         }
-        if (version >= 7u) slett_put32(e + 76, shape->type == LAYER_UPSAMPLE ? shape->mode : 0u);
+        if (version >= 7u)                      /* the upsampling mode; attention's causal mask, embeddings' positions */
+            slett_put32(e + 76, shape->type == LAYER_UPSAMPLE ? shape->mode
+                                : shape->type == LAYER_ATTENTION ? (shape->causal ? 1u : 0u)
+                                : shape->type == LAYER_EMBEDDING ? (shape->positions ? 1u : 0u) : 0u);
+        if (version >= 8u && shape->type == LAYER_ATTENTION) {
+            slett_put32(e + 104, shape->kv_heads);
+            memcpy(&bits, &shape->theta, 4);
+            slett_put32(e + 108, bits);
+        }
         if (version >= 6u) {
             const uint32_t count = spingalett_input_count(net, l + 1), *in = spingalett_inputs(net, l + 1);
             slett_put32(e + 80, count);
@@ -288,10 +305,11 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             memcpy(img + off[4 * l + 1], net->running_mean + net->bias_offsets[l], (size_t)rows * 4u);
             memcpy(img + off[4 * l + 1] + (size_t)rows * 4u, net->running_var + net->bias_offsets[l], (size_t)rows * 4u);
         }
-        memcpy(img + off[4 * l + 2], net->biases + net->bias_offsets[l], (size_t)rows * 4u);
+        const size_t bbytes = (size_t)spingalett_bias_count(net, l) * 4u;
+        if (bbytes) memcpy(img + off[4 * l + 2], net->biases + net->bias_offsets[l], bbytes);
         if (save_optimizer && net->opt_m_weights) {     /* without, before any training: the zeros the image has */
             uint8_t *o = img + off[4 * l + 3];
-            size_t wbytes = (size_t)rows * row_len * 4u, bbytes = (size_t)rows * 4u;
+            size_t wbytes = (size_t)rows * row_len * 4u;
             memcpy(o, net->opt_m_weights + net->weight_offsets[l], wbytes);
             memcpy(o + wbytes, net->opt_v_weights + net->weight_offsets[l], wbytes);
             memcpy(o + 2u * wbytes, net->opt_m_biases + net->bias_offsets[l], bbytes);
@@ -377,12 +395,12 @@ static NeuralNetwork *fold_batch_norm(const NeuralNetwork *net, bool *failed) {
         if (foldable(net, uses, l)) continue;   /* folded into its input below */
         const uint32_t k = map[l] - 1;          /* weight layer l - 1 becomes weight layer k */
         uint64_t rows = spingalett_weight_rows(net, l - 1), len = spingalett_weight_row_len(net, l - 1);
-        uint64_t sw = net->weight_offsets[l - 1], sb = net->bias_offsets[l - 1];
+        uint64_t sw = net->weight_offsets[l - 1], sb = net->bias_offsets[l - 1], nb = spingalett_bias_count(net, l - 1);
         uint64_t dw = f->weight_offsets[k], db = f->bias_offsets[k];
         memcpy(f->weights + dw, net->weights + sw, (size_t)(rows * len) * sizeof(float));
-        memcpy(f->biases + db, net->biases + sb, (size_t)rows * sizeof(float));
-        memcpy(f->running_mean + db, net->running_mean + sb, (size_t)rows * sizeof(float));
-        memcpy(f->running_var + db, net->running_var + sb, (size_t)rows * sizeof(float));
+        memcpy(f->biases + db, net->biases + sb, (size_t)nb * sizeof(float));
+        memcpy(f->running_mean + db, net->running_mean + sb, (size_t)nb * sizeof(float));
+        memcpy(f->running_var + db, net->running_var + sb, (size_t)nb * sizeof(float));
         if (into[l]) {
             /* weight layer into[l] - 1 is the normalization of this layer's rows (one channel each) */
             const uint32_t b = into[l];
@@ -538,7 +556,7 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
         spingalett_slett_layer(p, l, &e);
         neurons += e.outputs;
         weights += (uint64_t)e.rows * e.row_len;
-        biases += e.rows;
+        biases += e.type == LAYER_EMBEDDING ? (e.positions ? e.outputs : 0u) : e.type == LAYER_RMS_NORM ? 0u : e.rows;
     }
     (void)spingalett_network_reserve(net, neurons, weights, biases);
     bool ok = spingalett_add_layer(input);
@@ -555,10 +573,20 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
         for (uint32_t k = 0; k < e.input_count; k++) a.inputs[k] = spingalett_slett_input(p, &e, k);
         if (e.type == LAYER_DENSE) {
             a.neurons_amount = e.outputs;
-        } else if (e.type == LAYER_BATCH_NORM || e.type == LAYER_LAYER_NORM) {
+        } else if (e.type == LAYER_BATCH_NORM || e.type == LAYER_LAYER_NORM || e.type == LAYER_RMS_NORM) {
             a.epsilon = e.eps;
             a.momentum = e.momentum;
-        } else if (e.type == LAYER_ADD || e.type == LAYER_CONCAT || e.type == LAYER_GLOBAL_AVG_POOL) {
+        } else if (e.type == LAYER_EMBEDDING) {
+            a.neurons_amount = e.out_c;
+            a.vocabulary = e.vocabulary;
+            a.positions = e.positions;
+        } else if (e.type == LAYER_ATTENTION) {
+            a.heads = e.heads;
+            a.kv_heads = e.kv_heads;
+            a.rope_theta = e.theta;
+            a.causal = e.causal;
+        } else if (e.type == LAYER_ADD || e.type == LAYER_CONCAT || e.type == LAYER_GLOBAL_AVG_POOL ||
+                   e.type == LAYER_MULTIPLY) {
             /* the inputs give the shape */
         } else if (e.type == LAYER_UPSAMPLE) {
             a.stride_h = e.stride_h;
@@ -604,7 +632,8 @@ static NeuralNetwork *load_image(const uint8_t *p, size_t size, PrecisionMode *p
     for (uint32_t l = 0; l < L; l++) {
         SlettLayer e;
         spingalett_slett_layer(p, l, &e);
-        if (first && (e.type == LAYER_DENSE || e.type == LAYER_CONV2D || e.type == LAYER_CONV_TRANSPOSE2D)) {
+        if (first && (e.type == LAYER_DENSE || e.type == LAYER_CONV2D || e.type == LAYER_CONV_TRANSPOSE2D ||
+                      e.type == LAYER_EMBEDDING)) {
             *precision = e.precision;
             first = false;
         }
@@ -653,14 +682,15 @@ static NeuralNetwork *load_image(const uint8_t *p, size_t size, PrecisionMode *p
                     break;
             }
         }
-        memcpy(net->biases + net->bias_offsets[l], p + e.biases, (size_t)e.rows * 4u);
+        const size_t bbytes = (size_t)spingalett_bias_count(net, l) * 4u;
+        if (bbytes) memcpy(net->biases + net->bias_offsets[l], p + e.biases, bbytes);
         if (e.type == LAYER_BATCH_NORM) {
             memcpy(net->running_mean + net->bias_offsets[l], p + e.scales, (size_t)e.rows * 4u);
             memcpy(net->running_var + net->bias_offsets[l], p + e.scales + (size_t)e.rows * 4u, (size_t)e.rows * 4u);
         }
         if (info.flags & SLETT_FLAG_OPTIMIZER) {
             const uint8_t *o = p + e.optimizer;
-            size_t wbytes = (size_t)e.rows * e.row_len * 4u, bbytes = (size_t)e.rows * 4u;
+            size_t wbytes = (size_t)e.rows * e.row_len * 4u;
             memcpy(net->opt_m_weights + net->weight_offsets[l], o, wbytes);
             memcpy(net->opt_v_weights + net->weight_offsets[l], o + wbytes, wbytes);
             memcpy(net->opt_m_biases + net->bias_offsets[l], o + 2u * wbytes, bbytes);

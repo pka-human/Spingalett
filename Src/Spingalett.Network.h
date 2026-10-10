@@ -21,8 +21,13 @@ typedef struct {
     uint32_t height, width, channels;
     uint32_t kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w;
     uint32_t groups;                /* conv and transposed conv: channel groups (1 otherwise) */
-    float eps, momentum;            /* batch normalization (0 otherwise); layer normalization: eps */
+    float eps, momentum;            /* batch normalization (0 otherwise); layer and RMS normalization: eps */
     uint32_t mode;                  /* upsampling: UpsampleMode */
+    uint32_t vocabulary;            /* embedding: rows of its table */
+    uint32_t heads, kv_heads;       /* attention: query heads, key and value heads */
+    float theta;                    /* attention: base of the rotary position embeddings (0: none) */
+    bool causal;                    /* attention: each cell attends to the cells up to itself */
+    bool positions;                 /* embedding: a learned vector a cell, its biases */
 } LayerShape;
 
 /*
@@ -116,20 +121,23 @@ static inline uint32_t spingalett_source(const NeuralNetwork *net, uint32_t l) {
 }
 
 /* Weight layer l as a matrix: rows (dense outputs, conv and transposed conv filters, normalization
-   channels) of row_len weights (dense inputs, kernel_h x kernel_w x input channels of the filter's
-   group, the normalization's gamma), one bias per row; pooling, adding, concatenating and
-   upsampling layers have none. A transposed convolution's filter j holds, at (kh, kw, c), the weight
-   by which input channel c of its group reaches output channel j at offset (kh, kw) of the input
-   cell's window. */
+   channels, an embedding's tokens) of row_len weights (dense inputs, kernel_h x kernel_w x input
+   channels of the filter's group, the normalization's gamma, an embedding's channels), one bias per
+   row (spingalett_bias_count()); pooling, adding, concatenating, multiplying, upsampling and attention
+   layers have none. A transposed convolution's filter j holds, at (kh, kw, c), the weight by which
+   input channel c of its group reaches output channel j at offset (kh, kw) of the input cell's
+   window. An RMS normalization has no biases, an embedding a vector of its channels a cell (the
+   positions') or none. */
 static inline bool spingalett_filters(LayerType type) { return type == LAYER_CONV2D || type == LAYER_CONV_TRANSPOSE2D; }
 static inline bool spingalett_normalization(LayerType type) {
-    return type == LAYER_BATCH_NORM || type == LAYER_LAYER_NORM;
+    return type == LAYER_BATCH_NORM || type == LAYER_LAYER_NORM || type == LAYER_RMS_NORM;
 }
 
 static inline uint32_t spingalett_weight_rows(const NeuralNetwork *net, uint32_t l) {
     const LayerShape *s = &net->shapes[l + 1];
     return s->type == LAYER_DENSE ? net->topology[l + 1]
-         : spingalett_filters(s->type) || spingalett_normalization(s->type) ? s->channels : 0u;
+         : spingalett_filters(s->type) || spingalett_normalization(s->type) ? s->channels
+         : s->type == LAYER_EMBEDDING ? s->vocabulary : 0u;
 }
 
 static inline uint32_t spingalett_weight_row_len(const NeuralNetwork *net, uint32_t l) {
@@ -137,13 +145,39 @@ static inline uint32_t spingalett_weight_row_len(const NeuralNetwork *net, uint3
     const uint32_t src = spingalett_source(net, l + 1);
     return s->type == LAYER_DENSE ? net->topology[src]
          : spingalett_filters(s->type) ? s->kernel_h * s->kernel_w * (net->shapes[src].channels / s->groups)
-         : spingalett_normalization(s->type) ? 1u : 0u;
+         : spingalett_normalization(s->type) ? 1u
+         : s->type == LAYER_EMBEDDING ? s->channels : 0u;
 }
 
-/* Whether every weight layer is dense and reads the one before it (the network of earlier versions). */
+static inline uint64_t spingalett_weight_count(const NeuralNetwork *net, uint32_t l) {
+    return (uint64_t)spingalett_weight_rows(net, l) * spingalett_weight_row_len(net, l);
+}
+
+static inline uint32_t spingalett_bias_count(const NeuralNetwork *net, uint32_t l) {
+    const LayerShape *s = &net->shapes[l + 1];
+    return s->type == LAYER_RMS_NORM ? 0u
+         : s->type == LAYER_EMBEDDING ? (s->positions ? net->topology[l + 1] : 0u)
+         : spingalett_weight_rows(net, l);
+}
+
+/* Targets a sample has: one a cell of the output layer for LOSS_SPARSE_CROSS_ENTROPY (class indices),
+   its outputs otherwise. */
+static inline uint32_t spingalett_targets_of(const NeuralNetwork *net) {
+    const LayerShape *s = &net->shapes[net->layers - 1];
+    return net->loss_func == LOSS_SPARSE_CROSS_ENTROPY ? s->height * s->width : net->topology[net->layers - 1];
+}
+
+/* Whether an activation's derivative needs the layer's values before it (GELU, SiLU): training keeps
+   them for such a layer (BatchWorkspace.pre). */
+static inline bool spingalett_act_needs_input(ActivationFunction act) {
+    return act == ACT_GELU || act == ACT_GELU_TANH || act == ACT_SILU;
+}
+
+/* Whether every weight layer is dense and reads the one before it, with activations whose derivatives
+   their outputs give (the network of earlier versions, which the per-sample path trains). */
 static inline bool spingalett_all_dense(const NeuralNetwork *net) {
     if (net->graph) return false;
     for (uint32_t l = 1; l < net->layers; l++)
-        if (net->shapes[l].type != LAYER_DENSE) return false;
+        if (net->shapes[l].type != LAYER_DENSE || net->act_func[l - 1] >= ACT_GELU) return false;
     return true;
 }

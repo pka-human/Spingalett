@@ -54,10 +54,14 @@ typedef struct {
     uint64_t act_offset;                            /* version 6: byte offset of the output in the
                                                        workspace's activations (0 for the last layer) */
     uint32_t mode;                                  /* version 7: upsampling: UpsampleMode */
+    uint32_t vocabulary;                            /* version 8: embedding: rows (= rows) */
+    uint32_t heads, kv_heads;                       /* version 8: attention */
+    float theta;                                    /* version 8: attention: rotary embeddings' base */
+    bool causal, positions;                         /* version 8: attention, embedding */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3 to 7 */
+    uint32_t version;           /* 3 to 8 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -78,14 +82,16 @@ static inline void slett_put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 static inline void slett_put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 static inline void slett_put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 /* Activations as .slett files code them, fixed since format version 1: 0 sigmoid, 1 ReLU, 2 tanh,
-   3 leaky ReLU, 4 FOO52, 5 softmax, 6 none; ActivationFunction has none first, then the same order.
-   slett_act() gives ACT_COUNT for a code that names none. */
+   3 leaky ReLU, 4 FOO52, 5 softmax, 6 none; from version 8 also 7 GELU, 8 GELU's tanh approximation,
+   9 SiLU. ActivationFunction has none first, then the same order (GELU is 7 in both). slett_act()
+   gives ACT_COUNT for a code that names none. */
 #define SLETT_ACT_NONE 6u
 static inline uint8_t slett_act_code(ActivationFunction act) {
-    return act == ACT_NONE ? (uint8_t)SLETT_ACT_NONE : (uint8_t)(act - 1);
+    return act == ACT_NONE ? (uint8_t)SLETT_ACT_NONE : act >= ACT_GELU ? (uint8_t)act : (uint8_t)(act - 1);
 }
 static inline ActivationFunction slett_act(uint32_t code) {
-    return code == SLETT_ACT_NONE ? ACT_NONE : code < SLETT_ACT_NONE ? (ActivationFunction)(code + 1u) : ACT_COUNT;
+    return code == SLETT_ACT_NONE ? ACT_NONE : code < SLETT_ACT_NONE ? (ActivationFunction)(code + 1u)
+         : code < (uint32_t)ACT_COUNT ? (ActivationFunction)code : ACT_COUNT;
 }
 static inline uint64_t slett_align(uint64_t x) { return (x + SLETT_SECTION_ALIGN - 1) & ~(uint64_t)(SLETT_SECTION_ALIGN - 1); }
 
@@ -180,11 +186,51 @@ void spingalett_engine_bilinear(uint32_t o, uint32_t factor, uint32_t in, uint32
 void spingalett_engine_layer_norm(const float *x, uint32_t cells, uint32_t channels, const float *gamma,
                                   const float *beta, float eps, float *y, float *stats);
 
+/* RMS normalization of `cells` cells of `channels` values: y = gamma x / sqrt(mean of x^2 + eps) per cell
+   (float sums in channel order); stats, when not NULL, gets each cell's 1 / sqrt(mean of x^2 + eps). */
+void spingalett_engine_rms_norm(const float *x, uint32_t cells, uint32_t channels, const float *gamma, float eps,
+                                float *y, float *stats);
+/* y = x[0] x[1] ... over n values, the inputs multiplied in their order. */
+void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y, uint32_t n);
+/* The rotary position embeddings of `cells` positions and heads of `head` values: table[p * half + i] the
+   cosine and table[cells * half + p * half + i] the sine of p theta^(-2 i / head), for i below half = head
+   / 2, computed in double and rounded to float (alike on every platform that rounds double alike: the
+   same table for every backend). A vector's halves are paired: x'[i] = x[i] cos - x[i + half] sin,
+   x'[i + half] = x[i + half] cos + x[i] sin. */
+void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, float *table);
+/* The attention of one sample, as the engine computes it: x of `cells` cells of (heads + 2 kv) x head
+   values (queries, keys, values), y of cells x heads x head values; each query's scores in the order of
+   the keys, its softmax online (the running maximum and sum, the values' weighted sum rescaled when the
+   maximum grows), causal: the keys up to its cell. With a table (the rotary embeddings) the queries and
+   keys are rotated first, in scratch of slett_attention_floats() floats. */
+void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads, uint32_t kv, uint32_t head,
+                                 bool causal, const float *table, float *y, float *scratch);
+/* An embedding of one sample: a row of L's table (in its precision, as floats) for every input value, zeros
+   for values outside it, plus the position's vector with positions. */
+void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);
+static inline uint64_t slett_attention_floats(uint32_t cells, uint32_t kv, uint32_t head, bool rope) {
+    return rope ? (uint64_t)cells * kv * head + (uint64_t)cells * head + head : 0u;
+}
+
+/* GELU, its tanh approximation and SiLU of one value. */
+static inline float spingalett_engine_activate_one(float x, ActivationFunction act) {
+    if (act == ACT_GELU) return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f));
+    if (act == ACT_GELU_TANH) {
+        const float u = 0.79788456080286536f * (x + 0.044715f * x * x * x);
+        return 0.5f * x * (1.0f + tanhf(u));
+    }
+    if (act == ACT_SILU) return x / (1.0f + expf(-x));
+    return x;
+}
+
 /* Bytes of engine scratch layer L needs: a convolution its transposed filters and one pixel's sums,
    or a gathered window (of its group's channels; an INT8 convolution with one group four windows
-   and the sums of its filters); batch normalization its coefficients (0 for other layers). */
+   and the sums of its filters); batch normalization its coefficients; attention with rotary
+   embeddings its table and rotated keys (0 for other layers). */
 static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
     if (L->type == LAYER_BATCH_NORM) return (uint64_t)L->out_c * 8u;
+    if (L->type == LAYER_ATTENTION)
+        return 4u * slett_attention_floats(L->out_h * L->out_w, L->kv_heads, L->out_c / L->heads, L->theta > 0.0f);
     if (L->type == LAYER_CONV_TRANSPOSE2D) return (uint64_t)L->row_len * 4u;     /* a window of its group */
     if (L->type != LAYER_CONV2D) return 0;
     if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) {

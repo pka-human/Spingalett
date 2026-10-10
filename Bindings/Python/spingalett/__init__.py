@@ -44,7 +44,7 @@ __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
-    "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample",
+    "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample", "Linear", "Embedding", "Attention", "RMSNorm", "Multiply",
     "Model", "LayerInfo", "DeviceData",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
@@ -66,11 +66,15 @@ class Activation(enum.IntEnum):
     LEAKY_RELU = 4
     FOO52 = 5
     SOFTMAX = 6
+    GELU = 7        # x Phi(x); its derivative needs the layer's values before it, which training keeps
+    GELU_TANH = 8   # GELU's tanh approximation (GPT-2's)
+    SILU = 9        # x sigmoid(x)
 
 
 class Loss(enum.IntEnum):
     MSE = 0
     CROSS_ENTROPY = 1
+    SPARSE_CROSS_ENTROPY = 2    # softmax over each cell's channels against a class index a cell (-1: none)
 
 
 class Init(enum.IntEnum):
@@ -124,6 +128,10 @@ class LayerType(enum.IntEnum):
     CONV_TRANSPOSE2D = 8
     UPSAMPLE = 9
     LAYER_NORM = 10
+    EMBEDDING = 11
+    ATTENTION = 12
+    RMS_NORM = 13
+    MULTIPLY = 14
 
 
 class Upsample(enum.IntEnum):
@@ -220,7 +228,13 @@ class _NetworkLayer(Structure):
         ("input_count", c_uint32),
         ("inputs", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
-        ("reserved", c_uint64 * _RESERVED),
+        ("vocabulary", c_uint32),
+        ("heads", c_uint32),
+        ("kv_heads", c_uint32),
+        ("rope_theta", c_float),
+        ("causal", c_bool),
+        ("positions", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 2)),
     ]
 
 
@@ -299,7 +313,13 @@ class _LayerArgs(Structure):
         ("output_padding", c_uint32),
         ("output_padding_h", c_uint32),
         ("output_padding_w", c_uint32),
-        ("reserved", c_uint64 * _RESERVED),
+        ("vocabulary", c_uint32),
+        ("heads", c_uint32),
+        ("kv_heads", c_uint32),
+        ("rope_theta", c_float),
+        ("causal", c_bool),
+        ("positions", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 3)),
     ]
 
 
@@ -521,7 +541,13 @@ class _LayerInfo(Structure):
         ("input_count", c_uint32),
         ("input_layers", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
-        ("reserved", c_uint64 * _RESERVED),
+        ("vocabulary", c_uint32),
+        ("heads", c_uint32),
+        ("kv_heads", c_uint32),
+        ("rope_theta", c_float),
+        ("causal", c_bool),
+        ("positions", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 2)),
     ]
 
 
@@ -616,6 +642,7 @@ _layer = _bind("spingalett_append_layer", c_uint32, [_LayerArgs])
 _layer_count = _bind("spingalett_layer_count", c_uint32, [_NetPtr])
 _input_size = _bind("spingalett_input_size", c_uint32, [_NetPtr])
 _output_size = _bind("spingalett_output_size", c_uint32, [_NetPtr])
+_target_size = _bind("spingalett_target_size", c_uint32, [_NetPtr])
 _network_layer = _bind("spingalett_network_layer", c_bool, [_NetPtr, c_uint32, POINTER(_NetworkLayer)])
 _parameter_count = _bind("spingalett_parameter_count", c_uint64, [_NetPtr])
 _network_loss = _bind("spingalett_network_loss", c_int, [_NetPtr])
@@ -1002,6 +1029,62 @@ class LayerNorm:
 
 
 @dataclasses.dataclass(frozen=True)
+class Linear:
+    """A dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution): the linear
+    layers of transformers over their tokens."""
+    neurons: int
+    activation: Activation = Activation.NONE
+    init: Init = Init.LECUN
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Embedding:
+    """Token embeddings: each input value the index of a row of ``vocabulary`` rows of ``size`` values;
+    with ``positions``, a learned vector a cell added (GPT-2's absolute positions)."""
+    vocabulary: int
+    size: int
+    positions: bool = False
+    activation: Activation = Activation.NONE
+    init: Init = Init.LECUN
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Attention:
+    """Multi-head scaled dot-product attention over the cells of a layer of queries, keys and values side
+    by side ((heads + 2 kv_heads) x head size channels a cell): ``kv_heads`` key and value heads (fewer
+    than ``heads``: grouped-query attention), ``causal`` masking, rotary position embeddings of base
+    ``rope_theta`` (0: none)."""
+    heads: int = 1
+    kv_heads: int = 0
+    causal: bool = False
+    rope_theta: float = 0.0
+    activation: Activation = Activation.NONE
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RMSNorm:
+    """RMS normalization over each cell's channels (a gamma per channel, no beta), then ``activation``."""
+    activation: Activation = Activation.NONE
+    epsilon: float = 1e-5
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Multiply:
+    """The element-wise product of earlier layers of one shape (SwiGLU's gate), then ``activation``."""
+    inputs: _Inputs
+    activation: Activation = Activation.NONE
+    dropout: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
 class LayerDescription:
     """Layer ``index`` of a :class:`Network` (0 is the input layer)."""
     type: LayerType
@@ -1018,6 +1101,12 @@ class LayerDescription:
     epsilon: float = 0.0            # batch normalization
     momentum: float = 0.0
     inputs: Tuple[int, ...] = ()    # the layers it reads (none for the input layer)
+    vocabulary: int = 0             # embedding: rows of its table
+    heads: int = 0                  # attention: query heads
+    kv_heads: int = 0               # attention: key and value heads
+    rope_theta: float = 0.0         # attention: base of the rotary position embeddings (0: none)
+    causal: bool = False            # attention: each cell attends to the cells up to itself
+    positions: bool = False         # embedding: a learned vector a cell
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1221,6 +1310,18 @@ class Network:
                 self.add_upsample(spec.factor, spec.mode, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, LayerNorm):
                 self.add_layer_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, Linear):
+                self.add_linear(spec.neurons, spec.activation, spec.init, spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, Embedding):
+                self.add_embedding(spec.vocabulary, spec.size, spec.positions, spec.activation, spec.init, spec.dropout,
+                                   inputs=spec.inputs)
+            elif isinstance(spec, Attention):
+                self.add_attention(spec.heads, spec.kv_heads, spec.causal, spec.rope_theta, spec.activation,
+                                   spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, RMSNorm):
+                self.add_rms_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, Multiply):
+                self.add_multiply(spec.inputs, spec.activation, spec.dropout)
             else:
                 self.add_layer(int(spec))
 
@@ -1371,6 +1472,45 @@ class Network:
         return self._add(inputs, type=int(LayerType.LAYER_NORM), act_func=int(activation), epsilon=float(epsilon),
                          dropout_rate=float(dropout))
 
+    def add_linear(self, neurons: int, activation: Activation = Activation.NONE, init: Init = Init.LECUN,
+                   dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
+        """Append a dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution),
+        the linear layers of transformers over their tokens."""
+        return self._add(inputs, type=int(LayerType.CONV2D), filters=int(neurons), kernel=1,
+                         act_func=int(activation), weight_initialization=int(init), dropout_rate=float(dropout))
+
+    def add_embedding(self, vocabulary: int, size: int, positions: bool = False,
+                      activation: Activation = Activation.NONE, init: Init = Init.LECUN, dropout: float = 0.0,
+                      inputs: _Inputs = None) -> "Network":
+        """Append token embeddings: each input value (a token's index, as a float) the row of a table of
+        ``vocabulary`` rows of ``size`` values (indices outside it give zeros), plus with ``positions`` a
+        learned vector a cell. A sequence of n tokens (an input layer of n values) gives n cells."""
+        return self._add(inputs, type=int(LayerType.EMBEDDING), vocabulary=int(vocabulary), neurons_amount=int(size),
+                         positions=bool(positions), act_func=int(activation), weight_initialization=int(init),
+                         dropout_rate=float(dropout))
+
+    def add_attention(self, heads: int = 1, kv_heads: int = 0, causal: bool = False, rope_theta: float = 0.0,
+                      activation: Activation = Activation.NONE, dropout: float = 0.0,
+                      inputs: _Inputs = None) -> "Network":
+        """Append multi-head attention over the cells of a layer whose channels hold each cell's queries,
+        keys and values side by side: ``heads`` query vectors, then ``kv_heads`` (0: as many as heads)
+        key and value vectors of one head size; ``causal`` lets each cell attend to the cells up to
+        itself only, ``rope_theta`` (10000 is usual) rotates queries and keys by position."""
+        return self._add(inputs, type=int(LayerType.ATTENTION), heads=int(heads), kv_heads=int(kv_heads),
+                         causal=bool(causal), rope_theta=float(rope_theta), act_func=int(activation),
+                         dropout_rate=float(dropout))
+
+    def add_rms_norm(self, activation: Activation = Activation.NONE, epsilon: float = 1e-5, dropout: float = 0.0,
+                     inputs: _Inputs = None) -> "Network":
+        """Append RMS normalization over each cell's channels (a gamma per channel), then ``activation``."""
+        return self._add(inputs, type=int(LayerType.RMS_NORM), act_func=int(activation), epsilon=float(epsilon),
+                         dropout_rate=float(dropout))
+
+    def add_multiply(self, inputs: _Inputs, activation: Activation = Activation.NONE,
+                     dropout: float = 0.0) -> "Network":
+        """Append the element-wise product of earlier layers of one shape, then ``activation``."""
+        return self._add(inputs, type=int(LayerType.MULTIPLY), act_func=int(activation), dropout_rate=float(dropout))
+
     def layer(self, index: int) -> LayerDescription:
         """Layer ``index`` (0 is the input layer)."""
         info = _NetworkLayer()
@@ -1382,7 +1522,9 @@ class Network:
                                 Activation(info.activation), float(info.dropout_rate), (info.kernel_h, info.kernel_w),
                                 (info.stride_h, info.stride_w), (info.padding_h, info.padding_w),
                                 int(info.weight_count), int(info.bias_count), int(info.groups), float(info.epsilon),
-                                float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)))
+                                float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)),
+                                int(info.vocabulary), int(info.heads), int(info.kv_heads), float(info.rope_theta),
+                                bool(info.causal), bool(info.positions))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -1414,6 +1556,12 @@ class Network:
         return int(_output_size(self._net))
 
     @property
+    def target_size(self) -> int:
+        """Targets a sample has: the output size, or for ``Loss.SPARSE_CROSS_ENTROPY`` the output's cells
+        (a class index each)."""
+        return int(_target_size(self._net))
+
+    @property
     def num_parameters(self) -> int:
         return int(_parameter_count(self._net))
 
@@ -1431,8 +1579,10 @@ class Network:
         info = self.layer(i)
         if info.type in (LayerType.CONV2D, LayerType.CONV_TRANSPOSE2D):
             shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(info.inputs[0]).shape[2] // info.groups)
-        elif info.type in (LayerType.BATCH_NORM, LayerType.LAYER_NORM):
-            shape = (info.bias_count,)
+        elif info.type in (LayerType.BATCH_NORM, LayerType.LAYER_NORM, LayerType.RMS_NORM):
+            shape = (info.shape[2],)
+        elif info.type == LayerType.EMBEDDING:
+            shape = (info.vocabulary, info.shape[2])
         else:
             shape = (info.bias_count, info.weight_count // info.bias_count if info.bias_count else 0)
         return i, info, shape
@@ -1519,8 +1669,8 @@ class Network:
         """Inputs and targets as arrays of rows, or DeviceData (either or both)."""
         x = (self._rows(inputs, self.input_size, what + "inputs") if isinstance(inputs, DeviceData)
              else _as_matrix(inputs, self.input_size, what + "inputs"))
-        y = (self._rows(targets, self.output_size, what + "targets") if isinstance(targets, DeviceData)
-             else _as_matrix(targets, self.output_size, what + "targets", images=False))
+        y = (self._rows(targets, self.target_size, what + "targets") if isinstance(targets, DeviceData)
+             else _as_matrix(targets, self.target_size, what + "targets", images=False))
         if len(x) != len(y):
             raise ValueError(f"{what}inputs have {len(x)} rows but {what}targets have {len(y)}")
         if len(x) == 0:
@@ -1551,11 +1701,11 @@ class Network:
         if raw is not None and raw.dtype == np.uint8:
             # image bytes stay bytes: a reader converts a batch at a time (a quarter of the memory)
             xb = np.ascontiguousarray(raw).reshape(-1, self.input_size) if raw.size % self.input_size == 0 else None
-            y = _as_matrix(targets, self.output_size, "targets", images=False)
+            y = _as_matrix(targets, self.target_size, "targets", images=False)
             if xb is None or xb.shape[0] != y.shape[0] or xb.shape[0] == 0:
                 raise ValueError(f"inputs {raw.shape} and targets {y.shape} do not match the network")
             reader = _call(_dataset_open_u8, xb.ctypes.data_as(POINTER(ctypes.c_uint8)), _float_ptr(y),
-                           xb.shape[0], self.input_size, self.output_size, bool(cfg.shuffle))
+                           xb.shape[0], self.input_size, self.target_size, bool(cfg.shuffle))
             try:
                 return self._run(cfg, _MODE_GENERATOR, None, None, int(xb.shape[0]),
                                  _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
@@ -1597,9 +1747,9 @@ class Network:
         reader = _call(_dataset_open, _encode_path(path), ctypes.byref(opts))
         try:
             info = _dataset_info(reader)
-            if (info.input_size, info.target_size) != (self.input_size, self.output_size):
+            if (info.input_size, info.target_size) != (self.input_size, self.target_size):
                 raise ValueError(f"{path!s} has {info.input_size} inputs and {info.target_size} targets, "
-                                 f"the network {self.input_size} and {self.output_size}")
+                                 f"the network {self.input_size} and {self.target_size}")
             return self._run(cfg, _MODE_GENERATOR, None, None, int(info.count),
                              _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
         finally:
@@ -1653,7 +1803,7 @@ class Network:
         if isinstance(generator, _NativeGenerator):
             c_gen, c_gen_data = generator.fn, generator.data
         elif generator is not None:
-            n_in, n_out = self.input_size, self.output_size
+            n_in, n_out = self.input_size, self.target_size
 
             def produce(in_ptr, tg_ptr, requested, _ud):
                 if pending:
@@ -1874,6 +2024,12 @@ class LayerInfo:
     groups: int = 0
     epsilon: float = 0.0
     input_layers: Tuple[int, ...] = ()  # network layers it reads (0: the input; i + 1: layer i here)
+    vocabulary: int = 0                 # embedding: rows of its table
+    heads: int = 0                      # attention: query heads
+    kv_heads: int = 0                   # attention: key and value heads
+    rope_theta: float = 0.0             # attention: base of the rotary position embeddings (0: none)
+    causal: bool = False                # attention: each cell attends to the cells up to itself
+    positions: bool = False             # embedding: a learned vector a cell
 
 
 class Model:
@@ -1968,7 +2124,10 @@ class Model:
                                  stride=(int(info.stride_h), int(info.stride_w)),
                                  padding=(int(info.padding_h), int(info.padding_w)),
                                  groups=int(info.groups), epsilon=float(info.epsilon),
-                                 input_layers=tuple(int(info.input_layers[k]) for k in range(info.input_count))))
+                                 input_layers=tuple(int(info.input_layers[k]) for k in range(info.input_count)),
+                                 vocabulary=int(info.vocabulary), heads=int(info.heads), kv_heads=int(info.kv_heads),
+                                 rope_theta=float(info.rope_theta), causal=bool(info.causal),
+                                 positions=bool(info.positions)))
         return out
 
     def to_bytes(self) -> bytes:
@@ -1995,7 +2154,9 @@ class Model:
     def evaluate(self, inputs, targets) -> Metrics:
         """Mean loss and accuracy over a data set, as :meth:`Network.evaluate` computes them."""
         x = _as_matrix(inputs, self.input_size, "inputs")
-        y = _as_matrix(targets, self.output_size, "targets", images=False)
+        last = self.layers[-1]
+        targets_size = last.shape[0] * last.shape[1] if self.loss == Loss.SPARSE_CROSS_ENTROPY else self.output_size
+        y = _as_matrix(targets, targets_size, "targets", images=False)
         if x.shape[0] != y.shape[0] or x.shape[0] == 0:
             raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
         return _metrics(_call(_model_evaluate, self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0]))
@@ -2067,7 +2228,7 @@ class Trainer:
 
     def backward(self, targets) -> float:
         """Back-propagates the network's loss for the last forward pass; returns the summed loss."""
-        y = _as_matrix(targets, self._network.output_size, "targets", images=False)
+        y = _as_matrix(targets, self._network.target_size, "targets", images=False)
         if y.shape[0] != self._rows:
             raise ValueError(f"targets have {y.shape[0]} rows, the last forward pass had {self._rows}")
         return float(_call(_trainer_backward, self._handle(), y.ctypes.data))

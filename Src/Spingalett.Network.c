@@ -23,8 +23,8 @@ static void compute_offsets(NeuralNetwork *net) {
         if (l + 1 < net->layers) {
             net->weight_offsets[l] = w;
             net->bias_offsets[l] = b;
-            w += (uint64_t)spingalett_weight_rows(net, l) * spingalett_weight_row_len(net, l);
-            b += (uint64_t)spingalett_weight_rows(net, l);
+            w += spingalett_weight_count(net, l);
+            b += spingalett_bias_count(net, l);
         }
     }
     net->total_neurons = n;
@@ -76,8 +76,8 @@ static bool layer_inputs(const NeuralNetwork *net, const LayerArgs *args, uint32
         }
         *count = n;
     }
-    if (*count > 1 && args->type != LAYER_ADD && args->type != LAYER_CONCAT)
-        return layer_error("Only add and concatenation layers read several layers");
+    if (*count > 1 && args->type != LAYER_ADD && args->type != LAYER_CONCAT && args->type != LAYER_MULTIPLY)
+        return layer_error("Only add, concatenation and multiplication layers read several layers");
     return true;
 }
 
@@ -104,19 +104,21 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
     } else if (args->type == LAYER_DENSE) {
         units = args->neurons_amount;
         shape->channels = args->neurons_amount;
-    } else if (args->type == LAYER_ADD || args->type == LAYER_CONCAT) {
-        /* adding: one shape for all; concatenating: one height and width, the channels summed */
+    } else if (args->type == LAYER_ADD || args->type == LAYER_CONCAT || args->type == LAYER_MULTIPLY) {
+        /* adding and multiplying: one shape for all; concatenating: one height and width, the channels
+           summed */
         const LayerShape *first = &net->shapes[inputs[0]];
+        const bool same = args->type != LAYER_CONCAT;
         uint64_t channels = 0;
         for (uint32_t k = 0; k < count; k++) {
             const LayerShape *in = &net->shapes[inputs[k]];
-            if (in->height != first->height || in->width != first->width ||
-                (args->type == LAYER_ADD && in->channels != first->channels))
+            if (in->height != first->height || in->width != first->width || (same && in->channels != first->channels))
                 return layer_error(args->type == LAYER_ADD ? "Added layers must have the same shape"
-                                                           : "Concatenated layers must have the same height and width");
+                                 : args->type == LAYER_MULTIPLY ? "Multiplied layers must have the same shape"
+                                                                : "Concatenated layers must have the same height and width");
             channels += in->channels;
         }
-        if (args->type == LAYER_ADD) channels = first->channels;
+        if (same) channels = first->channels;
         if (channels > UINT32_MAX)
             return layer_error("Layers are limited to 2^32 - 1 outputs");
         shape->height = first->height;
@@ -142,11 +144,51 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->width = in->width * sw;
         shape->channels = in->channels;
         units = (uint64_t)shape->height * shape->width * shape->channels;
-    } else if (args->type == LAYER_LAYER_NORM) {
+    } else if (args->type == LAYER_EMBEDDING) {
+        /* a row of the table for every value of the input: h x (w c) cells */
+        const LayerShape *in = &net->shapes[inputs[0]];
+        if (args->vocabulary == 0)
+            return layer_error("An embedding needs a vocabulary (the rows of its table)");
+        if (args->neurons_amount == 0)
+            return layer_error("An embedding needs neurons_amount (the values of a row)");
+        const uint64_t width = (uint64_t)in->width * in->channels;
+        if (width > 65535)
+            return layer_error("Layer heights and widths are limited to 65535");
+        shape->height = in->height;
+        shape->width = (uint32_t)width;
+        shape->channels = args->neurons_amount;
+        shape->vocabulary = args->vocabulary;
+        shape->positions = args->positions;
+        units = (uint64_t)in->height * width * args->neurons_amount;
+        if ((uint64_t)args->vocabulary * args->neurons_amount > (1ull << 40))
+            return layer_error("Embedding tables are limited to 2^40 values");
+    } else if (args->type == LAYER_ATTENTION) {
+        /* queries, keys and values of every cell side by side; the heads' results side by side */
+        const LayerShape *in = &net->shapes[inputs[0]];
+        const uint32_t heads = args->heads ? args->heads : 1u, kv = args->kv_heads ? args->kv_heads : heads;
+        if (heads > 4096 || kv > heads || heads % kv != 0)
+            return layer_error("Attention: kv_heads must divide heads (at most 4096)");
+        if (in->channels % (heads + 2u * kv) != 0)
+            return layer_error("Attention reads (heads + 2 kv_heads) x head size channels a cell");
+        const uint32_t head = in->channels / (heads + 2u * kv);
+        if (!(args->rope_theta >= 0.0f && args->rope_theta < INFINITY))
+            return layer_error("Attention: rope_theta must be 0 (none) or positive");
+        if (args->rope_theta > 0.0f && head % 2u != 0)
+            return layer_error("Attention: rotary position embeddings need an even head size");
+        shape->height = in->height;
+        shape->width = in->width;
+        shape->channels = heads * head;
+        shape->heads = heads;
+        shape->kv_heads = kv;
+        shape->theta = args->rope_theta;
+        shape->causal = args->causal;
+        units = (uint64_t)in->height * in->width * shape->channels;
+    } else if (args->type == LAYER_LAYER_NORM || args->type == LAYER_RMS_NORM) {
         /* the input's shape, normalized per cell */
         const LayerShape *in = &net->shapes[inputs[0]];
         if (!(args->epsilon >= 0.0f && args->epsilon < 1.0f))
-            return layer_error("Layer normalization needs epsilon in [0, 1)");
+            return layer_error(args->type == LAYER_LAYER_NORM ? "Layer normalization needs epsilon in [0, 1)"
+                                                              : "RMS normalization needs epsilon in [0, 1)");
         shape->height = in->height;
         shape->width = in->width;
         shape->channels = in->channels;
@@ -219,10 +261,11 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
             return layer_error("Padding must be smaller than the kernel");
         if ((uint64_t)in->height + 2u * ph < kh || (uint64_t)in->width + 2u * pw < kw)
             return layer_error("The kernel is larger than the (padded) input");
-        if (conv && args->filters == 0)
+        const uint32_t filters = args->filters ? args->filters : args->neurons_amount;
+        if (conv && filters == 0)
             return layer_error("A convolution layer needs filters > 0");
         uint32_t groups = conv && args->groups ? args->groups : 1u;
-        if (conv && (in->channels % groups != 0 || args->filters % groups != 0))
+        if (conv && (in->channels % groups != 0 || filters % groups != 0))
             return layer_error("Convolution groups must divide the input channels and the filters");
         shape->groups = groups;
         shape->kernel_h = kh; shape->kernel_w = kw;
@@ -230,7 +273,7 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->pad_h = ph; shape->pad_w = pw;
         shape->height = (uint32_t)(((uint64_t)in->height + 2u * ph - kh) / sh + 1u);
         shape->width = (uint32_t)(((uint64_t)in->width + 2u * pw - kw) / sw + 1u);
-        shape->channels = conv ? args->filters : in->channels;
+        shape->channels = conv ? filters : in->channels;
         units = (uint64_t)shape->height * shape->width * shape->channels;
         if (conv && (uint64_t)kh * kw * (in->channels / groups) > UINT32_MAX)
             return layer_error("Convolution windows are limited to 2^32 - 1 inputs");
@@ -382,7 +425,7 @@ bool spingalett_add_layer(LayerArgs args) {
     if (pooling) act_func = ACT_NONE;
     static const char *const type_names[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add",
                                              "concat", "global_avg_pool2d", "conv_transpose2d", "upsample2d",
-                                             "layer_norm"};
+                                             "layer_norm", "embedding", "attention", "rms_norm", "multiply"};
 
     uint32_t nl = net->layers + 1;
 
@@ -415,8 +458,10 @@ bool spingalett_add_layer(LayerArgs args) {
         row_len = shape.kernel_h * shape.kernel_w * (net->shapes[inputs[0]].channels / shape.groups);
     }
     if (nl > 1 && spingalett_normalization(shape.type)) { rows = shape.channels; row_len = 1; }
+    if (nl > 1 && shape.type == LAYER_EMBEDDING) { rows = shape.vocabulary; row_len = shape.channels; }
     uint64_t add_w = (uint64_t)rows * row_len;
-    uint64_t add_b = rows;
+    uint64_t add_b = shape.type == LAYER_RMS_NORM ? 0u
+                   : shape.type == LAYER_EMBEDDING ? (shape.positions ? (uint64_t)neurons_amount : 0u) : rows;
 
     uint64_t new_tn = net->total_neurons + (uint64_t)neurons_amount;
     uint64_t new_tw = net->total_weights + add_w;
@@ -490,7 +535,8 @@ bool spingalett_add_layer(LayerArgs args) {
     memcpy(t_ilist + old_inputs, inputs, input_count * sizeof(uint32_t));
     t_ioff[nl] = old_inputs + input_count;
     bool graph = net->graph || shape.type == LAYER_ADD || shape.type == LAYER_CONCAT ||
-                 shape.type == LAYER_GLOBAL_AVG_POOL || (nl > 1 && !(input_count == 1 && inputs[0] == nl - 2));
+                 shape.type == LAYER_GLOBAL_AVG_POOL || shape.type == LAYER_MULTIPLY ||
+                 (nl > 1 && !(input_count == 1 && inputs[0] == nl - 2));
 
     if (nl > 1) {
         if (net->layers > 1)
@@ -631,11 +677,24 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
             break;
         case LAYER_BATCH_NORM:
         case LAYER_LAYER_NORM:
+        case LAYER_RMS_NORM:
             a.epsilon = s->eps;
             a.momentum = s->momentum;
             break;
+        case LAYER_EMBEDDING:
+            a.neurons_amount = s->channels;
+            a.vocabulary = s->vocabulary;
+            a.positions = s->positions;
+            break;
+        case LAYER_ATTENTION:
+            a.heads = s->heads;
+            a.kv_heads = s->kv_heads;
+            a.rope_theta = s->theta;
+            a.causal = s->causal;
+            break;
         case LAYER_ADD:
         case LAYER_CONCAT:
+        case LAYER_MULTIPLY:
         case LAYER_GLOBAL_AVG_POOL:
             break;
         case LAYER_UPSAMPLE:
@@ -687,9 +746,15 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->epsilon = s->eps;
     layer->momentum = s->momentum;
     layer->upsample = (UpsampleMode)s->mode;
+    layer->vocabulary = s->vocabulary;
+    layer->heads = s->heads;
+    layer->kv_heads = s->kv_heads;
+    layer->rope_theta = s->theta;
+    layer->causal = s->causal;
+    layer->positions = s->positions;
     if (index > 0) {
-        layer->bias_count = spingalett_weight_rows(net, index - 1);
-        layer->weight_count = layer->bias_count * spingalett_weight_row_len(net, index - 1);
+        layer->bias_count = spingalett_bias_count(net, index - 1);
+        layer->weight_count = spingalett_weight_count(net, index - 1);
         layer->input_count = spingalett_input_count(net, index);
         memcpy(layer->inputs, spingalett_inputs(net, index), layer->input_count * sizeof(uint32_t));
     }
@@ -702,6 +767,10 @@ uint32_t spingalett_input_size(const NeuralNetwork *net) {
 
 uint32_t spingalett_output_size(const NeuralNetwork *net) {
     return net && net->layers ? net->topology[net->layers - 1] : 0;
+}
+
+uint32_t spingalett_target_size(const NeuralNetwork *net) {
+    return net && net->layers ? spingalett_targets_of(net) : 0;
 }
 
 uint64_t spingalett_parameter_count(const NeuralNetwork *net) {
@@ -725,10 +794,9 @@ static float *parameter_block(const NeuralNetwork *net, uint32_t index, Paramete
         set_error(SPINGALETT_ERR_INVALID, who);
         return NULL;
     }
-    uint64_t rows = spingalett_weight_rows(net, index - 1);
     bool weights = kind == PARAM_WEIGHTS || kind == PARAM_WEIGHT_GRADIENTS;
     bool statistics = kind == PARAM_RUNNING_MEAN || kind == PARAM_RUNNING_VARIANCE;
-    uint64_t expected = weights ? rows * spingalett_weight_row_len(net, index - 1) : rows;
+    uint64_t expected = weights ? spingalett_weight_count(net, index - 1) : spingalett_bias_count(net, index - 1);
     if (count != expected || (statistics && net->shapes[index].type != LAYER_BATCH_NORM)) {
         set_error(SPINGALETT_ERR_INVALID, who);
         return NULL;

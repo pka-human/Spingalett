@@ -223,6 +223,14 @@ const char *spingalett_gpu_name(void) {
 }
 
 bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
+    for (uint32_t l = 1; l < net->layers; l++) {
+        const LayerType type = net->shapes[l].type;
+        if (type == LAYER_EMBEDDING || type == LAYER_ATTENTION || type == LAYER_RMS_NORM || type == LAYER_MULTIPLY ||
+            net->act_func[l - 1] >= ACT_GELU || net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) {
+            if (why) *why = "the layers of transformers";
+            return false;
+        }
+    }
     for (uint32_t l = 0; l < net->layers; l++)
         if ((uint64_t)net->topology[l] * 64u > INT32_MAX) {
             if (why) *why = "layers of over 2^25 values a sample";

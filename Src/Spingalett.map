@@ -114,3 +114,8 @@ SPINGALETT_1.1 {
     global:
         spingalett_cuda_device;
 } SPINGALETT_1.0;
+
+SPINGALETT_1.2 {
+    global:
+        spingalett_target_size;
+} SPINGALETT_1.1;
