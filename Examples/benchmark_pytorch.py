@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """PyTorch counterpart of Examples/Benchmark.c: same networks, data shapes, optimizers and schedules.
 
-    python Examples/benchmark_pytorch.py [threads] [--cuda | --cuda-fp32 | --cuda-bf16] [--host-data]
+    python Examples/benchmark_pytorch.py [threads] [--cuda | --cuda-fp32 | --cuda-bf16] [--host-data] [--max] [--gpt]
 
 784-512-1000-10 MLP (ReLU, softmax + cross-entropy on soft targets, Adam, lr 1e-3), 20,000
 synthetic samples: full batch (5 epochs), mini-batches of 64 (1 epoch) and inference. Then the
@@ -15,7 +15,10 @@ cross-entropy): one epoch of mini-batches of 32 with AdamW, and inference in bat
 MobileNet-style network (a 3 x 3 convolution of 32 filters and four depthwise-separable blocks of 64 to 256
 channels, each convolution normalized) on 4,096 synthetic 32 x 32 images: one epoch of mini-batches of
 128 with SGD and momentum, and inference in batches of 1,000, channels-last (PyTorch's faster layout for
-its depthwise convolutions). Each measurement
+its depthwise convolutions). Then a GPT of 6 blocks of width 384 (6 heads, context 256, a vocabulary of
+256; scaled_dot_product_attention, flash attention on the GPU) on 1,024 random sequences: one epoch of
+mini-batches of 64 with AdamW, and the logits of 512 sequences, in tokens per second (--gpt: the GPT
+alone). Each measurement
 runs on a fresh model after one untimed warm-up step, so lazy initialization inside PyTorch is not
 counted.
 
@@ -339,6 +342,70 @@ def mobilenet_throughput(x, y):
     return train, infer
 
 
+GPT_CONTEXT, GPT_WIDTH, GPT_HEADS, GPT_LAYERS, GPT_VOCAB, GPT_SAMPLES = 256, 384, 6, 6, 256, 1024
+
+
+class GPTBlock(nn.Module):
+    """Examples/Benchmark.c's GPT block: layer normalization, causal attention (scaled_dot_product_attention,
+    flash attention on the GPU), a GELU MLP, residual connections."""
+
+    def __init__(self):
+        super().__init__()
+        self.ln1, self.qkv, self.proj = nn.LayerNorm(GPT_WIDTH), nn.Linear(GPT_WIDTH, 3 * GPT_WIDTH), nn.Linear(GPT_WIDTH, GPT_WIDTH)
+        self.ln2 = nn.LayerNorm(GPT_WIDTH)
+        self.mlp = nn.Sequential(nn.Linear(GPT_WIDTH, 4 * GPT_WIDTH), nn.GELU(), nn.Linear(4 * GPT_WIDTH, GPT_WIDTH))
+
+    def forward(self, x):
+        b, t, c = x.shape
+        q, k, v = self.qkv(self.ln1(x)).split(c, dim=2)
+        q, k, v = (z.view(b, t, GPT_HEADS, c // GPT_HEADS).transpose(1, 2) for z in (q, k, v))
+        y = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + self.proj(y.transpose(1, 2).contiguous().view(b, t, c))
+        return x + self.mlp(self.ln2(x))
+
+
+class GPT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wte, self.wpe = nn.Embedding(GPT_VOCAB, GPT_WIDTH), nn.Embedding(GPT_CONTEXT, GPT_WIDTH)
+        self.blocks = nn.Sequential(*[GPTBlock() for _ in range(GPT_LAYERS)])
+        self.ln, self.head = nn.LayerNorm(GPT_WIDTH), nn.Linear(GPT_WIDTH, GPT_VOCAB)
+        self.register_buffer("pos", torch.arange(GPT_CONTEXT), persistent=False)
+
+    def forward(self, idx):
+        return self.head(self.ln(self.blocks(self.wte(idx) + self.wpe(self.pos))))
+
+
+def gpt_throughput(tokens, nxt):
+    """One epoch of mini-batches of 64 sequences with AdamW, and the logits of half the sequences, in tokens
+    per second (Examples/Benchmark.c's GPT)."""
+    samples = GPT_SAMPLES if DEVICE != "cpu" else GPT_SAMPLES // 16
+    model = placed(GPT())
+    opt = optimizer(torch.optim.AdamW, model.parameters(), lr=1e-3, weight_decay=0.1, betas=(0.9, 0.99))
+
+    def loss_fn(logits, y):
+        return nn.functional.cross_entropy(logits.view(-1, GPT_VOCAB), y.view(-1))
+
+    step = trainer(model, opt, loss_fn)
+    warm_up(step, tokens, nxt, samples, 64)
+    start = clock()
+    perm = perm_of(samples)
+    for i in range(0, samples, 64):
+        idx = perm[i:i + 64]
+        step(to_dev(tokens[idx]), to_dev(nxt[idx]))
+    train = samples * GPT_CONTEXT / (clock() - start)
+    model.eval()
+    infer_n = samples // 2
+    run = predictor(model, lambda o: o)
+    with torch.inference_mode():
+        warm_up_inference(run, tokens, infer_n, 256)
+        start = clock()
+        for i in range(0, infer_n, 256):
+            back(run(to_dev(tokens[i:i + 256])))
+        infer = infer_n * GPT_CONTEXT / (clock() - start)
+    return train, infer
+
+
 def data(t):
     """Training data where the run keeps it: the device, or (pinned) the host with --host-data."""
     return t.pin_memory() if HOST else t.to(DEVICE)
@@ -376,6 +443,9 @@ def main():
         if MAX:
             where += ", torch.compile max-autotune, cudnn.benchmark, channels-last, fused optimizers"
     print(f"PyTorch {torch.__version__}, {where}\n")
+    if "--gpt" in sys.argv:     # the GPT alone
+        gpt_report()
+        return
     print(f"{'samples/s':<16} {'full batch':>14} {'mini-batch 64':>14} {'inference':>14}")
     full = train_throughput(x, y, SAMPLES, EPOCHS)
     mini = train_throughput(x, y, MINI_BATCH, 1)
@@ -407,6 +477,18 @@ def main():
     print(f"{'samples/s':<16} {'training':>14} {'inference':>14}")
     train, infer = mobilenet_throughput(data(torch.rand(MOBILE_SAMPLES, 3, 32, 32)),
                                         data(torch.randint(0, 10, (MOBILE_SAMPLES,))))
+    print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
+    gpt_report()
+
+
+def gpt_report():
+    torch.manual_seed(42)
+    tokens = data(torch.randint(0, GPT_VOCAB, (GPT_SAMPLES, GPT_CONTEXT)))
+    nxt = data(torch.randint(0, GPT_VOCAB, (GPT_SAMPLES, GPT_CONTEXT)))
+    print(f"\nGPT ({GPT_LAYERS} layers of width {GPT_WIDTH}, {GPT_HEADS} heads, context {GPT_CONTEXT}, "
+          f"vocabulary {GPT_VOCAB})")
+    print(f"{'tokens/s':<16} {'training':>14} {'inference':>14}")
+    train, infer = gpt_throughput(tokens, nxt)
     print(f"{'PyTorch':<16} {train:14.0f} {infer:14.0f}")
 
 

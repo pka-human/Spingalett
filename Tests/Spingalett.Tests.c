@@ -4849,6 +4849,69 @@ static void gpu_transformer(int which) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA) against single
+   precision: predictions, one step's change of every parameter, and two runs alike. */
+static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
+    const uint32_t T = 80, V = 37, n = 20, heads = 4, d = heads * head;
+    float *pred[2] = {NULL, NULL}, *delta[2] = {NULL, NULL}, *again = NULL;
+    uint64_t count = 0;
+    float *x = (float *)malloc((size_t)n * T * sizeof(float)), *t = (float *)malloc((size_t)n * T * sizeof(float));
+    lcg_state = 1234u + head;
+    for (uint32_t i = 0; i < n * T; i++) x[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
+    for (uint32_t i = 0; i < n * T; i++) t[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
+    for (int run = 0; run < 3; run++) {
+        const int bf16 = run != 0;
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = T);
+        embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = !rope,
+                  .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        linear(.net = net, .neurons_amount = (heads + 2u * kv) * head, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        attention(.net = net, .heads = heads, .kv_heads = kv, .causal = true, .rope_theta = rope ? 10000.0f : 0.0f);
+        linear(.net = net, .neurons_amount = V, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        lcg_state = 77;
+        for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
+        spingalett_set_compute_mode(gpu_mode);
+        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+            free_network(net);
+            break;
+        }
+        const uint32_t out = net->topology[net->layers - 1];
+        float *y = (float *)malloc((size_t)n * out * sizeof(float));
+        predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
+        count = net->total_weights;
+        float *w0 = (float *)malloc(count * sizeof(float));
+        memcpy(w0, net->weights, count * sizeof(float));
+        train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .learning_rate = 1.0f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+        SpingalettNetworkLayer first;
+        spingalett_network_layer(net, 1, &first);
+        float *probe = (float *)malloc(first.weight_count * sizeof(float));
+        spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe, first.weight_count);       /* (brings them back) */
+        free(probe);
+        for (uint64_t i = 0; i < count; i++) w0[i] -= net->weights[i];
+        if (run < 2) {
+            pred[run] = y;
+            delta[run] = w0;
+        } else {
+            again = w0;
+            free(y);
+        }
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        free_network(net);
+    }
+    if (pred[1]) {
+        const double predicted = gpu_max_scaled(pred[0], pred[1], (size_t)n * V);
+        const double stepped = gpu_max_scaled(delta[0], delta[1], count);
+        const bool same = again && !memcmp(again, delta[1], count * sizeof(float));
+        CHECK(predicted < 2e-2 && stepped < 6e-2 && same, "gpu flash head %u: predictions %.2e, step %.2e from single "
+              "precision, deterministic %d", head, predicted, stepped, same);
+        printf("  gpu flash head %u%s%s: bf16 predictions %.1e, step %.1e from single precision, deterministic %s\n", head,
+               rope ? ", rotary" : "", kv < 4u ? ", grouped" : "", predicted, stepped, same ? "yes" : "no");
+    }
+    free(pred[0]); free(pred[1]); free(delta[0]); free(delta[1]); free(again); free(x); free(t);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 /* The step API on a transformer, on the GPU against the CPU: forward, the sparse loss's backward pass with
    label smoothing, two passes a step. */
 static void gpu_transformer_trainer(void) {
@@ -6022,6 +6085,9 @@ int main(int argc, char **argv) {
             gpu_bf16();
             for (int k = 0; k < 4; k++) gpu_transformer(k);
             gpu_transformer_trainer();
+            gpu_flash(32, false, 4);
+            gpu_flash(64, true, 2);
+            gpu_flash(128, true, 1);
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }

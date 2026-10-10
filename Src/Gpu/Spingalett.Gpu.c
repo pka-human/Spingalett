@@ -1207,6 +1207,15 @@ static void dw_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t m
     kernel(r, a, SPG_KERNEL_dwconv, spec, 11, &p, sizeof p, sums ? sums : groups(p.total, 256u), 1, 1);
 }
 
+/* Whether convolution l is a dense layer of each cell (a 1 x 1 window of stride 1, unpadded, one group: the
+   linear layers of transformers, pointwise convolutions), whose products read its maps as matrices (rows
+   of cells) rather than through the geometry: the same sums in the same order of k, faster loads. */
+static bool pointwise(const NeuralNetwork *net, uint32_t l) {
+    const LayerShape *s = &net->shapes[l];
+    return s->type == LAYER_CONV2D && s->kernel_h == 1u && s->kernel_w == 1u && s->stride_h == 1u &&
+           s->stride_w == 1u && s->pad_h == 0u && s->pad_w == 0u && layer_groups(s) == 1u;
+}
+
 static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *x, const SpgGpuBuffer *y,
                        uint32_t n, uint32_t epi, uint32_t act, uint64_t e0, float beta) {
     if (depthwise(g->net, l)) {
@@ -1214,6 +1223,24 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
         return;
     }
     const ConvView v = conv_view(g->net, l);
+    if (pointwise(g->net, l)) {             /* y[cells x out] = x[cells x in] W^T */
+        const bool bias = epi == SPG_EPI_BIAS_ACT;
+        SpgGemmPush p = {
+            .a = x->address, .b = mm_weights_at(g, l - 1), .c = y->address, .e0 = bias ? biases_at(g, l - 1) : e0,
+            .e1 = epi == SPG_EPI_SCALE_ACT ? e0 + 4ull * v.out_c : 0, .M = n * v.out_h * v.out_w, .N = v.out_c,
+            .K = v.in_c, .lda = v.in_c, .ldb = v.in_c, .ldc = v.out_c, .alpha = 1.0f, .beta = beta,
+            .flags = bias ? SPG_GEMM_BIAS : 0u,
+        };
+        SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, epi, act, 1, false, true, true, 0,
+                         (uint64_t)n * v.out_h * v.out_w * v.out_c, g->bf16, 0, true, true};
+        reads(a, whole(x));
+        reads(a, mm_weights_of(g, l - 1));
+        if (bias) reads(a, biases_of(g, l - 1));
+        if (epi == SPG_EPI_SCALE_ACT) reads(a, span(e0, 2ull * v.out_c));
+        writes(a, whole(y));
+        product(r, a, &p, &m);
+        return;
+    }
     const uint32_t K = v.taps * v.CG;
     const bool bias = epi == SPG_EPI_BIAS_ACT;
     SpgGemmPush p = {
@@ -1250,6 +1277,19 @@ static void conv_spread(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const 
     const ConvView v = conv_view(g->net, l);
     const SpgConvGeometry *info = g->conv[l];
     const bool bias = epi == SPG_EPI_BIAS_ACT;
+    if (pointwise(g->net, l)) {             /* dx[cells x in] = dy[cells x out] W, W stored [out x in] */
+        SpgGemmPush p = {
+            .a = dy->address, .b = mm_weights_at(g, l - 1), .c = dx->address, .e0 = e0, .M = n * v.in_h * v.in_w,
+            .N = v.in_c, .K = v.out_c, .lda = v.out_c, .ldb = v.in_c, .ldc = v.in_c, .alpha = 1.0f, .beta = beta,
+        };
+        SpgGemmMode m = {SPG_A_ROW, SPG_B_ROW, epi, act, 1, false, true, true, 0, (uint64_t)n * v.in_h * v.in_w * v.in_c,
+                         g->bf16, 0, true, true};
+        reads(a, whole(dy));
+        reads(a, mm_weights_of(g, l - 1));
+        writes(a, whole(dx));
+        product(r, a, &p, &m);
+        return;
+    }
     SpgWtransPush wp = {weights_at(g, l - 1), g->wt.address, g->geo[l].address + 4u * info->order,
                         v.G * v.OG * v.taps * v.CG, v.OG, v.CG, v.taps};
     Access t = {0};
@@ -1522,7 +1562,16 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
                      .flags = (s->causal ? SPG_ATTN_CAUSAL : 0u) | (g->geo[l].buffer ? SPG_ATTN_ROPE : 0u) |
                               (stats ? SPG_ATTN_STATS : 0u),
                      .scale = 1.0f / sqrtf((float)head)};
-    const uint32_t spec[4] = {op, bq, dmax, threads};
+    /* networks in bfloat16 on CUDA, heads of 32, 64 or 128: flash.cu on the matrix units (BQ 0 names it), a
+       block 64 rows (32 for heads of 128) */
+    const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE &&
+                     (head == 32u || head == 64u || head == 128u);
+    if (mma) {
+        dmax = head;
+        bq = head <= 64u ? 64u : 32u;
+        threads = 2u * bq;
+    }
+    const uint32_t spec[4] = {op, mma ? 0u : bq, dmax, threads};
     if (g->geo[l].buffer) reads(a, whole(&g->geo[l]));
     const uint32_t tiles = (cells + bq - 1u) / bq;
     if (op == SPG_ATTN_PRE)
@@ -1924,6 +1973,12 @@ static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, f
         M = out_sz; N = net->topology[src]; K = n; rows = n;
         p.a = g->delta[l + 1].address; p.lda = out_sz;
         p.b = g->act[src].address; p.ldb = N;
+    } else if (pointwise(net, l + 1)) {
+        /* gW[out x in] = dy^T x over the cells, as a dense layer's */
+        const uint32_t cells = n * s->height * s->width, in_c = net->shapes[src].channels;
+        M = s->channels; N = in_c; K = cells; rows = cells;
+        p.a = g->delta[l + 1].address; p.lda = s->channels;
+        p.b = outputs_of(g, src)->address; p.ldb = in_c;
     } else {
         /* gW[g OG + f][window] = sum over the convolution's output pixels of dy[pixel][g OG + f] x
            window[pixel] (conv_view(): for a transposed convolution, x is its output gradient and dy

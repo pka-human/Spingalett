@@ -324,7 +324,9 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         return -1;
     } else if (kernel == SPG_KERNEL_attn || kernel == SPG_KERNEL_attn_h) {
         if (count < 3) return -1;
-        snprintf(name, sizeof name, "attn_d%u", spec[2]);                /* the unit of its head size */
+        /* the unit of its head size; with BQ 0 the matrix units' (flash.cu) of its head size and pass */
+        if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], spec[0]);
+        else snprintf(name, sizeof name, "attn_d%u", spec[2]);
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];

@@ -406,6 +406,67 @@ static void mobilenet_benchmark(const char *name, ComputeMode mode, const float 
     }
 }
 
+/* A GPT (nanoGPT's character-level configuration: GPT-2's blocks of layer normalization, causal attention
+   and a GELU MLP, learned positions) over GPT_CONTEXT tokens of a vocabulary of 256 (bytes), on random
+   tokens: one epoch of mini-batches of 64 sequences with AdamW, and inference (the logits of every
+   position). Throughput in tokens per second. */
+#define GPT_CONTEXT 256u
+#define GPT_WIDTH   384u
+#define GPT_HEADS   6u
+#define GPT_LAYERS  6u
+#define GPT_VOCAB   256u
+#define GPT_SAMPLES 1024u           /* sequences on the GPU (the CPU's rows take GPT_SAMPLES / 16) */
+
+static NeuralNetwork *create_gpt(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = GPT_CONTEXT);
+    uint32_t x = embedding(.net = net, .vocabulary = GPT_VOCAB, .neurons_amount = GPT_WIDTH, .positions = true,
+                           .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    for (uint32_t b = 0; b < GPT_LAYERS; b++) {
+        layer_norm(.net = net);
+        linear(.net = net, .neurons_amount = 3u * GPT_WIDTH, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        attention(.net = net, .heads = GPT_HEADS, .causal = true);
+        uint32_t a = linear(.net = net, .neurons_amount = GPT_WIDTH, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        x = add_layers(.net = net, .inputs = {x, a});
+        layer_norm(.net = net);
+        linear(.net = net, .neurons_amount = 4u * GPT_WIDTH, .act_func = ACT_GELU,
+               .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        a = linear(.net = net, .neurons_amount = GPT_WIDTH, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        x = add_layers(.net = net, .inputs = {x, a});
+    }
+    layer_norm(.net = net);
+    linear(.net = net, .neurons_amount = GPT_VOCAB, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    return net;
+}
+
+static void gpt_benchmark(const char *name, ComputeMode mode, const float *tokens, const float *next) {
+    spingalett_set_compute_mode(mode);
+    const uint32_t samples = is_gpu(mode) ? GPT_SAMPLES : GPT_SAMPLES / 16u, infer = samples / 2u;
+    for (int untimed = is_gpu(mode); untimed >= 0; untimed--) { /* the GPU's first run */
+    NeuralNetwork *net = create_gpt();
+    Sets d = sets_of(tokens, GPT_CONTEXT, next, GPT_CONTEXT, samples);
+    double start = now();
+    train(.net = net, .inputs = d.x ? NULL : tokens, .targets = d.t ? NULL : next, .device_inputs = d.x,
+          .device_targets = d.t, .sample_count = samples, .epochs = 1, .learning_rate = 1e-3f,
+          .weight_decay = 0.1f, .beta2 = 0.99f, .optimizer_type = OPTIMIZER_ADAMW,
+          .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 64);
+    double trained = now() - start;
+    float *logits = (float *)malloc((size_t)infer * GPT_CONTEXT * GPT_VOCAB * sizeof(float));
+    for (int timed = 0; timed < 2; timed++) {
+        start = now();
+        predict(.net = net, .inputs = d.x ? NULL : tokens, .device_inputs = d.x, .sample_count = infer,
+                .outputs = logits);
+    }
+    double inferred = now() - start;
+    if (!untimed)
+        printf("%-24s %14.0f %14.0f\n", name, (double)samples * GPT_CONTEXT / trained,
+               (double)infer * GPT_CONTEXT / inferred);
+    sets_free(d);
+    free(logits);
+    free_network(net);
+    }
+}
+
 static void run_benchmark(const char *name, ComputeMode mode, const float *inputs, const float *targets) {
     spingalett_set_compute_mode(mode);
     if (is_gpu(mode)) { /* the GPU's first use, not timed */
@@ -481,12 +542,20 @@ int main(int argc, char **argv) {
 
     /* More threads than cores oversubscribes the CPU and slows training down. */
     bool cpu = true, vulkan = true, cuda = true;
+    /* workloads: all, or those named */
+    static const char *const workloads[] = {"mlp", "cnn", "resnet", "unet", "mobilenet", "gpt"};
+    bool run[6] = {false}, named = false;
     for (int i = 1; i < argc; i++) {
+        bool workload = false;
+        for (int w = 0; w < 6; w++)
+            if (!strcmp(argv[i], workloads[w])) run[w] = workload = named = true;
+        if (workload) continue;
         if (!strcmp(argv[i], "gpu")) cpu = false;
         else if (!strcmp(argv[i], "vulkan")) cuda = false;
         else if (!strcmp(argv[i], "cuda")) vulkan = false;
         else spingalett_set_num_threads((unsigned)strtoul(argv[i], NULL, 10));
     }
+    for (int w = 0; !named && w < 6; w++) run[w] = true;
     /* the GPU's rows: each backend with a device, in single precision and (with matrix units) bfloat16 */
     for (int b = 0; b < 2; b++) {
         const ComputeMode mode = b ? COMPUTE_CUDA : COMPUTE_VULKAN;
@@ -509,6 +578,7 @@ int main(int argc, char **argv) {
     const char *gpu = spingalett_cuda_device() ? spingalett_cuda_device() : spingalett_gpu_device();
     printf(gpu ? ", GPU: %s\n\n" : "\n\n", gpu);
 
+    if (run[0]) {
     printf("%-24s %14s %14s %14s\n", "samples/s", "full batch", "mini-batch 64", "inference");
     if (cpu) {
         run_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, inputs, targets);
@@ -521,6 +591,7 @@ int main(int argc, char **argv) {
     }
     GPU_ROWS(run_benchmark(label, row->mode, inputs, targets));
     if (cpu) deployment_benchmark(inputs);
+    }
 
     /* the convolutional network: random images, one-hot labels */
     float *images = (float *)malloc((size_t)CNN_SAMPLES * INPUT_SIZE * sizeof(float));
@@ -531,7 +602,7 @@ int main(int argc, char **argv) {
     }
     for (size_t i = 0; i < (size_t)CNN_SAMPLES * INPUT_SIZE; i++) images[i] = (float)rand() / (float)RAND_MAX;
     for (size_t s = 0; s < CNN_SAMPLES; s++) labels[s * OUTPUT_SIZE + (size_t)rand() % OUTPUT_SIZE] = 1.0f;
-    for (int normalized = 0; normalized < 2; normalized++) {
+    for (int normalized = 0; run[1] && normalized < 2; normalized++) {
         NeuralNetwork *cnn = create_cnn(normalized);
         printf("\nconvolutional network (Examples/MNIST_CNN.c)%s, %" PRIu64 " parameters, %d images\n",
                normalized ? " with batch normalization" : "", spingalett_parameter_count(cnn), CNN_SAMPLES);
@@ -561,6 +632,7 @@ int main(int argc, char **argv) {
     }
     for (size_t i = 0; i < (size_t)RESNET_SAMPLES * 3072; i++) images[i] = (float)rand() / (float)RAND_MAX;
     for (size_t s = 0; s < RESNET_SAMPLES; s++) labels[s * OUTPUT_SIZE + (size_t)rand() % OUTPUT_SIZE] = 1.0f;
+    if (run[2]) {
     NeuralNetwork *resnet = create_resnet20();
     printf("\nResNet-20 (Examples/CIFAR10.c resnet20), %u layers, %" PRIu64 " parameters, %d images\n",
            spingalett_layer_count(resnet), spingalett_parameter_count(resnet), RESNET_SAMPLES);
@@ -573,6 +645,7 @@ int main(int argc, char **argv) {
 #endif
     }
     GPU_ROWS(resnet_benchmark(label, row->mode, images, labels));
+    }
     free(images);
     free(labels);
 
@@ -586,6 +659,7 @@ int main(int argc, char **argv) {
     }
     for (size_t i = 0; i < pixels * 3; i++) images[i] = (float)rand() / (float)RAND_MAX;
     for (size_t i = 0; i < pixels * 3; i++) labels[i] = (float)(rand() % 2);
+    if (run[3]) {
     NeuralNetwork *unet = create_unet();
     printf("\nU-Net (Examples/Segmentation.c), %u layers, %" PRIu64 " parameters, %d images of %d x %d\n",
            spingalett_layer_count(unet), spingalett_parameter_count(unet), UNET_SAMPLES, UNET_SIZE, UNET_SIZE);
@@ -598,6 +672,7 @@ int main(int argc, char **argv) {
 #endif
     }
     GPU_ROWS(unet_benchmark(label, row->mode, images, labels));
+    }
     free(images);
     free(labels);
 
@@ -610,6 +685,7 @@ int main(int argc, char **argv) {
     }
     for (size_t i = 0; i < (size_t)MOBILE_SAMPLES * 3072; i++) images[i] = (float)rand() / (float)RAND_MAX;
     for (size_t s = 0; s < MOBILE_SAMPLES; s++) labels[s * OUTPUT_SIZE + (size_t)rand() % OUTPUT_SIZE] = 1.0f;
+    if (run[4]) {
     NeuralNetwork *mobile = create_mobilenet();
     printf("\nMobileNet-style network (depthwise-separable), %u layers, %" PRIu64 " parameters, %d images\n",
            spingalett_layer_count(mobile), spingalett_parameter_count(mobile), MOBILE_SAMPLES);
@@ -622,8 +698,36 @@ int main(int argc, char **argv) {
 #endif
     }
     GPU_ROWS(mobilenet_benchmark(label, row->mode, images, labels));
+    }
     free(images);
     free(labels);
+
+    /* the GPT on random tokens, its targets the next token of a random sequence */
+    if (run[5]) {
+        const size_t count = (size_t)GPT_SAMPLES * GPT_CONTEXT;
+        float *tokens = (float *)malloc(count * sizeof(float)), *next = (float *)malloc(count * sizeof(float));
+        if (!tokens || !next) {
+            fprintf(stderr, "Allocation failed\n");
+            return 1;
+        }
+        for (size_t i = 0; i < count; i++) tokens[i] = (float)(rand() % GPT_VOCAB);
+        for (size_t i = 0; i < count; i++) next[i] = (i + 1) % GPT_CONTEXT ? tokens[i + 1] : (float)(rand() % GPT_VOCAB);
+        NeuralNetwork *gpt = create_gpt();
+        printf("\nGPT (%u layers of width %u, %u heads, context %u, vocabulary %u), %" PRIu64 " parameters\n",
+               GPT_LAYERS, GPT_WIDTH, GPT_HEADS, GPT_CONTEXT, GPT_VOCAB, spingalett_parameter_count(gpt));
+        free_network(gpt);
+        printf("%-24s %14s %14s\n", "tokens/s", "training", "inference");
+        if (cpu) {
+#if defined(SPINGALETT_HAS_OPENMP)
+            gpt_benchmark("OpenMP", COMPUTE_OPENMP, tokens, next);
+#else
+            gpt_benchmark("Single-threaded", COMPUTE_SINGLE_THREADED, tokens, next);
+#endif
+        }
+        GPU_ROWS(gpt_benchmark(label, row->mode, tokens, next));
+        free(tokens);
+        free(next);
+    }
     free(inputs);
     free(targets);
     return 0;

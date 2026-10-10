@@ -33,6 +33,16 @@ SPG_CUDA_UNIT(attn_d32, attn, "-DDMAX=32u")       /* attention: a unit per head 
 SPG_CUDA_UNIT(attn_d64, attn, "-DDMAX=64u")
 SPG_CUDA_UNIT(attn_d128, attn, "-DDMAX=128u")
 SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")
+/* attention on the matrix units (networks in bfloat16): a unit per head size and pass (0 FORWARD, 2 DQ, 3 DKV) */
+SPG_CUDA_UNIT(flash_d32_o0, flash, "-DD=32u -DOPC=0u")
+SPG_CUDA_UNIT(flash_d32_o2, flash, "-DD=32u -DOPC=2u")
+SPG_CUDA_UNIT(flash_d32_o3, flash, "-DD=32u -DOPC=3u")
+SPG_CUDA_UNIT(flash_d64_o0, flash, "-DD=64u -DOPC=0u")
+SPG_CUDA_UNIT(flash_d64_o2, flash, "-DD=64u -DOPC=2u")
+SPG_CUDA_UNIT(flash_d64_o3, flash, "-DD=64u -DOPC=3u")
+SPG_CUDA_UNIT(flash_d128_o0, flash, "-DD=128u -DOPC=0u")
+SPG_CUDA_UNIT(flash_d128_o2, flash, "-DD=128u -DOPC=2u")
+SPG_CUDA_UNIT(flash_d128_o3, flash, "-DD=128u -DOPC=3u")
 
 /* depthwise convolutions: any window, stride, mode, VEC and padding, and the common windows (KH, KW, SH, SW),
    padded (KW - 1) / 2, for every mode (0 APPLY, 1 SPREAD, 2 WEIGHTS) and VEC (1, 4) as constants: units
