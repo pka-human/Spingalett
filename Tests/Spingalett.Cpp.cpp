@@ -86,6 +86,42 @@ int main() {
     for (std::size_t i = 0; close && i < w->size(); i++) close = std::abs((*w)[i] - (*y)[i]) < 1e-4f;
     check(close, "the deployment model predicts within 1e-4");
 
+    /* a LLaMA-like language model: learns to count, then generates the continuation */
+    {
+        const std::uint32_t T = 16, V = 13;
+        sg::seed(3);
+        sg::Builder lm(sg::Loss::SparseCrossEntropy);
+        lm.input(T).embedding(V, 16);
+        const std::uint32_t h = lm.last();
+        lm.rms_norm().linear(48).attention(4, true, 2, 10000.0f).linear(16);
+        lm.add_layers({h, lm.last()}).linear(V);
+        sg::Result<sg::Network> model_lm = lm.build();
+        std::vector<float> tx, ty;
+        for (std::uint32_t smp = 0; smp < 256; smp++)
+            for (std::uint32_t i = 0; i < T; i++) {
+                const std::uint32_t start = (smp * 7u + 3u) % V;
+                tx.push_back(float((start + i) % V));
+                ty.push_back(float((start + i + 1u) % V));
+            }
+        sg::TrainOptions lo;
+        lo.epochs = 30;
+        lo.strategy = sg::Strategy::MiniBatch;
+        lo.batch_size = 32;
+        lo.optimizer = sg::Optimizer::Adam;
+        lo.learning_rate = 1e-2f;
+        sg::Result<sg::TrainReport> lr = model_lm ? model_lm->train(tx, ty, lo) : std::unexpected(model_lm.error());
+        check(lr && lr->train_loss < 0.3f && model_lm->target_size() == T, "a language model trains");
+        const std::uint32_t prompt[3] = {3, 4, 5};
+        sg::Result<std::vector<std::uint32_t>> g = lr ? model_lm->generate(prompt, 20) : std::unexpected(lr.error());
+        bool counts = g && g->size() == 20;
+        for (std::uint32_t i = 0; counts && i < 20; i++) counts = (*g)[i] == (6u + i) % V;
+        check(counts, "generate() continues the count");
+        sg::Sampling stop;
+        stop.stop = {9};
+        sg::Result<std::vector<std::uint32_t>> st = lr ? model_lm->generate(prompt, 20, stop) : std::unexpected(lr.error());
+        check(st && *st == std::vector<std::uint32_t>{6, 7, 8, 9}, "generate() stops at a stop token");
+    }
+
     /* errors are values */
     sg::Result<std::vector<float>> partial = net.predict(std::span<const float>(x).first(in + 1));
     check(!partial && partial.error().code == SPINGALETT_ERR_INVALID, "a partial sample is an error");
