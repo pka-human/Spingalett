@@ -157,6 +157,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   reader applies it to the normalization's input as it reads. Code that reads a layer's outputs goes
   through `outputs_of()` and, for a `pro[]` layer, applies the normalization (the forward pass, the
   weight gradient, the derivative in the data gradient), or it reads a buffer that was never written.
+  In inference the other way round too: a dense or convolution layer without activation read only by
+  a batch normalization (`into[]`) is not run; the normalization runs its product with the
+  normalization's coefficients in the epilogue (`SPG_EPI_SCALE_ACT`, its biases folded in by bn.comp's
+  FOLD), so in inference that layer's outputs are never written (nor made, in a copy that only infers).
 - **Lazy training state.** Gradients and optimizer moments exist on the host once a network has
   trained on the CPU, made a trainer, or had its GPU copy's parameters brought back
   (`spingalett_training_state()`, which `spingalett_gpu_download()` calls); code that reads them

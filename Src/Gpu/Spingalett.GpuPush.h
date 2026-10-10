@@ -48,7 +48,7 @@ typedef struct {
     float m, eps, momentum, scale, beta_g;
     uint32_t pad;
 } SpgBnPush;
-enum { SPG_BN_TRAIN, SPG_BN_INFER, SPG_BN_BACKWARD };
+enum { SPG_BN_TRAIN, SPG_BN_INFER, SPG_BN_BACKWARD, SPG_BN_FOLD };
 
 /* eltwise.comp */
 typedef struct {

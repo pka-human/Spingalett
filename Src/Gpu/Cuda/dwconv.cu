@@ -24,6 +24,7 @@
 #define WEIGHTS 2u
 #define EPI_STORE    0u
 #define EPI_BIAS_ACT 1u
+#define EPI_SCALE_ACT 2u
 #define EPI_DERIV    4u
 #define PX 4u
 #define ANY 255u                /* a template parameter taken from the spec */
@@ -69,6 +70,8 @@ struct Dw {
     MEMBER void finish(uint32_t i, uint32_t channel, float v) const {
         if (EPI == EPI_BIAS_ACT) {
             v = activate(v + F(p.e0)[channel], ACT);
+        } else if (EPI == EPI_SCALE_ACT) {
+            v = activate(v * F(p.e0)[channel] + F(p.e0)[p.out_c + channel], ACT);
         } else {
             if (p.beta != 0.0f) v += p.beta * ld(p.y, i, 2u, HALF);
             if (EPI == EPI_DERIV) v *= derivative(ld(p.e0, i, 3u, HALF), ACT);
@@ -79,8 +82,10 @@ struct Dw {
     /* and of values i .. i + 3, channels channel .. + 3 (the normalization of e0 and SUMS: SPREAD only) */
     template <bool SPREADS>
     MEMBER void finish4(uint32_t i, uint32_t channel, float4_ v) {
-        if (EPI == EPI_BIAS_ACT) {
-            v = add4(v, float4_{F(p.e0)[channel], F(p.e0)[channel + 1u], F(p.e0)[channel + 2u], F(p.e0)[channel + 3u]});
+        if (EPI == EPI_BIAS_ACT || EPI == EPI_SCALE_ACT) {
+            const float *e = F(p.e0) + channel;
+            if (EPI == EPI_SCALE_ACT) v = mul4(v, float4_{e[0], e[1], e[2], e[3]}), e += p.out_c;
+            v = add4(v, float4_{e[0], e[1], e[2], e[3]});
             v = slope >= 0.0f ? sloped4(v, slope) : activate4_call(v, ACT);
         } else {
             if (p.beta != 0.0f) v = add4(v, scale4(ld4(p.y, i, 2u, HALF), p.beta));

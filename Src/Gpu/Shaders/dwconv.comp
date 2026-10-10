@@ -21,7 +21,8 @@
  *            then the lanes' sums added in a fixed tree
  *
  * with the epilogues of the products (gemm_common.glsl's store_c()): STORE (+ beta y), BIAS_ACT
- * (act(v + bias[channel]), the biases in e0), DERIV ((v + beta y) act'(e0)). Every sum runs in a fixed
+ * (act(v + bias[channel]), the biases in e0), SCALE_ACT (act(v scale[channel] + shift[channel]), the
+ * scales in e0, the shifts after them), DERIV ((v + beta y) act'(e0)). Every sum runs in a fixed
  * order, so the results never depend on the dispatch. With VEC 4 (og 1, channels in fours) a thread
  * computes four channels at once, in vector loads, of PX adjacent pixels of a row (APPLY: output
  * pixels; SPREAD: input pixels, where PX is a multiple of the stride), which share the loads of their
@@ -48,6 +49,7 @@
 #define WEIGHTS 2u
 #define EPI_STORE    0u
 #define EPI_BIAS_ACT 1u
+#define EPI_SCALE_ACT 2u
 #define EPI_DERIV    4u
 
 layout(constant_id = 0) const uint MODE = APPLY;
@@ -92,6 +94,9 @@ vec4 normalized(vec4 v, vec4 a, vec4 b) {
 void finish(uint i, uint channel, float v) {
     if (EPI == EPI_BIAS_ACT) {
         v = activate(v + p.e0.v[channel], ACT);
+    } else if (EPI == EPI_SCALE_ACT) {
+        precise float t = v * p.e0.v[channel] + p.e0.v[p.out_c + channel];
+        v = activate(t, ACT);
     } else {
         if (p.beta != 0.0) v += p.beta * ld(p.y, i, 2u);
         if (EPI == EPI_DERIV) v *= derivative(ld(p.e0, i, 3u), ACT);
@@ -103,6 +108,11 @@ void finish(uint i, uint channel, float v) {
 void finish4(uint i, uint channel, vec4 v) {
     if (EPI == EPI_BIAS_ACT) {
         [[unroll]] for (uint k = 0u; k < 4u; k++) v[k] = activate(v[k] + p.e0.v[channel + k], ACT);
+    } else if (EPI == EPI_SCALE_ACT) {
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            precise float t = v[k] * p.e0.v[channel + k] + p.e0.v[p.out_c + channel + k];
+            v[k] = activate(t, ACT);
+        }
     } else {
         if (p.beta != 0.0) v += p.beta * ld4(p.y, i, 2u);
         if (EPI == EPI_DERIV) {

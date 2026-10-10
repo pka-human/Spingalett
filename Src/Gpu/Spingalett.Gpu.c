@@ -96,6 +96,11 @@ struct SpgGpuNet {
        which applies them to the values it reads (dwconv.comp's PRO): their outputs are never stored, and
        the readers read their inputs (outputs_of()); pro[l] = that convolution, or 0 */
     uint32_t *pro;
+    /* dense and convolution layers (no activation) read only by a batch normalization whose
+       outputs are stored: in inference their products apply it in their epilogue (SPG_EPI_SCALE_ACT, the
+       normalization's coefficients with the layer's biases folded in) and write the normalization's
+       outputs, their own never stored; into[l] = that normalization, or 0 */
+    uint32_t *into;
 
     Slot slots[SLOTS];
     uint32_t next;                  /* the slot of the next chunk */
@@ -714,7 +719,7 @@ static void spingalett_gpu_net_free_here(SpgGpuNet *g) {
     for (uint32_t k = 0; k < SLOTS; k++) spingalett_aligned_free(g->slots[k].host_inputs);
     for (uint32_t l = 0; g->conv && l < g->layers; l++) free(g->conv[l]);
     free(g->act); free(g->delta); free(g->dmask); free(g->geo); free(g->conv); free(g->bn);
-    free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold); free(g->pro); free(g->half); free(g->dhalf);
+    free(g->uses); free(g->pending); free(g->woff); free(g->boff); free(g->fold); free(g->pro); free(g->into); free(g->half); free(g->dhalf);
     free(g);
     spg_gemm_release();
 }
@@ -757,10 +762,11 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
     g->boff = (uint64_t *)calloc(L, sizeof(uint64_t));
     g->fold = (uint32_t *)calloc(L, sizeof(uint32_t));
     g->pro = (uint32_t *)calloc(L, sizeof(uint32_t));
+    g->into = (uint32_t *)calloc(L, sizeof(uint32_t));
     g->half = (uint8_t *)calloc(L, 1);
     g->dhalf = (uint8_t *)calloc(L, 1);
     if (!g->act || !g->delta || !g->dmask || !g->geo || !g->conv || !g->bn || !g->uses || !g->pending ||
-        !g->woff || !g->boff || !g->fold || !g->pro || !g->half || !g->dhalf)
+        !g->woff || !g->boff || !g->fold || !g->pro || !g->into || !g->half || !g->dhalf)
         goto fail;
     for (uint32_t l = 1; l < L; l++)
         for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) g->uses[spingalett_inputs(net, l)[k]]++;
@@ -782,6 +788,13 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
             net->shapes[l].channels % 4u == 0 && net->shapes[l].type == LAYER_BATCH_NORM && g->uses[l] == 1 &&
             net->dropout_rates[l] == 0.0f && net->act_func[l - 1] != ACT_SOFTMAX && !g->fold[l])
             g->pro[l] = c;
+    }
+    for (uint32_t l = 2; l < L; l++) {
+        const uint32_t c = spingalett_source(net, l);
+        const LayerType type = net->shapes[c].type;
+        if (net->shapes[l].type == LAYER_BATCH_NORM && !g->fold[l] && !g->pro[l] && c > 0 && g->uses[c] == 1 &&
+            net->act_func[c - 1] == ACT_NONE && (type == LAYER_DENSE || type == LAYER_CONV2D))
+            g->into[c] = l;
     }
     for (uint32_t l = 0; l < L; l++) {     /* (a pro[] layer has no outputs, but a gradient as any other) */
         g->half[l] = kept_half(g, l) && !g->pro[l];
@@ -814,7 +827,7 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
     for (uint32_t l = 0; l < L; l++) {
         const LayerShape *s = &net->shapes[l];
         const uint64_t rows = (uint64_t)capacity * net->topology[l] * 4u;
-        if (l > 0 && !g->fold[l] && !g->pro[l])
+        if (l > 0 && !g->fold[l] && !g->pro[l] && (training || !g->into[l]))
             spg_gpu_arena_add(A, &g->act[l], g->half[l] ? rows / 2u : rows, SPG_MEMORY_DEVICE);
         if (training && l > 0 && !g->fold[l])
             spg_gpu_arena_add(A, &g->delta[l], g->dhalf[l] ? rows / 2u : rows, SPG_MEMORY_DEVICE);
@@ -1064,7 +1077,8 @@ static void eltwise(SpgGpuNet *g, Recorder *r, const Access *a, uint32_t op, uin
 
 /* ---- convolutions (conv_view()) ---- */
 
-/* y = act(x convolved + layer l's biases) with SPG_EPI_BIAS_ACT; otherwise y = (beta = 1: +=) x
+/* y = act(x convolved + layer l's biases) with SPG_EPI_BIAS_ACT; y = act(x convolved times e0 plus the
+   floats after them, a pair per output channel) with SPG_EPI_SCALE_ACT; otherwise y = (beta = 1: +=) x
    convolved, times act'(e0) with SPG_EPI_DERIV (e0 laid out like y). Over n samples, x and y the
    maps of the convolution's input and output: a convolution's forward pass, a transposed
    convolution's data gradient. The access lists what the caller reads and writes besides. */
@@ -1089,6 +1103,7 @@ static void dw_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t m
     const uint32_t spec[11] = {mode, epi, act, s->kernel_h, s->kernel_w, s->stride_h, s->stride_w, vec, s->pad_w,
                                bn ? 1u + g->net->act_func[bn - 1] : 0u, sums ? 1u : 0u};
     if (bn) reads(a, span(g->bn[bn].address, 4u * v.in_c));
+    if (epi == SPG_EPI_SCALE_ACT) reads(a, span(e0, 2ull * v.out_c));
     if (sums) writes(a, span(g->part.address, 2ull * sums * v.in_c));
     reads(a, whole(x));
     reads(a, weights_of(g, l - 1));
@@ -1109,6 +1124,7 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
     const bool bias = epi == SPG_EPI_BIAS_ACT;
     SpgGemmPush p = {
         .a = x->address, .b = mm_weights_at(g, l - 1), .c = y->address, .e0 = bias ? biases_at(g, l - 1) : e0,
+        .e1 = epi == SPG_EPI_SCALE_ACT ? e0 + 4ull * v.out_c : 0,
         .geo = g->geo[l].address, .M = n * v.out_h * v.out_w, .N = v.OG, .K = K, .ldb = K, .ldc = v.out_c,
         .a_group = v.CG, .b_group = v.OG * K, .c_group = v.OG, .alpha = 1.0f, .beta = beta,
         .flags = bias ? SPG_GEMM_BIAS : 0u,
@@ -1120,6 +1136,7 @@ static void conv_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const S
     reads(a, whole(x));
     reads(a, mm_weights_of(g, l - 1));
     if (bias) reads(a, biases_of(g, l - 1));
+    if (epi == SPG_EPI_SCALE_ACT) reads(a, span(e0, 2ull * v.out_c));
     reads(a, whole(&g->geo[l]));
     writes(a, whole(y));
     product(r, a, &p, &m);
@@ -1218,42 +1235,55 @@ static void ln_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32
     kernel(r, &a, SPG_KERNEL_ln, spec, 3, &p, sizeof p, groups(cells, 256u / T), 1, 1);
 }
 
-static void dense_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act) {
+/* y = act(dense layer l of x + its biases), or with scales (a pair of floats an output: e0, the scales then
+   the shifts) y = act(the product times the scales plus the shifts) */
+static void dense_apply(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, const SpgGpuBuffer *y, uint32_t n,
+                        uint32_t act, uint64_t scales) {
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, l), K = net->topology[src], N = net->topology[l];
     SpgGemmPush p = {
-        .a = g->act[src].address, .b = mm_weights_at(g, l - 1), .c = g->act[l].address, .e0 = biases_at(g, l - 1),
-        .M = n, .N = N, .K = K, .lda = K, .ldb = K, .ldc = N, .alpha = 1.0f, .flags = SPG_GEMM_BIAS,
+        .a = g->act[src].address, .b = mm_weights_at(g, l - 1), .c = y->address,
+        .e0 = scales ? scales : biases_at(g, l - 1), .e1 = scales ? scales + 4ull * N : 0,
+        .M = n, .N = N, .K = K, .lda = K, .ldb = K, .ldc = N, .alpha = 1.0f, .flags = scales ? 0u : SPG_GEMM_BIAS,
     };
-    SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, act, 1, false, true, true, 0, (uint64_t)n * N, g->bf16,
-                     0, true, true};
+    SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, scales ? SPG_EPI_SCALE_ACT : SPG_EPI_BIAS_ACT, act, 1, false, true, true, 0,
+                     (uint64_t)n * N, g->bf16, 0, true, true};
+    reads(a, whole(&g->act[src]));
+    reads(a, mm_weights_of(g, l - 1));
+    if (scales) reads(a, span(scales, 2ull * N));
+    else reads(a, biases_of(g, l - 1));
+    writes(a, whole(y));
+    product(r, a, &p, &m);
+}
+
+static void dense_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act) {
     Access a = {0};
-    reads(&a, whole(&g->act[src]));
-    reads(&a, mm_weights_of(g, l - 1));
-    reads(&a, biases_of(g, l - 1));
-    writes(&a, whole(&g->act[l]));
-    product(r, &a, &p, &m);
+    dense_apply(g, r, &a, l, &g->act[l], n, act, 0);
 }
 
 /* train: with the batch's statistics (which also move the running ones); otherwise the running statistics,
-   as inference and validation use them */
+   as inference and validation use them, applied by the product of its input where that applies it (into[]):
+   the coefficients with the product's biases folded in, then the product (the normalization's input never
+   stored; ResNet-20 of Examples/Benchmark.c infers 1.1 times as fast) */
 static void bn_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act, bool train) {
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, l);
     const LayerShape *s = &net->shapes[l];
     const uint32_t C = s->channels, R = n * s->height * s->width, slices = (R + COLSUM_ROWS - 1u) / COLSUM_ROWS;
     const uint64_t stats = g->bn[l].address;
+    const bool into = !train && g->into[src] == l;
     SpgBnPush bp = {
-        .part = g->part.address, .x = g->act[src].address, .gamma = weights_at(g, l - 1), .beta = biases_at(g, l - 1),
-        .rmean = running_at(g, l - 1, 0), .rvar = running_at(g, l - 1, 1), .stats = stats, .C = C,
-        .slices = slices, .m = (float)R, .eps = s->eps, .momentum = s->momentum,
+        .part = g->part.address, .x = into ? biases_at(g, src - 1) : g->act[src].address, .gamma = weights_at(g, l - 1),
+        .beta = biases_at(g, l - 1), .rmean = running_at(g, l - 1, 0), .rvar = running_at(g, l - 1, 1), .stats = stats,
+        .C = C, .slices = slices, .m = (float)R, .eps = s->eps, .momentum = s->momentum,
     };
-    uint32_t mode = SPG_BN_INFER;
+    uint32_t mode = into ? SPG_BN_FOLD : SPG_BN_INFER;
     Access a = {0};
     reads(&a, weights_of(g, l - 1));
     reads(&a, biases_of(g, l - 1));
     reads(&a, span(running_at(g, l - 1, 0), C));
     reads(&a, span(running_at(g, l - 1, 1), C));
+    if (into) reads(&a, biases_of(g, src - 1));
     writes(&a, span(stats, 4u * C));
     if (train) {
         /* the sums of x - x[row 0] and their squares, then the statistics and coefficients */
@@ -1273,6 +1303,12 @@ static void bn_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32
     kernel(r, &a, SPG_KERNEL_bn, &mode, 1, &bp, sizeof bp, (C + 63u) / 64u, 1, 1);
     if (g->fold[l] || g->pro[l]) return;        /* applied by the addition or the convolution that reads it */
     Access b = {0};
+    if (into) {
+        if (net->shapes[src].type == LAYER_DENSE) dense_apply(g, r, &b, src, &g->act[l], n, act, stats + 8u * C);
+        else conv_apply(g, r, &b, src, outputs_of(g, spingalett_source(net, src)), &g->act[l], n, SPG_EPI_SCALE_ACT,
+                        act, stats + 8u * C, 0.0f);
+        return;
+    }
     reads(&b, whole(&g->act[src]));
     reads(&b, span(stats, 4u * C));
     writes(&b, whole(&g->act[l]));
@@ -1369,6 +1405,7 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
         const uint64_t total = (uint64_t)n * net->topology[l];
         /* softmax runs over whole rows after the layer; every other activation in its kernel */
         const uint32_t fused = act == ACT_SOFTMAX ? ACT_NONE : act;
+        if (!train && g->into[l]) continue;     /* its product runs with the normalization it applies */
         if (type == LAYER_DENSE) dense_forward(g, r, l, n, fused);
         else if (spingalett_filters(type)) conv_forward(g, r, l, n, fused);
         else if (type == LAYER_BATCH_NORM) bn_forward(g, r, l, n, fused, train);

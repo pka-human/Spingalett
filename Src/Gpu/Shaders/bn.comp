@@ -11,6 +11,7 @@
  *             a = gamma / std, b = beta - mean a (stats: mean, inv, a, b); the running statistics
  *             move towards the batch's (the variance unbiased)
  *   INFER     a = gamma / sqrt(running variance + eps), b = beta - running mean a (stats + 2C)
+ *   FOLD      as INFER, the biases of the product that applies them (x) in b: beta + (bias - mean) a
  *   BACKWARD  from the sums of dy and dy (x - mean): the gradients of gamma and beta (scaled, added
  *             to beta_g times the old ones) and dx = k dy + p x + q (coef: k, p, q)
  */
@@ -28,6 +29,7 @@ layout(local_size_x = 64) in;
 #define TRAIN    0u
 #define INFER    1u
 #define BACKWARD 2u
+#define FOLD     3u
 
 layout(push_constant) uniform Push {
     F32 part, x, gamma, beta, rmean, rvar, stats, coef;
@@ -53,9 +55,13 @@ float total(uint c, uint j) {
 void main() {
     const uint c = gl_GlobalInvocationID.x, C = p.C;
     if (c >= C) return;
-    if (MODE == INFER) {
+    if (MODE == INFER || MODE == FOLD) {
         float a = p.gamma.v[c] / sqrt(p.rvar.v[c] + p.eps);
         p.stats.v[2u * C + c] = a;
+        if (MODE == FOLD) {
+            p.stats.v[3u * C + c] = p.beta.v[c] + (p.x.v[c] - p.rmean.v[c]) * a;
+            return;
+        }
         p.stats.v[3u * C + c] = p.beta.v[c] - p.rmean.v[c] * a;
         return;
     }

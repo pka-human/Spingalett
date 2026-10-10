@@ -4,13 +4,14 @@
 */
 
 /* bn.comp: the per-channel coefficients of batch normalization, a thread a channel (TRAIN, INFER,
-   BACKWARD). Spec: MODE, HALF (word: x 1). 64 threads. */
+   BACKWARD, FOLD). Spec: MODE, HALF (word: x 1). 64 threads. */
 
 #include "common.cuh"
 
 #define TRAIN    0u
 #define INFER    1u
 #define BACKWARD 2u
+#define FOLD     3u
 
 /* sums j (0 or 1) of channel c over the slices, compensated, in order */
 DEVICE float total(const SpgBnPush &p, uint32_t c, uint32_t j) {
@@ -29,10 +30,10 @@ KERNEL(bn, SpgBnPush) {
     const uint32_t c = global_x(), C = p.C;
     if (c >= C) return;
     float *stats = F(p.stats);
-    if (MODE == INFER) {
+    if (MODE == INFER || MODE == FOLD) {
         const float a = F(p.gamma)[c] / sqrt_(F(p.rvar)[c] + p.eps);
         stats[2u * C + c] = a;
-        stats[3u * C + c] = F(p.beta)[c] - F(p.rmean)[c] * a;
+        stats[3u * C + c] = MODE == FOLD ? F(p.beta)[c] + (F(p.x)[c] - F(p.rmean)[c]) * a : F(p.beta)[c] - F(p.rmean)[c] * a;
         return;
     }
     if (MODE == TRAIN) {
