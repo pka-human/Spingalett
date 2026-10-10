@@ -781,7 +781,12 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
     memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
     if (cu.profile) {
         int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
-        if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 8)
+        if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {      /* (its unit's ways of reading A and B, _g) */
+            const char *unit = spg_cuda_units[unit_of(kernel, spec, spec_count)].name, *ways = strrchr(unit, '_');
+            if (ways && !strcmp(ways, "_g")) for (ways--; ways > unit && *ways != '_'; ways--) {}
+            snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %s", spec[5], spec[6], spec[7],
+                     spec[0], spec[1], ways ? ways + 1 : "");
+        } else if (kernel == SPG_KERNEL_gemm && spec_count >= 8)
             snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7],
                      spec[0], spec[1]);
         else

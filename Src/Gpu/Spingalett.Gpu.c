@@ -875,8 +875,13 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
         g->dhalf[l] = training && l > 0 && kept_half(g, l);
     }
     /* every layer's weights at a multiple of eight floats (a bfloat16 copy's start at 16 bytes), its
-       biases at one of four: the same layout in every copy of the network */
-    const bool wh = g->bf16 && spg_gpu_bf16_storage() && capacity >= 256u;
+       biases at one of four: the same layout in every copy of the network; the copy where products take
+       256 rows or more of a weight layer (samples times its cells: a sequence's tokens, a map's pixels) */
+    uint64_t rows = 0;
+    for (uint32_t l = 1; l < L; l++)
+        if (spingalett_weight_count(net, l - 1) && (uint64_t)net->shapes[l].height * net->shapes[l].width > rows)
+            rows = (uint64_t)net->shapes[l].height * net->shapes[l].width;
+    const bool wh = g->bf16 && spg_gpu_bf16_storage() && (uint64_t)capacity * rows >= 256u;
     for (uint32_t l = 0; l + 1 < L; l++) {
         g->woff[l] = g->Wp;
         g->boff[l] = g->Bp;
