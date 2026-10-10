@@ -26,4 +26,4 @@ Bindings/Rust/target/
 Bindings/Rust/Cargo.lock
 Bindings/CSharp/**/bin/
 Bindings/CSharp/**/obj/
-Bindings/Java/build/
+Bindings/Java/target/
