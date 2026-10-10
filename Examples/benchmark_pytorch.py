@@ -28,6 +28,14 @@ bfloat16, the counterpart of spingalett_set_gpu_precision(PRECISION_BFLOAT16).
 --host-data keeps the data in the host's memory (pinned), as Spingalett's functions take it: each
 batch is copied to the GPU as it is used (mini-batches gathered on the host first, the way a plain
 training loop does), and the outputs of inference copied back.
+
+--max (with --cuda, --cuda-fp32 or --cuda-bf16) is the fastest PyTorch configuration rather than its
+defaults: cuDNN's algorithms chosen by timing (cudnn.benchmark), images and models channels-last,
+the forward and backward passes compiled by torch.compile(mode="max-autotune") (Triton kernels and
+cuDNN or cuBLAS calls chosen by timing, activations and normalizations fused into them, the passes
+replayed as CUDA graphs), the losses and softmax inside the compiled code, and the optimizers'
+fused single-kernel steps (fused=True). Every batch size a run uses is compiled and recorded before
+its clock starts.
 """
 import contextlib
 import sys
@@ -41,6 +49,7 @@ CNN_SAMPLES, CNN_BATCH = 10000, 128
 DEVICE = "cpu"
 BF16 = False
 HOST = False
+MAX = False
 
 
 def to_dev(t):
@@ -62,6 +71,72 @@ def amp():
     return torch.autocast("cuda", dtype=torch.bfloat16) if BF16 else contextlib.nullcontext()
 
 
+def optimizer(cls, params, **kw):
+    """An optimizer: with --max its fused step (one kernel over all parameters)."""
+    return cls(params, fused=True, **kw) if MAX else cls(params, **kw)
+
+
+def placed(model, images=False):
+    """A model on the device: channels-last with --max for image models (whose compiled code starts
+    afresh: every workload compiles its own)."""
+    if MAX:
+        torch._dynamo.reset()
+    model = model.to(DEVICE)
+    return model.to(memory_format=torch.channels_last) if MAX and images else model
+
+
+def laid(x):
+    """A batch of images channels-last with --max."""
+    return x.contiguous(memory_format=torch.channels_last) if MAX and x.dim() == 4 else x
+
+
+def compiled(fn):
+    """fn, compiled by torch.compile(mode="max-autotune") with --max."""
+    return torch.compile(fn, mode="max-autotune") if MAX else fn
+
+
+def batch_sizes(total, batch):
+    """The sizes of the batches a loop over total samples in batches of batch takes."""
+    return sorted({min(batch, total - i) for i in range(0, total, batch)})
+
+
+def trainer(model, opt, loss_fn):
+    """A training step on a batch: the forward pass and loss (compiled with --max), backward, step."""
+    def forward(xb, yb):
+        with amp():
+            return loss_fn(model(xb), yb)
+    forward = compiled(forward)
+
+    def step(xb, yb):
+        opt.zero_grad(set_to_none=True)
+        forward(laid(xb), yb).backward()
+        opt.step()
+    return step
+
+
+def predictor(model, act):
+    """Inference on a batch: the model and its output activation (compiled with --max)."""
+    def run(xb):
+        with amp():
+            return act(model(xb))
+    run = compiled(run)
+    return lambda xb: run(laid(xb))
+
+
+def warm_up(step, x, y, total, batch):
+    """Untimed steps on every batch size of the run (several with --max: compiled, then recorded as a
+    CUDA graph)."""
+    for n in batch_sizes(total, batch):
+        for _ in range(3 if MAX else 1):
+            step(to_dev(x[:n]), to_dev(y[:n]))
+
+
+def warm_up_inference(run, x, total, batch):
+    for n in batch_sizes(total, batch):
+        for _ in range(3 if MAX else 1):
+            run(to_dev(x[:n]))
+
+
 def sync():
     if DEVICE != "cpu":
         torch.cuda.synchronize()
@@ -77,18 +152,10 @@ def make_model():
 
 
 def train_throughput(x, y, batch, epochs):
-    model = make_model().to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = nn.CrossEntropyLoss()          # applies softmax; accepts probability targets
-
-    def step(xb, yb):
-        opt.zero_grad(set_to_none=True)
-        with amp():
-            loss = loss_fn(model(xb), yb)
-        loss.backward()
-        opt.step()
-
-    step(to_dev(x[:batch]), to_dev(y[:batch]))  # warm-up
+    model = placed(make_model())
+    opt = optimizer(torch.optim.Adam, model.parameters(), lr=1e-3)
+    step = trainer(model, opt, nn.CrossEntropyLoss())   # applies softmax; accepts probability targets
+    warm_up(step, x, y, SAMPLES, batch)
     start = clock()
     for _ in range(epochs):
         perm = perm_of(SAMPLES) if batch < SAMPLES else None
@@ -99,11 +166,12 @@ def train_throughput(x, y, batch, epochs):
 
 
 def inference_throughput(x):
-    model = make_model().to(DEVICE).eval()
-    with torch.inference_mode(), amp():
-        torch.softmax(model(to_dev(x[:64])), dim=1)  # warm-up
+    model = placed(make_model()).eval()
+    run = predictor(model, lambda o: torch.softmax(o, dim=1))
+    with torch.inference_mode():
+        warm_up_inference(run, x, SAMPLES, SAMPLES)
         start = clock()
-        back(torch.softmax(model(to_dev(x)), dim=1))
+        back(run(to_dev(x)))
         return SAMPLES / (clock() - start)
 
 
@@ -116,18 +184,10 @@ def make_cnn(normalized=False):
 
 
 def cnn_throughput(x, y, normalized=False):
-    model = make_cnn(normalized).to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    loss_fn = nn.CrossEntropyLoss()
-
-    def step(xb, yb):
-        opt.zero_grad(set_to_none=True)
-        with amp():
-            loss = loss_fn(model(xb), yb)
-        loss.backward()
-        opt.step()
-
-    step(to_dev(x[:CNN_BATCH]), to_dev(y[:CNN_BATCH]))  # warm-up
+    model = placed(make_cnn(normalized), images=True)
+    opt = optimizer(torch.optim.AdamW, model.parameters(), lr=1e-3, weight_decay=1e-4)
+    step = trainer(model, opt, nn.CrossEntropyLoss())
+    warm_up(step, x, y, CNN_SAMPLES, CNN_BATCH)
     start = clock()
     perm = perm_of(CNN_SAMPLES)
     for i in range(0, CNN_SAMPLES, CNN_BATCH):
@@ -135,11 +195,12 @@ def cnn_throughput(x, y, normalized=False):
         step(to_dev(x[idx]), to_dev(y[idx]))
     train = CNN_SAMPLES / (clock() - start)
     model.eval()
-    with torch.inference_mode(), amp():
-        torch.softmax(model(to_dev(x[:64])), dim=1)  # warm-up
+    run = predictor(model, lambda o: torch.softmax(o, dim=1))
+    with torch.inference_mode():
+        warm_up_inference(run, x, CNN_SAMPLES, 1000)
         start = clock()
         for i in range(0, CNN_SAMPLES, 1000):
-            back(torch.softmax(model(to_dev(x[i:i + 1000])), dim=1))
+            back(run(to_dev(x[i:i + 1000])))
         infer = CNN_SAMPLES / (clock() - start)
     return train, infer
 
@@ -172,18 +233,10 @@ def make_resnet20():
 
 
 def resnet_throughput(x, y):
-    model = make_resnet20().to(DEVICE)
-    opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
-    loss_fn = nn.CrossEntropyLoss()
-
-    def step(xb, yb):
-        opt.zero_grad(set_to_none=True)
-        with amp():
-            loss = loss_fn(model(xb), yb)
-        loss.backward()
-        opt.step()
-
-    step(to_dev(x[:CNN_BATCH]), to_dev(y[:CNN_BATCH]))  # warm-up
+    model = placed(make_resnet20(), images=True)
+    opt = optimizer(torch.optim.SGD, model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+    step = trainer(model, opt, nn.CrossEntropyLoss())
+    warm_up(step, x, y, RESNET_SAMPLES, CNN_BATCH)
     start = clock()
     perm = perm_of(RESNET_SAMPLES)
     for i in range(0, RESNET_SAMPLES, CNN_BATCH):
@@ -191,11 +244,12 @@ def resnet_throughput(x, y):
         step(to_dev(x[idx]), to_dev(y[idx]))
     train = RESNET_SAMPLES / (clock() - start)
     model.eval()
-    with torch.inference_mode(), amp():
-        torch.softmax(model(to_dev(x[:64])), dim=1)  # warm-up
+    run = predictor(model, lambda o: torch.softmax(o, dim=1))
+    with torch.inference_mode():
+        warm_up_inference(run, x, RESNET_SAMPLES, 1000)
         start = clock()
         for i in range(0, RESNET_SAMPLES, 1000):
-            back(torch.softmax(model(to_dev(x[i:i + 1000])), dim=1))
+            back(run(to_dev(x[i:i + 1000])))
         infer = RESNET_SAMPLES / (clock() - start)
     return train, infer
 
@@ -229,18 +283,10 @@ class UNet(nn.Module):
 
 
 def unet_throughput(x, y):
-    model = UNet().to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    loss_fn = nn.BCEWithLogitsLoss()
-
-    def step(xb, yb):
-        opt.zero_grad(set_to_none=True)
-        with amp():
-            loss = loss_fn(model(xb), yb)
-        loss.backward()
-        opt.step()
-
-    step(to_dev(x[:UNET_BATCH]), to_dev(y[:UNET_BATCH]))  # warm-up
+    model = placed(UNet(), images=True)
+    opt = optimizer(torch.optim.AdamW, model.parameters(), lr=1e-3, weight_decay=1e-4)
+    step = trainer(model, opt, nn.BCEWithLogitsLoss())
+    warm_up(step, x, y, UNET_SAMPLES, UNET_BATCH)
     start = clock()
     perm = perm_of(UNET_SAMPLES)
     for i in range(0, UNET_SAMPLES, UNET_BATCH):
@@ -248,11 +294,12 @@ def unet_throughput(x, y):
         step(to_dev(x[idx]), to_dev(y[idx]))
     train = UNET_SAMPLES / (clock() - start)
     model.eval()
-    with torch.inference_mode(), amp():
-        torch.sigmoid(model(to_dev(x[:32])))  # warm-up
+    run = predictor(model, torch.sigmoid)
+    with torch.inference_mode():
+        warm_up_inference(run, x, UNET_SAMPLES, 256)
         start = clock()
         for i in range(0, UNET_SAMPLES, 256):
-            back(torch.sigmoid(model(to_dev(x[i:i + 256]))))
+            back(run(to_dev(x[i:i + 256])))
         infer = UNET_SAMPLES / (clock() - start)
     return train, infer
 
@@ -271,18 +318,10 @@ def make_mobilenet():
 
 
 def mobilenet_throughput(x, y):
-    model = make_mobilenet().to(DEVICE).to(memory_format=torch.channels_last)
-    opt = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
-    loss_fn = nn.CrossEntropyLoss()
-
-    def step(xb, yb):
-        opt.zero_grad(set_to_none=True)
-        with amp():
-            loss = loss_fn(model(xb.contiguous(memory_format=torch.channels_last)), yb)
-        loss.backward()
-        opt.step()
-
-    step(to_dev(x[:CNN_BATCH]), to_dev(y[:CNN_BATCH]))  # warm-up
+    model = placed(make_mobilenet()).to(memory_format=torch.channels_last)
+    opt = optimizer(torch.optim.SGD, model.parameters(), lr=0.05, momentum=0.9)
+    step = trainer(model, opt, nn.CrossEntropyLoss())
+    warm_up(step, x, y, MOBILE_SAMPLES, CNN_BATCH)
     start = clock()
     perm = perm_of(MOBILE_SAMPLES)
     for i in range(0, MOBILE_SAMPLES, CNN_BATCH):
@@ -290,11 +329,12 @@ def mobilenet_throughput(x, y):
         step(to_dev(x[idx]), to_dev(y[idx]))
     train = MOBILE_SAMPLES / (clock() - start)
     model.eval()
-    with torch.inference_mode(), amp():
-        torch.softmax(model(to_dev(x[:64]).contiguous(memory_format=torch.channels_last)), dim=1)  # warm-up
+    run = predictor(model, lambda o: torch.softmax(o, dim=1))
+    with torch.inference_mode():
+        warm_up_inference(lambda xb: run(xb.contiguous(memory_format=torch.channels_last)), x, MOBILE_SAMPLES, 1000)
         start = clock()
         for i in range(0, MOBILE_SAMPLES, 1000):
-            back(torch.softmax(model(to_dev(x[i:i + 1000]).contiguous(memory_format=torch.channels_last)), dim=1))
+            back(run(to_dev(x[i:i + 1000]).contiguous(memory_format=torch.channels_last)))
         infer = MOBILE_SAMPLES / (clock() - start)
     return train, infer
 
@@ -305,7 +345,7 @@ def data(t):
 
 
 def main():
-    global DEVICE, BF16, HOST
+    global DEVICE, BF16, HOST, MAX
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if args:
         torch.set_num_threads(int(args[0]))
@@ -315,6 +355,11 @@ def main():
         torch.backends.cudnn.allow_tf32 = "--cuda-fp32" not in sys.argv
         torch.backends.cuda.matmul.allow_tf32 = "--cuda-fp32" not in sys.argv and torch.backends.cuda.matmul.allow_tf32
         HOST = "--host-data" in sys.argv
+        MAX = "--max" in sys.argv
+        torch.backends.cudnn.benchmark = MAX
+        if MAX:     # every batch size of a workload, in training and inference, compiled once
+            torch._dynamo.config.recompile_limit = 64
+            torch._dynamo.config.accumulated_recompile_limit = 4096
     torch.manual_seed(42)
     x = torch.rand(SAMPLES, 784)
     y = torch.rand(SAMPLES, 10)
@@ -328,6 +373,8 @@ def main():
             where += ", autocast to bfloat16"
         if HOST:
             where += ", data in host memory"
+        if MAX:
+            where += ", torch.compile max-autotune, cudnn.benchmark, channels-last, fused optimizers"
     print(f"PyTorch {torch.__version__}, {where}\n")
     print(f"{'samples/s':<16} {'full batch':>14} {'mini-batch 64':>14} {'inference':>14}")
     full = train_throughput(x, y, SAMPLES, EPOCHS)

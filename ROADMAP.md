@@ -22,105 +22,156 @@ against PyTorch on the same machine.
 | 0.13.1 | "GPU": activations and their gradients in bfloat16 on the GPU, the network's copy kept there between calls, inputs and parameters written into device memory, tiles chosen by device timestamps, inference in chunks that stay in cache, faster pooling, weight gradients split only where it pays: ahead of PyTorch with cuDNN in every workload but the MLP's inference with PyTorch's data already in GPU memory |
 | 0.14 | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.14 times at least in every workload, its data in GPU memory or not |
 | 1.0 | "Stability": the API, ABI and formats of 0.14 kept by semantic versioning (symbol versions, the `api.abi` test against the last release), the names of 0.x only on request, pkg-config, Conan and vcpkg recipes |
-| 1.1 | "CUDA": a backend for NVIDIA GPUs on the library's own kernels (PTX compiled by Clang, no CUDA toolkit, cuBLAS or cuDNN), ahead of PyTorch with cuDNN by 1.2 to 7.7 times in every workload and of the Vulkan backend; batch normalizations in their product's epilogue at inference on both backends; the runtime library for programs that only run models |
+| 1.1 | "CUDA": a backend for NVIDIA GPUs on the library's own kernels (PTX compiled by Clang, no CUDA toolkit, cuBLAS or cuDNN), ahead of PyTorch with cuDNN by 1.2 to 7.7 times in every workload and of the Vulkan backend; batch normalizations in their product's epilogue at inference on both backends; the runtime library for programs that only run models. Why not cuDNN and cuBLAS: half a gigabyte to a gigabyte of libraries for each CUDA version, backward algorithms that add through atomics (runs would no longer repeat their bits), and the library measures its own kernels rather than wrapping others'; they remain what the backend is measured against |
 
-## 0.14: the release candidate (released)
+## 1.2: transformers, more languages, more packages (in progress)
 
-The last minor version of 0.x: whatever would break programs after 1.0 happens here, and nothing
-else.
+Spingalett learns the networks of today's language models, in every part of the library at once
+(training on the CPU and both GPU backends, the model format, the engine, deployment models, the
+runtime, the importers and the bindings), and reaches more languages and package managers. Nothing
+of 1.1 changes: a 1.1 program builds and runs against 1.2 unchanged.
 
-- **Data sets on the GPU** (done): `SpingalettDeviceData` and the `device_*` fields of the
-  argument structs, which change their layout.
+### The layers of transformers
 
-- **Names** (done): every public name under the library's prefix (`spingalett_`, `Spingalett`,
-  `SPINGALETT_`; the weight initializations shortened to `SPINGALETT_INIT_*`); the names of 0.x
-  stay available from `Spingalett.Short.h`, which `Spingalett.h` includes unless
-  `SPINGALETT_NO_SHORT_NAMES` is defined. The examples and the documentation use the new names.
-- **Structs that can grow** (done): every public struct ends with `SPINGALETT_RESERVED` zeroed
-  words; one way of reporting errors (stated in `Spingalett.h`; `spingalett_save()` and
-  `spingalett_set_compute_mode()` now return whether they succeeded); nothing was deprecated.
-- **Zero means the default** (done): `SPINGALETT_ACT_NONE` is 0, so a layer whose arguments leave
-  out `.act_func` has no activation; `.slett` files keep their activation codes.
-- **Formats** (done): `.slett` version 7 and `.slettd` version 2 frozen as the 1.0 formats (later
-  versions only add kinds of layers or coders, and every 1.x engine reads every 1.x file it can
-  run), stated in `docs/ModelFormat.md` and `docs/DatasetFormat.md`.
-- **C++ wrapper** (done): the header-only `Spingalett.hpp` (C++23) with move-only owners (`Network`,
-  `Model`, `Dataset`, `DeviceData`), `std::span` inputs, `std::expected` for errors, and a fluent
-  `Builder`.
-- **Documentation** (done): `docs/Reference.md`, generated from the headers by
-  `docs/make_reference.py` (a test keeps it current), and `docs/Tutorial.md`, a path through the
-  examples (XOR, MNIST, its CNN, CIFAR-10, a U-Net, deployment to a microcontroller).
-- **Room for CUDA** (done for the API): `SPINGALETT_COMPUTE_CUDA` reserved in the compute modes (it
-  falls back to the CPU until 1.1). The device layer under the GPU executor changes no
-  API and comes with the CUDA backend.
+A sequence of `n` tokens is a layer of `1 x n` cells (the input layer holds the tokens' indices as
+floats), so that what the library has per cell (layer normalization, dropout, additions, products
+of layers) serves sequences as it serves images.
 
-## 1.0: stability (released)
+- **Embeddings** (`spingalett_embedding()`): a table of `vocabulary` rows, a learned position vector
+  per cell when asked (GPT-2's absolute positions). The table's gradient is summed per token in the
+  order of the batch (on the GPU through a stable sort of the batch's tokens, so that it stays
+  deterministic without atomics).
+- **Attention** (`spingalett_attention()`): multi-head scaled dot-product attention over a layer of
+  queries, keys and values side by side, with grouped-query and multi-query attention (`kv_heads`),
+  a causal mask, and rotary position embeddings (`rope_theta`, LLaMA's). On the CPU as blocked
+  matrix products a thread per sample and group of heads; on CUDA as flash attention on the tensor
+  cores (the scores never stored, the backward pass recomputing them, its two halves in two kernels
+  so that no sum depends on the order of atomics); on Vulkan as tiles of the same scheme in single
+  precision.
+- **RMS normalization** (`spingalett_rms_norm()`), **products of layers**
+  (`spingalett_multiply_layers()`, SwiGLU's gate), **GELU** (exact and tanh) and **SiLU**, whose
+  derivatives need the values before the activation (training keeps them for those layers), and
+  **linear layers over tokens** (`spingalett_linear()`: a 1 x 1 convolution).
+- **The sparse cross-entropy loss** (`SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY`): a softmax over each
+  cell's channels against one class index a cell (a negative one for none, as padding), with label
+  smoothing; targets are `spingalett_target_size()` values a sample, not one-hot rows of the
+  vocabulary.
+- **Format 8** of `.slett` files for them; the engine and deployment models run them in every
+  precision (an embedding table in INT8 or INT4 is a table of rows with their scales).
+- **Language models end to end:** a reader of token files (`.bin` files of 16- or 32-bit tokens, as
+  nanoGPT writes them) that serves windows of a context and their next tokens; generation from a
+  prompt (temperature, top-k, top-p); PyTorch weights of GPT-2- and LLaMA-style models (an embedding
+  takes its token and position tables, attention's projections concatenated); an example that trains
+  a character-level GPT and samples from it; the GPT in `Examples/Benchmark.c` against PyTorch with
+  `scaled_dot_product_attention` and `torch.compile`.
 
-0.14 with what its users find fixed: the C API and ABI follow semantic versioning from then on, the
-soname becomes `libspingalett.so.1`, and a CMake package, pkg-config file, vcpkg and Conan recipes
-ship with it.
+### The GPU against PyTorch at its fastest
 
-- **The names of 0.x only on request** (done): `Spingalett.h` leaves out `Spingalett.Short.h`, whose
-  macros clashed with `<syslog.h>` and replaced programs' own `train()` and `layer()`.
-- **The ABI held by tests** (done): symbol versions (`Src/Spingalett.map`, `SPINGALETT_1.0`) and
-  `api.abi`, which compares the structs' layouts, the enumerators, the constants and the functions'
-  declarations with those of the last release (`Tests/Data/abi.txt`).
-- **Packages** (done): `spingalett.pc` (relocatable), the CMake package compatible within a major
-  version, a Conan recipe and a vcpkg port of the source tree (`packaging/`, tested in CI); the
-  rules of compatibility in the README.
+1.1 was measured against PyTorch's defaults. `benchmark_pytorch.py --max` runs PyTorch at its
+fastest: `torch.compile(mode="max-autotune")` (Triton kernels, cuDNN and cuBLAS chosen by timing,
+the passes replayed as CUDA graphs), `cudnn.benchmark`, channels-last tensors and fused optimizers.
+On the RTX 4050, 1.1 stays ahead of it in single precision and TF32 (by 1.05 times in the U-Net's
+training to 2.7 times) and in most of bfloat16, but not everywhere: ResNet-20 trains 1.03 times as
+fast and infers 1.06 times as fast, and the U-Net trains at 0.94 times PyTorch's speed. 1.2's target
+is a clear margin in every workload against that configuration: the matrix units' kernel for
+convolutions (shared memory without bank conflicts, tiles that start the next tile's loads under
+the current sums), batch normalization's sums in the epilogue of the convolution before it, and the
+passes between products fused where PyTorch's compiler fuses them.
 
-## 1.1: the runtime and a CUDA backend (released)
+### Bindings
 
-Programs that only run trained models get a library of that part alone, and NVIDIA GPUs a backend
-of their own (below).
+The C API stays the source of truth; each binding wraps it whole (networks and layers, training,
+the step API, prediction and evaluation, deployment models, data sets, the GPU) and loads the same
+shared library, so that it gains every backend and kernel of a release on the day it ships.
 
-- **The runtime** (done): `libspingalett-runtime` and `Spingalett.Runtime.h`, the deployment models
-  (loading, batched prediction on every core with the kernels chosen at run time, evaluation, the
-  engine) with errors, logging and the thread settings, built from the library's sources with its
-  flags, so that it gives the library's bits (`runtime.library` compares them on 121 models of every
-  kind of layer and precision); a quarter of the library's size, without networks, training, data
-  sets, importers or the GPU. Built next to the library or alone (`SPINGALETT_RUNTIME_ONLY`), with
-  its own archives, the CMake target `Spingalett::runtime`, pkg-config's `spingalett-runtime`, the
-  Conan and vcpkg packages, and `RunModel`.
-- **Examples in the short names** (done): the examples, DigitPad and the README's code use the
-  names of `Spingalett.Short.h`, which read more easily.
+- **Rust** (`Bindings/Rust`): `spingalett-sys` (the declarations, checked against the headers in CI)
+  and `spingalett`, a safe crate (owners that free on drop, slices, `Result` for errors).
+- **C#** (`Bindings/CSharp`): a .NET 8 library over P/Invoke (`LibraryImport`, spans, `IDisposable`
+  owners), packaged for NuGet with the native libraries of every platform inside.
+- **Go** (`Bindings/Go`): a cgo package (`go get github.com/pka-human/Spingalett/Bindings/Go`).
+- **Java** (`Bindings/Java`): the Foreign Function and Memory API of Java 22 (no JNI code to build).
 
-### The CUDA backend (done)
+### Packages
 
-The first large work of 1.x, now that the Vulkan backend's steps (under **Any time**) had shown how
-far Vulkan goes. `COMPUTE_CUDA` (reserved in 0.14) runs on NVIDIA GPUs of compute capability 8.0 or
-later; Vulkan stays the backend for AMD, Intel and Apple GPUs, and for NVIDIA ones where CUDA is not
-built.
+Where Spingalett can be installed from, with what each channel needs from the maintainer (see
+**Distribution** below): a Homebrew tap and a Scoop bucket served from this repository, a Nix
+flake, an AUR package description, `.deb` and `.rpm` packages and a container image built by the
+release workflow, and recipes for conda-forge.
 
-- **Own kernels, no cuDNN or cuBLAS** (done): the CUDA driver (libcuda, which NVIDIA's driver
-  installs) is opened at run time, as the Vulkan loader is, so the library still loads and runs
-  without it. The kernels are CUDA C compiled by Clang to PTX (no CUDA toolkit: `-nocudainc`, the
-  thread indices and math as builtins), gzip-compressed into the library and expanded when first
-  used; the driver compiles them for the GPU at hand and caches them. Packages take 10.6 MB of PTX.
-- **Why not cuDNN and cuBLAS:** they are half a gigabyte to a gigabyte of libraries for each CUDA
-  version; their fastest backward algorithms add through atomics, so runs would no longer repeat
-  their bits; and the library measures its own kernels rather than wrapping others'. They remain
-  what the backend is measured against (`benchmark_pytorch.py --cuda`).
-- **The executor of the Vulkan backend** (done): the batch path recorded once per kind of chunk and
-  replayed as a CUDA graph, the head of each submission (its copies) on a stream of its own; the
-  same fixed orders of summation, so CUDA runs repeat their bits too, and agree with the CPU up to
-  rounding.
-- **Kernels** (done): single-precision products as tiles chosen by timing (operand modes, vector
-  loads and tiles as template instances, two buffers filled by `cp.async`, epilogues inline);
-  bfloat16 products on `mma.sync` m16n8k16 with `ldmatrix`, results through shared memory to
-  coalesced stores; a direct kernel for products of few k over a convolution's windows (first
-  layers); depthwise convolutions with their windows, strides, modes and bfloat16 maps as instances;
-  normalization, pooling, additions and optimizer steps four values a thread. Not done: TF32 and
-  FP16 products (a precision of their own: step 5 below), deployment models on the GPU.
-- **Targets on the RTX 4050** (met): PyTorch's speed with cuDNN in each precision on ResNet-20, the
-  MNIST CNN and the U-Net, and within 10% of it on the MLP's full batches. 1.1 trains them 1.3 to
-  2.1 times as fast as PyTorch and infers them 2.1 to 4.1 times as fast, the MLP's full batches 1.2
-  and 1.25 times; it is ahead of the Vulkan backend in every workload but the single-precision
-  U-Net's inference (even).
-- **Tests** (done) as for Vulkan: the GPU against the CPU up to rounding, two runs bit for bit, the
-  matrix kernels' tiles bit for bit (`SPINGALETT_GPU_BACKEND=cuda Bin/SpingalettGpuTests all`, the
-  `cuda` group); CI builds the kernels with Clang (no NVIDIA GPU there: the tests skip), and they
-  run on the RTX 4050 before each release.
+## 1.3: language models in production
+
+What a model needs after training: running it fast for many tokens, from the formats people have
+weights in.
+
+- **Inference with a key-value cache:** generation that computes each new token once (the keys and
+  values of the tokens before kept per layer), on the CPU (deployment models: `spingalett_model_*`
+  gains a session for a sequence) and on the GPU; batched generation of several sequences.
+- **Deployment models on the GPU**: `spingalett_model_predict()` with FP16, BF16 and INT8 weights
+  (exact against the CPU where the sums are integers), and weight-only INT4 and INT8 matrix kernels
+  for language models (the weights read once per token, dequantized in registers).
+- **Tokenizers**: byte-level BPE (GPT-2, tiktoken's encodings) and SentencePiece-style models from
+  `tokenizer.json`, encoding and decoding in C, with the special tokens of chat formats.
+- **Weights from the formats they come in**: Hugging Face checkpoints of LLaMA, Mistral, Qwen and
+  GPT-2 by their names (safetensors, sharded), and GGUF files.
+- **Training features of language models**: tied input and output embeddings, activation
+  recomputation (checkpointing) to fit longer contexts, gradient accumulation and learning-rate
+  schedules by step in `spingalett_train()`, sequences of different lengths in one batch, sliding
+  window attention, cross-attention (encoder-decoder models), and FP16 products with loss scaling.
+- **ONNX import of transformers**: products of two activations, softmax over an axis, Gather,
+  layer normalization over sequences, attention patterns folded into the attention layer.
+- **A WebAssembly build of the engine** and a JavaScript package around it (npm), for models that
+  run in browsers.
+
+## 1.4: scale
+
+Models that do not fit one GPU's memory or time.
+
+- **Data-parallel training on several GPUs** of one machine: each GPU a share of the batch, the
+  gradients summed in a fixed order (a deterministic all-reduce over peer copies, no NCCL), the same
+  bits as one GPU taking the whole batch.
+- **Sharded optimizer state** (each GPU keeps the moments of its share of the parameters) and the
+  optimizer's state, or parameters, offloaded to the host's memory.
+- **Data sets of billions of tokens**: token files mapped into memory and read without copies,
+  shuffled windows across files, the GPU's data sets streamed in chunks.
+- **Checkpoints** that save and resume a run exactly (the readers' positions, the generators'
+  states), sharded across files for large models.
+- **More GPU backends' reach**: Metal on Apple GPUs (MoltenVK runs the Vulkan backend there today).
+
+## 2.0: what 1.x cannot add
+
+A major release only for what would break programs; candidates so far:
+
+- tensors of more than three axes and of variable length in the API (sequences of any length per
+  call rather than a fixed input layer), which the transformer layers of 1.2 approximate with a
+  fixed context;
+- layers of the program's own (forward and backward callbacks, with GPU kernels) in networks the
+  library trains;
+- training across machines.
+
+## Distribution
+
+Where Spingalett can be installed from, and what each channel needs. "Today" means it works from
+this repository and its releases alone, without accounts elsewhere.
+
+| Channel | State | What it takes |
+|---|---|---|
+| PyPI (`pip install spingalett`) | published since 0.12 | trusted publishing from `release.yml` |
+| GitHub releases (library, runtime, DigitPad, wheels) | published | `release.yml` |
+| CMake package, pkg-config | in every archive | — |
+| vcpkg and Conan recipes (`packaging/`) | in the repository | submitting them to vcpkg's registry and Conan Center: pull requests from the maintainer's accounts |
+| Homebrew (`brew tap pka-human/spingalett https://github.com/pka-human/Spingalett`) | today, 1.2 | `Formula/spingalett.rb` in this repository; homebrew-core asks for a project with more users first |
+| Scoop (`scoop bucket add spingalett https://github.com/pka-human/Spingalett`) | today, 1.2 | `bucket/spingalett.json` in this repository |
+| Nix (`nix profile install github:pka-human/Spingalett`) | today, 1.2 | `flake.nix` in this repository; nixpkgs: a pull request |
+| Debian, Ubuntu, Fedora (`.deb`, `.rpm` on the release page) | today, 1.2 | built by `release.yml`; a PPA or COPR repository needs the maintainer's Launchpad or Fedora account |
+| Container image (`ghcr.io/pka-human/spingalett`) | today, 1.2 | pushed by `release.yml` with its own token |
+| Go modules (`go get github.com/pka-human/Spingalett/Bindings/Go`) | today, 1.2 | nothing: Go fetches from the repository |
+| Rust (`cargo add spingalett --git https://github.com/pka-human/Spingalett`) | today, 1.2 | crates.io: an API token as the secret `CARGO_REGISTRY_TOKEN`, then `release.yml` publishes |
+| .NET (`.nupkg` on the release page) | today, 1.2 | nuget.org: an API key as the secret `NUGET_API_KEY`, then `release.yml` publishes |
+| Java (`.jar` on the release page; JitPack builds from tags) | today, 1.2 | Maven Central: a Sonatype account and a signing key |
+| AUR (`spingalett`, `spingalett-bin`) | `packaging/aur` in 1.2 | an AUR account with an SSH key: the maintainer pushes the PKGBUILDs |
+| conda-forge | `packaging/conda` in 1.2 | a pull request to conda-forge/staged-recipes from the maintainer's account |
+| winget, Chocolatey | after 1.2 | manifests submitted from the maintainer's accounts |
+| npm (the engine in WebAssembly) | 1.3 | an npm account |
 
 ## Any time: work that changes no API
 
@@ -210,14 +261,12 @@ cache between products; training chunks of 8,192 samples were no faster than of 
 epoch's first chunk submitted before the last one's losses come back would win 2 to 4% of full-batch
 epochs of 6 ms, and is left for now (it runs before early stopping and callbacks decide).
 
-## After 1.0
+## Later, in no particular release
 
 - **Quantization-aware training:** fake-quantized forward passes with straight-through gradients,
   so INT4 and INT2 models keep their accuracy (INT2 loses most of it on CIFAR-10 today).
 - **NEON kernels for training**, so that Apple silicon and AArch64 servers train as fast as x86
   does; SVE where available.
-- **Attention and sequence models:** embeddings, multi-head attention (on the layer normalization
-  of 0.13), and a small transformer example; recurrent layers if there is demand.
-- **More language bindings:** Rust, C#, and a JavaScript / WebAssembly build of the engine.
+- **Recurrent layers** (GRU, LSTM) and state-space layers (Mamba-style scans), if there is demand.
 - **More of the engine on microcontrollers:** CMSIS-style kernels for Cortex-M55 (Helium/MVE),
   RISC-V vector, and a way to run models larger than RAM layer by layer from flash.
