@@ -604,6 +604,10 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
         spingalett_log(LOG_WARNING, "The GPU cannot run this network (%s); running it on the CPU", why);
         return NULL;
     }
+    /* chunks of a power of two (at least 64) samples, so that calls of nearby sizes share one */
+    uint32_t want = 64;
+    while (want < count && want < (1u << 24)) want *= 2;
+    const uint32_t capacity = spingalett_gpu_capacity(net, want, false);
     /* the copy train() left, its parameters there already (taken from the host when it wrote them
        since), when no other call holds it and its chunks are not much smaller than this call's */
     SpgGpuNet *kept = net->gpu_kept ? net->gpu_trainer : NULL;
@@ -623,10 +627,6 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
     SpgGpuNet *source = kept && spingalett_gpu_net_current(kept) && net->param_version == net->gpu_version &&
                         spingalett_network_hold_gpu(net, true) ? kept : NULL;
     if (!source) spingalett_network_sync(net);
-    /* chunks of a power of two (at least 64) samples, so that calls of nearby sizes share one */
-    uint32_t want = 64;
-    while (want < count && want < (1u << 24)) want *= 2;
-    uint32_t capacity = spingalett_gpu_capacity(net, want, false);
     SpgGpuNet *gpu = atomic_exchange(&net->gpu_predict, NULL);
     /* the parameters as they are now: those it has when the arrays have not changed since (nor the
        kept copy, which changes in train() only, whose end writes them) */
@@ -641,8 +641,14 @@ SpgGpuNet *spingalett_gpu_for(NeuralNetwork *net, uint32_t count) {
     }
     spingalett_gpu_net_free(gpu);
     gpu = capacity ? spingalett_gpu_net_create_from(net, capacity, NULL, source) : NULL;
-    if (gpu) spingalett_gpu_net_set_version(gpu, version);
     if (source) spingalett_network_let_go_gpu(net);
+    /* no room beside the copy train() left: that copy released (its parameters brought back first), then
+       this call's made again */
+    if (!gpu && capacity && net->gpu_kept) {
+        spingalett_network_release_gpu(net);
+        gpu = spingalett_gpu_net_create_from(net, capacity, NULL, NULL);
+    }
+    if (gpu) spingalett_gpu_net_set_version(gpu, atomic_load(&net->host_version));
     if (!gpu) spingalett_log(LOG_WARNING, "Not enough GPU memory for the network; running it on the CPU");
     return gpu;
 }

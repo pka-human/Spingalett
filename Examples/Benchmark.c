@@ -39,9 +39,10 @@
  * GPU (which predict() keeps while the parameters do not change), the step that moving a PyTorch model
  * to the GPU is.
  *
- * Usage: Benchmark [threads] [gpu] [vulkan | cuda] ("gpu": the GPU's rows only, as
- * Examples/benchmark_pytorch.py --cuda runs them; "vulkan" or "cuda": that backend's only).
- * Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
+ * Usage: Benchmark [threads] [gpu] [vulkan | cuda] [fp32 | bf16] [mlp cnn resnet unet mobilenet gpt] ("gpu": the
+ * GPU's rows only, as Examples/benchmark_pytorch.py --cuda runs them; "vulkan" or "cuda": that backend's only;
+ * "fp32" or "bf16": the GPU's rows of that precision; workloads by name: those only). BENCH_VERBOSE=1 in the
+ * environment shows the library's messages. Examples/benchmark_pytorch.py runs the same workloads in PyTorch.
  */
 
 #include <Spingalett/Spingalett.Short.h>
@@ -535,7 +536,7 @@ static void deployment_benchmark(const float *inputs) {
 
 int main(int argc, char **argv) {
     srand(42);
-    spingalett_set_verbose(false);
+    spingalett_set_verbose(getenv("BENCH_VERBOSE") != NULL);
 
     float *inputs = NULL, *targets = NULL;
     generate_synthetic_data(&inputs, &targets);
