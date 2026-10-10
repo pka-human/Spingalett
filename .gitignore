@@ -20,3 +20,10 @@ data/
 
 # Package recipes: what Conan writes next to them
 CMakeUserPresets.json
+
+# Bindings of other languages: build outputs
+Bindings/Rust/target/
+Bindings/Rust/Cargo.lock
+Bindings/CSharp/**/bin/
+Bindings/CSharp/**/obj/
+Bindings/Java/build/

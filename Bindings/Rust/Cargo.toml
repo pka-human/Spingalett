@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 pka_human (pka_human@proton.me)
+
+[workspace]
+members = ["spingalett-sys", "spingalett"]
+resolver = "2"
+
+[workspace.package]
+version = "1.2.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/pka-human/Spingalett"
+rust-version = "1.77"
