@@ -668,9 +668,10 @@ static void predict_layer(const uint8_t *image, const SlettLayer *L, const Prepa
                     spingalett_engine_embedding(image, L, xs, ys);
                 } else if (L->type == LAYER_ATTENTION) {
                     const uint32_t cells = L->out_h * L->out_w, head = L->out_c / L->heads;
-                    float *scratch = (float *)(void *)(w->window + (size_t)spingalett_thread_num() * w->window_stride);
-                    float *table = NULL;
+                    /* (no scratch without rotary embeddings: the window may not exist) */
+                    float *scratch = NULL, *table = NULL;
                     if (L->theta > 0.0f) {
+                        scratch = (float *)(void *)(w->window + (size_t)spingalett_thread_num() * w->window_stride);
                         table = scratch + (size_t)cells * L->kv_heads * head + head;
                         spingalett_engine_rope_table(cells, head, L->theta, table);
                     }

@@ -1357,7 +1357,10 @@ static void ln_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32
     const LayerShape *s = &net->shapes[l];
     const uint32_t cells = n * s->height * s->width, T = ln_threads(s->channels);
     const bool stats = train && g->bn[l].buffer, rms = s->type == LAYER_RMS_NORM;
-    SpgLnPush p = {g->act[src].address, g->act[l].address, 0, weights_at(g, l - 1), rms ? 0 : biases_at(g, l - 1),
+    /* (RMS: no beta, gamma's address in its place: some drivers, as lavapipe, load from an address the same for
+       every thread whatever the branch around the load) */
+    const uint64_t gamma = weights_at(g, l - 1);
+    SpgLnPush p = {g->act[src].address, g->act[l].address, 0, gamma, rms ? gamma : biases_at(g, l - 1),
                    stats ? g->bn[l].address : 0, cells, s->channels, (stats ? SPG_LN_STATS : 0u) | (rms ? SPG_LN_RMS : 0u),
                    s->eps};
     uint32_t spec[3] = {T, 0, act};
