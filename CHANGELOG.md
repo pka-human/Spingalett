@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-10
+
 "CUDA": a GPU backend for NVIDIA GPUs on the library's own kernels (`SPINGALETT_COMPUTE_CUDA`, which
 1.0 reserved), compiled to PTX by Clang and carried in the library: neither the CUDA toolkit nor
 cuBLAS or cuDNN is needed to build or to run. On an RTX 4050 Laptop GPU it trains every workload of
@@ -1081,7 +1083,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/pka-human/Spingalett/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/pka-human/Spingalett/compare/v0.14.0...v1.0.0
 [0.14.0]: https://github.com/pka-human/Spingalett/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/pka-human/Spingalett/compare/v0.13.0...v0.13.1
