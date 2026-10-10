@@ -135,7 +135,34 @@ Models that do not fit one GPU's memory or time.
   shuffled windows across files, the GPU's data sets streamed in chunks.
 - **Checkpoints** that save and resume a run exactly (the readers' positions, the generators'
   states), sharded across files for large models.
-- **More GPU backends' reach**: Metal on Apple GPUs (MoltenVK runs the Vulkan backend there today).
+- **Mixture of experts**: a layer of expert networks with a learned router (top-k gating, the
+  experts' products batched by expert, the load-balancing loss), for the sparse models that reach
+  large parameter counts at a dense model's cost per token.
+
+## 1.5: Arm, Apple and the edge
+
+The CPU and GPU paths that 1.0 to 1.4 tuned on x86 and NVIDIA, brought to the other hardware the
+library runs on.
+
+- **NEON kernels for training** (and SVE where available), so that Apple silicon and AArch64
+  servers train as fast as x86 does; AArch64 matrix kernels chosen at run time as x86's are.
+- **A Metal backend** for Apple GPUs (MoltenVK runs the Vulkan backend there today), on the same
+  executor, with bfloat16 products where the GPU has them.
+- **Quantization-aware training**: fake-quantized forward passes with straight-through gradients,
+  so that INT4 and INT2 models (and language models' INT4 weights) keep their accuracy (INT2 loses
+  most of it on CIFAR-10 today).
+- **More of the engine on microcontrollers**: CMSIS-style kernels for Cortex-M55 (Helium/MVE) and
+  RISC-V vector, transformers' layers within a microcontroller's memory, and models larger than RAM
+  run layer by layer from flash.
+
+## 1.6: sequence models beyond attention
+
+- **Recurrent layers** (GRU, LSTM) and **state-space layers** (Mamba-style selective scans) with
+  parallel scans on the GPU, as layers of the same graphs as attention (hybrid models).
+- **Attention variants** of later models: multi-head latent attention, attention sinks, ALiBi
+  positions, block-sparse and sliding-window masks in the flash kernels.
+- **Multimodal inputs**: patch embeddings for images (vision transformers) and audio frames, and
+  inputs of several kinds in one network.
 
 ## 2.0: what 1.x cannot add
 
@@ -260,13 +287,3 @@ inference chunks larger than 32 MB of activations slowed even the MLP, whose lay
 cache between products; training chunks of 8,192 samples were no faster than of 4,096; the next
 epoch's first chunk submitted before the last one's losses come back would win 2 to 4% of full-batch
 epochs of 6 ms, and is left for now (it runs before early stopping and callbacks decide).
-
-## Later, in no particular release
-
-- **Quantization-aware training:** fake-quantized forward passes with straight-through gradients,
-  so INT4 and INT2 models keep their accuracy (INT2 loses most of it on CIFAR-10 today).
-- **NEON kernels for training**, so that Apple silicon and AArch64 servers train as fast as x86
-  does; SVE where available.
-- **Recurrent layers** (GRU, LSTM) and state-space layers (Mamba-style scans), if there is demand.
-- **More of the engine on microcontrollers:** CMSIS-style kernels for Cortex-M55 (Helium/MVE),
-  RISC-V vector, and a way to run models larger than RAM layer by layer from flash.
