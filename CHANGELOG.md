@@ -1181,7 +1181,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/pka-human/Spingalett/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/pka-human/Spingalett/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/pka-human/Spingalett/compare/v0.14.0...v1.0.0
 [0.14.0]: https://github.com/pka-human/Spingalett/compare/v0.13.1...v0.14.0
