@@ -1,0 +1,18 @@
+<!--
+SPDX-License-Identifier: MIT
+Copyright (c) 2026 pka_human (pka_human@proton.me)
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>Major</RollForward>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Spingalett/Spingalett.csproj" />
+  </ItemGroup>
+</Project>
