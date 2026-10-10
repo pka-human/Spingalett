@@ -13,9 +13,10 @@
 
 </div>
 
-Spingalett is a neural-network library written in C23 for training and running fully connected
-and convolutional networks, chains of layers or graphs of them (residual connections, concatenated
-branches), on the CPU and on GPUs: NVIDIA's through CUDA, with kernels of its own (no CUDA toolkit,
+Spingalett is a neural-network library written in C23 for training and running fully connected,
+convolutional and transformer networks (language models among them: GPT-2 and LLaMA in form, trained
+on token files and generating text), chains of layers or graphs of them (residual connections,
+concatenated branches), on the CPU and on GPUs: NVIDIA's through CUDA, with kernels of its own (no CUDA toolkit,
 cuBLAS or cuDNN), and others through Vulkan compute. It depends only on the C standard library (the
 CUDA driver and the Vulkan loader are opened at run time where there are some): on the CPU, batch
 training and inference run as matrix-matrix products on built-in AVX-512, AVX2, NEON or portable kernels (on
@@ -25,8 +26,8 @@ designated initializers and all parameters live in flat contiguous arrays. For d
 model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
 alike; programs that only run models link the runtime, a library of that part alone. Models come in
-from ONNX files and PyTorch weights, and Python bindings (wheels with the library inside) are
-included.
+from ONNX files and PyTorch weights (GPT-2 and LLaMA-like checkpoints in Python), and bindings for
+Python (wheels with the library inside), C++, Rust, .NET, Go and Java are included.
 
 ## Contents
 
@@ -37,6 +38,7 @@ included.
 - [Deployment](#deployment)
 - [Python bindings](#python-bindings)
 - [C++](#c)
+- [Bindings for other languages](#bindings-for-other-languages)
 - [DigitPad demo](#digitpad-demo)
 - [Performance](#performance)
 - [Project layout](#project-layout)
@@ -49,24 +51,26 @@ included.
 
 | Area | Supported |
 |---|---|
-| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), transposed 2D convolution (strides, padding, output padding, groups), max, average and global average pooling, nearest and bilinear upsampling, batch and layer normalization, addition and concatenation of layers; channels-last tensors; optional dropout per layer |
+| Layers | Fully connected, 2D convolution (any kernel, stride and padding, rectangular windows; grouped and depthwise), transposed 2D convolution (strides, padding, output padding, groups), max, average and global average pooling, nearest and bilinear upsampling, batch, layer and RMS normalization, addition, concatenation and element-wise products of layers; token embeddings (with learned positions), multi-head attention (causal or not, grouped-query and multi-query, rotary position embeddings), linear maps of each position; channels-last tensors; optional dropout per layer |
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
-| Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, Softmax (output layer), None |
-| Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs) |
+| Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
+| Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
-| Data | `.slettd` data set files (compact, lossless by default, streamable into training), IDX (MNIST), CIFAR-10/100 and CSV readers, shuffling, hold-out splits |
+| Data | `.slettd` data set files (compact, lossless by default, streamable into training), token files, IDX (MNIST), CIFAR-10/100 and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
-| Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy) |
+| Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()` |
 | Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
-| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed) |
+| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API) |
+| Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes |
 
 ## Building
 
@@ -142,7 +146,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 and `Spingalett::runtime` for the runtime, which carry the include paths:
 
 ```cmake
-find_package(Spingalett 1.1 REQUIRED)         # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 1.2 REQUIRED)         # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)    # or Spingalett::runtime
 ```
 
@@ -150,6 +154,22 @@ pkg-config finds it as `spingalett` (`cc app.c $(pkg-config --cflags --libs spin
 runtime as `spingalett-runtime`; the file
 locates the installation from its own directory, so an extracted release archive serves too, through
 `PKG_CONFIG_PATH=<dir>/lib/pkgconfig`.
+
+Released versions also come as packages:
+
+```bash
+pip install spingalett                    # Python: wheels with the library inside (Linux, Windows, macOS)
+brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
+scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
+nix build github:pka-human/Spingalett     # the flake's package; nix develop: a shell to build it in
+sudo apt install ./spingalett_1.2.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.2.0     # the library, tools and Python, CUDA and Vulkan
+```
+
+The `.deb` and `.rpm` packages are assets of each [release](https://github.com/pka-human/Spingalett/releases),
+as are the archives for Linux (x86-64, x86-64-v3, AArch64), Windows (x86-64, x86-64-v3) and macOS (universal).
+`packaging/aur` holds PKGBUILDs for Arch Linux (`spingalett`, `spingalett-git`; `makepkg -si`), and
+`packaging/conda` a recipe for conda-forge.
 
 The repository carries a [Conan](https://conan.io) recipe and a [vcpkg](https://vcpkg.io) port that
 build the library of the checkout (shared, with OpenMP, kernels chosen at run time, the runtime
@@ -432,6 +452,87 @@ layer_norm(.net = net, .act_func = ACT_RELU);                                   
 of transposed convolutions (or bilinear upsampling, or layer normalization): 12 epochs take 15 s on
 an RTX 4050 Laptop GPU and reach a mean intersection over union of 0.88, which its INT8 model keeps
 (see [Performance](#performance)).
+
+### Transformers and language models
+
+A sequence is a row of cells: the input layer holds a window of token ids (as floats), an embedding
+turns each into a vector, and the layers after it work on each position's channels, attention
+mixing the positions. `spingalett_linear()` is the projection of each position (a 1 x 1
+convolution), `spingalett_attention()` reads the queries, keys and values a linear layer packs
+before it (the query heads' vectors, then the key heads', then the value heads'), and the output
+layer gives each position the logits of every token of the vocabulary, which the sparse
+cross-entropy compares with the next token. A GPT-2 small, and the changes that make a LLaMA:
+
+```c
+NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+layer(.net = net, .neurons_amount = 1024);                          /* a window of 1024 tokens */
+uint32_t x = embedding(.net = net, .vocabulary = 50257, .neurons_amount = 768,
+                       .positions = true);                          /* learned positions, as GPT-2's */
+for (int b = 0; b < 12; b++) {
+    layer_norm(.net = net);
+    linear(.net = net, .neurons_amount = 3 * 768);                  /* queries, keys and values */
+    attention(.net = net, .heads = 12, .causal = true);
+    uint32_t a = linear(.net = net, .neurons_amount = 768);
+    x = add_layers(.net = net, .inputs = {x, a});
+    layer_norm(.net = net);
+    linear(.net = net, .neurons_amount = 4 * 768, .act_func = ACT_GELU_TANH);
+    a = linear(.net = net, .neurons_amount = 768);
+    x = add_layers(.net = net, .inputs = {x, a});
+}
+layer_norm(.net = net);
+linear(.net = net, .neurons_amount = 50257);                        /* each position's logits */
+
+/* LLaMA: RMS normalization, grouped-query attention with rotary embeddings, a SwiGLU MLP */
+uint32_t n = rms_norm(.net = net, .epsilon = 1e-5f);
+linear(.net = net, .neurons_amount = (32 + 2 * 8) * 128);           /* 32 query heads, 8 key/value heads */
+attention(.net = net, .heads = 32, .kv_heads = 8, .rope_theta = 500000.0f, .causal = true);
+/* ... */
+uint32_t g = linear(.net = net, .inputs = {n}, .neurons_amount = 14336, .act_func = ACT_SILU);
+uint32_t u = linear(.net = net, .inputs = {n}, .neurons_amount = 14336);
+multiply_layers(.net = net, .inputs = {g, u});
+```
+
+Language models train on files of token ids, as nanoGPT's and llm.c's preparation scripts write them,
+read in windows by `spingalett_dataset_open_tokens()` (the file is mapped, not read), and
+`spingalett_generate()` continues a prompt a token at a time:
+
+```c
+SpingalettTokenReaderOptions o = {.context = 1024, .stride = 512, .shuffle = true};
+SpingalettDatasetReader *r = spingalett_dataset_open_tokens("train.bin", &o);
+train(.net = net, .training_mode = MODE_GENERATOR_FUNCTION, .generator = spingalett_dataset_generator,
+      .generator_data = r, .sample_count = spingalett_dataset_info(r).count, .epochs = 1,
+      .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 16, .optimizer_type = OPTIMIZER_ADAMW,
+      .learning_rate = 6e-4f, .weight_decay = 0.1f, .beta2 = 0.95f, .max_grad_norm = 1.0f);
+
+uint32_t prompt[] = {15496, 11, 314}, tokens[200];
+uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = tokens,
+                                    .count = 200, .temperature = 0.8f, .top_k = 40);
+```
+
+| Builder or call | Arguments | What it does |
+|---|---|---|
+| `spingalett_embedding()` | `vocabulary`, `neurons_amount` (the width), `positions` | Each token id's vector (ids outside the vocabulary give zeros); with `positions`, a learned vector per position added (the layer's biases) |
+| `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs` | Each position's channels times a matrix, plus biases |
+| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled; outputs the heads' vectors side by side |
+| `spingalett_rms_norm()` | `epsilon` (1e-5) | Each position's channels over their root mean square, times a gain (no biases) |
+| `spingalett_multiply_layers()` | `inputs` | The element-wise product of layers of one shape |
+| `spingalett_dataset_open_tokens()` | `context`, `token_bytes` (2 or 4), `stride`, `offset`, `shuffle` | Windows of a token file: inputs and, as targets, the tokens after them |
+| `spingalett_generate()` | `prompt`, `count`, `temperature` (0: greedy), `top_k`, `top_p`, `seed`, `stop_tokens` | Tokens continuing the prompt |
+
+- The rotary embeddings rotate the halves of each head's queries and keys (the `rotate_half` form
+  of GPT-NeoX and of Hugging Face's LLaMA weights). GELU comes in its erf form (`ACT_GELU`) and
+  GPT-2's tanh form (`ACT_GELU_TANH`), SiLU as `ACT_SILU`.
+- The sparse cross-entropy takes one class index a position (`spingalett_target_size()` per sample);
+  an index outside the classes leaves the position out of the loss. Label smoothing applies.
+- Attention never stores the scores: the CPU computes a block of queries at a time, the backward
+  pass recomputes the probabilities from each query's log-sum-exp. On the GPU it runs in tiles
+  (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16 on
+  CUDA), deterministic like everything else.
+- Networks of these layers save to `.slett` files (format 8), become deployment models in every
+  precision (the linear maps in INT8 down to INT2) and run on the runtime and the engine.
+- `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every
+  epoch. In Python, `gpt2_from_state_dict()` and `llama_from_state_dict()` make networks of GPT-2
+  checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2).
 
 ### Importing models: ONNX and PyTorch
 
@@ -1201,6 +1302,10 @@ cnn = sg.Network(sg.Loss.CROSS_ENTROPY, [sg.Input(28, 28, 1), sg.Conv2D(32, 3, p
 print(cnn.layers[1].shape, cnn.get_weights(0).shape)    # (28, 28, 32) (32, 3, 3, 1)
 
 resnet = sg.Network.from_torch(torch_module, torch.rand(1, 3, 32, 32))   # through ONNX, channels last
+
+gpt = sg.gpt2_from_state_dict(GPT2LMHeadModel.from_pretrained("gpt2").state_dict(), heads=12, context=256)
+gpt.train_from_tokens("train.bin", epochs=1, batch_size=8, optimizer=sg.Optimizer.ADAMW, learning_rate=3e-4)
+print(gpt.generate([15496, 11, 314], 50, temperature=0.8, top_k=40))
 ```
 
 See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
@@ -1242,8 +1347,39 @@ sg::Result<sg::Model> int8 = net->to_model(sg::Precision::Int8);
 
 `Builder::from({a, b})` names the inputs of the next layer and `last()` gives the index of the last
 one, for residual blocks and branches; `add_layers()` and `concat_layers()` take their inputs
-directly. `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()` gives the
-C object of a wrapper for whatever the wrapper does not cover.
+directly. `linear()`, `embedding()`, `attention()`, `rms_norm()` and `multiply_layers()` build
+transformers; `Network::train_tokens()` trains on a token file and `generate()` continues a prompt
+(`sg::Sampling`). `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()`
+gives the C object of a wrapper for whatever the wrapper does not cover.
+
+## Bindings for other languages
+
+`Bindings/` holds bindings for Rust, .NET, Go and Java over the shared library: networks of every
+kind of layer built in each language's style, training on arrays or token files, prediction,
+evaluation, generation, parameters, files and deployment models. Each one's tests train XOR and a
+small LLaMA-like model whose generation they check, and compare every structure the binding lays out
+with the C compiler's layout (CI runs them against the installed library):
+
+| Language | Directory | Interface | Builds with |
+|---|---|---|---|
+| Rust | [`Bindings/Rust`](Bindings/Rust/README.md) | crates `spingalett-sys` (declarations) and `spingalett` (safe) | cargo; `SPINGALETT_LIB_DIR` |
+| C# (.NET 8+) | [`Bindings/CSharp`](Bindings/CSharp/README.md) | package `Spingalett` (`LibraryImport`) | dotnet |
+| Go | [`Bindings/Go`](Bindings/Go/README.md) | module `github.com/pka-human/Spingalett/Bindings/Go` (cgo) | go; pkg-config |
+| Java (22+) | [`Bindings/Java`](Bindings/Java/README.md) | `io.github.pkahuman.spingalett` (the foreign function and memory API) | Maven |
+
+```rust
+let mut lm = Network::new(Loss::SparseCrossEntropy)?;
+lm.add(Layer::input(1, 1, 128))?;
+let h = lm.add(Layer::embedding(256, 128))?;
+lm.add(Layer::rms_norm())?;
+lm.add(Layer::linear(3 * 128))?;
+lm.add(Layer::attention(4).causal(true).rope_theta(10000.0))?;
+let a = lm.add(Layer::linear(128))?;
+lm.add(Layer::add_layers(&[h, a]))?;
+lm.add(Layer::linear(256))?;
+lm.train_tokens("train.bin", 64, &TrainOptions { epochs: 5, ..Default::default() })?;
+let text = lm.generate(&[72, 101], 100, &Sampling { temperature: 0.8, top_k: 40, ..Default::default() })?;
+```
 
 ## DigitPad demo
 
@@ -1449,14 +1585,17 @@ Include/Spingalett/   Public headers (Spingalett.h, the runtime's Spingalett.Run
 Src/                  Library sources (network, training, kernels, serialization, inference engine, ...)
 Src/Gpu/              The GPU backends: device layer, network executor, Vulkan's compute shaders
                       (Shaders/) and the CUDA kernels (Cuda/)
-Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, throughput
-                      benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
+Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, CharGPT (a
+                      character-level GPT), throughput benchmark (C and PyTorch counterpart),
+                      DatasetTool, ModelTool
 Examples/Runtime/     RunModel, a program of the runtime alone
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets)
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
-Bindings/Python/      Python bindings
+Bindings/             Bindings for Python, Rust, .NET (C#), Go and Java
+packaging/            Conan, vcpkg, AUR, conda recipes and the container image (Formula/: Homebrew,
+                      bucket/: Scoop, flake.nix: Nix)
 cmake/                CMake package, pkg-config, runtime and inference-only build helpers
 ```
 
@@ -1478,7 +1617,8 @@ what 1.0 gave, and only 2.0 may take anything away.
   their parameters. On ELF platforms the functions carry symbol versions (`SPINGALETT_1.0`, then one
   per release that adds some), so that the loader refuses a library older than the program needs.
   The test `api.abi` compares every release with the one before.
-- **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7)
+- **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7;
+  1.2 adds format 8 for transformers)
   and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
   later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
   that uses only what it knows.
@@ -1493,8 +1633,8 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.1.0. Its API (prefixed names, structs that can grow, zero as every
-field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 7, `.slettd` 2)
+Spingalett is at version 1.2.0. Its API (prefixed names, structs that can grow, zero as every
+field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 8, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and
 remain loadable.
@@ -1503,9 +1643,13 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 
 - 1.1 (released): the runtime, and the CUDA backend of the library's own kernels (no CUDA toolkit,
   cuBLAS or cuDNN), next to Vulkan
-- Any release of 1.x, changing no API: the single-precision kernel for convolutions of few
-  channels, fewer passes, products in FP16, Winograd convolutions, deployment models on the GPU
-- Later: quantization-aware training, NEON kernels for training, further language bindings
+- 1.2 (released): transformers and language models (embeddings, attention, RMS normalization,
+  GELU, SiLU, the sparse cross-entropy, token files, generation, GPT-2 and LLaMA checkpoints),
+  flash attention on CUDA, bindings for Rust, .NET, Go and Java, packages for the usual managers
+- 1.3: a KV cache and batched generation, mixed precision with loss scaling, gradient
+  checkpointing, deployment models on the GPU
+- 1.4 to 2.0: training across several GPUs, mixture-of-experts layers, Arm and Apple GPUs, sequence
+  models beyond attention
 
 ## Contributing
 

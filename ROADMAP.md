@@ -23,80 +23,7 @@ against PyTorch on the same machine.
 | 0.14 | Data sets in the GPU's memory (`spingalett_device_data_new()`), depthwise convolutions on a kernel of their own that applies the batch normalization before it, training chunks of 4,096 samples, networks made on the GPU without new memory: ahead of PyTorch with cuDNN by 1.14 times at least in every workload, its data in GPU memory or not |
 | 1.0 | "Stability": the API, ABI and formats of 0.14 kept by semantic versioning (symbol versions, the `api.abi` test against the last release), the names of 0.x only on request, pkg-config, Conan and vcpkg recipes |
 | 1.1 | "CUDA": a backend for NVIDIA GPUs on the library's own kernels (PTX compiled by Clang, no CUDA toolkit, cuBLAS or cuDNN), ahead of PyTorch with cuDNN by 1.2 to 7.7 times in every workload and of the Vulkan backend; batch normalizations in their product's epilogue at inference on both backends; the runtime library for programs that only run models. Why not cuDNN and cuBLAS: half a gigabyte to a gigabyte of libraries for each CUDA version, backward algorithms that add through atomics (runs would no longer repeat their bits), and the library measures its own kernels rather than wrapping others'; they remain what the backend is measured against |
-
-## 1.2: transformers, more languages, more packages (in progress)
-
-Spingalett learns the networks of today's language models, in every part of the library at once
-(training on the CPU and both GPU backends, the model format, the engine, deployment models, the
-runtime, the importers and the bindings), and reaches more languages and package managers. Nothing
-of 1.1 changes: a 1.1 program builds and runs against 1.2 unchanged.
-
-### The layers of transformers
-
-A sequence of `n` tokens is a layer of `1 x n` cells (the input layer holds the tokens' indices as
-floats), so that what the library has per cell (layer normalization, dropout, additions, products
-of layers) serves sequences as it serves images.
-
-- **Embeddings** (`spingalett_embedding()`): a table of `vocabulary` rows, a learned position vector
-  per cell when asked (GPT-2's absolute positions). The table's gradient is summed per token in the
-  order of the batch (on the GPU through a stable sort of the batch's tokens, so that it stays
-  deterministic without atomics).
-- **Attention** (`spingalett_attention()`): multi-head scaled dot-product attention over a layer of
-  queries, keys and values side by side, with grouped-query and multi-query attention (`kv_heads`),
-  a causal mask, and rotary position embeddings (`rope_theta`, LLaMA's). On the CPU as blocked
-  matrix products a thread per sample and group of heads; on CUDA as flash attention on the tensor
-  cores (the scores never stored, the backward pass recomputing them, its two halves in two kernels
-  so that no sum depends on the order of atomics); on Vulkan as tiles of the same scheme in single
-  precision.
-- **RMS normalization** (`spingalett_rms_norm()`), **products of layers**
-  (`spingalett_multiply_layers()`, SwiGLU's gate), **GELU** (exact and tanh) and **SiLU**, whose
-  derivatives need the values before the activation (training keeps them for those layers), and
-  **linear layers over tokens** (`spingalett_linear()`: a 1 x 1 convolution).
-- **The sparse cross-entropy loss** (`SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY`): a softmax over each
-  cell's channels against one class index a cell (a negative one for none, as padding), with label
-  smoothing; targets are `spingalett_target_size()` values a sample, not one-hot rows of the
-  vocabulary.
-- **Format 8** of `.slett` files for them; the engine and deployment models run them in every
-  precision (an embedding table in INT8 or INT4 is a table of rows with their scales).
-- **Language models end to end:** a reader of token files (`.bin` files of 16- or 32-bit tokens, as
-  nanoGPT writes them) that serves windows of a context and their next tokens; generation from a
-  prompt (temperature, top-k, top-p); PyTorch weights of GPT-2- and LLaMA-style models (an embedding
-  takes its token and position tables, attention's projections concatenated); an example that trains
-  a character-level GPT and samples from it; the GPT in `Examples/Benchmark.c` against PyTorch with
-  `scaled_dot_product_attention` and `torch.compile`.
-
-### The GPU against PyTorch at its fastest
-
-1.1 was measured against PyTorch's defaults. `benchmark_pytorch.py --max` runs PyTorch at its
-fastest: `torch.compile(mode="max-autotune")` (Triton kernels, cuDNN and cuBLAS chosen by timing,
-the passes replayed as CUDA graphs), `cudnn.benchmark`, channels-last tensors and fused optimizers.
-On the RTX 4050, 1.1 stays ahead of it in single precision and TF32 (by 1.05 times in the U-Net's
-training to 2.7 times) and in most of bfloat16, but not everywhere: ResNet-20 trains 1.03 times as
-fast and infers 1.06 times as fast, and the U-Net trains at 0.94 times PyTorch's speed. 1.2's target
-is a clear margin in every workload against that configuration: the matrix units' kernel for
-convolutions (shared memory without bank conflicts, tiles that start the next tile's loads under
-the current sums), batch normalization's sums in the epilogue of the convolution before it, and the
-passes between products fused where PyTorch's compiler fuses them.
-
-### Bindings
-
-The C API stays the source of truth; each binding wraps it whole (networks and layers, training,
-the step API, prediction and evaluation, deployment models, data sets, the GPU) and loads the same
-shared library, so that it gains every backend and kernel of a release on the day it ships.
-
-- **Rust** (`Bindings/Rust`): `spingalett-sys` (the declarations, checked against the headers in CI)
-  and `spingalett`, a safe crate (owners that free on drop, slices, `Result` for errors).
-- **C#** (`Bindings/CSharp`): a .NET 8 library over P/Invoke (`LibraryImport`, spans, `IDisposable`
-  owners), packaged for NuGet with the native libraries of every platform inside.
-- **Go** (`Bindings/Go`): a cgo package (`go get github.com/pka-human/Spingalett/Bindings/Go`).
-- **Java** (`Bindings/Java`): the Foreign Function and Memory API of Java 22 (no JNI code to build).
-
-### Packages
-
-Where Spingalett can be installed from, with what each channel needs from the maintainer (see
-**Distribution** below): a Homebrew tap and a Scoop bucket served from this repository, a Nix
-flake, an AUR package description, `.deb` and `.rpm` packages and a container image built by the
-release workflow, and recipes for conda-forge.
+| 1.2 | "Transformers": embeddings, multi-head attention (grouped-query, causal, rotary), RMS normalization, products of layers, GELU and SiLU, the sparse cross-entropy, `.slett` format 8, in training on the CPU and both GPU backends, the engine, deployment models and the runtime; token files, text generation, GPT-2 and LLaMA checkpoints in Python, a character-level GPT example; on CUDA flash attention on the tensor cores, register-tiled attention in single precision, GELU and SiLU in the products' epilogues, the weights' bfloat16 copy for sequences and images, block order kept in L2; bindings for Rust, .NET, Go and Java; Debian and RPM packages, AUR, Homebrew, Scoop, Nix, a container image, conda |
 
 ## 1.3: language models in production
 
@@ -112,7 +39,12 @@ weights in.
 - **Tokenizers**: byte-level BPE (GPT-2, tiktoken's encodings) and SentencePiece-style models from
   `tokenizer.json`, encoding and decoding in C, with the special tokens of chat formats.
 - **Weights from the formats they come in**: Hugging Face checkpoints of LLaMA, Mistral, Qwen and
-  GPT-2 by their names (safetensors, sharded), and GGUF files.
+  GPT-2 by their names (safetensors, sharded) in C and the other bindings (1.2 has them in Python),
+  and GGUF files.
+- **The matrix units' products at cuBLAS's speed** for language models: 1.2's products of a GPT's
+  forward pass and data gradients run at 15 to 17 TFLOPS on the RTX 4050 where cuBLAS reaches 22 to
+  23 (the weight gradients match it), which leaves the GPT's bfloat16 training at 0.94 times
+  PyTorch's `torch.compile` and its inference at 0.85 times; target: ahead of both.
 - **Training features of language models**: tied input and output embeddings, activation
   recomputation (checkpointing) to fit longer contexts, gradient accumulation and learning-rate
   schedules by step in `spingalett_train()`, sequences of different lengths in one batch, sliding
@@ -177,8 +109,8 @@ A major release only for what would break programs; candidates so far:
 
 ## Distribution
 
-Where Spingalett can be installed from, and what each channel needs. "Today" means it works from
-this repository and its releases alone, without accounts elsewhere.
+Where Spingalett can be installed from, and what each channel needs: a version where it works from
+this repository and its releases alone, and what publishing it elsewhere takes.
 
 | Channel | State | What it takes |
 |---|---|---|
@@ -186,16 +118,16 @@ this repository and its releases alone, without accounts elsewhere.
 | GitHub releases (library, runtime, DigitPad, wheels) | published | `release.yml` |
 | CMake package, pkg-config | in every archive | — |
 | vcpkg and Conan recipes (`packaging/`) | in the repository | submitting them to vcpkg's registry and Conan Center: pull requests from the maintainer's accounts |
-| Homebrew (`brew tap pka-human/spingalett https://github.com/pka-human/Spingalett`) | today, 1.2 | `Formula/spingalett.rb` in this repository; homebrew-core asks for a project with more users first |
-| Scoop (`scoop bucket add spingalett https://github.com/pka-human/Spingalett`) | today, 1.2 | `bucket/spingalett.json` in this repository |
-| Nix (`nix profile install github:pka-human/Spingalett`) | today, 1.2 | `flake.nix` in this repository; nixpkgs: a pull request |
-| Debian, Ubuntu, Fedora (`.deb`, `.rpm` on the release page) | today, 1.2 | built by `release.yml`; a PPA or COPR repository needs the maintainer's Launchpad or Fedora account |
-| Container image (`ghcr.io/pka-human/spingalett`) | today, 1.2 | pushed by `release.yml` with its own token |
-| Go modules (`go get github.com/pka-human/Spingalett/Bindings/Go`) | today, 1.2 | nothing: Go fetches from the repository |
-| Rust (`cargo add spingalett --git https://github.com/pka-human/Spingalett`) | today, 1.2 | crates.io: an API token as the secret `CARGO_REGISTRY_TOKEN`, then `release.yml` publishes |
-| .NET (`.nupkg` on the release page) | today, 1.2 | nuget.org: an API key as the secret `NUGET_API_KEY`, then `release.yml` publishes |
-| Java (`.jar` on the release page; JitPack builds from tags) | today, 1.2 | Maven Central: a Sonatype account and a signing key |
-| AUR (`spingalett`, `spingalett-bin`) | `packaging/aur` in 1.2 | an AUR account with an SSH key: the maintainer pushes the PKGBUILDs |
+| Homebrew (`brew tap pka-human/spingalett https://github.com/pka-human/Spingalett`) | 1.2 | `Formula/spingalett.rb` in this repository; homebrew-core asks for a project with more users first |
+| Scoop (`scoop bucket add spingalett https://github.com/pka-human/Spingalett`) | 1.2 | `bucket/spingalett.json` in this repository |
+| Nix (`nix profile install github:pka-human/Spingalett`) | 1.2 | `flake.nix` in this repository; nixpkgs: a pull request |
+| Debian, Ubuntu, Fedora (`.deb`, `.rpm` on the release page) | 1.2 | built by `release.yml`; a PPA or COPR repository needs the maintainer's Launchpad or Fedora account |
+| Container image (`ghcr.io/pka-human/spingalett`) | 1.2 | pushed by `release.yml` with its own token |
+| Go modules (`go get github.com/pka-human/Spingalett/Bindings/Go`) | 1.2 | nothing: Go fetches from the repository |
+| Rust (`cargo add spingalett --git https://github.com/pka-human/Spingalett`) | 1.2 | crates.io: an API token, then `cargo publish` of the two crates |
+| .NET (`Spingalett.1.2.0.nupkg` on the release page) | 1.2 | nuget.org: an API key, then `dotnet nuget push` |
+| Java (`spingalett-1.2.0.jar` on the release page) | 1.2 | Maven Central: a Sonatype account and a signing key |
+| AUR (`spingalett`, `spingalett-git`) | `packaging/aur` in 1.2 | an AUR account with an SSH key: the maintainer pushes the PKGBUILDs |
 | conda-forge | `packaging/conda` in 1.2 | a pull request to conda-forge/staged-recipes from the maintainer's account |
 | winget, Chocolatey | after 1.2 | manifests submitted from the maintainer's accounts |
 | npm (the engine in WebAssembly) | 1.3 | an npm account |
@@ -230,13 +162,17 @@ in freed memory, their parameters' upload not waited for. Done in 1.1: the CUDA 
 whose margins over PyTorch are wider in every workload (1.2 to 7.7 times; README); on both backends
 a batch normalization applied in the epilogue of the product it reads at inference (part of 3), its
 coefficients computed once until the parameters change, and three chunks in flight; on CUDA a
-kernel of its own for a first layer's few channels (part of 3). The next steps, each measured
-against the release before and against PyTorch:
+kernel of its own for a first layer's few channels (part of 3). Done in 1.2 (CUDA): the weights'
+bfloat16 copy wherever products take 256 rows of a layer (sequences and images, not only batches of
+256 samples: ResNet-20 and the U-Net infer 1.1 to 1.14 times as fast in bfloat16), blocks of a
+product in bands that keep their rows of A in L2, GELU's and SiLU's epilogues in the products. The
+next steps, each measured against the release before and against PyTorch:
 
 1. **The matrix units' kernel:** stores to shared memory without bank conflicts (a swizzled
    layout), the epilogue writing four results a thread at once, split sums of weight gradients
    chosen by the tile the timing picked rather than by a single-precision estimate; target: cuBLAS's
-   17 to 19.5 TFLOPS on the MLP's products, the weight gradients' among them.
+   22 to 23 TFLOPS on a GPT's products (1.2: 15 to 17 forward and in data gradients; a warp tile of
+   64 x 64, and k of 64 a step, both measured slower in 1.2's kernel).
 2. **The single-precision kernel for convolutions of few channels.** ResNet-20's and the U-Net's
    convolutions (16 to 64 filters, k = 144 to 576 values of the window) reach 3.3 to 4.5 TFLOPS, the
    MLP's products 5.6 to 6.4, and they take 70% of those networks' training time in single
@@ -264,10 +200,6 @@ against the release before and against PyTorch:
 
 ### Elsewhere
 
-- **Deployment models on the GPU**: `spingalett_model_predict()` with FP16 weights, and with INT8
-  weights where the result can stay exact against the CPU's (integer sums are; activations other
-  than piecewise-linear ones go through `expf` and `tanhf` of the C library, which a GPU does not
-  reproduce bit for bit).
 - **Integer transposed convolutions in batches**: the phases of the stride as convolutions on the
   integer tile kernels (deployment models run them sample by sample through the engine's pass).
 - **CPU kernels**: convolution windows as runs of `kernel_w x channels` floats (fast first layers),

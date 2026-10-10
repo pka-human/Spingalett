@@ -533,6 +533,35 @@ jobs:
             -Wl,-rpath,$PWD/result/lib -o nix-consumer
           ./nix-consumer
 
+  # the .NET package and the Java archive of the bindings, attached to the release (they load the library
+  # installed apart: a release archive, a system package)
+  bindings:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Package
+        run: |
+          mkdir -p out
+          dotnet pack Bindings/CSharp/Spingalett -c Release -o out
+          mvn -B -q -f Bindings/Java/pom.xml package -DskipTests
+          cp Bindings/Java/target/spingalett-*.jar out/
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bindings
+          path: out/*
+          if-no-files-found: error
+
   # the inference engine's three source files, for firmware projects
   engine:
     needs: version
@@ -673,9 +702,10 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   publish:
-    needs: [version, package, wheels, sdist, engine, model, appimage, digitpad-windows]
+    needs: [version, package, wheels, sdist, engine, model, appimage, digitpad-windows, bindings]
     if: >-
       always() && needs.version.outputs.publish == 'true' &&
+      (needs.bindings.result == 'success' || needs.bindings.result == 'skipped') &&
       (needs.package.result == 'success' || needs.package.result == 'skipped') &&
       (needs.wheels.result == 'success' || needs.wheels.result == 'skipped') &&
       (needs.engine.result == 'success' || needs.engine.result == 'skipped') &&
