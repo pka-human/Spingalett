@@ -13,7 +13,7 @@ Models come from the library, its bindings or `ModelTool` (`spingalett_save()`, 
 ## Installing
 
 ```bash
-npm install ./spingalett-1.2.0.tgz              # the package attached to each release
+npm install ./spingalett-<version>.tgz          # the package attached to each release
 sh Bindings/JavaScript/build.sh                 # or from a checkout: builds spingalett.wasm next to index.js
 ```
 
@@ -42,11 +42,11 @@ model.free();
 </script>
 ```
 
-`loadEngine()` takes the module from anywhere else too: a URL or a URL string (`loadEngine('/assets/spingalett.wasm')`),
-a path in Node, its bytes, a `fetch()` response, or a `WebAssembly.Module` compiled already. Served as
-`application/wasm`, it compiles while it downloads. Bundlers that understand
-`new URL('./spingalett.wasm', import.meta.url)` (Vite, webpack 5, Parcel) copy it with the bundle; the
-package also exports it as `spingalett/spingalett.wasm`.
+`loadEngine()` takes the module from anywhere else too: a URL or a URL string
+(`loadEngine('/assets/spingalett.wasm')`), a path in Node, its bytes, a `fetch()` response, or a
+`WebAssembly.Module` compiled already. Served as `application/wasm`, it compiles while it downloads.
+Bundlers that understand `new URL('./spingalett.wasm', import.meta.url)` (Vite, webpack 5, Parcel) copy
+it with the bundle; the package also exports it as `spingalett/spingalett.wasm`.
 
 ## Language models
 
@@ -86,8 +86,8 @@ called with each token as it comes (returning `false` ends it).
 | `model.logits(tokens)`, `model.generate(prompt, count, options?)` | the next token's logits; a continuation |
 | `model.free()` | releases the model's memory in the engine |
 
-Enumerations are strings, as `ModelTool info` prints them: layer types (`'dense'`, `'conv2d'`, `'attention'`,
-...), activations (`'relu'`, `'gelu_tanh'`, ...), precisions (`'fp32'`, `'int8'`, ...). Images the engine
+Enumerations are strings: layer types (`'dense'`, `'conv2d'`, `'attention'`, ...), activations
+(`'relu'`, `'gelu_tanh'`, ...), precisions (`'fp32'`, `'int8'`, ...), losses (`'cross_entropy'`, ...). Images the engine
 refuses throw a `SpingalettError` whose `code` is the engine's (`SPINGALETT_ERR_*`: 2 a damaged image,
 3 a truncated one, 4 a format version it does not read); wrong sizes throw a `RangeError`.
 
@@ -130,9 +130,9 @@ compiler is at hand (`CC`), with the same code built natively, which must give e
 and every generation bit for bit. `test/make_models.py` writes the language models (a GPT and a LLaMA
 of 28 characters, trained to continue a phrase).
 
-`build.sh` needs Clang with the `wasm32` target and `wasm-ld` (LLD) of version 18 or later; it takes
-`CC` and `WASM_LD` (Debian's `wasm-ld-18`, for instance), and no C library: `wasm/include` holds the part
-of `<math.h>` and `<string.h>` the engine uses.
+`build.sh` needs Clang with the `wasm32` target and `wasm-ld` (LLD), and no C library: `wasm/include`
+holds the part of `<math.h>` and `<string.h>` the engine uses. It takes `CC` and `WASM_LD` (Debian's
+`wasm-ld-18`, for instance); CI builds the module with Ubuntu 24.04's Clang and LLD 18.
 
 ## License
 
