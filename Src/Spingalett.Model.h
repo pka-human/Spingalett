@@ -82,10 +82,13 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
                                                       bool dense_tiles, bool sessions);
 void spingalett_predict_workspace_free(PredictWorkspace *w);
 
-/* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included. A dense layer's
-   interleaved rows are read only in calls with dense_tiles. */
+/* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included (input: the network's inputs,
+   n rows of input_size, whose tokens attention ignoring padding reads; NULL for other layers; kv: the second
+   input of cross-attention, else NULL). A dense layer's interleaved rows are read only in calls with
+   dense_tiles. */
 void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, bool dense_tiles,
-                              const float *x, float *y, uint32_t n, PredictWorkspace *w, ComputeMode mode);
+                              const float *input, uint32_t input_size, const float *x, const float *kv, float *y,
+                              uint32_t n, PredictWorkspace *w, ComputeMode mode);
 /* An addition, product, concatenation or global pooling over n samples (x[k]: input k, units[k] per
    sample, channels[k] a cell). */
 void spingalett_predict_combine(const SlettLayer *L, const float *const *x, const uint32_t *units,

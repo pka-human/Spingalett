@@ -126,6 +126,8 @@ SPINGALETT_1.3 {
     global:
         spingalett_detokenize_args;
         spingalett_load_pretrained_args;
+        spingalett_lr_linear_decay;
+        spingalett_lr_warmup_linear;
         spingalett_session_copy;
         spingalett_session_feed;
         spingalett_session_free;

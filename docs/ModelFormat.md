@@ -1,4 +1,4 @@
-# The .slett model format, versions 3 to 8
+# The .slett model format, versions 3 to 9
 
 `.slett` files store a network: its shape, its parameters in a chosen precision and, optionally,
 the optimizer state for resuming training. `spingalett_save()` and `spingalett_save_to_memory()`
@@ -9,8 +9,9 @@ version 6 for graphs: networks with a layer that reads other layers than the one
 concatenates several, or pools globally (0.10 on), version 7 for networks with transposed
 convolutions, upsampling or layer normalization (0.13 on), version 8 for the layers of transformers
 (embeddings, attention, RMS normalization, products of layers), the GELU and SiLU activations and the
-sparse cross-entropy loss (1.2 on). `spingalett_load()` and `spingalett_load_from_memory()` read
-versions 1 to 8.
+sparse cross-entropy loss (1.2 on), version 9 for the training features of language models: dense and
+linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window,
+cross-attention and embeddings of part of their input (1.3 on). `spingalett_load()` and `spingalett_load_from_memory()` read versions 1 to 9.
 
 Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
 (`spingalett_model_init()` in `Spingalett.Inference.h`) checks the image and computes directly from
@@ -21,8 +22,8 @@ version 5 extends the entry again with convolution groups and the constants of b
 normalization; version 6 adds the layers each layer reads and where its output lives in the
 engine's workspace; version 7 adds three kinds of layers and the field of the upsampling mode, in
 version 6's layout; version 8 adds four kinds of layers, three activations and a loss, in version 6's
-layout too (their fields in the existing ones and the reserved bytes 104 to 111). The differences are
-marked below.
+layout too (their fields in the existing ones and the reserved bytes 104 to 111); version 9 adds fields
+to version 8's entries in bytes that were 0 for their kinds. The differences are marked below.
 
 Batch normalization is folded when a network is saved for deployment: files written in a precision
 other than FLOAT32 without optimizer state, and the models of `spingalett_model_from_network()`,
@@ -36,8 +37,8 @@ still be version 3 or 4.
 ones cannot express (kinds of layers, precisions, activations, fields in space reserved as zero),
 and leave what a version 7 file means unchanged; a 1.x writer writes the oldest version that holds
 the network, as now, and every 1.x engine runs every file whose layers it has. Codes of version 7
-(activations, layer kinds, precisions) keep their values. Version 8 (Spingalett 1.2) is such an
-addition.
+(activations, layer kinds, precisions) keep their values. Version 8 (Spingalett 1.2) and version 9
+(Spingalett 1.3) are such additions.
 
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 CRC-32 is the IEEE polynomial (0xEDB88320, reflected, initial value and final XOR 0xFFFFFFFF), as
@@ -47,12 +48,12 @@ in zlib and PNG.
 
 ```
 header (64 bytes) | layer table (48 bytes per entry in version 3, 64 in version 4, 80 in version 5,
-112 in versions 6 to 8) | sections ...
+112 in versions 6 to 9) | sections ...
 ```
 
 A network of `L` layers (the input layer included) has `L - 1` table entries; entry `i` (counted
 from 0) describes layer `i + 1` and what feeds it: the output of layer `i` in versions 3 to 5, the
-outputs of the layers it names in versions 6 to 8 (always layers before it, so that the table order is an
+outputs of the layers it names in versions 6 to 9 (always layers before it, so that the table order is an
 order in which every layer can be computed after its inputs). Each dense or convolution layer
 owns up to four sections: its weights, the per-row scales of integer weights, its biases and its
 optimizer state; a batch normalization owns the same four, its scales section holding its running
@@ -70,16 +71,16 @@ its input as a flat vector; its output has shape `1 x 1 x out`. In version 3 eve
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 6 | magic `SLETTM` |
-| 6 | 2 | format version, 3 to 8 |
+| 6 | 2 | format version, 3 to 9 |
 | 8 | 4 | `L`: number of layers, input layer included (2 to 65536) |
 | 12 | 1 | loss function: 0 mean squared error, 1 cross-entropy, 2 sparse cross-entropy (version 8: a softmax over each cell's channels of the output layer against a class index a cell) |
 | 13 | 1 | flags: bit 0 set when the file holds optimizer state; other bits 0 |
 | 14 | 2 | reserved, 0 |
 | 16 | 8 | optimizer time step (number of steps taken; 0 without optimizer state) |
 | 24 | 8 | file size in bytes |
-| 32 | 4 | versions 4 to 7: height of the input layer (1 to 65535); version 3: reserved, 0 |
-| 36 | 4 | versions 4 to 7: width of the input layer (1 to 65535); version 3: reserved, 0 |
-| 40 | 8 | versions 6 to 8: bytes of activations, the part of the engine's workspace that holds the layers' outputs (see below); versions 3 to 5: reserved, 0 |
+| 32 | 4 | versions 4 to 9: height of the input layer (1 to 65535); version 3: reserved, 0 |
+| 36 | 4 | versions 4 to 9: width of the input layer (1 to 65535); version 3: reserved, 0 |
+| 40 | 8 | versions 6 to 9: bytes of activations, the part of the engine's workspace that holds the layers' outputs (see below); versions 3 to 5: reserved, 0 |
 | 48 | 8 | reserved, 0 |
 | 56 | 4 | CRC-32 of bytes 64 to file size - 1 (the layer table and all sections) |
 | 60 | 4 | CRC-32 of bytes 0 to 59 |
@@ -92,42 +93,42 @@ The input layer's channels are its units (`in` of the first entry) divided by he
 ## Layer table
 
 `L - 1` entries start at offset 64, 48 bytes each in version 3, 64 bytes in version 4, 80 bytes
-in version 5 and 112 bytes in versions 6 to 8:
+in version 5 and 112 bytes in versions 6 to 9:
 
 | Offset | Size | Field |
 |---:|---:|---|
-| 0 | 4 | `in`: units of layer `i` (for the first entry, the network's input size); versions 6 to 8: units of the entry's first input |
+| 0 | 4 | `in`: units of layer `i` (for the first entry, the network's input size); versions 6 to 9: units of the entry's first input |
 | 4 | 4 | `out`: units of layer `i + 1`; in versions 3 to 5 equals `in` of the next entry |
 | 8 | 1 | activation of layer `i + 1` (codes below) |
 | 9 | 1 | weight precision (codes below) |
-| 10 | 1 | versions 4 to 8: kind of layer `i + 1`: 0 dense, 1 convolution, 2 max pooling, 3 average pooling, 4 batch normalization (versions 5 to 8), 5 addition, 6 concatenation, 7 global average pooling (versions 6 to 8), 8 transposed convolution, 9 upsampling, 10 layer normalization (versions 7 and 8), 11 embedding, 12 attention, 13 RMS normalization, 14 multiplication (version 8); version 3: reserved, 0 |
+| 10 | 1 | versions 4 to 9: kind of layer `i + 1`: 0 dense, 1 convolution, 2 max pooling, 3 average pooling, 4 batch normalization (versions 5 to 9), 5 addition, 6 concatenation, 7 global average pooling (versions 6 to 9), 8 transposed convolution, 9 upsampling, 10 layer normalization (versions 7 to 9), 11 embedding, 12 attention, 13 RMS normalization, 14 multiplication (versions 8 and 9); version 3: reserved, 0 |
 | 11 | 1 | reserved, 0 |
 | 12 | 4 | dropout rate of layer `i + 1`, a float in [0, 1) (used only when training) |
 | 16 | 8 | offset of the weights; 0 for kinds without parameters (pooling, addition, concatenation) |
 | 24 | 8 | offset of the row scales (batch normalization: of its running statistics); 0 for FLOAT32, FP16 and BFLOAT16 dense and convolution layers, and for kinds without parameters |
 | 32 | 8 | offset of the biases; 0 for kinds without parameters |
 | 40 | 8 | offset of the optimizer state; 0 when the file has none, and for kinds without parameters |
-| 48 | 2 | versions 4 to 7: output height of layer `i + 1` |
-| 50 | 2 | versions 4 to 7: output width of layer `i + 1` |
-| 52 | 2 | versions 4 to 7: kernel height (window rows) |
-| 54 | 2 | versions 4 to 7: kernel width (window columns) |
-| 56 | 2 | versions 4 to 7: vertical stride |
-| 58 | 2 | versions 4 to 7: horizontal stride |
-| 60 | 2 | versions 4 to 7: padding at the top and at the bottom |
-| 62 | 2 | versions 4 to 7: padding on the left and on the right |
-| 64 | 4 | versions 5 to 8: convolution groups `g` (at least 1, dividing `in_c` and `out_c`; also of transposed convolutions); version 8: an attention's heads, an embedding's vocabulary (the rows of its table); 0 for other kinds |
-| 68 | 4 | versions 5 to 8: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); 0 for other kinds |
-| 72 | 4 | versions 5 to 7: batch normalization's momentum, a float in [0, 1] (used only when training); 0 for other kinds |
-| 76 | 4 | versions 7 and 8: upsampling mode, 0 nearest or 1 bilinear; version 8: attention's flags (bit 0: causal), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
-| 80 | 4 | versions 6 to 8: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications) |
-| 84 | 4 | versions 6 to 8: the first of them, a layer index from 0 (the network's input) to `i` |
-| 88 | 8 | versions 6 to 8: offset of the input list, `k` 32-bit layer indices (the first equal to the one above, all from 0 to `i`), when `k` is 2 or more; 0 otherwise |
-| 96 | 8 | versions 6 to 8: byte offset of the layer's output among the activations (a multiple of 16); 0 for the last layer |
-| 104 | 4 | version 8: an attention's key and value heads (at least 1, dividing its heads); 0 for other kinds; versions 6 and 7: reserved, 0 |
-| 108 | 4 | version 8: an attention's base of the rotary position embeddings, a float at least 0 (0: none); 0 for other kinds; versions 6 and 7: reserved, 0 |
+| 48 | 2 | versions 4 to 9: output height of layer `i + 1` |
+| 50 | 2 | versions 4 to 9: output width of layer `i + 1` |
+| 52 | 2 | versions 4 to 9: kernel height (window rows) |
+| 54 | 2 | versions 4 to 9: kernel width (window columns) |
+| 56 | 2 | versions 4 to 9: vertical stride |
+| 58 | 2 | versions 4 to 9: horizontal stride |
+| 60 | 2 | versions 4 to 9: padding at the top and at the bottom |
+| 62 | 2 | versions 4 to 9: padding on the left and on the right |
+| 64 | 4 | versions 5 to 9: convolution groups `g` (at least 1, dividing `in_c` and `out_c`; also of transposed convolutions); versions 8 and 9: an attention's heads, an embedding's vocabulary (the rows of its table); 0 for other kinds |
+| 68 | 4 | versions 5 to 9: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); 0 for other kinds |
+| 72 | 4 | versions 5 to 9: batch normalization's momentum, a float in [0, 1] (used only when training); version 9: an attention's sliding window `w`, an integer (0: every key); 0 for other kinds |
+| 76 | 4 | versions 7 to 9: upsampling mode, 0 nearest or 1 bilinear; versions 8 and 9: attention's flags (bit 0: causal; version 9: bit 1, padding ignored, with bits 16 to 31 the index of the embedding whose tokens tell it; other bits 0), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
+| 80 | 4 | versions 6 to 9: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications; version 9: 2 for cross-attention) |
+| 84 | 4 | versions 6 to 9: the first of them, a layer index from 0 (the network's input) to `i` |
+| 88 | 8 | versions 6 to 9: offset of the input list, `k` 32-bit layer indices (the first equal to the one above, all from 0 to `i`), when `k` is 2 or more; 0 otherwise |
+| 96 | 8 | versions 6 to 9: byte offset of the layer's output among the activations (a multiple of 16); 0 for the last layer |
+| 104 | 4 | versions 8 and 9: an attention's key and value heads (at least 1, dividing its heads); version 9 also: a dense or convolution layer's tied embedding, the index of an embedding layer before it whose table are its weights (0: weights of its own), an embedding's token offset, the first of its input's values it reads; 0 for other kinds; versions 6 and 7: reserved, 0 |
+| 108 | 4 | versions 8 and 9: an attention's base of the rotary position embeddings, a float at least 0 (0: none); 0 for other kinds; versions 6 and 7: reserved, 0 |
 
 The input shape of entry `i` is the output shape of entry `i - 1` in versions 4 and 5, and the
-output shape of its first input in versions 6 to 8 (the input layer's shape from the header when that is
+output shape of its first input in versions 6 to 9 (the input layer's shape from the header when that is
 layer 0): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output channels are
 `out_c = out / (out_h * out_w)`. Both divisions must be exact.
 
@@ -172,11 +173,28 @@ layer 0): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output chan
   vocabulary (offset 64) rows of `n = out_c` values in the file's precision (with row scales for the
   integer ones); its biases section, when flag bit 0 (offset 76) is set, holds a vector of `out_c`
   floats for each output cell (`out` floats, the positions'), and is absent (offset 0) otherwise.
+  Version 9: an embedding of part of its input reads, of an input of one row (`in_h` 1), the `out_w` values
+  from its token offset `o` (offset 104) on, `o + out_w` at most `in_w x in_c` (an encoder's and a decoder's
+  tokens side by side in one input, an embedding each).
 - Attention (version 8): output shape `in_h x in_w x (heads x head)`, the input's channels `(heads +
   2 kv_heads) x head` for a head size `head` (even when the rotary base is not 0); no sections, no
-  window, epsilon and momentum 0.
+  window, epsilon and momentum 0 (version 9: offset 72 the sliding window, any value). Version 9: with flag
+  bit 1, keys of padding are left out: the embedding
+  `e` of bits 16 to 31 (a layer before it, reading the network's input) has as many cells as the attention
+  has keys, key `j`'s token being value `o + j` of the network's input (`o` the embedding's token offset).
+  Cross-attention (version 9): `k` = 2, the first input the queries (`in_c` = `heads x head`), the second, a
+  layer other than the network's input, the keys and values of its own cells (`2 kv_heads x head` channels,
+  the key heads' then the value heads'), the first input a layer too; neither causal, nor windowed, nor
+  rotary (offset 108 0), and its padding that of the second input's cells.
 - RMS normalization (version 8): as layer normalization without beta (no biases section).
 - Multiplication (version 8): as addition, `k` inputs of the entry's output shape.
+- A dense layer or convolution tied to an embedding (version 9, offset 104 the embedding's layer index `t`,
+  from 1 to `i`): a dense layer, or a convolution of a 1 x 1 window, stride 1, no padding and one group,
+  whose `rows` (its outputs or filters) are the embedding's vocabulary and whose `n` (its inputs, or the
+  input's channels) are a row of the table: its weights and row scales offsets equal the embedding's
+  (entry `t - 1`) and so does its precision; the table is stored once. Its biases are its own, and its
+  optimizer state holds the moments of its biases alone (`2 x rows` floats: `m`, then `v`), the table's
+  being the embedding's.
 
 The precision byte of kinds without parameters is the file's precision, which they do not use.
 
@@ -248,8 +266,15 @@ layer kind as described above (a batch normalization in a version 4 file, a kind
 version 6, a kind above 7 before version 7, or a kind above 10, an activation code above 6 or loss 2
 before version 8, is invalid); when a section offset is below 64, misaligned for its type or extends past
 the file size; for integer layers but embeddings, when `n` exceeds 131072 (so that `127 * 127 * n`
-fits a 32-bit accumulator); and in versions 6 to 8, when an entry reads a layer that is not before it,
-more than 16 layers, several layers without being an addition, concatenation or multiplication, or
+fits a 32-bit accumulator); in version 9, when a tied layer names no embedding before it, or one whose
+rows, row length, precision, weights or scales differ from its own, or is a convolution of another window,
+or an attention's flags have bits other than those above, bit 1 without an embedding, or an embedding that
+reads another layer than the input or has another number of cells than its keys, or a cross-attention reads the
+network's input or keys and values of other channels, or is causal, windowed or rotary, or an embedding's range
+lies beyond its input or its input has several rows;
+and in versions 6 to 9, when an entry reads a layer that is not before it,
+more than 16 layers, several layers without being an addition, concatenation, multiplication or (version 9)
+cross-attention, or
 layers whose shapes do not
 fit, when `in` differs from the units of its first input, or when an output (other than the last
 one) does not lie within the activations, is misaligned or overlaps the output of an input of its
@@ -268,7 +293,8 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
 16.
 
 - FLOAT32, FP16 and BFLOAT16 layers compute `y = b + W x` in float, with the weights converted to
-  float as they are read.
+  float as they are read. A tied layer computes as any other with the table as `W` (the logits of a
+  language model's head: `y_j = b_j + E_j . x`, `E_j` the row of token `j`).
 - INT8, INT4 and INT2 layers quantize their input `x` (`in` floats, the whole tensor) to bytes
   first: `s = max |x| / 127` and `xq = round(x / s)` to nearest even (all `xq` 0 when `x` is all 0),
   then `y[j] = b[j] + (scale[j] * s) * sum_k q[j][k] * xq[k]` with the sum in 32-bit integers.
@@ -298,9 +324,9 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   `y = (x - mean) * (1 / sqrt(var + eps)) * gamma[c] + beta[c]`.
 - RMS normalization computes, per cell, `r = 1 / sqrt((sum over c of x^2) * (1 / C) + eps)` in float
   (the sum in channel order), then `y = x * r * gamma[c]`.
-- An embedding copies, for each input value `t`, row `t` of its table (decoded as the weights of a
-  dense layer are) when `0 <= t < vocabulary` (`t` taken as an integer), zeros otherwise, then adds
-  the position's vector of its cell when it has them.
+- An embedding copies, for each input value `t` (version 9: of its range), row `t` of its table (decoded as
+  the weights of a dense layer are) when `0 <= t < vocabulary` (`t` taken as an integer), zeros otherwise,
+  then adds the position's vector of its cell when it has them.
 - Attention computes, for each query head `h` (reading key and value head `g = h / (heads /
   kv_heads)`) and each cell `i`, the scores `s_j = (q_i . k_j) / sqrt(head)` over the cells `j` (up to
   `i` when causal) in order, each dot product summed in order, and `y = (sum_j exp(s_j - m) v_j) /
@@ -308,7 +334,12 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   by `exp(m_old - m_new)` when it grows. With a rotary base `theta > 0`, queries and keys are first
   rotated: for `i` below `half = head / 2`, `x'_i = x_i cos - x_(i + half) sin` and `x'_(i + half) =
   x_(i + half) cos + x_i sin` with the angle `p theta^(-2 i / head)` of the cell's position `p`, its
-  cosine and sine computed in double and rounded to float.
+  cosine and sine computed in double and rounded to float. With a sliding window `w > 0` (version 9), cell
+  `i` reads the keys `j` with `j + w > i`, and `j < i + w` when not causal (a window of at least the cells is
+  no window). Ignoring padding (version 9), the keys whose tokens are negative (not 0 or more) are left out
+  of the sums as if they were not there; a query left without a key gives zeros. Cross-attention (version 9)
+  computes the same with the queries of its first input and the keys and values of its second, every query
+  over every key of its sample.
 - A multiplication multiplies its inputs in their order (`x0 * x1`, then `* x2` and so on).
 - Pooling takes, per channel, the maximum or the mean of the window's cells inside the input;
   padding cells are not counted (a window of 2 x 2 cells over one row of padding averages 2 cells).
@@ -335,4 +366,4 @@ and decode as `q / 127`, `q / 7` and `q` times it. Reading such a file and savin
 version 3 file (`ModelTool convert`).
 
 Spingalett 0.5 and 0.6 read versions 1 to 3; version 4 appeared in 0.7, version 5 in 0.8,
-version 6 in 0.10, version 7 in 0.13 and version 8 in 1.2.
+version 6 in 0.10, version 7 in 0.13, version 8 in 1.2 and version 9 in 1.3.

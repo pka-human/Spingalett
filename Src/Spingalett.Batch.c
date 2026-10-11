@@ -35,6 +35,8 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->pre_flat);
     spingalett_aligned_free(ws->rope_flat);
     spingalett_aligned_free(ws->attn);
+    spingalett_aligned_free(ws->dkv_flat);
+    free(ws->dkv);
     for (int t = 0; ws->attn_gemm && t < ws->attn_threads; t++) spingalett_gemm_scratch_free(ws->attn_gemm[t]);
     free(ws->attn_gemm);
     free(ws->pre);
@@ -47,7 +49,36 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     free(ws->dmask);
     free(ws->bn_stats);
     free(ws->bn_sums);
+    free(ws->kept);
+    free(ws->segment);
     free(ws);
+}
+
+/* The layers a recomputing workspace keeps (kept[l]) and every layer's segment (the kept layers below it):
+   the layers several read, batch normalizations (their running statistics move once a pass), the output
+   layer, layers tied to an embedding with that embedding and their inputs (whose gradients the table's
+   order needs at the end), and then, until none is added, every input that a layer of another segment
+   reads, so that a segment's layers read kept layers or their own. */
+static void plan_recompute(const NeuralNetwork *net, const uint32_t *uses, uint8_t *kept, uint32_t *segment) {
+    const uint32_t L = net->layers;
+    for (uint32_t l = 1; l < L; l++) {
+        const LayerShape *s = &net->shapes[l];
+        kept[l] = uses[l] > 1 || l + 1 == L || s->type == LAYER_BATCH_NORM;
+        if (s->tied) {
+            kept[l] = kept[s->tied] = 1;
+            for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) kept[spingalett_inputs(net, l)[k]] = 1;
+        }
+    }
+    kept[0] = 1;
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (uint32_t l = 1, below = 0; l < L; below += kept[l], l++) segment[l] = below;
+        for (uint32_t l = 1; l < L; l++)
+            for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) {
+                const uint32_t i = spingalett_inputs(net, l)[k];
+                if (!kept[i] && segment[i] != segment[l]) kept[i] = 1, changed = true;
+            }
+    }
 }
 
 /* Floats a training workspace keeps for layer l's backward pass beside its output: a layer
@@ -68,8 +99,41 @@ uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count) {
     return count < cap ? count : (uint32_t)cap;
 }
 
+static BatchWorkspace *workspace_create(const NeuralNetwork *net, uint32_t capacity, bool training, bool gather,
+                                        bool recompute, ComputeMode mode);
+
 BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint32_t capacity,
                                                   bool training, bool gather, ComputeMode mode) {
+    return workspace_create(net, capacity, training, gather, false, mode);
+}
+
+BatchWorkspace *spingalett_batch_workspace_recompute(const NeuralNetwork *net, uint32_t capacity, bool gather,
+                                                     ComputeMode mode) {
+    return workspace_create(net, capacity, true, gather, true, mode);
+}
+
+/* The floats a layer's buffers of `per` floats a sample take where they are laid out: the kept layers' (or every
+   layer's) one after the other from *kept_end on, the others' at the same places in every segment, after the kept
+   ones (*shared_end: the most a segment needs past its own start). Returns the layer's offset; shared ones are
+   moved past the kept ones by the caller. */
+static size_t lay_out(const BatchWorkspace *ws, uint32_t l, size_t floats, size_t *kept_end, size_t *segment_end,
+                      uint32_t *open_segment) {
+    if (!ws->kept || ws->kept[l]) {
+        const size_t at = *kept_end;
+        *kept_end += floats;
+        return at;
+    }
+    if (*open_segment != ws->segment[l]) {      /* a new segment starts over */
+        *open_segment = ws->segment[l];
+        *segment_end = 0;
+    }
+    const size_t at = *segment_end;
+    *segment_end += floats;
+    return at;
+}
+
+static BatchWorkspace *workspace_create(const NeuralNetwork *net, uint32_t capacity, bool training, bool gather,
+                                        bool recompute, ComputeMode mode) {
     BatchWorkspace *ws = (BatchWorkspace *)calloc(1, sizeof(BatchWorkspace));
     if (!ws) return NULL;
     ws->capacity = capacity;
@@ -84,27 +148,38 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
     if (!ws->act || !ws->delta || !ws->dmask || !ws->bn_stats || !ws->bn_sums || !ws->uses || !ws->pending) goto fail;
     for (uint32_t l = 1; l < net->layers; l++)
         for (uint32_t k = 0; k < spingalett_input_count(net, l); k++) ws->uses[spingalett_inputs(net, l)[k]]++;
-
-    size_t dropout_total = 0;
-    for (uint32_t l = 1; training && l + 1 < net->layers; l++)
-        if (net->dropout_rates[l] > 0.0f)
-            dropout_total += (size_t)capacity * net->topology[l];
+    if (training && recompute) {
+        ws->kept = (uint8_t *)calloc(net->layers, 1);
+        ws->segment = (uint32_t *)calloc(net->layers, sizeof(uint32_t));
+        if (!ws->kept || !ws->segment) goto fail;
+        plan_recompute(net, ws->uses, ws->kept, ws->segment);
+    }
 
     if (training) {
-        /* every layer's output and delta, kept for the backward pass */
-        size_t act_total = 0, widest_shared = 0;
+        /* every layer's output and delta, kept for the backward pass (recomputing: the kept layers', the others'
+           shared between the segments, after them) */
+        size_t kept_end = 0, segment_end = 0, shared = 0, widest_shared = 0;
+        uint32_t open_segment = UINT32_MAX;
+        size_t *at = (size_t *)malloc(net->layers * sizeof(size_t));
+        if (!at) goto fail;
         for (uint32_t l = 1; l < net->layers; l++) {
-            act_total += (size_t)capacity * net->topology[l];
+            at[l] = lay_out(ws, l, (size_t)capacity * net->topology[l], &kept_end, &segment_end, &open_segment);
+            if (segment_end > shared) shared = segment_end;
             if (ws->uses[l] > 1 && net->topology[l] > widest_shared) widest_shared = net->topology[l];
         }
+        const size_t act_total = kept_end + shared;
+        ws->flat_floats = 2u * act_total;
         ws->flat = (float *)spingalett_aligned_alloc(2u * act_total * sizeof(float));
-        if (!ws->flat) goto fail;
-        size_t off = 0;
+        if (!ws->flat) {
+            free(at);
+            goto fail;
+        }
         for (uint32_t l = 1; l < net->layers; l++) {
+            const size_t off = at[l] + (ws->kept && !ws->kept[l] ? kept_end : 0u);
             ws->act[l] = ws->flat + off;
             ws->delta[l] = ws->flat + act_total + off;
-            off += (size_t)capacity * net->topology[l];
         }
+        free(at);
         if (widest_shared > 0) {
             ws->gtmp = (float *)spingalett_aligned_alloc((size_t)capacity * widest_shared * sizeof(float));
             if (!ws->gtmp) goto fail;
@@ -125,14 +200,23 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
         free(offsets);
     }
 
-    if (dropout_total > 0) {
-        ws->dmask_flat = (float *)spingalett_aligned_alloc(dropout_total * sizeof(float));
+    /* dropout masks (recomputing: shared as the outputs are) */
+    size_t dropout_kept = 0, dropout_segment = 0, dropout_shared = 0;
+    uint32_t dropout_open = UINT32_MAX;
+    for (uint32_t l = 1; training && l + 1 < net->layers; l++)
+        if (net->dropout_rates[l] > 0.0f) {
+            (void)lay_out(ws, l, (size_t)capacity * net->topology[l], &dropout_kept, &dropout_segment, &dropout_open);
+            if (dropout_segment > dropout_shared) dropout_shared = dropout_segment;
+        }
+    if (dropout_kept + dropout_shared > 0) {
+        ws->dmask_flat = (float *)spingalett_aligned_alloc((dropout_kept + dropout_shared) * sizeof(float));
         if (!ws->dmask_flat) goto fail;
-        size_t doff = 0;
+        size_t kept_end = 0, segment_end = 0;
+        uint32_t open = UINT32_MAX;
         for (uint32_t l = 1; l + 1 < net->layers; l++)
             if (net->dropout_rates[l] > 0.0f) {
-                ws->dmask[l] = ws->dmask_flat + doff;
-                doff += (size_t)capacity * net->topology[l];
+                const size_t off = lay_out(ws, l, (size_t)capacity * net->topology[l], &kept_end, &segment_end, &open);
+                ws->dmask[l] = ws->dmask_flat + off + (ws->kept && !ws->kept[l] ? dropout_kept : 0u);
             }
     }
 
@@ -191,15 +275,22 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
     ws->pre = (float **)calloc(net->layers, sizeof(float *));
     ws->rope = (float **)calloc(net->layers, sizeof(float *));
     if (!ws->pre || !ws->rope) goto fail;
-    size_t pre_floats = 0;
+    /* (recomputing: shared as the outputs are) */
+    size_t pre_kept = 0, pre_segment = 0, pre_shared = 0;
+    uint32_t pre_open = UINT32_MAX;
     for (uint32_t l = 1; training && l < net->layers; l++)
-        if (spingalett_act_needs_input(net->act_func[l - 1])) pre_floats += (size_t)capacity * net->topology[l];
-    if (pre_floats > 0) {
-        if (!(ws->pre_flat = (float *)spingalett_aligned_alloc(pre_floats * sizeof(float)))) goto fail;
-        for (uint32_t l = 1, off = 0; l < net->layers; l++)
+        if (spingalett_act_needs_input(net->act_func[l - 1])) {
+            (void)lay_out(ws, l, (size_t)capacity * net->topology[l], &pre_kept, &pre_segment, &pre_open);
+            if (pre_segment > pre_shared) pre_shared = pre_segment;
+        }
+    if (pre_kept + pre_shared > 0) {
+        if (!(ws->pre_flat = (float *)spingalett_aligned_alloc((pre_kept + pre_shared) * sizeof(float)))) goto fail;
+        size_t kept_end = 0, segment_end = 0;
+        uint32_t open = UINT32_MAX;
+        for (uint32_t l = 1; l < net->layers; l++)
             if (spingalett_act_needs_input(net->act_func[l - 1])) {
-                ws->pre[l] = ws->pre_flat + off;
-                off += capacity * net->topology[l];
+                const size_t off = lay_out(ws, l, (size_t)capacity * net->topology[l], &kept_end, &segment_end, &open);
+                ws->pre[l] = ws->pre_flat + off + (ws->kept && !ws->kept[l] ? pre_kept : 0u);
             }
     }
 
@@ -221,6 +312,21 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
             spingalett_engine_rope_table(a->height * a->width, a->channels / a->heads, a->theta, ws->rope[l]);
             off += a->height * a->width * (a->channels / a->heads);
         }
+    }
+    /* cross-attention, training: its keys' and values' gradient */
+    size_t dkv_floats = 0;
+    for (uint32_t l = 1; training && l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_ATTENTION && spingalett_input_count(net, l) == 2)
+            dkv_floats += (size_t)capacity * net->topology[spingalett_attention_kv(net, l)];
+    if (dkv_floats > 0) {
+        ws->dkv = (float **)calloc(net->layers, sizeof(float *));
+        ws->dkv_flat = (float *)spingalett_aligned_alloc(dkv_floats * sizeof(float));
+        if (!ws->dkv || !ws->dkv_flat) goto fail;
+        for (uint32_t l = 1, off = 0; l < net->layers; l++)
+            if (net->shapes[l].type == LAYER_ATTENTION && spingalett_input_count(net, l) == 2) {
+                ws->dkv[l] = ws->dkv_flat + off;
+                off += capacity * net->topology[spingalett_attention_kv(net, l)];
+            }
     }
     if (attn_floats > 0) {
         int threads = 1;
@@ -309,8 +415,9 @@ static void batch_layer(NeuralNetwork *net, BatchWorkspace *ws, uint32_t l, cons
             spingalett_embedding_forward(net, l - 1, X, y, N, act, mode);
             break;
         case LAYER_ATTENTION:
-            spingalett_attention_forward(net, l - 1, X, y, N, ws->training ? ws->bn_stats[l] : NULL, ws->rope[l], ws,
-                                         mode);
+            spingalett_attention_forward(net, l - 1, X, spingalett_input_count(net, l) == 2 ?
+                                         ws->act[spingalett_attention_kv(net, l)] : NULL, y, N,
+                                         ws->training ? ws->bn_stats[l] : NULL, ws->rope[l], ws, mode);
             if (act != ACT_NONE) apply_activation_bulk(y, (uint64_t)N * curr_size, act);
             break;
         case LAYER_ADD:
@@ -333,9 +440,12 @@ static void batch_layer(NeuralNetwork *net, BatchWorkspace *ws, uint32_t l, cons
     }
 }
 
-void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
-                              const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode) {
+/* The forward pass of every layer, or (only, a segment's index) of the layers of that segment that a recomputing
+   workspace does not keep. */
+static void forward_layers(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout,
+                           uint32_t position_offset, ComputeMode mode, int64_t only) {
     for (uint32_t l = 1; l < net->layers; l++) {
+        if (only >= 0 && (ws->kept[l] || ws->segment[l] != (uint64_t)only)) continue;
         const uint32_t src = spingalett_source(net, l);
         uint32_t prev_size = net->topology[src];
         uint32_t curr_size = net->topology[l];
@@ -445,6 +555,16 @@ void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N
                                          net->dropout_rates[l], dropout, l, position_offset + (uint32_t)s);
         }
     }
+}
+
+void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
+                              const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode) {
+    forward_layers(net, ws, N, dropout, position_offset, mode, -1);
+}
+
+void spingalett_batch_forward_segment(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout,
+                                      uint32_t position_offset, ComputeMode mode, uint32_t s) {
+    forward_layers(net, ws, N, dropout, position_offset, mode, (int64_t)s);
 }
 
 /* ---- data sets in the GPU's memory ---- */

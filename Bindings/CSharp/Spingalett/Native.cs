@@ -63,7 +63,12 @@ public unsafe struct LayerArgs
     public float rope_theta;
     public byte causal;
     public byte positions;
-    public fixed ulong reserved[Const.Reserved - 3];
+    public byte ignore_padding;
+    public uint tied;
+    public uint window;
+    public uint token_offset;
+    public uint token_count;
+    public fixed ulong reserved[Const.Reserved - 5];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -90,7 +95,11 @@ public unsafe struct NetworkLayer
     public float rope_theta;
     public byte causal;
     public byte positions;
-    public fixed ulong reserved[Const.Reserved - 2];
+    public byte ignore_padding;
+    public uint tied;
+    public uint window;
+    public uint token_offset;
+    public fixed ulong reserved[Const.Reserved - 4];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -146,7 +155,10 @@ public unsafe struct TrainArgs
     public float lr_plateau_factor;
     public nuint lr_plateau_patience;
     public float lr_plateau_min_lr;
-    public fixed ulong reserved[Const.Reserved];
+    public uint accumulation_steps;
+    public byte lr_per_step;
+    public byte recompute;
+    public fixed ulong reserved[Const.Reserved - 1];
 }
 
 [StructLayout(LayoutKind.Sequential)]

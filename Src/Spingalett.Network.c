@@ -30,6 +30,9 @@ static void compute_offsets(NeuralNetwork *net) {
     net->total_neurons = n;
     net->total_weights = w;
     net->total_biases = b;
+    /* a layer tied to an embedding computes with its table */
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].tied) net->weight_offsets[l - 1] = net->weight_offsets[net->shapes[l].tied - 1];
 }
 
 NeuralNetwork *spingalett_network_new_args(NeuralNetworkArgs args) {
@@ -76,9 +79,47 @@ static bool layer_inputs(const NeuralNetwork *net, const LayerArgs *args, uint32
         }
         *count = n;
     }
-    if (*count > 1 && args->type != LAYER_ADD && args->type != LAYER_CONCAT && args->type != LAYER_MULTIPLY)
-        return layer_error("Only add, concatenation and multiplication layers read several layers");
+    if (*count > 1 && args->type != LAYER_ADD && args->type != LAYER_CONCAT && args->type != LAYER_MULTIPLY &&
+        !(args->type == LAYER_ATTENTION && *count == 2))
+        return layer_error("Only add, concatenation and multiplication layers read several layers (cross-attention "
+                           "two)");
     return true;
+}
+
+/* A dense or convolution layer's tie to an embedding (args->tied), of shape `shape` reading `in`: an earlier
+   embedding of a table of `outputs` rows of the input's channels (a dense layer's inputs), a pointwise
+   convolution; false (error set) otherwise. */
+static bool layer_tie(const NeuralNetwork *net, const LayerArgs *args, const LayerShape *in, uint32_t in_units,
+                      const LayerShape *shape) {
+    const uint32_t e = args->tied;
+    if (e == 0 || e >= net->layers || net->shapes[e].type != LAYER_EMBEDDING)
+        return layer_error("tied must name an earlier embedding layer");
+    const LayerShape *table = &net->shapes[e];
+    const bool pointwise = shape->type == LAYER_DENSE ||
+                           (shape->kernel_h == 1 && shape->kernel_w == 1 && shape->stride_h == 1 && shape->stride_w == 1 &&
+                            shape->pad_h == 0 && shape->pad_w == 0 && shape->groups == 1);
+    const uint32_t reads = shape->type == LAYER_DENSE ? in_units : in->channels;
+    if (!pointwise || table->vocabulary != shape->channels || table->channels != reads)
+        return layer_error("A layer tied to an embedding is dense or a linear layer (a 1 x 1 convolution) of an output a "
+                           "token of its table and an input a value of a token's row");
+    return true;
+}
+
+/* The embedding of the network's input whose cells layer l's are, one for one (through layers that keep their
+   input's cells: linear layers and convolutions of stride 1 that keep the shape, normalizations, additions,
+   products, concatenations, attention's queries), or 0: its tokens tell which cells are padding. */
+static uint32_t cells_of(const NeuralNetwork *net, uint32_t l) {
+    while (l > 0) {
+        const LayerShape *s = &net->shapes[l], *in = &net->shapes[spingalett_source(net, l)];
+        if (s->type == LAYER_EMBEDDING) return spingalett_source(net, l) == 0 ? l : 0u;
+        const bool same = s->height == in->height && s->width == in->width;
+        const bool keeps = spingalett_normalization(s->type) || s->type == LAYER_ADD || s->type == LAYER_MULTIPLY ||
+                           s->type == LAYER_CONCAT || s->type == LAYER_ATTENTION ||
+                           (s->type == LAYER_CONV2D && s->stride_h == 1 && s->stride_w == 1);
+        if (!keeps || !same) return 0u;
+        l = spingalett_source(net, l);
+    }
+    return 0u;
 }
 
 /* The shape of a new layer from its arguments and its inputs; false (error set) when they do not
@@ -87,8 +128,10 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
                         LayerShape *shape, uint32_t *outputs) {
     *shape = (LayerShape){.type = args->type, .height = 1, .width = 1};
     uint64_t units;
+    if (args->tied && args->type != LAYER_DENSE && args->type != LAYER_CONV2D)
+        return layer_error("Only dense and linear layers are tied to an embedding");
     if (net->layers == 0) {
-        if (args->type != LAYER_DENSE)
+        if (args->type != LAYER_DENSE || args->tied)
             return layer_error("The first layer is the input layer; give it a size or a shape, not a type");
         if (args->height || args->width || args->channels) {
             shape->height = args->height ? args->height : 1;
@@ -104,6 +147,8 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
     } else if (args->type == LAYER_DENSE) {
         units = args->neurons_amount;
         shape->channels = args->neurons_amount;
+        if (args->tied && !layer_tie(net, args, &net->shapes[inputs[0]], net->topology[inputs[0]], shape)) return false;
+        shape->tied = args->tied;
     } else if (args->type == LAYER_ADD || args->type == LAYER_CONCAT || args->type == LAYER_MULTIPLY) {
         /* adding and multiplying: one shape for all; concatenating: one height and width, the channels
            summed */
@@ -145,13 +190,21 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->channels = in->channels;
         units = (uint64_t)shape->height * shape->width * shape->channels;
     } else if (args->type == LAYER_EMBEDDING) {
-        /* a row of the table for every value of the input: h x (w c) cells */
+        /* a row of the table for every value of the input: h x (w c) cells; with a range of tokens, the input's
+           values [token_offset, token_offset + token_count) of its one row */
         const LayerShape *in = &net->shapes[inputs[0]];
         if (args->vocabulary == 0)
             return layer_error("An embedding needs a vocabulary (the rows of its table)");
         if (args->neurons_amount == 0)
             return layer_error("An embedding needs neurons_amount (the values of a row)");
-        const uint64_t width = (uint64_t)in->width * in->channels;
+        uint64_t width = (uint64_t)in->width * in->channels;
+        if (args->token_offset || args->token_count) {
+            if (in->height != 1 || args->token_offset >= width ||
+                (uint64_t)args->token_offset + args->token_count > width)
+                return layer_error("An embedding's range of tokens lies within its input's one row (of height 1)");
+            width = args->token_count ? args->token_count : width - args->token_offset;
+            shape->token_offset = args->token_offset;
+        }
         if (width > 65535)
             return layer_error("Layer heights and widths are limited to 65535");
         shape->height = in->height;
@@ -163,14 +216,27 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         if ((uint64_t)args->vocabulary * args->neurons_amount > (1ull << 40))
             return layer_error("Embedding tables are limited to 2^40 values");
     } else if (args->type == LAYER_ATTENTION) {
-        /* queries, keys and values of every cell side by side; the heads' results side by side */
+        /* queries, keys and values of every cell side by side; the heads' results side by side. Cross-attention:
+           the queries of the first input's cells over the keys and values of the second's */
         const LayerShape *in = &net->shapes[inputs[0]];
+        const bool cross = count == 2;
         const uint32_t heads = args->heads ? args->heads : 1u, kv = args->kv_heads ? args->kv_heads : heads;
         if (heads > 4096 || kv > heads || heads % kv != 0)
             return layer_error("Attention: kv_heads must divide heads (at most 4096)");
-        if (in->channels % (heads + 2u * kv) != 0)
+        if (cross) {
+            const LayerShape *keys = &net->shapes[inputs[1]];
+            if (inputs[0] == 0 || inputs[1] == 0)
+                return layer_error("Cross-attention reads layers of queries and of keys and values, not the network's "
+                                   "input");
+            if (args->causal || args->window || args->rope_theta != 0.0f)
+                return layer_error("Cross-attention is neither causal nor of a sliding window nor rotary");
+            if (in->channels % heads != 0 || keys->channels != 2u * kv * (in->channels / heads))
+                return layer_error("Cross-attention reads heads x head size channels a cell of queries, and 2 "
+                                   "kv_heads x head size of keys and values");
+        } else if (in->channels % (heads + 2u * kv) != 0) {
             return layer_error("Attention reads (heads + 2 kv_heads) x head size channels a cell");
-        const uint32_t head = in->channels / (heads + 2u * kv);
+        }
+        const uint32_t head = in->channels / (cross ? heads : heads + 2u * kv);
         if (!(args->rope_theta >= 0.0f && args->rope_theta < INFINITY))
             return layer_error("Attention: rope_theta must be 0 (none) or positive");
         if (args->rope_theta > 0.0f && head % 2u != 0)
@@ -182,6 +248,12 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->kv_heads = kv;
         shape->theta = args->rope_theta;
         shape->causal = args->causal;
+        shape->window = args->window;
+        /* padding: the keys' cells those of an embedding of the network's input */
+        shape->mask = args->ignore_padding ? cells_of(net, inputs[cross ? 1 : 0]) : 0u;
+        if (args->ignore_padding && !shape->mask)
+            return layer_error("Attention: ignore_padding needs keys whose cells are an embedding's of the network's "
+                               "input, through layers that keep cells one for one");
         units = (uint64_t)in->height * in->width * shape->channels;
     } else if (args->type == LAYER_LAYER_NORM || args->type == LAYER_RMS_NORM) {
         /* the input's shape, normalized per cell */
@@ -277,6 +349,8 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         units = (uint64_t)shape->height * shape->width * shape->channels;
         if (conv && (uint64_t)kh * kw * (in->channels / groups) > UINT32_MAX)
             return layer_error("Convolution windows are limited to 2^32 - 1 inputs");
+        if (args->tied && !layer_tie(net, args, in, net->topology[inputs[0]], shape)) return false;
+        shape->tied = args->tied;
     }
     if (units == 0)
         return layer_error("A layer needs at least one output (neurons_amount, filters or shape)");
@@ -460,6 +534,7 @@ bool spingalett_add_layer(LayerArgs args) {
     }
     if (nl > 1 && spingalett_normalization(shape.type)) { rows = shape.channels; row_len = 1; }
     if (nl > 1 && shape.type == LAYER_EMBEDDING) { rows = shape.vocabulary; row_len = shape.channels; }
+    if (shape.tied) row_len = 0;                /* (the embedding's table: its biases alone) */
     uint64_t add_w = (uint64_t)rows * row_len;
     uint64_t add_b = shape.type == LAYER_RMS_NORM ? 0u
                    : shape.type == LAYER_EMBEDDING ? (shape.positions ? (uint64_t)neurons_amount : 0u) : rows;
@@ -672,6 +747,7 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
     a.act_func = net->act_func[l - 1];
     a.input_count = spingalett_input_count(net, l);
     memcpy(a.inputs, spingalett_inputs(net, l), a.input_count * sizeof(uint32_t));
+    a.tied = s->tied;
     switch (s->type) {
         case LAYER_DENSE:
             a.neurons_amount = net->topology[l];
@@ -686,12 +762,18 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
             a.neurons_amount = s->channels;
             a.vocabulary = s->vocabulary;
             a.positions = s->positions;
+            if (s->token_offset || (uint64_t)s->height * s->width != net->topology[spingalett_source(net, l)]) {
+                a.token_offset = s->token_offset;
+                a.token_count = s->height * s->width;
+            }
             break;
         case LAYER_ATTENTION:
             a.heads = s->heads;
             a.kv_heads = s->kv_heads;
             a.rope_theta = s->theta;
             a.causal = s->causal;
+            a.ignore_padding = s->mask != 0;
+            a.window = s->window;
             break;
         case LAYER_ADD:
         case LAYER_CONCAT:
@@ -753,6 +835,10 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->rope_theta = s->theta;
     layer->causal = s->causal;
     layer->positions = s->positions;
+    layer->ignore_padding = s->mask != 0;
+    layer->tied = s->tied;
+    layer->window = s->window;
+    layer->token_offset = s->token_offset;
     if (index > 0) {
         layer->bias_count = spingalett_bias_count(net, index - 1);
         layer->weight_count = spingalett_weight_count(net, index - 1);

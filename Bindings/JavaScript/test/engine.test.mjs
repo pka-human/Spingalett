@@ -26,7 +26,7 @@ test('the module loads from its default place, a path, a URL, bytes and a compil
     for (const source of sources) {
         const e = await loadEngine(source);
         assert.ok(e instanceof Engine);
-        assert.equal(e.formatVersion, 8);
+        assert.equal(e.formatVersion, 9);
         assert.deepEqual(e.loadModel(runtime('mlp_int8')).run(samples({ inputSize: 64, layers: [{}] }, 1)), reference);
     }
     await assert.rejects(loadEngine(42), TypeError);
@@ -141,7 +141,7 @@ test('damaged, truncated and unknown images are refused with the engine\'s error
     const damaged = image.slice();
     damaged[damaged.length - 100] ^= 1;
     const newer = image.slice();
-    newer[6] = 9;
+    newer[6] = 10;
     const cases = [[damaged, 2], [image.slice(0, image.length - 16), 3], [newer, 4], [new Uint8Array(64), 2],
         [new Uint8Array(0), 2]];
     for (const [bytes, code] of cases) {

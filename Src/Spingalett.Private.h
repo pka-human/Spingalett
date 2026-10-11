@@ -139,6 +139,18 @@ typedef struct BatchWorkspace {
     float *attn;
     SpingalettGemmScratch **attn_gemm;
     int attn_threads;
+    /* training: the gradient of cross-attention layer l's keys and values (dkv[l], capacity x the outputs of its
+       second input), which its backward pass for the queries writes and the second input's takes */
+    float **dkv;
+    float *dkv_flat;
+    /* activation recomputation (training with recompute): kept[l] whether layer l's outputs live through the
+       backward pass, segment[l] the kept layers below l (a segment: the layers between two kept ones, and the
+       later); the others' outputs, gradients, values before their activation and dropout masks share memory
+       with the other segments' and are computed again before their segment's backward pass. NULL: every layer
+       kept */
+    uint8_t *kept;
+    uint32_t *segment;
+    size_t flat_floats;     /* the floats of flat (the layers' outputs and gradients) */
     bool training;          /* normalize with batch statistics */
     float smoothing;        /* LOSS_SPARSE_CROSS_ENTROPY: label smoothing of the loss's targets */
     uint32_t capacity;
@@ -146,14 +158,21 @@ typedef struct BatchWorkspace {
 
 BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint32_t capacity,
                                                   bool training, bool gather, ComputeMode mode);
+/* A training workspace that recomputes activations (BatchWorkspace.kept). */
+BatchWorkspace *spingalett_batch_workspace_recompute(const NeuralNetwork *net, uint32_t capacity, bool gather,
+                                                     ComputeMode mode);
 void spingalett_batch_workspace_free(BatchWorkspace *ws);
-/* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
-   layers; samples are numbered position_offset + s for the dropout hash. */
 /* Samples per chunk for `count` samples: at most count, SPINGALETT_BATCH_CHUNK and what fits
    SPINGALETT_BATCH_FLOATS activations, at least 1. */
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
+/* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
+   layers; samples are numbered position_offset + s for the dropout hash. */
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
+/* The forward pass of the layers of segment s that are not kept (recomputation), as the full pass computes
+   them. */
+void spingalett_batch_forward_segment(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout,
+                                      uint32_t position_offset, ComputeMode mode, uint32_t s);
 /* Inference: whether layer l (dense or convolution, no activation) feeds only the batch
    normalization l + 1, which then runs in its product's epilogue and l's output is never stored. */
 bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint32_t l);
@@ -312,12 +331,14 @@ void spingalett_multiply_backward(const float *const *x, uint32_t count, uint32_
    scratch a thread needs, the forward pass (y without activation; lse, when training, each query's log
    of the softmax's sum) and the input's gradient dx from dy = dL/dy (lse the forward pass's), with one
    scratch of spingalett_attention_scratch() floats and one matrix product scratch a
-   thread (ws->attn, ws->attn_gemm). */
+   thread (ws->attn, ws->attn_gemm). Cross-attention reads its keys and values from kvx (the second input; NULL
+   for self-attention) and writes their gradient to dkv; dx then holds the queries' only. */
 size_t spingalett_attention_scratch(const NeuralNetwork *net, uint32_t l, bool training);
-void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
-                                  float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
-void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
-                                   uint32_t n, const float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, const float *kvx, float *y,
+                                  uint32_t n, float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *kvx,
+                                   const float *dy, float *dx, float *dkv, uint32_t n, const float *lse,
+                                   const float *rope, BatchWorkspace *ws, ComputeMode mode);
 /* The sparse cross-entropy of one sample (LOSS_SPARSE_CROSS_ENTROPY): `cells` rows of C logits z and a
    target a cell (a class index; outside 0 .. C - 1: none), the targets smoothed (one-hot times 1 -
    smoothing, plus smoothing / C at every class). Returns the mean loss over the cells with targets (0

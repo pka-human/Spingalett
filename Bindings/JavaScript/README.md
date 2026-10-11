@@ -75,7 +75,7 @@ called with each token as it comes (returning `false` ends it).
 |---|---|
 | `loadEngine(source?)` | the module, compiled and instantiated: an `Engine` with a memory of its own |
 | `loadModel(bytes, { engine, wasm }?)` | a model in `engine`, or in a default engine loaded on first use |
-| `engine.loadModel(bytes)` | checks a `.slett` image (formats 3 to 8, CRC-32 checksums) and opens a copy of it |
+| `engine.loadModel(bytes)` | checks a `.slett` image (formats 3 to 9, CRC-32 checksums) and opens a copy of it |
 | `engine.formatVersion`, `engine.memorySize` | the newest format the engine reads; the bytes of its memory |
 | `model.inputSize`, `outputSize`, `layerCount` | values a sample has in and out; weight layers |
 | `model.loss`, `formatVersion`, `imageSize`, `workspaceSize` | the loss it was trained with, its file, its workspace |

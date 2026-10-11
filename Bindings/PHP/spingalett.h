@@ -107,7 +107,11 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
-    uint64_t reserved[8 - 2];
+    bool ignore_padding;
+    uint32_t tied;
+    uint32_t window;
+    uint32_t token_offset;
+    uint64_t reserved[8 - 4];
 } SpingalettLayerInfo;
 
 int spingalett_model_init(SpingalettModel *model, const void *image, size_t size);
@@ -267,7 +271,11 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
-    uint64_t reserved[8 - 2];
+    bool ignore_padding;
+    uint32_t tied;
+    uint32_t window;
+    uint32_t token_offset;
+    uint64_t reserved[8 - 4];
 } SpingalettNetworkLayer;
 
 typedef enum {
@@ -372,7 +380,12 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
-    uint64_t reserved[8 - 3];
+    bool ignore_padding;
+    uint32_t tied;
+    uint32_t window;
+    uint32_t token_offset;
+    uint32_t token_count;
+    uint64_t reserved[8 - 5];
 } SpingalettLayerArgs;
 
 typedef struct {
@@ -432,7 +445,10 @@ typedef struct {
     float lr_plateau_factor;
     size_t lr_plateau_patience;
     float lr_plateau_min_lr;
-    uint64_t reserved[8];
+    uint32_t accumulation_steps;
+    bool lr_per_step;
+    bool recompute;
+    uint64_t reserved[8 - 1];
 } SpingalettTrainArgs;
 
 typedef struct {
@@ -515,6 +531,8 @@ float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initia
 float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+float spingalett_lr_linear_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+float spingalett_lr_warmup_linear(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 bool spingalett_predict_args(SpingalettPredictArgs args);
 SpingalettEvalMetrics spingalett_evaluate_args(SpingalettEvaluateArgs args);
 SpingalettTrainReport spingalett_train_args(SpingalettTrainArgs args);
@@ -570,6 +588,7 @@ bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const cha
                              uint32_t module_count);
 bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size,
                                          const char *const *modules, uint32_t module_count);
+
 SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
 bool spingalett_export_c_header(const SpingalettNetwork *net, const char *path, const char *name,
                                 SpingalettPrecisionMode precision);

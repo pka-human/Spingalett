@@ -75,7 +75,8 @@ struct SpgGpuNet {
     SpgGpuBuffer *geo;              /* per (transposed) conv layer: its geometries (spg_conv_geometry()) */
     SpgConvGeometry **conv;         /* and where they are */
     SpgGpuBuffer *bn;               /* per batch normalization layer: stats (4C) | coefficients (3C);
-                                       per layer normalization layer (training): mean, 1 / std per cell */
+                                       per layer normalization layer (training): mean, 1 / std per cell;
+                                       per embedding of part of its input: the chunk's tokens (capacity x cells) */
     SpgGpuBuffer part;              /* partial sums: colsum slices, split products, norm slices */
     SpgGpuBuffer wt;                /* convolution weights regrouped for data gradients (conv_spread()) */
     SpgGpuBuffer transfer;          /* host-visible: parameters on their way in or out */
@@ -260,6 +261,12 @@ bool spingalett_gpu_supports(const NeuralNetwork *net, const char **why) {
         }
     }
     return true;
+}
+
+/* Whether embedding l reads part of its input (a range of each sample's tokens). */
+static bool embeds_part(const NeuralNetwork *net, uint32_t l) {
+    const LayerShape *s = &net->shapes[l];
+    return s->token_offset != 0 || (uint64_t)s->height * s->width != net->topology[spingalett_source(net, l)];
 }
 
 /* Whether training keeps layer l's values before its activation (pre[]). */
@@ -687,8 +694,8 @@ static uint64_t part_floats(const NeuralNetwork *net, uint32_t capacity) {
         }
         if (s->type == LAYER_DENSE || spingalett_filters(s->type)) {
             /* the partial products of split weight gradients, summed over the pixels of the
-               convolution's output (conv_view()) */
-            uint64_t w = (uint64_t)spingalett_weight_rows(net, l - 1) * spingalett_weight_row_len(net, l - 1);
+               convolution's output (conv_view()); a tied layer's of its embedding's table */
+            uint64_t w = (uint64_t)spingalett_weight_rows(net, l - 1) * spingalett_matrix_row_len(net, l - 1);
             if (w > SPG_SPLIT_FLOATS / 2u) continue;
             if (s->type == LAYER_CONV_TRANSPOSE2D) {
                 const LayerShape *x = &net->shapes[spingalett_source(net, l)];
@@ -905,7 +912,8 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
        256 rows or more of a weight layer (samples times its cells: a sequence's tokens, a map's pixels) */
     uint64_t rows = 0;
     for (uint32_t l = 1; l < L; l++)
-        if (spingalett_weight_count(net, l - 1) && (uint64_t)net->shapes[l].height * net->shapes[l].width > rows)
+        if (spingalett_weight_rows(net, l - 1) && spingalett_matrix_row_len(net, l - 1) &&
+            (uint64_t)net->shapes[l].height * net->shapes[l].width > rows)
             rows = (uint64_t)net->shapes[l].height * net->shapes[l].width;
     const bool wh = g->bf16 && spg_gpu_bf16_storage() && (uint64_t)capacity * rows >= 256u;
     for (uint32_t l = 0; l + 1 < L; l++) {
@@ -914,6 +922,9 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
         g->Wp += align8(spingalett_weight_count(net, l));
         g->Bp += align4(spingalett_bias_count(net, l));
     }
+    /* a layer tied to an embedding computes with its table */
+    for (uint32_t l = 1; l < L; l++)
+        if (net->shapes[l].tied) g->woff[l - 1] = g->woff[net->shapes[l].tied - 1];
 
     /* every buffer asked for, then made at once in a few allocations; what the host writes (the
        parameters and moments it uploads, the geometries, each chunk's header and inputs) straight
@@ -976,6 +987,8 @@ SpgGpuNet *spingalett_gpu_net_create_from(NeuralNetwork *net, uint32_t capacity,
             const uint64_t keys = (uint64_t)capacity * net->topology[spingalett_source(net, l)];
             if (4u * keys > sort_keys) sort_keys = 4u * keys;
         }
+        if (s->type == LAYER_EMBEDDING && embeds_part(net, l))
+            spg_gpu_arena_add(A, &g->bn[l], (uint64_t)capacity * s->height * s->width * 4u, SPG_MEMORY_DEVICE);
     }
     spg_gpu_arena_add(A, &g->wt, wt * 4u, SPG_MEMORY_DEVICE);
     spg_gpu_arena_add(A, &g->sort, sort_keys * 4u, SPG_MEMORY_DEVICE);
@@ -1112,7 +1125,7 @@ static const struct { uint16_t words; uint8_t id; } half_words[SPG_KERNEL_COUNT]
     [SPG_KERNEL_colsum] = {0x7, 2}, [SPG_KERNEL_bn] = {0x2, 1}, [SPG_KERNEL_eltwise] = {0x10F, 2},
     [SPG_KERNEL_pool] = {0xF, 3}, [SPG_KERNEL_combine] = {0x7, 3}, [SPG_KERNEL_upsample] = {0xF, 3},
     [SPG_KERNEL_ln] = {0x7, 3}, [SPG_KERNEL_optim] = {0x100, 1}, [SPG_KERNEL_rows] = {0x2, 2},
-    [SPG_KERNEL_dwconv] = {0xD, 11}, [SPG_KERNEL_embed] = {0x44, 1}, [SPG_KERNEL_attn] = {0xF, 4},
+    [SPG_KERNEL_dwconv] = {0xD, 11}, [SPG_KERNEL_embed] = {0x44, 1}, [SPG_KERNEL_attn] = {0x100F, 4},
 };
 
 /* Records a kernel after the barrier it needs; its bfloat16 variant, told which buffers are such, when
@@ -1155,9 +1168,10 @@ static void product(Recorder *r, const Access *a, SpgGemmPush *p, const SpgGemmM
     spg_gemm(r->c, p, &mode);
 }
 
-/* The parameters of weight layer l: weights, biases, running statistics, and their gradients. */
+/* The parameters of weight layer l: weights (a tied layer's: its embedding's table), biases, running
+   statistics, and their gradients. */
 static uint64_t weight_count(const SpgGpuNet *g, uint32_t l) {
-    return (uint64_t)spingalett_weight_rows(g->net, l) * spingalett_weight_row_len(g->net, l);
+    return (uint64_t)spingalett_weight_rows(g->net, l) * spingalett_matrix_row_len(g->net, l);
 }
 static uint64_t bias_count(const SpgGpuNet *g, uint32_t l) { return spingalett_bias_count(g->net, l); }
 static uint64_t weights_at(const SpgGpuNet *g, uint32_t l) { return at(&g->params, g->woff[l]); }
@@ -1578,18 +1592,35 @@ static void pool_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n) {
     kernel(r, &a, SPG_KERNEL_pool, spec, 3, &p, sizeof p, groups((uint64_t)n * net->topology[l], 256u), 1, 1);
 }
 
-/* An embedding's forward pass: a row of the table for every token (and the positions' vectors). */
+/* The tokens embedding l reads: its input's, or (an embedding of part of its input) those of its range, which
+   embed_forward() gathers into bn[l]. */
+static const SpgGpuBuffer *embed_tokens(const SpgGpuNet *g, uint32_t l) {
+    return embeds_part(g->net, l) ? &g->bn[l] : &g->act[spingalett_source(g->net, l)];
+}
+
+/* An embedding's forward pass: a row of the table for every token (and the positions' vectors); an embedding of
+   part of its input first gathers its range of each sample's tokens (combine.comp's SLICE backward). */
 static void embed_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n) {
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, l);
     const LayerShape *s = &net->shapes[l];
-    const uint32_t tokens = net->topology[src], d = s->channels;
-    SpgEmbedPush p = {.x = g->act[src].address, .w = weights_at(g, l - 1), .y = g->act[l].address,
-                      .pos = s->positions ? biases_at(g, l - 1) : 0, .keys = g->act[src].address, .tokens = tokens,
-                      .d = d, .vocab = s->vocabulary, .n = n, .flags = s->positions ? SPG_EMBED_POS : 0u};
+    const uint32_t tokens = s->height * s->width, d = s->channels;
+    if (embeds_part(net, l)) {
+        SpgCombinePush c = {g->bn[l].address, g->act[src].address, 0, n, 1, net->topology[src], s->token_offset, tokens,
+                            0};
+        uint32_t spec[3] = {SPG_COMBINE_SLICE, ACT_NONE, 1};
+        Access a = {0};
+        reads(&a, whole(&g->act[src]));
+        writes(&a, whole(&g->bn[l]));
+        kernel(r, &a, SPG_KERNEL_combine, spec, 3, &c, sizeof c, groups((uint64_t)n * tokens, 256u), 1, 1);
+    }
+    SpgEmbedPush p = {.x = embed_tokens(g, l)->address, .w = weights_at(g, l - 1), .y = g->act[l].address,
+                      .pos = s->positions ? biases_at(g, l - 1) : 0, .keys = embed_tokens(g, l)->address,
+                      .tokens = tokens, .d = d, .vocab = s->vocabulary, .n = n,
+                      .flags = s->positions ? SPG_EMBED_POS : 0u};
     uint32_t spec[1] = {SPG_EMBED_FORWARD};
     Access a = {0};
-    reads(&a, whole(&g->act[src]));
+    reads(&a, whole(embed_tokens(g, l)));
     reads(&a, weights_of(g, l - 1));
     if (s->positions) reads(&a, biases_of(g, l - 1));
     writes(&a, whole(&g->act[l]));
@@ -1609,24 +1640,48 @@ static void attn_tiles(uint32_t head, uint32_t op, uint32_t *dmax, uint32_t *bq,
     *threads = *dmax == 32u ? 128u : *dmax == 256u ? 16u : 64u;
 }
 
+/* The sliding window of attention layer s, 0 when it holds every key (a window of the cells or more). */
+static uint32_t attn_window(const LayerShape *s) {
+    return s->window < s->height * s->width ? s->window : 0u;
+}
+
+/* Whether attention layer l runs on the passes that read padding, windows and the keys and values of another
+   layer (SPG_ATTN_EXT). */
+static bool attn_ext(const NeuralNetwork *net, uint32_t l) {
+    const LayerShape *s = &net->shapes[l];
+    return s->mask != 0 || attn_window(s) != 0 || spingalett_input_count(net, l) == 2;
+}
+
 /* A pass of attention layer l over n samples (attn.comp's FORWARD, PRE, DQ, DKV): x its queries, keys and
-   values (PRE: its outputs), y its outputs, dy their gradient, dx the input's. */
+   values (PRE: its outputs; cross-attention: its queries, kvx its keys and values, else 0), y its outputs, dy
+   their gradient, dx the input's (cross-attention: DQ the queries', DKV the keys' and values'). */
 static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t op, uint32_t n, uint64_t x,
-                      uint64_t y, uint64_t dy, uint64_t dx, bool stats) {
-    const LayerShape *s = &g->net->shapes[l];
+                      uint64_t kvx, uint64_t y, uint64_t dy, uint64_t dx, bool stats) {
+    const NeuralNetwork *net = g->net;
+    const LayerShape *s = &net->shapes[l], *kv = &net->shapes[spingalett_attention_kv(net, l)];
     const uint32_t cells = s->height * s->width, head = s->channels / s->heads;
+    const bool cross = kvx != 0;
+    const uint32_t kcells = cross ? kv->height * kv->width : cells;
     uint32_t dmax, bq, threads;
     attn_tiles(head, op, &dmax, &bq, &threads);
+    /* a layer ignoring padding: its keys' tokens, the network's inputs (otherwise loads that stay in x) */
+    const bool ext = attn_ext(net, l) && op != SPG_ATTN_PRE;
     SpgAttnPush p = {.x = x, .y = y, .dy = dy, .dx = dx, .stats = g->bn[l].buffer ? g->bn[l].address : 0,
                      .table = g->geo[l].buffer ? g->geo[l].address : 0, .n = n, .cells = cells, .heads = s->heads,
                      .kv = s->kv_heads, .d = head,
                      .flags = (s->causal ? SPG_ATTN_CAUSAL : 0u) | (g->geo[l].buffer ? SPG_ATTN_ROPE : 0u) |
-                              (stats ? SPG_ATTN_STATS : 0u),
-                     .scale = 1.0f / sqrtf((float)head)};
+                              (stats ? SPG_ATTN_STATS : 0u) | (ext && s->mask ? SPG_ATTN_PAD : 0u) |
+                              (ext && cross ? SPG_ATTN_CROSS : 0u),
+                     .scale = 1.0f / sqrtf((float)head), .window = ext ? attn_window(s) : 0u,
+                     .tokens = ext && s->mask ? g->act[0].address : x,
+                     .tokens_stride = ext && s->mask ? net->topology[0] : 0u,
+                     .tokens_at = ext && s->mask ? net->shapes[s->mask].token_offset : 0u,
+                     .kvx = ext ? (cross ? kvx : x) : 0u, .kcells = kcells};
     /* networks in bfloat16 on CUDA, heads of 32, 64 or 128: flash.cu on the matrix units (BQ 0 names it), a
        block 64 rows of four warps (32 of two for heads of 128; FORWARD 128 rows of four warps for heads of up to
-       64) */
-    const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE &&
+       64). A layer with padding or a sliding window runs on the kernels of single precision (rattn.cu's units of
+       EXT, which read activations kept as bfloat16 too): flash.cu does not read them. */
+    const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE && !ext &&
                      (head == 32u || head == 64u || head == 128u);
     if (mma) {
         dmax = head;
@@ -1634,9 +1689,10 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
         threads = 2u * bq;
         if (op == SPG_ATTN_FORWARD && head <= 64u) bq = 128u;
     }
-    const uint32_t spec[4] = {op, mma ? 0u : bq, dmax, threads};
+    const uint32_t spec[4] = {op | (ext ? SPG_ATTN_EXT : 0u), mma ? 0u : bq, dmax, threads};
     if (g->geo[l].buffer) reads(a, whole(&g->geo[l]));
-    const uint32_t tiles = (cells + bq - 1u) / bq;
+    if (ext && s->mask) reads(a, whole(&g->act[0]));
+    const uint32_t tiles = ((op == SPG_ATTN_DKV ? kcells : cells) + bq - 1u) / bq;
     if (op == SPG_ATTN_PRE)
         kernel(r, a, SPG_KERNEL_attn, spec, 4, &p, sizeof p, groups((uint64_t)n * s->heads * cells, threads), 1, 1);
     else
@@ -1644,12 +1700,14 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
 }
 
 static void attn_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, bool train) {
-    const uint32_t src = spingalett_source(g->net, l);
+    const uint32_t src = spingalett_source(g->net, l), kv = spingalett_attention_kv(g->net, l);
     Access a = {0};
     reads(&a, whole(&g->act[src]));
+    if (kv != src) reads(&a, whole(&g->act[kv]));
     writes(&a, whole(&g->act[l]));
     if (train && g->bn[l].buffer) writes(&a, whole(&g->bn[l]));
-    attn_pass(g, r, &a, l, SPG_ATTN_FORWARD, n, g->act[src].address, g->act[l].address, 0, 0, train && g->bn[l].buffer);
+    attn_pass(g, r, &a, l, SPG_ATTN_FORWARD, n, g->act[src].address, kv != src ? g->act[kv].address : 0,
+              g->act[l].address, 0, 0, train && g->bn[l].buffer);
 }
 
 /* A product of layers: y = x0 x1 ..., then act. */
@@ -1870,19 +1928,36 @@ static bool input_gradient(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t k, c
         }
         case LAYER_ATTENTION: {
             /* the rows' sums of dO o (o: its outputs before its activation), then the queries' gradient and the
-               keys' and values' (different channels of dst: one group, no wait between them) */
+               keys' and values' (different channels of dst: one group, no wait between them). Cross-attention:
+               the keys' and values' gradient is its second input's (k 1, after the queries' pass that wrote the
+               sums) */
+            const bool cross = spingalett_input_count(net, cl) == 2;
+            const uint64_t kvx = cross ? g->act[in[1]].address : 0;
+            if (cross) {
+                reads(&a, whole(&g->act[in[0]]));
+                reads(&a, whole(&g->act[in[1]]));
+                reads(&a, whole(&g->bn[cl]));
+            }
+            if (k == 1) {
+                attn_pass(g, r, &a, cl, SPG_ATTN_DKV, n, g->act[in[0]].address, kvx, 0, g->delta[cl].address,
+                          dst->address, false);
+                return false;
+            }
             const uint64_t o = g->pre[cl].buffer ? g->pre[cl].address : g->act[cl].address;
             const uint64_t rows = (uint64_t)n * s->heads * s->height * s->width;
             Access pa = {0};
             reads(&pa, whole(&g->delta[cl]));
             reads(&pa, whole(g->pre[cl].buffer ? &g->pre[cl] : &g->act[cl]));
             writes(&pa, span(g->bn[cl].address + 4u * rows, rows));
-            attn_pass(g, r, &pa, cl, SPG_ATTN_PRE, n, o, 0, g->delta[cl].address, 0, false);
+            attn_pass(g, r, &pa, cl, SPG_ATTN_PRE, n, o, 0, 0, g->delta[cl].address, 0, false);
             reads(&a, whole(&g->act[i]));
             reads(&a, whole(&g->bn[cl]));
             a.group = group_of(cl, GROUP_PHASES);
-            attn_pass(g, r, &a, cl, SPG_ATTN_DQ, n, g->act[i].address, 0, g->delta[cl].address, dst->address, false);
-            attn_pass(g, r, &a, cl, SPG_ATTN_DKV, n, g->act[i].address, 0, g->delta[cl].address, dst->address, false);
+            attn_pass(g, r, &a, cl, SPG_ATTN_DQ, n, g->act[i].address, kvx, 0, g->delta[cl].address, dst->address,
+                      false);
+            if (!cross)
+                attn_pass(g, r, &a, cl, SPG_ATTN_DKV, n, g->act[i].address, 0, 0, g->delta[cl].address, dst->address,
+                          false);
             return false;
         }
         case LAYER_MULTIPLY: {      /* dst (+)= dy times the other inputs */
@@ -2097,18 +2172,20 @@ static void weight_gradient(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, f
 }
 
 /* An embedding's gradients: the table's through a stable sort of the chunk's tokens (embed.comp), each
-   token's rows of dy summed in their order; the positions', the column sums of dy over the samples. */
+   token's rows of dy summed in their order (added to what a layer tied to the table wrote, which ran before);
+   the positions', the column sums of dy over the samples. */
 static void embed_backward(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t n, float scale, float beta) {
     const NeuralNetwork *net = g->net;
     const LayerShape *s = &net->shapes[cl];
-    const uint32_t src = spingalett_source(net, cl), tokens = net->topology[src], d = s->channels;
+    const uint32_t tokens = s->height * s->width, d = s->channels;
     const uint32_t total = n * tokens, blocks = (total + SPG_EMBED_BLOCK - 1u) / SPG_EMBED_BLOCK;
     const Range grad = span(grad_weights_at(g, cl - 1), weight_count(g, cl - 1));
-    SpgEmbedPush p = {.x = g->act[src].address, .keys = g->sort.address, .part = g->part.address,
+    const float table_beta = spingalett_table_tied(net, cl) ? 1.0f : beta;
+    SpgEmbedPush p = {.x = embed_tokens(g, cl)->address, .keys = g->sort.address, .part = g->part.address,
                       .dy = g->delta[cl].address, .gw = grad_weights_at(g, cl - 1), .total = total, .tokens = tokens,
-                      .d = d, .vocab = s->vocabulary, .n = n, .blocks = blocks, .scale = scale, .beta = beta};
+                      .d = d, .vocab = s->vocabulary, .n = n, .blocks = blocks, .scale = scale, .beta = table_beta};
     const Range keys = span(g->sort.address, 4ull * total), counts = span(g->part.address, 256ull * blocks);
-    if (beta == 0.0f) {                         /* the step's first chunk: the rows of absent tokens zero */
+    if (table_beta == 0.0f) {                   /* the step's first chunk: the rows of absent tokens zero */
         Access z = {0};
         writes(&z, grad);
         need(r, &z);
@@ -2116,7 +2193,7 @@ static void embed_backward(SpgGpuNet *g, Recorder *r, uint32_t cl, uint32_t n, f
     }
     uint32_t op = SPG_EMBED_KEYS;
     Access a = {0};
-    reads(&a, whole(&g->act[src]));
+    reads(&a, whole(embed_tokens(g, cl)));
     writes(&a, keys);
     kernel(r, &a, SPG_KERNEL_embed, &op, 1, &p, sizeof p, groups(total, 256u), 1, 1);
     /* eight bits of the token a pass, up to the vocabulary (the key of none) */
@@ -2258,6 +2335,7 @@ static void optimizer(SpgGpuNet *g, Recorder *r) {
         if (spingalett_normalization(net->shapes[l].type)) per_layer = true;
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
         uint64_t w0 = per_layer ? g->woff[l] : 0, count = per_layer ? weight_count(g, l) : W;
+        if (per_layer && net->shapes[l + 1].tied) continue;     /* (its table is its embedding's) */
         if (count > 0) {
             p.w = at(&g->params, w0); p.g = at(&g->grads, w0); p.n = (uint32_t)count;
             p.wh = g->wh.buffer ? g->wh.address + 2u * w0 : 0;
@@ -3100,6 +3178,7 @@ static bool decodes(const NeuralNetwork *net, uint32_t l, uint32_t cells, const 
             return true;
         case LAYER_ATTENTION:
             if (!s->causal) return *why = "attention that is not causal", false;
+            if (s->window && s->window < cells) return *why = "attention of a sliding window", false;
             if (s->channels / s->heads > (spg_gpu_using() == SPG_BACKEND_CUDA ? 128u : 256u) ||
                 (s->channels / s->heads) % 2u)
                 return *why = "attention heads of over 128 values (Vulkan: 256), or of an odd number", false;

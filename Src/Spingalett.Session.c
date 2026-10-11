@@ -51,6 +51,7 @@
 /* The keys and values one attention layer keeps for every sequence. */
 typedef struct {
     uint32_t heads, kv, head;
+    uint32_t window;                /* a sliding window: the keys of the last `window` positions (0: all) */
     float *keys, *values;           /* [sequences x max_length x kv x head] each, the keys rotated */
     float *table;                   /* the rotary embeddings of max_length positions (cosines, then sines), or NULL */
 } Cache;
@@ -103,6 +104,10 @@ static bool session_model(const SpingalettModel *model, uint32_t *cells, uint32_
     SlettLayer L;
     spingalett_slett_layer(image, 0, &L);
     *cells = L.out_h * L.out_w;
+    if (L.token_offset != 0 || *cells != L.inputs) {
+        snprintf(why, size, "its embedding reads part of the input");
+        return false;
+    }
     for (uint32_t i = 1; i < model->layer_count; i++) {
         spingalett_slett_layer(image, i, &L);
         const char *name = (unsigned)L.type < LAYER_TYPE_COUNT ? layer_names[L.type] : "unknown";
@@ -293,7 +298,7 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
         if (L.type == LAYER_CONV2D) s->token_work += (uint64_t)L.rows * L.row_len;
         if (L.type != LAYER_ATTENTION) continue;
         Cache *c = &s->caches[i];
-        c->heads = L.heads, c->kv = L.kv_heads, c->head = L.out_c / L.heads;
+        c->heads = L.heads, c->kv = L.kv_heads, c->head = L.out_c / L.heads, c->window = L.window;
         const size_t floats = (size_t)sequences * max_length * c->kv * c->head;
         c->keys = (float *)spingalett_aligned_alloc(floats * sizeof(float));
         c->values = (float *)spingalett_aligned_alloc(floats * sizeof(float));
@@ -439,7 +444,8 @@ static void session_int_linear(SpingalettSession *s, const SlettLayer *L, const 
 }
 
 /* Attention on `rows` rows (row r of the pass, or the picked row r): their keys and values kept first,
-   then each query over the keys of its sequence up to its own position. */
+   then each query over the keys of its sequence up to its own position (with a window, the last `window` of
+   them). Every key is live: tokens are 0 or more, so that a layer ignoring padding finds none. */
 static void session_attention(SpingalettSession *s, const Cache *c, const float *x, float *y, uint32_t rows,
                               ComputeMode mode) {
     const uint32_t heads = c->heads, kv = c->kv, head = c->head, half = head / 2u, group = heads / kv;
@@ -471,8 +477,9 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
                 spingalett_engine_rope_rotate(q, rotated, half, c->table + (size_t)p * half, sines + (size_t)p * half);
                 q = rotated;
             }
-            const size_t at = s->row_sequence[r] * sequence + (size_t)g * head;
-            spingalett_engine_attend(q, c->keys + at, per, c->values + at, per, p + 1u, head, scale,
+            const uint32_t first = c->window && p + 1u > c->window ? p + 1u - c->window : 0u;
+            const size_t at = s->row_sequence[r] * sequence + first * per + (size_t)g * head;
+            spingalett_engine_attend(q, c->keys + at, per, c->values + at, per, p + 1u - first, head, scale, NULL,
                                      y + (size_t)r * out_c + (size_t)h * head);
         }
     );
@@ -510,7 +517,7 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
             for (uint32_t k = 0; k < L->input_count; k++) units[k] = rows * channels[k];
             spingalett_predict_combine(&R, x, units, channels, y, 1, mode);
         } else {
-            spingalett_predict_layer(image, &R, prep, false, x[0], y, 1, w, mode);
+            spingalett_predict_layer(image, &R, prep, false, NULL, 0, x[0], NULL, y, 1, w, mode);
         }
     }
     activate_rows(y, rows, L->out_c, pos, s->cells, L->activation);

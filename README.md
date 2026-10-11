@@ -58,11 +58,11 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
 | Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens) with a key-value cache (sessions of deployment models: each token computed once, several sequences generated together), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) and GGUF files (dequantized from 15 types) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
-| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
+| Training | Per-sample, full-batch and mini-batch strategies; gradient accumulation over mini-batches; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
 | Data | `.slettd` data set files (compact, lossless by default, streamable into training), token files, IDX (MNIST), CIFAR-10/100 and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
-| Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
+| Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, linear decay, warm-up + linear decay, or a custom callback; by epoch or by optimizer step |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()`, sessions of language models (`spingalett_session_feed()`) |
 | Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
@@ -467,8 +467,8 @@ cross-entropy compares with the next token. A GPT-2 small, and the changes that 
 ```c
 NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
 layer(.net = net, .neurons_amount = 1024);                          /* a window of 1024 tokens */
-uint32_t x = embedding(.net = net, .vocabulary = 50257, .neurons_amount = 768,
-                       .positions = true);                          /* learned positions, as GPT-2's */
+uint32_t e = embedding(.net = net, .vocabulary = 50257, .neurons_amount = 768,
+                       .positions = true), x = e;                   /* learned positions, as GPT-2's */
 for (int b = 0; b < 12; b++) {
     layer_norm(.net = net);
     linear(.net = net, .neurons_amount = 3 * 768);                  /* queries, keys and values */
@@ -481,7 +481,8 @@ for (int b = 0; b < 12; b++) {
     x = add_layers(.net = net, .inputs = {x, a});
 }
 layer_norm(.net = net);
-linear(.net = net, .neurons_amount = 50257);                        /* each position's logits */
+linear(.net = net, .neurons_amount = 50257, .tied = e);             /* each position's logits, with the
+                                                                       embedding's table (tied, as GPT-2's) */
 
 /* LLaMA: RMS normalization, grouped-query attention with rotary embeddings, a SwiGLU MLP */
 uint32_t n = rms_norm(.net = net, .epsilon = 1e-5f);
@@ -513,8 +514,8 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 | Builder or call | Arguments | What it does |
 |---|---|---|
 | `spingalett_embedding()` | `vocabulary`, `neurons_amount` (the width), `positions` | Each token id's vector (ids outside the vocabulary give zeros); with `positions`, a learned vector per position added (the layer's biases) |
-| `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs` | Each position's channels times a matrix, plus biases |
-| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled; outputs the heads' vectors side by side |
+| `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs`, `tied` | Each position's channels times a matrix, plus biases; with `tied`, an embedding's index, that embedding's table is the matrix (tied input and output embeddings: one table, its gradient the sum of both layers') |
+| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `ignore_padding`, `window` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled, the keys of padding left out with `ignore_padding`, the keys `window` or more cells away with `window` (Mistral's sliding window: with `causal` a cell and the `window - 1` before it); outputs the heads' vectors side by side |
 | `spingalett_rms_norm()` | `epsilon` (1e-5) | Each position's channels over their root mean square, times a gain (no biases) |
 | `spingalett_multiply_layers()` | `inputs` | The element-wise product of layers of one shape |
 | `spingalett_dataset_open_tokens()` | `context`, `token_bytes` (2 or 4), `stride`, `offset`, `shuffle` | Windows of a token file: inputs and, as targets, the tokens after them |
@@ -561,15 +562,44 @@ spingalett_session_free(s);
   GPT-2's tanh form (`ACT_GELU_TANH`), SiLU as `ACT_SILU`.
 - The sparse cross-entropy takes one class index a position (`spingalett_target_size()` per sample);
   an index outside the classes leaves the position out of the loss. Label smoothing applies.
+- Sequences of different lengths train in one batch padded with the token -1 (inputs and targets): an
+  embedding reads it as zeros, the loss leaves its positions out (a sample's loss is the mean over its real
+  tokens), and attention with `.ignore_padding = true` leaves its keys out (their tokens in the network's
+  input, which the keys' cells come from through an embedding). The gradient of a padded batch is then the
+  mean of the sequences' own, each trained alone in a network of its length, up to the order of the sums,
+  on the CPU and the GPU. Causal attention over right padding never reaches it anyway; non-causal attention
+  and left padding need the option. Batch normalization takes its statistics over padded cells too.
 - Attention never stores the scores: the CPU computes a block of queries at a time, the backward
   pass recomputes the probabilities from each query's log-sum-exp. On the GPU it runs in tiles
   (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16 on
   CUDA), deterministic like everything else.
-- Networks of these layers save to `.slett` files (format 8), become deployment models in every
-  precision (the linear maps in INT8 down to INT2) and run on the runtime and the engine.
+- A sliding window costs what it reads: the CPU and the GPU's kernels of single precision skip the blocks of
+  keys outside every query's window (in bfloat16 on CUDA such layers run on those kernels, not on flash
+  attention).
+- Encoder-decoders take the source's tokens and then the target's in one input: an embedding reads each part
+  (`.token_offset`, `.token_count`; the decoder's names the input layer, `.inputs = {0}, .input_count = 1`),
+  and cross-attention, an attention of two inputs, takes the decoder's queries over the encoder's keys and
+  values (a linear layer of `2 kv_heads x head size` outputs reading the encoder), ignoring the source's
+  padding with `.ignore_padding`:
+
+  ```c
+  uint32_t src = embedding(.net = net, .vocabulary = V, .neurons_amount = 512, .positions = true,
+                           .token_count = 64);                 /* the first 64 tokens: the source */
+  /* ... the encoder's blocks, its output e ... */
+  uint32_t kv = linear(.net = net, .inputs = {e}, .neurons_amount = 2 * 512);
+  uint32_t tgt = embedding(.net = net, .inputs = {0}, .input_count = 1, .vocabulary = V,
+                           .neurons_amount = 512, .positions = true, .token_offset = 64);
+  /* ... the decoder's causal self-attention, its queries q = linear(512) ... */
+  attention(.net = net, .inputs = {q, kv}, .heads = 8, .ignore_padding = true);
+  ```
+- Networks of these layers save to `.slett` files (format 8; 9 with a tied head, its table stored once,
+  padding ignored, a sliding window, cross-attention or embeddings of part of their input),
+  become deployment models in every precision (the linear maps in INT8 down to INT2) and run on the
+  runtime and the engine.
 - `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every
   epoch. In Python, `gpt2_from_state_dict()` and `llama_from_state_dict()` make networks of GPT-2
-  checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2).
+  checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2), the head tied
+  to the embedding when the checkpoint ties them.
 
 ### Tokenizers
 
@@ -646,8 +676,8 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
   embeddings (the queries', keys' and values' projections in one linear layer, with Qwen2's biases;
   a `head_dim` of its own), and SwiGLU as a SiLU layer times a linear one; GPT-2 layer
   normalizations, learned positions, its GELU (`gelu_new`: the tanh form) and its Conv1D weights,
-  transposed. A missing `lm_head.weight` (tied embeddings) becomes a copy of the embeddings. These
-  are the networks of the Python bindings' `llama_from_state_dict()` and `gpt2_from_state_dict()`,
+  transposed. Without `lm_head.weight` (tied embeddings) the head is tied to the embedding (`.tied`:
+  one table, trained by both layers). These are the networks of the Python bindings' `llama_from_state_dict()` and `gpt2_from_state_dict()`,
   which give the same logits bit for bit.
 - Weights in F32, F16 or BF16 are decoded straight from the mapped files into the network, whose
   arrays are reserved at their final sizes first, so a model is never copied: SmolLM2-135M (BF16)
@@ -655,8 +685,7 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 - `Examples/Pretrained.c` continues a prompt with any of these models, printing each token as it
   comes: `Bin/Pretrained models/SmolLM2-135M "The three primary colors are" 64`.
 - `.context` 0 takes the model's positions (GPT-2's all, LLaMA's up to 2048). Mistral's sliding
-  window is not applied: attention covers the whole window, which is exact while the context is
-  within the sliding window (a warning says when it is not). Scaled rotary embeddings (LLaMA 3.1's
+  window is the attention layers' `window`. Scaled rotary embeddings (LLaMA 3.1's
   `llama3`, YaRN) are refused, as is anything else the layers do not compute, with an error that
   names it.
 - On SmolLM2-135M the logits are those of `transformers` within 2.4e-4 (of logits up to 42), on
@@ -799,6 +828,7 @@ below.
 | `epochs` | required | Number of passes over the data |
 | `training_strategy` | `SPINGALETT_STRATEGY_SAMPLE` | `SPINGALETT_STRATEGY_SAMPLE` (one step per sample), `SPINGALETT_STRATEGY_FULL_BATCH`, `SPINGALETT_STRATEGY_SMALL_BATCH` |
 | `batch_size` | 32 | Mini-batch size |
+| `accumulation_steps` | 0 (off) | Gradient accumulation: an optimizer step after every this many mini-batches, with the mean gradient of their samples (see below) |
 | `do_not_shuffle` | false | Per-sample and mini-batch training reshuffle the samples every epoch unless set |
 | `optimizer_type` | `SPINGALETT_OPTIMIZER_SGD` | `SGD`, `MOMENTUM`, `RMSPROP`, `ADAM`, `ADAMW` |
 | `learning_rate` | 0.01 | Base learning rate |
@@ -807,6 +837,8 @@ below.
 | `weight_decay` | 0 | L2 penalty; decoupled (`w *= 1 - lr * wd`) for AdamW. Biases are not decayed |
 | `max_grad_norm` | 0 (off) | Clip the global L2 norm of every step's gradient |
 | `lr_scheduler`, `lr_scheduler_data` | none | Learning-rate schedule, see below |
+| `lr_per_step` | false | Evaluate the schedule before every optimizer step instead of every epoch |
+| `recompute` | false | Activation recomputation on the CPU: less memory for about one more forward pass, the same results (see below) |
 | `reset_optimizer` | false | Clear moment estimates and the step counter before training |
 | `nan_check_interval` | 0 (off) | Stop when weights become NaN/Inf, checked every N epochs |
 | `report_interval` | 0 (off) | Log the training loss every N epochs |
@@ -823,6 +855,27 @@ below.
 The reported loss is averaged over the samples of an epoch: the sum of squared errors per sample
 for MSE, and categorical (softmax) or binary (sigmoid) cross-entropy otherwise. Cross-entropy
 requires a softmax or sigmoid output layer; `spingalett_train()` rejects other combinations.
+
+Gradient accumulation (`.accumulation_steps = 4` with `.batch_size = 8`) trains on steps of four
+mini-batches with the memory of one: the step's samples run in chunks of a mini-batch, and its
+gradient is their mean. That is the gradient of one batch of 32 samples computed in chunks of 8, bit
+for bit (`spingalett_train()` computes batches larger than its workspace holds that way: a full
+batch of 5,000 samples in chunks of 2,048 gives the bits of 3 x 2,048 accumulated); against a batch
+of 32 computed in one chunk, only the order of the sums differs, and batch normalization takes its
+statistics over each mini-batch. Dropout masks and augmentation are drawn by a sample's position in
+its step, as for the larger batch. With a generator, a step is `accumulation_steps` calls of it;
+full-batch training ignores the option, its step being the whole set. On the GPU the step's
+mini-batches are its chunks in the same way.
+
+Activation recomputation (checkpointing, `.recompute = true`) trades a forward pass for memory: the
+workspace keeps through the backward pass the outputs of the layers several layers read (a transformer's
+residual stream, one a block), of batch normalizations and of the output layer, and the other layers'
+outputs, gradients and values before their activations for one segment between two kept layers at a time
+(a block), computing a segment's outputs again just before its backward pass. The weights come out bit for
+bit as without it. A GPT-like network of six blocks of 256 channels over 256 tokens trains in chunks of 16
+samples with a peak of 141 MB instead of 216 MB (the parameters and AdamW's moments are 80 MB of either),
+taking 18.2 s instead of 14.2 s on one thread and 7.8 s instead of 5.6 s on eight (i7-12650H). It applies
+to mini-batch and full-batch training on the CPU; the GPU keeps every layer.
 
 Optimizer state (moment estimates and the step counter used for Adam's bias correction) is stored
 in the network, so training can be resumed by calling `spingalett_train()` again or after loading a
@@ -870,8 +923,12 @@ typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_
 ```
 
 The scheduler runs before every epoch; `epoch` counts the epochs already completed (0 for the
-first). Four schedules are built in and take an optional `SpingalettLRScheduleParams` as
-`user_data`:
+first). With `.lr_per_step = true` it runs before every optimizer step instead, `epoch` counting the
+steps taken in the call and `total_epochs` the steps of the call (epochs times steps an epoch; with a
+generator and no `sample_count`, 0 during the first epoch, then that epoch's steps times the epochs),
+as language models are trained: a warm-up of a few thousand steps, then a decay. Six schedules are
+built in and take an optional `SpingalettLRScheduleParams` as `user_data` (its `warmup_epochs` and
+`step_size` counting steps with `lr_per_step`):
 
 ```c
 LRScheduleParams schedule = {.warmup_epochs = 10, .min_lr = 1e-5f};
@@ -885,6 +942,8 @@ train(.net = net, /* ... */ .learning_rate = 1e-3f,
 | `spingalett_lr_linear_warmup` | `warmup_epochs` (default 5% of the run) |
 | `spingalett_lr_step_decay` | `step_size` (default a third of the run), `gamma` (default 0.1) |
 | `spingalett_lr_warmup_cosine` | `warmup_epochs`, `min_lr` |
+| `spingalett_lr_linear_decay` | `min_lr` |
+| `spingalett_lr_warmup_linear` | `warmup_epochs`, `min_lr` |
 
 Reduce on plateau works with or without a schedule: with `.lr_plateau_patience = 5` and
 `.lr_plateau_factor = 0.5f`, five epochs without improvement of the monitored value (`monitor`:
@@ -1884,7 +1943,7 @@ what 1.0 gave, and only 2.0 may take anything away.
   per release that adds some), so that the loader refuses a library older than the program needs.
   The test `api.abi` compares every release with the one before.
 - **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7;
-  1.2 adds format 8 for transformers)
+  1.2 adds format 8 for transformers, 1.3 format 9 for the training features of language models)
   and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
   later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
   that uses only what it knows.

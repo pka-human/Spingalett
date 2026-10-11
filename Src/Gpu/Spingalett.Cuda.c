@@ -343,10 +343,12 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     } else if (kernel == SPG_KERNEL_attn || kernel == SPG_KERNEL_attn_h) {
         if (count < 3) return -1;
         /* the unit of its head size and pass: with BQ 0 the matrix units' (flash.cu), else rattn.cu's (heads of up
-           to 128) or attn.cu's */
-        if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], spec[0]);
-        else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u", spec[2], spec[0]);
-        else snprintf(name, sizeof name, "attn_d%u", spec[2]);
+           to 128) or attn.cu's; a pass of a layer with padding (SPG_ATTN_EXT) the units that read it (x) */
+        const uint32_t op = spec[0] & 3u;
+        const char *ext = spec[0] & SPG_ATTN_EXT ? "x" : "";
+        if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], op);
+        else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u%s", spec[2], op, op == SPG_ATTN_PRE ? "" : ext);
+        else snprintf(name, sizeof name, "attn_d%u%s", spec[2], ext);
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];

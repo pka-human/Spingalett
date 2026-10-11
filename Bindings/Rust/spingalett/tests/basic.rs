@@ -214,7 +214,8 @@ fn layout_matches_c() {
         epsilon = "epsilon", momentum = "momentum", inputs = "inputs", input_count = "input_count",
         upsample = "upsample", output_padding = "output_padding", output_padding_h = "output_padding_h",
         output_padding_w = "output_padding_w", vocabulary = "vocabulary", heads = "heads", kv_heads = "kv_heads",
-        rope_theta = "rope_theta", causal = "causal", positions = "positions", reserved = "reserved",
+        rope_theta = "rope_theta", causal = "causal", positions = "positions", ignore_padding = "ignore_padding", tied = "tied", window = "window", token_offset = "token_offset",
+        token_count = "token_count", reserved = "reserved",
     ]);
     fields!("TrainArgs", sys::TrainArgs, [
         net = "net", training_mode = "training_mode", training_strategy = "training_strategy",
@@ -234,7 +235,8 @@ fn layout_matches_c() {
         restore_best_weights = "restore_best_weights", blas_num_threads = "blas_num_threads",
         augment_shift = "augment_shift", augment_flip = "augment_flip", label_smoothing = "label_smoothing",
         lr_plateau_factor = "lr_plateau_factor", lr_plateau_patience = "lr_plateau_patience",
-        lr_plateau_min_lr = "lr_plateau_min_lr", reserved = "reserved",
+        lr_plateau_min_lr = "lr_plateau_min_lr", accumulation_steps = "accumulation_steps",
+        lr_per_step = "lr_per_step", recompute = "recompute", reserved = "reserved",
     ]);
     fields!("TrainReport", sys::TrainReport, [
         status = "status", epochs_run = "epochs_run", train_loss = "train_loss", has_validation = "has_validation",
@@ -281,7 +283,8 @@ fn layout_matches_c() {
         weight_count = "weight_count", bias_count = "bias_count", groups = "groups", epsilon = "epsilon",
         momentum = "momentum", input_count = "input_count", inputs = "inputs", upsample = "upsample",
         vocabulary = "vocabulary", heads = "heads", kv_heads = "kv_heads", rope_theta = "rope_theta",
-        causal = "causal", positions = "positions", reserved = "reserved",
+        causal = "causal", positions = "positions", ignore_padding = "ignore_padding", tied = "tied", window = "window", token_offset = "token_offset",
+        reserved = "reserved",
     ]);
     fields!("SpingalettModel", sys::Model, [
         input_size = "input_size", output_size = "output_size", layer_count = "layer_count", loss = "loss",

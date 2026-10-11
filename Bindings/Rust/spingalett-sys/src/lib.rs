@@ -177,7 +177,12 @@ pub struct LayerArgs {
     pub rope_theta: f32,
     pub causal: bool,
     pub positions: bool,
-    pub reserved: [u64; RESERVED - 3],
+    pub ignore_padding: bool,
+    pub tied: u32,
+    pub window: u32,
+    pub token_offset: u32,
+    pub token_count: u32,
+    pub reserved: [u64; RESERVED - 5],
 }
 
 impl Default for LayerArgs {
@@ -218,7 +223,11 @@ pub struct NetworkLayer {
     pub rope_theta: f32,
     pub causal: bool,
     pub positions: bool,
-    pub reserved: [u64; RESERVED - 2],
+    pub ignore_padding: bool,
+    pub tied: u32,
+    pub window: u32,
+    pub token_offset: u32,
+    pub reserved: [u64; RESERVED - 4],
 }
 
 impl Default for NetworkLayer {
@@ -296,7 +305,10 @@ pub struct TrainArgs {
     pub lr_plateau_factor: f32,
     pub lr_plateau_patience: usize,
     pub lr_plateau_min_lr: f32,
-    pub reserved: [u64; RESERVED],
+    pub accumulation_steps: u32,
+    pub lr_per_step: bool,
+    pub recompute: bool,
+    pub reserved: [u64; RESERVED - 1],
 }
 
 impl Default for TrainArgs {

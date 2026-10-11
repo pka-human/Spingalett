@@ -67,12 +67,14 @@ final class Native {
             i("padding"), i("kernel_h"), i("kernel_w"), i("stride_h"), i("stride_w"), i("padding_h"), i("padding_w"),
             i("groups"), f("epsilon"), f("momentum"), MemoryLayout.sequenceLayout(MAX_INPUTS, JAVA_INT).withName("inputs"),
             i("input_count"), i("upsample"), i("output_padding"), i("output_padding_h"), i("output_padding_w"),
-            i("vocabulary"), i("heads"), i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), reserved(RESERVED - 3));
+            i("vocabulary"), i("heads"), i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), b("ignore_padding"), i("tied"),
+            i("window"), i("token_offset"), i("token_count"), reserved(RESERVED - 5));
     static final StructLayout NETWORK_LAYER = struct(i("type"), i("height"), i("width"), i("channels"), i("outputs"),
             i("activation"), f("dropout_rate"), i("kernel_h"), i("kernel_w"), i("stride_h"), i("stride_w"), i("padding_h"),
             i("padding_w"), l("weight_count"), l("bias_count"), i("groups"), f("epsilon"), f("momentum"), i("input_count"),
             MemoryLayout.sequenceLayout(MAX_INPUTS, JAVA_INT).withName("inputs"), i("upsample"), i("vocabulary"), i("heads"),
-            i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), reserved(RESERVED - 2));
+            i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), b("ignore_padding"), i("tied"), i("window"),
+            i("token_offset"), reserved(RESERVED - 4));
     static final StructLayout TRAIN_ARGS = struct(a("net"), i("training_mode"), i("training_strategy"),
             i("optimizer_type"), a("inputs"), a("targets"), a("device_inputs"), a("device_targets"), a("generator"),
             a("generator_data"), i("sample_count"), i("batch_size"), b("do_not_shuffle"), l("epochs"), f("learning_rate"),
@@ -83,7 +85,7 @@ final class Native {
             a("device_val_inputs"), a("device_val_targets"), i("val_count"), i("monitor"), l("early_stopping_patience"),
             f("early_stopping_min_delta"), b("restore_best_weights"), i("blas_num_threads"), i("augment_shift"),
             b("augment_flip"), f("label_smoothing"), f("lr_plateau_factor"), l("lr_plateau_patience"),
-            f("lr_plateau_min_lr"), reserved(RESERVED));
+            f("lr_plateau_min_lr"), i("accumulation_steps"), b("lr_per_step"), b("recompute"), reserved(RESERVED - 1));
     static final StructLayout TRAIN_REPORT = struct(i("status"), l("epochs_run"), f("train_loss"), b("has_validation"),
             EVAL_METRICS.withName("validation"), i("monitor"), l("best_epoch"), f("best_value"), b("restored_best"),
             reserved(RESERVED));

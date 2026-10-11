@@ -8,6 +8,75 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Activation recomputation** (`SpingalettTrainArgs.recompute`, checkpointing) on the CPU: the training
+  workspace keeps the outputs of the layers several layers read (a transformer's residual stream, one a
+  block), of batch normalizations and of the output layer; the others' outputs, gradients, values before
+  their activation and dropout masks share memory between the segments between kept layers, and the backward
+  pass computes a segment's outputs again before it (the last segment's still there), propagates its
+  gradients and takes its layers' parameter gradients while they are there (layers tied to an embedding
+  after every segment, in the table's order). The weights are those of training without it, bit for bit
+  (transformer group: GPT-2-like with dropout, LLaMA-like, a tied head, an encoder-decoder, a Mistral-like
+  model and a convolutional graph with batch normalization, on one thread and many, updated in the backward
+  pass, clipped and accumulated). A GPT-like network of six blocks of 256 channels over 256 tokens trains in
+  chunks of 16 samples with a peak of 141 MB instead of 216 MB, in 18.2 s instead of 14.2 s on one thread
+  and 7.8 s instead of 5.6 s on eight (i7-12650H, medians of interleaved runs). The GPU keeps every layer.
+  Python `train(..., recompute=True)` and the other bindings' options.
+- **Cross-attention and encoder-decoders**: an attention layer of two inputs (`.inputs = {q, kv}`) takes the
+  queries of layer `q` over the keys and values of the cells of layer `kv` (`2 kv_heads x head size`
+  channels), with grouped queries and ignoring the padding of `kv`'s tokens, on the CPU, both GPU backends
+  (the passes of `SPG_ATTN_EXT`, the keys and values a second input of the push constants; the units of
+  other layers keep their PTX), the engine and deployment models. An embedding reads part of its input
+  (`SpingalettLayerArgs.token_offset`, `token_count`), so that one input holds the source's tokens and the
+  target's. `.slett` format 9 stores both (an attention entry of two inputs, an embedding's token offset at
+  offset 104); `SpingalettNetworkLayer.token_offset`, `SpingalettLayerInfo.token_offset`; Python
+  `add_embedding(..., token_offset=, token_count=)` and `add_attention(..., inputs=[q, kv])`, the C++
+  builder's `cross_attention()` and the other bindings' `tokens` options. Sessions refuse such models (they
+  run causal language models). The transformer group checks an encoder-decoder's gradients numerically and
+  which keys the decoder's queries read; on the GPU heads of 32 to 256 match the CPU (predictions 6e-7, steps
+  1.7e-5 at most) on Vulkan and CUDA.
+- **Sliding window attention** (`SpingalettLayerArgs.window` on attention, Mistral's): each cell attends to
+  the keys less than `window` cells away, with `.causal` the cell and the `window - 1` before it, without
+  the `window - 1` on either side, on the CPU, both GPU backends, the engine and deployment models. The CPU
+  and the GPU's kernels of single precision skip the blocks of keys outside every query's window (in
+  bfloat16 on CUDA such layers run on those kernels, not `flash.cu`); `.slett` format 9 stores the window in
+  the attention's momentum field. `SpingalettNetworkLayer.window`, `SpingalettLayerInfo.window`; Python
+  `add_attention(..., window=w)`, the C++ builder's and the other bindings' options.
+- **Sequences of different lengths in one batch** (`SpingalettLayerArgs.ignore_padding` on attention): the
+  keys of padding, tokens of -1 in the network's input (traced through the layers that keep cells one for
+  one to the embedding the keys' cells come from), left out of the softmax, a query without a key giving
+  zeros, on the CPU, both GPU backends (the passes of such layers in `attn.comp` behind a specialization
+  constant and in CUDA units of their own, `rattn_d*_o*x`, `attn_d256x`, so that the other layers' kernels
+  stay as they were; in bfloat16 on CUDA such layers run on those units, not `flash.cu`), the engine and
+  deployment models; `.slett` format 9 records it in the attention's flags. With the sparse cross-entropy's
+  mean over a sample's real tokens, a padded batch's gradient is the mean of the sequences' own, each in a
+  network of its length (transformer group: 8e-8 of 0.2 over right padding with non-causal attention and
+  left padding with causal rotary attention; 0.19 apart without the option; the gpu group compares heads of
+  32 to 256 with the CPU).
+- **Tied input and output embeddings** (`SpingalettLayerArgs.tied`, `.tied = e` on a linear or dense layer):
+  a language model's head computing with embedding `e`'s table, as GPT-2's and LLaMA's tied heads do, on
+  the CPU, both GPU backends, the engine, deployment models and the runtime. The table is stored once and
+  stepped by the sum of both layers' gradients, added in a fixed order (on the CPU the embedding's first,
+  on the GPU the head's); the head keeps its biases. `.slett` format 9 records the tie (offset 104 of the
+  head's entry, its weights and scales those of the embedding's section), which the writer picks only
+  for networks with a tie; `SpingalettNetworkLayer.tied` and `SpingalettLayerInfo.tied` name it. In Python
+  `add_linear(..., tied=e)`, and `gpt2_from_state_dict()` and `llama_from_state_dict()` tie the head when
+  the checkpoint does (no `lm_head.weight`, or the embeddings' values) instead of copying the table; the
+  C++ builder's `tied_linear()` and the other bindings' `tied` options.
+- **Gradient accumulation** in `spingalett_train()` (`SpingalettTrainArgs.accumulation_steps`, on the CPU
+  and both GPU backends): an optimizer step after every `accumulation_steps` mini-batches of
+  `batch_size` samples (with a generator, calls of it), with the mean gradient of the step's samples
+  and the workspace of one mini-batch. The step's mini-batches are its chunks, so its gradient is
+  that of one batch of their samples computed in chunks of a mini-batch, bit for bit (a full batch
+  of 5,000 samples in chunks of 2,048 against 3 x 2,048 accumulated, from arrays and from a
+  generator), and differs from a batch computed in one chunk in the order of its sums only; dropout
+  masks and augmentation are drawn by the sample's position in its step.
+- **Learning-rate schedules by step** (`SpingalettTrainArgs.lr_per_step`): the schedule evaluated
+  before every optimizer step, with the steps taken and the steps of the call in place of the epochs
+  (the built-in schedules' `warmup_epochs` and `step_size` counting steps), reduce on plateau
+  scaling each step's rate; two more built-in schedules, `spingalett_lr_linear_decay()` and
+  `spingalett_lr_warmup_linear()` (a warm-up, then a straight line down to `min_lr`, as BERT and
+  GPT-2 were trained). Python: `TrainConfig.accumulation_steps`, `lr_per_step`, `LinearDecay`,
+  `WarmupLinear`; the other bindings' options take `accumulation_steps`.
 - **Bindings for PHP** 8.0 and later (`Bindings/PHP`: the Composer package `pka-human/spingalett`,
   PHP's FFI extension): `spingalett.h`, the library's C declarations as FFI parses them (the `*_args`
   functions, no macros), loaded with the library that `SPINGALETT_LIBRARY`, `SPINGALETT_LIB_DIR` or
@@ -144,8 +213,8 @@ All notable changes to this project are documented in this file. The format foll
   `gpt2_from_state_dict()`, which give the same logits bit for bit, with Qwen2's biases, explicit
   `head_dim`, tied embeddings, GPT-2's Conv1D weights. The arrays are reserved at their final sizes and
   each tensor is decoded once from the mapped file into its layer (SmolLM2-135M loads in 0.17 s on an
-  i7-12650H). Mistral's sliding window is not applied (exact within the window; a warning beyond it);
-  scaled rotary embeddings are refused. On SmolLM2-135M and Qwen2.5-0.5B-Instruct the logits agree with
+  i7-12650H). Mistral's sliding window is the attention layers' `window`, a head missing from the
+  checkpoint is tied to the embedding; scaled rotary embeddings are refused. On SmolLM2-135M and Qwen2.5-0.5B-Instruct the logits agree with
   `transformers` within 2.4e-4 and 4e-4 and the greedy continuations are the same. The `pretrained` test
   group compares tiny LLaMA,
   Qwen2, Mistral and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) with PyTorch.

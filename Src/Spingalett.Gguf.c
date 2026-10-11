@@ -638,6 +638,7 @@ NeuralNetwork *spingalett_gguf_network(const uint8_t *data, size_t size, uint32_
     t.eps = gpt2 ? kv_float(&g, ARCH_KEY("attention.layer_norm_epsilon"), 1e-5f)
                  : kv_float(&g, ARCH_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
     t.theta = kv_float(&g, ARCH_KEY("rope.freq_base"), 10000.0f);
+    t.window = kv_u32(&g, ARCH_KEY("attention.sliding_window"), 0);
     t.act = ACT_GELU_TANH;
     const uint32_t positions = kv_u32(&g, ARCH_KEY("context_length"), 0);
     t.context = context ? context : gpt2 ? positions : positions && positions < 2048 ? positions : 2048;

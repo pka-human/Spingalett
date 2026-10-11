@@ -289,6 +289,22 @@ func (l Layer) Causal(c bool) Layer          { l.args.causal = C.bool(c); return
 func (l Layer) RopeTheta(t float32) Layer    { l.args.rope_theta = C.float(t); return l }
 func (l Layer) Positions(p bool) Layer       { l.args.positions = C.bool(p); return l }
 
+// Tied makes a linear layer compute with the table of the embedding of index e (tied input and output embeddings).
+func (l Layer) Tied(e uint32) Layer { l.args.tied = C.uint32_t(e); return l }
+
+// IgnorePadding leaves the keys of padding (tokens of -1) out of attention (sequences of different lengths in one batch).
+func (l Layer) IgnorePadding(i bool) Layer { l.args.ignore_padding = C.bool(i); return l }
+
+// Window gives attention a sliding window: keys less than w cells away (with causal the cell and the w - 1 before it).
+func (l Layer) Window(w uint32) Layer { l.args.window = C.uint32_t(w); return l }
+
+// Tokens makes an embedding read part of its input: count tokens (0: the rest) from value offset on.
+func (l Layer) Tokens(offset, count uint32) Layer {
+	l.args.token_offset = C.uint32_t(offset)
+	l.args.token_count = C.uint32_t(count)
+	return l
+}
+
 // Inputs names the layers it reads (indices Add returned; 0 the input layer); none: the last one.
 func (l Layer) Inputs(inputs ...uint32) Layer {
 	for k, i := range inputs {
@@ -313,6 +329,10 @@ type TrainOptions struct {
 	MaxGradNorm    float32
 	LabelSmoothing float32
 	NoShuffle      bool
+	// AccumulationSteps: an optimizer step after every this many mini-batches (0 or 1: every one).
+	AccumulationSteps uint32
+	// Recompute: activation recomputation on the CPU (less memory, a forward pass more, the same results).
+	Recompute bool
 }
 
 // TrainResult says how a training run ended.
@@ -423,6 +443,8 @@ func (n *Network) trainArgs(o TrainOptions) C.SpingalettTrainArgs {
 	a.beta1, a.beta2 = C.float(o.Beta1), C.float(o.Beta2)
 	a.max_grad_norm = C.float(o.MaxGradNorm)
 	a.label_smoothing = C.float(o.LabelSmoothing)
+	a.accumulation_steps = C.uint32_t(o.AccumulationSteps)
+	a.recompute = C.bool(o.Recompute)
 	return a
 }
 

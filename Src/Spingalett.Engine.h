@@ -58,13 +58,20 @@ typedef struct {
     uint32_t heads, kv_heads;                       /* version 8: attention */
     float theta;                                    /* version 8: attention: rotary embeddings' base */
     bool causal, positions;                         /* version 8: attention, embedding */
+    uint32_t tied;                                  /* version 9: a dense or convolution layer's embedding (a layer
+                                                       index), whose table are its weights (and scales), or 0 */
+    uint32_t mask;                                  /* version 9: an attention's embedding (a layer index) whose
+                                                       tokens tell its padded keys, or 0 */
+    uint32_t window;                                /* version 9: an attention's sliding window (0: none) */
+    uint32_t token_offset;                          /* version 9: the first of an embedding's input values it
+                                                       reads (its cells from there on) */
     bool cells;                                     /* an integer linear layer of a language model
                                                        (slett_token_linear()): each cell's channels
                                                        quantized with a scale of their own */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3 to 8 */
+    uint32_t version;           /* 3 to 9 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -216,22 +223,40 @@ void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y,
    same table for every backend). A vector's halves are paired: x'[i] = x[i] cos - x[i + half] sin,
    x'[i + half] = x[i + half] cos + x[i] sin. */
 void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, float *table);
+/* An attention layer of one sample: `cells` cells (of queries), heads query heads and kv key and value heads of
+   head values; causal; keys less than `window` cells away (0: all); ignoring padding, the keys' tokens (the
+   network's inputs: a negative one marks a key left out), else NULL. Cross-attention: kv_input the keys and values
+   of its kcells cells (2 kv x head values each, the key heads' then the value heads'); NULL for self-attention
+   (kcells = cells). */
+typedef struct {
+    uint32_t cells, kcells, heads, kv, head, window;
+    bool causal;
+    const float *tokens;
+    const float *kv_input;
+} SlettAttention;
+
 /* The attention of one sample, as the engine computes it: x of `cells` cells of (heads + 2 kv) x head
-   values (queries, keys, values), y of cells x heads x head values; each query's scores in the order of
-   the keys, its softmax online (the running maximum and sum, the values' weighted sum rescaled when the
-   maximum grows), causal: the keys up to its cell. With a table (the rotary embeddings) the queries and
-   keys are rotated first, in scratch of slett_attention_floats() floats. */
-void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads, uint32_t kv, uint32_t head,
-                                 bool causal, const float *table, float *y, float *scratch);
+   values (queries, keys, values; cross-attention: heads x head values of queries, the keys and values in
+   a->kv_input), y of cells x heads x head values; each query's scores in the order of the keys, its softmax online
+   (the running maximum and sum, the values' weighted sum rescaled when the maximum grows), causal: the keys up
+   to its cell, with a window those less than window cells away, the keys of padding left out (a query without a
+   key gives zeros). With a table (the rotary embeddings) the queries and keys are rotated first, in scratch of
+   slett_attention_floats() floats. */
+void spingalett_engine_attention(const SlettAttention *a, const float *x, const float *table, float *y, float *scratch);
+/* The attention of layer L for one sample of the network's inputs `input` (whose tokens a layer ignoring padding
+   reads); a cross-attention's kv_input is the caller's to set. */
+void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, const float *input, SlettAttention *a);
 /* A head vector rotated by its position's angles (cosines and sines: the table's halves of its row). */
 void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, const float *cosines,
                                    const float *sines);
 /* One query's attention over `count` keys and values (key j at keys + j key_stride, its value at values + j
    value_stride) as spingalett_engine_attention() computes it, into o[head]: the scores in the order of the
-   keys, times scale, the softmax online. Sessions (spingalett_session_feed()) attend over the keys they
-   keep with it, so that their results are the engine's. */
+   keys, times scale, the softmax online; with tokens, key j left out when tokens[j] is negative (padding), and
+   zeros when no key is left. Sessions (spingalett_session_feed()) attend over the keys they keep with it, so
+   that their results are the engine's. */
 void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,
-                              size_t value_stride, uint32_t count, uint32_t head, float scale, float *o);
+                              size_t value_stride, uint32_t count, uint32_t head, float scale, const float *tokens,
+                              float *o);
 /* An embedding of one sample: a row of L's table (in its precision, as floats) for every input value, zeros
    for values outside it, plus the position's vector with positions. */
 void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);
