@@ -13,7 +13,7 @@
         "source": "https://github.com/pka-human/Spingalett/tree/main/Bindings/PHP"
     },
     "require": {
-        "php": ">=7.4",
+        "php": ">=8.0",
         "ext-ffi": "*"
     },
     "autoload": {

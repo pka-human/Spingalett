@@ -51,7 +51,7 @@ weights in.
   layer normalization over sequences, attention patterns folded into the attention layer.
 - **A WebAssembly build of the engine** and a JavaScript package around it (npm), for models that
   run in browsers.
-- **Bindings for PHP** (`Bindings/PHP`): PHP's FFI extension (PHP 7.4 and later) over the shared
+- **Bindings for PHP** (`Bindings/PHP`): PHP's FFI extension (PHP 8.0 and later) over the shared
   library, as the bindings of 1.2 are: the C declarations of the `*_args` functions and structures
   in a header FFI loads (`FFI::load()`, no macros), classes for networks, layers, training on arrays
   and token files, prediction, evaluation, generation, parameters, files and deployment models, PHP

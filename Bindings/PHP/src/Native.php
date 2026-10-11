@@ -67,7 +67,7 @@ final class Native
         $row = min($count, self::ROW);
         for ($k = 0; $k * $row < $count; $k++) {
             $bytes = pack($format, ...($count === $row ? $values : array_slice($values, $k * $row, $row)));
-            $to = $buffer[$k];                  // a variable: PHP 7.4's FFI takes its arguments by reference
+            $to = $buffer[$k];                  // a variable: FFI::memcpy() takes its arguments by reference
             FFI::memcpy($to, $bytes, strlen($bytes));
         }
         return $buffer;
