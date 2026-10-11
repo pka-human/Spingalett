@@ -241,6 +241,13 @@ final class Layer
         return $this;
     }
 
+    /** Attention: keys of padding (tokens of -1) left out (sequences of different lengths in one batch). */
+    public function ignorePadding(bool $ignore = true): self
+    {
+        $this->fields['ignore_padding'] = $ignore;
+        return $this;
+    }
+
     /** Linear: computes with the table of the embedding of index $embedding (tied input and output embeddings). */
     public function tied(int $embedding): self
     {

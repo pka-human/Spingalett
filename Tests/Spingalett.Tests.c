@@ -4392,6 +4392,114 @@ static void tf_models(void) {
     }
 }
 
+/* A network over sequences of T tokens of which some are padding (-1): attention (non-causal, or causal with rotary
+   embeddings) ignoring padding (or not, `mask` false), learned positions without rotary ones. */
+static NeuralNetwork *pad_net(uint32_t T, uint32_t V, bool causal, bool mask) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = T);
+    uint32_t x = embedding(.net = net, .vocabulary = V, .neurons_amount = 8, .positions = !causal);
+    layer_norm(.net = net);
+    linear(.net = net, .neurons_amount = 24);
+    attention(.net = net, .heads = 2, .causal = causal, .rope_theta = causal ? 10000.0f : 0.0f, .ignore_padding = mask);
+    uint32_t a = linear(.net = net, .neurons_amount = 8);
+    add_layers(.net = net, .inputs = {x, a});
+    rms_norm(.net = net, .act_func = ACT_GELU);
+    linear(.net = net, .neurons_amount = V);
+    return net;
+}
+
+/* Sequences of different lengths in one batch, padded with -1 tokens (and targets): with attention ignoring
+   padding, the gradient of the batch is the mean of the sequences' own, each in a network of its length (the
+   learned positions its first ones), up to the order of the sums; right padding with non-causal attention,
+   left padding with causal attention and rotary embeddings (relative positions); without the mask the
+   non-causal network attends to padding and its gradient differs. */
+static void tf_padding(ComputeMode mode) {
+    const uint32_t T = 8, V = 11, lengths[3] = {3, 5, 8}, N = 3;
+    spingalett_set_compute_mode(mode);
+    for (int which = 0; which < 3; which++) {
+        const bool causal = which == 1, mask = which != 2;
+        lcg_state = 4000 + (unsigned)which;
+        NeuralNetwork *net = pad_net(T, V, causal, mask);
+        tf_init(net);
+        const uint64_t nw = net->total_weights, nb = net->total_biases, pos = causal ? 0u : (uint64_t)T * 8;
+        float x[3 * 8], y[3 * 8];
+        for (uint32_t s = 0; s < N; s++)
+            for (uint32_t t = 0; t < T; t++) {
+                const uint32_t L = lengths[s], at = causal ? T - L : 0u;      /* (left padding with causal) */
+                const bool real = t >= at && t < at + L;
+                x[s * T + t] = real ? (float)((s * 7u + t * 3u + 1u) % V) : -1.0f;
+                y[s * T + t] = real ? (float)((s * 5u + t * 2u + 3u) % V) : -1.0f;
+            }
+        float *w0 = malloc(nw * 4), *b0 = malloc(nb * 4);
+        memcpy(w0, net->weights, nw * 4);
+        memcpy(b0, net->biases, nb * 4);
+        /* each sequence alone in a network of its length: the mean of their steps */
+        double *mw = calloc(nw, sizeof(double)), *mb = calloc(nb, sizeof(double));
+        for (uint32_t s = 0; s < N; s++) {
+            const uint32_t L = lengths[s], at = causal ? T - L : 0u;
+            NeuralNetwork *one = pad_net(L, V, causal, mask);
+            const uint64_t lpos = causal ? 0u : (uint64_t)L * 8;
+            memcpy(one->weights, w0, nw * 4);
+            memcpy(one->biases, b0, lpos * 4);                         /* the first L positions */
+            memcpy(one->biases + lpos, b0 + pos, (nb - pos) * 4);
+            train(.net = one, .inputs = x + s * T + at, .targets = y + s * T + at, .sample_count = 1, .epochs = 1,
+                  .learning_rate = 1.0f, .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+            for (uint64_t i = 0; i < nw; i++) mw[i] += ((double)w0[i] - one->weights[i]) / N;
+            for (uint64_t i = 0; i < lpos; i++) mb[i] += ((double)b0[i] - one->biases[i]) / N;
+            for (uint64_t i = lpos; i < nb - pos + lpos; i++) mb[i - lpos + pos] += ((double)b0[i - lpos + pos] - one->biases[i]) / N;
+            free_network(one);
+        }
+        train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 1.0f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+        double worst = 0.0, top = 0.0;
+        for (uint64_t i = 0; i < nw; i++) {
+            worst = fmax(worst, fabs(((double)w0[i] - net->weights[i]) - mw[i]));
+            top = fmax(top, fabs(mw[i]));
+        }
+        for (uint64_t i = 0; i < nb; i++) {
+            worst = fmax(worst, fabs(((double)b0[i] - net->biases[i]) - mb[i]));
+            top = fmax(top, fabs(mb[i]));
+        }
+        printf("  padding mode=%d %s%s: a padded batch's step %.1e from the sequences' own (of %.1e)\n", mode,
+               causal ? "causal, left" : "non-causal, right", mask ? "" : ", not ignored", worst, top);
+        if (mask) CHECK(worst <= 2e-5 * top, "padding mode=%d %d: %.3e of %.3e", mode, which, worst, top);
+        else CHECK(worst > 1e-3 * top, "padding mode=%d: attention to padding left the gradient alike (%.3e)", mode, worst);
+        if (mask && mode == COMPUTE_SINGLE_THREADED) {
+            /* format 9 keeps the mask; the engine and deployment models leave padding out as predict() does */
+            float ref[3 * 8 * 11], got[3 * 8 * 11], one[3 * 8 * 11];
+            predict(.net = net, .inputs = x, .sample_count = N, .outputs = ref);
+            size_t size = 0;
+            void *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, false, &size);
+            NeuralNetwork *back = img ? spingalett_load_from_memory(img, size) : NULL;
+            SpingalettNetworkLayer la;
+            bool kept = img && ((const uint8_t *)img)[6] == 9 && back && spingalett_network_layer(back, 4, &la) &&
+                        la.ignore_padding && back->shapes[4].mask == 1;
+            if (back) {
+                predict(.net = back, .inputs = x, .sample_count = N, .outputs = got);
+                kept = kept && !memcmp(got, ref, sizeof ref);
+                free_network(back);
+            }
+            spingalett_free(img);
+            for (int p = 0; p < 2; p++) {
+                SpingalettModel *m = spingalett_model_from_network(net, p ? PRECISION_INT8 : PRECISION_FLOAT32);
+                SpingalettLayerInfo li;
+                if (!m || !spingalett_model_layer(m, 3, &li) || !li.ignore_padding) { kept = false; spingalett_model_free(m); continue; }
+                void *ws = malloc(m->workspace_size);
+                for (uint32_t s = 0; s < N; s++) spingalett_model_run(m, x + s * T, one + s * T * V, ws);
+                free(ws);
+                spingalett_model_predict(m, x, N, got);
+                const float err = max_abs_diff(ref, one, sizeof ref / 4), diff = max_abs_diff(got, one, sizeof ref / 4);
+                kept = kept && (p ? diff == 0.0f && err < 0.3f : diff < 1e-5f && err < 1e-4f);
+                spingalett_model_free(m);
+            }
+            CHECK(kept, "padding %d: the mask in files, the engine and deployment models", which);
+        }
+        free(w0); free(b0); free(mw); free(mb);
+        free_network(net);
+    }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 /* Tied input and output embeddings: the head computes with the table, as an untied head holding a copy of it
    does, and the table's step is the sum of the embedding's and the head's; the layers' other parameters step
    alike; ties that do not fit are refused. */
@@ -5229,6 +5337,74 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
         free(delta[k]);
     }
     free(again); free(x); free(t);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Sequences of different lengths in one batch on the GPU: attention ignoring padding (non-causal over right padding,
+   causal with rotary embeddings over left padding, heads of 32 and 64 over several tiles) against the CPU's
+   predictions and step, two runs alike, and in bfloat16 (on CUDA the kernels of single precision that read
+   padding, not flash.cu) close to single precision. */
+static void gpu_padding(uint32_t head, bool causal) {
+    const uint32_t T = 72, V = 23, n = 12, heads = 2, d = heads * head;
+    float *x = (float *)malloc((size_t)n * T * sizeof(float)), *t = (float *)malloc((size_t)n * T * sizeof(float));
+    lcg_state = 77u + head;
+    for (uint32_t s = 0; s < n; s++) {
+        const uint32_t L = 1u + (s * 37u + 5u) % T, at = causal ? T - L : 0u;
+        for (uint32_t i = 0; i < T; i++) {
+            const bool real = i >= at && i < at + L;
+            x[s * T + i] = real ? (float)((uint32_t)(frand() * 4096.0f) % V) : -1.0f;
+            t[s * T + i] = real ? (float)((uint32_t)(frand() * 4096.0f) % V) : -1.0f;
+        }
+    }
+    /* runs: the CPU, the GPU twice, the GPU in bfloat16 */
+    float *pred[4] = {NULL, NULL, NULL, NULL}, *step[4] = {NULL, NULL, NULL, NULL};
+    uint64_t count = 0;
+    for (int run = 0; run < 4; run++) {
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = T);
+        embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = !causal);
+        linear(.net = net, .neurons_amount = 3 * d);
+        attention(.net = net, .heads = heads, .causal = causal, .rope_theta = causal ? 10000.0f : 0.0f,
+                  .ignore_padding = true);
+        linear(.net = net, .neurons_amount = V);
+        lcg_state = 91;
+        for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
+        spingalett_set_compute_mode(run == 0 ? COMPUTE_OPENMP : gpu_mode);
+        if (run == 3 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+            free_network(net);
+            break;
+        }
+        pred[run] = (float *)malloc((size_t)n * T * V * sizeof(float));
+        predict(.net = net, .inputs = x, .outputs = pred[run], .sample_count = n);
+        count = net->total_weights;
+        step[run] = (float *)malloc(count * sizeof(float));
+        memcpy(step[run], net->weights, count * sizeof(float));
+        train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .learning_rate = 1.0f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0);
+        SpingalettNetworkLayer first;
+        spingalett_network_layer(net, 1, &first);
+        float *probe = (float *)malloc(first.weight_count * sizeof(float));
+        spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe, first.weight_count);       /* (brings them back) */
+        free(probe);
+        for (uint64_t i = 0; i < count; i++) step[run][i] -= net->weights[i];
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        free_network(net);
+    }
+    const double p = gpu_max_scaled(pred[0], pred[1], (size_t)n * T * V), s = gpu_max_scaled(step[0], step[1], count);
+    const bool same = !memcmp(step[1], step[2], count * sizeof(float)) &&
+                      !memcmp(pred[1], pred[2], (size_t)n * T * V * sizeof(float));
+    CHECK(p < 1e-4 && s < 1e-3 && same, "gpu padding head %u%s: predictions %.2e, step %.2e from the CPU's, "
+          "deterministic %d", head, causal ? " causal" : "", p, s, same);
+    printf("  gpu padding head %u %s: predictions %.1e, step %.1e from the CPU's, deterministic %s", head,
+           causal ? "causal, left" : "non-causal, right", p, s, same ? "yes" : "no");
+    if (pred[3]) {
+        const double bp = gpu_max_scaled(pred[1], pred[3], (size_t)n * T * V), bs = gpu_max_scaled(step[1], step[3], count);
+        CHECK(bp < 2e-2 && bs < 6e-2, "gpu padding head %u bf16: predictions %.2e, step %.2e", head, bp, bs);
+        printf("; bf16 %.1e, step %.1e", bp, bs);
+    }
+    printf("\n");
+    for (int k = 0; k < 4; k++) { free(pred[k]); free(step[k]); }
+    free(x); free(t);
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
@@ -6322,6 +6498,7 @@ int main(int argc, char **argv) {
         tf_determinism();
         tf_models();
         tf_tied();
+        for (int m = 0; m < 2; m++) tf_padding(cm[m]);
         tf_validation();
         tf_learns(COMPUTE_OPENMP);
     }
@@ -6482,6 +6659,10 @@ int main(int argc, char **argv) {
             gpu_flash(32, false, 4);
             gpu_flash(64, true, 2);
             gpu_flash(128, true, 1);
+            gpu_padding(32, false);
+            gpu_padding(64, true);
+            gpu_padding(128, false);
+            gpu_padding(256, true);
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }

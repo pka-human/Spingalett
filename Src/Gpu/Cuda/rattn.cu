@@ -22,8 +22,10 @@
  *
  * Queries come scaled (and queries and keys rotated, ROPE) as they are loaded; a product adds its terms in
  * the order of the head's values, a sum over keys in their order: the same bits on every run. A unit per
- * head size D and pass (OPC); the head d may be smaller than D (zeros past it). Spec: OP, BQ, DMAX, THREADS,
- * HALF (words: x 0, y 1, dy 2, dx 3), the tiles those of SPG_RATTN_ROWS and SPG_RATTN_THREADS.
+ * head size D and pass (OPC); the head d may be smaller than D (zeros past it). Units of EXT (rattn_d<D>_o<OPC>x)
+ * compile in the passes of a layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query
+ * without a key giving zeros); the others are those of layers without, unchanged. Spec: OP (| SPG_ATTN_EXT), BQ,
+ * DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3), the tiles those of SPG_RATTN_ROWS and SPG_RATTN_THREADS.
  */
 
 #include "common.cuh"
@@ -32,6 +34,9 @@
 #define SPG_ENTRY spg_rattn_d64_o0
 #define D 64u
 #define OPC 0u
+#endif
+#if !defined(EXT)
+#define EXT 0
 #endif
 #define R SPG_RATTN_ROWS(D, OPC)
 #define T SPG_RATTN_THREADS(D, OPC)
@@ -58,6 +63,12 @@
 #define FLAG_CAUSAL 1u
 #define FLAG_ROPE   2u
 #define FLAG_STATS  4u
+#define FLAG_PAD    8u
+
+/* Whether key j of sample s is attended to: inside the keys and (EXT with FLAG_PAD) not padding. */
+DEVICE bool live(const SpgAttnPush &p, uint32_t s, uint32_t j) {
+    return j < p.cells && (!(p.flags & FLAG_PAD) || F(p.tokens)[s * p.tokens_stride + p.tokens_at + j] >= 0.0f);
+}
 
 DEVICE float shfl_xor(float v, uint32_t mask) { return __nvvm_shfl_sync_bfly_f32(0xFFFFFFFFu, v, mask, 0x1F); }
 DEVICE void warp_sync() { __nvvm_bar_warp_sync(0xFFFFFFFFu); }
@@ -301,6 +312,11 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
         scores(sh.q, sh.k, ry, tx, sc);
         const float *vt = sh.v;
 #endif
+#if EXT
+        bool kl[CN];                /* the tile's keys of this thread attended to */
+#pragma unroll
+        for (uint32_t n = 0; n < CN; n++) kl[n] = live(p, s, j0 + tx + TX * n);
+#endif
 #if OPC == FORWARD
 #pragma unroll
         for (uint32_t m = 0; m < RM; m++) {
@@ -309,7 +325,11 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
 #pragma unroll
             for (uint32_t n = 0; n < CN; n++) {
                 const uint32_t j = j0 + tx + TX * n;
+#if EXT
+                if (!(i < p.cells && kl[n] && (!causal || j <= i))) sc[m][n] = NEG;
+#else
                 if (!(i < p.cells && j < p.cells && (!causal || j <= i))) sc[m][n] = NEG;
+#endif
                 top = max_(top, sc[m][n]);
             }
             const float mn = max_(mx[m], group_max(top)), alpha = mn == NEG ? 1.0f : exp_(mx[m] - mn);
@@ -340,7 +360,11 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
 #pragma unroll
             for (uint32_t n = 0; n < CN; n++) {
                 const uint32_t j = j0 + tx + TX * n;
+#if EXT
+                const bool valid = i < p.cells && kl[n] && (!causal || j <= i);
+#else
                 const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
+#endif
                 sh.p[(ry * RM + m) * SP + tx + TX * n] = valid ? exp_(sc[m][n] - lse[m]) * (dp[m][n] - del[m]) : 0.0f;
             }
         }
@@ -353,7 +377,12 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
     for (uint32_t m = 0; m < RM; m++) {
         const uint32_t i = i0 + ry * RM + m;
         if (i >= p.cells) continue;
+#if EXT
+        const bool none = sum[m] == 0.0f;      /* (a query without a key left: zeros, its log sum 0, never read) */
+        const float inv = none ? 0.0f : 1.0f / sum[m];
+#else
         const float inv = 1.0f / sum[m];
+#endif
         const uint32_t at = (s * p.cells + i) * out_c + h * d;
 #pragma unroll
         for (uint32_t k = 0; k < CH; k++) {
@@ -367,7 +396,11 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
                     if (c + e < d) st(p.y, at + c + e, 1u, HALF, get4(o, e));
             }
         }
+#if EXT
+        if ((p.flags & FLAG_STATS) && tx == 0u) F(p.stats)[sa + i] = none ? 0.0f : mx[m] + log_(sum[m]);
+#else
         if ((p.flags & FLAG_STATS) && tx == 0u) F(p.stats)[sa + i] = mx[m] + log_(sum[m]);
+#endif
     }
 #else
     /* dQ times the scale, rotated back through shared memory */
@@ -389,6 +422,11 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
     for (uint32_t m = 0; m < RM; m++)
 #pragma unroll
         for (uint32_t k = 0; k < CH; k++) dk[m][k] = dv[m][k] = float4_{0.0f, 0.0f, 0.0f, 0.0f};
+#if EXT
+    bool kk[RM];                    /* this thread's keys attended to (padding: a key left out gets no gradient) */
+#pragma unroll
+    for (uint32_t m = 0; m < RM; m++) kk[m] = live(p, s, j0 + ry * RM + m);
+#endif
     const uint32_t first = causal ? (j0 / B) * B : 0u;
     for (uint32_t h = kh * group; h < (kh + 1u) * group; h++) {
         const uint32_t sa = (s * p.heads + h) * p.cells;
@@ -425,7 +463,11 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
 #pragma unroll
                 for (uint32_t n = 0; n < CN; n++) {
                     const uint32_t qc = tx + TX * n, query = q0 + qc;
+#if EXT
+                    const bool valid = query < p.cells && kk[m] && (!causal || key <= query);
+#else
                     const bool valid = query < p.cells && key < p.cells && (!causal || key <= query);
+#endif
                     const float pv = valid ? exp_(st_[m][n] - sh.l[qc]) : 0.0f;
                     sh.p[(ry * RM + m) * SP + qc] = pv;
                     st_[m][n] = pv * (dpt[m][n] - sh.dl[qc]);

@@ -348,6 +348,12 @@ impl Layer {
         self.args.positions = positions;
         self
     }
+    /// Attention: keys of padding (tokens of -1 in the network's input) left out, for sequences of different
+    /// lengths in one batch.
+    pub fn ignore_padding(mut self, ignore: bool) -> Self {
+        self.args.ignore_padding = ignore;
+        self
+    }
     /// A linear layer computing with the table of the embedding of this index (tied input and output
     /// embeddings); its outputs the embedding's vocabulary.
     pub fn tied(mut self, embedding: u32) -> Self {

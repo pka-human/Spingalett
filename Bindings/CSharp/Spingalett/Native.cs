@@ -62,6 +62,7 @@ public unsafe struct LayerArgs
     public float rope_theta;
     public byte causal;
     public byte positions;
+    public byte ignore_padding;
     public uint tied;
     public fixed ulong reserved[Const.Reserved - 3];
 }
@@ -90,6 +91,7 @@ public unsafe struct NetworkLayer
     public float rope_theta;
     public byte causal;
     public byte positions;
+    public byte ignore_padding;
     public uint tied;
     public fixed ulong reserved[Const.Reserved - 3];
 }

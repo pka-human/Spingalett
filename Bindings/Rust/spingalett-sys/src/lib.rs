@@ -177,6 +177,7 @@ pub struct LayerArgs {
     pub rope_theta: f32,
     pub causal: bool,
     pub positions: bool,
+    pub ignore_padding: bool,
     pub tied: u32,
     pub reserved: [u64; RESERVED - 3],
 }
@@ -219,6 +220,7 @@ pub struct NetworkLayer {
     pub rope_theta: f32,
     pub causal: bool,
     pub positions: bool,
+    pub ignore_padding: bool,
     pub tied: u32,
     pub reserved: [u64; RESERVED - 3],
 }

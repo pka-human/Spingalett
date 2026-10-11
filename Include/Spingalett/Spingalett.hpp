@@ -423,12 +423,14 @@ public:
         a.weight_initialization = SPINGALETT_INIT_LECUN;
         return add(a);
     }
-    Builder &attention(std::uint32_t heads, bool causal = true, std::uint32_t kv_heads = 0, float rope_theta = 0.0f) {
+    Builder &attention(std::uint32_t heads, bool causal = true, std::uint32_t kv_heads = 0, float rope_theta = 0.0f,
+                       bool ignore_padding = false) {
         SpingalettLayerArgs a = args(SPINGALETT_LAYER_ATTENTION, Activation::None, 0);
         a.heads = heads;
         a.kv_heads = kv_heads;
         a.causal = causal;
         a.rope_theta = rope_theta;
+        a.ignore_padding = ignore_padding;
         return add(a);
     }
     Builder &rms_norm(float epsilon = 0.0f) {

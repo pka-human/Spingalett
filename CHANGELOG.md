@@ -8,6 +8,17 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Sequences of different lengths in one batch** (`SpingalettLayerArgs.ignore_padding` on attention): the
+  keys of padding, tokens of -1 in the network's input (traced through the layers that keep cells one for
+  one to the embedding the keys' cells come from), left out of the softmax, a query without a key giving
+  zeros, on the CPU, both GPU backends (the passes of such layers in `attn.comp` behind a specialization
+  constant and in CUDA units of their own, `rattn_d*_o*x`, `attn_d256x`, so that the other layers' kernels
+  stay as they were; in bfloat16 on CUDA such layers run on those units, not `flash.cu`), the engine and
+  deployment models; `.slett` format 9 records it in the attention's flags. With the sparse cross-entropy's
+  mean over a sample's real tokens, a padded batch's gradient is the mean of the sequences' own, each in a
+  network of its length (transformer group: 8e-8 of 0.2 over right padding with non-causal attention and
+  left padding with causal rotary attention; 0.19 apart without the option; the gpu group compares heads of
+  32 to 256 with the CPU).
 - **Tied input and output embeddings** (`SpingalettLayerArgs.tied`, `.tied = e` on a linear or dense layer):
   a language model's head computing with embedding `e`'s table, as GPT-2's and LLaMA's tied heads do, on
   the CPU, both GPU backends, the engine, deployment models and the runtime. The table is stored once and

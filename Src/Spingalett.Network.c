@@ -103,6 +103,23 @@ static bool layer_tie(const NeuralNetwork *net, const LayerArgs *args, const Lay
     return true;
 }
 
+/* The embedding of the network's input whose cells layer l's are, one for one (through layers that keep their
+   input's cells: linear layers and convolutions of stride 1 that keep the shape, normalizations, additions,
+   products, concatenations, attention's queries), or 0: its tokens tell which cells are padding. */
+static uint32_t cells_of(const NeuralNetwork *net, uint32_t l) {
+    while (l > 0) {
+        const LayerShape *s = &net->shapes[l], *in = &net->shapes[spingalett_source(net, l)];
+        if (s->type == LAYER_EMBEDDING) return spingalett_source(net, l) == 0 ? l : 0u;
+        const bool same = s->height == in->height && s->width == in->width;
+        const bool keeps = spingalett_normalization(s->type) || s->type == LAYER_ADD || s->type == LAYER_MULTIPLY ||
+                           s->type == LAYER_CONCAT || s->type == LAYER_ATTENTION ||
+                           (s->type == LAYER_CONV2D && s->stride_h == 1 && s->stride_w == 1);
+        if (!keeps || !same) return 0u;
+        l = spingalett_source(net, l);
+    }
+    return 0u;
+}
+
 /* The shape of a new layer from its arguments and its inputs; false (error set) when they do not
    fit together. */
 static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const uint32_t *inputs, uint32_t count,
@@ -208,6 +225,11 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->kv_heads = kv;
         shape->theta = args->rope_theta;
         shape->causal = args->causal;
+        /* padding: the keys' cells those of an embedding of the network's input */
+        shape->mask = args->ignore_padding ? cells_of(net, inputs[0]) : 0u;
+        if (args->ignore_padding && !shape->mask)
+            return layer_error("Attention: ignore_padding needs keys whose cells are an embedding's of the network's "
+                               "input, through layers that keep cells one for one");
         units = (uint64_t)in->height * in->width * shape->channels;
     } else if (args->type == LAYER_LAYER_NORM || args->type == LAYER_RMS_NORM) {
         /* the input's shape, normalized per cell */
@@ -721,6 +743,7 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
             a.kv_heads = s->kv_heads;
             a.rope_theta = s->theta;
             a.causal = s->causal;
+            a.ignore_padding = s->mask != 0;
             break;
         case LAYER_ADD:
         case LAYER_CONCAT:
@@ -782,6 +805,7 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->rope_theta = s->theta;
     layer->causal = s->causal;
     layer->positions = s->positions;
+    layer->ignore_padding = s->mask != 0;
     layer->tied = s->tied;
     if (index > 0) {
         layer->bias_count = spingalett_bias_count(net, index - 1);

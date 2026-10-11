@@ -60,6 +60,8 @@ typedef struct {
     bool causal, positions;                         /* version 8: attention, embedding */
     uint32_t tied;                                  /* version 9: a dense or convolution layer's embedding (a layer
                                                        index), whose table are its weights (and scales), or 0 */
+    uint32_t mask;                                  /* version 9: an attention's embedding (a layer index) whose
+                                                       tokens tell its padded keys, or 0 */
 } SlettLayer;
 
 typedef struct {
@@ -200,13 +202,25 @@ void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y,
    same table for every backend). A vector's halves are paired: x'[i] = x[i] cos - x[i + half] sin,
    x'[i + half] = x[i + half] cos + x[i] sin. */
 void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, float *table);
+/* An attention layer of one sample: `cells` cells, heads query heads and kv key and value heads of head values;
+   causal; ignoring padding, the keys' tokens (the network's inputs: a negative one marks a key left out),
+   else NULL. */
+typedef struct {
+    uint32_t cells, heads, kv, head;
+    bool causal;
+    const float *tokens;
+} SlettAttention;
+
 /* The attention of one sample, as the engine computes it: x of `cells` cells of (heads + 2 kv) x head
    values (queries, keys, values), y of cells x heads x head values; each query's scores in the order of
    the keys, its softmax online (the running maximum and sum, the values' weighted sum rescaled when the
-   maximum grows), causal: the keys up to its cell. With a table (the rotary embeddings) the queries and
-   keys are rotated first, in scratch of slett_attention_floats() floats. */
-void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads, uint32_t kv, uint32_t head,
-                                 bool causal, const float *table, float *y, float *scratch);
+   maximum grows), causal: the keys up to its cell, the keys of padding left out (a query without a key gives
+   zeros). With a table (the rotary embeddings) the queries and keys are rotated first, in scratch of
+   slett_attention_floats() floats. */
+void spingalett_engine_attention(const SlettAttention *a, const float *x, const float *table, float *y, float *scratch);
+/* The attention of layer L for one sample of the network's inputs `input` (whose tokens a layer ignoring padding
+   reads). */
+void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, const float *input, SlettAttention *a);
 /* An embedding of one sample: a row of L's table (in its precision, as floats) for every input value, zeros
    for values outside it, plus the position's vector with positions. */
 void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);

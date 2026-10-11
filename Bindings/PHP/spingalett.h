@@ -107,6 +107,7 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
+    bool ignore_padding;
     uint32_t tied;
     uint64_t reserved[8 - 3];
 } SpingalettLayerInfo;
@@ -229,6 +230,7 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
+    bool ignore_padding;
     uint32_t tied;
     uint64_t reserved[8 - 3];
 } SpingalettNetworkLayer;
@@ -335,6 +337,7 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
+    bool ignore_padding;
     uint32_t tied;
     uint64_t reserved[8 - 3];
 } SpingalettLayerArgs;

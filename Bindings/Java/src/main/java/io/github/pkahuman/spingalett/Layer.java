@@ -11,7 +11,7 @@ public final class Layer {
     int type, neurons, act, init, height, width, channels, filters, kernel, stride, padding, groups, upsample;
     int outputPadding, vocabulary, heads, kvHeads, tied;
     float dropout, epsilon, ropeTheta;
-    boolean causal, positions;
+    boolean causal, positions, ignorePadding;
     int[] inputs = new int[0];
 
     private Layer(int type) { this.type = type; }
@@ -92,6 +92,8 @@ public final class Layer {
     public Layer positions(boolean p) { positions = p; return this; }
     /** A linear layer computing with the table of the embedding of index e (tied input and output embeddings). */
     public Layer tied(int e) { tied = e; return this; }
+    /** Attention: keys of padding (tokens of -1) left out (sequences of different lengths in one batch). */
+    public Layer ignorePadding(boolean v) { ignorePadding = v; return this; }
     /** The layers it reads (indices that Network.add returned; 0 the input layer); none: the last one. */
     public Layer inputs(int... names) {
         if (names.length > Native.MAX_INPUTS) throw new IllegalArgumentException("a layer reads at most 16 layers");
@@ -126,6 +128,7 @@ public final class Layer {
         Native.set(s, L, "causal", (byte) (causal ? 1 : 0));
         Native.set(s, L, "positions", (byte) (positions ? 1 : 0));
         Native.set(s, L, "tied", tied);
+        Native.set(s, L, "ignore_padding", (byte) (ignorePadding ? 1 : 0));
         long at = L.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("inputs"));
         for (int k = 0; k < inputs.length; k++) s.set(ValueLayout.JAVA_INT, at + 4L * k, inputs[k]);
         Native.set(s, L, "input_count", inputs.length);

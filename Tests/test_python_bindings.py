@@ -811,6 +811,20 @@ check(drawn == lm.generate([3, 4, 5], 20, temperature=1.0, top_p=0.9, seed=8) an
 check(lm.generate([3, 4, 5], 20, stop=[9]) == [6, 7, 8, 9], "generate: stop tokens")
 os.remove(tokens_path)
 
+# sequences of different lengths: attention ignoring the keys of padding (-1), its outputs at the real tokens
+# those of the sequence alone (the padding's values do not matter: here, the network's cells past the sequence)
+enc = sg.Network(sg.Loss.SPARSE_CROSS_ENTROPY, [8, sg.Embedding(V, 8, positions=True), sg.Linear(24),
+                                                sg.Attention(heads=2, ignore_padding=True), sg.Linear(V)])
+check(enc.layer(3).ignore_padding and enc.to_model(sg.Precision.FLOAT32).layers[2].ignore_padding,
+      "ignore_padding described")
+short = np.array([4, 7, 1, -1, -1, -1, -1, -1], dtype=np.float32)
+out = enc.forward(short).reshape(8, V)
+enc.set_biases(0, np.concatenate([enc.get_biases(0)[:24], np.zeros(40, np.float32)]))   # the padding's positions
+check(np.allclose(enc.forward(short).reshape(8, V)[:3], out[:3], atol=1e-6), "padding ignored by attention")
+r = enc.train(np.stack([short, np.arange(8, dtype=np.float32) % V]), np.stack([short, np.arange(8, dtype=np.float32) % V]),
+              epochs=2, strategy=sg.Strategy.FULL_BATCH)
+check(r.status == sg.TrainStatus.COMPLETED, "a padded batch trains")
+
 # the library versions the bindings accept: major.minor before 1.0, then the major and a minor at least theirs
 check(sg._compatible("0.14.2", "0.14.0") and not sg._compatible("0.13.1", "0.14.0"), "versions of 0.x")
 check(sg._compatible("1.0.0", "1.0.0") and sg._compatible("1.3.0", "1.2.5") and not sg._compatible("1.1.0", "1.2.0")

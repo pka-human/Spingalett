@@ -91,6 +91,7 @@ typedef struct {
     float rope_theta;               /* attention: base of the rotary position embeddings, 0 for none */
     bool causal;                    /* attention: each cell attends to itself and the cells before it */
     bool positions;                 /* embedding: a learned vector added a cell */
+    bool ignore_padding;            /* attention: keys of padding (negative tokens) ignored */
     uint32_t tied;                  /* dense and linear layers: the embedding whose table they compute with
                                        (weight_count 0: the table is the embedding's), or 0 */
     uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them) */
@@ -245,6 +246,13 @@ typedef struct {
                                        (language models) */
     bool positions;                 /* embedding: a learned vector added to each cell (absolute position
                                        embeddings, as GPT-2's) */
+    bool ignore_padding;            /* attention: keys at padding ignored, so that sequences of different lengths
+                                       train in one batch, padded with the token -1 (which an embedding reads as
+                                       zeros and the sparse cross-entropy as no target): a key is padding when
+                                       its token is negative, its cells those of an embedding of the network's
+                                       input through layers that keep them one for one (linear layers,
+                                       normalizations, additions, products, concatenations, attention); a query
+                                       without a key to attend to gives zeros */
     uint32_t tied;                  /* dense and linear layers: the index of an earlier embedding whose table
                                        the layer takes as its weights, tied input and output embeddings (GPT-2,
                                        LLaMA): its outputs the embedding's vocabulary, its inputs a row's values;
@@ -494,7 +502,7 @@ SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkA
    .positions adds a learned vector a cell. */
 #define spingalett_embedding(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_EMBEDDING, __VA_ARGS__})
 /* Multi-head attention over the cells of a layer of queries, keys and values side by side (a linear layer
-   of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta. */
+   of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta, .ignore_padding. */
 #define spingalett_attention(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_ATTENTION, __VA_ARGS__})
 /* RMS normalization over each cell's channels. */
 #define spingalett_rms_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_RMS_NORM, __VA_ARGS__})

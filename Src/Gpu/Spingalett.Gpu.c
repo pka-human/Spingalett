@@ -1582,6 +1582,11 @@ static void attn_tiles(uint32_t head, uint32_t op, uint32_t *dmax, uint32_t *bq,
     *threads = *dmax == 32u ? 128u : *dmax == 256u ? 16u : 64u;
 }
 
+/* Whether attention layer l runs on the passes that read padding (SPG_ATTN_EXT). */
+static bool attn_ext(const LayerShape *s) {
+    return s->mask != 0;
+}
+
 /* A pass of attention layer l over n samples (attn.comp's FORWARD, PRE, DQ, DKV): x its queries, keys and
    values (PRE: its outputs), y its outputs, dy their gradient, dx the input's. */
 static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t op, uint32_t n, uint64_t x,
@@ -1590,23 +1595,29 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
     const uint32_t cells = s->height * s->width, head = s->channels / s->heads;
     uint32_t dmax, bq, threads;
     attn_tiles(head, op, &dmax, &bq, &threads);
+    /* a layer ignoring padding: its keys' tokens, the network's inputs (otherwise loads that stay in x) */
+    const bool ext = attn_ext(s) && op != SPG_ATTN_PRE;
     SpgAttnPush p = {.x = x, .y = y, .dy = dy, .dx = dx, .stats = g->bn[l].buffer ? g->bn[l].address : 0,
                      .table = g->geo[l].buffer ? g->geo[l].address : 0, .n = n, .cells = cells, .heads = s->heads,
                      .kv = s->kv_heads, .d = head,
                      .flags = (s->causal ? SPG_ATTN_CAUSAL : 0u) | (g->geo[l].buffer ? SPG_ATTN_ROPE : 0u) |
-                              (stats ? SPG_ATTN_STATS : 0u),
-                     .scale = 1.0f / sqrtf((float)head)};
+                              (stats ? SPG_ATTN_STATS : 0u) | (ext && s->mask ? SPG_ATTN_PAD : 0u),
+                     .scale = 1.0f / sqrtf((float)head),
+                     .tokens = ext && s->mask ? g->act[0].address : x,
+                     .tokens_stride = ext && s->mask ? g->net->topology[0] : 0u};
     /* networks in bfloat16 on CUDA, heads of 32, 64 or 128: flash.cu on the matrix units (BQ 0 names it), a
-       block 64 rows (32 for heads of 128) */
-    const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE &&
+       block 64 rows (32 for heads of 128). A layer with padding runs on the kernels of single precision
+       (rattn.cu's units of EXT, which read activations kept as bfloat16 too): flash.cu does not read it. */
+    const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE && !ext &&
                      (head == 32u || head == 64u || head == 128u);
     if (mma) {
         dmax = head;
         bq = head <= 64u ? 64u : 32u;
         threads = 2u * bq;
     }
-    const uint32_t spec[4] = {op, mma ? 0u : bq, dmax, threads};
+    const uint32_t spec[4] = {op | (ext ? SPG_ATTN_EXT : 0u), mma ? 0u : bq, dmax, threads};
     if (g->geo[l].buffer) reads(a, whole(&g->geo[l]));
+    if (ext && s->mask) reads(a, whole(&g->act[0]));
     const uint32_t tiles = (cells + bq - 1u) / bq;
     if (op == SPG_ATTN_PRE)
         kernel(r, a, SPG_KERNEL_attn, spec, 4, &p, sizeof p, groups((uint64_t)n * s->heads * cells, threads), 1, 1);

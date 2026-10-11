@@ -98,6 +98,8 @@ public sealed unsafe class Layer
     public Layer Positions(bool positions = true) { Args.positions = (byte)(positions ? 1 : 0); return this; }
     /// <summary>A linear layer computing with the table of the embedding of this index (tied embeddings).</summary>
     public Layer Tied(uint embedding) { Args.tied = embedding; return this; }
+    /// <summary>Attention: keys of padding (tokens of -1) left out (sequences of different lengths in one batch).</summary>
+    public Layer IgnorePadding(bool ignore = true) { Args.ignore_padding = (byte)(ignore ? 1 : 0); return this; }
     /// <summary>The layers it reads (indices that Network.Add returned); none: the last one.</summary>
     public Layer Inputs(params uint[] inputs)
     {

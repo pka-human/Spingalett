@@ -16,7 +16,9 @@
  * pass) instead of storing them: per block dP = dO V^T, dS = P (dP - rowsum(P dP)), dQ = dS K / sqrt(d),
  * and dK, dV summed over the blocks and the group's heads in their order. A task is one thread's
  * work from start to end, on a matrix product scratch of its own, so that every sum is taken in an
- * order fixed by the shape, whatever the thread count.
+ * order fixed by the shape, whatever the thread count. A layer that ignores padding marks its sample's
+ * keys first (a negative token: padding), and its softmax leaves those keys out, as it leaves out the
+ * keys after a causal query; a row without a key left gives zeros.
  */
 
 #include "Spingalett.Private.h"
@@ -99,11 +101,19 @@ typedef struct {
     uint32_t cells, heads, kv, head, half, C, out_c, group;
     float scale;
     bool causal;
+    /* ignoring padding: the keys' tokens, the network's inputs (a sample's tokens_stride values, the keys'
+       from tokens_at on), or NULL */
+    const float *tokens;
+    uint32_t tokens_stride, tokens_at;
 } AttnShape;
 
-static AttnShape attn_shape(const NeuralNetwork *net, uint32_t l) {
+/* Layer l + 1's attention; the keys' tokens of a layer that ignores padding from the workspace's inputs. */
+static AttnShape attn_shape(const NeuralNetwork *net, uint32_t l, const BatchWorkspace *ws) {
     const LayerShape *s = &net->shapes[l + 1];
     AttnShape a;
+    a.tokens = s->mask && ws ? ws->act[0] : NULL;
+    a.tokens_stride = net->topology[0];
+    a.tokens_at = 0;
     a.cells = s->height * s->width;
     a.heads = s->heads;
     a.kv = s->kv_heads;
@@ -118,11 +128,18 @@ static AttnShape attn_shape(const NeuralNetwork *net, uint32_t l) {
 }
 
 size_t spingalett_attention_scratch(const NeuralNetwork *net, uint32_t l, bool training) {
-    const AttnShape a = attn_shape(net, l);
+    const AttnShape a = attn_shape(net, l, NULL);
     const size_t B = ATTN_BLOCK, T = a.cells, d = a.head;
     /* scores (and their gradient), a block of rotated queries (and its gradient), rotated keys (and the
-       sums of the keys' and values' gradients) */
-    return training ? 2u * B * T + 2u * B * d + 3u * T * d + B + 16u : B * T + B * d + T * d + 16u;
+       sums of the keys' and values' gradients); ignoring padding, a byte a key: whether it is padding */
+    const size_t keys = net->shapes[l + 1].mask ? (T + 3u) / 4u + 4u : 0u;
+    return (training ? 2u * B * T + 2u * B * d + 3u * T * d + B + 16u : B * T + B * d + T * d + 16u) + keys;
+}
+
+/* Whether each of the sample's keys is attended to (its token is 0 or more), in `live`. */
+static void live_keys(const AttnShape *a, uint32_t smp, uint8_t *live) {
+    const float *t = a->tokens + (size_t)smp * a->tokens_stride + a->tokens_at;
+    for (uint32_t j = 0; j < a->cells; j++) live[j] = t[j] >= 0.0f;
 }
 
 /* Rows of head vectors rotated by their positions' angles (inverse: by minus them, the transpose),
@@ -160,13 +177,38 @@ static void block_softmax(float *S, size_t ld, uint32_t rows, uint32_t keys, uin
     }
 }
 
+/* block_softmax() leaving out the keys that are not live, in their order: with every key live, the same bits;
+   a row without a live key all zeros (lse 0, never read: its probabilities are 0). */
+static void block_softmax_live(float *S, size_t ld, uint32_t rows, uint32_t keys, uint32_t i0, bool causal,
+                               const uint8_t *live, float *lse) {
+    for (uint32_t r = 0; r < rows; r++) {
+        float *row = S + r * ld;
+        const uint32_t end = causal ? i0 + r + 1u : keys;
+        float m = -FLT_MAX, sum = 0.0f;
+        bool any = false;
+        for (uint32_t j = 0; j < end; j++)
+            if (live[j]) {
+                m = row[j] > m ? row[j] : m;
+                any = true;
+            }
+        for (uint32_t j = 0; j < end; j++) {
+            row[j] = live[j] ? expf(row[j] - m) : 0.0f;
+            sum += row[j];
+        }
+        const float inv = any ? 1.0f / sum : 0.0f;
+        for (uint32_t j = 0; j < end; j++) row[j] *= inv;
+        for (uint32_t j = end; j < keys; j++) row[j] = 0.0f;
+        if (lse) lse[r] = any ? m + logf(sum) : 0.0f;
+    }
+}
+
 static int attn_threads(const BatchWorkspace *ws, ComputeMode mode, uint64_t tasks) {
     return mode == COMPUTE_OPENMP && tasks > 1 ? ws->attn_threads : 1;
 }
 
 void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
                                   float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode) {
-    const AttnShape a = attn_shape(net, l);
+    const AttnShape a = attn_shape(net, l, ws);
     const size_t per_thread = spingalett_attention_scratch(net, l, ws->training);
     const uint64_t tasks = (uint64_t)n * a.kv;
     const int threads = attn_threads(ws, mode, tasks);
@@ -175,8 +217,10 @@ void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const fl
             const int tid = threads > 1 ? spingalett_thread_num() : 0;
             float *S = ws->attn + (size_t)tid * per_thread, *Qr = S + (size_t)ATTN_BLOCK * a.cells;
             float *Kr = Qr + (size_t)ATTN_BLOCK * a.head;
+            uint8_t *live = a.tokens ? (uint8_t *)(S + per_thread - ((a.cells + 3u) / 4u + 4u)) : NULL;
             SpingalettGemmScratch *gemm = ws->attn_gemm[tid];
             const uint32_t smp = (uint32_t)(task / a.kv), g = (uint32_t)(task % a.kv);
+            if (live) live_keys(&a, smp, live);
             const float *xs = x + (size_t)smp * a.cells * a.C;
             const float *K = xs + (size_t)(a.heads + g) * a.head, *V = xs + (size_t)(a.heads + a.kv + g) * a.head;
             size_t ldk = a.C;
@@ -198,8 +242,9 @@ void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const fl
                     }
                     spingalett_gemm_native(gemm, false, true, rows, keys, a.head, a.scale, Q, ldq, K, ldk, 0.0f, S,
                                            a.cells, false);
-                    block_softmax(S, a.cells, rows, keys, i0, a.causal,
-                                  lse ? lse + ((size_t)smp * a.heads + h) * a.cells + i0 : NULL);
+                    float *row_lse = lse ? lse + ((size_t)smp * a.heads + h) * a.cells + i0 : NULL;
+                    if (live) block_softmax_live(S, a.cells, rows, keys, i0, a.causal, live, row_lse);
+                    else block_softmax(S, a.cells, rows, keys, i0, a.causal, row_lse);
                     spingalett_gemm_native(gemm, false, false, rows, a.head, keys, 1.0f, S, a.cells, V, a.C, 0.0f,
                                            y + ((size_t)smp * a.cells + i0) * a.out_c + (size_t)h * a.head, a.out_c,
                                            false);
@@ -210,7 +255,7 @@ void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const fl
 
 void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
                                    uint32_t n, const float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode) {
-    const AttnShape a = attn_shape(net, l);
+    const AttnShape a = attn_shape(net, l, ws);
     const size_t per_thread = spingalett_attention_scratch(net, l, true);
     const uint64_t tasks = (uint64_t)n * a.kv;
     const int threads = attn_threads(ws, mode, tasks);
@@ -220,8 +265,10 @@ void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const f
             const size_t B = ATTN_BLOCK, T = a.cells, d = a.head;
             float *P = ws->attn + (size_t)tid * per_thread, *dP = P + B * T, *Qr = dP + B * T, *dQ = Qr + B * d;
             float *Kr = dQ + B * d, *dK = Kr + T * d, *dV = dK + T * d, *D = dV + T * d;
+            uint8_t *live = a.tokens ? (uint8_t *)(P + per_thread - ((a.cells + 3u) / 4u + 4u)) : NULL;
             SpingalettGemmScratch *gemm = ws->attn_gemm[tid];
             const uint32_t smp = (uint32_t)(task / a.kv), g = (uint32_t)(task % a.kv);
+            if (live) live_keys(&a, smp, live);
             const float *xs = x + (size_t)smp * T * a.C;
             float *dxs = dx + (size_t)smp * T * a.C;
             const float *K = xs + (size_t)(a.heads + g) * d, *V = xs + (size_t)(a.heads + a.kv + g) * d;
@@ -252,7 +299,10 @@ void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const f
                     for (uint32_t r = 0; r < rows; r++) {
                         float *row = P + r * T;
                         const uint32_t end = a.causal ? i0 + r + 1u : keys;
-                        for (uint32_t j = 0; j < end; j++) row[j] = expf(row[j] - L[r]);
+                        if (live)
+                            for (uint32_t j = 0; j < end; j++) row[j] = live[j] ? expf(row[j] - L[r]) : 0.0f;
+                        else
+                            for (uint32_t j = 0; j < end; j++) row[j] = expf(row[j] - L[r]);
                         for (uint32_t j = end; j < keys; j++) row[j] = 0.0f;
                     }
                     /* dS = P (dP - D) with dP = dO V^T and D = rowsum(dO O) = rowsum(P dP) (the outputs before

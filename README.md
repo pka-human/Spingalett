@@ -515,7 +515,7 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 |---|---|---|
 | `spingalett_embedding()` | `vocabulary`, `neurons_amount` (the width), `positions` | Each token id's vector (ids outside the vocabulary give zeros); with `positions`, a learned vector per position added (the layer's biases) |
 | `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs`, `tied` | Each position's channels times a matrix, plus biases; with `tied`, an embedding's index, that embedding's table is the matrix (tied input and output embeddings: one table, its gradient the sum of both layers') |
-| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled; outputs the heads' vectors side by side |
+| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `ignore_padding`, `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled, the keys of padding left out with `ignore_padding`; outputs the heads' vectors side by side |
 | `spingalett_rms_norm()` | `epsilon` (1e-5) | Each position's channels over their root mean square, times a gain (no biases) |
 | `spingalett_multiply_layers()` | `inputs` | The element-wise product of layers of one shape |
 | `spingalett_dataset_open_tokens()` | `context`, `token_bytes` (2 or 4), `stride`, `offset`, `shuffle` | Windows of a token file: inputs and, as targets, the tokens after them |
@@ -526,6 +526,13 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
   GPT-2's tanh form (`ACT_GELU_TANH`), SiLU as `ACT_SILU`.
 - The sparse cross-entropy takes one class index a position (`spingalett_target_size()` per sample);
   an index outside the classes leaves the position out of the loss. Label smoothing applies.
+- Sequences of different lengths train in one batch padded with the token -1 (inputs and targets): an
+  embedding reads it as zeros, the loss leaves its positions out (a sample's loss is the mean over its real
+  tokens), and attention with `.ignore_padding = true` leaves its keys out (their tokens in the network's
+  input, which the keys' cells come from through an embedding). The gradient of a padded batch is then the
+  mean of the sequences' own, each trained alone in a network of its length, up to the order of the sums,
+  on the CPU and the GPU. Causal attention over right padding never reaches it anyway; non-causal attention
+  and left padding need the option. Batch normalization takes its statistics over padded cells too.
 - Attention never stores the scores: the CPU computes a block of queries at a time, the backward
   pass recomputes the probabilities from each query's log-sum-exp. On the GPU it runs in tiles
   (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16 on

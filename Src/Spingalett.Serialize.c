@@ -102,10 +102,11 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
 /* The oldest format version that holds the network: 3 for dense layers only, 4 with convolution or
    pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs, 7 with
    transposed convolutions, upsampling or layer normalization, 8 with the layers, activations or the
-   loss of transformers, 9 with the training features of language models (layers tied to an embedding). */
+   loss of transformers, 9 with the training features of language models (layers tied to an embedding,
+   attention ignoring padding). */
 static uint16_t format_version(const NeuralNetwork *net) {
     for (uint32_t l = 1; l < net->layers; l++)
-        if (net->shapes[l].tied) return 9u;
+        if (net->shapes[l].tied || net->shapes[l].mask) return 9u;
     if (net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) return 8u;
     for (uint32_t l = 1; l < net->layers; l++)
         if (net->shapes[l].type > LAYER_LAYER_NORM || net->act_func[l - 1] >= ACT_GELU) return 8u;
@@ -284,9 +285,12 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             memcpy(&bits, &shape->momentum, 4);
             slett_put32(e + 72, bits);
         }
-        if (version >= 7u)                      /* the upsampling mode; attention's causal mask, embeddings' positions */
+        /* the upsampling mode; attention's flags (causal; version 9: ignoring padding, the embedding of the tokens in
+           bits 16 to 31), embeddings' positions */
+        if (version >= 7u)
             slett_put32(e + 76, shape->type == LAYER_UPSAMPLE ? shape->mode
-                                : shape->type == LAYER_ATTENTION ? (shape->causal ? 1u : 0u)
+                                : shape->type == LAYER_ATTENTION ? (shape->causal ? 1u : 0u) |
+                                                                   (shape->mask ? 2u | shape->mask << 16 : 0u)
                                 : shape->type == LAYER_EMBEDDING ? (shape->positions ? 1u : 0u) : 0u);
         if (version >= 8u && shape->type == LAYER_ATTENTION) {
             slett_put32(e + 104, shape->kv_heads);
@@ -615,7 +619,9 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
             a.stride_h = e.stride_h; a.stride_w = e.stride_w;
             a.padding_h = e.pad_h; a.padding_w = e.pad_w;
         }
-        ok = spingalett_add_layer(a) && net->topology[l + 1] == e.outputs;
+        a.ignore_padding = e.mask != 0;
+        /* (the network's own trace of the padding's tokens: the file's) */
+        ok = spingalett_add_layer(a) && net->topology[l + 1] == e.outputs && net->shapes[l + 1].mask == e.mask;
     }
     if (!ok) {
         free_network(net);

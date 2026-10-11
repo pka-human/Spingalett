@@ -7,14 +7,18 @@
    precision, reading and writing activations kept as bfloat16 through ld()/st(). A unit per head size at
    most (DMAX 32, 64, 128, 256 with tiles of 32, 16, 8, 4 rows, THREADS 128, 64, 64, 16; Kernels.def builds
    DMAX 256, the smaller heads run on rattn.cu): the rows' threads, keys and columns as constants, so that
-   the arrays of a thread's sums stay in registers.
-   Spec: OP, BQ, DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3). */
+   the arrays of a thread's sums stay in registers. EXT (a unit of its own, attn_d256x) compiles in the passes of a
+   layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query without a key giving zeros).
+   Spec: OP (| SPG_ATTN_EXT), BQ, DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3). */
 
 #include "common.cuh"
 
 #if !defined(SPG_ENTRY)
 #define SPG_ENTRY spg_attn_d64
 #define DMAX 64u
+#endif
+#if !defined(EXT)
+#define EXT 0
 #endif
 #if DMAX <= 32
 #define BQ 32u
@@ -40,6 +44,7 @@
 #define FLAG_CAUSAL 1u
 #define FLAG_ROPE   2u
 #define FLAG_STATS  4u
+#define FLAG_PAD    8u
 
 struct Shared {
     float a[BQ * DMAX], b[BQ * DMAX], k[BQ * DMAX], v[BQ * DMAX];
@@ -53,6 +58,11 @@ DEVICE float rotated(const SpgAttnPush &p, uint32_t half, uint32_t at, uint32_t 
     const uint32_t hd = p.d / 2u, i = c < hd ? c : c - hd;
     const float cs = F(p.table)[pos * hd + i], sn = F(p.table)[p.cells * hd + pos * hd + i];
     return c < hd ? v * cs - ld(p.x, at + c + hd, 0u, half) * sn : v * cs + ld(p.x, at + c - hd, 0u, half) * sn;
+}
+
+/* whether key j of sample s is attended to: not padding (EXT with FLAG_PAD: its token is 0 or more) */
+DEVICE bool live(const SpgAttnPush &p, uint32_t s, uint32_t j) {
+    return !EXT || !(p.flags & FLAG_PAD) || F(p.tokens)[s * p.tokens_stride + p.tokens_at + j] >= 0.0f;
 }
 
 /* the maximum (or the sum) of v over a row's threads, in their order */
@@ -76,7 +86,7 @@ DEVICE float unrotated(const SpgAttnPush &p, const float *t, uint32_t pos, uint3
 }
 
 extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPush p, const Spec spec) {
-    const uint32_t OP = spec.v[0], HALF = spec.v[4];
+    const uint32_t OP = EXT ? spec.v[0] & 3u : spec.v[0], HALF = spec.v[4];    /* (EXT's units: OP | SPG_ATTN_EXT) */
     __shared__ Shared sh;
     const uint32_t tid = thread_x(), r = tid / TPR, q = tid % TPR, d = p.d;
     const uint32_t C = (p.heads + 2u * p.kv) * d, out_c = p.heads * d, group = p.heads / p.kv;
@@ -125,7 +135,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
                     dot = fma_(sh.a[r * DMAX + c], sh.k[jj * DMAX + c], dot);
                     if (OP == DQ) dot2 = fma_(sh.b[r * DMAX + c], sh.v[jj * DMAX + c], dot2);
                 }
-                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
+                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i) && live(p, s, j);
                 sc[k] = valid ? dot : NEG;
                 dp[k] = dot2;
                 top = max_(top, sc[k]);
@@ -164,14 +174,16 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
             }
         }
         if (OP == FORWARD) {
-            const float inv = 1.0f / l;
+            /* (EXT: a query without a key left gives zeros, its log sum 0, never read) */
+            const bool none = EXT && l == 0.0f;
+            const float inv = none ? 0.0f : 1.0f / l;
             if (i < p.cells) {
 #pragma unroll
                 for (uint32_t k = 0; k < CPT; k++) {
                     const uint32_t c = q + TPR * k;
                     if (c < d) st(p.y, (s * p.cells + i) * out_c + h * d + c, 1u, HALF, acc[k] * inv);
                 }
-                if ((p.flags & FLAG_STATS) && q == 0u) F(p.stats)[stat] = m + log_(l);
+                if ((p.flags & FLAG_STATS) && q == 0u) F(p.stats)[stat] = none ? 0.0f : m + log_(l);
             }
             return;
         }
@@ -189,6 +201,9 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
     }
     /* DKV */
     const uint32_t g = block_y(), j0 = block_x() * BQ, j = j0 + r;
+#if EXT
+    const bool key = j < p.cells && live(p, s, j);     /* (padding: a key left out gets no gradient) */
+#endif
     for (uint32_t e = tid; e < BQ * d; e += THREADS) {
         const uint32_t jj = e / d, c = e % d, jk = j0 + jj, at = (s * p.cells + jk) * C;
         sh.k[jj * DMAX + c] = jk < p.cells ? rotated(p, HALF, at + (p.heads + g) * d, jk, c) : 0.0f;
@@ -219,7 +234,11 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
                     dot = fma_(sh.a[rr * DMAX + c], sh.k[r * DMAX + c], dot);
                     dot2 = fma_(sh.b[rr * DMAX + c], sh.v[r * DMAX + c], dot2);
                 }
+#if EXT
+                const bool valid = ii < p.cells && key && (!causal || j <= ii);
+#else
                 const bool valid = ii < p.cells && j < p.cells && (!causal || j <= ii);
+#endif
                 const float pk = valid ? exp_(dot - sh.l[rr]) : 0.0f;
                 sh.p[rr * BQ + r] = pk;
                 sh.s[rr * BQ + r] = pk * (dot2 - sh.d[rr]);

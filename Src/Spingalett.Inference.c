@@ -1330,7 +1330,11 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         uint32_t f = slett_get32(e + 108);
         memcpy(&layer->theta, &f, 4);
         layer->causal = (layer->mode & 1u) != 0;
-        layer->mode = 0;
+        /* version 9: bit 1 ignores padding, the embedding whose tokens tell it in bits 16 to 31 (bits left over,
+           or bit 1 without an embedding, stay in the mode, which shape_ok() refuses) */
+        const uint32_t padding = version >= 9u && (layer->mode & 2u) && (layer->mode >> 16) ? 0xFFFF0002u : 0u;
+        layer->mask = padding ? layer->mode >> 16 : 0u;
+        layer->mode = version >= 9u ? layer->mode & ~(1u | padding) : 0u;
     }
     if (version >= 8u && layer->type == LAYER_EMBEDDING) {
         layer->positions = (layer->mode & 1u) != 0;
@@ -1567,6 +1571,16 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
                                              L.pad_h == 0 && L.pad_w == 0 && L.groups == 1));
             if (!tie) return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
         }
+        if (L.mask) {
+            /* version 9: an attention ignoring padding reads the tokens of an embedding of the network's input before
+               it, a token a key */
+            SlettLayer E;
+            bool mask = L.mask <= i;
+            if (mask) spingalett_slett_layer(p, L.mask - 1u, &E);
+            mask = mask && E.type == LAYER_EMBEDDING && E.input0 == 0 &&
+                   (uint64_t)E.out_h * E.out_w == (uint64_t)L.in_h * L.in_w && E.out_h * E.out_w <= E.inputs;
+            if (!mask) return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
+        }
         bool norm = L.type == LAYER_BATCH_NORM, layer_norm = L.type == LAYER_LAYER_NORM || L.type == LAYER_RMS_NORM;
         bool embedding = L.type == LAYER_EMBEDDING;
         bool weighted = L.type == LAYER_DENSE || L.type == LAYER_CONV2D || L.type == LAYER_CONV_TRANSPOSE2D || norm ||
@@ -1671,6 +1685,7 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
     info->rope_theta = L.theta;
     info->causal = L.causal;
     info->positions = L.positions;
+    info->ignore_padding = L.mask != 0;
     info->tied = L.tied;
     info->input_count = L.input_count;
     for (uint32_t k = 0; k < L.input_count; k++)
@@ -2247,8 +2262,10 @@ static void rope_rotate(const float *src, float *dst, uint32_t half, const float
     }
 }
 
-void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads, uint32_t kv, uint32_t head,
-                                 bool causal, const float *table, float *y, float *scratch) {
+void spingalett_engine_attention(const SlettAttention *a, const float *x, const float *table, float *y, float *scratch) {
+    const uint32_t cells = a->cells, heads = a->heads, kv = a->kv, head = a->head;
+    const bool causal = a->causal;
+    const float *tokens = a->tokens;
     const uint32_t C = (heads + 2u * kv) * head, out_c = heads * head, group = heads / kv, half = head / 2u;
     const float scale = 1.0f / sqrtf((float)head);
     float *keys = scratch, *q = table ? scratch + (size_t)cells * kv * head : NULL;     /* (scratch: with a table) */
@@ -2270,6 +2287,7 @@ void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads,
             for (uint32_t d = 0; d < head; d++) o[d] = 0.0f;
             const uint32_t end = causal ? i + 1u : cells;
             for (uint32_t j = 0; j < end; j++) {
+                if (tokens && !(tokens[j] >= 0.0f)) continue;      /* a key of padding */
                 const float *k = table ? keys + ((size_t)j * kv + g) * head : x + (size_t)j * C + (size_t)(heads + g) * head;
                 const float *v = x + (size_t)j * C + (size_t)(heads + kv + g) * head;
                 float score = 0.0f;
@@ -2285,10 +2303,20 @@ void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads,
                 sum += w;
                 for (uint32_t d = 0; d < head; d++) o[d] += w * v[d];
             }
-            const float inv = 1.0f / sum;
+            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;          /* (no key: zeros) */
             for (uint32_t d = 0; d < head; d++) o[d] *= inv;
         }
     }
+}
+
+void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, const float *input, SlettAttention *a) {
+    (void)image;
+    a->cells = L->out_h * L->out_w;
+    a->heads = L->heads;
+    a->kv = L->kv_heads;
+    a->head = L->out_c / L->heads;
+    a->causal = L->causal;
+    a->tokens = L->mask ? input : NULL;
 }
 
 /* Row `row` of layer L's weights as floats (an embedding's table: one token's vector). */
@@ -2338,9 +2366,9 @@ void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, cons
     }
 }
 
-/* One layer on one sample: x [inputs] -> y [outputs], activation included. */
-static void layer_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
-                          void *window) {
+/* One layer on one sample: x [inputs] -> y [outputs], activation included (input: the network's inputs). */
+static void layer_forward(const uint8_t *image, const SlettLayer *L, const float *input, const float *x, float *y,
+                          int8_t *xq, void *window) {
     switch (L->type) {
         case LAYER_CONV2D:
             conv_forward(image, L, x, y, xq, window);
@@ -2370,13 +2398,14 @@ static void layer_forward(const uint8_t *image, const SlettLayer *L, const float
             spingalett_engine_embedding(image, L, x, y);
             break;
         case LAYER_ATTENTION: {
-            const uint32_t cells = L->out_h * L->out_w, head = L->out_c / L->heads;
+            SlettAttention a;
+            spingalett_engine_attention_of(image, L, input, &a);
             float *table = NULL, *scratch = (float *)window;
             if (L->theta > 0.0f) {          /* the table after the rotated keys and the query */
-                table = scratch + (size_t)cells * L->kv_heads * head + head;
-                spingalett_engine_rope_table(cells, head, L->theta, table);
+                table = scratch + (size_t)a.cells * a.kv * a.head + a.head;
+                spingalett_engine_rope_table(a.cells, a.head, L->theta, table);
             }
-            spingalett_engine_attention(x, cells, L->heads, L->kv_heads, head, L->causal, table, y, scratch);
+            spingalett_engine_attention(&a, x, table, y, scratch);
             break;
         }
         default: {
@@ -2419,7 +2448,7 @@ int spingalett_model_run(const SpingalettModel *model, const float *input, float
             SlettLayer L;
             spingalett_slett_layer(image, i, &L);
             float *y = i + 1 == model->layer_count ? output : buffers[i & 1u];
-            layer_forward(image, &L, x, y, xq, window);
+            layer_forward(image, &L, input, x, y, xq, window);
             x = y;
         }
     } else {
@@ -2441,7 +2470,7 @@ int spingalett_model_run(const SpingalettModel *model, const float *input, float
             else if (L.type == LAYER_CONCAT) spingalett_engine_concat(x, channels, L.input_count, y, L.out_h * L.out_w);
             else if (L.type == LAYER_GLOBAL_AVG_POOL) spingalett_engine_global_pool(x[0], y, L.in_h * L.in_w, L.in_c);
             else {
-                layer_forward(image, &L, x[0], y, xq, window);
+                layer_forward(image, &L, input, x[0], y, xq, window);
                 continue;
             }
             spingalett_engine_activate(y, L.outputs, L.activation);

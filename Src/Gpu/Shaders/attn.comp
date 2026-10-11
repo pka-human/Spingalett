@@ -16,7 +16,10 @@
  *             sqrt(d)) and values (P^T dO) summed over the group's query heads and the tiles of queries
  *
  * x holds a cell's queries, keys and values side by side ((heads + 2 kv) d floats), y and dy the heads'
- * outputs (heads d floats a cell). With ROPE, queries and keys are rotated by their cell's position first
+ * outputs (heads d floats a cell). OP | EXT (4) runs a pass of a layer with padding (FLAG_PAD: a key whose token,
+ * tokens[s stride + at + j], is negative is left out of its sample's softmax, and a query without a key left
+ * gives zeros); without it that code is not compiled in. With ROPE, queries and keys are rotated by their
+ * cell's position first
  * (table: cells x d/2 cosines, then as many sines), their gradients rotated back. Each thread of a row's
  * TPR = THREADS / BQ threads takes the keys (and the columns) q, q + TPR, ...; what a row sums over keys
  * is combined across its threads in their order: every sum in a fixed order, the same bits on every run.
@@ -30,7 +33,7 @@
 #endif
 #include "common.glsl"
 
-layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 0) const uint OP = 0;         /* the pass, | EXT */
 /* (the defaults are the tiles of the most shared memory: some drivers size it before specialization) */
 layout(constant_id = 1) const uint BQ = 32;         /* rows of a tile of queries or keys */
 layout(constant_id = 2) const uint DMAX = 32;       /* the head size, at most (a multiple of THREADS / BQ) */
@@ -46,11 +49,18 @@ layout(local_size_x_id = 3) in;
 #define FLAG_CAUSAL 1u
 #define FLAG_ROPE   2u
 #define FLAG_STATS  4u
+#define FLAG_PAD    8u
+
+const uint PASS = OP & 3u;
+const bool EXT = (OP & 4u) != 0u;
 
 layout(push_constant) uniform Push {
     F32 x, y, dy, dx, stats, table;
     uint n, cells, heads, kv, d, flags;
     float scale;
+    uint pad_;
+    F32 tokens;
+    uint tokens_stride, tokens_at;
 } p;
 
 #include "half.glsl"
@@ -70,6 +80,11 @@ float rotated(uint at, uint pos, uint c) {
     return c < half_ ? v * cs - ld(p.x, at + c + half_, 0u) * sn : v * cs + ld(p.x, at + c - half_, 0u) * sn;
 }
 
+/* Whether key j of sample s is attended to: not padding (EXT with FLAG_PAD: its token is 0 or more). */
+bool live(uint s, uint j) {
+    return !EXT || (p.flags & FLAG_PAD) == 0u || p.tokens.v[s * p.tokens_stride + p.tokens_at + j] >= 0.0;
+}
+
 /* the maximum (or the sum) of v over a row's threads, in their order */
 float row_combine(uint tid, uint r, float v, bool maximum) {
     red[tid] = v;
@@ -85,7 +100,7 @@ void main() {
     const uint C = (p.heads + 2u * p.kv) * d, out_c = p.heads * d, group = p.heads / p.kv;
     const bool causal = (p.flags & FLAG_CAUSAL) != 0u;
     const float NEG = -3.402823466e38;
-    if (OP == PRE) {
+    if (PASS == PRE) {
         const uint rows = p.n * p.heads * p.cells;
         for (uint e = gl_GlobalInvocationID.x; e < rows; e += gl_NumWorkGroups.x * THREADS) {
             const uint i = e % p.cells, h = (e / p.cells) % p.heads, s = e / (p.cells * p.heads);
@@ -97,17 +112,17 @@ void main() {
         return;
     }
     const uint s = gl_WorkGroupID.z, rows = p.n * p.heads * p.cells;
-    if (OP == FORWARD || OP == DQ) {
+    if (PASS == FORWARD || PASS == DQ) {
         const uint h = gl_WorkGroupID.y, g = h / group, i0 = gl_WorkGroupID.x * BQ, i = i0 + r;
         /* the queries (times the scale) in sA, with DQ the outputs' gradient in sB and their sums */
         for (uint e = tid; e < BQ * d; e += THREADS) {
             const uint rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * C + h * d;
             sA[rr * DMAX + c] = ii < p.cells ? rotated(at, ii, c) * p.scale : 0.0;
-            if (OP == DQ) sB[rr * DMAX + c] = ii < p.cells ? ld(p.dy, (s * p.cells + ii) * out_c + h * d + c, 2u) : 0.0;
+            if (PASS == DQ) sB[rr * DMAX + c] = ii < p.cells ? ld(p.dy, (s * p.cells + ii) * out_c + h * d + c, 2u) : 0.0;
         }
         const uint stat = (s * p.heads + h) * p.cells + i;
-        const float lse = OP == DQ && i < p.cells ? p.stats.v[stat] : 0.0;
-        const float delta = OP == DQ && i < p.cells ? p.stats.v[rows + stat] : 0.0;
+        const float lse = PASS == DQ && i < p.cells ? p.stats.v[stat] : 0.0;
+        const float delta = PASS == DQ && i < p.cells ? p.stats.v[rows + stat] : 0.0;
         float m = NEG, l = 0.0, acc[CPT];
         for (uint k = 0u; k < CPT; k++) acc[k] = 0.0;
         const uint keys = causal ? min(p.cells, i0 + BQ) : p.cells;
@@ -126,14 +141,14 @@ void main() {
                 float dot = 0.0, dot2 = 0.0;
                 for (uint c = 0u; c < d; c++) {
                     dot = fma(sA[r * DMAX + c], sK[jj * DMAX + c], dot);
-                    if (OP == DQ) dot2 = fma(sB[r * DMAX + c], sV[jj * DMAX + c], dot2);
+                    if (PASS == DQ) dot2 = fma(sB[r * DMAX + c], sV[jj * DMAX + c], dot2);
                 }
-                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
+                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i) && live(s, j);
                 sc[k] = valid ? dot : NEG;
                 dp[k] = dot2;
                 top = max(top, sc[k]);
             }
-            if (OP == FORWARD) {
+            if (PASS == FORWARD) {
                 const float mt = row_combine(tid, r, top, true), mnew = max(m, mt);
                 const float alpha = mnew == NEG ? 1.0 : exp(m - mnew);
                 float sum = 0.0;
@@ -161,14 +176,16 @@ void main() {
                 }
             }
         }
-        if (OP == FORWARD) {
-            const float inv = 1.0 / l;
+        if (PASS == FORWARD) {
+            /* (EXT: a query without a key left gives zeros, its log sum 0, never read) */
+            const bool none = EXT && l == 0.0;
+            const float inv = none ? 0.0 : 1.0 / l;
             if (i < p.cells) {
                 for (uint k = 0u; k < CPT; k++) {
                     const uint c = q + TPR * k;
                     if (c < d) st(p.y, (s * p.cells + i) * out_c + h * d + c, 1u, acc[k] * inv);
                 }
-                if ((p.flags & FLAG_STATS) != 0u && q == 0u) p.stats.v[stat] = m + log(l);
+                if ((p.flags & FLAG_STATS) != 0u && q == 0u) p.stats.v[stat] = none ? 0.0 : m + log(l);
             }
             return;
         }
@@ -192,6 +209,7 @@ void main() {
     }
     /* DKV: a tile of keys and values of head g; this thread's key r, its columns q, q + TPR, ... */
     const uint g = gl_WorkGroupID.y, j0 = gl_WorkGroupID.x * BQ, j = j0 + r;
+    const bool key = !EXT || (j < p.cells && live(s, j));     /* (padding: a key left out gets no gradient) */
     for (uint e = tid; e < BQ * d; e += THREADS) {
         const uint jj = e / d, c = e % d, jk = j0 + jj, at = (s * p.cells + jk) * C;
         sK[jj * DMAX + c] = jk < p.cells ? rotated(at + (p.heads + g) * d, jk, c) : 0.0;
@@ -221,7 +239,7 @@ void main() {
                     dot = fma(sA[rr * DMAX + c], sK[r * DMAX + c], dot);
                     dot2 = fma(sB[rr * DMAX + c], sV[r * DMAX + c], dot2);
                 }
-                const bool valid = ii < p.cells && j < p.cells && (!causal || j <= ii);
+                const bool valid = ii < p.cells && j < p.cells && key && (!causal || j <= ii);
                 const float pk = valid ? exp(dot - sL[rr]) : 0.0;
                 sP[rr * BQ + r] = pk;
                 sS[rr * BQ + r] = pk * (dot2 - sD[rr]);

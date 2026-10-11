@@ -30,6 +30,8 @@ typedef struct {
     bool positions;                 /* embedding: a learned vector a cell, its biases */
     uint32_t tied;                  /* dense and pointwise convolution: the embedding layer whose table are its
                                        weights (its weight_offsets that table's), or 0 */
+    uint32_t mask;                  /* attention ignoring padding: the embedding of the network's input whose cells
+                                       its keys' are (a negative token: a padded key), or 0 */
 } LayerShape;
 
 /*

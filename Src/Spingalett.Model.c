@@ -643,10 +643,12 @@ static void predict_combine(const SlettLayer *L, const float *const *x, const ui
     (void)mode;
 }
 
-/* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included. A dense
-   layer's interleaved rows are read only in calls with dense_tiles (others may be building them). */
+/* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included (input: the network's inputs,
+   n rows of input_size, whose tokens attention ignoring padding reads). A dense layer's interleaved rows are read
+   only in calls with dense_tiles (others may be building them). */
 static void predict_layer(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, bool dense_tiles,
-                          const float *x, float *y, uint32_t n, PredictWorkspace *w, ComputeMode mode) {
+                          const float *input, uint32_t input_size, const float *x, float *y, uint32_t n,
+                          PredictWorkspace *w, ComputeMode mode) {
     uint32_t in = L->inputs, out = L->outputs;
     const float *dequant = prep->dequant;
     const float *bias = (const float *)(const void *)(image + L->biases);
@@ -667,15 +669,16 @@ static void predict_layer(const uint8_t *image, const SlettLayer *L, const Prepa
                 } else if (L->type == LAYER_EMBEDDING) {
                     spingalett_engine_embedding(image, L, xs, ys);
                 } else if (L->type == LAYER_ATTENTION) {
-                    const uint32_t cells = L->out_h * L->out_w, head = L->out_c / L->heads;
+                    SlettAttention a;
+                    spingalett_engine_attention_of(image, L, input + (size_t)s * input_size, &a);
                     /* (no scratch without rotary embeddings: the window may not exist) */
                     float *scratch = NULL, *table = NULL;
                     if (L->theta > 0.0f) {
                         scratch = (float *)(void *)(w->window + (size_t)spingalett_thread_num() * w->window_stride);
-                        table = scratch + (size_t)cells * L->kv_heads * head + head;
-                        spingalett_engine_rope_table(cells, head, L->theta, table);
+                        table = scratch + (size_t)a.cells * a.kv * a.head + a.head;
+                        spingalett_engine_rope_table(a.cells, a.head, L->theta, table);
                     }
-                    spingalett_engine_attention(xs, cells, L->heads, L->kv_heads, head, L->causal, table, ys, scratch);
+                    spingalett_engine_attention(&a, xs, table, ys, scratch);
                 } else {
                     spingalett_engine_layer_norm(xs, L->out_h * L->out_w, L->out_c, gamma, bias, L->eps, ys, NULL);
                 }
@@ -882,7 +885,8 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
             spingalett_slett_layer(image, i, &L);
             if (!graph) {
                 float *y = i + 1 == model->layer_count ? out : w->act[i & 1u];
-                predict_layer(image, &L, &layers[i], dense_tiles, x, y, n, w, mode);
+                predict_layer(image, &L, &layers[i], dense_tiles, inputs + (size_t)start * model->input_size,
+                              model->input_size, x, y, n, w, mode);
                 x = y;
                 continue;
             }
@@ -900,7 +904,7 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
                 L.type == LAYER_MULTIPLY)
                 predict_combine(&L, xs, units, channels, y, n, mode);
             else
-                predict_layer(image, &L, &layers[i], dense_tiles, xs[0], y, n, w, mode);
+                predict_layer(image, &L, &layers[i], dense_tiles, x, model->input_size, xs[0], y, n, w, mode);
         }
     }
     if (owner && w->bytes <= SPARE_WORKSPACE_MAX) w = atomic_exchange(&owner->spare, w);
