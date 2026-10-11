@@ -30,12 +30,16 @@
 #include <omp.h>
 #endif
 
-/* Multiply-adds a thread takes at least when few rows of a linear layer split its columns (float, and
-   integer, whose multiply-adds cost less), and of attention: below them threads cost more than they save
-   (a token's product of 256 x 768 takes three threads, of 768 x 2304 every core). */
-#define ROWS_THREAD_WORK ((uint64_t)1 << 16)
-#define INT_ROWS_THREAD_WORK ((uint64_t)1 << 18)
-#define ATTENTION_THREAD_WORK ((uint64_t)1 << 14)
+/* Multiply-adds from which few rows of a linear layer split its columns between the threads (float, and
+   integer, whose multiply-adds cost less). */
+#define ROWS_PARALLEL_WORK ((uint64_t)1 << 17)
+#define INT_ROWS_PARALLEL_WORK ((uint64_t)1 << 19)
+
+/* A pass takes a thread for this many multiply-adds of its linear layers, all of them at most, and its
+   parallel loops run on that team alone: a token's pass is short, and more threads than its work keeps
+   busy, or teams of changing sizes (OpenMP wakes the threads a smaller team left asleep), cost more than
+   they save (a token of the CharGPT model took three times as long on 16 threads as on one). */
+#define PASS_THREAD_WORK ((uint64_t)1 << 19)
 
 /* Integer linear layers run on few rows (a token of each sequence) with their columns split between
    threads, up to this many rows; more go through batched prediction's pass, a tile of rows a thread. */
@@ -54,6 +58,8 @@ struct SpingalettSession {
     uint32_t max_length, sequences, vocabulary;
     uint32_t *length;               /* [sequences] tokens each holds */
     uint32_t layers;                /* the model's weight layers */
+    uint64_t token_work;            /* multiply-adds of a token's row through the linear layers */
+    int team;                       /* threads of the current pass */
     Cache *caches;                  /* [layers]: those of its attention layers */
     PreparedLayer *prepared;        /* the model's (prepared under its lock), or the session's own */
     /* a pass: up to capacity rows, m times the cells (the workspace's chunk) */
@@ -225,6 +231,7 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
     for (uint32_t i = 0; ok && i < s->layers; i++) {
         SlettLayer L;
         spingalett_slett_layer(image, i, &L);
+        if (L.type == LAYER_CONV2D) s->token_work += (uint64_t)L.rows * L.row_len;
         if (L.type != LAYER_ATTENTION) continue;
         Cache *c = &s->caches[i];
         c->heads = L.heads, c->kv = L.kv_heads, c->head = L.out_c / L.heads;
@@ -319,12 +326,6 @@ static void activate_rows(float *y, uint32_t rows, uint32_t C, const uint32_t *p
     }
 }
 
-/* Threads for `work` multiply-adds of which a thread takes at least `least`: one when that is all of them. */
-static int threads_for(const PredictWorkspace *w, ComputeMode mode, uint64_t work, uint64_t least) {
-    if (mode != COMPUTE_OPENMP) return 1;
-    const uint64_t n = work / least;
-    return n < 1 ? 1 : n > (uint64_t)w->threads ? w->threads : (int)n;
-}
 
 /* An integer linear layer on few rows, its filters split between threads in blocks: each row quantized
    alone, as batched prediction quantizes each cell, then a block's integer sums against the interleaved
@@ -344,9 +345,8 @@ static void session_int_linear(SpingalettSession *s, const SlettLayer *L, const 
         w->xs[r] = spingalett_quantize_activations(x + (size_t)r * C, C, w->xq + (size_t)r * C);
         s->row_sums[r] = tiles ? 0 : spingalett_engine_permute(w->xq + (size_t)r * C, C, L->precision);
     }
-    const int threads = threads_for(w, mode, (uint64_t)rows * OC * C, INT_ROWS_THREAD_WORK);
-    (void)threads;
-    SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1,
+    (void)mode;
+    SPINGALETT_PARALLEL_FOR_THREADS(s->team, s->team > 1 && (uint64_t)rows * OC * C >= INT_ROWS_PARALLEL_WORK,
         for (int64_t it = 0; it < (int64_t)((OC + block - 1) / block); it++) {
             const uint32_t j0 = (uint32_t)it * block, n = OC - j0 < block ? OC - j0 : block;
             if (!tiles) {
@@ -392,10 +392,7 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
     const float scale = 1.0f / sqrtf((float)head);
     uint64_t work = 0;
     for (uint32_t r = 0; r < rows; r++) work += (uint64_t)(s->row_position[r] + 1u) * head * heads * 2u;
-    int threads = threads_for(s->w, mode, work, ATTENTION_THREAD_WORK);
-    if ((uint64_t)threads > (uint64_t)rows * heads) threads = (int)(rows * heads);
-    (void)threads;
-    SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1,
+    SPINGALETT_PARALLEL_FOR_THREADS(s->team, s->team > 1 && spingalett_use_omp(mode, work),
         for (int64_t it = 0; it < (int64_t)rows * heads; it++) {
             const uint32_t r = (uint32_t)(it / heads), h = (uint32_t)(it % heads), g = h / group;
             const uint32_t p = s->row_position[r];
@@ -426,9 +423,8 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
         /* a float linear layer: its bias and activation in the epilogue, row by row as batched prediction's */
         SpingalettBiasActivation epilogue = {(const float *)(const void *)(image + L->biases), L->activation, NULL};
         SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
-        const int threads = threads_for(w, mode, (uint64_t)rows * L->rows * L->row_len, ROWS_THREAD_WORK);
-        spingalett_conv_rows(x[0], L->in_c, rows, prep->panels, L->row_len, L->rows, y, L->out_c, &hooks, threads > 1,
-                             threads);
+        spingalett_conv_rows(x[0], L->in_c, rows, prep->panels, L->row_len, L->rows, y, L->out_c, &hooks,
+                             s->team > 1 && (uint64_t)rows * L->rows * L->row_len >= ROWS_PARALLEL_WORK, s->team);
         return;
     } else if (L->type == LAYER_CONV2D && rows <= INT_ROWS) {
         session_int_linear(s, L, prep, x[0], y, rows, mode);
@@ -465,6 +461,8 @@ static bool session_pass(SpingalettSession *s, uint32_t rows, ComputeMode mode) 
     const SpingalettModel *model = s->model;
     const uint8_t *image = (const uint8_t *)model->image;
     float *arena = s->w->act[0];
+    const uint64_t team = mode == COMPUTE_OPENMP ? rows * s->token_work / PASS_THREAD_WORK : 1u;
+    s->team = team < 1 ? 1 : team > (uint64_t)s->w->threads ? s->w->threads : (int)team;
     uint32_t picked = 0;
     for (uint32_t r = 0; r < rows; r++)
         if (s->row_logits[r]) s->picked_position[picked] = s->row_position[r], s->picked[picked++] = r;
