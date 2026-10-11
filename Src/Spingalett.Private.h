@@ -370,6 +370,8 @@ void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t
                               const DropoutContext *ctx, uint32_t layer, uint32_t position);
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
+/* +1: messages below warnings quiet on this thread until the matching -1 */
+void spingalett_log_quiet(int delta);
 
 /* ------------------------------------------------------------------------- importers (Import.c) */
 

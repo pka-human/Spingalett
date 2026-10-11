@@ -5872,6 +5872,104 @@ static void gpu_transformer(int which) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* A GPT-like (learned positions, layer normalization, GELU) or LLaMA-like (rotary, grouped queries, RMS
+   normalization, SwiGLU) language model of two blocks, for sessions. */
+static NeuralNetwork *session_lm(bool llama, uint32_t T, uint32_t V) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = T);
+    uint32_t x = embedding(.net = net, .vocabulary = V, .neurons_amount = 64, .positions = !llama,
+                           .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    for (int b = 0; b < 2; b++) {
+        if (llama) rms_norm(.net = net);
+        else layer_norm(.net = net);
+        linear(.net = net, .neurons_amount = llama ? 64 + 2 * 32 : 3 * 64, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        attention(.net = net, .heads = 4, .kv_heads = llama ? 2 : 4, .causal = true, .rope_theta = llama ? 10000.0f : 0.0f);
+        uint32_t a = linear(.net = net, .neurons_amount = 64, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        x = add_layers(.net = net, .inputs = {x, a});
+        const uint32_t n = llama ? rms_norm(.net = net) : layer_norm(.net = net);
+        if (llama) {
+            const uint32_t gate = linear(.net = net, .neurons_amount = 128, .act_func = ACT_SILU, .inputs = {n},
+                                         .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+            const uint32_t up = linear(.net = net, .neurons_amount = 128, .inputs = {n},
+                                       .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+            multiply_layers(.net = net, .inputs = {gate, up});
+        } else {
+            linear(.net = net, .neurons_amount = 256, .act_func = ACT_GELU, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        }
+        a = linear(.net = net, .neurons_amount = 64, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        x = add_layers(.net = net, .inputs = {x, a});
+    }
+    if (llama) rms_norm(.net = net);
+    else layer_norm(.net = net);
+    linear(.net = net, .neurons_amount = V, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    return net;
+}
+
+/* Sessions on the GPU (a decoder: attn_cache.comp over each sequence's keys and values): the logits of the CPU's
+   session to rounding (single precision) or within bfloat16's error, a prompt fed at once the bits of a token at a
+   time, a sequence copied and rewound; and greedy generation on the GPU the CPU's tokens. */
+static void gpu_session(bool llama) {
+    const uint32_t T = 48, V = 40, P = 40;
+    NeuralNetwork *net = session_lm(llama, T, V);
+    lcg_state = 91u + llama;
+    for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
+    SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+    uint32_t tok[40];
+    for (uint32_t i = 0; i < P; i++) tok[i] = (i * 7 + 3) % V;
+    float *cpu = (float *)malloc((size_t)P * V * sizeof(float)), *one = (float *)malloc((size_t)P * V * sizeof(float));
+    float *all = (float *)malloc((size_t)P * V * sizeof(float));
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 3});
+    bool ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = cpu, .all = true}, 1);
+    spingalett_session_free(s);
+    double worst[2] = {0, 0};
+    bool same[2] = {false, false};
+    for (int bf16 = 0; bf16 < 2 && ok; bf16++) {
+        spingalett_set_compute_mode(gpu_mode);
+        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
+        s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 3});
+        ok = s != NULL;
+        ok = ok && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = all, .all = true}, 1);
+        for (uint32_t i = 0; ok && i < P; i++)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 1, .tokens = tok + i, .count = 1,
+                                                                     .logits = one + (size_t)i * V}, 1);
+        /* sequence 2: sequence 0 copied, rewound to its first half, then fed the rest */
+        ok = ok && spingalett_session_copy(s, 0, 2) && spingalett_session_rewind(s, 2, P / 2);
+        float *rest = (float *)malloc((size_t)P / 2 * V * sizeof(float));
+        ok = ok && rest && spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 2, .tokens = tok + P / 2,
+                                                                               .count = P / 2, .logits = rest, .all = true}, 1);
+        same[bf16] = ok && !memcmp(all, one, (size_t)P * V * sizeof(float)) &&
+                     !memcmp(rest, all + (size_t)P / 2 * V, (size_t)P / 2 * V * sizeof(float));
+        worst[bf16] = ok ? gpu_max_scaled(all, cpu, (size_t)P * V) : 1.0;
+        free(rest);
+        spingalett_session_free(s);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    }
+    /* greedy generation, once trained to count: the GPU's tokens the CPU's */
+    float *x = (float *)malloc((size_t)256 * T * sizeof(float)), *t = (float *)malloc((size_t)256 * T * sizeof(float));
+    for (uint32_t k = 0; k < 256; k++)
+        for (uint32_t i = 0; i < T; i++) x[k * T + i] = (float)((k * 5 + i) % V), t[k * T + i] = (float)((k * 5 + i + 1) % V);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    train(.net = net, .inputs = x, .targets = t, .sample_count = 256, .epochs = 4, .learning_rate = 3e-3f,
+          .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32);
+    uint32_t prompt[3] = {3, 4, 5}, a[24] = {0}, b[24] = {0};
+    const uint32_t ca = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = a, .count = 24);
+    spingalett_set_compute_mode(gpu_mode);
+    const uint32_t cb = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = b, .count = 24);
+    const bool generated = ca == 24 && cb == 24 && !memcmp(a, b, sizeof a);
+    /* (a session the GPU could not run runs on the CPU: its single precision equal to the CPU's says so) */
+    CHECK(ok && worst[0] > 0.0 && worst[0] < 1e-4 && worst[1] < 3e-2 && same[0] && same[1] && generated,
+          "gpu session %s: single precision %.2e, bf16 %.2e from the CPU's, a prompt as tokens %d %d, generation %d",
+          llama ? "llama" : "gpt", worst[0], worst[1], same[0], same[1], generated);
+    printf("  gpu session %s: logits %.1e (bf16 %.1e) from the CPU's session, a prompt the bits of its tokens %s, "
+           "greedy generation the CPU's %s\n", llama ? "LLaMA-like" : "GPT-like", worst[0], worst[1],
+           same[0] && same[1] ? "yes" : "no", generated ? "yes" : "no");
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    spingalett_model_free(m);
+    free_network(net);
+    free(cpu); free(one); free(all); free(x); free(t);
+}
+
 /* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA) against single
    precision: predictions, one step's change of every parameter, and two runs alike; over T tokens (several
    blocks of queries, the last partial), causal or not. */
@@ -7174,6 +7272,8 @@ int main(int argc, char **argv) {
             gpu_flash(64, false, 4, 300, true);
             gpu_flash(64, true, 2, 200, false);
             gpu_flash(32, false, 2, 150, true);
+            gpu_session(false);
+            gpu_session(true);
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }
