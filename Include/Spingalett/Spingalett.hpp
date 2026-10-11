@@ -71,9 +71,13 @@ inline std::unexpected<Error> invalid(const char *message) {
 enum class Activation : int {
     None = SPINGALETT_ACT_NONE, Sigmoid = SPINGALETT_ACT_SIGMOID, Relu = SPINGALETT_ACT_RELU,
     Tanh = SPINGALETT_ACT_TANH, LeakyRelu = SPINGALETT_ACT_LEAKY_RELU, Foo52 = SPINGALETT_ACT_FOO52,
-    Softmax = SPINGALETT_ACT_SOFTMAX,
+    Softmax = SPINGALETT_ACT_SOFTMAX, Gelu = SPINGALETT_ACT_GELU, GeluTanh = SPINGALETT_ACT_GELU_TANH,
+    Silu = SPINGALETT_ACT_SILU,
 };
-enum class Loss : int { Mse = SPINGALETT_LOSS_MSE, CrossEntropy = SPINGALETT_LOSS_CROSS_ENTROPY };
+enum class Loss : int {
+    Mse = SPINGALETT_LOSS_MSE, CrossEntropy = SPINGALETT_LOSS_CROSS_ENTROPY,
+    SparseCrossEntropy = SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY,
+};
 enum class Init : int {
     Random = SPINGALETT_INIT_RANDOM, Xavier = SPINGALETT_INIT_XAVIER,
     He = SPINGALETT_INIT_HE, Zeros = SPINGALETT_INIT_NONE,
@@ -93,7 +97,7 @@ enum class Precision : int {
 };
 enum class Compute : int {
     SingleThreaded = SPINGALETT_COMPUTE_SINGLE_THREADED, OpenMP = SPINGALETT_COMPUTE_OPENMP,
-    OpenBLAS = SPINGALETT_COMPUTE_OPENBLAS, Vulkan = SPINGALETT_COMPUTE_VULKAN,
+    OpenBLAS = SPINGALETT_COMPUTE_OPENBLAS, Vulkan = SPINGALETT_COMPUTE_VULKAN, Cuda = SPINGALETT_COMPUTE_CUDA,
 };
 enum class Upsample : int { Nearest = SPINGALETT_UPSAMPLE_NEAREST, Bilinear = SPINGALETT_UPSAMPLE_BILINEAR };
 
@@ -115,6 +119,11 @@ inline Result<void> set_compute_mode(Compute mode) {
 /* The GPU's name, or empty without a usable device. */
 inline std::string gpu_device() {
     const char *name = spingalett_gpu_device();
+    return name ? name : "";
+}
+/* The NVIDIA GPU that Compute::Cuda uses, or empty. */
+inline std::string cuda_device() {
+    const char *name = spingalett_cuda_device();
     return name ? name : "";
 }
 /* Whether the GPU multiplies in that precision from the next call on. */
@@ -281,7 +290,7 @@ public:
     }
     Result<EvalMetrics> evaluate(std::span<const float> inputs, std::span<const float> targets) const {
         const std::uint32_t n = samples(inputs.size(), input_size());
-        if (n == 0 || targets.size() != std::size_t(n) * output_size())
+        if (n == 0 || (m_->loss != SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY && targets.size() != std::size_t(n) * output_size()))
             return invalid("Model::evaluate: inputs and targets are not of whole samples of one count");
         spingalett_clear_error();
         EvalMetrics m = spingalett_model_evaluate(m_, inputs.data(), targets.data(), n);
@@ -315,6 +324,15 @@ struct TrainOptions {
 };
 
 class Network;
+
+/* How Network::generate() picks each token (the defaults: the most likely one). */
+struct Sampling {
+    float temperature = 0.0f;       /* the logits divided by it before the softmax; 0: the most likely token */
+    std::uint32_t top_k = 0;        /* draws among the top_k most likely tokens (0: all) */
+    float top_p = 0.0f;             /* and among those whose probabilities add up to top_p (0: all) */
+    std::uint64_t seed = 0;         /* the draws' generator (0: one draw of the library's) */
+    std::vector<std::uint32_t> stop{};      /* tokens that end the generation */
+};
 
 /* A dense, convolution or transposed convolution layer's settings for Builder. */
 struct Conv2D {
@@ -374,6 +392,40 @@ public:
     }
     Builder &concat_layers(std::initializer_list<std::uint32_t> layers, Activation act = Activation::None) {
         return from(layers).add(args(SPINGALETT_LAYER_CONCAT, act, 0));
+    }
+    /* the product of layers of one shape, element by element (SwiGLU's gate) */
+    Builder &multiply_layers(std::initializer_list<std::uint32_t> layers, Activation act = Activation::None) {
+        return from(layers).add(args(SPINGALETT_LAYER_MULTIPLY, act, 0));
+    }
+    /* transformers: a linear map of each cell's channels (a 1 x 1 convolution), the vectors of a vocabulary's
+       tokens (with positions: learned position vectors added), attention over packed queries, keys and values
+       (kv_heads 0: as many as heads; rope_theta 0: no rotary embeddings), RMS normalization */
+    Builder &linear(std::uint32_t units, Activation act = Activation::None, Init init = Init::Lecun) {
+        SpingalettLayerArgs a = args(SPINGALETT_LAYER_CONV2D, act, 0);
+        a.filters = units;
+        a.kernel = 1;
+        a.weight_initialization = static_cast<SpingalettWeightInitialization>(init);
+        return add(a);
+    }
+    Builder &embedding(std::uint32_t vocabulary, std::uint32_t width, bool positions = false) {
+        SpingalettLayerArgs a = args(SPINGALETT_LAYER_EMBEDDING, Activation::None, width);
+        a.vocabulary = vocabulary;
+        a.positions = positions;
+        a.weight_initialization = SPINGALETT_INIT_LECUN;
+        return add(a);
+    }
+    Builder &attention(std::uint32_t heads, bool causal = true, std::uint32_t kv_heads = 0, float rope_theta = 0.0f) {
+        SpingalettLayerArgs a = args(SPINGALETT_LAYER_ATTENTION, Activation::None, 0);
+        a.heads = heads;
+        a.kv_heads = kv_heads;
+        a.causal = causal;
+        a.rope_theta = rope_theta;
+        return add(a);
+    }
+    Builder &rms_norm(float epsilon = 0.0f) {
+        SpingalettLayerArgs a = args(SPINGALETT_LAYER_RMS_NORM, Activation::None, 0);
+        a.epsilon = epsilon;
+        return add(a);
     }
     /* any layer, as the C builders describe it (its net and inputs are set by the builder) */
     Builder &layer(const SpingalettLayerArgs &a) { return add(a); }
@@ -484,6 +536,8 @@ public:
 
     std::uint32_t input_size() const { return spingalett_input_size(n_); }
     std::uint32_t output_size() const { return spingalett_output_size(n_); }
+    /* targets a sample: the outputs, or one class index a cell with the sparse cross-entropy */
+    std::uint32_t target_size() const { return spingalett_target_size(n_); }
     std::uint32_t layer_count() const { return spingalett_layer_count(n_); }
     std::uint64_t parameter_count() const { return spingalett_parameter_count(n_); }
     Result<LayerInfo> layer(std::uint32_t index) const {
@@ -496,7 +550,7 @@ public:
     Result<TrainReport> train(std::span<const float> inputs, std::span<const float> targets,
                               const TrainOptions &o = {}) {
         const std::uint32_t n = samples(inputs.size(), input_size());
-        if (n == 0 || targets.size() != std::size_t(n) * output_size())
+        if (n == 0 || targets.size() != std::size_t(n) * target_size())
             return invalid("Network::train: inputs and targets are not of whole samples of one count");
         SpingalettTrainArgs a = arguments(o);
         a.inputs = inputs.data();
@@ -507,6 +561,25 @@ public:
     Result<TrainReport> train(const Dataset &data, const TrainOptions &o = {}) {
         return train(data.inputs(), data.targets(), o);
     }
+    /* a language model on the windows of a file of token ids (nanoGPT's .bin, llm.c's): each sample
+       input_size() tokens from a multiple of stride (0: the window's length) on, its targets the next tokens */
+    Result<TrainReport> train_tokens(const std::string &path, std::uint32_t stride = 0, const TrainOptions &o = {}) {
+        SpingalettTokenReaderOptions r{};
+        r.context = input_size();
+        r.stride = stride;
+        r.shuffle = !o.raw.do_not_shuffle;
+        spingalett_clear_error();
+        SpingalettDatasetReader *reader = spingalett_dataset_open_tokens(path.c_str(), &r);
+        if (!reader) return failure("spingalett_dataset_open_tokens failed");
+        SpingalettTrainArgs a = arguments(o);
+        a.training_mode = SPINGALETT_MODE_GENERATOR_FUNCTION;
+        a.generator = spingalett_dataset_generator;
+        a.generator_data = reader;
+        a.sample_count = spingalett_dataset_info(reader).count;
+        Result<TrainReport> report = run(a, o);
+        spingalett_dataset_close(reader);
+        return report;
+    }
     /* from data sets on the GPU, their first rows */
     Result<TrainReport> train(const DeviceData &inputs, const DeviceData &targets, const TrainOptions &o = {}) {
         SpingalettTrainArgs a = arguments(o);
@@ -514,6 +587,30 @@ public:
         a.device_targets = targets.raw();
         a.sample_count = inputs.count();
         return run(a, o);
+    }
+
+    /* a causal language model's continuation of a prompt, a token at a time (spingalett_generate()) */
+    Result<std::vector<std::uint32_t>> generate(std::span<const std::uint32_t> prompt, std::uint32_t count,
+                                                const Sampling &s = {}) {
+        if (prompt.empty()) return invalid("Network::generate: an empty prompt");
+        std::vector<std::uint32_t> tokens(count);
+        SpingalettGenerateArgs a{};
+        a.net = n_;
+        a.prompt = prompt.data();
+        a.prompt_length = static_cast<std::uint32_t>(prompt.size());
+        a.tokens = tokens.data();
+        a.count = count;
+        a.temperature = s.temperature;
+        a.top_k = s.top_k;
+        a.top_p = s.top_p;
+        a.seed = s.seed;
+        a.stop_tokens = s.stop.empty() ? nullptr : s.stop.data();
+        a.stop_count = static_cast<std::uint32_t>(s.stop.size());
+        spingalett_clear_error();
+        const std::uint32_t made = spingalett_generate_args(a);
+        if (made == 0 && count > 0) return failure("generate failed");
+        tokens.resize(made);
+        return tokens;
     }
 
     Result<void> predict(std::span<const float> inputs, std::span<float> outputs) {
@@ -537,7 +634,7 @@ public:
     }
     Result<EvalMetrics> evaluate(std::span<const float> inputs, std::span<const float> targets) {
         const std::uint32_t n = samples(inputs.size(), input_size());
-        if (n == 0 || targets.size() != std::size_t(n) * output_size())
+        if (n == 0 || targets.size() != std::size_t(n) * target_size())
             return invalid("Network::evaluate: inputs and targets are not of whole samples of one count");
         SpingalettEvaluateArgs a{};
         a.net = n_;

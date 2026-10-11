@@ -8,7 +8,7 @@ log=$(mktemp)
 ctest "$@" --output-on-failure 2>&1 | tee "$log"
 status=${PIPESTATUS[0]}
 if [ "$status" -ne 0 ]; then
-    grep -E '\*\*\*|Failed|FAILED|failed' "$log" | head -n 20 | while IFS= read -r line; do echo "::error::$line"; done
+    grep -E '\*\*\*|Failed|FAILED|failed|FAIL:' "$log" | head -n 40 | while IFS= read -r line; do echo "::error::$line"; done
     printf '::error title=end of the output::'
     tail -n 100 "$log" | sed 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }' | head -c 60000
     echo

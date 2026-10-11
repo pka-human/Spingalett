@@ -137,6 +137,38 @@ void spingalett_add_forward(const float *const *x, uint32_t count, float *y, uin
     (void)mode;
 }
 
+void spingalett_multiply_forward(const float *const *x, uint32_t count, float *y, uint32_t n, uint64_t size,
+                                 ActivationFunction act, ComputeMode mode) {
+    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * size * count),
+        for (int64_t s = 0; s < (int64_t)n; s++) {
+            const uint64_t base = (uint64_t)s * size;
+            const float *in[SPINGALETT_MAX_INPUTS];
+            for (uint32_t k = 0; k < count; k++) in[k] = x[k] + base;
+            spingalett_engine_multiply(in, count, y + base, (uint32_t)size);
+            apply_activation_batch(y + base, (uint32_t)size, act);
+        }
+    );
+    (void)mode;
+}
+
+void spingalett_multiply_backward(const float *const *x, uint32_t count, uint32_t k, const float *dy, float *dx,
+                                  uint32_t n, uint64_t size, bool accumulate, ComputeMode mode) {
+    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * size * count),
+        for (int64_t s = 0; s < (int64_t)n; s++) {
+            const uint64_t base = (uint64_t)s * size;
+            float *restrict d = dx + base;
+            const float *restrict g = dy + base;
+            for (uint64_t i = 0; i < size; i++) {
+                float v = g[i];
+                for (uint32_t j = 0; j < count; j++)
+                    if (j != k) v *= x[j][base + i];
+                d[i] = accumulate ? d[i] + v : v;
+            }
+        }
+    );
+    (void)mode;
+}
+
 /* Copies of a few channels (a cell of a narrow input), kept inline. */
 static inline void copy_channels(float *restrict dst, const float *restrict src, uint32_t n) {
     if (n > 16) { memcpy(dst, src, (size_t)n * sizeof(float)); return; }

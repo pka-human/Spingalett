@@ -38,13 +38,13 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
-    "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample",
+    "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample", "Linear", "Embedding", "Attention", "RMSNorm", "Multiply",
     "Model", "LayerInfo", "DeviceData",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
@@ -52,6 +52,7 @@ __all__ = [
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
+    "gpt2_from_state_dict", "llama_from_state_dict",
 ]
 
 
@@ -66,11 +67,15 @@ class Activation(enum.IntEnum):
     LEAKY_RELU = 4
     FOO52 = 5
     SOFTMAX = 6
+    GELU = 7        # x Phi(x); its derivative needs the layer's values before it, which training keeps
+    GELU_TANH = 8   # GELU's tanh approximation (GPT-2's)
+    SILU = 9        # x sigmoid(x)
 
 
 class Loss(enum.IntEnum):
     MSE = 0
     CROSS_ENTROPY = 1
+    SPARSE_CROSS_ENTROPY = 2    # softmax over each cell's channels against a class index a cell (-1: none)
 
 
 class Init(enum.IntEnum):
@@ -124,6 +129,10 @@ class LayerType(enum.IntEnum):
     CONV_TRANSPOSE2D = 8
     UPSAMPLE = 9
     LAYER_NORM = 10
+    EMBEDDING = 11
+    ATTENTION = 12
+    RMS_NORM = 13
+    MULTIPLY = 14
 
 
 class Upsample(enum.IntEnum):
@@ -220,7 +229,13 @@ class _NetworkLayer(Structure):
         ("input_count", c_uint32),
         ("inputs", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
-        ("reserved", c_uint64 * _RESERVED),
+        ("vocabulary", c_uint32),
+        ("heads", c_uint32),
+        ("kv_heads", c_uint32),
+        ("rope_theta", c_float),
+        ("causal", c_bool),
+        ("positions", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 2)),
     ]
 
 
@@ -299,7 +314,13 @@ class _LayerArgs(Structure):
         ("output_padding", c_uint32),
         ("output_padding_h", c_uint32),
         ("output_padding_w", c_uint32),
-        ("reserved", c_uint64 * _RESERVED),
+        ("vocabulary", c_uint32),
+        ("heads", c_uint32),
+        ("kv_heads", c_uint32),
+        ("rope_theta", c_float),
+        ("causal", c_bool),
+        ("positions", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 3)),
     ]
 
 
@@ -466,6 +487,34 @@ class _DatasetReaderOptions(Structure):
     _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32), ("reserved", c_uint64 * _RESERVED)]
 
 
+class _TokenReaderOptions(Structure):
+    _fields_ = [
+        ("context", c_uint32),
+        ("token_bytes", c_uint32),
+        ("stride", c_uint32),
+        ("offset", c_uint64),
+        ("shuffle", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _GenerateArgs(Structure):
+    _fields_ = [
+        ("net", _NetPtr),
+        ("prompt", POINTER(c_uint32)),
+        ("prompt_length", c_uint32),
+        ("tokens", POINTER(c_uint32)),
+        ("count", c_uint32),
+        ("temperature", c_float),
+        ("top_k", c_uint32),
+        ("top_p", c_float),
+        ("seed", c_uint64),
+        ("stop_tokens", POINTER(c_uint32)),
+        ("stop_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 class _SaveArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
@@ -521,7 +570,13 @@ class _LayerInfo(Structure):
         ("input_count", c_uint32),
         ("input_layers", c_uint32 * MAX_INPUTS),
         ("upsample", c_int),
-        ("reserved", c_uint64 * _RESERVED),
+        ("vocabulary", c_uint32),
+        ("heads", c_uint32),
+        ("kv_heads", c_uint32),
+        ("rope_theta", c_float),
+        ("causal", c_bool),
+        ("positions", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 2)),
     ]
 
 
@@ -616,6 +671,7 @@ _layer = _bind("spingalett_append_layer", c_uint32, [_LayerArgs])
 _layer_count = _bind("spingalett_layer_count", c_uint32, [_NetPtr])
 _input_size = _bind("spingalett_input_size", c_uint32, [_NetPtr])
 _output_size = _bind("spingalett_output_size", c_uint32, [_NetPtr])
+_target_size = _bind("spingalett_target_size", c_uint32, [_NetPtr])
 _network_layer = _bind("spingalett_network_layer", c_bool, [_NetPtr, c_uint32, POINTER(_NetworkLayer)])
 _parameter_count = _bind("spingalett_parameter_count", c_uint64, [_NetPtr])
 _network_loss = _bind("spingalett_network_loss", c_int, [_NetPtr])
@@ -647,6 +703,8 @@ _save_dataset = _bind("spingalett_save_dataset", c_bool, [POINTER(_Dataset), c_c
 _load_dataset = _bind("spingalett_load_dataset_targets", c_bool, [c_char_p, c_uint32, POINTER(_Dataset)])
 _dataset_set_class_names = _bind("spingalett_dataset_set_class_names", c_bool, [POINTER(_Dataset), POINTER(c_char_p), c_uint32])
 _dataset_open = _bind("spingalett_dataset_open_ex", c_void_p, [c_char_p, POINTER(_DatasetReaderOptions)])
+_dataset_open_tokens = _bind("spingalett_dataset_open_tokens", c_void_p, [c_char_p, POINTER(_TokenReaderOptions)])
+_generate = _bind("spingalett_generate_args", c_uint32, [_GenerateArgs])
 _dataset_open_u8 = _bind("spingalett_dataset_open_u8", c_void_p,
                          [POINTER(ctypes.c_uint8), POINTER(c_float), c_uint32, c_uint32, c_uint32, c_bool])
 _dataset_target_set_name = _bind("spingalett_dataset_target_set_name", c_char_p, [c_void_p, c_uint32])
@@ -1002,6 +1060,62 @@ class LayerNorm:
 
 
 @dataclasses.dataclass(frozen=True)
+class Linear:
+    """A dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution): the linear
+    layers of transformers over their tokens."""
+    neurons: int
+    activation: Activation = Activation.NONE
+    init: Init = Init.LECUN
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Embedding:
+    """Token embeddings: each input value the index of a row of ``vocabulary`` rows of ``size`` values;
+    with ``positions``, a learned vector a cell added (GPT-2's absolute positions)."""
+    vocabulary: int
+    size: int
+    positions: bool = False
+    activation: Activation = Activation.NONE
+    init: Init = Init.LECUN
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Attention:
+    """Multi-head scaled dot-product attention over the cells of a layer of queries, keys and values side
+    by side ((heads + 2 kv_heads) x head size channels a cell): ``kv_heads`` key and value heads (fewer
+    than ``heads``: grouped-query attention), ``causal`` masking, rotary position embeddings of base
+    ``rope_theta`` (0: none)."""
+    heads: int = 1
+    kv_heads: int = 0
+    causal: bool = False
+    rope_theta: float = 0.0
+    activation: Activation = Activation.NONE
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RMSNorm:
+    """RMS normalization over each cell's channels (a gamma per channel, no beta), then ``activation``."""
+    activation: Activation = Activation.NONE
+    epsilon: float = 1e-5
+    dropout: float = 0.0
+    inputs: _Inputs = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Multiply:
+    """The element-wise product of earlier layers of one shape (SwiGLU's gate), then ``activation``."""
+    inputs: _Inputs
+    activation: Activation = Activation.NONE
+    dropout: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
 class LayerDescription:
     """Layer ``index`` of a :class:`Network` (0 is the input layer)."""
     type: LayerType
@@ -1018,6 +1132,12 @@ class LayerDescription:
     epsilon: float = 0.0            # batch normalization
     momentum: float = 0.0
     inputs: Tuple[int, ...] = ()    # the layers it reads (none for the input layer)
+    vocabulary: int = 0             # embedding: rows of its table
+    heads: int = 0                  # attention: query heads
+    kv_heads: int = 0               # attention: key and value heads
+    rope_theta: float = 0.0         # attention: base of the rotary position embeddings (0: none)
+    causal: bool = False            # attention: each cell attends to the cells up to itself
+    positions: bool = False         # embedding: a learned vector a cell
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1221,6 +1341,18 @@ class Network:
                 self.add_upsample(spec.factor, spec.mode, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, LayerNorm):
                 self.add_layer_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, Linear):
+                self.add_linear(spec.neurons, spec.activation, spec.init, spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, Embedding):
+                self.add_embedding(spec.vocabulary, spec.size, spec.positions, spec.activation, spec.init, spec.dropout,
+                                   inputs=spec.inputs)
+            elif isinstance(spec, Attention):
+                self.add_attention(spec.heads, spec.kv_heads, spec.causal, spec.rope_theta, spec.activation,
+                                   spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, RMSNorm):
+                self.add_rms_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
+            elif isinstance(spec, Multiply):
+                self.add_multiply(spec.inputs, spec.activation, spec.dropout)
             else:
                 self.add_layer(int(spec))
 
@@ -1371,6 +1503,45 @@ class Network:
         return self._add(inputs, type=int(LayerType.LAYER_NORM), act_func=int(activation), epsilon=float(epsilon),
                          dropout_rate=float(dropout))
 
+    def add_linear(self, neurons: int, activation: Activation = Activation.NONE, init: Init = Init.LECUN,
+                   dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
+        """Append a dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution),
+        the linear layers of transformers over their tokens."""
+        return self._add(inputs, type=int(LayerType.CONV2D), filters=int(neurons), kernel=1,
+                         act_func=int(activation), weight_initialization=int(init), dropout_rate=float(dropout))
+
+    def add_embedding(self, vocabulary: int, size: int, positions: bool = False,
+                      activation: Activation = Activation.NONE, init: Init = Init.LECUN, dropout: float = 0.0,
+                      inputs: _Inputs = None) -> "Network":
+        """Append token embeddings: each input value (a token's index, as a float) the row of a table of
+        ``vocabulary`` rows of ``size`` values (indices outside it give zeros), plus with ``positions`` a
+        learned vector a cell. A sequence of n tokens (an input layer of n values) gives n cells."""
+        return self._add(inputs, type=int(LayerType.EMBEDDING), vocabulary=int(vocabulary), neurons_amount=int(size),
+                         positions=bool(positions), act_func=int(activation), weight_initialization=int(init),
+                         dropout_rate=float(dropout))
+
+    def add_attention(self, heads: int = 1, kv_heads: int = 0, causal: bool = False, rope_theta: float = 0.0,
+                      activation: Activation = Activation.NONE, dropout: float = 0.0,
+                      inputs: _Inputs = None) -> "Network":
+        """Append multi-head attention over the cells of a layer whose channels hold each cell's queries,
+        keys and values side by side: ``heads`` query vectors, then ``kv_heads`` (0: as many as heads)
+        key and value vectors of one head size; ``causal`` lets each cell attend to the cells up to
+        itself only, ``rope_theta`` (10000 is usual) rotates queries and keys by position."""
+        return self._add(inputs, type=int(LayerType.ATTENTION), heads=int(heads), kv_heads=int(kv_heads),
+                         causal=bool(causal), rope_theta=float(rope_theta), act_func=int(activation),
+                         dropout_rate=float(dropout))
+
+    def add_rms_norm(self, activation: Activation = Activation.NONE, epsilon: float = 1e-5, dropout: float = 0.0,
+                     inputs: _Inputs = None) -> "Network":
+        """Append RMS normalization over each cell's channels (a gamma per channel), then ``activation``."""
+        return self._add(inputs, type=int(LayerType.RMS_NORM), act_func=int(activation), epsilon=float(epsilon),
+                         dropout_rate=float(dropout))
+
+    def add_multiply(self, inputs: _Inputs, activation: Activation = Activation.NONE,
+                     dropout: float = 0.0) -> "Network":
+        """Append the element-wise product of earlier layers of one shape, then ``activation``."""
+        return self._add(inputs, type=int(LayerType.MULTIPLY), act_func=int(activation), dropout_rate=float(dropout))
+
     def layer(self, index: int) -> LayerDescription:
         """Layer ``index`` (0 is the input layer)."""
         info = _NetworkLayer()
@@ -1382,7 +1553,9 @@ class Network:
                                 Activation(info.activation), float(info.dropout_rate), (info.kernel_h, info.kernel_w),
                                 (info.stride_h, info.stride_w), (info.padding_h, info.padding_w),
                                 int(info.weight_count), int(info.bias_count), int(info.groups), float(info.epsilon),
-                                float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)))
+                                float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)),
+                                int(info.vocabulary), int(info.heads), int(info.kv_heads), float(info.rope_theta),
+                                bool(info.causal), bool(info.positions))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -1414,6 +1587,12 @@ class Network:
         return int(_output_size(self._net))
 
     @property
+    def target_size(self) -> int:
+        """Targets a sample has: the output size, or for ``Loss.SPARSE_CROSS_ENTROPY`` the output's cells
+        (a class index each)."""
+        return int(_target_size(self._net))
+
+    @property
     def num_parameters(self) -> int:
         return int(_parameter_count(self._net))
 
@@ -1431,8 +1610,10 @@ class Network:
         info = self.layer(i)
         if info.type in (LayerType.CONV2D, LayerType.CONV_TRANSPOSE2D):
             shape = (info.shape[2], info.kernel[0], info.kernel[1], self.layer(info.inputs[0]).shape[2] // info.groups)
-        elif info.type in (LayerType.BATCH_NORM, LayerType.LAYER_NORM):
-            shape = (info.bias_count,)
+        elif info.type in (LayerType.BATCH_NORM, LayerType.LAYER_NORM, LayerType.RMS_NORM):
+            shape = (info.shape[2],)
+        elif info.type == LayerType.EMBEDDING:
+            shape = (info.vocabulary, info.shape[2])
         else:
             shape = (info.bias_count, info.weight_count // info.bias_count if info.bias_count else 0)
         return i, info, shape
@@ -1519,8 +1700,8 @@ class Network:
         """Inputs and targets as arrays of rows, or DeviceData (either or both)."""
         x = (self._rows(inputs, self.input_size, what + "inputs") if isinstance(inputs, DeviceData)
              else _as_matrix(inputs, self.input_size, what + "inputs"))
-        y = (self._rows(targets, self.output_size, what + "targets") if isinstance(targets, DeviceData)
-             else _as_matrix(targets, self.output_size, what + "targets", images=False))
+        y = (self._rows(targets, self.target_size, what + "targets") if isinstance(targets, DeviceData)
+             else _as_matrix(targets, self.target_size, what + "targets", images=False))
         if len(x) != len(y):
             raise ValueError(f"{what}inputs have {len(x)} rows but {what}targets have {len(y)}")
         if len(x) == 0:
@@ -1551,11 +1732,11 @@ class Network:
         if raw is not None and raw.dtype == np.uint8:
             # image bytes stay bytes: a reader converts a batch at a time (a quarter of the memory)
             xb = np.ascontiguousarray(raw).reshape(-1, self.input_size) if raw.size % self.input_size == 0 else None
-            y = _as_matrix(targets, self.output_size, "targets", images=False)
+            y = _as_matrix(targets, self.target_size, "targets", images=False)
             if xb is None or xb.shape[0] != y.shape[0] or xb.shape[0] == 0:
                 raise ValueError(f"inputs {raw.shape} and targets {y.shape} do not match the network")
             reader = _call(_dataset_open_u8, xb.ctypes.data_as(POINTER(ctypes.c_uint8)), _float_ptr(y),
-                           xb.shape[0], self.input_size, self.output_size, bool(cfg.shuffle))
+                           xb.shape[0], self.input_size, self.target_size, bool(cfg.shuffle))
             try:
                 return self._run(cfg, _MODE_GENERATOR, None, None, int(xb.shape[0]),
                                  _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
@@ -1597,13 +1778,51 @@ class Network:
         reader = _call(_dataset_open, _encode_path(path), ctypes.byref(opts))
         try:
             info = _dataset_info(reader)
-            if (info.input_size, info.target_size) != (self.input_size, self.output_size):
+            if (info.input_size, info.target_size) != (self.input_size, self.target_size):
                 raise ValueError(f"{path!s} has {info.input_size} inputs and {info.target_size} targets, "
-                                 f"the network {self.input_size} and {self.output_size}")
+                                 f"the network {self.input_size} and {self.target_size}")
             return self._run(cfg, _MODE_GENERATOR, None, None, int(info.count),
                              _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
         finally:
             _dataset_close(reader)
+
+    def train_from_tokens(self, path, config: Optional[TrainConfig] = None, token_bytes: int = 0, stride: int = 0,
+                          offset: int = 0, shuffle: bool = True, validation_data=None, **overrides) -> TrainResult:
+        """Train a language model on the windows of a file of token ids (nanoGPT's .bin: uint16; llm.c's,
+        recognized by its header): each sample the network's ``input_size`` tokens from a multiple of
+        ``stride`` (0: the window's length) on, its targets the token after each. ``token_bytes`` 2 or 4
+        (0: 2, or what an llm.c header says); ``offset`` bytes of a header to skip. The file is mapped,
+        not read; ``shuffle`` visits the windows in a new random order every epoch."""
+        cfg = dataclasses.replace(config or TrainConfig(), **overrides)
+        opts = _TokenReaderOptions(self.input_size, int(token_bytes), int(stride), int(offset), bool(shuffle))
+        reader = _call(_dataset_open_tokens, _encode_path(path), ctypes.byref(opts))
+        try:
+            info = _dataset_info(reader)
+            if info.target_size != self.target_size:
+                raise ValueError(f"windows of {info.target_size} tokens, the network takes {self.target_size} targets")
+            return self._run(cfg, _MODE_GENERATOR, None, None, int(info.count),
+                             _NativeGenerator(_dataset_generator, c_void_p(reader)), validation_data)
+        finally:
+            _dataset_close(reader)
+
+    def generate(self, prompt, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
+                 seed: int = 0, stop=()) -> List[int]:
+        """Continue a prompt (token ids) by ``count`` tokens, a token at a time, with a causal language model
+        whose outputs are the logits of every token of its vocabulary for each input token: the most likely
+        token (``temperature`` 0), or a draw from the softmax of the logits over ``temperature`` among the
+        ``top_k`` most likely and those whose probabilities add up to ``top_p``. ``seed`` (0: the library's
+        generator) makes draws repeatable; a token of ``stop`` ends the generation (it is returned last)."""
+        p = np.ascontiguousarray(np.asarray(prompt, dtype=np.uint32).ravel())
+        if p.size == 0:
+            raise ValueError("generate needs a prompt of one token at least")
+        s = np.ascontiguousarray(np.asarray(list(stop), dtype=np.uint32))
+        out = np.zeros(max(int(count), 0), dtype=np.uint32)
+        u32 = POINTER(c_uint32)
+        args = _GenerateArgs(self._ptr, p.ctypes.data_as(u32), p.size, out.ctypes.data_as(u32), out.size,
+                             float(temperature), int(top_k), float(top_p), int(seed),
+                             s.ctypes.data_as(u32) if s.size else None, s.size)
+        made = _call(_generate, args)
+        return out[:made].tolist()
 
     def _run(self, cfg: TrainConfig, mode: int, x, y, sample_count: int, generator,
              validation_data) -> TrainResult:
@@ -1653,7 +1872,7 @@ class Network:
         if isinstance(generator, _NativeGenerator):
             c_gen, c_gen_data = generator.fn, generator.data
         elif generator is not None:
-            n_in, n_out = self.input_size, self.output_size
+            n_in, n_out = self.input_size, self.target_size
 
             def produce(in_ptr, tg_ptr, requested, _ud):
                 if pending:
@@ -1874,6 +2093,12 @@ class LayerInfo:
     groups: int = 0
     epsilon: float = 0.0
     input_layers: Tuple[int, ...] = ()  # network layers it reads (0: the input; i + 1: layer i here)
+    vocabulary: int = 0                 # embedding: rows of its table
+    heads: int = 0                      # attention: query heads
+    kv_heads: int = 0                   # attention: key and value heads
+    rope_theta: float = 0.0             # attention: base of the rotary position embeddings (0: none)
+    causal: bool = False                # attention: each cell attends to the cells up to itself
+    positions: bool = False             # embedding: a learned vector a cell
 
 
 class Model:
@@ -1968,7 +2193,10 @@ class Model:
                                  stride=(int(info.stride_h), int(info.stride_w)),
                                  padding=(int(info.padding_h), int(info.padding_w)),
                                  groups=int(info.groups), epsilon=float(info.epsilon),
-                                 input_layers=tuple(int(info.input_layers[k]) for k in range(info.input_count))))
+                                 input_layers=tuple(int(info.input_layers[k]) for k in range(info.input_count)),
+                                 vocabulary=int(info.vocabulary), heads=int(info.heads), kv_heads=int(info.kv_heads),
+                                 rope_theta=float(info.rope_theta), causal=bool(info.causal),
+                                 positions=bool(info.positions)))
         return out
 
     def to_bytes(self) -> bytes:
@@ -1995,7 +2223,9 @@ class Model:
     def evaluate(self, inputs, targets) -> Metrics:
         """Mean loss and accuracy over a data set, as :meth:`Network.evaluate` computes them."""
         x = _as_matrix(inputs, self.input_size, "inputs")
-        y = _as_matrix(targets, self.output_size, "targets", images=False)
+        last = self.layers[-1]
+        targets_size = last.shape[0] * last.shape[1] if self.loss == Loss.SPARSE_CROSS_ENTROPY else self.output_size
+        y = _as_matrix(targets, targets_size, "targets", images=False)
         if x.shape[0] != y.shape[0] or x.shape[0] == 0:
             raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
         return _metrics(_call(_model_evaluate, self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0]))
@@ -2067,7 +2297,7 @@ class Trainer:
 
     def backward(self, targets) -> float:
         """Back-propagates the network's loss for the last forward pass; returns the summed loss."""
-        y = _as_matrix(targets, self._network.output_size, "targets", images=False)
+        y = _as_matrix(targets, self._network.target_size, "targets", images=False)
         if y.shape[0] != self._rows:
             raise ValueError(f"targets have {y.shape[0]} rows, the last forward pass had {self._rows}")
         return float(_call(_trainer_backward, self._handle(), y.ctypes.data))
@@ -2098,6 +2328,152 @@ class Trainer:
 
 
 # --------------------------------------------------------------------------- data sets
+
+# --------------------------------------------------------------------------- language models from PyTorch
+
+def _tensor(value) -> np.ndarray:
+    """A state dict's tensor (PyTorch's, any precision, on any device; or an array) as float32."""
+    if hasattr(value, "detach"):
+        value = value.detach().to("cpu").float().numpy()
+    return np.ascontiguousarray(value, dtype=np.float32)
+
+
+def _prefix(state, suffix: str) -> str:
+    for key in state:
+        if key.endswith(suffix):
+            return key[:-len(suffix)]
+    raise KeyError(f"the state dict has no ...{suffix}")
+
+
+def gpt2_from_state_dict(state, heads: int, context: Optional[int] = None,
+                         activation: Optional[Activation] = None) -> "Network":
+    """A GPT-2 from its state dict: Hugging Face's (GPT2LMHeadModel, GPT2Model: Conv1D weights stored
+    [in, out]) or nanoGPT's (nn.Linear weights [out, in]), told apart by the shape of the queries', keys' and
+    values' weights. ``heads`` is the model's attention heads (12 for GPT-2 small); ``context`` the window of
+    the network (tokens a sample; at most the model's positions, all of them when None); ``activation`` the
+    MLP's GELU (default: Hugging Face's tanh approximation, nanoGPT's erf). The language model head is
+    ``lm_head.weight`` when the state dict has one, else tied to the token embeddings, as GPT-2's is. The
+    network's input is a window of token ids, its outputs each position's logits; it trains on, generates
+    with and saves like any other (the weights are copied, the head no longer tied)."""
+    p = _prefix(state, "wte.weight")
+    wte, wpe = _tensor(state[p + "wte.weight"]), _tensor(state[p + "wpe.weight"])
+    vocabulary, width = wte.shape
+    layers = 1 + max(int(k[len(p) + 2:].split(".")[0]) for k in state if k.startswith(p + "h."))
+    context = int(context or wpe.shape[0])
+    if not 0 < context <= wpe.shape[0] or width % heads:
+        raise ValueError(f"a context of 1 to {wpe.shape[0]} tokens and heads dividing {width}")
+    conv1d = _tensor(state[p + "h.0.attn.c_attn.weight"]).shape == (width, 3 * width)
+    act = activation if activation is not None else (Activation.GELU_TANH if conv1d else Activation.GELU)
+
+    def weight(name):
+        w = _tensor(state[name])
+        return w.T if conv1d else w
+
+    def bias(name, size):
+        return _tensor(state[name]) if name in state else np.zeros(size, dtype=np.float32)
+
+    net = Network(Loss.SPARSE_CROSS_ENTROPY)
+    sets = []          # (weight set index, weights, biases) once the layers exist
+    net.add_layer(context)
+    net.add_embedding(vocabulary, width, positions=True)
+    sets.append((net.last - 1, wte, wpe[:context]))
+    x = net.last
+    for i in range(layers):
+        h = f"{p}h.{i}."
+        net.add_layer_norm()
+        sets.append((net.last - 1, _tensor(state[h + "ln_1.weight"]), bias(h + "ln_1.bias", width)))
+        net.add_linear(3 * width)
+        sets.append((net.last - 1, weight(h + "attn.c_attn.weight"), bias(h + "attn.c_attn.bias", 3 * width)))
+        net.add_attention(heads=heads, causal=True)
+        net.add_linear(width)
+        sets.append((net.last - 1, weight(h + "attn.c_proj.weight"), bias(h + "attn.c_proj.bias", width)))
+        net.add_add([x, net.last])
+        x = net.last
+        net.add_layer_norm()
+        sets.append((net.last - 1, _tensor(state[h + "ln_2.weight"]), bias(h + "ln_2.bias", width)))
+        hidden = _tensor(state[h + "mlp.c_fc.weight"]).size // width
+        net.add_linear(hidden, activation=act)
+        sets.append((net.last - 1, weight(h + "mlp.c_fc.weight"), bias(h + "mlp.c_fc.bias", hidden)))
+        net.add_linear(width)
+        sets.append((net.last - 1, weight(h + "mlp.c_proj.weight"), bias(h + "mlp.c_proj.bias", width)))
+        net.add_add([x, net.last])
+        x = net.last
+    net.add_layer_norm()
+    sets.append((net.last - 1, _tensor(state[p + "ln_f.weight"]), bias(p + "ln_f.bias", width)))
+    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else wte
+    net.add_linear(vocabulary)
+    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    for index, w, b in sets:
+        net.set_weights(index, w)
+        net.set_biases(index, b)
+    return net
+
+
+def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, context: int = 2048,
+                          rope_theta: float = 10000.0, epsilon: float = 1e-6) -> "Network":
+    """A LLaMA-like model from its state dict in Hugging Face's names (LlamaForCausalLM, and the models of its
+    form: Mistral, Qwen2 with its queries', keys' and values' biases, ...): RMS normalization, grouped-query
+    attention with rotary embeddings (rotate_half, as Hugging Face stores the weights), a SwiGLU MLP. ``heads``
+    and ``kv_heads`` are the config's num_attention_heads and num_key_value_heads (None: as many), ``rope_theta``
+    and ``epsilon`` its rope_theta and rms_norm_eps; ``context`` the network's window of tokens. The language
+    model head is lm_head.weight, else tied to the token embeddings."""
+    p = _prefix(state, "embed_tokens.weight")
+    embed = _tensor(state[p + "embed_tokens.weight"])
+    vocabulary, width = embed.shape
+    kv_heads = int(kv_heads or heads)
+    head_size = width // heads
+    layers = 1 + max(int(k[len(p) + 7:].split(".")[0]) for k in state if k.startswith(p + "layers."))
+
+    def bias(name, size):
+        return _tensor(state[name]) if name in state else np.zeros(size, dtype=np.float32)
+
+    net = Network(Loss.SPARSE_CROSS_ENTROPY)
+    sets = []
+    net.add_layer(int(context))
+    net.add_embedding(vocabulary, width)
+    sets.append((net.last - 1, embed, None))
+    x = net.last
+    for i in range(layers):
+        h = f"{p}layers.{i}."
+        net.add_rms_norm(epsilon=epsilon)
+        sets.append((net.last - 1, _tensor(state[h + "input_layernorm.weight"]), None))
+        qkv = [_tensor(state[h + f"self_attn.{n}_proj.weight"]) for n in "qkv"]
+        sizes = [w.shape[0] for w in qkv]
+        net.add_linear(sum(sizes))
+        sets.append((net.last - 1, np.concatenate(qkv),
+                     np.concatenate([bias(h + f"self_attn.{n}_proj.bias", m) for n, m in zip("qkv", sizes)])))
+        net.add_attention(heads=heads, kv_heads=kv_heads, rope_theta=rope_theta, causal=True)
+        net.add_linear(width)
+        sets.append((net.last - 1, _tensor(state[h + "self_attn.o_proj.weight"]), bias(h + "self_attn.o_proj.bias", width)))
+        net.add_add([x, net.last])
+        x = net.last
+        net.add_rms_norm(epsilon=epsilon)
+        normed = net.last
+        sets.append((normed - 1, _tensor(state[h + "post_attention_layernorm.weight"]), None))
+        gate = _tensor(state[h + "mlp.gate_proj.weight"])
+        net.add_linear(gate.shape[0], activation=Activation.SILU)
+        sets.append((net.last - 1, gate, np.zeros(gate.shape[0], dtype=np.float32)))
+        g = net.last
+        net.add_linear(gate.shape[0], inputs=normed)
+        sets.append((net.last - 1, _tensor(state[h + "mlp.up_proj.weight"]), np.zeros(gate.shape[0], dtype=np.float32)))
+        net.add_multiply([g, net.last])
+        net.add_linear(width)
+        sets.append((net.last - 1, _tensor(state[h + "mlp.down_proj.weight"]), np.zeros(width, dtype=np.float32)))
+        net.add_add([x, net.last])
+        x = net.last
+    net.add_rms_norm(epsilon=epsilon)
+    sets.append((net.last - 1, _tensor(state[p + "norm.weight"]), None))
+    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else embed
+    net.add_linear(vocabulary)
+    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    for index, w, b in sets:
+        net.set_weights(index, w)
+        if b is not None:
+            net.set_biases(index, b)
+    if head_size * heads != width:
+        raise ValueError(f"{heads} heads do not divide the width {width}")
+    return net
+
 
 def _take_dataset(ds: _Dataset):
     try:

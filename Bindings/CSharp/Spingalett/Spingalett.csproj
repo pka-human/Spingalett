@@ -1,0 +1,26 @@
+<!--
+SPDX-License-Identifier: MIT
+Copyright (c) 2026 pka_human (pka_human@proton.me)
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>12</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>CS1591</NoWarn>
+    <PackageId>Spingalett</PackageId>
+    <Version>1.2.0</Version>
+    <Authors>pka_human</Authors>
+    <Description>Neural networks in C for .NET: training on the CPU and the GPU (CUDA, Vulkan), transformers and text generation, INT8 to INT2 deployment models.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/pka-human/Spingalett</RepositoryUrl>
+    <PackageTags>neural-network;machine-learning;deep-learning;transformer;gpu</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>

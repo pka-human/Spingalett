@@ -4,7 +4,7 @@
 */
 
 /* eltwise.comp: element-wise passes over `total` floats, rows of n (BIAS_ACT, DERIV, MUL, ADD, DROPOUT,
-   AFFINE, BDATA, SCALE, AFFINE_ADD, COPY). Spec: OP, ACT, HALF (words: y 0, x 1, a 2, b 3, z 8). 256
+   AFFINE, BDATA, SCALE, AFFINE_ADD, COPY, ACT_OP, PRODUCT). Spec: OP, ACT, HALF (words: y 0, x 1, a 2, b 3, z 8). 256
    threads, a grid-stride loop. */
 
 #include "common.cuh"
@@ -19,7 +19,10 @@
 #define SCALE      7u
 #define AFFINE_ADD 8u
 #define COPY       9u
+#define ACT_OP     10u
+#define PRODUCT    11u
 #define FLAG_A     1u
+#define FLAG_ADD   2u
 
 DEVICE uint32_t hash32(uint32_t x) {
     x ^= x >> 16; x *= 0x7FEB352Du;
@@ -74,6 +77,11 @@ DEVICE void element(const SpgEltwisePush &p, uint32_t ACT, uint32_t HALF, uint32
            activate(ld(p.z, i, 8u, HALF) + (ld(p.x, i, 1u, HALF) * ld(p.a, c, 2u, HALF) + ld(p.b, c, 3u, HALF)), ACT));
     } else if (OP == COPY) {
         st(p.y, i, 0u, HALF, ld(p.x, i, 1u, HALF));
+    } else if (OP == ACT_OP) {
+        st(p.y, i, 0u, HALF, activate(ld(p.x, i, 1u, HALF), ACT));
+    } else if (OP == PRODUCT) {
+        const float v = ld(p.x, i, 1u, HALF) * ld(p.a, i, 2u, HALF);
+        st(p.y, i, 0u, HALF, (p.flags & FLAG_ADD) ? ld(p.y, i, 0u, HALF) + v : v);
     }
 }
 
@@ -83,10 +91,13 @@ DEVICE void element(const SpgEltwisePush &p, uint32_t ACT, uint32_t HALF, uint32
 template <uint32_t OP>
 DEVICE void four(const SpgEltwisePush &p, uint32_t ACT, float slope, uint32_t HALF, uint32_t i) {
     float4_ y = {0.0f, 0.0f, 0.0f, 0.0f}, x = y, b = y, z = y;
-    const bool reads_y = OP == BIAS_ACT || OP == DERIV || OP == MUL || OP == ADD || OP == DROPOUT || OP == SCALE;
-    const bool reads_x = OP == DERIV || OP == MUL || OP == ADD || OP == AFFINE || OP == BDATA || OP == AFFINE_ADD || OP == COPY;
+    const bool reads_y = OP == BIAS_ACT || OP == DERIV || OP == MUL || OP == ADD || OP == DROPOUT || OP == SCALE ||
+                         (OP == PRODUCT && (p.flags & FLAG_ADD));
+    const bool reads_x = OP == DERIV || OP == MUL || OP == ADD || OP == AFFINE || OP == BDATA || OP == AFFINE_ADD || OP == COPY ||
+                         OP == ACT_OP || OP == PRODUCT;
     if (reads_y) y = ld4(p.y, i, 0u, HALF);
     if (reads_x) x = ld4(p.x, i, 1u, HALF);
+    if (OP == PRODUCT) b = ld4(p.a, i, 2u, HALF);           /* (a by element) */
     if (OP == BDATA) b = ld4(p.b, i, 3u, HALF);
     if (OP == AFFINE_ADD) z = ld4(p.z, i, 8u, HALF);
     /* the columns' parameters (AFFINE, AFFINE_ADD: scale a and shift b; BDATA: three rows of a; BIAS_ACT: a) */
@@ -118,6 +129,10 @@ DEVICE void four(const SpgEltwisePush &p, uint32_t ACT, float slope, uint32_t HA
     float4_ out = {0.0f, 0.0f, 0.0f, 0.0f}, out_x = out;
     if (OP == BIAS_ACT) {
         out = activate4s((p.flags & FLAG_A) ? add4(y, pa) : y, ACT, slope);
+    } else if (OP == ACT_OP) {
+        out = activate4s(x, ACT, slope);
+    } else if (OP == PRODUCT) {
+        out = (p.flags & FLAG_ADD) ? add4(y, mul4(x, b)) : mul4(x, b);
     } else if (OP == AFFINE) {
         out = activate4s(add4(mul4(x, pa), pb), ACT, slope);
     } else if (OP == AFFINE_ADD) {
@@ -160,7 +175,7 @@ DEVICE void four(const SpgEltwisePush &p, uint32_t ACT, float slope, uint32_t HA
 template <uint32_t OP>
 DEVICE void pass(const SpgEltwisePush &p, uint32_t ACT, uint32_t HALF) {
     const uint32_t stride = blocks_x() * 256u;
-    if (p.total % 4u == 0u && ((p.y | p.x | p.b | p.z) & 15u) == 0u) {
+    if (p.total % 4u == 0u && ((p.y | p.x | p.b | p.z | (OP == PRODUCT ? p.a : 0u)) & 15u) == 0u) {
         const float slope = act_slope(ACT);
         for (uint32_t q = global_x(); q < p.total / 4u; q += stride) four<OP>(p, ACT, slope, HALF, 4u * q);
         return;
@@ -180,6 +195,8 @@ KERNEL(eltwise, SpgEltwisePush) {
         case BDATA: pass<BDATA>(p, ACT, HALF); break;
         case SCALE: pass<SCALE>(p, ACT, HALF); break;
         case AFFINE_ADD: pass<AFFINE_ADD>(p, ACT, HALF); break;
+        case ACT_OP: pass<ACT_OP>(p, ACT, HALF); break;
+        case PRODUCT: pass<PRODUCT>(p, ACT, HALF); break;
         default: pass<COPY>(p, ACT, HALF); break;
     }
 }

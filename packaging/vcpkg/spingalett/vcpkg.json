@@ -1,6 +1,6 @@
 {
   "name": "spingalett",
-  "version-semver": "1.1.0",
+  "version-semver": "1.2.0",
   "description": "Neural networks in C: training on the CPU and on GPUs through Vulkan, deployment models from FP32 down to INT2 (also in a runtime library without training), an inference engine for microcontrollers",
   "homepage": "https://github.com/pka-human/Spingalett",
   "license": "MIT",

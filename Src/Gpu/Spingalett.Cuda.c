@@ -64,6 +64,7 @@ typedef unsigned long long CUdeviceptr;
 #define CU_ATTRIBUTE_COMPUTE_MINOR            76
 #define CU_ATTRIBUTE_UNIFIED_ADDRESSING       41
 #define CU_ATTRIBUTE_SHARED_PER_BLOCK_OPTIN   97
+#define CU_ATTRIBUTE_L2_CACHE_SIZE            38
 #define CU_FUNC_MAX_DYNAMIC_SHARED            8
 #define CU_FUNC_NUM_REGS                      4
 #define CU_FUNC_SHARED_BYTES                  1
@@ -141,6 +142,7 @@ static struct {
     char name[256];
     uint64_t memory;
     uint32_t sms, shared_optin;
+    uint64_t l2;                    /* the L2 cache's bytes (0: unknown) */
     Unit units[UNIT_COUNT];
     SpgSignal *lock;                /* loading units, submitting, capturing, the profile */
     bool profile;
@@ -224,6 +226,8 @@ static bool open_device(void) {
         cu.memory = total;
         cu.sms = (uint32_t)sms;
         cu.shared_optin = (uint32_t)shared;
+        int l2 = 0;
+        cu.l2 = cuDeviceGetAttribute(&l2, CU_ATTRIBUTE_L2_CACHE_SIZE, d) == 0 && l2 > 0 ? (uint64_t)l2 : 0u;
         make_current();
         if (cuStreamCreate(&cu.stream, CU_STREAM_NON_BLOCKING) != 0 ||
             cuStreamCreate(&cu.capture, CU_STREAM_NON_BLOCKING) != 0 ||
@@ -270,6 +274,7 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
     switch (kernel) {
         case SPG_KERNEL_bn: case SPG_KERNEL_bn_h: case SPG_KERNEL_output: return 64u;
         case SPG_KERNEL_gemm: case SPG_KERNEL_gemm_mma: return count > 9 ? spec[9] : 0u;
+        case SPG_KERNEL_attn: case SPG_KERNEL_attn_h: return count > 3 ? spec[3] : 0u;
         default: return 256u;
     }
 }
@@ -285,6 +290,8 @@ static bool grid_stride(SpgKernel kernel) {
             return false;
     }
 }
+
+static bool sloped_epilogue(uint32_t epi, uint32_t act);
 
 /* The unit that runs a kernel with these constants: the kernel's own, its tile's or window's. */
 static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
@@ -305,22 +312,31 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         if (conv_a) a = va && v ? 3u : 2u;
         if (conv_b) b = vb && v ? 3u : 2u;
         v = v && a != 2u && b != 2u;
-        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u%s", spec[0], spec[1], spec[2], spec[3], spec[4], a, b,
-                 v ? "v" : "");
+        /* (an epilogue of no slope: only the units with GENERAL, else none) */
+        snprintf(name, sizeof name, "gemm_%ux%ux%u_%ux%u_a%ub%u%s%s", spec[0], spec[1], spec[2], spec[3], spec[4], a, b,
+                 v ? "v" : "", sloped_epilogue(spec[7], spec[8]) ? "" : "_g");
     } else if (kernel == SPG_KERNEL_gemm_mma) {
         if (count < 14) return -1;
+        const bool general = !sloped_epilogue(spec[7], spec[8]);   /* (only the units with GENERAL, else none) */
         /* each operand: kept as bfloat16 and read eight values at once (w: VEC 4, 8), floats read four at once
            (f: VEC 1, 2), else o; the instances of Kernels.def, or else the one that reads anything */
         const uint32_t vec = spec[11], half = spec[13];
         const char ka = vec & 4u ? 'w' : (vec & 1u) && !(half & 1u) ? 'f' : 'o';
         const char kb = vec & 8u ? 'w' : (vec & 2u) && !(half & 2u) ? 'f' : 'o';
-        for (int any = 0; any < 2; any++) {
-            snprintf(name, sizeof name, "gemm_mma_%ux%ux%u_%ux%u_a%ub%u_%c%c", spec[0], spec[1], spec[2], spec[3], spec[4],
-                     spec[5], spec[6], any ? 'o' : ka, any ? 'o' : kb);
+        for (int any = 0; any < (general ? 1 : 2); any++) {
+            snprintf(name, sizeof name, "gemm_mma_%ux%ux%u_%ux%u_a%ub%u_%c%c%s", spec[0], spec[1], spec[2], spec[3], spec[4],
+                     spec[5], spec[6], any ? 'o' : ka, any ? 'o' : kb, general ? "_g" : "");
             for (uint32_t u = 0; u < UNIT_COUNT; u++)
                 if (!strcmp(spg_cuda_units[u].name, name)) return (int)u;
         }
         return -1;
+    } else if (kernel == SPG_KERNEL_attn || kernel == SPG_KERNEL_attn_h) {
+        if (count < 3) return -1;
+        /* the unit of its head size and pass: with BQ 0 the matrix units' (flash.cu), else rattn.cu's (heads of up
+           to 128) or attn.cu's */
+        if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], spec[0]);
+        else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u", spec[2], spec[0]);
+        else snprintf(name, sizeof name, "attn_d%u", spec[2]);
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];
@@ -663,8 +679,9 @@ static bool cub_record_begin(void *commands) {
     return true;
 }
 
-/* Whether a product's epilogue is one gemm.cu and gemm_mma.cu hold: its activation (or with EPI_DERIV its
-   derivative) a slope below zero, or none (softmax, which the output pass applies, leaves the outputs as they are). */
+/* Whether a product's epilogue is one gemm.cu, gemm_mma.cu and dconv.cu hold: its activation (or with EPI_DERIV its
+   derivative) a slope below zero, or none (softmax, which the output pass applies, leaves the outputs as they are).
+   The products' units built with GENERAL hold the others. */
 static bool sloped_epilogue(uint32_t epi, uint32_t act) {
     const bool sloped = act == SPINGALETT_ACT_NONE || act == SPINGALETT_ACT_RELU || act == SPINGALETT_ACT_LEAKY_RELU;
     if (epi == SPG_EPI_BIAS_ACT || epi == SPG_EPI_SCALE_ACT) return sloped || act == SPINGALETT_ACT_SOFTMAX;
@@ -714,14 +731,28 @@ static void dispatch_direct(CuCommands *c, SpgKernel kernel, const uint32_t *spe
     if (cu.profile) snprintf(op->label, sizeof op->label, "%s E%u", names[which], spec[7]);
 }
 
+/* Whether gemm.cu's blocks of a product take its tiles in bands of 2^BAND_LOG tiles of rows (gemm_common.cuh's
+   band_tile()): a product of matrices (not of a convolution's windows) whose A and C do not fit in L2 together, so
+   that a band's rows of A stay in L2 while its blocks take every tile of columns, rather than all of A read from
+   memory again for each (a GPT's products of 16,384 rows and more: its training 1.02 to 1.08 times as fast, its
+   inference 1.1 times). Where they fit, the blocks take the tiles of rows fastest, as before: in bands the MLP's
+   products of 4,096 rows ran 5% slower. (gemm_mma.cu takes its tiles in bands always: swizzled().) */
+#define BAND_LOG 3u
+static bool bands_pay(const uint32_t *spec, uint32_t spec_count, const SpgGemmPush *p) {
+    if (spec_count < 7 || spec[5] >= SPG_A_CONV || spec[6] >= SPG_B_CONV) return false;
+    return ((uint64_t)p->M * p->K + (uint64_t)p->M * p->N) * 4u > cu.l2;
+}
+
 static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec, uint32_t spec_count, const void *push,
                          uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
     CuCommands *c = (CuCommands *)commands;
     if (gx == 0 || gy == 0 || gz == 0) return;
-    /* the other epilogues (sigmoid, tanh, ...): the product with EPI_STORE (and with EPI_DERIV its alpha and beta),
-       then epi.cu's pass over its outputs, in the groups in z (such epilogues have no slices) */
+    /* the other epilogues (sigmoid, tanh, ...) where no unit with GENERAL runs the product: the product with EPI_STORE
+       (and with EPI_DERIV its alpha and beta), then epi.cu's pass over its outputs, in the groups in z (such epilogues
+       have no slices) */
     if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 9 && spec_count <= SPG_SPEC_MAX &&
-        push_size == sizeof(SpgGemmPush) && !sloped_epilogue(spec[7], spec[8])) {
+        push_size == sizeof(SpgGemmPush) && !sloped_epilogue(spec[7], spec[8]) &&
+        (direct_product(kernel, spec, spec_count, (const SpgGemmPush *)push) || unit_of(kernel, spec, spec_count) < 0)) {
         uint32_t linear[SPG_SPEC_MAX];
         SpgGemmPush q;
         memcpy(linear, spec, spec_count * sizeof(uint32_t));
@@ -752,26 +783,51 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
     const CUfunction f = spec_count <= SPG_SPEC_MAX && push_size <= SPG_PUSH_BYTES
                        ? unit_function(unit_of(kernel, spec, spec_count)) : NULL;
     const uint32_t threads = block_threads(kernel, spec, spec_count);
-    Op *op = f && threads ? add_op(c, OP_LAUNCH) : NULL;
-    if (!op) { c->ok = false; return; }
+    if (!f || !threads) { c->ok = false; return; }
     /* the kernels that run a grid-stride loop: a wave of blocks (eight of 256 threads an SM), each looping, rather
        than a block for every 256 values (blocks with little to do cost their launch: 3 us for 1,024 on an RTX
        4050; ResNet-20 inference in bfloat16 6% faster) */
     if (grid_stride(kernel) && gx > 8u * cu.sms) gx = 8u * cu.sms;
-    op->function = f;
-    op->grid[0] = gx; op->grid[1] = gy; op->grid[2] = gz;
-    op->block = threads;
-    op->shared = dynamic_shared(kernel, spec, spec_count);
-    memcpy(op->push, push, push_size);
-    memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
-    if (cu.profile) {
-        int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
-        if ((kernel == SPG_KERNEL_gemm || kernel == SPG_KERNEL_gemm_mma) && spec_count >= 8)
-            snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7],
-                     spec[0], spec[1]);
-        else
-            for (uint32_t k = 0; k < spec_count && k < 2 && len < 40; k++)
-                len += snprintf(op->label + len, sizeof op->label - (size_t)len, " %u", spec[k]);
+    const bool banded = kernel == SPG_KERNEL_gemm && push_size == sizeof(SpgGemmPush) &&
+                        bands_pay(spec, spec_count, (const SpgGemmPush *)push);
+    SpgGemmPush q;
+    if (banded) memcpy(&q, push, sizeof q);
+    const uint32_t first = banded ? q.m_tile0 : 0u;
+    for (uint32_t done = 0; done < gx;) {
+        uint32_t lx = gx, ly = gy;
+        if (banded) {       /* whole bands, at most 65,535 a launch; the tiles of rows after them as they are */
+            const uint32_t log = gx - done >= 1u << BAND_LOG ? BAND_LOG : 0u;
+            const uint32_t count = log ? ((gx - done) >> log < 65535u ? (gx - done) >> log : 65535u) : gx - done;
+            q.m_tile0 = first + done;
+            q.flags = (q.flags & ~(15u << SPG_GEMM_BAND_SHIFT)) | log << SPG_GEMM_BAND_SHIFT;
+            lx = log ? gy << log : count;
+            ly = log ? count : gy;
+            done += count << log;
+        } else {
+            done = gx;
+        }
+        Op *op = add_op(c, OP_LAUNCH);
+        if (!op) { c->ok = false; return; }
+        op->function = f;
+        op->grid[0] = lx; op->grid[1] = ly; op->grid[2] = gz;
+        op->block = threads;
+        op->shared = dynamic_shared(kernel, spec, spec_count);
+        memcpy(op->push, banded ? (const void *)&q : push, push_size);
+        memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
+        if (cu.profile) {
+            int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
+            if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {  /* (its unit's ways of reading A and B, _g) */
+                const char *unit = spg_cuda_units[unit_of(kernel, spec, spec_count)].name, *ways = strrchr(unit, '_');
+                if (ways && !strcmp(ways, "_g")) for (ways--; ways > unit && *ways != '_'; ways--) {}
+                snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %s", spec[5], spec[6],
+                         spec[7], spec[0], spec[1], ways ? ways + 1 : "");
+            } else if (kernel == SPG_KERNEL_gemm && spec_count >= 8)
+                snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u", spec[5], spec[6], spec[7],
+                         spec[0], spec[1]);
+            else
+                for (uint32_t k = 0; k < spec_count && k < 2 && len < 40; k++)
+                    len += snprintf(op->label + len, sizeof op->label - (size_t)len, " %u", spec[k]);
+        }
     }
 }
 

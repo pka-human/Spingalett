@@ -26,6 +26,32 @@
 #define EPI_PARTIAL     3u
 #define EPI_DERIV       4u
 #define FLAG_BIAS       1u
+#define FLAG_PRE        2u
+
+/* gemm_mma.cu's tiles of rows and columns (tm, tn) of block (x, y) of a product's dispatch: bands of SWIZZLE tiles
+   of rows, a band's blocks over every tile of columns with its rows fastest. Blocks start roughly in the order of x + y
+   times the blocks in x, so that a band's rows of A stay in L2 while its blocks take every tile of columns,
+   rather than all of A read again from memory for each tile of columns. Which block computes a tile changes
+   nothing in it. */
+#define SWIZZLE 8u
+DEVICE void swizzled(uint32_t &tm, uint32_t &tn) {
+    const uint32_t nx = blocks_x(), ny = blocks_y(), pid = block_y() * nx + block_x();
+    const uint32_t band = SWIZZLE * ny, first = pid / band * SWIZZLE, size = umin(nx - first, SWIZZLE);
+    tm = first + pid % band % size;
+    tn = pid % band / size;
+}
+
+/* gemm.cu's tiles: bands where the backend launches them so (Spingalett.Cuda.c's bands_pay()), a band's 2^b tiles of
+   rows (b in the flags: SPG_GEMM_BAND_SHIFT) over every tile of columns in x, the bands in y; with b = 0 block (x, y)
+   computes tile (x, y). Shifts and masks of the block's indices, which the compiler computes again where it needs
+   them: swizzled()'s divisions made the 128 x 128 tiles of single precision spill registers, which cost the MLP's
+   inference 4%. */
+DEVICE void band_tile(uint32_t flags, uint32_t &tm, uint32_t &tn) {
+    const uint32_t b = (flags >> SPG_GEMM_BAND_SHIFT) & 15u;
+    tm = block_x();
+    tn = block_y();
+    if (b) tm = (block_y() << b) + (block_x() & ((1u << b) - 1u)), tn = block_x() >> b;
+}
 
 #define GEO_RH 0u
 #define GEO_RW 1u

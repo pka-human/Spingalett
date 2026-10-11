@@ -251,6 +251,12 @@ void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total,
 #endif
 
     switch (act) {
+        case ACT_GELU:
+        case ACT_GELU_TANH:
+        case ACT_SILU:                  /* act_data: the values before the activation */
+            for (; i < total; i++)
+                deriv[i] *= spingalett_input_derivative(act_data[i], act);
+            break;
         case ACT_RELU:
             for (; i < total; i++)
                 deriv[i] *= (act_data[i] > 0.0f) ? 1.0f : 0.0f;
@@ -547,12 +553,50 @@ float spingalett_clip_grad_norm(NeuralNetwork *net, float max_norm) {
     return grad_norm;
 }
 
+float spingalett_sparse_cross_entropy(const float *z, const float *t, uint32_t cells, uint32_t C, float smoothing,
+                                      float *delta, float *correct) {
+    const float keep = 1.0f - smoothing, share = smoothing / (float)C;
+    uint32_t count = 0, hits = 0;
+    for (uint32_t p = 0; p < cells; p++) count += t[p] >= 0.0f && t[p] < (float)C;
+    const float inv = count ? 1.0f / (float)count : 0.0f;
+    double loss = 0.0;
+    for (uint32_t p = 0; p < cells; p++) {
+        const float *zp = z + (uint64_t)p * C;
+        float *dp = delta ? delta + (uint64_t)p * C : NULL;
+        if (!(t[p] >= 0.0f && t[p] < (float)C)) {
+            if (dp) memset(dp, 0, (size_t)C * sizeof(float));
+            continue;
+        }
+        const uint32_t target = (uint32_t)t[p];
+        uint32_t best = 0;
+        float m = zp[0], sum = 0.0f, total = 0.0f;
+        for (uint32_t c = 1; c < C; c++)
+            if (zp[c] > m) { m = zp[c]; best = c; }
+        for (uint32_t c = 0; c < C; c++) {
+            sum += expf(zp[c] - m);
+            total += zp[c];
+        }
+        const float lse = m + logf(sum);
+        hits += best == target;
+        /* -sum_c q_c log p_c with q = keep at the target plus share everywhere */
+        loss += (double)(keep * (lse - zp[target]) + (share > 0.0f ? share * ((float)C * lse - total) : 0.0f));
+        if (dp) {
+            for (uint32_t c = 0; c < C; c++) dp[c] = (expf(zp[c] - lse) - share) * inv;
+            dp[target] -= keep * inv;
+        }
+    }
+    if (correct) *correct = count ? (float)hits / (float)count : 0.0f;
+    return (float)(loss * (double)inv);
+}
+
 float compute_sample_loss(const float *output, const float *target,
-                          uint32_t output_size, LossFunction loss_func,
+                          uint32_t output_size, uint32_t cells, LossFunction loss_func,
                           ActivationFunction output_act) {
     const float epsilon_log = 1e-9f;
     float loss = 0.0f;
 
+    if (loss_func == LOSS_SPARSE_CROSS_ENTROPY)
+        return spingalett_sparse_cross_entropy(output, target, cells, output_size / cells, 0.0f, NULL, NULL);
     if (loss_func == LOSS_MSE) {
         for (uint32_t k = 0; k < output_size; k++) {
             float diff = output[k] - target[k];
@@ -579,7 +623,23 @@ float compute_sample_loss(const float *output, const float *target,
     return loss;
 }
 
-bool spingalett_sample_correct(const float *out, const float *target, uint32_t n) {
+float spingalett_sample_correct(const float *out, const float *target, uint32_t n, uint32_t cells,
+                                LossFunction loss_func) {
+    if (loss_func == LOSS_SPARSE_CROSS_ENTROPY) {
+        /* the cells' largest logits against their targets */
+        const uint32_t C = n / cells;
+        uint32_t count = 0, hits = 0;
+        for (uint32_t p = 0; p < cells; p++) {
+            if (!(target[p] >= 0.0f && target[p] < (float)C)) continue;
+            const float *o = out + (uint64_t)p * C;
+            uint32_t best = 0;
+            for (uint32_t c = 1; c < C; c++)
+                if (o[c] > o[best]) best = c;
+            count++;
+            hits += best == (uint32_t)target[p];
+        }
+        return count ? (float)hits / (float)count : 0.0f;
+    }
     if (n == 1)
         return (out[0] >= 0.5f) == (target[0] >= 0.5f);
     uint32_t best_out = 0, best_target = 0;
@@ -587,7 +647,7 @@ bool spingalett_sample_correct(const float *out, const float *target, uint32_t n
         if (out[k] > out[best_out]) best_out = k;
         if (target[k] > target[best_target]) best_target = k;
     }
-    return best_out == best_target;
+    return best_out == best_target ? 1.0f : 0.0f;
 }
 
 void spingalett_fp16_encode(const float *restrict src, size_t n, uint16_t *restrict dst) {

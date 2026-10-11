@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 1.1.0 LANGUAGES C)
+project(Spingalett VERSION 1.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -583,7 +583,7 @@ if(BUILD_TESTS)
         endif()
     endif()
 
-    foreach(group grad conv norm graph onnx equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
+    foreach(group grad conv norm graph transformer onnx equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()
@@ -629,6 +629,11 @@ if(BUILD_TESTS)
     spingalett_engine_library(SpingalettEngine)
     spingalett_engine_tests(SpingalettEngine SpingalettTests)
 
+    # The public structures' layout as the C compiler lays them out, which the bindings' tests compare with
+    # theirs (Python here, the others' through SPINGALETT_LAYOUT)
+    add_executable(SpingalettLayout ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Layout.c)
+    target_link_libraries(SpingalettLayout PRIVATE spingalett)
+
     # A sanitizer-instrumented library cannot be loaded into an uninstrumented Python.
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND AND NOT CMAKE_C_FLAGS MATCHES "-fsanitize" AND NOT CMAKE_CROSSCOMPILING)
@@ -641,8 +646,6 @@ if(BUILD_TESTS)
                              PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/Bindings/Python
                              ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Tests/test_python_bindings.py)
 
-            add_executable(SpingalettLayout ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Layout.c)
-            target_link_libraries(SpingalettLayout PRIVATE spingalett)
             add_test(NAME python.layout
                      COMMAND ${CMAKE_COMMAND} -E env
                              SPINGALETT_LIBRARY=$<TARGET_FILE:spingalett>
@@ -676,3 +679,28 @@ if(TARGET spingalett_runtime)
     spingalett_runtime_install(OFF)
 endif()
 spingalett_install_package()
+
+# ------------------------------------------------------------------------------
+# Packages of the installed files: cpack -G DEB, cpack -G RPM (the release workflow configures the library
+# directory each wants: lib/<multiarch> for Debian, lib64 for RPM distributions)
+# ------------------------------------------------------------------------------
+set(CPACK_PACKAGE_NAME spingalett)
+set(CPACK_PACKAGE_VENDOR pka_human)
+set(CPACK_PACKAGE_CONTACT "pka_human <pka_human@proton.me>")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Neural networks in C: training on the CPU and GPUs (CUDA, Vulkan), transformers, deployment down to INT2")
+set(CPACK_PACKAGE_HOMEPAGE_URL https://github.com/pka-human/Spingalett)
+set(CPACK_RESOURCE_FILE_LICENSE ${PROJECT_SOURCE_DIR}/LICENSE)
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_SECTION libs)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libgomp1")
+find_program(SPINGALETT_DPKG_SHLIBDEPS dpkg-shlibdeps)
+if(SPINGALETT_DPKG_SHLIBDEPS)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)          # (libc6's version, ... from the binaries, on Debian systems)
+endif()
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+set(CPACK_RPM_PACKAGE_LICENSE MIT)
+set(CPACK_RPM_PACKAGE_GROUP "Development/Libraries")
+set(CPACK_RPM_PACKAGE_URL https://github.com/pka-human/Spingalett)
+include(CPack)

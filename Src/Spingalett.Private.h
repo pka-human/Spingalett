@@ -122,10 +122,25 @@ typedef struct BatchWorkspace {
     float *bn_flat;
     double *bn_sums_flat;
     /* layer normalization, training only: bn_stats[l] of a normalizing layer l holds each cell's mean
-       and 1 / std (2 x capacity x cells, in ln_flat), ln_scratch its parameter gradients' partial sums */
+       and 1 / std (2 x capacity x cells, in ln_flat), ln_scratch its parameter gradients' partial sums;
+       RMS normalization each cell's 1 / rms (capacity x cells), attention each sample's, head's and
+       query's log of the softmax's sum (capacity x heads x cells), in ln_flat too */
     float *ln_flat;
     double *ln_scratch;
+    /* training: the values of layers whose activation needs them for its derivative (GELU, SiLU)
+       before it (spingalett_act_needs_input()), capacity x outputs each, or NULL */
+    float **pre;
+    float *pre_flat;
+    /* attention: the rotary embeddings' cosines and sines of every attention layer that has them
+       (rope[l]: cells x head size / 2 of each), scratch for every thread, and a matrix product scratch
+       of one thread each */
+    float **rope;
+    float *rope_flat;
+    float *attn;
+    SpingalettGemmScratch **attn_gemm;
+    int attn_threads;
     bool training;          /* normalize with batch statistics */
+    float smoothing;        /* LOSS_SPARSE_CROSS_ENTROPY: label smoothing of the loss's targets */
     uint32_t capacity;
 } BatchWorkspace;
 
@@ -179,11 +194,11 @@ void spingalett_global_pool_backward(const float *dy, float *dx, const float *x,
    derivative of act read from y. */
 void spingalett_gradient_sum(float *delta, const float *add, const float *y, const float *dmask, uint32_t n,
                              uint64_t size, ActivationFunction act, bool last, ComputeMode mode);
-/* Summed loss and number of correctly classified samples (see EvalMetrics) over n samples, in
+/* Summed loss and of how far each sample was classified correctly (see EvalMetrics) over n samples, in
    chunks of ws->capacity. ws is an inference workspace; out_buf holds [capacity x output size]. */
 void spingalett_batch_evaluate(NeuralNetwork *net, BatchWorkspace *ws, float *out_buf,
                                const float *inputs, const float *targets, uint32_t n, ComputeMode mode,
-                               double *loss_sum, uint32_t *correct);
+                               double *loss_sum, double *correct);
 
 /* Convolution and pooling over batches of n channels-last samples (Spingalett.Conv.c); weight
    layer l connects layer l to l + 1. scratch holds spingalett_conv_scratch_floats() floats. */
@@ -273,6 +288,45 @@ void spingalett_ln_backward_data(const NeuralNetwork *net, uint32_t l, const flo
                                  uint32_t n, const float *stats, ActivationFunction act, ComputeMode mode);
 void spingalett_ln_backward_params(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
                                    const float *stats, float scale, float beta, double *partial, ComputeMode mode);
+/* The layers of transformers (Spingalett.Transformer.c), weight layer l (feeding layer l + 1) over n
+   samples. Embeddings: the forward pass (act applied unless softmax), and the gradients of the table
+   (and positions) g = beta g + the sum of scale dy over the batch. */
+void spingalett_embedding_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                                  ActivationFunction act, ComputeMode mode);
+void spingalett_embedding_backward(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
+                                   float scale, float beta, ComputeMode mode);
+/* RMS normalization: as layer normalization's passes (stats: each cell's 1 / rms). */
+void spingalett_rms_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                            ActivationFunction act, float *stats, ComputeMode mode);
+void spingalett_rms_backward_data(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
+                                  uint32_t n, const float *stats, ComputeMode mode);
+void spingalett_rms_backward_params(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
+                                    const float *stats, float scale, float beta, double *partial, ComputeMode mode);
+/* Multiplication: y = act(x[0] x[1] ...) over n samples of `size` floats, the inputs multiplied in their
+   order; the gradient of input k: dx (= dx + with accumulate) = dy times the other inputs. */
+void spingalett_multiply_forward(const float *const *x, uint32_t count, float *y, uint32_t n, uint64_t size,
+                                 ActivationFunction act, ComputeMode mode);
+void spingalett_multiply_backward(const float *const *x, uint32_t count, uint32_t k, const float *dy, float *dx,
+                                  uint32_t n, uint64_t size, bool accumulate, ComputeMode mode);
+/* Attention: the rotary embeddings' table of layer l + 1 (spingalett_engine_rope_table()), the floats of
+   scratch a thread needs, the forward pass (y without activation; lse, when training, each query's log
+   of the softmax's sum) and the input's gradient dx from dy = dL/dy (lse the forward pass's), with one
+   scratch of spingalett_attention_scratch() floats and one matrix product scratch a
+   thread (ws->attn, ws->attn_gemm). */
+size_t spingalett_attention_scratch(const NeuralNetwork *net, uint32_t l, bool training);
+void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                                  float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
+                                   uint32_t n, const float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+/* The sparse cross-entropy of one sample (LOSS_SPARSE_CROSS_ENTROPY): `cells` rows of C logits z and a
+   target a cell (a class index; outside 0 .. C - 1: none), the targets smoothed (one-hot times 1 -
+   smoothing, plus smoothing / C at every class). Returns the mean loss over the cells with targets (0
+   without any); delta (unless NULL) gets dL/dz, (softmax(z) - target) / that count (zero in cells
+   without targets); *correct (unless NULL) the fraction of those cells whose largest logit is the
+   target's. */
+float spingalett_sparse_cross_entropy(const float *z, const float *t, uint32_t cells, uint32_t C, float smoothing,
+                                      float *delta, float *correct);
+
 /* Upsampling (Spingalett.Graph.c): n samples of in_h x in_w x C by sh x sw (UpsampleMode upsample);
    the backward pass writes dx (or adds to it with accumulate, then without act) times act'(x). */
 void spingalett_upsample_forward(const float *x, float *y, uint32_t n, uint32_t in_h, uint32_t in_w, uint32_t C,
@@ -376,11 +430,29 @@ static inline float spingalett_activate_value(float x, ActivationFunction act) {
             return tanhf(x);
         case ACT_FOO52:
             return x > 1.0f ? 1.0f + 0.01f * (x - 1.0f) : (x < 0.0f ? 0.01f * x : x);
+        case ACT_GELU:
+        case ACT_GELU_TANH:
+        case ACT_SILU:
+            return spingalett_engine_activate_one(x, act);
         default:
             return x;
     }
 }
 
+/* The derivative of GELU, its tanh approximation or SiLU at x, the value before the activation. */
+static inline float spingalett_input_derivative(float x, ActivationFunction act) {
+    if (act == ACT_GELU)                /* Phi(x) + x phi(x) */
+        return 0.5f * (1.0f + erff(x * 0.70710678118654752f)) + x * 0.39894228040143268f * expf(-0.5f * x * x);
+    if (act == ACT_GELU_TANH) {
+        const float k = 0.79788456080286536f, t = tanhf(k * (x + 0.044715f * x * x * x));
+        return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * k * (1.0f + 3.0f * 0.044715f * x * x);
+    }
+    const float sg = 1.0f / (1.0f + expf(-x));      /* SiLU: sigmoid (1 + x (1 - sigmoid)) */
+    return sg * (1.0f + x * (1.0f - sg));
+}
+
+/* Applies `act` to n values (softmax: as one vector) and its derivative: deriv *= act'(act_data), from
+   the layer's outputs, or for GELU and SiLU from its values before the activation. */
 void apply_softmax(float *layer, uint32_t size);
 void apply_activation_batch(float *data, uint32_t size, ActivationFunction act);
 void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act);
@@ -639,7 +711,7 @@ void spingalett_gpu_done(NeuralNetwork *net, struct SpgGpuNet *gpu);
    the GPU; false when the device failed. */
 bool spingalett_gpu_evaluate(struct SpgGpuNet *gpu, NeuralNetwork *net, const float *inputs,
                              const SpingalettDeviceData *rows, const float *targets, uint32_t n, double *loss_sum,
-                             uint32_t *correct);
+                             double *correct);
 /* A call's samples given either on the host or in the GPU's memory (`what` names them): one of them,
    a set of at least count rows of `size`; false with the error set otherwise. */
 bool spingalett_device_check(const float *host, const SpingalettDeviceData *data, uint32_t count, uint32_t size,
@@ -651,11 +723,14 @@ float *spingalett_device_rows(const SpingalettDeviceData *data, uint32_t count, 
 void spingalett_fp_flush_denormals_begin(void);
 void spingalett_fp_flush_denormals_end(void);
 
+/* A sample's loss: `outputs` values in `cells` cells (the output layer's) against its targets. */
 float compute_sample_loss(const float *output, const float *target,
-                          uint32_t output_size, LossFunction loss_func,
+                          uint32_t output_size, uint32_t cells, LossFunction loss_func,
                           ActivationFunction output_act);
-/* Whether a sample counts as correctly classified (see EvalMetrics). */
-bool spingalett_sample_correct(const float *output, const float *target, uint32_t n);
+/* How far a sample counts as correctly classified (see EvalMetrics): 0 or 1, for
+   LOSS_SPARSE_CROSS_ENTROPY the fraction of its cells with targets whose class it predicts. */
+float spingalett_sample_correct(const float *output, const float *target, uint32_t n, uint32_t cells,
+                                LossFunction loss_func);
 
 extern const char * const act_func_names[];
 extern const char * const loss_func_names[];

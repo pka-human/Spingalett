@@ -114,6 +114,12 @@ typedef SpingalettDatasetReaderOptions DatasetReaderOptions;
 #define conv_transpose2d(...) spingalett_conv_transpose2d(__VA_ARGS__)
 #define upsample2d(...) spingalett_upsample2d(__VA_ARGS__)
 #define layer_norm(...) spingalett_layer_norm(__VA_ARGS__)
+/* the transformers' layers of 1.2, short for the examples as the rest */
+#define linear(...) spingalett_linear(__VA_ARGS__)
+#define embedding(...) spingalett_embedding(__VA_ARGS__)
+#define attention(...) spingalett_attention(__VA_ARGS__)
+#define rms_norm(...) spingalett_rms_norm(__VA_ARGS__)
+#define multiply_layers(...) spingalett_multiply_layers(__VA_ARGS__)
 #define forward(...) spingalett_forward(__VA_ARGS__)
 #define predict(...) spingalett_predict(__VA_ARGS__)
 #define evaluate(...) spingalett_evaluate(__VA_ARGS__)

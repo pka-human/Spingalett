@@ -15,6 +15,10 @@
  * Backward: dx = rstd (gamma dy - (a + xhat b) / C), a and b the cell's sums of gamma dy and of
  * gamma dy xhat, xhat = (x - mean) rstd; times the derivative of the input layer's activation.
  * The parameters' gradients are column sums (colsum.comp, mode LN).
+ *
+ * RMS (RMS normalization): the mean taken as 0 and the variance as the mean square, no beta, and the
+ * backward pass without a (whose term the mean brings); stats keep 0 and 1 / rms, so that the
+ * parameters' sums are layer normalization's.
  */
 
 #version 460
@@ -30,6 +34,7 @@ layout(constant_id = 3) const uint HALF = 0;    /* words: x 0, y 1, dy 2 (half.g
 layout(local_size_x = 256) in;
 
 #define FLAG_STATS 1u
+#define FLAG_RMS   2u
 
 layout(push_constant) uniform Push {
     F32 x, y, dy, gamma, beta, stats;   /* backward: y is dx */
@@ -59,9 +64,10 @@ void main() {
     for (uint base = gl_WorkGroupID.x * per; base < p.cells; base += gl_NumWorkGroups.x * per) {
         const uint cell = base + tid / T, at = cell * C;
         const bool live = cell < p.cells;
+        const bool rms = (p.flags & FLAG_RMS) != 0u;
         if (BACKWARD == 0u) {
             float sum = 0.0;
-            if (live) for (uint c = lane; c < C; c += T) sum += ld(p.x, at + c, 0u);
+            if (live && !rms) for (uint c = lane; c < C; c += T) sum += ld(p.x, at + c, 0u);
             s1[tid] = sum;
             tree(tid, lane, false);
             const float mean = s1[first] * inv;
@@ -77,7 +83,8 @@ void main() {
             const float rstd = 1.0 / sqrt(s1[first] * inv + p.eps);
             if (live) {
                 for (uint c = lane; c < C; c += T)
-                    st(p.y, at + c, 1u, activate((ld(p.x, at + c, 0u) - mean) * rstd * p.gamma.v[c] + p.beta.v[c], ACT));
+                    st(p.y, at + c, 1u, activate((ld(p.x, at + c, 0u) - mean) * rstd * p.gamma.v[c] + (rms ? 0.0 : p.beta.v[c]),
+                                                 ACT));
                 if ((p.flags & FLAG_STATS) != 0u && lane == 0u) {
                     p.stats.v[2u * cell] = mean;
                     p.stats.v[2u * cell + 1u] = rstd;
@@ -95,7 +102,7 @@ void main() {
             s1[tid] = a;
             s2[tid] = b;
             tree(tid, lane, true);
-            const float sa = s1[first], sb = s2[first];
+            const float sa = rms ? 0.0 : s1[first], sb = s2[first];
             if (live)
                 for (uint c = lane; c < C; c += T) {
                     const float v = ld(p.x, at + c, 0u), xhat = (v - mean) * rstd;

@@ -2013,6 +2013,71 @@ static void dataset_crafted(const char *path, const SpingalettDataset *ph) {
     remove("spingalett_test_many.slettd");
 }
 
+/* Windows of token files: nanoGPT's (uint16, nothing else) and llm.c's (a header, then uint32 here), every
+   window once a pass, in the order its seed gives. */
+static void token_files(void) {
+    const char *paths[] = {"spingalett_test_tokens.bin", "spingalett_test_tokens_llmc.bin"};
+    const uint32_t n = 103, context = 8, stride = 3;
+    for (int file = 0; file < 2; file++) {
+        FILE *f = fopen(paths[file], "wb");
+        if (file) {         /* llm.c: magic, version 2 (uint32 tokens), the count, then 253 more int32 */
+            uint32_t header[256] = {20240520u, 2u, n};
+            fwrite(header, sizeof header, 1, f);
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t t = (i * 37u + 5u) % 50000u;
+            const uint8_t b[4] = {(uint8_t)t, (uint8_t)(t >> 8), (uint8_t)(t >> 16), (uint8_t)(t >> 24)};
+            fwrite(b, 1, file ? 4 : 2, f);
+        }
+        fclose(f);
+        for (int shuffled = 0; shuffled < 2; shuffled++) {
+            spingalett_seed(77);
+            SpingalettTokenReaderOptions o = {.context = context, .stride = stride, .shuffle = shuffled};
+            SpingalettDatasetReader *r = spingalett_dataset_open_tokens(paths[file], &o);
+            const uint32_t count = (n - context - 1) / stride + 1;
+            CHECK(r && spingalett_dataset_info(r).count == count && spingalett_dataset_info(r).input_size == context &&
+                  spingalett_dataset_info(r).target_size == context, "tokens %d: reader info", file);
+            if (!r) continue;
+            float x[5 * 8], t[5 * 8];
+            bool *seen = calloc(count, sizeof(bool)), ok = true, ordered = true;
+            uint32_t total = 0, got, first[2] = {0, 0};
+            for (int pass = 0; pass < 2; pass++) {
+                total = 0;
+                memset(seen, 0, count * sizeof(bool));
+                while ((got = spingalett_dataset_read(r, x, t, 5)) > 0) {
+                    for (uint32_t k = 0; k < got; k++) {
+                        uint32_t start = 0;     /* the window's start: the token whose value it holds first */
+                        while (start < n && (start * 37u + 5u) % 50000u != (uint32_t)x[k * context]) start++;
+                        ok = ok && start % stride == 0 && start / stride < count && !seen[start / stride];
+                        if (start / stride < count) seen[start / stride] = true;
+                        if (total + k == 0) first[pass] = start;
+                        ordered = ordered && start == (total + k) * stride;
+                        for (uint32_t j = 0; j < context; j++)
+                            ok = ok && x[k * context + j] == (float)(((start + j) * 37u + 5u) % 50000u) &&
+                                 t[k * context + j] == (float)(((start + j + 1u) * 37u + 5u) % 50000u);
+                    }
+                    total += got;
+                }
+            }
+            CHECK(ok && total == count, "tokens %d: windows (%u of %u)", file, total, count);
+            CHECK(shuffled ? !ordered && first[0] != first[1] : ordered, "tokens %d: order of a pass (shuffled %d)", file,
+                  shuffled);
+            free(seen);
+            spingalett_dataset_close(r);
+        }
+        remove(paths[file]);
+    }
+    /* too few tokens for a window */
+    SpingalettTokenReaderOptions o = {.context = 1000};
+    FILE *f = fopen(paths[0], "wb");
+    fwrite(paths[0], 1, 20, f);
+    fclose(f);
+    CHECK(!spingalett_dataset_open_tokens(paths[0], &o) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "tokens: a file too short for its windows");
+    remove(paths[0]);
+    printf("  token files: nanoGPT's and llm.c's windows ok\n");
+}
+
 static void dataset_files_v2(void) {
     /* dense 8-bit "photographs" (smooth colour fields with noise), 32 x 32 x 3; the first two
        values of a sample encode its index */
@@ -2520,7 +2585,7 @@ static void model_validation(void) {
     }
 
     memcpy(buf, img, size);
-    buf[6] = 8;                                                  /* a future format version */
+    buf[6] = 9;                                                  /* a future format version */
     reseal(buf, size);
     CHECK(spingalett_model_init(&m, buf, size) == SPINGALETT_ERR_FORMAT_VERSION, "validation: future version");
     CHECK(spingalett_model_init(NULL, img, size) == SPINGALETT_ERR_INVALID && spingalett_model_init(&m, NULL, size) == SPINGALETT_ERR_INVALID,
@@ -3891,6 +3956,330 @@ static void graph_folding(void) {
 
 /* Builders reject inputs that do not fit; unused layers fail training and prediction; corrupt
    version 6 images are rejected. */
+/* ------------------------------------------------------------------------- transformers */
+
+/* Networks of the transformer layers on sequences of T tokens (the inputs: token indices). */
+static NeuralNetwork *tf_net(int which, uint32_t T, uint32_t V) {
+    NeuralNetwork *net;
+    uint32_t x, a, b, c;
+    switch (which) {
+        case 0:     /* GPT-2-like: learned positions, layer normalization, causal attention, a GELU MLP */
+            net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+            layer(.net = net, .neurons_amount = T);
+            x = embedding(.net = net, .vocabulary = V, .neurons_amount = 8, .positions = true,
+                          .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+            layer_norm(.net = net);
+            linear(.net = net, .neurons_amount = 24);
+            attention(.net = net, .heads = 2, .causal = true);
+            a = linear(.net = net, .neurons_amount = 8);
+            x = add_layers(.net = net, .inputs = {x, a});
+            layer_norm(.net = net);
+            linear(.net = net, .neurons_amount = 16, .act_func = ACT_GELU);
+            a = linear(.net = net, .neurons_amount = 8);
+            add_layers(.net = net, .inputs = {x, a});
+            layer_norm(.net = net);
+            linear(.net = net, .neurons_amount = V);
+            return net;
+        case 1:     /* LLaMA-like: RMS normalization, grouped-query attention with rotary embeddings, SwiGLU */
+            net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+            layer(.net = net, .neurons_amount = T);
+            x = embedding(.net = net, .vocabulary = V, .neurons_amount = 8);
+            rms_norm(.net = net);
+            linear(.net = net, .neurons_amount = 32);             /* 4 query heads, 2 key and value heads of 4 */
+            attention(.net = net, .heads = 4, .kv_heads = 2, .rope_theta = 10000.0f, .causal = true);
+            a = linear(.net = net, .neurons_amount = 8);
+            x = add_layers(.net = net, .inputs = {x, a});
+            b = rms_norm(.net = net, .epsilon = 1e-6f);
+            c = linear(.net = net, .neurons_amount = 12, .act_func = ACT_SILU);
+            a = linear(.net = net, .inputs = {b}, .neurons_amount = 12);
+            multiply_layers(.net = net, .inputs = {c, a});
+            a = linear(.net = net, .neurons_amount = 8);
+            add_layers(.net = net, .inputs = {x, a});
+            rms_norm(.net = net);
+            linear(.net = net, .neurons_amount = V);
+            return net;
+        case 2:     /* attention over the cells of a map, every cell to every other (no mask), multi-query with
+                       rotary embeddings, GELU's tanh form, a regression */
+            net = new_spingalett(.loss_func = LOSS_MSE);
+            layer(.net = net, .height = 2, .width = 3, .channels = 4);
+            conv2d(.net = net, .filters = 12, .kernel = 1, .act_func = ACT_NONE);   /* 2 query heads, 1 key/value head of 3 */
+            attention(.net = net, .heads = 2, .kv_heads = 1, .act_func = ACT_GELU_TANH);
+            layer(.net = net, .neurons_amount = 3, .act_func = ACT_TANH);
+            return net;
+        default:    /* products of three layers and of a layer with itself, SiLU and GELU outputs read twice */
+            net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+            layer(.net = net, .neurons_amount = T);
+            x = embedding(.net = net, .vocabulary = V, .neurons_amount = 6, .positions = true, .act_func = ACT_SILU);
+            a = linear(.net = net, .neurons_amount = 6, .act_func = ACT_GELU);
+            b = linear(.net = net, .inputs = {x}, .neurons_amount = 6, .act_func = ACT_TANH);
+            c = multiply_layers(.net = net, .inputs = {a, b, a});
+            a = multiply_layers(.net = net, .inputs = {c, x}, .act_func = ACT_SILU);
+            linear(.net = net, .inputs = {a}, .neurons_amount = V);
+            return net;
+    }
+}
+
+/* Token inputs and targets (a fifth of them none) for N samples, or random inputs and regression targets. */
+static void tf_data(const NeuralNetwork *net, uint32_t N, uint32_t V, float **x, float **y) {
+    const uint32_t in = net->topology[0], tn = spingalett_target_size(net);
+    *x = malloc((size_t)N * in * sizeof(float));
+    *y = malloc((size_t)N * tn * sizeof(float));
+    const bool tokens = net->shapes[1].type == LAYER_EMBEDDING;
+    for (size_t i = 0; i < (size_t)N * in; i++) {
+        float r = frand();
+        (*x)[i] = tokens ? (float)((uint32_t)(r * 4096.0f) % V) : r * 2 - 1;
+    }
+    for (size_t i = 0; i < (size_t)N * tn; i++) {
+        float r = frand();
+        if (net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) (*y)[i] = r < 0.2f ? -1.0f : (float)((uint32_t)(r * 4096.0f) % V);
+        else (*y)[i] = r * 1.6f - 0.8f;
+    }
+}
+
+static void tf_init(NeuralNetwork *net) {
+    for (uint32_t l = 1; l < net->layers; l++) {
+        SpingalettNetworkLayer d;
+        spingalett_network_layer(net, l, &d);
+        const bool norm = d.type == LAYER_LAYER_NORM || d.type == LAYER_RMS_NORM;
+        const uint64_t rows = d.type == LAYER_EMBEDDING ? d.vocabulary : d.type == LAYER_RMS_NORM ? d.channels : d.bias_count;
+        const float scale = d.weight_count && rows && !norm && d.type != LAYER_EMBEDDING
+                          ? 1.5f / sqrtf((float)(d.weight_count / rows)) : 0.6f;
+        for (uint64_t i = 0; i < d.weight_count; i++)
+            net->weights[net->weight_offsets[l - 1] + i] = norm ? 0.6f + frand() * 0.8f : (frand() * 2 - 1) * scale;
+        for (uint64_t i = 0; i < d.bias_count; i++) net->biases[net->bias_offsets[l - 1] + i] = frand() * 0.2f - 0.1f;
+    }
+}
+
+/* The loss the gradient follows: the sparse cross-entropy as evaluate() gives it, half the squared error. */
+static double tf_loss(NeuralNetwork *net, const float *x, const float *y, uint32_t N) {
+    EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y, .sample_count = N);
+    return net->loss_func == LOSS_MSE ? 0.5 * m.loss : m.loss;
+}
+
+static void tf_gradcheck(int which, ComputeMode mode, TrainingStrategy strat) {
+    lcg_state = 5000 + which;
+    const uint32_t T = 5, V = 7, N = 4;
+    NeuralNetwork *net = tf_net(which, T, V);
+    float *x, *y;
+    tf_data(net, N, V, &x, &y);
+    spingalett_set_compute_mode(mode);
+    tf_init(net);
+    uint64_t nw = net->total_weights, nb = net->total_biases;
+    float *w0 = malloc(nw * 4 + 4), *b0 = malloc(nb * 4 + 4);
+    memcpy(w0, net->weights, nw * 4); memcpy(b0, net->biases, nb * 4);
+    TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 1.0f,
+                          .optimizer_type = OPTIMIZER_SGD, .training_strategy = strat, .batch_size = N);
+    CHECK(r.status == TRAIN_COMPLETED, "transformer gradcheck net %d: train failed (%s)", which, spingalett_last_error_message());
+    float *ga = malloc((nw + nb) * 4 + 4);
+    for (uint64_t i = 0; i < nw; i++) ga[i] = w0[i] - net->weights[i];
+    for (uint64_t i = 0; i < nb; i++) ga[nw + i] = b0[i] - net->biases[i];
+    memcpy(net->weights, w0, nw * 4); memcpy(net->biases, b0, nb * 4);
+    net->param_version++; net->host_version++;
+
+    int bad = 0, kinks = 0; double maxrel = 0;
+    for (uint64_t i = 0; i < nw + nb; i++) {
+        float *p = i < nw ? &net->weights[i] : &net->biases[i - nw];
+        float orig = *p, h = 1e-3f, h2 = 2.5e-4f;
+        *p = orig + h; double lp = tf_loss(net, x, y, N);
+        *p = orig - h; double lm = tf_loss(net, x, y, N);
+        *p = orig + h2; double lp2 = tf_loss(net, x, y, N);
+        *p = orig - h2; double lm2 = tf_loss(net, x, y, N);
+        *p = orig;
+        double gn = (lp - lm) / (2.0 * h), gn2 = (lp2 - lm2) / (2.0 * h2);
+        if (fabs(gn - gn2) > 0.1 * (fabs(gn) + fabs(gn2)) + 3e-4) { kinks++; continue; }
+        double rel = fmin(fabs(gn - ga[i]) / fmax(1e-2, fabs(gn) + fabs(ga[i])),
+                          fabs(gn2 - ga[i]) / fmax(1e-2, fabs(gn2) + fabs(ga[i])));
+        if (rel > maxrel) maxrel = rel;
+        if (rel > 3e-2) {
+            bad++;
+            if (bad <= 3) printf("    param %llu: numeric %.5f analytic %.5f\n", (unsigned long long)i, gn, ga[i]);
+        }
+    }
+    printf("  transformer gradcheck net %d mode=%d strat=%d  maxrel=%.2e  outliers=%d/%llu kinks=%d\n", which, mode,
+           strat, maxrel, bad, (unsigned long long)(nw + nb), kinks);
+    CHECK(bad == 0 && kinks * 10 < (int)(nw + nb), "transformer gradcheck net %d mode %d strat %d: %d outliers", which,
+          mode, strat, bad);
+    free(ga); free(w0); free(b0); free(x); free(y);
+    free_network(net);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Training gives the same bits on one thread and on many, with dropout on a SiLU layer and AdamW. */
+static void tf_determinism(void) {
+    const uint32_t T = 12, V = 11, N = 40;
+    float *w[2] = {NULL, NULL};
+    uint64_t nw = 0;
+    for (int run = 0; run < 2; run++) {
+        lcg_state = 77;
+        spingalett_seed(5);
+        NeuralNetwork *net = tf_net(1, T, V);
+        net->dropout_rates[9] = 0.2f;                       /* the SiLU gate */
+        float *x, *y;
+        tf_data(net, N, V, &x, &y);
+        tf_init(net);
+        spingalett_set_compute_mode(run ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+        TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 3,
+                              .learning_rate = 3e-3f, .optimizer_type = OPTIMIZER_ADAMW, .weight_decay = 0.1f,
+                              .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 16, .label_smoothing = 0.1f,
+                              .max_grad_norm = 1.0f);
+        CHECK(r.status == TRAIN_COMPLETED && isfinite(r.train_loss), "transformer determinism: training failed");
+        nw = net->total_weights + net->total_biases;
+        w[run] = malloc(nw * sizeof(float));
+        memcpy(w[run], net->weights, net->total_weights * sizeof(float));
+        memcpy(w[run] + net->total_weights, net->biases, net->total_biases * sizeof(float));
+        free(x); free(y);
+        free_network(net);
+    }
+    CHECK(memcmp(w[0], w[1], nw * sizeof(float)) == 0, "transformer determinism: threads changed the bits");
+    printf("  transformer determinism: %llu parameters alike on 1 and many threads\n", (unsigned long long)nw);
+    free(w[0]); free(w[1]);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* A causal model learns to predict the next token of sequences counting up modulo V by one or two. */
+static void tf_learns(ComputeMode mode) {
+    const uint32_t T = 16, V = 13, N = 256;
+    lcg_state = 99;
+    spingalett_seed(3);
+    NeuralNetwork *net = tf_net(1, T, V);
+    float *x = malloc((size_t)N * T * sizeof(float)), *y = malloc((size_t)N * T * sizeof(float));
+    for (uint32_t s = 0; s < N; s++) {
+        const uint32_t start = (uint32_t)(frand() * 4096.0f) % V, step = 1 + (s & 1u);
+        for (uint32_t t = 0; t < T; t++) {
+            x[s * T + t] = (float)((start + step * t) % V);
+            y[s * T + t] = (float)((start + step * (t + 1)) % V);
+        }
+    }
+    spingalett_set_compute_mode(mode);
+    TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 40, .learning_rate = 1e-2f,
+                          .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32);
+    EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y, .sample_count = N);
+    printf("  transformer learns (mode %d): loss %.3f, accuracy %.3f\n", mode, m.loss, m.accuracy);
+    CHECK(r.status == TRAIN_COMPLETED && m.accuracy > 0.9f, "transformer learns: accuracy %.3f", m.accuracy);
+    /* generation: a prompt continued past the window (rotary embeddings: any window's start), greedy and drawn */
+    const uint32_t prompt[3] = {3, 4, 5}, stop = (6u + 4u) % V;
+    uint32_t greedy[24], top1[24], a[24], b[24], stopped[24];
+    const uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = greedy, .count = 24);
+    bool follows = made == 24;
+    for (uint32_t i = 0; i < 24 && follows; i++) follows = greedy[i] == (6u + i) % V;
+    CHECK(follows, "transformer generates: greedy continuation (%u tokens)", made);
+    spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = top1, .count = 24, .temperature = 1.5f,
+                        .top_k = 1, .seed = 5);
+    spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = a, .count = 24, .temperature = 2.0f,
+                        .top_p = 0.9f, .seed = 11);
+    spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = b, .count = 24, .temperature = 2.0f,
+                        .top_p = 0.9f, .seed = 11);
+    const uint32_t until = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = stopped,
+                                               .count = 24, .stop_tokens = &stop, .stop_count = 1);
+    CHECK(!memcmp(top1, greedy, sizeof greedy) && !memcmp(a, b, sizeof a) && until == 5 && stopped[4] == stop,
+          "transformer generates: top-k 1 as greedy, draws repeat with their seed, stop tokens (%u)", until);
+    free(x); free(y);
+    free_network(net);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Deployment models and files of transformers: format 8, every precision, the engine and batches. */
+static void tf_models(void) {
+    const uint32_t T = 9, V = 10, N = 37;
+    for (int which = 0; which < 4; which++) {
+        lcg_state = 4242 + which;
+        NeuralNetwork *net = tf_net(which, T, V);
+        tf_init(net);
+        float *x, *y;
+        tf_data(net, N, V, &x, &y);
+        const uint32_t in = net->topology[0], out = net->topology[net->layers - 1];
+        float *ref = malloc((size_t)N * out * sizeof(float)), *got = malloc((size_t)N * out * sizeof(float));
+        float *one = malloc((size_t)N * out * sizeof(float));
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        predict(.net = net, .inputs = x, .sample_count = N, .outputs = ref);
+        /* the file: version 8, the same network back */
+        size_t size = 0;
+        void *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &size);
+        CHECK(img && ((const uint8_t *)img)[6] == 8, "transformer models net %d: format 8", which);
+        NeuralNetwork *back = img ? spingalett_load_from_memory(img, size) : NULL;
+        CHECK(back && back->total_weights == net->total_weights && back->total_biases == net->total_biases &&
+              !memcmp(back->weights, net->weights, net->total_weights * 4) &&
+              !memcmp(back->biases, net->biases, net->total_biases * 4), "transformer models net %d: round trip", which);
+        if (back) {
+            predict(.net = back, .inputs = x, .sample_count = N, .outputs = got);
+            CHECK(!memcmp(got, ref, (size_t)N * out * 4), "transformer models net %d: loaded network predicts alike", which);
+            for (uint32_t l = 1; l < net->layers; l++) {
+                SpingalettNetworkLayer da, db;
+                spingalett_network_layer(net, l, &da);
+                spingalett_network_layer(back, l, &db);
+                CHECK(!memcmp(&da, &db, sizeof da), "transformer models net %d: layer %u described alike", which, l);
+            }
+            free_network(back);
+        }
+        spingalett_free(img);
+        /* (random weights through several layers: quantization's error grows with depth) */
+        const float tol[PRECISION_COUNT] = {2e-5f, 1e-2f, 6e-2f, 0.25f, 2.5f, 6.0f};
+        for (int p = 0; p < PRECISION_COUNT; p++) {
+            SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+            CHECK(m != NULL, "transformer models net %d: model of precision %d", which, p);
+            if (!m) continue;
+            void *ws = malloc(m->workspace_size);
+            for (uint32_t s = 0; s < N; s++) spingalett_model_run(m, x + (size_t)s * in, one + (size_t)s * out, ws);
+            free(ws);
+            spingalett_model_predict(m, x, N, got);
+            float err = max_abs_diff(ref, one, (size_t)N * out);
+            const float diff = max_abs_diff(got, one, (size_t)N * out);
+            CHECK(p >= PRECISION_INT8 ? diff == 0.0f : diff < 1e-5f, "transformer models net %d p=%d: batches differ from runs "
+                  "by %.3g", which, p, diff);
+            CHECK(err <= tol[p], "transformer models net %d p=%d: error %.3g", which, p, err);
+            if (p == PRECISION_FLOAT32 || p == PRECISION_INT8) {
+                EvalMetrics a = spingalett_model_evaluate(m, x, y, N), b = evaluate(.net = net, .inputs = x, .targets = y,
+                                                                                   .sample_count = N);
+                CHECK(fabsf(a.loss - b.loss) <= (p ? 0.1f : 1e-4f) * (1.0f + fabsf(b.loss)),
+                      "transformer models net %d p=%d: evaluation %.5f against %.5f", which, p, a.loss, b.loss);
+            }
+            if (p == PRECISION_FLOAT32 && which == 1) {
+                SpingalettLayerInfo li;
+                CHECK(spingalett_model_layer(m, 3, &li) && li.type == LAYER_ATTENTION && li.heads == 4 && li.kv_heads == 2 &&
+                      li.causal && li.rope_theta == 10000.0f && spingalett_model_layer(m, 0, &li) && li.vocabulary == V,
+                      "transformer models: layer info");
+            }
+            spingalett_model_free(m);
+        }
+        printf("  transformer models net %d: format 8 round trip, the engine and batches in every precision\n", which);
+        free(ref); free(got); free(one); free(x); free(y);
+        free_network(net);
+    }
+}
+
+static void tf_validation(void) {
+    spingalett_set_log_level(LOG_NONE);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = 4);
+    CHECK(embedding(.net = net, .neurons_amount = 6) == SPINGALETT_NO_LAYER, "embedding without a vocabulary accepted");
+    embedding(.net = net, .vocabulary = 5, .neurons_amount = 6);
+    linear(.net = net, .neurons_amount = 18);
+    CHECK(attention(.net = net, .heads = 4, .kv_heads = 3) == SPINGALETT_NO_LAYER, "kv_heads not dividing heads accepted");
+    CHECK(attention(.net = net, .heads = 4) == SPINGALETT_NO_LAYER, "attention of channels not in heads accepted");
+    CHECK(attention(.net = net, .heads = 2, .kv_heads = 2, .rope_theta = 10000.0f) == SPINGALETT_NO_LAYER,
+          "rotary embeddings of an odd head size accepted");
+    CHECK(attention(.net = net, .heads = 2) != SPINGALETT_NO_LAYER, "attention of 2 heads of 3 refused");
+    CHECK(multiply_layers(.net = net, .inputs = {1, 2}) == SPINGALETT_NO_LAYER, "a product of shapes that differ accepted");
+    layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX);
+    float x[4] = {0, 1, 7, -3}, t[1] = {2};
+    CHECK(spingalett_target_size(net) == 1, "the target size of a dense output is its cells");
+    TrainReport r = train(.net = net, .inputs = x, .targets = t, .sample_count = 1, .epochs = 1,
+                          .training_strategy = STRATEGY_FULL_BATCH);
+    CHECK(r.status == TRAIN_FAILED, "sparse cross-entropy with a softmax output trained");
+    free_network(net);
+
+    /* tokens outside the table give zeros */
+    net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .neurons_amount = 3);
+    embedding(.net = net, .vocabulary = 2, .neurons_amount = 2, .weight_initialization = WEIGHT_INITIALIZATION_RANDOM);
+    float tok[3] = {1, 2, -1}, o[6];
+    predict(.net = net, .inputs = tok, .sample_count = 1, .outputs = o);
+    CHECK(o[0] == net->weights[2] && o[1] == net->weights[3] && o[2] == 0 && o[3] == 0 && o[4] == 0 && o[5] == 0,
+          "embedding: tokens outside the table give zeros");
+    free_network(net);
+    spingalett_set_log_level(LOG_WARNING);
+}
+
 static void graph_validation(void) {
     NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
     CHECK(layer(.net = net, .neurons_amount = 4, .inputs = {1}) == SPINGALETT_NO_LAYER, "the input layer reads nothing");
@@ -4421,6 +4810,241 @@ static void gpu_equivalence(int which) {
            trained, full, same ? "yes" : "no");
     free(oc); free(og); free(og2); free(ofc); free(ofg); free(wc); free(wg); free(wg2); free(fc); free(fg);
     free(pc); free(pg); free(x); free(t);
+}
+
+/* The transformers' networks (tf_net) on the GPU against the CPU: predictions, mini-batch and full-batch
+   training (AdamW, gradient clipping, label smoothing, dropout on a layer whose activation keeps its input),
+   the same bits from two GPU runs, data sets on the GPU, the step API, and bfloat16 close to single
+   precision and repeating itself. */
+static float *gpu_tf_trained(int which, ComputeMode mode, const float *x, const float *t, uint32_t n, uint32_t T,
+                             uint32_t V, TrainingStrategy strategy, bool device, float **params, size_t *count,
+                             TrainReport *report) {
+    NeuralNetwork *net = tf_net(which, T, V);
+    lcg_state = 31u + (unsigned)which;
+    tf_init(net);
+    if (which == 0) net->dropout_rates[8] = 0.1f;          /* the GELU layer */
+    spingalett_set_compute_mode(mode);
+    spingalett_seed(99);
+    SpingalettDeviceData *dx = device ? spingalett_device_data_new(x, n, net->topology[0]) : NULL;
+    SpingalettDeviceData *dt = device ? spingalett_device_data_new(t, n, spingalett_target_size(net)) : NULL;
+    *report = train(.net = net, .inputs = dx ? NULL : x, .targets = dt ? NULL : t, .device_inputs = dx,
+                    .device_targets = dt, .sample_count = n, .epochs = 3, .training_strategy = strategy,
+                    .batch_size = 24, .optimizer_type = OPTIMIZER_ADAMW, .learning_rate = 3e-3f, .weight_decay = 0.01f,
+                    .max_grad_norm = 1.0f, .label_smoothing = 0.05f);
+    spingalett_device_data_free(dx);
+    spingalett_device_data_free(dt);
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    const uint32_t out = net->topology[net->layers - 1];
+    float *y = (float *)malloc((size_t)n * out * sizeof(float));
+    predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
+    *count = net->total_weights + net->total_biases;
+    *params = (float *)malloc(*count * sizeof(float) + 4);
+    SpingalettNetworkLayer first;               /* (a read of the parameters brings them back from the GPU) */
+    spingalett_network_layer(net, 1, &first);
+    float *probe = (float *)malloc(first.weight_count * sizeof(float) + 4);
+    spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe, first.weight_count);
+    free(probe);
+    memcpy(*params, net->weights, net->total_weights * sizeof(float));
+    memcpy(*params + net->total_weights, net->biases, net->total_biases * sizeof(float));
+    free_network(net);
+    return y;
+}
+
+/* The largest difference over the largest magnitude (logits near zero make relative errors meaningless). */
+static double gpu_max_scaled(const float *a, const float *b, size_t n) {
+    double worst = 0.0, top = 1e-6;
+    for (size_t i = 0; i < n; i++) {
+        worst = fmax(worst, fabs((double)a[i] - b[i]));
+        top = fmax(top, fabs((double)a[i]));
+    }
+    return worst / top;
+}
+
+static void gpu_transformer(int which) {
+    const uint32_t T = 24, V = 19, n = 120;
+    NeuralNetwork *probe = tf_net(which, T, V);
+    lcg_state = 31u + (unsigned)which;
+    tf_init(probe);
+    float *x, *t;
+    lcg_state = 811u + (unsigned)which;
+    tf_data(probe, n, V, &x, &t);
+    const uint32_t out = probe->topology[probe->layers - 1];
+    float *pc = (float *)malloc((size_t)n * out * sizeof(float)), *pg = (float *)malloc((size_t)n * out * sizeof(float));
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    predict(.net = probe, .inputs = x, .outputs = pc, .sample_count = n);
+    EvalMetrics ec = evaluate(.net = probe, .inputs = x, .targets = t, .sample_count = n);
+    spingalett_set_compute_mode(gpu_mode);
+    predict(.net = probe, .inputs = x, .outputs = pg, .sample_count = n);
+    EvalMetrics eg = evaluate(.net = probe, .inputs = x, .targets = t, .sample_count = n);
+    free_network(probe);
+    const double predicted = gpu_max_scaled(pc, pg, (size_t)n * out);
+
+    float *wc, *wg, *wg2, *wd;
+    size_t count;
+    TrainReport rc, rg, rg2, rd;
+    const TrainingStrategy mini = STRATEGY_SMALL_BATCH;
+    float *oc = gpu_tf_trained(which, COMPUTE_OPENMP, x, t, n, T, V, mini, false, &wc, &count, &rc);
+    float *og = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &wg, &count, &rg);
+    float *og2 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &wg2, &count, &rg2);
+    float *od = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, true, &wd, &count, &rd);
+    const double trained = gpu_max_scaled(oc, og, (size_t)n * out);
+    const bool same = !memcmp(wg, wg2, count * sizeof(float)) && !memcmp(og, og2, (size_t)n * out * sizeof(float));
+    const bool device = !memcmp(wg, wd, count * sizeof(float));
+    float *fc, *fg;
+    TrainReport fr1, fr2;
+    float *ofc = gpu_tf_trained(which, COMPUTE_OPENMP, x, t, n, T, V, STRATEGY_FULL_BATCH, false, &fc, &count, &fr1);
+    float *ofg = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, STRATEGY_FULL_BATCH, false, &fg, &count, &fr2);
+    const double full = gpu_max_scaled(ofc, ofg, (size_t)n * out);
+    CHECK(predicted < 1e-5, "gpu transformer %d: predictions differ by %.2e", which, predicted);
+    CHECK(fabsf(ec.loss - eg.loss) <= 1e-5f * (1.0f + ec.loss) && fabsf(ec.accuracy - eg.accuracy) < 1e-6f,
+          "gpu transformer %d: evaluation %g/%g against %g/%g", which, (double)eg.loss, (double)eg.accuracy,
+          (double)ec.loss, (double)ec.accuracy);
+    CHECK(rg.status == TRAIN_COMPLETED && fr2.status == TRAIN_COMPLETED && rd.status == TRAIN_COMPLETED,
+          "gpu transformer %d: training failed", which);
+    CHECK(trained < 1e-3, "gpu transformer %d: trained outputs differ by %.2e (loss %g / %g)", which, trained,
+          (double)rc.train_loss, (double)rg.train_loss);
+    CHECK(fabsf(rc.train_loss - rg.train_loss) <= 1e-4f * fabsf(rc.train_loss), "gpu transformer %d: losses %g / %g",
+          which, (double)rc.train_loss, (double)rg.train_loss);
+    CHECK(full < 1e-3, "gpu transformer %d: full-batch outputs differ by %.2e", which, full);
+    CHECK(same, "gpu transformer %d: two GPU runs differ", which);
+    CHECK(device, "gpu transformer %d: data sets on the GPU train otherwise than host arrays", which);
+
+    /* bfloat16: close to single precision, deterministic */
+    float *b1 = NULL, *b2 = NULL, *pb = (float *)malloc((size_t)n * out * sizeof(float));
+    bool bf16_same = true;
+    double bf16 = 0.0;
+    if (spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+        TrainReport r1, r2;
+        float *o1 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &b1, &count, &r1);
+        float *o2 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &b2, &count, &r2);
+        bf16_same = !memcmp(b1, b2, count * sizeof(float)) && !memcmp(o1, o2, (size_t)n * out * sizeof(float));
+        bf16 = fabs((double)r1.train_loss - rg.train_loss) / rg.train_loss;
+        CHECK(bf16_same && bf16 < 0.05, "gpu transformer %d: bfloat16 loss %.3g against %.3g, deterministic %d", which,
+              (double)r1.train_loss, (double)rg.train_loss, bf16_same);
+        free(o1); free(o2);
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    }
+    printf("  gpu transformer %d: predict %.1e, trained %.1e, full batch %.1e, deterministic %s, device data %s, "
+           "bf16 loss %.1e\n", which, predicted, trained, full, same ? "yes" : "no", device ? "alike" : "differ", bf16);
+    free(oc); free(og); free(og2); free(od); free(ofc); free(ofg); free(wc); free(wg); free(wg2); free(wd); free(fc);
+    free(fg); free(b1); free(b2); free(pb); free(pc); free(pg); free(x); free(t);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA) against single
+   precision: predictions, one step's change of every parameter, and two runs alike. */
+static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
+    const uint32_t T = 80, V = 37, n = 20, heads = 4, d = heads * head;
+    /* runs: the GPU in single precision, the CPU, the GPU in bfloat16 twice */
+    float *pred[3] = {NULL, NULL, NULL}, *delta[3] = {NULL, NULL, NULL}, *again = NULL;
+    uint64_t count = 0;
+    float *x = (float *)malloc((size_t)n * T * sizeof(float)), *t = (float *)malloc((size_t)n * T * sizeof(float));
+    lcg_state = 1234u + head;
+    for (uint32_t i = 0; i < n * T; i++) x[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
+    for (uint32_t i = 0; i < n * T; i++) t[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
+    for (int run = 0; run < 4; run++) {
+        const int bf16 = run >= 2;
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = T);
+        embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = !rope,
+                  .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        linear(.net = net, .neurons_amount = (heads + 2u * kv) * head, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        attention(.net = net, .heads = heads, .kv_heads = kv, .causal = true, .rope_theta = rope ? 10000.0f : 0.0f);
+        /* (a GELU kept for its derivative: on CUDA the products' epilogues store both) */
+        linear(.net = net, .neurons_amount = 64, .act_func = ACT_GELU, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        linear(.net = net, .neurons_amount = V, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+        lcg_state = 77;
+        for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
+        spingalett_set_compute_mode(run == 1 ? COMPUTE_OPENMP : gpu_mode);
+        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+            free_network(net);
+            break;
+        }
+        const uint32_t out = net->topology[net->layers - 1];
+        float *y = (float *)malloc((size_t)n * out * sizeof(float));
+        predict(.net = net, .inputs = x, .outputs = y, .sample_count = n);
+        count = net->total_weights;
+        float *w0 = (float *)malloc(count * sizeof(float));
+        memcpy(w0, net->weights, count * sizeof(float));
+        train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .learning_rate = 1.0f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+        SpingalettNetworkLayer first;
+        spingalett_network_layer(net, 1, &first);
+        float *probe = (float *)malloc(first.weight_count * sizeof(float));
+        spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe, first.weight_count);       /* (brings them back) */
+        free(probe);
+        for (uint64_t i = 0; i < count; i++) w0[i] -= net->weights[i];
+        if (run < 3) {
+            pred[run] = y;
+            delta[run] = w0;
+        } else {
+            again = w0;
+            free(y);
+        }
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        free_network(net);
+    }
+    /* single precision on the GPU against the CPU (tiles of several sizes, the last ones partial) */
+    const double cpu_pred = gpu_max_scaled(pred[0], pred[1], (size_t)n * V);
+    const double cpu_step = gpu_max_scaled(delta[0], delta[1], count);
+    CHECK(cpu_pred < 1e-4 && cpu_step < 1e-3, "gpu attention head %u: predictions %.2e, step %.2e from the CPU's", head,
+          cpu_pred, cpu_step);
+    printf("  gpu attention head %u%s%s: predictions %.1e, step %.1e from the CPU's", head, rope ? ", rotary" : "",
+           kv < 4u ? ", grouped" : "", cpu_pred, cpu_step);
+    if (pred[2]) {
+        const double predicted = gpu_max_scaled(pred[0], pred[2], (size_t)n * V);
+        const double stepped = gpu_max_scaled(delta[0], delta[2], count);
+        const bool same = again && !memcmp(again, delta[2], count * sizeof(float));
+        CHECK(predicted < 2e-2 && stepped < 6e-2 && same, "gpu flash head %u: predictions %.2e, step %.2e from single "
+              "precision, deterministic %d", head, predicted, stepped, same);
+        printf("; bf16 %.1e, step %.1e from single precision, deterministic %s", predicted, stepped, same ? "yes" : "no");
+    }
+    printf("\n");
+    for (int k = 0; k < 3; k++) {
+        free(pred[k]);
+        free(delta[k]);
+    }
+    free(again); free(x); free(t);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* The step API on a transformer, on the GPU against the CPU: forward, the sparse loss's backward pass with
+   label smoothing, two passes a step. */
+static void gpu_transformer_trainer(void) {
+    const uint32_t T = 16, V = 11, n = 32;
+    float out_loss[2] = {0, 0}, *params[2] = {NULL, NULL};
+    size_t count = 0;
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = tf_net(1, T, V);
+        lcg_state = 5;
+        tf_init(net);
+        float *x, *t;
+        tf_data(net, n, V, &x, &t);
+        spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_OPENMP);
+        SpingalettTrainer *tr = spingalett_trainer_new(net, n / 2);
+        spingalett_trainer_set_label_smoothing(tr, 0.1f);
+        OptimizerArgs o = {.type = OPTIMIZER_ADAM, .learning_rate = 1e-3f};
+        for (int step = 0; step < 3; step++) {
+            for (uint32_t h = 0; h < 2; h++) {
+                spingalett_trainer_forward(tr, x + (size_t)h * (n / 2) * T, n / 2);
+                out_loss[k] = spingalett_trainer_backward(tr, t + (size_t)h * (n / 2) * T);
+            }
+            spingalett_trainer_step(tr, &o);
+        }
+        spingalett_trainer_free(tr);            /* (brings the parameters back) */
+        count = net->total_weights + net->total_biases;
+        params[k] = (float *)malloc(count * sizeof(float));
+        memcpy(params[k], net->weights, net->total_weights * sizeof(float));
+        memcpy(params[k] + net->total_weights, net->biases, net->total_biases * sizeof(float));
+        free(x); free(t);
+        free_network(net);
+    }
+    double worst = gpu_max_rel(params[0], params[1], count);
+    CHECK(worst < 1e-3 && fabsf(out_loss[0] - out_loss[1]) <= 1e-4f * out_loss[0],
+          "gpu transformer trainer: parameters %.2e apart, losses %g / %g", worst, (double)out_loss[0], (double)out_loss[1]);
+    printf("  gpu transformer trainer: parameters %.1e from the CPU's\n", worst);
+    free(params[0]); free(params[1]);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
 /* The training loss of a sigmoid output saturated at 1, on the CPU and the GPU: finite, the same. */
@@ -5394,6 +6018,18 @@ int main(int argc, char **argv) {
         graph_folding();
         graph_validation();
     }
+    if (!*only || !strcmp(only, "transformer")) {
+        printf("[transformers]\n");
+        ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
+        TrainingStrategy strats[] = {STRATEGY_FULL_BATCH, STRATEGY_SMALL_BATCH};
+        for (int m = 0; m < 2; m++) for (int s = 0; s < 2; s++)
+            for (int k = 0; k < 4; k++) tf_gradcheck(k, cm[m], strats[s]);
+        tf_gradcheck(1, cm[2], STRATEGY_FULL_BATCH);
+        tf_determinism();
+        tf_models();
+        tf_validation();
+        tf_learns(COMPUTE_OPENMP);
+    }
     if (!*only || !strcmp(only, "onnx")) {
         printf("[ONNX import, PyTorch weights]\n");
         onnx_models();
@@ -5493,6 +6129,7 @@ int main(int argc, char **argv) {
         cifar_files();
         dataset_files();
         dataset_files_v2();
+        token_files();
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");
@@ -5543,6 +6180,11 @@ int main(int argc, char **argv) {
             gpu_device_data();
             gpu_device_data_threads();
             gpu_bf16();
+            for (int k = 0; k < 4; k++) gpu_transformer(k);
+            gpu_transformer_trainer();
+            gpu_flash(32, false, 4);
+            gpu_flash(64, true, 2);
+            gpu_flash(128, true, 1);
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }

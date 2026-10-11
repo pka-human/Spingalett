@@ -26,6 +26,8 @@ int main(void) {
     FIELD(LayerArgs, momentum); FIELD(LayerArgs, inputs); FIELD(LayerArgs, input_count);
     FIELD(LayerArgs, upsample); FIELD(LayerArgs, output_padding); FIELD(LayerArgs, output_padding_h);
     FIELD(LayerArgs, output_padding_w);
+    FIELD(LayerArgs, vocabulary); FIELD(LayerArgs, heads); FIELD(LayerArgs, kv_heads); FIELD(LayerArgs, rope_theta);
+    FIELD(LayerArgs, causal); FIELD(LayerArgs, positions);
 
     SIZE(SpingalettNetworkLayer); FIELD(SpingalettNetworkLayer, reserved);
     FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
@@ -36,6 +38,8 @@ int main(void) {
     FIELD(SpingalettNetworkLayer, groups); FIELD(SpingalettNetworkLayer, epsilon); FIELD(SpingalettNetworkLayer, momentum);
     FIELD(SpingalettNetworkLayer, input_count); FIELD(SpingalettNetworkLayer, inputs);
     FIELD(SpingalettNetworkLayer, upsample);
+    FIELD(SpingalettNetworkLayer, vocabulary); FIELD(SpingalettNetworkLayer, heads); FIELD(SpingalettNetworkLayer, kv_heads); FIELD(SpingalettNetworkLayer, rope_theta);
+    FIELD(SpingalettNetworkLayer, causal); FIELD(SpingalettNetworkLayer, positions);
 
     SIZE(ForwardArgs); FIELD(ForwardArgs, reserved); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
@@ -107,6 +111,17 @@ int main(void) {
     FIELD(DatasetReaderOptions, shuffle); FIELD(DatasetReaderOptions, in_memory); FIELD(DatasetReaderOptions, no_prefetch);
     FIELD(DatasetReaderOptions, target_set);
 
+    SIZE(SpingalettTokenReaderOptions); FIELD(SpingalettTokenReaderOptions, reserved);
+    FIELD(SpingalettTokenReaderOptions, context); FIELD(SpingalettTokenReaderOptions, token_bytes);
+    FIELD(SpingalettTokenReaderOptions, stride); FIELD(SpingalettTokenReaderOptions, offset);
+    FIELD(SpingalettTokenReaderOptions, shuffle);
+
+    SIZE(SpingalettGenerateArgs); FIELD(SpingalettGenerateArgs, reserved);
+    FIELD(SpingalettGenerateArgs, net); FIELD(SpingalettGenerateArgs, prompt); FIELD(SpingalettGenerateArgs, prompt_length);
+    FIELD(SpingalettGenerateArgs, tokens); FIELD(SpingalettGenerateArgs, count); FIELD(SpingalettGenerateArgs, temperature);
+    FIELD(SpingalettGenerateArgs, top_k); FIELD(SpingalettGenerateArgs, top_p); FIELD(SpingalettGenerateArgs, seed);
+    FIELD(SpingalettGenerateArgs, stop_tokens); FIELD(SpingalettGenerateArgs, stop_count);
+
     SIZE(PredictArgs); FIELD(PredictArgs, reserved);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);
     FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
@@ -129,6 +144,8 @@ int main(void) {
     FIELD(SpingalettLayerInfo, stride_w); FIELD(SpingalettLayerInfo, padding_h); FIELD(SpingalettLayerInfo, padding_w);
     FIELD(SpingalettLayerInfo, groups); FIELD(SpingalettLayerInfo, epsilon); FIELD(SpingalettLayerInfo, input_count);
     FIELD(SpingalettLayerInfo, input_layers); FIELD(SpingalettLayerInfo, upsample);
+    FIELD(SpingalettLayerInfo, vocabulary); FIELD(SpingalettLayerInfo, heads); FIELD(SpingalettLayerInfo, kv_heads); FIELD(SpingalettLayerInfo, rope_theta);
+    FIELD(SpingalettLayerInfo, causal); FIELD(SpingalettLayerInfo, positions);
 
     SIZE(LRScheduleParams); FIELD(LRScheduleParams, reserved);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);

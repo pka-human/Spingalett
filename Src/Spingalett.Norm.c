@@ -224,7 +224,7 @@ size_t spingalett_ln_scratch_doubles(const NeuralNetwork *net, uint32_t capacity
     size_t need = 0;
     for (uint32_t l = 1; l < net->layers; l++) {
         const LayerShape *s = &net->shapes[l];
-        if (s->type != LAYER_LAYER_NORM) continue;
+        if (s->type != LAYER_LAYER_NORM && s->type != LAYER_RMS_NORM) continue;
         uint64_t m = (uint64_t)capacity * s->height * s->width;
         uint64_t chunks = (m + chunk_rows(m) - 1) / chunk_rows(m);
         size_t d = (size_t)chunks * 2u * s->channels;
@@ -324,5 +324,87 @@ void spingalett_ln_backward_params(NeuralNetwork *net, uint32_t l, const float *
         float dg = (float)sg * scale, db = (float)sb * scale;
         gW[c] = beta_g == 0.0f ? dg : dg + beta_g * gW[c];
         gB[c] = beta_g == 0.0f ? db : db + beta_g * gB[c];
+    }
+}
+
+/* ---- RMS normalization: each cell over its channels, no mean, no beta ---- */
+
+void spingalett_rms_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
+                            ActivationFunction act, float *stats, ComputeMode mode) {
+    const LayerShape *s = &net->shapes[l + 1];
+    const uint32_t C = s->channels, cells = s->height * s->width;
+    const uint64_t per = (uint64_t)cells * C;
+    const float *gamma = net->weights + net->weight_offsets[l];
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)n * per) && n > 1)
+#endif
+    for (int64_t smp = 0; smp < (int64_t)n; smp++) {
+        float *ys = y + (uint64_t)smp * per;
+        spingalett_engine_rms_norm(x + (uint64_t)smp * per, cells, C, gamma, s->eps, ys,
+                                   stats ? stats + (uint64_t)smp * cells : NULL);
+        if (act != ACT_NONE && act != ACT_SOFTMAX) apply_activation_batch(ys, (uint32_t)per, act);
+    }
+    (void)mode;
+}
+
+/* dx = r (g - xhat (sum g xhat) / C) per cell, g = gamma dy, xhat = x r, r = 1 / rms */
+void spingalett_rms_backward_data(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
+                                  uint32_t n, const float *stats, ComputeMode mode) {
+    const LayerShape *s = &net->shapes[l + 1];
+    const uint32_t C = s->channels, cells = s->height * s->width;
+    const uint64_t per = (uint64_t)cells * C;
+    const float *gamma = net->weights + net->weight_offsets[l], inv = 1.0f / (float)C;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)n * per) && n > 1)
+#endif
+    for (int64_t smp = 0; smp < (int64_t)n; smp++) {
+        const float *xs = x + (uint64_t)smp * per, *gs = dy + (uint64_t)smp * per, *st = stats + (uint64_t)smp * cells;
+        float *ds = dx + (uint64_t)smp * per;
+        for (uint32_t p = 0; p < cells; p++) {
+            const float r = st[p];
+            const float *v = xs + (uint64_t)p * C, *g = gs + (uint64_t)p * C;
+            float *d = ds + (uint64_t)p * C, b = 0.0f;
+            for (uint32_t c = 0; c < C; c++) b += gamma[c] * g[c] * (v[c] * r);
+            b *= inv;
+            for (uint32_t c = 0; c < C; c++) d[c] = r * (gamma[c] * g[c] - (v[c] * r) * b);
+        }
+    }
+    (void)mode;
+}
+
+/* gamma's gradient, the sum of dy xhat over every cell of the batch, in ranges as layer normalization's */
+void spingalett_rms_backward_params(NeuralNetwork *net, uint32_t l, const float *x, const float *dy, uint32_t n,
+                                    const float *stats, float scale, float beta_g, double *partial, ComputeMode mode) {
+    const LayerShape *s = &net->shapes[l + 1];
+    const uint32_t C = s->channels;
+    const uint64_t m = (uint64_t)n * s->height * s->width, rows = chunk_rows(m), chunks = (m + rows - 1) / rows;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, m * C) && chunks > 1)
+#endif
+    for (int64_t chunk = 0; chunk < (int64_t)chunks; chunk++) {
+        const uint64_t r0 = (uint64_t)chunk * rows, r1 = r0 + rows < m ? r0 + rows : m;
+        double *t = partial + (uint64_t)chunk * C;
+        for (uint32_t c = 0; c < C; c++) t[c] = 0.0;
+        for (uint64_t r = r0; r < r1; r += BLOCK) {
+            const uint64_t re = r + BLOCK < r1 ? r + BLOCK : r1;
+            for (uint32_t c0 = 0; c0 < C; c0 += SLAB) {
+                const uint32_t w = C - c0 < SLAB ? C - c0 : SLAB;
+                float f[SLAB] = {0};
+                for (uint64_t i = r; i < re; i++) {
+                    const float rr = stats[i];
+                    const float *v = x + i * C + c0, *g = dy + i * C + c0;
+                    for (uint32_t c = 0; c < w; c++) f[c] += g[c] * (v[c] * rr);
+                }
+                for (uint32_t c = 0; c < w; c++) t[c0 + c] += f[c];
+            }
+        }
+    }
+    (void)mode;
+    float *gW = net->grad_weights + net->weight_offsets[l];
+    for (uint32_t c = 0; c < C; c++) {
+        double sg = 0.0;
+        for (uint64_t chunk = 0; chunk < chunks; chunk++) sg += partial[chunk * C + c];
+        float dg = (float)sg * scale;
+        gW[c] = beta_g == 0.0f ? dg : dg + beta_g * gW[c];
     }
 }

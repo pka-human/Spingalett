@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 pka_human (pka_human@proton.me)
+
+[package]
+name = "spingalett"
+description = "Neural networks in C for Rust: training on the CPU and the GPU (CUDA, Vulkan), transformers, INT8 to INT2 deployment models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+keywords = ["neural-network", "machine-learning", "deep-learning", "transformer", "gpu"]
+categories = ["science", "api-bindings"]
+
+[dependencies]
+spingalett-sys = { path = "../spingalett-sys", version = "1.2.0" }

@@ -11,6 +11,15 @@
  *             layer (output_delta() in Spingalett.Training.c), from targets t
  *   GRADS     delta = dL/dz from t = dL/dy of a loss of the caller's (output_delta_from_grad())
  *
+ * The sparse cross-entropy (LOSS 2) has a row a cell of `cells` a sample, t a class index a cell (none
+ * outside the n classes), and per sample sums in part, for R = samples x cells: [0, R) the cells'
+ * losses, [R, 2R) whether each cell's largest output (the first of them) is its target, [2R, 2R +
+ * samples) 1 / the sample's cells with targets (0 without any). COUNT (a thread a sample, rows the
+ * samples) writes the last; LOSS (a row a cell, rows R) the first two and delta = (softmax(z) - the
+ * smoothed target) / the count; SUM (a thread a sample) loss[s] = the mean of its cells' losses, as
+ * spingalett_sparse_cross_entropy() computes it, and with ACCURACY loss[samples + s] the fraction
+ * of its cells predicted.
+ *
  * A thread takes a row; with WIDE (rows of many outputs, such as a segmentation's maps), a
  * workgroup does, thread j outputs j, j + 64, ... in order, and what the row sums or maximizes over
  * its outputs is combined across the threads in a fixed tree, so the results do not depend on
@@ -31,13 +40,20 @@ const uint STEP = WIDE != 0u ? 64u : 1u;        /* outputs between those of a th
 #define SOFTMAX 0u
 #define LOSS_OP 1u
 #define GRADS   2u
+#define COUNT   3u
+#define SUM     4u
 
 #define LOSS_MSE 0u
 #define LOSS_CROSS_ENTROPY 1u
+#define LOSS_SPARSE 2u
+
+#define FLAG_ACCURACY 1u
 
 layout(push_constant) uniform Push {
-    F32 y, t, delta, loss;
-    uint rows, n;
+    F32 y, t, delta, loss, part;
+    uint rows, n, cells;
+    float smoothing;
+    uint flags, pad;
 } p;
 
 shared float red[64];
@@ -56,12 +72,66 @@ float combine(uint tid, float v, bool maximum) {
     return r;
 }
 
+bool has_target(float t) { return t >= 0.0 && t < float(p.n); }
+
 void main() {
     const uint tid = WIDE != 0u ? gl_LocalInvocationID.x : 0u, n = p.n;
     const uint first = WIDE != 0u ? gl_WorkGroupID.x : gl_GlobalInvocationID.x;
     const uint stride = WIDE != 0u ? gl_NumWorkGroups.x : gl_NumWorkGroups.x * 64u;
+    if (OP == COUNT || OP == SUM) {     /* the sparse cross-entropy's sums, a thread a sample */
+        const uint R = p.rows * p.cells;
+        for (uint s = gl_GlobalInvocationID.x; s < p.rows; s += gl_NumWorkGroups.x * 64u) {
+            if (OP == COUNT) {
+                uint count = 0u;
+                for (uint c = 0u; c < p.cells; c++) count += has_target(p.t.v[s * p.cells + c]) ? 1u : 0u;
+                p.part.v[2u * R + s] = count > 0u ? 1.0 / float(count) : 0.0;
+                continue;
+            }
+            float loss = 0.0, hits = 0.0;
+            for (uint c = 0u; c < p.cells; c++) {
+                loss += p.part.v[s * p.cells + c];
+                hits += p.part.v[R + s * p.cells + c];
+            }
+            const float inv = p.part.v[2u * R + s];
+            p.loss.v[s] = loss * inv;
+            if ((p.flags & FLAG_ACCURACY) != 0u) p.loss.v[p.rows + s] = hits * inv;
+        }
+        return;
+    }
     for (uint s = first; s < p.rows; s += stride) {
         const uint base = s * n;
+        if (OP == LOSS_OP && LOSS == LOSS_SPARSE) {
+            /* a cell: the log of its softmax's sum, its loss against the smoothed target, its gradient */
+            const uint R = p.rows;
+            const float t = p.t.v[s], inv = p.part.v[2u * R + s / p.cells];
+            const bool live = has_target(t);
+            const uint target = live ? uint(t) : 0u;
+            float top = -3.402823466e38, sum = 0.0, all = 0.0;
+            for (uint k = tid; k < n; k += STEP) top = max(top, p.y.v[base + k]);
+            top = combine(tid, top, true);
+            float later = 0.0;          /* n - the first output of the largest value */
+            for (uint k = tid; k < n; k += STEP) {
+                const float z = p.y.v[base + k];
+                sum += exp(z - top);
+                all += z;
+                if (z == top) later = max(later, float(n - k));
+            }
+            sum = combine(tid, sum, false);
+            all = combine(tid, all, false);
+            later = combine(tid, later, true);
+            const float lse = top + log(sum), keep = 1.0 - p.smoothing, share = p.smoothing / float(n);
+            for (uint k = tid; k < n; k += STEP) {
+                float d = live ? (exp(p.y.v[base + k] - lse) - share) * inv : 0.0;
+                if (live && k == target) d -= keep * inv;
+                p.delta.v[base + k] = d;
+            }
+            if (tid == 0u) {
+                const float loss = keep * (lse - p.y.v[base + target]) + (share > 0.0 ? share * (float(n) * lse - all) : 0.0);
+                p.part.v[s] = live ? loss : 0.0;
+                p.part.v[R + s] = live && uint(float(n) - later) == target ? 1.0 : 0.0;
+            }
+            continue;
+        }
         if (OP == SOFTMAX) {
             float top = -3.402823466e38;
             for (uint k = tid; k < n; k += STEP) top = max(top, p.y.v[base + k]);

@@ -6,11 +6,11 @@
 #include "Spingalett.Private.h"
 
 const char * const act_func_names[] = {
-    "NONE", "SIGMOID", "RELU", "TANH", "LEAKY_RELU", "FOO52", "SOFTMAX"
+    "NONE", "SIGMOID", "RELU", "TANH", "LEAKY_RELU", "FOO52", "SOFTMAX", "GELU", "GELU_TANH", "SILU"
 };
 
 const char * const loss_func_names[] = {
-    "MSE", "CROSS_ENTROPY"
+    "MSE", "CROSS_ENTROPY", "SPARSE_CROSS_ENTROPY"
 };
 
 const char * const training_strategy_names[] = {

@@ -28,6 +28,30 @@ SPG_CUDA_UNIT(dconv16, dconv, "-DKMAX=16")              /* KMAX (EXACT), or up t
 SPG_CUDA_UNIT(dconv27, dconv, "-DKMAX=27 -DEXACT=1")
 SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
 SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
+SPG_CUDA_UNIT(embed, embed, "")
+SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")     /* attention in single precision: heads of up to 256, */
+SPG_CUDA_UNIT(rattn_d32_o0, rattn, "-DD=32u -DOPC=0u")   /* of up to 32, 64, 128 a unit per pass */
+SPG_CUDA_UNIT(rattn_d32_o1, rattn, "-DD=32u -DOPC=1u")
+SPG_CUDA_UNIT(rattn_d32_o2, rattn, "-DD=32u -DOPC=2u")
+SPG_CUDA_UNIT(rattn_d32_o3, rattn, "-DD=32u -DOPC=3u")
+SPG_CUDA_UNIT(rattn_d64_o0, rattn, "-DD=64u -DOPC=0u")
+SPG_CUDA_UNIT(rattn_d64_o1, rattn, "-DD=64u -DOPC=1u")
+SPG_CUDA_UNIT(rattn_d64_o2, rattn, "-DD=64u -DOPC=2u")
+SPG_CUDA_UNIT(rattn_d64_o3, rattn, "-DD=64u -DOPC=3u")
+SPG_CUDA_UNIT(rattn_d128_o0, rattn, "-DD=128u -DOPC=0u")
+SPG_CUDA_UNIT(rattn_d128_o1, rattn, "-DD=128u -DOPC=1u")
+SPG_CUDA_UNIT(rattn_d128_o2, rattn, "-DD=128u -DOPC=2u")
+SPG_CUDA_UNIT(rattn_d128_o3, rattn, "-DD=128u -DOPC=3u")
+/* attention on the matrix units (networks in bfloat16): a unit per head size and pass (0 FORWARD, 2 DQ, 3 DKV) */
+SPG_CUDA_UNIT(flash_d32_o0, flash, "-DD=32u -DOPC=0u")
+SPG_CUDA_UNIT(flash_d32_o2, flash, "-DD=32u -DOPC=2u")
+SPG_CUDA_UNIT(flash_d32_o3, flash, "-DD=32u -DOPC=3u")
+SPG_CUDA_UNIT(flash_d64_o0, flash, "-DD=64u -DOPC=0u")
+SPG_CUDA_UNIT(flash_d64_o2, flash, "-DD=64u -DOPC=2u")
+SPG_CUDA_UNIT(flash_d64_o3, flash, "-DD=64u -DOPC=3u")
+SPG_CUDA_UNIT(flash_d128_o0, flash, "-DD=128u -DOPC=0u")
+SPG_CUDA_UNIT(flash_d128_o2, flash, "-DD=128u -DOPC=2u")
+SPG_CUDA_UNIT(flash_d128_o3, flash, "-DD=128u -DOPC=3u")
 
 /* depthwise convolutions: any window, stride, mode, VEC and padding, and the common windows (KH, KW, SH, SW),
    padded (KW - 1) / 2, for every mode (0 APPLY, 1 SPREAD, 2 WEIGHTS) and VEC (1, 4) as constants: units
@@ -70,6 +94,11 @@ SPG_CUDA_GEMM_MODES(2, 0, 0)
 SPG_CUDA_GEMM_MODES(1, 3, 1)        /* weight gradient */
 SPG_CUDA_GEMM_MODES(1, 2, 0)
 
+/* units of the product built with GENERAL (every activation in the epilogue, the values before it with FLAG_PRE):
+   dense layers' forward passes and data gradients, reading four values at once */
+SPG_CUDA_GEMM_GENERAL(0, 1, 1)
+SPG_CUDA_GEMM_GENERAL(0, 0, 1)
+
 /* the matrix product on the matrix units (gemm_mma.cu): every tile (BM, BN, BK, TM, TN: warps of 16 TM x 16 TN
    outputs), which is also the table of Spingalett.GpuKernels.c, for the operand modes and the ways of reading
    them (A, B, KA, KB: 2 kept as bfloat16, eight values at once; 1 floats, four at once; 0 anything, one value
@@ -103,3 +132,10 @@ SPG_CUDA_MMA_MODES(2, 0, 2, 2)
 SPG_CUDA_MMA_MODES(2, 0, 0, 0)
 SPG_CUDA_MMA_MODES(1, 2, 2, 2)      /* weight gradient */
 SPG_CUDA_MMA_MODES(1, 2, 0, 0)
+
+/* units of the product on the matrix units built with GENERAL (every activation in the epilogue, the values
+   before it with FLAG_PRE): dense layers' forward passes and data gradients, of activations kept as bfloat16 */
+SPG_CUDA_MMA_GENERAL(0, 1, 2, 1)
+SPG_CUDA_MMA_GENERAL(0, 1, 2, 2)
+SPG_CUDA_MMA_GENERAL(0, 0, 2, 1)
+SPG_CUDA_MMA_GENERAL(0, 0, 2, 2)

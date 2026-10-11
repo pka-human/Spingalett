@@ -25,6 +25,10 @@ enum { SPG_A_ROW, SPG_A_COL, SPG_A_CONV };
 enum { SPG_B_ROW, SPG_B_COL, SPG_B_CONV };
 enum { SPG_EPI_STORE, SPG_EPI_BIAS_ACT, SPG_EPI_SCALE_ACT, SPG_EPI_PARTIAL, SPG_EPI_DERIV };
 #define SPG_GEMM_BIAS 1u            /* flags: EPI_BIAS_ACT adds e0 */
+#define SPG_GEMM_PRE  2u            /* EPI_BIAS_ACT also stores its values before the activation at e1 (CUDA's
+                                       gemm_mma.cu and epi.cu: as C, laid out and kept like it) */
+#define SPG_GEMM_BAND_SHIFT 8u      /* CUDA's gemm.cu: bits 8 to 11, the log of the tiles of rows a band of blocks
+                                       takes (gemm_common.cuh's band_tile()), which the backend sets */
 
 /* colsum.comp */
 typedef struct {
@@ -59,14 +63,19 @@ typedef struct {
     uint64_t z;
 } SpgEltwisePush;
 enum { SPG_ELT_BIAS_ACT, SPG_ELT_DERIV, SPG_ELT_MUL, SPG_ELT_ADD, SPG_ELT_DROPOUT, SPG_ELT_AFFINE, SPG_ELT_BDATA,
-       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD, SPG_ELT_COPY };
+       SPG_ELT_SCALE, SPG_ELT_AFFINE_ADD, SPG_ELT_COPY, SPG_ELT_ACT, SPG_ELT_PRODUCT };
+#define SPG_ELT_FLAG_A   1u         /* BIAS_ACT adds a */
+#define SPG_ELT_FLAG_ADD 2u         /* PRODUCT adds to y */
 
 /* output.comp */
 typedef struct {
-    uint64_t y, t, delta, loss;
-    uint32_t rows, n;
+    uint64_t y, t, delta, loss, part;
+    uint32_t rows, n, cells;
+    float smoothing;
+    uint32_t flags, pad;
 } SpgOutputPush;
-enum { SPG_OUT_SOFTMAX, SPG_OUT_LOSS, SPG_OUT_GRADS };
+enum { SPG_OUT_SOFTMAX, SPG_OUT_LOSS, SPG_OUT_GRADS, SPG_OUT_COUNT, SPG_OUT_SUM };
+#define SPG_OUT_ACCURACY 1u         /* SUM: the samples' accuracies too, after their losses */
 
 /* pool.comp */
 typedef struct {
@@ -86,6 +95,8 @@ typedef struct {
     uint32_t cells, C, flags;
     float eps;
 } SpgLnPush;
+#define SPG_LN_STATS 1u             /* flags: keep each cell's statistics (training) */
+#define SPG_LN_RMS   2u             /* RMS normalization */
 
 /* combine.comp */
 typedef struct {
@@ -103,6 +114,34 @@ typedef struct {
 } SpgDwconvPush;
 enum { SPG_DW_APPLY, SPG_DW_SPREAD, SPG_DW_WEIGHTS };
 #define SPG_DW_TAPS 49u             /* taps at most */
+
+/* embed.comp */
+typedef struct {
+    uint64_t x, w, y, pos, keys, part, dy, gw;
+    uint32_t total, tokens, d, vocab, n, shift, blocks, flags;
+    float scale, beta;
+} SpgEmbedPush;
+enum { SPG_EMBED_FORWARD, SPG_EMBED_KEYS, SPG_EMBED_HIST, SPG_EMBED_SCAN, SPG_EMBED_SCATTER, SPG_EMBED_GRAD };
+#define SPG_EMBED_FROM 1u           /* the sort's keys in its second pair of arrays */
+#define SPG_EMBED_POS  2u           /* FORWARD adds the positions' vectors */
+#define SPG_EMBED_BLOCK 256u        /* keys a block of HIST and SCATTER */
+
+/* attn.comp */
+typedef struct {
+    uint64_t x, y, dy, dx, stats, table;
+    uint32_t n, cells, heads, kv, d, flags;
+    float scale;
+    uint32_t pad;
+} SpgAttnPush;
+enum { SPG_ATTN_FORWARD, SPG_ATTN_PRE, SPG_ATTN_DQ, SPG_ATTN_DKV };
+#define SPG_ATTN_CAUSAL 1u
+#define SPG_ATTN_ROPE   2u
+#define SPG_ATTN_STATS  4u          /* FORWARD keeps each query's log of the softmax's sum */
+/* rattn.cu (CUDA, single precision, heads up to 128): rows of a block (queries; keys in DKV) and its threads,
+   for a unit's head size d (32, 64, 128) and pass */
+#define SPG_RATTN_ROWS(d, op) ((d) <= 64u || (op) == SPG_ATTN_FORWARD ? 64u : 32u)
+#define SPG_RATTN_THREADS(d, op) \
+    ((op) == SPG_ATTN_PRE ? 256u : (d) > 64u && (op) != SPG_ATTN_FORWARD ? 64u : 128u)
 
 /* rows.comp */
 typedef struct {

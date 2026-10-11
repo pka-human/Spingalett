@@ -563,6 +563,9 @@ int main(int argc, char **argv) {
         test_dense(37, 50, 21);
         test_dense(64, 784, 128);
         test_dense(5, 3, 7);
+        /* products whose A and C exceed L2 (on GPUs of up to 28 MB of it): CUDA runs gemm.cu's blocks in bands of
+           eight tiles of rows then, the tiles of rows after the last whole band (8,200 rows) as they are */
+        if (cuda && !mma) test_dense(8200, 384, 520);
     }
     printf(failures ? "%d FAILED\n" : "ALL PASSED\n", failures);
     return failures != 0;

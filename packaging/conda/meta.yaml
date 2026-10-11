@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 pka_human (pka_human@proton.me)
+#
+# A recipe for conda-forge (staged-recipes), with build.sh and bld.bat: the library with the Vulkan backend,
+# its runtime, tools, headers, pkg-config and CMake files.
+{% set version = "1.2.0" %}
+
+package:
+  name: spingalett
+  version: {{ version }}
+
+source:
+  url: https://github.com/pka-human/Spingalett/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+
+build:
+  number: 0
+  run_exports:
+    - {{ pin_subpackage('spingalett', max_pin='x') }}
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - {{ stdlib('c') }}
+    - cmake
+    - ninja
+    - shaderc
+    - llvm-openmp  # [osx]
+  host:
+    - vulkan-headers
+    - llvm-openmp  # [osx]
+
+test:
+  commands:
+    - test -f $PREFIX/lib/libspingalett${SHLIB_EXT}                      # [unix]
+    - test -f $PREFIX/include/Spingalett/Spingalett.h                    # [unix]
+    - if not exist %LIBRARY_BIN%\\libspingalett.dll exit 1               # [win]
+    - ModelTool --help || true
+
+about:
+  home: https://github.com/pka-human/Spingalett
+  summary: 'Neural networks in C: training on CPUs and GPUs, transformers, INT8 to INT2 deployment'
+  description: |
+    Spingalett trains dense, convolutional and transformer networks (chains or graphs) on the CPU or the GPU
+    (CUDA, Vulkan), exports deployment models from FP32 down to INT2, and generates text with language models.
+  license: MIT
+  license_file: LICENSE
+  dev_url: https://github.com/pka-human/Spingalett
+
+extra:
+  recipe-maintainers:
+    - pka-human
