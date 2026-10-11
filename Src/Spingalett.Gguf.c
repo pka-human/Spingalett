@@ -570,7 +570,8 @@ static bool gguf_read(SpgTensorSource *s, SpgPart part, uint32_t block, float *d
     const bool vector = rows == 1 && part != SPG_PART_EMBED && part != SPG_PART_HEAD;
     /* innermost first: a matrix [rows][cols] is cols x rows; learned positions may be more than the context */
     const bool fits = vector ? t->ndims == 1 && t->dims[0] == cols
-                    : t->ndims == 2 && t->dims[0] == cols && (t->dims[1] == rows || (part == SPG_PART_POSITIONS && t->dims[1] > rows));
+                    : t->ndims == 2 && t->dims[0] == cols &&
+                      (t->dims[1] == rows || (part == SPG_PART_POSITIONS && t->dims[1] > rows));
     if (!fits) {
         snprintf(s->error, sizeof s->error, "GGUF: %s has shape [%llu, %llu], not [%u, %u]", name,
                  (unsigned long long)t->dims[0], (unsigned long long)(t->ndims > 1 ? t->dims[1] : 1), cols, vector ? 1u : rows);
@@ -697,8 +698,8 @@ static void *kv_numbers(const Gguf *g, const char *key, uint32_t count, bool flo
             else { free(out); return NULL; }
             ((float *)out)[k] = f;
         } else {
-            int32_t v = size == 1 ? (int32_t)(int8_t)p[0] : size == 2 ? (int32_t)(int16_t)slett_get16(p) : (int32_t)slett_get32(p);
-            ((int32_t *)out)[k] = v;
+            ((int32_t *)out)[k] = size == 1 ? (int32_t)(int8_t)p[0] : size == 2 ? (int32_t)(int16_t)slett_get16(p)
+                                                                       : (int32_t)slett_get32(p);
         }
     }
     return out;

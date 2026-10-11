@@ -200,7 +200,8 @@ static void part_name(const HfSource *h, SpgPart part, uint32_t block, char *nam
     static const char *const gpt2[SPG_PART_COUNT] = {
         [SPG_PART_EMBED] = "wte.weight", [SPG_PART_POSITIONS] = "wpe.weight", [SPG_PART_NORM] = "ln_f.weight",
         [SPG_PART_NORM_BIAS] = "ln_f.bias", [SPG_PART_HEAD] = "lm_head.weight", [SPG_PART_ATTN_NORM] = "ln_1.weight",
-        [SPG_PART_ATTN_NORM_BIAS] = "ln_1.bias", [SPG_PART_QKV] = "attn.c_attn.weight", [SPG_PART_QKV_BIAS] = "attn.c_attn.bias",
+        [SPG_PART_ATTN_NORM_BIAS] = "ln_1.bias", [SPG_PART_QKV] = "attn.c_attn.weight",
+        [SPG_PART_QKV_BIAS] = "attn.c_attn.bias",
         [SPG_PART_O] = "attn.c_proj.weight", [SPG_PART_O_BIAS] = "attn.c_proj.bias", [SPG_PART_FFN_NORM] = "ln_2.weight",
         [SPG_PART_FFN_NORM_BIAS] = "ln_2.bias", [SPG_PART_UP] = "mlp.c_fc.weight", [SPG_PART_UP_BIAS] = "mlp.c_fc.bias",
         [SPG_PART_DOWN] = "mlp.c_proj.weight", [SPG_PART_DOWN_BIAS] = "mlp.c_proj.bias",
@@ -319,8 +320,10 @@ static bool read_config(const SpgJson *j, SpgTransformer *t, uint32_t context, u
         }
         v = spingalett_json_member(j, SPG_JSON_ROOT, "activation_function");
         if (v && j->values[v].count < sizeof act) spingalett_json_copy(j, v, act);
-        t->act = !act[0] || !strcmp(act, "gelu_new") || !strcmp(act, "gelu_pytorch_tanh") || !strcmp(act, "gelu_fast") ? ACT_GELU_TANH
-               : !strcmp(act, "gelu") ? ACT_GELU : !strcmp(act, "relu") ? ACT_RELU : !strcmp(act, "silu") ? ACT_SILU : ACT_COUNT;
+        const bool tanh_form = !act[0] || !strcmp(act, "gelu_new") || !strcmp(act, "gelu_pytorch_tanh") ||
+                               !strcmp(act, "gelu_fast");
+        t->act = tanh_form ? ACT_GELU_TANH : !strcmp(act, "gelu") ? ACT_GELU : !strcmp(act, "relu") ? ACT_RELU
+               : !strcmp(act, "silu") ? ACT_SILU : ACT_COUNT;
         bool scaled = true, by_layer = false;
         (void)spingalett_json_bool(j, spingalett_json_member(j, SPG_JSON_ROOT, "scale_attn_weights"), &scaled);
         (void)spingalett_json_bool(j, spingalett_json_member(j, SPG_JSON_ROOT, "scale_attn_by_inverse_layer_idx"), &by_layer);

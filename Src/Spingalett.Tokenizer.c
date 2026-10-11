@@ -107,7 +107,8 @@ static size_t utf8_put(char *out, uint32_t cp) {
 enum { CAT_NONE, CAT_LU, CAT_LL, CAT_LT, CAT_LM, CAT_LO, CAT_M, CAT_N };
 
 static int category(uint32_t cp) {
-    if (cp < 0x80) return cp >= 'A' && cp <= 'Z' ? CAT_LU : cp >= 'a' && cp <= 'z' ? CAT_LL : cp >= '0' && cp <= '9' ? CAT_N : CAT_NONE;
+    if (cp < 0x80)
+        return cp >= 'A' && cp <= 'Z' ? CAT_LU : cp >= 'a' && cp <= 'z' ? CAT_LL : cp >= '0' && cp <= '9' ? CAT_N : CAT_NONE;
     size_t lo = 0, hi = sizeof unicode_categories / sizeof unicode_categories[0];
     while (hi - lo > 1) {                   /* the last run starting at or before cp */
         size_t mid = (lo + hi) / 2;
@@ -166,7 +167,8 @@ static bool decomposition(uint32_t cp, uint32_t *a, uint32_t *b) {
 static uint32_t composite(uint32_t a, uint32_t b) {
     if (a >= HANGUL_L && a < HANGUL_L + HANGUL_LC && b >= HANGUL_V && b < HANGUL_V + HANGUL_VC)
         return HANGUL_S + ((a - HANGUL_L) * HANGUL_VC + (b - HANGUL_V)) * HANGUL_TC;
-    if (a >= HANGUL_S && a < HANGUL_S + HANGUL_SC && (a - HANGUL_S) % HANGUL_TC == 0 && b > HANGUL_T && b < HANGUL_T + HANGUL_TC)
+    if (a >= HANGUL_S && a < HANGUL_S + HANGUL_SC && (a - HANGUL_S) % HANGUL_TC == 0 && b > HANGUL_T &&
+        b < HANGUL_T + HANGUL_TC)
         return a + (b - HANGUL_T);
     size_t lo = 0, hi = sizeof unicode_composites / sizeof unicode_composites[0];
     while (lo < hi) {
@@ -507,8 +509,10 @@ static bool index_added(SpingalettTokenizer *t) {
         if (t->added[k].len) t->added_order[fill[(unsigned char)t->pool[t->added[k].off]]++] = k;
     for (unsigned b = 0; b < 256; b++)      /* longest first, then in the file's order */
         for (uint32_t i = t->added_first[b] + 1; i < t->added_first[b + 1]; i++)
-            for (uint32_t j = i; j > t->added_first[b] && t->added[t->added_order[j - 1]].len < t->added[t->added_order[j]].len; j--) {
-                uint32_t x = t->added_order[j]; t->added_order[j] = t->added_order[j - 1]; t->added_order[j - 1] = x;
+            for (uint32_t j = i; j > t->added_first[b]; j--) {
+                uint32_t *o = t->added_order;
+                if (t->added[o[j - 1]].len >= t->added[o[j]].len) break;
+                uint32_t x = o[j]; o[j] = o[j - 1]; o[j - 1] = x;
             }
     return true;
 }
@@ -617,8 +621,15 @@ static bool is_newline_or_slash(uint32_t c) { return c == '\r' || c == '\n' || c
 /* [^\r\n\p{L}\p{N}]: the character a word may start with. */
 static bool is_word_lead(uint32_t c) { return c != '\r' && c != '\n' && !is_letter(c) && !is_number(c); }
 /* o200k's [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and [\p{Ll}\p{Lm}\p{Lo}\p{M}] */
-static bool is_upper_class(uint32_t c) { int k = category(c); return k == CAT_LU || k == CAT_LT || k == CAT_LM || k == CAT_LO || k == CAT_M; }
-static bool is_lower_class(uint32_t c) { int k = category(c); return k == CAT_LL || k == CAT_LM || k == CAT_LO || k == CAT_M; }
+static bool is_upper_class(uint32_t c) {
+    int k = category(c);
+    return k == CAT_LU || k == CAT_LT || k == CAT_LM || k == CAT_LO || k == CAT_M;
+}
+
+static bool is_lower_class(uint32_t c) {
+    int k = category(c);
+    return k == CAT_LL || k == CAT_LM || k == CAT_LO || k == CAT_M;
+}
 
 /* \s+(?!\S) and \s+ from i: the whitespace run, less its last character when something follows it and
    the run has more than one (lookahead); 0 when the lookahead form fails. */
@@ -653,7 +664,8 @@ static size_t match_gpt2(const char *s, size_t n, size_t i) {
     size_t l0, l1;
     uint32_t c0 = cp_at(s, n, i, &l0);
     for (int k = 0; k < 3; k++) {
-        if (c0 == ' ' && i + 1 < n && classes[k](cp_at(s, n, i + 1, &l1))) return run_end(s, n, i + 1, classes[k], SIZE_MAX) - i;
+        if (c0 == ' ' && i + 1 < n && classes[k](cp_at(s, n, i + 1, &l1)))
+            return run_end(s, n, i + 1, classes[k], SIZE_MAX) - i;
         if (classes[k](c0)) return run_end(s, n, i, classes[k], SIZE_MAX) - i;
     }
     m = spaces_not_before_text(s, n, i);
@@ -741,8 +753,8 @@ static bool recognize_pattern(const char *re, Step *st) {
     static const char *const digit_forms[2] = {"\\p{N}{1,3}", "\\p{N}"};
     char text[1024];
     for (int d = 0; d < 2; d++) {
-        snprintf(text, sizeof text, "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|%s| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|"
-                 "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+", digit_forms[d]);
+        snprintf(text, sizeof text, "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|%s|"
+                 " ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+", digit_forms[d]);
         if (!strcmp(re, text)) { st->pattern = PATTERN_CL100K; st->digits = d ? 1 : 3; return true; }
         for (int c = 0; c < 2; c++)
             for (int sl = 0; sl < 2; sl++) {
@@ -1203,7 +1215,8 @@ static bool bpe_word(const SpingalettTokenizer *t, const char *s, size_t n, Work
         if ((!is_first && t->prefix) || (is_last && t->suffix)) {
             w->scratch.len = 0;
             if ((!is_first && t->prefix && !bytes_add(&w->scratch, t->prefix, t->prefix_len)) ||
-                !bytes_add(&w->scratch, s + i, j - i) || (is_last && t->suffix && !bytes_add(&w->scratch, t->suffix, t->suffix_len)))
+                !bytes_add(&w->scratch, s + i, j - i) ||
+                (is_last && t->suffix && !bytes_add(&w->scratch, t->suffix, t->suffix_len)))
                 return false;
             piece = w->scratch.buf;
             len = w->scratch.len;
@@ -1419,10 +1432,13 @@ static void lossy_utf8(Bytes *out, const char *s, size_t n, bool *failed) {
     }
 }
 
+static int hex_value(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
 static bool is_byte_token(const char *s, size_t n, unsigned *byte) {
     if (n != 6 || memcmp(s, "<0x", 3) != 0 || s[5] != '>') return false;
-    int h = s[3] >= '0' && s[3] <= '9' ? s[3] - '0' : s[3] >= 'a' && s[3] <= 'f' ? s[3] - 'a' + 10 : s[3] >= 'A' && s[3] <= 'F' ? s[3] - 'A' + 10 : -1;
-    int l = s[4] >= '0' && s[4] <= '9' ? s[4] - '0' : s[4] >= 'a' && s[4] <= 'f' ? s[4] - 'a' + 10 : s[4] >= 'A' && s[4] <= 'F' ? s[4] - 'A' + 10 : -1;
+    int h = hex_value(s[3]), l = hex_value(s[4]);
     if (h < 0 || l < 0) return false;
     *byte = (unsigned)(h * 16 + l);
     return true;
@@ -1496,8 +1512,10 @@ static bool decode_step(const SpingalettTokenizer *t, const Step *st, const Strs
             for (size_t k = 0; k < in->count; k++) {
                 const char *s = in->text.buf + in->off[k];
                 size_t n = in->len[k], a = 0, b = n;
-                for (uint32_t r = 0; r < st->start && a + st->alen <= n && memcmp(s + a, st->a, st->alen) == 0; r++) a += st->alen;
-                for (uint32_t r = 0; r < st->stop && b >= a + st->alen && memcmp(s + b - st->alen, st->a, st->alen) == 0; r++) b -= st->alen;
+                for (uint32_t r = 0; r < st->start && a + st->alen <= n && memcmp(s + a, st->a, st->alen) == 0; r++)
+                    a += st->alen;
+                for (uint32_t r = 0; r < st->stop && b >= a + st->alen && memcmp(s + b - st->alen, st->a, st->alen) == 0; r++)
+                    b -= st->alen;
                 strs_add(out, s + a, b - a);
             }
             break;
@@ -1748,7 +1766,8 @@ static bool read_pre_tokenizer(Loader *l, uint32_t v) {
         st->invert = member_bool(l, v, "invert", false);
     } else if (spingalett_json_is(l->j, type, "Metaspace")) {
         if (!(st = add_step(&t->pre, &t->pre_count, STEP_METASPACE))) return lfail(l, "out of memory", NULL);
-        if (!(st->a = member_string(l, v, "replacement", &st->alen))) return lfail(l, "tokenizer: Metaspace has no replacement", NULL);
+        if (!(st->a = member_string(l, v, "replacement", &st->alen)))
+            return lfail(l, "tokenizer: Metaspace has no replacement", NULL);
         st->prepend = prepend_scheme(l, v);
         st->split = member_bool(l, v, "split", true);
     } else if (spingalett_json_is(l->j, type, "Digits")) {
@@ -1786,13 +1805,15 @@ static bool read_decoder(Loader *l, uint32_t v) {
         if (!add_step(&t->dec, &t->dec_count, STEP_FUSE)) return lfail(l, "out of memory", NULL);
     } else if (spingalett_json_is(l->j, type, "Strip")) {
         if (!(st = add_step(&t->dec, &t->dec_count, STEP_STRIP))) return lfail(l, "out of memory", NULL);
-        if (!(st->a = member_string(l, v, "content", &st->alen)) || !st->alen) return lfail(l, "tokenizer: Strip has no content", NULL);
+        if (!(st->a = member_string(l, v, "content", &st->alen)) || !st->alen)
+            return lfail(l, "tokenizer: Strip has no content", NULL);
         int64_t x = 0;
         if (spingalett_json_integer(l->j, spingalett_json_member(l->j, v, "start"), 0, 1 << 20, &x)) st->start = (uint32_t)x;
         if (spingalett_json_integer(l->j, spingalett_json_member(l->j, v, "stop"), 0, 1 << 20, &x)) st->stop = (uint32_t)x;
     } else if (spingalett_json_is(l->j, type, "Metaspace")) {
         if (!(st = add_step(&t->dec, &t->dec_count, STEP_METASPACE))) return lfail(l, "out of memory", NULL);
-        if (!(st->a = member_string(l, v, "replacement", &st->alen))) return lfail(l, "tokenizer: Metaspace has no replacement", NULL);
+        if (!(st->a = member_string(l, v, "replacement", &st->alen)))
+            return lfail(l, "tokenizer: Metaspace has no replacement", NULL);
         st->prepend = prepend_scheme(l, v);
     } else {
         char name[64];
@@ -1828,8 +1849,9 @@ static bool read_post_processor(Loader *l, uint32_t v) {
     }
     if (spingalett_json_is(l->j, type, "BertProcessing") || spingalett_json_is(l->j, type, "RobertaProcessing")) {
         int64_t cls, sep;
-        if (!spingalett_json_integer(l->j, spingalett_json_element(l->j, spingalett_json_member(l->j, v, "cls"), 1), 0, UINT32_MAX - 1, &cls) ||
-            !spingalett_json_integer(l->j, spingalett_json_element(l->j, spingalett_json_member(l->j, v, "sep"), 1), 0, UINT32_MAX - 1, &sep))
+        const uint32_t c = spingalett_json_element(l->j, spingalett_json_member(l->j, v, "cls"), 1);
+        const uint32_t s = spingalett_json_element(l->j, spingalett_json_member(l->j, v, "sep"), 1);
+        if (!spingalett_json_integer(l->j, c, 0, MAX_IDS - 1, &cls) || !spingalett_json_integer(l->j, s, 0, MAX_IDS - 1, &sep))
             return lfail(l, "tokenizer: the post-processor's cls or sep cannot be read", NULL);
         t->before[0] = (uint32_t)cls; t->before_count = 1;
         t->after[0] = (uint32_t)sep; t->after_count = 1;
@@ -1850,7 +1872,8 @@ static bool read_post_processor(Loader *l, uint32_t v) {
         uint32_t ids = spingalett_json_member(l->j, entry, "ids");
         for (uint32_t i = spingalett_json_first(l->j, ids); i && i < l->j->values[ids].next; i = l->j->values[i].next) {
             int64_t id;
-            if (!spingalett_json_integer(l->j, i, 0, UINT32_MAX - 1, &id)) return lfail(l, "tokenizer: the template's ids cannot be read", NULL);
+            if (!spingalett_json_integer(l->j, i, 0, UINT32_MAX - 1, &id))
+                return lfail(l, "tokenizer: the template's ids cannot be read", NULL);
             uint32_t *list = seen_sequence ? t->after : t->before, *count = seen_sequence ? &t->after_count : &t->before_count;
             if (*count == 4) return lfail(l, "tokenizer: the template adds more than four tokens on a side", NULL);
             list[(*count)++] = (uint32_t)id;
@@ -1949,7 +1972,10 @@ static bool read_model(Loader *l, uint32_t model, uint32_t added) {
         if (m->type == SPG_JSON_STRING) {
             whole = spingalett_json_strdup(j, e, &an);
             char *space = whole ? memchr(whole, ' ', an) : NULL;
-            if (!space || memchr(space + 1, ' ', an - (size_t)(space + 1 - whole))) { free(whole); return lfail(l, "tokenizer: a merge is not two tokens", NULL); }
+            if (!space || memchr(space + 1, ' ', an - (size_t)(space + 1 - whole))) {
+                free(whole);
+                return lfail(l, "tokenizer: a merge is not two tokens", NULL);
+            }
             a = whole;
             b = space + 1;
             bn = an - (size_t)(b - whole);
@@ -2095,25 +2121,29 @@ static bool merges_from_scores(SpingalettTokenizer *t, const float *scores) {
     }
     for (uint32_t i = 0; i < t->size; i++)
         if (!distinct || sorted[i] != sorted[distinct - 1]) sorted[distinct++] = sorted[i];
+    /* the pairs counted first (a table sized by them), then entered */
     uint64_t pairs = 0;
-    for (uint32_t id = 0; id < t->size; id++) pairs += t->model_len[id];
-    bool ok = pairs_alloc(t, (uint32_t)(pairs < UINT32_MAX / 4 ? pairs : UINT32_MAX / 4));
-    for (uint32_t id = 0; ok && id < t->size; id++) {
-        if (t->model_off[id] == UINT32_MAX || t->added_of[id] >= 0) continue;
-        const char *s = t->pool + t->model_off[id];
-        uint32_t n = t->model_len[id];
-        uint32_t lo = 0, hi = distinct;     /* the rank of its score */
-        while (lo < hi) {
-            uint32_t mid = (lo + hi) / 2;
-            if (sorted[mid] > scores[id]) lo = mid + 1;
-            else hi = mid;
-        }
-        for (uint32_t k = 1; k < n; k++) {
-            if (((unsigned char)s[k] & 0xC0) == 0x80) continue;
-            uint32_t a = vocab_get(t, s, k), b = vocab_get(t, s + k, n - k);
-            if (a == NONE || b == NONE) continue;
-            const Pair *p = pair_get(t, a, b);
-            if (!p || p->rank > lo) merge_put(t, a, b, lo, id);
+    bool ok = true;
+    for (int pass = 0; pass < 2 && ok; pass++) {
+        if (pass) ok = pairs_alloc(t, (uint32_t)(pairs < UINT32_MAX / 4 ? pairs : UINT32_MAX / 4));
+        for (uint32_t id = 0; ok && id < t->size; id++) {
+            if (t->model_off[id] == UINT32_MAX || t->added_of[id] >= 0) continue;
+            const char *s = t->pool + t->model_off[id];
+            uint32_t n = t->model_len[id];
+            uint32_t lo = 0, hi = distinct;     /* the rank of its score */
+            while (pass && lo < hi) {
+                uint32_t mid = (lo + hi) / 2;
+                if (sorted[mid] > scores[id]) lo = mid + 1;
+                else hi = mid;
+            }
+            for (uint32_t k = 1; k < n; k++) {
+                if (((unsigned char)s[k] & 0xC0) == 0x80) continue;
+                uint32_t a = vocab_get(t, s, k), b = vocab_get(t, s + k, n - k);
+                if (a == NONE || b == NONE) continue;
+                if (!pass) { pairs++; continue; }
+                const Pair *p = pair_get(t, a, b);
+                if (!p || p->rank > lo) merge_put(t, a, b, lo, id);
+            }
         }
     }
     free(sorted);
@@ -2124,12 +2154,14 @@ SpingalettTokenizer *spingalett_tokenizer_build(const SpgTokenizerSpec *spec) {
     char error[200] = "";
     const bool spm = spec->model && !strcmp(spec->model, "llama");
     if (!spec->model || (!spm && strcmp(spec->model, "gpt2"))) {
-        tfail(error, sizeof error, "GGUF: the tokenizer model %s is not supported (gpt2 and llama are)", spec->model ? spec->model : "(none)");
+        tfail(error, sizeof error, "GGUF: the tokenizer model %s is not supported (gpt2 and llama are)",
+              spec->model ? spec->model : "(none)");
         set_error(SPINGALETT_ERR_INVALID, error);
         return NULL;
     }
     if (!spec->count || spec->count > MAX_IDS || (spm && !spec->scores) || (!spm && !spec->merges)) {
-        set_error(SPINGALETT_ERR_INVALID, spm ? "GGUF: the vocabulary has no tokens or scores" : "GGUF: the vocabulary has no tokens or merges");
+        set_error(SPINGALETT_ERR_INVALID, spm ? "GGUF: the vocabulary has no tokens or scores"
+                                              : "GGUF: the vocabulary has no tokens or merges");
         return NULL;
     }
     SpingalettTokenizer *t = tokenizer_new();
@@ -2169,9 +2201,11 @@ SpingalettTokenizer *spingalett_tokenizer_build(const SpgTokenizerSpec *spec) {
             ok = (st = add_step(&t->norm, &t->norm_count, STEP_PREPEND)) && (st->a = dup_bytes("\xE2\x96\x81", 3));
             if (ok) st->alen = 3;
         }
-        ok = ok && (st = add_step(&t->norm, &t->norm_count, STEP_REPLACE)) && (st->a = dup_bytes(" ", 1)) && (st->b = dup_bytes("\xE2\x96\x81", 3));
+        ok = ok && (st = add_step(&t->norm, &t->norm_count, STEP_REPLACE)) && (st->a = dup_bytes(" ", 1)) &&
+             (st->b = dup_bytes("\xE2\x96\x81", 3));
         if (ok) { st->alen = 1; st->blen = 3; }
-        ok = ok && (st = add_step(&t->dec, &t->dec_count, STEP_REPLACE)) && (st->a = dup_bytes("\xE2\x96\x81", 3)) && (st->b = dup_bytes(" ", 1));
+        ok = ok && (st = add_step(&t->dec, &t->dec_count, STEP_REPLACE)) && (st->a = dup_bytes("\xE2\x96\x81", 3)) &&
+             (st->b = dup_bytes(" ", 1));
         if (ok) { st->alen = 3; st->blen = 1; }
         ok = ok && add_step(&t->dec, &t->dec_count, STEP_BYTE_FALLBACK) && add_step(&t->dec, &t->dec_count, STEP_FUSE);
         if (ok && spec->add_space_prefix) {
