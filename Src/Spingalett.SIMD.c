@@ -189,6 +189,38 @@ void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act) 
         data[i] = spingalett_activate_value(data[i], act);
 }
 
+float spingalett_vec_exp_shifted(float *row, uint32_t n, float shift) {
+    uint32_t i = 0;
+    float sum = 0.0f;
+#if defined(__AVX2__)
+    const __m256 s = _mm256_set1_ps(shift);
+    __m256 acc = _mm256_setzero_ps();
+    for (; i + 8u <= n; i += 8u) {
+        const __m256 e = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(row + i), s));
+        _mm256_storeu_ps(row + i, e);
+        acc = _mm256_add_ps(acc, e);
+    }
+    sum = hsum256_ps(acc);
+#endif
+    for (; i < n; i++) {
+        row[i] = expf(row[i] - shift);
+        sum += row[i];
+    }
+    return sum;
+}
+
+float spingalett_vec_sum_lanes(const float *row, uint32_t n) {
+    uint32_t i = 0;
+    float sum = 0.0f;
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    for (; i + 8u <= n; i += 8u) acc = _mm256_add_ps(acc, _mm256_loadu_ps(row + i));
+    sum = hsum256_ps(acc);
+#endif
+    for (; i < n; i++) sum += row[i];
+    return sum;
+}
+
 void spingalett_activate_training(float *data, uint64_t total, ActivationFunction act) {
     uint64_t i = 0;
 #if defined(__AVX2__)

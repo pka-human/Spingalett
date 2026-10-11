@@ -193,12 +193,9 @@ static void block_softmax(float *S, size_t ld, uint32_t rows, uint32_t keys, uin
     for (uint32_t r = 0; r < rows; r++) {
         float *row = S + r * ld;
         const uint32_t end = causal ? i0 + r + 1u : keys;
-        float m = -FLT_MAX, sum = 0.0f;
+        float m = -FLT_MAX;
         for (uint32_t j = 0; j < end; j++) m = row[j] > m ? row[j] : m;
-        for (uint32_t j = 0; j < end; j++) {
-            row[j] = expf(row[j] - m);
-            sum += row[j];
-        }
+        const float sum = spingalett_vec_exp_shifted(row, end, m);
         const float inv = 1.0f / sum;
         for (uint32_t j = 0; j < end; j++) row[j] *= inv;
         for (uint32_t j = end; j < keys; j++) row[j] = 0.0f;
@@ -225,9 +222,11 @@ static void block_softmax_ext(float *S, size_t ld, uint32_t rows, uint32_t lo, u
                 any = true;
             }
         for (uint32_t c = 0; c < first; c++) row[c] = 0.0f;
-        for (uint32_t c = first; c < end; c++) {
-            row[c] = !live || live[lo + c] ? expf(row[c] - m) : 0.0f;
-            sum += row[c];
+        sum = spingalett_vec_exp_shifted(row + first, end - first, m);
+        if (live) {             /* padding's keys zero, the sum taken again in the same order */
+            for (uint32_t c = first; c < end; c++)
+                if (!live[lo + c]) row[c] = 0.0f;
+            sum = spingalett_vec_sum_lanes(row + first, end - first);
         }
         const float inv = any ? 1.0f / sum : 0.0f;
         for (uint32_t c = first; c < end; c++) row[c] *= inv;
@@ -347,10 +346,10 @@ void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const f
                         first -= lo;
                         end -= lo;
                         for (uint32_t c = 0; c < first; c++) row[c] = 0.0f;
+                        (void)spingalett_vec_exp_shifted(row + first, end - first, L[r]);
                         if (live)
-                            for (uint32_t c = first; c < end; c++) row[c] = live[lo + c] ? expf(row[c] - L[r]) : 0.0f;
-                        else
-                            for (uint32_t c = first; c < end; c++) row[c] = expf(row[c] - L[r]);
+                            for (uint32_t c = first; c < end; c++)
+                                if (!live[lo + c]) row[c] = 0.0f;
                         for (uint32_t c = end; c < keys; c++) row[c] = 0.0f;
                     }
                     /* dS = P (dP - D) with dP = dO V^T and D = rowsum(dO O) = rowsum(P dP) (the outputs before

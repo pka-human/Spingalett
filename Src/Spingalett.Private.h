@@ -531,6 +531,12 @@ void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total,
    expf, which the engine on its own, its WebAssembly build and sessions agree on. Other activations as
    apply_activation_bulk(). */
 void spingalett_activate_training(float *data, uint64_t total, ActivationFunction act);
+/* row[i] = exp(row[i] - shift) for i < n, the vector exp in blocks of 8 from the start (expf for the rest), and
+   their sum (eight lanes, then across them, then the rest in order): attention's softmax in training and
+   predict(); deployment models attend through spingalett_engine_attend(). */
+float spingalett_vec_exp_shifted(float *row, uint32_t n, float shift);
+/* The sum of n values in spingalett_vec_exp_shifted()'s order. */
+float spingalett_vec_sum_lanes(const float *row, uint32_t n);
 
 void     rng_seed(uint64_t seed);
 uint32_t rng_next(void);
