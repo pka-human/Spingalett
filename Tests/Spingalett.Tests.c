@@ -4860,26 +4860,31 @@ static bool window_logits(NeuralNetwork *net, const char *name, float **y, uint3
 
 static void gguf_models(void) {
     char path[512];
-    /* hf_llama's weights as llama.cpp's converter writes them (queries and keys permuted): the network of the
-       directory, bit for bit */
-    snprintf(path, sizeof path, "%s/gguf_llama.gguf", SPINGALETT_TEST_DATA_DIR);
-    NeuralNetwork *g = spingalett_load_pretrained(.path = path, .context = 10);
-    CHECK(g, "gguf_llama.gguf: %s", spingalett_last_error_message());
-    snprintf(path, sizeof path, "%s/hf_llama", SPINGALETT_TEST_DATA_DIR);
-    NeuralNetwork *h = spingalett_load_pretrained(.path = path, .context = 10);
-    float *yg, *yh;
+    /* the checkpoints' weights as llama.cpp's converter writes them (LLaMA's queries and keys permuted, GPT-2's
+       Conv1D matrices transposed): the networks of the directories, bit for bit */
+    static const char *const forms[3][2] = {{"gguf_llama.gguf", "hf_llama"}, {"gguf_qwen2.gguf", "hf_qwen2"},
+                                            {"gguf_gpt2.gguf", "hf_gpt2"}};
+    float *yg, *yh, worst = 0.0f;
     const float *expected;
     uint32_t count = 0;
     unsigned char *data, *data2;
-    bool ok = window_logits(g, "hf_llama", &yg, &count, &expected, &data) &&
-              window_logits(h, "hf_llama", &yh, &count, &expected, &data2);
-    float worst = 0.0f;
-    for (uint32_t i = 0; ok && i < count; i++) worst = fmaxf(worst, fabsf(yg[i] - expected[i]));
-    CHECK(ok && !memcmp(yg, yh, (size_t)count * sizeof(float)) && worst < 1e-4f,
-          "gguf_llama.gguf: logits differ from the directory's network's or PyTorch's (%g)", worst);
-    if (ok) printf("  %-20s the directory's logits bit for bit, |logits - PyTorch| %.1e\n", "gguf_llama.gguf", worst);
-    free(yg); free(yh); free(data); free(data2);
-    free_network(g); free_network(h);
+    bool ok;
+    for (int k = 0; k < 3; k++) {
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, forms[k][0]);
+        NeuralNetwork *g = spingalett_load_pretrained(.path = path, .context = 10);
+        CHECK(g, "%s: %s", forms[k][0], spingalett_last_error_message());
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, forms[k][1]);
+        NeuralNetwork *h = spingalett_load_pretrained(.path = path, .context = 10);
+        ok = window_logits(g, forms[k][1], &yg, &count, &expected, &data) &&
+             window_logits(h, forms[k][1], &yh, &count, &expected, &data2);
+        worst = 0.0f;
+        for (uint32_t i = 0; ok && i < count; i++) worst = fmaxf(worst, fabsf(yg[i] - expected[i]));
+        CHECK(ok && !memcmp(yg, yh, (size_t)count * sizeof(float)) && worst < 1e-4f,
+              "%s: logits differ from the directory's network's or PyTorch's (%g)", forms[k][0], worst);
+        if (ok) printf("  %-20s the directory's logits bit for bit, |logits - PyTorch| %.1e\n", forms[k][0], worst);
+        free(yg); free(yh); free(data); free(data2);
+        free_network(g); free_network(h);
+    }
     /* matrices of fifteen types: the logits of their dequantized weights, each matrix's sums */
     snprintf(path, sizeof path, "%s/gguf_quant.gguf", SPINGALETT_TEST_DATA_DIR);
     NeuralNetwork *q = spingalett_load_pretrained(.path = path, .context = 10);
@@ -4937,10 +4942,12 @@ static void gguf_models(void) {
     free_network(q);
     /* the vocabularies: a byte-level BPE (LLaMA 3's form, Hugging Face's ids) and SentencePiece's BPE (its ids) */
     tokenizer_cases("gguf_llama.gguf", "gguf_llama.gguf", "tokenizer_llama3.txt", 100);
+    tokenizer_cases("gguf_qwen2.gguf", "gguf_qwen2.gguf", "tokenizer_qwen2.txt", 100);
     tokenizer_cases("gguf_spm.gguf", "gguf_spm.gguf", "gguf_spm.txt", 60);
     static const struct { const char *file; uint32_t bos, eos, unk; } named[] = {
-        {"gguf_llama.gguf", 420, 424, SPINGALETT_NO_TOKEN}, {"gguf_spm.gguf", 1, 2, 0}};
-    for (size_t k = 0; k < 2; k++) {
+        {"gguf_llama.gguf", 420, 424, SPINGALETT_NO_TOKEN}, {"gguf_qwen2.gguf", SPINGALETT_NO_TOKEN, 420, SPINGALETT_NO_TOKEN},
+        {"gguf_spm.gguf", 1, 2, 0}};
+    for (size_t k = 0; k < sizeof named / sizeof *named; k++) {
         snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, named[k].file);
         SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
         SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);

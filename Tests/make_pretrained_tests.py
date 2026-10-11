@@ -24,6 +24,8 @@ GGUF files, written by the small writer below as llama.cpp's converter writes th
 
 - gguf_llama.gguf: hf_llama's weights (queries and keys permuted into llama.cpp's order, matrices in
   bfloat16, vectors in float32) and its tokenizer as a vocabulary of the "gpt2" model ("llama-bpe");
+- gguf_qwen2.gguf: hf_qwen2's (float16, its biases, no output.weight) and its tokenizer ("qwen2");
+- gguf_gpt2.gguf: hf_gpt2's (its Conv1D matrices transposed to [out][in], learned positions), no vocabulary;
 - gguf_quant.gguf (version 2): a LLaMA of width 256 whose sixteen matrices are random blocks of fifteen
   types, from F32 to the k-quants and IQ4_NL, IQ4_XS; gguf_quant.bin the logits of its weights as
   llama.cpp's formulas dequantize them (the numpy functions below, checked against the gguf package's
@@ -370,45 +372,25 @@ def unpermute(w, heads):
     return w.reshape(heads, w.shape[0] // heads // 2, 2, *w.shape[1:]).swapaxes(1, 2).reshape(w.shape)
 
 
-def llama_metadata(cfg, name):
+def llama_metadata(cfg, name, arch="llama"):
     H = cfg["num_attention_heads"]
-    head = [("llama.attention.key_length", GGUF_UINT32, cfg["head_dim"]), ("llama.attention.value_length", GGUF_UINT32,
+    head = [(f"{arch}.attention.key_length", GGUF_UINT32, cfg["head_dim"]), (f"{arch}.attention.value_length", GGUF_UINT32,
             cfg["head_dim"])] if "head_dim" in cfg else []
-    return head + [("general.architecture", GGUF_STRING, "llama"), ("general.name", GGUF_STRING, name),
-            ("general.alignment", GGUF_UINT32, 32), ("llama.context_length", GGUF_UINT32, cfg["max_position_embeddings"]),
-            ("llama.embedding_length", GGUF_UINT32, cfg["hidden_size"]), ("llama.block_count", GGUF_UINT32, cfg["num_hidden_layers"]),
-            ("llama.feed_forward_length", GGUF_UINT32, cfg["intermediate_size"]), ("llama.attention.head_count", GGUF_UINT32, H),
-            ("llama.attention.head_count_kv", GGUF_UINT32, cfg["num_key_value_heads"]),
-            ("llama.attention.layer_norm_rms_epsilon", GGUF_FLOAT32, cfg["rms_norm_eps"]),
-            ("llama.rope.freq_base", GGUF_FLOAT32, cfg["rope_theta"]),
-            ("llama.rope.dimension_count", GGUF_UINT32, cfg.get("head_dim", cfg["hidden_size"] // H))]
+    return head + [("general.architecture", GGUF_STRING, arch), ("general.name", GGUF_STRING, name),
+                   ("general.alignment", GGUF_UINT32, 32), (f"{arch}.context_length", GGUF_UINT32, cfg["max_position_embeddings"]),
+                   (f"{arch}.embedding_length", GGUF_UINT32, cfg["hidden_size"]),
+                   (f"{arch}.block_count", GGUF_UINT32, cfg["num_hidden_layers"]),
+                   (f"{arch}.feed_forward_length", GGUF_UINT32, cfg["intermediate_size"]),
+                   (f"{arch}.attention.head_count", GGUF_UINT32, H),
+                   (f"{arch}.attention.head_count_kv", GGUF_UINT32, cfg["num_key_value_heads"]),
+                   (f"{arch}.attention.layer_norm_rms_epsilon", GGUF_FLOAT32, cfg["rms_norm_eps"]),
+                   (f"{arch}.rope.freq_base", GGUF_FLOAT32, cfg["rope_theta"]),
+                   (f"{arch}.rope.dimension_count", GGUF_UINT32, cfg.get("head_dim", cfg["hidden_size"] // H))]
 
 
-def gguf_from_hf(cfg, sd, tokenizer_json):
-    """hf_llama's weights in a GGUF file, as llama.cpp's converter writes them: queries and keys permuted, matrices in
-    bfloat16 (lossless for these), vectors in float32; its tokenizer as a byte-level BPE of merges."""
-    H, KV = cfg["num_attention_heads"], cfg["num_key_value_heads"]
-    names = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": "output_norm.weight",
-             "lm_head.weight": "output.weight"}
-    parts = {"input_layernorm": "attn_norm", "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
-             "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output", "post_attention_layernorm": "ffn_norm",
-             "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
-    tensors = []
-    for key in sorted(sd):
-        w = sd[key].to(torch.float32).numpy()
-        if key in names:
-            name = names[key]
-        else:
-            layer, part = key[len("model.layers."):].split(".", 1)
-            part, suffix = part.rsplit(".", 1)
-            name = f"blk.{layer}.{parts[part]}.{suffix}"
-            if part == "self_attn.q_proj":
-                w = permute(w, H)
-            elif part == "self_attn.k_proj":
-                w = permute(w, KV)
-        kind = "BF16" if w.ndim == 2 else "F32"
-        data = (w.view(np.uint32) >> 16).astype("<u2").tobytes() if kind == "BF16" else w.astype("<f4").tobytes()
-        tensors.append((name, list(w.shape[::-1]), kind, data))
+def vocabulary_metadata(tokenizer_json, pre, bos, eos):
+    """A tokenizer.json of byte-level BPE as the vocabulary of GGUF's "gpt2" model: tokens by id, the added ones control
+    tokens (special) or user-defined ones, the merges as "a b" strings."""
     tok = json.load(open(os.path.join(DATA, tokenizer_json), encoding="utf-8"))
     vocab = {i: t for t, i in tok["model"]["vocab"].items()}
     types = {i: 1 for i in vocab}
@@ -416,15 +398,66 @@ def gguf_from_hf(cfg, sd, tokenizer_json):
         vocab[a["id"]], types[a["id"]] = a["content"], 3 if a["special"] else 4
     count = max(vocab) + 1
     merges = [m if isinstance(m, str) else " ".join(m) for m in tok["model"]["merges"]]
-    metadata = llama_metadata(cfg, "hf_llama") + [
-        ("tokenizer.ggml.model", GGUF_STRING, "gpt2"), ("tokenizer.ggml.pre", GGUF_STRING, "llama-bpe"),
-        ("tokenizer.ggml.tokens", GGUF_ARRAY, (GGUF_STRING, [vocab[i] for i in range(count)])),
-        ("tokenizer.ggml.token_type", GGUF_ARRAY, (GGUF_INT32, [types[i] for i in range(count)])),
-        ("tokenizer.ggml.merges", GGUF_ARRAY, (GGUF_STRING, merges)),
-        ("tokenizer.ggml.bos_token_id", GGUF_UINT32, tok["model"]["vocab"].get("<|begin_of_text|>", 420)),
-        ("tokenizer.ggml.eos_token_id", GGUF_UINT32, 424), ("tokenizer.ggml.add_bos_token", GGUF_BOOL, True)]
-    size = gguf_file(os.path.join(DATA, "gguf_llama.gguf"), metadata, tensors)
-    print(f"gguf_llama.gguf: hf_llama's weights, {len(tensors)} tensors, {size} bytes")
+    meta = [("tokenizer.ggml.model", GGUF_STRING, "gpt2"), ("tokenizer.ggml.pre", GGUF_STRING, pre),
+            ("tokenizer.ggml.tokens", GGUF_ARRAY, (GGUF_STRING, [vocab[i] for i in range(count)])),
+            ("tokenizer.ggml.token_type", GGUF_ARRAY, (GGUF_INT32, [types[i] for i in range(count)])),
+            ("tokenizer.ggml.merges", GGUF_ARRAY, (GGUF_STRING, merges))]
+    if bos is not None:
+        meta.append(("tokenizer.ggml.bos_token_id", GGUF_UINT32, bos))
+    meta.append(("tokenizer.ggml.eos_token_id", GGUF_UINT32, eos))
+    meta.append(("tokenizer.ggml.add_bos_token", GGUF_BOOL, bos is not None))
+    return meta
+
+
+def tensor_bytes(w, kind):
+    if kind == "BF16":
+        return (w.view(np.uint32) >> 16).astype("<u2").tobytes()
+    return w.astype("<f2" if kind == "F16" else "<f4").tobytes()
+
+
+def gguf_from_hf(file, arch, cfg, sd, matrices, vocabulary=None):
+    """A checkpoint's weights in a GGUF file, as llama.cpp's converter writes them: LLaMA's queries and keys permuted
+    (not Qwen2's), GPT-2's Conv1D matrices transposed to [out][in] and its mask buffers left out; matrices in a
+    lossless type for the checkpoint's values, vectors in float32; a vocabulary when given."""
+    names = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": "output_norm.weight",
+             "lm_head.weight": "output.weight", "wte.weight": "token_embd.weight", "wpe.weight": "position_embd.weight",
+             "ln_f.weight": "output_norm.weight", "ln_f.bias": "output_norm.bias"}
+    parts = {"input_layernorm": "attn_norm", "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
+             "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output", "post_attention_layernorm": "ffn_norm",
+             "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down", "ln_1": "attn_norm",
+             "attn.c_attn": "attn_qkv", "attn.c_proj": "attn_output", "ln_2": "ffn_norm", "mlp.c_fc": "ffn_up",
+             "mlp.c_proj": "ffn_down"}
+    tensors = []
+    for key in sorted(sd):
+        w = sd[key].to(torch.float32).numpy()
+        if key in names:
+            name = names[key]
+        else:
+            layer, part = key.split(".", 2)[1:] if arch == "gpt2" else key[len("model.layers."):].split(".", 1)
+            part, suffix = part.rsplit(".", 1)
+            if part == "attn":                                  # GPT-2's causal mask buffer
+                continue
+            name = f"blk.{layer}.{parts[part]}.{suffix}"
+            if arch == "llama" and part == "self_attn.q_proj":
+                w = permute(w, cfg["num_attention_heads"])
+            elif arch == "llama" and part == "self_attn.k_proj":
+                w = permute(w, cfg["num_key_value_heads"])
+            elif arch == "gpt2" and w.ndim == 2:
+                w = np.ascontiguousarray(w.T)                   # Conv1D [in][out] to [out][in]
+        kind = matrices if w.ndim == 2 else "F32"
+        tensors.append((name, list(w.shape[::-1]), kind, tensor_bytes(w, kind)))
+    if arch == "gpt2":
+        metadata = [("general.architecture", GGUF_STRING, "gpt2"), ("general.alignment", GGUF_UINT32, 32),
+                    ("gpt2.context_length", GGUF_UINT32, cfg["n_positions"]), ("gpt2.embedding_length", GGUF_UINT32, cfg["n_embd"]),
+                    ("gpt2.block_count", GGUF_UINT32, cfg["n_layer"]),
+                    ("gpt2.feed_forward_length", GGUF_UINT32, 4 * cfg["n_embd"]),
+                    ("gpt2.attention.head_count", GGUF_UINT32, cfg["n_head"]),
+                    ("gpt2.attention.layer_norm_epsilon", GGUF_FLOAT32, cfg["layer_norm_epsilon"])]
+    else:
+        metadata = llama_metadata(cfg, file.split(".")[0].replace("gguf_", "hf_"), arch)
+    metadata += vocabulary_metadata(*vocabulary) if vocabulary else []
+    size = gguf_file(os.path.join(DATA, file), metadata, tensors)
+    print(f"{file}: {len(tensors)} tensors, {size} bytes")
 
 
 # the quantized model's matrices: its type, and whether llama.cpp permutes its rows
@@ -585,7 +618,8 @@ def main():
              "intermediate_size": 24, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1,
              "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "max_position_embeddings": 32, "hidden_act": "silu",
              "tie_word_embeddings": True, "use_sliding_window": False, "sliding_window": 32, "torch_dtype": "float16"}
-    write("hf_qwen2", qwen2, llama_weights(qwen2, torch.float16, True, True, gen), ref_llama, "tokenizer_qwen2.json")
+    qwen2_sd = llama_weights(qwen2, torch.float16, True, True, gen)
+    write("hf_qwen2", qwen2, qwen2_sd, ref_llama, "tokenizer_qwen2.json")
     mistral = {"architectures": ["MistralForCausalLM"], "model_type": "mistral", "vocab_size": 64, "hidden_size": 16,
                "intermediate_size": 24, "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 2,
                "head_dim": 8, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "max_position_embeddings": 128,
@@ -594,8 +628,11 @@ def main():
     gpt2 = {"architectures": ["GPT2LMHeadModel"], "model_type": "gpt2", "vocab_size": 421, "n_embd": 16, "n_layer": 1,
             "n_head": 4, "n_positions": 32, "n_ctx": 32, "layer_norm_epsilon": 1e-5, "activation_function": "gelu_new",
             "scale_attn_weights": True, "torch_dtype": "float32"}
-    write("hf_gpt2", gpt2, gpt2_weights(gpt2, gen), ref_gpt2, "tokenizer_gpt2.json")
-    gguf_from_hf(llama, llama_sd, "tokenizer_llama3.json")
+    gpt2_sd = gpt2_weights(gpt2, gen)
+    write("hf_gpt2", gpt2, gpt2_sd, ref_gpt2, "tokenizer_gpt2.json")
+    gguf_from_hf("gguf_llama.gguf", "llama", llama, llama_sd, "BF16", ("tokenizer_llama3.json", "llama-bpe", 420, 424))
+    gguf_from_hf("gguf_qwen2.gguf", "qwen2", qwen2, qwen2_sd, "F16", ("tokenizer_qwen2.json", "qwen2", None, 420))
+    gguf_from_hf("gguf_gpt2.gguf", "gpt2", gpt2, gpt2_sd, "F32")
     gguf_quantized()
     gguf_sentencepiece()
 

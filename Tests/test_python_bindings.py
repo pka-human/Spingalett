@@ -805,7 +805,8 @@ def expectations(name):
 
 for tokenizer_file, expected_file in [(f"tokenizer_{n}.json", f"tokenizer_{n}.txt") for n in
                                       ("gpt2", "llama3", "qwen2", "o200k", "spm", "metaspace")] + \
-                                     [("gguf_llama.gguf", "tokenizer_llama3.txt"), ("gguf_spm.gguf", "gguf_spm.txt")]:
+                                     [("gguf_llama.gguf", "tokenizer_llama3.txt"), ("gguf_qwen2.gguf", "tokenizer_qwen2.txt"),
+                                      ("gguf_spm.gguf", "gguf_spm.txt")]:
     with sg.Tokenizer(os.path.join(data_dir, tokenizer_file)) as tok:
         wrong = 0
         for special, add, text, ids, decoded, decoded_skip in expectations(expected_file):
@@ -837,7 +838,8 @@ def window(name):
 
 
 for path, bin_name in [("hf_llama", "hf_llama"), ("hf_qwen2", "hf_qwen2"), ("hf_mistral", "hf_mistral"), ("hf_gpt2", "hf_gpt2"),
-                       ("gguf_llama.gguf", "hf_llama"), ("gguf_quant.gguf", "gguf_quant")]:
+                       ("gguf_llama.gguf", "hf_llama"), ("gguf_qwen2.gguf", "hf_qwen2"), ("gguf_gpt2.gguf", "hf_gpt2"),
+                       ("gguf_quant.gguf", "gguf_quant")]:
     tokens, logits = window(bin_name)
     with sg.Network.from_pretrained(os.path.join(data_dir, path), context=len(tokens)) as lm:
         got = lm.forward(tokens)
