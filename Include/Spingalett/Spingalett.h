@@ -821,12 +821,12 @@ typedef struct {
  * normalizations, grouped-query attention with rotary embeddings (the queries', keys' and values'
  * projections, with Qwen2's biases, in one linear layer), and a SwiGLU MLP (a SiLU layer times a linear
  * one); GPT-2 layer normalizations, learned positions, a GELU MLP and its Conv1D weights transposed. The
- * language model head is lm_head.weight (output.weight), or a copy of the embeddings (tied). The network
- * takes a window of `context` token ids and gives every position's logits
- * (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it generates (spingalett_generate()), trains and saves like any
- * other. Mistral's sliding window is not applied: attention covers the whole context, which is exact for
- * contexts within the window (a warning says when the context exceeds it). Scaled rotary embeddings (LLaMA
- * 3.1's, YaRN) are refused. The tokenizer comes from spingalett_tokenizer_load() on the same path. NULL on
+ * language model head is lm_head.weight (output.weight), or, in a checkpoint without one, tied to the
+ * embedding (SpingalettLayerArgs.tied: one table for both, trained by both). The network takes a window of
+ * `context` token ids and gives every position's logits (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it generates
+ * (spingalett_generate()), trains and saves like any other. Mistral's sliding window (config.json's
+ * sliding_window, a GGUF file's attention.sliding_window) is the attention layers' window. Scaled rotary
+ * embeddings (LLaMA 3.1's, YaRN) are refused. The tokenizer comes from spingalett_tokenizer_load() on the same path. NULL on
  * error.
  */
 #define spingalett_load_pretrained(...) spingalett_load_pretrained_args((SpingalettPretrainedArgs){__VA_ARGS__})

@@ -186,8 +186,8 @@ All notable changes to this project are documented in this file. The format foll
   `gpt2_from_state_dict()`, which give the same logits bit for bit, with Qwen2's biases, explicit
   `head_dim`, tied embeddings, GPT-2's Conv1D weights. The arrays are reserved at their final sizes and
   each tensor is decoded once from the mapped file into its layer (SmolLM2-135M loads in 0.17 s on an
-  i7-12650H). Mistral's sliding window is not applied (exact within the window; a warning beyond it);
-  scaled rotary embeddings are refused. On SmolLM2-135M and Qwen2.5-0.5B-Instruct the logits agree with
+  i7-12650H). Mistral's sliding window is the attention layers' `window`, a head missing from the
+  checkpoint is tied to the embedding; scaled rotary embeddings are refused. On SmolLM2-135M and Qwen2.5-0.5B-Instruct the logits agree with
   `transformers` within 2.4e-4 and 4e-4 and the greedy continuations are the same. The `pretrained` test
   group compares tiny LLaMA,
   Qwen2, Mistral and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) with PyTorch.

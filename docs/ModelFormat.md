@@ -10,8 +10,8 @@ concatenates several, or pools globally (0.10 on), version 7 for networks with t
 convolutions, upsampling or layer normalization (0.13 on), version 8 for the layers of transformers
 (embeddings, attention, RMS normalization, products of layers), the GELU and SiLU activations and the
 sparse cross-entropy loss (1.2 on), version 9 for the training features of language models: dense and
-linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window (1.3 on). `spingalett_load()` and
-`spingalett_load_from_memory()` read versions 1 to 9.
+linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window (1.3
+on). `spingalett_load()` and `spingalett_load_from_memory()` read versions 1 to 9.
 
 Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
 (`spingalett_model_init()` in `Spingalett.Inference.h`) checks the image and computes directly from

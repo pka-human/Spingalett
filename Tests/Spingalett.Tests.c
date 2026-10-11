@@ -5628,7 +5628,14 @@ static void pretrained_model(const char *name, bool tokenizer) {
         predict(.net = net, .inputs = tokens, .sample_count = 1, .outputs = y);
         for (uint32_t i = 0; i < out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
         CHECK(worst < 1e-4f, "%s: logits differ from PyTorch's by %g", name, worst);
-        printf("  %-12s %3u tokens x %3u logits, |logits - PyTorch| %.1e\n", name, T, out / T, worst);
+        /* a checkpoint without lm_head: the head tied to the embedding (GPT-2's, the Qwen2 checkpoint's) */
+        SpingalettNetworkLayer head;
+        spingalett_network_layer(net, spingalett_layer_count(net) - 1, &head);
+        const bool tied = !strcmp(name, "hf_gpt2") || !strcmp(name, "hf_qwen2");
+        CHECK((head.tied == 1) == tied && (head.weight_count == 0) == tied, "%s: head tied %u, %llu weights", name,
+              head.tied, (unsigned long long)head.weight_count);
+        printf("  %-12s %3u tokens x %3u logits, |logits - PyTorch| %.1e%s\n", name, T, out / T, worst,
+               tied ? ", the head tied" : "");
         free(y);
         free_network(net);
     }
@@ -5695,10 +5702,13 @@ static void pretrained_errors(void) {
             free_network(net);
         }
         CHECK(accepted == 0, "%d truncated checkpoints loaded", accepted);
-        /* a window beyond Mistral's sliding window: loaded, with a warning */
+        /* a context beyond Mistral's sliding window: attention over the last 16 tokens */
         write_file(weights_path, weights, wsize);
         NeuralNetwork *net = spingalett_load_pretrained(.path = dir, .context = 20);
-        CHECK(net && spingalett_input_size(net) == 20, "a context beyond the sliding window: %s", spingalett_last_error_message());
+        SpingalettNetworkLayer attn = {0};
+        if (net) spingalett_network_layer(net, 4, &attn);
+        CHECK(net && spingalett_input_size(net) == 20 && attn.type == LAYER_ATTENTION && attn.window == 16,
+              "a context beyond the sliding window: %s (window %u)", spingalett_last_error_message(), attn.window);
         free_network(net);
         remove(weights_path);
     }

@@ -11,7 +11,8 @@
  * gpt2_from_state_dict(): RMS normalization, the queries, keys and values of grouped-query attention in
  * one linear layer before rotary attention (rotate_half, as Hugging Face stores the weights), SwiGLU as
  * the product of a SiLU layer and a linear one; GPT-2's layer normalization, learned positions and its
- * Conv1D weights ([in][out]) transposed. A missing lm_head (tied embeddings) is a copy of the embeddings.
+ * Conv1D weights ([in][out]) transposed; Mistral's sliding window the attention layers' window. Without an
+ * lm_head (tied embeddings) the head is tied to the embedding (SpingalettLayerArgs.tied): one table for both.
  *
  * The network's arrays are reserved at their final sizes before the layers are added, so that a model
  * of several gigabytes is never copied, and each tensor is decoded (F32, F16, BF16) straight into its
@@ -100,8 +101,8 @@ static bool read_parts(const SpgTransformer *t, SpgTensorSource *src, NeuralNetw
     }
     ok = ok && part_into(src, SPG_PART_NORM, 0, weights_at(net, norm, 0), 1, W) &&
          (!gpt2 || bias_into(src, SPG_PART_NORM_BIAS, 0, biases_at(net, norm, 0), W));
+    /* the head's weights, or (tied) the embedding's table already */
     if (ok && src->has(src, SPG_PART_HEAD, 0)) ok = part_into(src, SPG_PART_HEAD, 0, weights_at(net, head, 0), V, W);
-    else if (ok && net) memcpy(weights_at(net, head, 0), weights_at(net, embed, 0), (size_t)V * W * sizeof(float));
     if (ok && net) memset(biases_at(net, head, 0), 0, (size_t)V * sizeof(float));
     src->dry = false;
     return ok;
@@ -120,9 +121,10 @@ NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSo
     }
     /* every tensor where the hyper-parameters say, before anything the size of the model is allocated */
     if (!read_parts(t, src, NULL, NULL, 0, 0, 0)) return NULL;
+    const bool tied = !src->has(src, SPG_PART_HEAD, 0);
     /* the final sizes, so that the arrays are never moved */
     uint64_t neurons = C + C * W + L * C * (gpt2 ? 10 * W + F : 6 * W + Q + 2 * KV + Q + 3 * F) + C * W + C * V;
-    uint64_t weights = V * W + L * (2 * W + (Q + 2 * KV) * W + W * Q + (gpt2 ? 2 : 3) * F * W) + W + V * W;
+    uint64_t weights = V * W + L * (2 * W + (Q + 2 * KV) * W + W * Q + (gpt2 ? 2 : 3) * F * W) + W + (tied ? 0 : V * W);
     uint64_t biases = (gpt2 ? C * W : 0) + L * ((Q + 2 * KV) + W + (gpt2 ? 3 * W + F : 2 * F + W)) + (gpt2 ? W : 0) + V;
     NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
     if (!net) return NULL;
@@ -140,7 +142,7 @@ NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSo
         k->attn_norm = gpt2 ? layer_norm(.net = net, .epsilon = t->eps) : rms_norm(.net = net, .epsilon = t->eps);
         k->qkv = linear(.net = net, .neurons_amount = (uint32_t)(Q + 2 * KV), .weight_initialization = none);
         attention(.net = net, .heads = t->heads, .kv_heads = t->kv_heads, .causal = true,
-                  .rope_theta = gpt2 ? 0.0f : t->theta);
+                  .rope_theta = gpt2 ? 0.0f : t->theta, .window = t->window);
         k->o = linear(.net = net, .neurons_amount = (uint32_t)W, .weight_initialization = none);
         x = add_layers(.net = net, .inputs = {x, k->o});
         k->ffn_norm = gpt2 ? layer_norm(.net = net, .epsilon = t->eps) : rms_norm(.net = net, .epsilon = t->eps);
@@ -159,7 +161,7 @@ NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSo
     }
     if (ok) {
         norm = gpt2 ? layer_norm(.net = net, .epsilon = t->eps) : rms_norm(.net = net, .epsilon = t->eps);
-        head = linear(.net = net, .neurons_amount = (uint32_t)V, .weight_initialization = none);
+        head = linear(.net = net, .neurons_amount = (uint32_t)V, .weight_initialization = none, .tied = tied ? embed : 0u);
         ok = embed != SPINGALETT_NO_LAYER && norm != SPINGALETT_NO_LAYER && head != SPINGALETT_NO_LAYER;
     }
     /* the parameters, part by part */
@@ -297,12 +299,11 @@ static bool exists(const char *path) {
 }
 
 /* The hyper-parameters of config.json; false with the error set for a model of another kind. */
-static bool read_config(const SpgJson *j, SpgTransformer *t, uint32_t context, uint32_t *window) {
+static bool read_config(const SpgJson *j, SpgTransformer *t, uint32_t context) {
     char type[32] = "", act[32] = "", msg[200];
     uint32_t v = spingalett_json_member(j, SPG_JSON_ROOT, "model_type");
     if (v && j->values[v].type == SPG_JSON_STRING && j->values[v].count < sizeof type) spingalett_json_copy(j, v, type);
     memset(t, 0, sizeof *t);
-    *window = 0;
     if (!strcmp(type, "gpt2")) {
         t->arch = SPG_ARCH_GPT2;
         t->width = config_int(j, "n_embd");
@@ -379,7 +380,7 @@ static bool read_config(const SpgJson *j, SpgTransformer *t, uint32_t context, u
     /* Mistral's (and Qwen2's, when it uses one) sliding window */
     bool sliding = !strcmp(type, "mistral");
     (void)spingalett_json_bool(j, spingalett_json_member(j, SPG_JSON_ROOT, "use_sliding_window"), &sliding);
-    if (sliding) *window = config_int(j, "sliding_window");
+    if (sliding) t->window = config_int(j, "sliding_window");
     return true;
 }
 
@@ -491,8 +492,7 @@ static NeuralNetwork *load_directory(const char *dir, uint32_t context) {
         return NULL;
     }
     SpgTransformer t;
-    uint32_t window = 0;
-    bool ok = read_config(&j, &t, context, &window);
+    bool ok = read_config(&j, &t, context);
     spingalett_json_free(&j);
     spingalett_file_close(&file);
     if (!ok) return NULL;
@@ -523,9 +523,6 @@ static NeuralNetwork *load_directory(const char *dir, uint32_t context) {
                 h.conv1d = qkv && qkv->ndims == 2 && qkv->dims[0] == t.width && qkv->dims[1] == 3 * (int64_t)t.width;
             }
             net = spingalett_build_transformer(&t, &h.base);
-            if (net && window && t.context > window)
-                spingalett_log(LOG_WARNING, "pretrained: the model attends to the last %u tokens (a sliding window); "
-                               "the network attends to all %u of its context", window, t.context);
         }
     }
     free(h.tensors);

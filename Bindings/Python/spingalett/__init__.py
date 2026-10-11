@@ -2874,14 +2874,14 @@ def _head(net: "Network", state, table: np.ndarray, vocabulary: int, sets) -> No
 
 
 def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, context: int = 2048,
-                          rope_theta: float = 10000.0, epsilon: float = 1e-6) -> "Network":
+                          rope_theta: float = 10000.0, epsilon: float = 1e-6, window: int = 0) -> "Network":
     """A LLaMA-like model from its state dict in Hugging Face's names (LlamaForCausalLM, and the models of its
     form: Mistral, Qwen2 with its queries', keys' and values' biases, ...): RMS normalization, grouped-query
     attention with rotary embeddings (rotate_half, as Hugging Face stores the weights), a SwiGLU MLP. ``heads``
     and ``kv_heads`` are the config's num_attention_heads and num_key_value_heads (None: as many), ``rope_theta``
-    and ``epsilon`` its rope_theta and rms_norm_eps; ``context`` the network's window of tokens. The language
-    model head is lm_head.weight when it differs from the token embeddings, else (tie_word_embeddings) a linear
-    layer tied to the embedding's table."""
+    and ``epsilon`` its rope_theta and rms_norm_eps, ``window`` Mistral's sliding_window (0: none); ``context`` the
+    network's window of tokens. The language model head is lm_head.weight when it differs from the token
+    embeddings, else (tie_word_embeddings) a linear layer tied to the embedding's table."""
     p = _prefix(state, "embed_tokens.weight")
     embed = _tensor(state[p + "embed_tokens.weight"])
     vocabulary, width = embed.shape
@@ -2907,7 +2907,7 @@ def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, con
         net.add_linear(sum(sizes))
         sets.append((net.last - 1, np.concatenate(qkv),
                      np.concatenate([bias(h + f"self_attn.{n}_proj.bias", m) for n, m in zip("qkv", sizes)])))
-        net.add_attention(heads=heads, kv_heads=kv_heads, rope_theta=rope_theta, causal=True)
+        net.add_attention(heads=heads, kv_heads=kv_heads, rope_theta=rope_theta, causal=True, window=window)
         net.add_linear(width)
         sets.append((net.last - 1, _tensor(state[h + "self_attn.o_proj.weight"]), bias(h + "self_attn.o_proj.bias", width)))
         net.add_add([x, net.last])
