@@ -265,6 +265,8 @@ static bool cub_host_writes(void) { return false; }
 
 /* Bytes of dynamic shared memory a kernel takes (the product's stages). */
 static uint32_t dynamic_shared(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
+    if (kernel == SPG_KERNEL_gemm_mma && count >= 15 && spec[14])
+        return SPG_CUDA_PIPE_SHARED(spec[0], spec[1], spec[2], spec[14]);
     if (kernel == SPG_KERNEL_gemm_mma && count >= 3) return SPG_CUDA_MMA_SHARED(spec[0], spec[1], spec[2]);
     return kernel == SPG_KERNEL_gemm && count >= 3 ? SPG_CUDA_GEMM_SHARED(spec[0], spec[1], spec[2]) : 0u;
 }
@@ -318,6 +320,13 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     } else if (kernel == SPG_KERNEL_gemm_mma) {
         if (count < 14) return -1;
         const bool general = !sloped_epilogue(spec[7], spec[8]);   /* (only the units with GENERAL, else none) */
+        if (count >= 15 && spec[14]) {      /* gemm_pipe.cu's tiles: their stages, both operands read eight at once */
+            snprintf(name, sizeof name, "gemm_pipe_%ux%ux%u_%ux%u_s%u_a%ub%u%s", spec[0], spec[1], spec[2], spec[3], spec[4],
+                     spec[14], spec[5], spec[6], general ? "_g" : "");
+            for (uint32_t u = 0; u < UNIT_COUNT; u++)
+                if (!strcmp(spg_cuda_units[u].name, name)) return (int)u;
+            return -1;
+        }
         /* each operand: kept as bfloat16 and read eight values at once (w: VEC 4, 8), floats read four at once
            (f: VEC 1, 2), else o; the instances of Kernels.def, or else the one that reads anything */
         const uint32_t vec = spec[11], half = spec[13];
@@ -816,7 +825,10 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
         memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
         if (cu.profile) {
             int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
-            if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {  /* (its unit's ways of reading A and B, _g) */
+            if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 15 && spec[14]) {     /* (gemm_pipe.cu's stages) */
+                snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %ux%u s%u", spec[5], spec[6],
+                         spec[7], spec[0], spec[1], spec[3], spec[4], spec[14]);
+            } else if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {  /* (its unit's ways of reading A and B, _g) */
                 const char *unit = spg_cuda_units[unit_of(kernel, spec, spec_count)].name, *ways = strrchr(unit, '_');
                 if (ways && !strcmp(ways, "_g")) for (ways--; ways > unit && *ways != '_'; ways--) {}
                 snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %s", spec[5], spec[6],
