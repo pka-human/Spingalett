@@ -122,6 +122,20 @@ int main(void) {
     FIELD(SpingalettGenerateArgs, top_k); FIELD(SpingalettGenerateArgs, top_p); FIELD(SpingalettGenerateArgs, seed);
     FIELD(SpingalettGenerateArgs, stop_tokens); FIELD(SpingalettGenerateArgs, stop_count);
 
+    SIZE(SpingalettSessionOptions); FIELD(SpingalettSessionOptions, reserved);
+    FIELD(SpingalettSessionOptions, max_length); FIELD(SpingalettSessionOptions, sequences);
+    SIZE(SpingalettSessionFeed); FIELD(SpingalettSessionFeed, reserved);
+    FIELD(SpingalettSessionFeed, sequence); FIELD(SpingalettSessionFeed, tokens); FIELD(SpingalettSessionFeed, count);
+    FIELD(SpingalettSessionFeed, logits); FIELD(SpingalettSessionFeed, all);
+    SIZE(SpingalettSessionGenerateArgs); FIELD(SpingalettSessionGenerateArgs, reserved);
+    FIELD(SpingalettSessionGenerateArgs, session); FIELD(SpingalettSessionGenerateArgs, sequences);
+    FIELD(SpingalettSessionGenerateArgs, prompts); FIELD(SpingalettSessionGenerateArgs, prompt_lengths);
+    FIELD(SpingalettSessionGenerateArgs, tokens); FIELD(SpingalettSessionGenerateArgs, made);
+    FIELD(SpingalettSessionGenerateArgs, count); FIELD(SpingalettSessionGenerateArgs, temperature);
+    FIELD(SpingalettSessionGenerateArgs, top_k); FIELD(SpingalettSessionGenerateArgs, top_p);
+    FIELD(SpingalettSessionGenerateArgs, seed); FIELD(SpingalettSessionGenerateArgs, stop_tokens);
+    FIELD(SpingalettSessionGenerateArgs, stop_count);
+
     SIZE(PredictArgs); FIELD(PredictArgs, reserved);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);
     FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
