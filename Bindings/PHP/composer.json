@@ -1,0 +1,27 @@
+{
+    "name": "pka-human/spingalett",
+    "description": "Bindings of Spingalett, a neural-network library in C: dense, convolutional and transformer layers, training on the CPU or the GPU, deployment models from FP32 to INT2, text generation (PHP FFI)",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["neural network", "deep learning", "machine learning", "transformer", "ffi"],
+    "homepage": "https://github.com/pka-human/Spingalett",
+    "authors": [
+        {"name": "pka_human", "email": "pka_human@proton.me"}
+    ],
+    "support": {
+        "issues": "https://github.com/pka-human/Spingalett/issues",
+        "source": "https://github.com/pka-human/Spingalett/tree/main/Bindings/PHP"
+    },
+    "require": {
+        "php": ">=7.4",
+        "ext-ffi": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Spingalett\\": "src/"
+        }
+    },
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}
