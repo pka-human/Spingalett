@@ -9,7 +9,7 @@ documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; 
 Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch,
 layer and RMS normalization, adding, concatenating and multiplying layers, embeddings and attention
 for transformers, as chains or graphs), deployment models in FP32 down to INT2, the runtime (a library of the deployment models alone), a standalone inference engine for
-microcontrollers (one C file, no heap), ONNX and PyTorch import, GPU backends through CUDA (its own
+microcontrollers (one C file, no heap) and its WebAssembly build for JavaScript, ONNX and PyTorch import, GPU backends through CUDA (its own
 kernels) and Vulkan compute, language-model tooling (token files, generation), bindings for Python
 (ctypes, wheels with the library inside), C++, Rust, .NET, Go and Java, packages for the usual
 managers, and the DigitPad demo app.
@@ -39,6 +39,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
 | `Src/Gpu/` | The GPU backends under one executor: `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as commands), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use, a table a backend; convolution geometries), `Spingalett.Device.h`/`.c` (the device interface: `SpgGpuOps` a backend, the calling thread's backend), `Spingalett.Vulkan.c` (the loader opened at run time; `Shaders/*.comp`, GLSL listed in `Spingalett.Kernels.def`, `SPG_KERNEL_H` ones built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`), `Spingalett.Cuda.c` (the driver opened at run time; commands captured as CUDA graphs; `Cuda/*.cu` compiled to PTX by Clang, units listed in `Cuda/Kernels.def`, gzip-compressed into the library and expanded by `Spingalett.Gunzip.c`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
 | `Bindings/Rust`, `CSharp`, `Go`, `Java` | Bindings over the shared library; their tests compare their structures with `Bin/SpingalettLayout` through `SPINGALETT_LAYOUT` (CI job `bindings`) |
+| `Bindings/JavaScript` | The engine in WebAssembly and its npm package: `build.sh` (Clang for wasm32, no C library), `wasm/` (the exports, `Spingalett.Libm.c` with the mathematical functions the engine calls, the parts of `<math.h>` and `<string.h>` it includes), `index.js` and `index.d.ts`; `test/` compares the module with the native engine (CI job `javascript`) |
 | `packaging/`, `Formula/`, `bucket/`, `flake.nix` | Conan, vcpkg, AUR, conda, the container image; Homebrew, Scoop, Nix; CPack (DEB, RPM) in `CMakeLists.txt` |
 | `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), `RuntimeTests.c` (the runtime alone, C99), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
 | `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools (`Examples/Runtime/`: programs of the runtime), the demo app, the bindings (a package; `setup.py` builds wheels) |
@@ -68,6 +69,8 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - the engine alone: `cc -std=c99 -Wall -Wextra -Wpedantic -Werror -DSPINGALETT_INFERENCE_ONLY -IInclude -ISrc -c Src/Spingalett.Inference.c`;
 - the runtime alone (`-DSPINGALETT_RUNTIME_ONLY=ON`) for changes to the files it is built from
   (`cmake/Runtime.cmake`) or to its header;
+- for changes to the engine, the engine in WebAssembly: `sh Bindings/JavaScript/build.sh` and `npm test` in
+  `Bindings/JavaScript` (Clang with the wasm32 target and `wasm-ld`, Node 18 or later);
 - for SIMD changes, every instruction set the code has a path for. AArch64 cross builds run under
   `qemu-aarch64` (`QEMU_CPU=cortex-a53` for no dot product, `max` for all features); MinGW builds
   run under Wine; `Examples/Embedded/run-qemu.sh` runs the engine on a Cortex-M4. AVX-512 paths on
@@ -175,6 +178,14 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   trained on the CPU, made a trainer, or had its GPU copy's parameters brought back
   (`spingalett_training_state()`, which `spingalett_gpu_download()` calls); code that reads them
   before (saving optimizer state, `spingalett_get_parameters()` of a gradient) treats them as zero.
+- **The engine in WebAssembly.** `Bindings/JavaScript` builds `Inference.c` for wasm32 without a C
+  library: what the engine takes from `<math.h>` and `<string.h>` is in `wasm/include` and
+  `wasm/Spingalett.Libm.c`, whose `expf` is glibc's algorithm and whose `tanhf` and `erff` are correctly
+  rounded, so that integer models give the native engine's bits. A function the engine starts calling
+  needs a definition there of the same accuracy (checked against glibc over every float). The tests hold
+  the module to `test/references`, the native engine's outputs (integer models bit for bit), and to the
+  same code built natively (every model bit for bit); a change of the engine's results makes the
+  references again (`node test/make_references.mjs`, on x86-64 Linux with glibc 2.41 or later).
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
   `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
   read afterwards (`model_shared` in the `model` group runs four threads; run it under
@@ -259,11 +270,13 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 ## Releases
 
 The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`,
-`Bindings/Python/spingalett/__init__.py` and `packaging/vcpkg/spingalett/vcpkg.json`. A release records
+`Bindings/Python/spingalett/__init__.py`, `Bindings/JavaScript/package.json` and
+`packaging/vcpkg/spingalett/vcpkg.json`. A release records
 its ABI (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`), and one that adds
 functions gives them a new node in `Src/Spingalett.map` (and `Src/Spingalett.Runtime.map`, for the
 runtime's). `.github/workflows/release.yml` builds packages for Linux
 (x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), each also as a runtime
 archive (`SPINGALETT_RUNTIME_ONLY`), trains the DigitPad model
-(2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip. The
-maintainer merges pull requests and pushes tags.
+(2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip, and the
+JavaScript package (`npm pack`) with its WebAssembly module; publishing it on npm takes the maintainer's
+account. The maintainer merges pull requests and pushes tags.

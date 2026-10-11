@@ -19,6 +19,20 @@ All notable changes to this project are documented in this file. The format foll
   generation they check, compare every declaration of `spingalett.h` with the C headers and every
   structure's layout with the C compiler's (`SpingalettLayout`); CI runs them on PHP 7.4 and 8.3
   against the installed library.
+- **The inference engine in WebAssembly, and a JavaScript package around it** (`Bindings/JavaScript`,
+  the npm package `spingalett`): `Src/Spingalett.Inference.c` built by Clang for wasm32 and `wasm-ld`
+  without a C library (`build.sh`), its portable kernels vectorized with SIMD128, the mathematical
+  functions it calls in `wasm/Spingalett.Libm.c` (`expf` glibc's algorithm, `tanhf` and `erff`
+  correctly rounded: glibc 2.43's results over all 2^32 floats but two of its FMA variant's), a module
+  of 62 KB that imports nothing. An ES module with TypeScript declarations for Node 18 and later and
+  browsers with WebAssembly SIMD loads the module from a URL, a path, bytes, a `fetch()` response or a
+  compiled module, and models from their bytes; describes their layers; runs samples and batches; and
+  for language models gives the next token's logits and generates (greedy, temperature, top-k, top-p,
+  a seed, stop tokens) with the tokens `spingalett_generate()` chooses. Its tests (`npm test`) hold it
+  to the native engine on the models of earlier releases and on a GPT and a LLaMA in FP32 and INT8
+  (`test/references`: integer models bit for bit, float ones within 1e-5 of each sample's largest
+  output), and to the same code built natively (every model bit for bit). CI builds and tests it;
+  releases attach the package (`npm pack`) and the module.
 
 ## [1.2.0] - 2026-10-11
 
