@@ -47,6 +47,15 @@ All notable changes to this project are documented in this file. The format foll
   directory's logits bit for bit), a model of fifteen types (each matrix against a reference written
   with llama.cpp's formulas and checked against `gguf`'s), a SentencePiece vocabulary against the
   `sentencepiece` library's ids, and damaged files.
+- Tokenizers and pretrained models in every binding: Python's `sg.Tokenizer` (`encode()`, `decode()`,
+  `token()`, `id()`, `bos`, `eos`, ...) and `Network.from_pretrained(path, context)`, which give the
+  logits of the 1.2 loader `llama_from_state_dict()` bit for bit without PyTorch; C++'s
+  `spingalett::Tokenizer` and `Network::from_pretrained()`; Rust's, C#'s, Go's and Java's `Tokenizer`
+  and pretrained loading, each tested on the `tokenizer` group's expectations and on `hf_llama` in both of
+  its forms, their structures compared with the C layout. The functions of 1.3 are bound optionally in
+  Python and Java, so that the bindings still load a library of 1.2.
+- `Examples/Pretrained.c`: a Hugging Face or GGUF language model continuing a prompt, printing each
+  token as it comes.
 - An internal JSON reader (`Src/Spingalett.Json.c`) for the files of language models.
 
 ## [1.2.0] - 2026-10-11

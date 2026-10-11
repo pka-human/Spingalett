@@ -1483,9 +1483,11 @@ gives the C object of a wrapper for whatever the wrapper does not cover.
 
 `Bindings/` holds bindings for Rust, .NET, Go and Java over the shared library: networks of every
 kind of layer built in each language's style, training on arrays or token files, prediction,
-evaluation, generation, parameters, files and deployment models. Each one's tests train XOR and a
-small LLaMA-like model whose generation they check, and compare every structure the binding lays out
-with the C compiler's layout (CI runs them against the installed library):
+evaluation, generation, parameters, files and deployment models, pretrained language models (Hugging
+Face directories, GGUF files) and their tokenizers. Each one's tests train XOR and a small LLaMA-like
+model whose generation they check, check the tokenizers and pretrained models against the C tests'
+expectations, and compare every structure the binding lays out with the C compiler's layout (CI runs
+them against the installed library):
 
 | Language | Directory | Interface | Builds with |
 |---|---|---|---|
