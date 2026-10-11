@@ -1570,7 +1570,7 @@ typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *mess
 
 ### `SpingalettComputeMode`
 
-Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU in every mode: on all its threads with SPINGALETT_COMPUTE_OPENMP and the GPU modes, on one otherwise. The runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with a warning, as in a full library built without it.
+Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU: on all its threads with SPINGALETT_COMPUTE_OPENMP, on one otherwise; in the full library's GPU modes those of float weights (FP32, FP16, BF16) and sessions run on the GPU, integer ones (their sums in integers) on all the CPU's threads. The runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with a warning, as in a full library built without it; nor a GPU.
 
 ```c
 typedef enum {
@@ -1718,7 +1718,7 @@ void spingalett_model_free(SpingalettModel *model);
 
 ### `spingalett_model_predict()`
 
-Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all threads in SPINGALETT_COMPUTE_OPENMP mode. Returns false on error.
+Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all threads in SPINGALETT_COMPUTE_OPENMP mode; in the full library's GPU modes, a model of float weights that owns its image (spingalett_model_load(), _from_memory(), _from_network()) as a network on the GPU, made by the first call and kept, its calls one at a time, the outputs the CPU's to rounding. Returns false on error.
 
 ```c
 bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs);
@@ -1736,7 +1736,7 @@ SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, co
 
 Sessions: a causal language model run a token at a time, with a key-value cache. The model's input is a window of token ids read by an embedding (its first layer), its output each position's logits (the vocabulary: the output's channels), and its layers treat each position alone (linear layers: 1 x 1 convolutions of one group; normalizations; additions, products and concatenations of layers) but for causal attention, whose keys (rotated, with rotary embeddings) and values the session keeps for every token it has been fed. A token fed then costs one row through every layer and its queries' attention over the tokens before it, instead of a pass over the whole window: a prompt fed at once runs its tokens through each layer together, and so do the tokens of several sequences fed in one call (batched generation). A session holds `sequences` sequences of at most max_length tokens (the model's window at most, positions 0 to max_length - 1), each with a cache of its own.
 
-The logits of a position are those spingalett_model_predict() gives it for the window holding the sequence's tokens: bit for bit for integer models, and for float ones too where batched prediction multiplies with the library's kernels (every mode but SPINGALETT_COMPUTE_OPENBLAS, which takes OpenBLAS's order: equal to rounding); however the tokens were fed, alone or with others. A session runs on the CPU, on the threads of the compute mode, and is used from one thread at a time; any number of sessions may run on one model at once, from any threads. The model must outlive its sessions.
+The logits of a position are those spingalett_model_predict() gives it for the window holding the sequence's tokens: bit for bit for integer models, and for float ones too where batched prediction multiplies with the library's kernels (every mode but SPINGALETT_COMPUTE_OPENBLAS, which takes OpenBLAS's order: equal to rounding); however the tokens were fed, alone or with others. A session runs on the CPU, on the threads of the compute mode, or in the full library's GPU modes on the GPU (its model a network there, its products in the GPU's precision, the keys and values in its memory: the logits the CPU's to rounding, still the same bits however the tokens were fed), and is used from one thread at a time; any number of sessions may run on one model at once, from any threads. The model must outlive its sessions.
 
 ```c
 typedef struct SpingalettSession SpingalettSession;

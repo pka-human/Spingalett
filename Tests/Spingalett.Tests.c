@@ -5970,6 +5970,55 @@ static void gpu_session(bool llama) {
     free(cpu); free(one); free(all); free(x); free(t);
 }
 
+/* Deployment models in a GPU's compute modes: those of float weights (FP32, FP16, BF16) predict on the GPU, within
+   single precision's rounding of the CPU's; integer ones on the CPU, the CPU's bits. A CNN and a GPT-like model. */
+static void gpu_model_predict(void) {
+    for (int which = 0; which < 2; which++) {
+        NeuralNetwork *net;
+        uint32_t in, n = 24;
+        if (which == 0) {
+            net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+            layer(.net = net, .height = 12, .width = 12, .channels = 3);
+            conv2d(.net = net, .filters = 8, .kernel = 3, .padding = 1, .act_func = ACT_NONE);
+            batch_norm(.net = net, .act_func = ACT_RELU);
+            max_pool2d(.net = net, .kernel = 2);
+            layer(.net = net, .neurons_amount = 16, .act_func = ACT_GELU);
+            layer(.net = net, .neurons_amount = 5, .act_func = ACT_SOFTMAX);
+            in = 12 * 12 * 3;
+        } else {
+            net = session_lm(false, 32, 30);
+            in = 32;
+        }
+        lcg_state = 501u + which;
+        for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.3f;
+        float *x = (float *)malloc((size_t)n * in * sizeof(float));
+        for (uint32_t i = 0; i < n * in; i++) x[i] = which ? (float)(i * 11u % 30u) : frand() * 2 - 1;
+        const uint32_t out = net->topology[net->layers - 1];
+        float *cpu = (float *)malloc((size_t)n * out * sizeof(float)), *gpu = (float *)malloc((size_t)n * out * sizeof(float));
+        static const PrecisionMode precisions[4] = {PRECISION_FLOAT32, PRECISION_FP16, PRECISION_BFLOAT16, PRECISION_INT8};
+        double worst = 0.0;
+        bool exact = true, ok = true;
+        for (int k = 0; k < 4 && ok; k++) {
+            SpingalettModel *m = spingalett_model_from_network(net, precisions[k]);
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            ok = m && spingalett_model_predict(m, x, n, cpu);
+            spingalett_set_compute_mode(gpu_mode);
+            ok = ok && spingalett_model_predict(m, x, n, gpu);
+            if (ok && precisions[k] == PRECISION_INT8) exact = !memcmp(cpu, gpu, (size_t)n * out * sizeof(float));
+            else if (ok) worst = fmax(worst, gpu_max_scaled(gpu, cpu, (size_t)n * out));
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            spingalett_model_free(m);
+        }
+        /* (float models that ran on the CPU in GPU modes would give the CPU's bits: some difference says the GPU ran) */
+        CHECK(ok && worst > 0.0 && worst < 1e-4 && exact, "gpu model predict %d: float models %.2e from the CPU's, "
+              "INT8 the CPU's bits %d", which, worst, exact);
+        printf("  gpu model predict %s: FP32, FP16, BF16 models %.1e from the CPU's, INT8 the CPU's bits %s\n",
+               which ? "GPT-like" : "CNN", worst, exact ? "yes" : "no");
+        free(x); free(cpu); free(gpu);
+        free_network(net);
+    }
+}
+
 /* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA) against single
    precision: predictions, one step's change of every parameter, and two runs alike; over T tokens (several
    blocks of queries, the last partial), causal or not. */
@@ -7274,6 +7323,7 @@ int main(int argc, char **argv) {
             gpu_flash(32, false, 2, 150, true);
             gpu_session(false);
             gpu_session(true);
+            gpu_model_predict();
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }
