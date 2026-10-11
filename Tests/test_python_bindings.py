@@ -83,6 +83,15 @@ with sg.Network(sg.Loss.MSE, [2, sg.Layer(4, sg.Activation.TANH), sg.Layer(1)]) 
     # built-in schedules
     check(abs(sg.CosineDecay()(50, 100, 1.0) - 0.5) < 1e-6 and abs(sg.StepDecay(10, 0.5)(25, 100, 1.0) - 0.25) < 1e-6, "builtin schedule values")
     net.train(x, y, epochs=10, lr_scheduler=sg.WarmupCosine(warmup_epochs=2))
+    check(abs(sg.LinearDecay(min_lr=0.1)(50, 100, 1.0) - 0.55) < 1e-6 and
+          abs(sg.WarmupLinear(4, 0.1)(54, 104, 1.0) - 0.55) < 1e-6, "linear schedule values")
+    # schedules by step, with gradient accumulation: steps of 2 mini-batches of 1 over the 4 samples, 3 epochs
+    calls, steps = [], net.time_step
+    net.train(x, y, epochs=3, strategy=sg.Strategy.MINI_BATCH, batch_size=1, accumulation_steps=2, lr_per_step=True,
+              lr_scheduler=lambda e, t, lr: (calls.append((e, t)), lr)[1])
+    check(calls == [(e, 6) for e in range(6)] and net.time_step == steps + 6, f"schedule by step {calls}")
+    net.train(x, y, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=2, accumulation_steps=2,
+              lr_per_step=True, lr_scheduler=sg.WarmupLinear(warmup_epochs=1))
     # validation errors
     for bad in (lambda: net.train(x[:, :1], y, epochs=1), lambda: net.train(x, y[:3], epochs=1), lambda: net.forward([1, 2, 3])):
         try: bad(); check(False, "bad shape accepted")

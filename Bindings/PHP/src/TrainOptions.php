@@ -33,12 +33,14 @@ final class TrainOptions
     public float $labelSmoothing;
     /** Keeps the samples in their order. */
     public bool $noShuffle;
+    /** Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one). */
+    public int $accumulationSteps;
 
     public function __construct(int $epochs = 10, int $batchSize = 32, float $learningRate = 1e-3,
                                 int $optimizer = Optimizer::ADAM, int $strategy = Strategy::SMALL_BATCH,
                                 float $weightDecay = 0.0, float $momentum = 0.0, float $beta1 = 0.0,
                                 float $beta2 = 0.0, float $maxGradNorm = 0.0, float $labelSmoothing = 0.0,
-                                bool $noShuffle = false)
+                                bool $noShuffle = false, int $accumulationSteps = 0)
     {
         $this->epochs = $epochs;
         $this->batchSize = $batchSize;
@@ -52,5 +54,6 @@ final class TrainOptions
         $this->maxGradNorm = $maxGradNorm;
         $this->labelSmoothing = $labelSmoothing;
         $this->noShuffle = $noShuffle;
+        $this->accumulationSteps = $accumulationSteps;
     }
 }

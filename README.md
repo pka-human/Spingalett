@@ -58,11 +58,11 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
 | Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
-| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
+| Training | Per-sample, full-batch and mini-batch strategies; gradient accumulation over mini-batches; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
 | Data | `.slettd` data set files (compact, lossless by default, streamable into training), token files, IDX (MNIST), CIFAR-10/100 and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
-| Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
+| Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, linear decay, warm-up + linear decay, or a custom callback; by epoch or by optimizer step |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()` |
 | Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
@@ -608,6 +608,7 @@ below.
 | `epochs` | required | Number of passes over the data |
 | `training_strategy` | `SPINGALETT_STRATEGY_SAMPLE` | `SPINGALETT_STRATEGY_SAMPLE` (one step per sample), `SPINGALETT_STRATEGY_FULL_BATCH`, `SPINGALETT_STRATEGY_SMALL_BATCH` |
 | `batch_size` | 32 | Mini-batch size |
+| `accumulation_steps` | 0 (off) | Gradient accumulation: an optimizer step after every this many mini-batches, with the mean gradient of their samples (see below) |
 | `do_not_shuffle` | false | Per-sample and mini-batch training reshuffle the samples every epoch unless set |
 | `optimizer_type` | `SPINGALETT_OPTIMIZER_SGD` | `SGD`, `MOMENTUM`, `RMSPROP`, `ADAM`, `ADAMW` |
 | `learning_rate` | 0.01 | Base learning rate |
@@ -616,6 +617,7 @@ below.
 | `weight_decay` | 0 | L2 penalty; decoupled (`w *= 1 - lr * wd`) for AdamW. Biases are not decayed |
 | `max_grad_norm` | 0 (off) | Clip the global L2 norm of every step's gradient |
 | `lr_scheduler`, `lr_scheduler_data` | none | Learning-rate schedule, see below |
+| `lr_per_step` | false | Evaluate the schedule before every optimizer step instead of every epoch |
 | `reset_optimizer` | false | Clear moment estimates and the step counter before training |
 | `nan_check_interval` | 0 (off) | Stop when weights become NaN/Inf, checked every N epochs |
 | `report_interval` | 0 (off) | Log the training loss every N epochs |
@@ -632,6 +634,17 @@ below.
 The reported loss is averaged over the samples of an epoch: the sum of squared errors per sample
 for MSE, and categorical (softmax) or binary (sigmoid) cross-entropy otherwise. Cross-entropy
 requires a softmax or sigmoid output layer; `spingalett_train()` rejects other combinations.
+
+Gradient accumulation (`.accumulation_steps = 4` with `.batch_size = 8`) trains on steps of four
+mini-batches with the memory of one: the step's samples run in chunks of a mini-batch, and its
+gradient is their mean. That is the gradient of one batch of 32 samples computed in chunks of 8, bit
+for bit (`spingalett_train()` computes batches larger than its workspace holds that way: a full
+batch of 5,000 samples in chunks of 2,048 gives the bits of 3 x 2,048 accumulated); against a batch
+of 32 computed in one chunk, only the order of the sums differs, and batch normalization takes its
+statistics over each mini-batch. Dropout masks and augmentation are drawn by a sample's position in
+its step, as for the larger batch. With a generator, a step is `accumulation_steps` calls of it;
+full-batch training ignores the option, its step being the whole set. On the GPU the step's
+mini-batches are its chunks in the same way.
 
 Optimizer state (moment estimates and the step counter used for Adam's bias correction) is stored
 in the network, so training can be resumed by calling `spingalett_train()` again or after loading a
@@ -679,8 +692,12 @@ typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_
 ```
 
 The scheduler runs before every epoch; `epoch` counts the epochs already completed (0 for the
-first). Four schedules are built in and take an optional `SpingalettLRScheduleParams` as
-`user_data`:
+first). With `.lr_per_step = true` it runs before every optimizer step instead, `epoch` counting the
+steps taken in the call and `total_epochs` the steps of the call (epochs times steps an epoch; with a
+generator and no `sample_count`, 0 during the first epoch, then that epoch's steps times the epochs),
+as language models are trained: a warm-up of a few thousand steps, then a decay. Six schedules are
+built in and take an optional `SpingalettLRScheduleParams` as `user_data` (its `warmup_epochs` and
+`step_size` counting steps with `lr_per_step`):
 
 ```c
 LRScheduleParams schedule = {.warmup_epochs = 10, .min_lr = 1e-5f};
@@ -694,6 +711,8 @@ train(.net = net, /* ... */ .learning_rate = 1e-3f,
 | `spingalett_lr_linear_warmup` | `warmup_epochs` (default 5% of the run) |
 | `spingalett_lr_step_decay` | `step_size` (default a third of the run), `gamma` (default 0.1) |
 | `spingalett_lr_warmup_cosine` | `warmup_epochs`, `min_lr` |
+| `spingalett_lr_linear_decay` | `min_lr` |
+| `spingalett_lr_warmup_linear` | `warmup_epochs`, `min_lr` |
 
 Reduce on plateau works with or without a schedule: with `.lr_plateau_patience = 5` and
 `.lr_plateau_factor = 0.5f`, five epochs without improvement of the monitored value (`monitor`:

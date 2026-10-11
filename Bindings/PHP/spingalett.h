@@ -393,7 +393,9 @@ typedef struct {
     float lr_plateau_factor;
     size_t lr_plateau_patience;
     float lr_plateau_min_lr;
-    uint64_t reserved[8];
+    uint32_t accumulation_steps;
+    bool lr_per_step;
+    uint64_t reserved[8 - 1];
 } SpingalettTrainArgs;
 
 typedef struct {
@@ -476,6 +478,8 @@ float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initia
 float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+float spingalett_lr_linear_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+float spingalett_lr_warmup_linear(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 bool spingalett_predict_args(SpingalettPredictArgs args);
 SpingalettEvalMetrics spingalett_evaluate_args(SpingalettEvaluateArgs args);
 SpingalettTrainReport spingalett_train_args(SpingalettTrainArgs args);

@@ -25,6 +25,12 @@ static float cosine(float initial_lr, float min_lr, double progress) {
     return min_lr + (initial_lr - min_lr) * (float)(0.5 * (1.0 + cos(SPINGALETT_PI * progress)));
 }
 
+/* A straight line from initial_lr (progress 0) to min_lr (progress 1). */
+static float line(float initial_lr, float min_lr, double progress) {
+    if (progress > 1.0) progress = 1.0;
+    return min_lr + (initial_lr - min_lr) * (float)(1.0 - progress);
+}
+
 float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params) {
     const LRScheduleParams *p = params_or_default(params);
     if (total_epochs == 0) return initial_lr;
@@ -51,4 +57,18 @@ float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initi
     if (epoch < w) return initial_lr * (float)(epoch + 1) / (float)w;
     if (total_epochs <= w) return initial_lr;
     return cosine(initial_lr, p->min_lr, (double)(epoch - w) / (double)(total_epochs - w));
+}
+
+float spingalett_lr_linear_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params) {
+    const LRScheduleParams *p = params_or_default(params);
+    if (total_epochs == 0) return initial_lr;
+    return line(initial_lr, p->min_lr, (double)epoch / (double)total_epochs);
+}
+
+float spingalett_lr_warmup_linear(size_t epoch, size_t total_epochs, float initial_lr, void *params) {
+    const LRScheduleParams *p = params_or_default(params);
+    size_t w = warmup_epochs(p, total_epochs);
+    if (epoch < w) return initial_lr * (float)(epoch + 1) / (float)w;
+    if (total_epochs <= w) return initial_lr;
+    return line(initial_lr, p->min_lr, (double)(epoch - w) / (double)(total_epochs - w));
 }

@@ -121,6 +121,8 @@ public sealed record TrainOptions
     public float MaxGradNorm { get; init; }
     public float LabelSmoothing { get; init; }
     public bool NoShuffle { get; init; }
+    /// <summary>Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one).</summary>
+    public uint AccumulationSteps { get; init; }
 }
 
 public readonly record struct TrainResult(bool Completed, int EpochsRun, float TrainLoss);
@@ -196,6 +198,7 @@ public sealed unsafe class Network : IDisposable
         beta2 = o.Beta2,
         max_grad_norm = o.MaxGradNorm,
         label_smoothing = o.LabelSmoothing,
+        accumulation_steps = o.AccumulationSteps,
     };
 
     static TrainResult Run(TrainArgs args)

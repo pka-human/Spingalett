@@ -48,7 +48,7 @@ __all__ = [
     "Model", "LayerInfo", "DeviceData",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
-    "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
+    "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine", "LinearDecay", "WarmupLinear",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
@@ -385,7 +385,9 @@ class _TrainArgs(Structure):
         ("lr_plateau_factor", c_float),
         ("lr_plateau_patience", c_size_t),
         ("lr_plateau_min_lr", c_float),
-        ("reserved", c_uint64 * _RESERVED),
+        ("accumulation_steps", c_uint32),
+        ("lr_per_step", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 1)),
     ]
 
 
@@ -925,6 +927,23 @@ class WarmupCosine(_BuiltinSchedule):
         super().__init__(warmup_epochs=warmup_epochs, min_lr=min_lr)
 
 
+class LinearDecay(_BuiltinSchedule):
+    """A straight line from ``learning_rate`` down to ``min_lr`` over the run."""
+    _symbol = "spingalett_lr_linear_decay"
+
+    def __init__(self, min_lr: float = 0.0):
+        super().__init__(min_lr=min_lr)
+
+
+class WarmupLinear(_BuiltinSchedule):
+    """Linear warmup over ``warmup_epochs`` (0 = 5% of the run), then a straight line down to ``min_lr``
+    (the schedule of BERT and GPT-2)."""
+    _symbol = "spingalett_lr_warmup_linear"
+
+    def __init__(self, warmup_epochs: int = 0, min_lr: float = 0.0):
+        super().__init__(warmup_epochs=warmup_epochs, min_lr=min_lr)
+
+
 Schedule = Union[_BuiltinSchedule, Callable[[int, int, float], float]]
 
 
@@ -1215,6 +1234,8 @@ class TrainConfig:
     lr_plateau_factor: float = 0.0      # reduce on plateau: multiply the learning rate by this...
     lr_plateau_patience: int = 0        # ...after this many epochs without improvement (0: off)
     lr_plateau_min_lr: float = 0.0      # ...but not below this
+    accumulation_steps: int = 0         # a step after every this many mini-batches (gradient accumulation)
+    lr_per_step: bool = False           # lr_scheduler before every optimizer step (its epochs counting steps)
 
 
 def _as_float(data) -> np.ndarray:
@@ -1946,6 +1967,8 @@ class Network:
             lr_plateau_factor=float(cfg.lr_plateau_factor),
             lr_plateau_patience=int(cfg.lr_plateau_patience),
             lr_plateau_min_lr=float(cfg.lr_plateau_min_lr),
+            accumulation_steps=int(cfg.accumulation_steps),
+            lr_per_step=bool(cfg.lr_per_step),
         )
         r = _call(_train, args)
         del keep

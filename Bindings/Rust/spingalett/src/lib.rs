@@ -367,6 +367,8 @@ pub struct TrainOptions {
     pub label_smoothing: f32,
     /// Keep the samples in order.
     pub no_shuffle: bool,
+    /// Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one).
+    pub accumulation_steps: u32,
 }
 
 impl Default for TrainOptions {
@@ -384,6 +386,7 @@ impl Default for TrainOptions {
             max_grad_norm: 0.0,
             label_smoothing: 0.0,
             no_shuffle: false,
+            accumulation_steps: 0,
         }
     }
 }
@@ -532,6 +535,7 @@ impl Network {
             beta2: o.beta2,
             max_grad_norm: o.max_grad_norm,
             label_smoothing: o.label_smoothing,
+            accumulation_steps: o.accumulation_steps,
             ..Default::default()
         }
     }

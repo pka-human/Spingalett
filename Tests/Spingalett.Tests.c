@@ -668,6 +668,88 @@ static void chunked_batches(ComputeMode mode) {
     free(expected); free_network(full); free_network(ref); free(x); free(y);
 }
 
+typedef struct { const float *x, *y; uint32_t n, in, out, at, calls; } Serve;
+
+static uint32_t serve_rows(float *inputs, float *targets, uint32_t requested, void *data) {
+    Serve *s = (Serve *)data;
+    uint32_t k = 0;
+    for (; k < requested && s->at < s->n; k++, s->at++) {
+        memcpy(inputs + (size_t)k * s->in, s->x + (size_t)s->at * s->in, s->in * sizeof(float));
+        memcpy(targets + (size_t)k * s->out, s->y + (size_t)s->at * s->out, s->out * sizeof(float));
+    }
+    if (k == 0) s->at = 0;
+    s->calls++;
+    return k;
+}
+
+/* Gradient accumulation: steps of several mini-batches give the bits of one batch of their samples in chunks of
+   a mini-batch (a full batch larger than the workspace's chunk, from arrays and from a generator), and the
+   steps of a batch of their size up to the order of the sums (with dropout, shuffling and per-step schedules). */
+static void accumulation(ComputeMode mode) {
+    L ls[] = {{7, ACT_NONE}, {11, ACT_TANH}, {3, ACT_SOFTMAX}};
+    const uint32_t N = 5000;
+    float *x, *y; lcg_state = 4711;
+    make_data(N, 7, 3, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    spingalett_set_compute_mode(mode);
+    NeuralNetwork *ref = build(LOSS_CROSS_ENTROPY, ls, 3, NULL, NULL);
+    const uint64_t nw = ref->total_weights, nb = ref->total_biases;
+    /* one full batch of 5000 samples (chunks of 2048) against 3 x 2048 accumulated, and from a generator */
+    NeuralNetwork *nets[3];
+    for (int k = 0; k < 3; k++) {
+        nets[k] = build(LOSS_CROSS_ENTROPY, ls, 3, ref->weights, ref->biases);
+        Serve serve = {x, y, N, 7, 3, 0, 0};
+        TrainReport r = k == 0 ? train(.net = nets[k], .inputs = x, .targets = y, .sample_count = N, .epochs = 2,
+                                       .learning_rate = 0.01f, .optimizer_type = OPTIMIZER_ADAM,
+                                       .training_strategy = STRATEGY_FULL_BATCH)
+                      : k == 1 ? train(.net = nets[k], .inputs = x, .targets = y, .sample_count = N, .epochs = 2,
+                                       .learning_rate = 0.01f, .optimizer_type = OPTIMIZER_ADAM,
+                                       .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 2048,
+                                       .accumulation_steps = 3, .do_not_shuffle = true)
+                               : train(.net = nets[k], .training_mode = MODE_GENERATOR_FUNCTION, .generator = serve_rows,
+                                       .generator_data = &serve, .sample_count = N, .epochs = 2, .learning_rate = 0.01f,
+                                       .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH,
+                                       .batch_size = 2048, .accumulation_steps = 3);
+        CHECK(r.status == TRAIN_COMPLETED && nets[k]->time_step == 2, "accumulation mode=%d run %d: %d, %llu steps",
+              mode, k, r.status, (unsigned long long)nets[k]->time_step);
+    }
+    bool same = true;
+    for (int k = 1; k < 3; k++)
+        same = same && !memcmp(nets[0]->weights, nets[k]->weights, nw * 4) &&
+               !memcmp(nets[0]->biases, nets[k]->biases, nb * 4);
+    CHECK(same, "accumulation mode=%d: 3 x 2048 accumulated differ from a full batch of 5000", mode);
+    for (int k = 0; k < 3; k++) free_network(nets[k]);
+
+    /* 4 mini-batches of 8 against batches of 32 (shuffled, dropout drawn by the position in the step), with a
+       schedule by step: the order of the sums alone differs */
+    float *w[2];
+    uint64_t steps[2];
+    for (int k = 0; k < 2; k++) {
+        NeuralNetwork *net = build(LOSS_CROSS_ENTROPY, ls, 3, ref->weights, ref->biases);
+        net->dropout_rates[1] = 0.25f;
+        spingalett_seed(77);
+        LRScheduleParams p = {.warmup_epochs = 5, .min_lr = 0.001f};
+        TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = 300, .epochs = 3,
+                              .learning_rate = 0.02f, .optimizer_type = OPTIMIZER_ADAMW, .weight_decay = 0.01f,
+                              .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = k ? 8 : 32,
+                              .accumulation_steps = k ? 4 : 0, .lr_scheduler = spingalett_lr_warmup_cosine,
+                              .lr_scheduler_data = &p, .lr_per_step = true);
+        CHECK(r.status == TRAIN_COMPLETED, "accumulation mode=%d: training failed", mode);
+        steps[k] = net->time_step;
+        w[k] = malloc(nw * 4);
+        memcpy(w[k], net->weights, nw * 4);
+        free_network(net);
+    }
+    float d = max_abs_diff(w[0], w[1], nw);
+    printf("  accumulation mode=%d: 3 x 2048 as a batch of 5000 bit for bit; 4 x 8 against 32: %.2e (%llu steps)\n",
+           mode, d, (unsigned long long)steps[1]);
+    CHECK(steps[0] == 30 && steps[1] == 30 && d < 1e-5f,
+          "accumulation mode=%d: 4 x 8 against 32 differ by %.3e (%llu, %llu steps)", mode, d,
+          (unsigned long long)steps[0], (unsigned long long)steps[1]);
+    free(w[0]); free(w[1]);
+    free_network(ref); free(x); free(y);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 // Training 10 epochs at once must equal 5 + 5 (optimizer state persists in the net).
 static void continuation(OptimizerType opt) {
     L ls[] = {{5, ACT_NONE}, {7, ACT_TANH}, {3, ACT_SIGMOID}};
@@ -802,6 +884,14 @@ static void schedulers(void) {
     CHECK(NEAR(spingalett_lr_warmup_cosine(1, 104, 1.0f, &p), 0.5f), "warmup_cosine warm");
     CHECK(NEAR(spingalett_lr_warmup_cosine(4, 104, 1.0f, &p), 1.0f), "warmup_cosine peak");
     CHECK(NEAR(spingalett_lr_warmup_cosine(54, 104, 1.0f, &p), 0.55f), "warmup_cosine mid");
+    CHECK(NEAR(spingalett_lr_linear_decay(0, 100, 1.0f, &p), 1.0f), "linear decay start");
+    CHECK(NEAR(spingalett_lr_linear_decay(50, 100, 1.0f, &p), 0.55f), "linear decay mid");
+    CHECK(NEAR(spingalett_lr_linear_decay(75, 100, 1.0f, NULL), 0.25f), "linear decay to 0");
+    CHECK(NEAR(spingalett_lr_linear_decay(3, 0, 1.0f, NULL), 1.0f), "linear decay of no epochs");
+    CHECK(NEAR(spingalett_lr_warmup_linear(1, 104, 1.0f, &p), 0.5f), "warmup_linear warm");
+    CHECK(NEAR(spingalett_lr_warmup_linear(4, 104, 1.0f, &p), 1.0f), "warmup_linear peak");
+    CHECK(NEAR(spingalett_lr_warmup_linear(54, 104, 1.0f, &p), 0.55f), "warmup_linear mid");
+    CHECK(NEAR(spingalett_lr_warmup_linear(104, 104, 1.0f, &p), 0.1f), "warmup_linear end");
 
     /* integration: lr only on epoch 0 must equal one plain epoch */
     L ls[] = {{5, ACT_NONE}, {7, ACT_TANH}, {3, ACT_SIGMOID}};
@@ -823,6 +913,46 @@ static void schedulers(void) {
         printf("  scheduler integration strat=%d: calls=%zu last_epoch=%zu total=%zu diff=%.2e\n", strats[st], sched_calls, sched_last_epoch, sched_total, d);
         CHECK(sched_calls == 6 && sched_last_epoch == 5 && sched_total == 6, "scheduler call sequence");
         CHECK(d < 1e-6f, "scheduler lr not applied (diff %.3e)", d);
+        free_network(a); free_network(b);
+    }
+
+    /* schedules by step: called before every optimizer step with the steps of the call (mini-batches,
+       accumulated mini-batches, per-sample steps, full batches, a generator's steps, known after its first
+       epoch); one_shot's rate of 0 after the second step leaves the parameters as the first two steps left
+       them (ref_count samples over ref_epochs at a constant rate) */
+    static const struct {
+        TrainingStrategy strategy;
+        uint32_t batch, accumulation;
+        bool generator;
+        size_t total;
+        uint32_t ref_count, ref_epochs;
+    } cases[] = {{STRATEGY_SMALL_BATCH, 3, 0, false, 9, 6, 1}, {STRATEGY_SMALL_BATCH, 2, 2, false, 6, 8, 1},
+                 {STRATEGY_SAMPLE, 0, 0, false, 24, 2, 1}, {STRATEGY_FULL_BATCH, 0, 4, false, 3, 8, 2},
+                 {STRATEGY_SMALL_BATCH, 3, 0, true, 9, 6, 1}};
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        NeuralNetwork *a = build(LOSS_MSE, ls, 3, NULL, NULL);
+        NeuralNetwork *b = build(LOSS_MSE, ls, 3, a->weights, a->biases);
+        Serve serve = {x, y, 8, 5, 3, 0, 0};
+        sched_calls = 0;
+        TrainReport r = train(.net = a, .inputs = cases[c].generator ? NULL : x, .targets = cases[c].generator ? NULL : y,
+                              .training_mode = cases[c].generator ? MODE_GENERATOR_FUNCTION : MODE_ARRAY,
+                              .generator = serve_rows, .generator_data = &serve, .sample_count = cases[c].generator ? 0 : 8,
+                              .epochs = 3, .learning_rate = 0.3f, .optimizer_type = OPTIMIZER_SGD,
+                              .training_strategy = cases[c].strategy, .batch_size = cases[c].batch,
+                              .accumulation_steps = cases[c].accumulation, .lr_scheduler = one_shot,
+                              .lr_per_step = true, .do_not_shuffle = true);
+        const size_t steps = (size_t)a->time_step;
+        train(.net = b, .inputs = x, .targets = y, .sample_count = cases[c].ref_count, .epochs = cases[c].ref_epochs,
+              .learning_rate = 0.3f, .optimizer_type = OPTIMIZER_SGD, .training_strategy = cases[c].strategy,
+              .batch_size = cases[c].batch, .accumulation_steps = cases[c].accumulation, .do_not_shuffle = true);
+        const bool alike = !memcmp(a->weights, b->weights, a->total_weights * 4) &&
+                           !memcmp(a->biases, b->biases, a->total_biases * 4) && b->time_step == 2;
+        printf("  schedule by step case %zu: calls=%zu last=%zu total=%zu steps=%zu, as two steps: %s\n", c, sched_calls,
+               sched_last_epoch, sched_total, steps, alike ? "yes" : "no");
+        CHECK(r.status == TRAIN_COMPLETED && sched_calls == cases[c].total && steps == cases[c].total &&
+              sched_last_epoch == cases[c].total - 1 && sched_total == cases[c].total && alike,
+              "schedule by step case %zu: %zu calls, last %zu, total %zu, %zu steps, as two steps %d", c, sched_calls,
+              sched_last_epoch, sched_total, steps, alike);
         free_network(a); free_network(b);
     }
     free(x); free(y);
@@ -5185,6 +5315,76 @@ static void gpu_training_options(void) {
     free(t);
 }
 
+/* Gradient accumulation and schedules by step on the GPU: against the CPU, the same bits from two runs, and a
+   generator's steps (accumulation_steps calls each) as the arrays'; for a dense network and a transformer. */
+static void gpu_accumulation(void) {
+    for (int which = 0; which < 2; which++) {
+        const uint32_t T = 12, V = 13, n = 200;
+        NeuralNetwork *probe = which ? tf_net(1, T, V) : gpu_net(0);
+        const uint32_t in = probe->topology[0], tn = spingalett_target_size(probe), out = probe->topology[probe->layers - 1];
+        float *x, *t;
+        if (which) {
+            lcg_state = 21;
+            tf_data(probe, n, V, &x, &t);
+        } else {
+            x = (float *)malloc((size_t)n * in * sizeof(float));
+            t = (float *)calloc((size_t)n * tn, sizeof(float));
+            lcg_state = 23;
+            for (size_t i = 0; i < (size_t)n * in; i++) x[i] = frand() * 2.0f - 1.0f;
+            for (uint32_t s = 0; s < n; s++) t[s * tn + (uint32_t)(frand() * tn) % tn] = 1.0f;
+        }
+        free_network(probe);
+        /* runs: the CPU, the GPU twice, the GPU from a generator */
+        float *w[4], *o[4];
+        TrainReport r[4];
+        size_t count = 0;
+        for (int k = 0; k < 4; k++) {
+            NeuralNetwork *net = which ? tf_net(1, T, V) : gpu_net(0);
+            if (which) {
+                lcg_state = 5;
+                tf_init(net);
+            }
+            spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_OPENMP);
+            spingalett_seed(12);
+            LRScheduleParams p = {.warmup_epochs = 4, .min_lr = 1e-4f};
+            Serve serve = {x, t, n, in, tn, 0, 0};
+            r[k] = train(.net = net, .inputs = k == 3 ? NULL : x, .targets = k == 3 ? NULL : t,
+                         .training_mode = k == 3 ? MODE_GENERATOR_FUNCTION : MODE_ARRAY, .generator = serve_rows,
+                         .generator_data = &serve, .sample_count = n, .epochs = 3, .batch_size = 16,
+                         .accumulation_steps = 3, .training_strategy = STRATEGY_SMALL_BATCH,
+                         .optimizer_type = OPTIMIZER_ADAMW, .learning_rate = 3e-3f, .weight_decay = 0.01f,
+                         .lr_scheduler = spingalett_lr_warmup_cosine, .lr_scheduler_data = &p, .lr_per_step = true,
+                         .do_not_shuffle = true, .report_interval = 0);
+            spingalett_set_compute_mode(COMPUTE_OPENMP);
+            o[k] = (float *)malloc((size_t)n * out * sizeof(float));
+            predict(.net = net, .inputs = x, .outputs = o[k], .sample_count = n);
+            SpingalettNetworkLayer first;               /* (a read of the parameters brings them back from the GPU) */
+            spingalett_network_layer(net, 1, &first);
+            float *probe_w = (float *)malloc(first.weight_count * sizeof(float) + 4);
+            spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe_w, first.weight_count);
+            free(probe_w);
+            count = net->total_weights + net->total_biases;
+            w[k] = (float *)malloc(count * sizeof(float));
+            memcpy(w[k], net->weights, net->total_weights * sizeof(float));
+            memcpy(w[k] + net->total_weights, net->biases, net->total_biases * sizeof(float));
+            CHECK(r[k].status == TRAIN_COMPLETED && net->time_step == 15, "gpu accumulation %d run %d: %d, %llu steps",
+                  which, k, r[k].status, (unsigned long long)net->time_step);
+            free_network(net);
+        }
+        const double trained = gpu_max_scaled(o[0], o[1], (size_t)n * out);
+        const bool same = !memcmp(w[1], w[2], count * sizeof(float)), generator = !memcmp(w[1], w[3], count * sizeof(float));
+        CHECK(trained < 1e-3 && fabsf(r[0].train_loss - r[1].train_loss) <= 1e-4f * fabsf(r[0].train_loss),
+              "gpu accumulation %d: outputs %.2e from the CPU's, losses %g / %g", which, trained, (double)r[0].train_loss,
+              (double)r[1].train_loss);
+        CHECK(same && generator, "gpu accumulation %d: two runs alike %d, a generator as arrays %d", which, same, generator);
+        printf("  gpu accumulation %s: 3 x 16 by step, %.1e from the CPU, deterministic %s, generator alike %s\n",
+               which ? "transformer" : "dense", trained, same ? "yes" : "no", generator ? "yes" : "no");
+        for (int k = 0; k < 4; k++) { free(w[k]); free(o[k]); }
+        free(x); free(t);
+    }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 /* Networks trained on the GPU from two threads at once get the same bits as one after the other. */
 typedef struct { int which; float *params; size_t count; } GpuJob;
 
@@ -6057,6 +6257,7 @@ int main(int argc, char **argv) {
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) { clip_norm(STRATEGY_SAMPLE, cm[m]); clip_norm(STRATEGY_FULL_BATCH, cm[m]); }
         for (int m = 0; m < 3; m++) chunked_batches(cm[m]);
+        for (int m = 0; m < 3; m++) accumulation(cm[m]);
         for (int o = 0; o < 5; o++) { strategy_consistency(opts[o], 0.05f, 0.0f); strategy_consistency(opts[o], 0.0f, 0.02f); }
     }
     if (!*only || !strcmp(only, "optim")) {
@@ -6170,6 +6371,7 @@ int main(int argc, char **argv) {
             gpu_equivalence(12);
             gpu_saturated();
             gpu_training_options();
+            gpu_accumulation();
             gpu_threads();
             gpu_trainer();
             gpu_callback();

@@ -145,7 +145,9 @@ public unsafe struct TrainArgs
     public float lr_plateau_factor;
     public nuint lr_plateau_patience;
     public float lr_plateau_min_lr;
-    public fixed ulong reserved[Const.Reserved];
+    public uint accumulation_steps;
+    public byte lr_per_step;
+    public fixed ulong reserved[Const.Reserved - 1];
 }
 
 [StructLayout(LayoutKind.Sequential)]

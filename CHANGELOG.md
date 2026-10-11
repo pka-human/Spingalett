@@ -8,6 +8,21 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Gradient accumulation** in `spingalett_train()` (`SpingalettTrainArgs.accumulation_steps`, on the CPU
+  and both GPU backends): an optimizer step after every `accumulation_steps` mini-batches of
+  `batch_size` samples (with a generator, calls of it), with the mean gradient of the step's samples
+  and the workspace of one mini-batch. The step's mini-batches are its chunks, so its gradient is
+  that of one batch of their samples computed in chunks of a mini-batch, bit for bit (a full batch
+  of 5,000 samples in chunks of 2,048 against 3 x 2,048 accumulated, from arrays and from a
+  generator), and differs from a batch computed in one chunk in the order of its sums only; dropout
+  masks and augmentation are drawn by the sample's position in its step.
+- **Learning-rate schedules by step** (`SpingalettTrainArgs.lr_per_step`): the schedule evaluated
+  before every optimizer step, with the steps taken and the steps of the call in place of the epochs
+  (the built-in schedules' `warmup_epochs` and `step_size` counting steps), reduce on plateau
+  scaling each step's rate; two more built-in schedules, `spingalett_lr_linear_decay()` and
+  `spingalett_lr_warmup_linear()` (a warm-up, then a straight line down to `min_lr`, as BERT and
+  GPT-2 were trained). Python: `TrainConfig.accumulation_steps`, `lr_per_step`, `LinearDecay`,
+  `WarmupLinear`; the other bindings' options take `accumulation_steps`.
 - **Bindings for PHP** 7.4 and later (`Bindings/PHP`: the Composer package `pka-human/spingalett`,
   PHP's FFI extension): `spingalett.h`, the library's C declarations as FFI parses them (the `*_args`
   functions, no macros), loaded with the library that `SPINGALETT_LIBRARY`, `SPINGALETT_LIB_DIR` or

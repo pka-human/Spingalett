@@ -10,6 +10,7 @@ public final class TrainOptions {
     Optimizer optimizer = Optimizer.ADAM;
     float learningRate = 1e-3f, weightDecay, momentum, beta1, beta2, maxGradNorm, labelSmoothing;
     boolean noShuffle;
+    int accumulationSteps;
 
     public TrainOptions epochs(int v) { epochs = v; return this; }
     public TrainOptions batchSize(int v) { batchSize = v; return this; }
@@ -23,4 +24,6 @@ public final class TrainOptions {
     public TrainOptions maxGradNorm(float v) { maxGradNorm = v; return this; }
     public TrainOptions labelSmoothing(float v) { labelSmoothing = v; return this; }
     public TrainOptions noShuffle(boolean v) { noShuffle = v; return this; }
+    /** Gradient accumulation: an optimizer step after every v mini-batches (0 or 1: every one). */
+    public TrainOptions accumulationSteps(int v) { accumulationSteps = v; return this; }
 }

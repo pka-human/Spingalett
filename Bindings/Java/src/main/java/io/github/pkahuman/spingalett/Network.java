@@ -101,6 +101,7 @@ public final class Network implements AutoCloseable {
         Native.set(a, T, "beta2", o.beta2);
         Native.set(a, T, "max_grad_norm", o.maxGradNorm);
         Native.set(a, T, "label_smoothing", o.labelSmoothing);
+        Native.set(a, T, "accumulation_steps", o.accumulationSteps);
         return a;
     }
 

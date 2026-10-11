@@ -121,3 +121,9 @@ SPINGALETT_1.2 {
         spingalett_generate_args;
         spingalett_target_size;
 } SPINGALETT_1.1;
+
+SPINGALETT_1.3 {
+    global:
+        spingalett_lr_linear_decay;
+        spingalett_lr_warmup_linear;
+} SPINGALETT_1.2;

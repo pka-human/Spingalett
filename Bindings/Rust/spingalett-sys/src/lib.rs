@@ -296,7 +296,9 @@ pub struct TrainArgs {
     pub lr_plateau_factor: f32,
     pub lr_plateau_patience: usize,
     pub lr_plateau_min_lr: f32,
-    pub reserved: [u64; RESERVED],
+    pub accumulation_steps: u32,
+    pub lr_per_step: bool,
+    pub reserved: [u64; RESERVED - 1],
 }
 
 impl Default for TrainArgs {

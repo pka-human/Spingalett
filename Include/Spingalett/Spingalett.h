@@ -168,16 +168,20 @@ typedef uint32_t (*SpingalettDataGeneratorFn)(float *inputs, float *targets, uin
 /*
  * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
  * completed in this spingalett_train() call (0 for the first), `initial_lr` is SpingalettTrainArgs.learning_rate.
- * Returns the learning rate for the coming epoch; negative or NaN results are ignored.
+ * Returns the learning rate for the coming epoch; negative or NaN results are ignored. With
+ * SpingalettTrainArgs.lr_per_step it is called before every optimizer step instead, with the steps
+ * taken in this call (0 for the first) and the steps the call takes in all in place of the epochs.
  */
 typedef float (*SpingalettLRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
 
-/* Parameters of the built-in schedulers, passed as lr_scheduler_data (NULL = defaults). */
+/* Parameters of the built-in schedulers, passed as lr_scheduler_data (NULL = defaults). With
+   lr_per_step, warmup_epochs and step_size count optimizer steps. */
 typedef struct {
-    size_t warmup_epochs;   /* linear_warmup, warmup_cosine; 0 = 5% of the run (at least 1) */
+    size_t warmup_epochs;   /* linear_warmup, warmup_cosine, warmup_linear; 0 = 5% of the run (at least 1) */
     size_t step_size;       /* step_decay: epochs between decays; 0 = a third of the run */
     float  gamma;           /* step_decay: decay factor; 0 = 0.1 */
-    float  min_lr;          /* cosine_decay, warmup_cosine: final learning rate; default 0 */
+    float  min_lr;          /* cosine_decay, warmup_cosine, linear_decay, warmup_linear: final learning
+                               rate; default 0 */
     uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettLRScheduleParams;
 
@@ -335,7 +339,25 @@ typedef struct {
     float lr_plateau_factor;
     size_t lr_plateau_patience;
     float lr_plateau_min_lr;
-    uint64_t reserved[SPINGALETT_RESERVED];
+
+    /* Gradient accumulation: an optimizer step after every accumulation_steps mini-batches of
+       batch_size samples (generator mode: after every accumulation_steps calls of the generator), with
+       the mean gradient of the step's samples; 0 or 1: a step a mini-batch. It applies to mini-batch
+       training, and to per-sample training as mini-batches of one sample; full-batch training ignores
+       it (its step is the whole set). The step's samples run in chunks of batch_size: its gradient is
+       that of one mini-batch of accumulation_steps x batch_size samples computed in chunks of
+       batch_size samples, which spingalett_train() does for batches larger than the samples its
+       workspace holds, bit for bit; against a larger batch computed in larger chunks it differs in
+       the order of the sums only (and batch normalization takes its statistics over each chunk).
+       Dropout masks and augmentation are drawn by the sample's position in its step, as for the larger
+       batch. Workspace memory is that of batch_size samples. */
+    uint32_t accumulation_steps;
+    /* The learning-rate schedule (lr_scheduler) evaluated before every optimizer step rather than every
+       epoch: its `epoch` the steps taken in this call, its `total_epochs` the steps of the call (epochs
+       x steps an epoch; with a generator and sample_count 0, 0 during the first epoch, then the first
+       epoch's steps x epochs). Reduce on plateau scales each step's rate. */
+    bool lr_per_step;
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettTrainArgs;
 
 typedef struct {
@@ -503,11 +525,17 @@ SPINGALETT_API float spingalett_derivative(float x, SpingalettActivationFunction
 #define spingalett_forward(...) spingalett_forward_args((SpingalettForwardArgs){__VA_ARGS__})
 SPINGALETT_API float *spingalett_forward_args(SpingalettForwardArgs args);
 
-/* Built-in learning-rate schedules (see SpingalettLRScheduleParams). */
+/* Built-in learning-rate schedules (see SpingalettLRScheduleParams), by epochs or, with lr_per_step, by
+   optimizer steps. */
 SPINGALETT_API float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+/* A straight line from initial_lr (epoch 0) down to min_lr (reached after the last epoch). */
+SPINGALETT_API float spingalett_lr_linear_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+/* A linear warmup over warmup_epochs (as spingalett_lr_linear_warmup), then a straight line down to min_lr
+   over the rest of the run (the schedule of BERT and GPT-2). */
+SPINGALETT_API float spingalett_lr_warmup_linear(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 
 /* Batched inference: writes the outputs of all samples. Uses matrix-matrix products on every
    backend, so it is much faster than calling spingalett_forward() per sample. Returns false on error. */

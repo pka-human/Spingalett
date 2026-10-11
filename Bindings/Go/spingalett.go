@@ -313,6 +313,8 @@ type TrainOptions struct {
 	MaxGradNorm    float32
 	LabelSmoothing float32
 	NoShuffle      bool
+	// AccumulationSteps: an optimizer step after every this many mini-batches (0 or 1: every one).
+	AccumulationSteps uint32
 }
 
 // TrainResult says how a training run ended.
@@ -423,6 +425,7 @@ func (n *Network) trainArgs(o TrainOptions) C.SpingalettTrainArgs {
 	a.beta1, a.beta2 = C.float(o.Beta1), C.float(o.Beta2)
 	a.max_grad_norm = C.float(o.MaxGradNorm)
 	a.label_smoothing = C.float(o.LabelSmoothing)
+	a.accumulation_steps = C.uint32_t(o.AccumulationSteps)
 	return a
 }
 
