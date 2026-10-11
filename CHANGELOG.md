@@ -7,6 +7,19 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- **Bindings for PHP** 7.4 and later (`Bindings/PHP`: the Composer package `pka-human/spingalett`,
+  PHP's FFI extension): `spingalett.h`, the library's C declarations as FFI parses them (the `*_args`
+  functions, no macros), loaded with the library that `SPINGALETT_LIBRARY`, `SPINGALETT_LIB_DIR` or
+  the system's loader gives, or once for all requests (`Library::preload()` under `opcache.preload`,
+  which PHP's default `ffi.enable=preload` needs outside the command line); classes for networks of
+  every kind of layer, training on arrays or token files, prediction, evaluation, generation,
+  parameters, files and deployment models, PHP arrays copied into the library's floats once a call.
+  Their tests (`tests/run.php`, no PHPUnit needed) train XOR and a small LLaMA-like model whose
+  generation they check, compare every declaration of `spingalett.h` with the C headers and every
+  structure's layout with the C compiler's (`SpingalettLayout`); CI runs them on PHP 7.4 and 8.3
+  against the installed library.
+
 ## [1.2.0] - 2026-10-11
 
 "Transformers": the networks of today's language models in every part of the library at once,
