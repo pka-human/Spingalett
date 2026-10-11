@@ -636,10 +636,20 @@ SPINGALETT_API void spingalett_free(void *ptr);
  * Dropout, Constant), as a network to train further, save or deploy. The network takes
  * channels-last samples: an input of shape [N, C, H, W] becomes an input layer of H x W x C, so
  * images in NCHW order must be transposed to H, W, C, and maps come out channels last too; a dense
- * layer after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy
- * when the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator
- * or node that cannot be imported. Weights in external data files are read when the model comes
- * from a path (the files in its folder), not from memory.
+ * layer after a flattened map gets its weight columns reordered to match. Transformers: an input of
+ * token ids [N, T] (integers) becomes an input layer of T values (the indices as floats), an input
+ * [N, T, C] a layer of 1 x T cells; Gather from a constant table becomes an embedding (a position
+ * table added to it, its positions), MatMul and Gemm by constant weights linear layers,
+ * LayerNormalization, RMSNormalization and their written-out forms normalizations of each token,
+ * element-wise expressions the activations they compute (GELU, SiLU), Mul of two layers a
+ * multiplication layer; attention written out (the queries' and keys' product scaled, masked
+ * causally, through a Softmax over the keys, times the values; grouped-query heads, rotary
+ * embeddings), opset 23's Attention and com.microsoft's Attention and MultiHeadAttention become an
+ * attention layer reading one linear layer of queries, keys and values. Nodes of constants are
+ * computed on import. Its loss is cross-entropy when the output layer is a softmax or sigmoid, sparse
+ * cross-entropy for a language model (token ids in, a sequence without activation out), else mean
+ * squared error. Errors name the operator or node that cannot be imported. Weights in external data
+ * files are read when the model comes from a path (the files in its folder), not from memory.
  */
 SPINGALETT_API SpingalettNetwork *spingalett_import_onnx(const char *path);
 SPINGALETT_API SpingalettNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);

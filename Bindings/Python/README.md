@@ -103,6 +103,9 @@ net = sg.Network.from_torch(model, torch.rand(1, 3, 32, 32))     # takes (32, 32
 same = sg.Network(sg.Loss.MSE, [sg.Input(32, 32, 3), sg.Conv2D(8, 3, padding=1), sg.Layer(10, sg.Activation.NONE)])
 same.load_pytorch(model.state_dict())                              # or "model.pt", "model.safetensors"
 onnx = sg.Network.from_onnx("model.onnx")
+# transformers too (GPT-2, LLaMA, BERT-like, nn.TransformerEncoderLayer): token ids in, as rows of floats
+lm = sg.Network.from_torch(my_gpt, torch.randint(0, 50257, (1, 256)))   # attention, RMS norm, SwiGLU ... as layers
+logits = lm.forward(tokens.astype(np.float32))      # tokens: (samples, 256) ids; logits: (samples, 256 x 50257)
 
 # a language model: GPT-2 from Hugging Face's weights (or nanoGPT's), trained further on a token file, sampled
 from transformers import GPT2LMHeadModel
@@ -137,7 +140,7 @@ with sg.Network.load("xor.slett") as net:
 | `gpt2_from_state_dict(state, heads, context=None, activation=None)`, `llama_from_state_dict(state, heads, kv_heads=None, context=2048, rope_theta=10000, epsilon=1e-6)` | networks of PyTorch checkpoints: GPT-2 (Hugging Face's or nanoGPT's state dict) and LLaMA's form in Hugging Face's names (LLaMA, Mistral, Qwen2); the weights copied, the networks train, generate and save as any other |
 | `inputs=` on every `add_*`, `last`, `len(net)` | a layer reads the one before it, or the earlier layers `inputs` names (indices; negative ones count back from the new layer); `last` is the index of the layer added last |
 | `add_add(inputs, activation=NONE, dropout=0)`, `add_concat(inputs, ...)`, `add_global_avg_pool(dropout=0, inputs=None)` | the sum of layers of one shape (residual connections), layers side by side along the channels, the mean of each channel |
-| `Network.from_onnx(path or bytes)`, `Network.from_torch(module, example_input)` | ONNX models (and PyTorch modules, exported to ONNX in memory) as networks with channels-last inputs: transpose NCHW images with `x.transpose(0, 2, 3, 1)` |
+| `Network.from_onnx(path or bytes)`, `Network.from_torch(module, example_input)` | ONNX models (and PyTorch modules, exported to ONNX in memory) as networks with channels-last inputs: transpose NCHW images with `x.transpose(0, 2, 3, 1)`; transformers (an `example_input` of token ids `[1, T]`, or of vectors `[1, T, C]`) with their embeddings, normalizations, attention (grouped-query, causal, rotary) and gated MLPs as the library's layers, token ids given as floats |
 | `load_pytorch(state_dict, path or bytes, modules=None)` | PyTorch weights (`state_dict()`, `torch.save` or safetensors files) into a network of the same layers, reordered for channels-last data; the network is unchanged on error |
 | `add_input(h, w, c)`, `add_conv2d(filters, kernel, stride=1, padding=0, activation=RELU, init=HE, dropout=0, groups=1)`, `add_max_pool2d(kernel, stride=0, padding=0)`, `add_avg_pool2d(...)` | convolution (grouped or depthwise with `groups`) and pooling over channels-last tensors; pooling's stride defaults to the kernel size |
 | `add_batch_norm(activation=NONE, epsilon=1e-5, momentum=0.1, dropout=0)` | per-channel normalization of the previous layer: batch statistics while training, running averages otherwise; `get_running_statistics(i)` / `set_running_statistics(i, mean, var)` |
