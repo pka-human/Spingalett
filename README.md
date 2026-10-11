@@ -622,8 +622,9 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
   within the sliding window (a warning says when it is not). Scaled rotary embeddings (LLaMA 3.1's
   `llama3`, YaRN) are refused, as is anything else the layers do not compute, with an error that
   names it.
-- On SmolLM2-135M the logits are those of `transformers` within 2.4e-4 (of logits up to 42) and the
-  greedy continuation is the same; on Hugging Face's tiny random LLaMA and GPT-2 within 2e-7. The
+- On SmolLM2-135M the logits are those of `transformers` within 2.4e-4 (of logits up to 42), on
+  Qwen2.5-0.5B-Instruct within 4e-4 (of 24), and the greedy continuations are the same; on Hugging
+  Face's tiny random LLaMA and GPT-2 within 2e-7. The
   `pretrained` test group checks tiny LLaMA (BF16, sharded), Qwen2 (F16, biases, tied), Mistral
   and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) against PyTorch, within 2e-6.
 
