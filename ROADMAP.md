@@ -51,6 +51,13 @@ weights in.
   layer normalization over sequences, attention patterns folded into the attention layer.
 - **A WebAssembly build of the engine** and a JavaScript package around it (npm), for models that
   run in browsers.
+- **Bindings for PHP** (`Bindings/PHP`): PHP's FFI extension (PHP 7.4 and later) over the shared
+  library, as the bindings of 1.2 are: the C declarations of the `*_args` functions and structures
+  in a header FFI loads (`FFI::load()`, no macros), classes for networks, layers, training on arrays
+  and token files, prediction, evaluation, generation, parameters, files and deployment models, PHP
+  arrays copied into the library's floats once per call; a Composer package; tests of XOR, a
+  LLaMA-like model's generation and every structure's layout against `SpingalettLayout`, run by CI's
+  `bindings` job against the installed library.
 
 ### Where PyTorch is faster (measured with 1.2)
 
@@ -192,6 +199,7 @@ this repository and its releases alone, and what publishing it elsewhere takes.
 | conda-forge | `packaging/conda` in 1.2 | a pull request to conda-forge/staged-recipes from the maintainer's account |
 | winget, Chocolatey | after 1.2 | manifests submitted from the maintainer's accounts |
 | npm (the engine in WebAssembly) | 1.3 | an npm account |
+| PHP (Composer, Packagist) | 1.3 | Packagist reads `composer.json` at a repository's root: a mirror repository of `Bindings/PHP` that `release.yml` pushes to (a token for it), and a Packagist account |
 
 ## Any time: work that changes no API
 
