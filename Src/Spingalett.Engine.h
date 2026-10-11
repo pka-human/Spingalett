@@ -297,6 +297,14 @@ void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, u
 void spingalett_engine_conv_transpose(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
                                       void *window);
 
+/* Outputs j0 .. j0 + count - 1 of integer weight layer L (dense, or a pointwise convolution's for one cell)
+   before activation, from its input quantized in xq with x_scale (spingalett_quantize_activations()) and
+   permuted by spingalett_engine_permute(), which returns xsum (0 for INT8 rows): the engine's kernels for
+   one vector, which sessions run on few rows (not in the engine alone). */
+void spingalett_engine_int_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count, const int8_t *xq,
+                                float x_scale, int32_t xsum, float *y);
+int32_t spingalett_engine_permute(int8_t *xq, uint32_t n, PrecisionMode precision);
+
 /* y[j] = bias[j] + scale[j] * x_scale * acc[j], the output of an integer layer before activation. */
 static inline float spingalett_int_output(float bias, float row_scale, float x_scale, int32_t acc) {
     return bias + (row_scale * x_scale) * (float)acc;

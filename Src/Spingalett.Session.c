@@ -30,9 +30,16 @@
 #include <omp.h>
 #endif
 
-/* Linear layers on few rows start threads from this many multiply-adds on (their threads split the
-   columns): a token's product of 256 x 768 already pays on several cores. */
-#define ROWS_PARALLEL_WORK ((uint64_t)1 << 17)
+/* Multiply-adds a thread takes at least when few rows of a linear layer split its columns (float, and
+   integer, whose multiply-adds cost less), and of attention: below them threads cost more than they save
+   (a token's product of 256 x 768 takes three threads, of 768 x 2304 every core). */
+#define ROWS_THREAD_WORK ((uint64_t)1 << 16)
+#define INT_ROWS_THREAD_WORK ((uint64_t)1 << 18)
+#define ATTENTION_THREAD_WORK ((uint64_t)1 << 14)
+
+/* Integer linear layers run on few rows (a token of each sequence) with their columns split between
+   threads, up to this many rows; more go through batched prediction's pass, a tile of rows a thread. */
+#define INT_ROWS SPINGALETT_I8_TILE
 
 /* The keys and values one attention layer keeps for every sequence. */
 typedef struct {
@@ -54,6 +61,7 @@ struct SpingalettSession {
     PredictWorkspace *w;
     uint32_t *row_sequence, *row_position;
     float *row_token, **row_logits;     /* the logits a row writes, or NULL */
+    int32_t *row_sums;                  /* the sums of the rows' permuted INT4 and INT2 activations */
     uint32_t *picked, *picked_position; /* the rows whose logits a pass writes, and their positions */
     float *queries;                 /* a rotated query a thread */
     uint32_t query_floats;
@@ -145,6 +153,7 @@ void spingalett_session_free(SpingalettSession *s) {
     free(s->row_position);
     free(s->row_token);
     free(s->row_logits);
+    free(s->row_sums);
     free(s->picked);
     free(s->picked_position);
     spingalett_aligned_free(s->queries);
@@ -207,10 +216,11 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
     s->row_position = (uint32_t *)malloc((size_t)s->capacity * sizeof(uint32_t));
     s->row_token = (float *)malloc((size_t)s->capacity * sizeof(float));
     s->row_logits = (float **)malloc((size_t)s->capacity * sizeof(float *));
+    s->row_sums = (int32_t *)malloc((size_t)s->capacity * sizeof(int32_t));
     s->picked = (uint32_t *)malloc((size_t)s->capacity * sizeof(uint32_t));
     s->picked_position = (uint32_t *)malloc((size_t)s->capacity * sizeof(uint32_t));
     bool ok = s->length && s->caches && s->row_sequence && s->row_position && s->row_token && s->row_logits &&
-              s->picked && s->picked_position;
+              s->row_sums && s->picked && s->picked_position;
     const uint8_t *image = (const uint8_t *)model->image;
     for (uint32_t i = 0; ok && i < s->layers; i++) {
         SlettLayer L;
@@ -309,6 +319,56 @@ static void activate_rows(float *y, uint32_t rows, uint32_t C, const uint32_t *p
     }
 }
 
+/* Threads for `work` multiply-adds of which a thread takes at least `least`: one when that is all of them. */
+static int threads_for(const PredictWorkspace *w, ComputeMode mode, uint64_t work, uint64_t least) {
+    if (mode != COMPUTE_OPENMP) return 1;
+    const uint64_t n = work / least;
+    return n < 1 ? 1 : n > (uint64_t)w->threads ? w->threads : (int)n;
+}
+
+/* An integer linear layer on few rows, its filters split between threads in blocks: each row quantized
+   alone, as batched prediction quantizes each cell, then a block's integer sums against the interleaved
+   filters for a tile of the rows at once (four rows and more), or against the stored rows by the engine's
+   kernels for one vector (spingalett_engine_int_rows()). The sums are integers and the outputs
+   spingalett_int_output()'s: batched prediction's bits. */
+static void session_int_linear(SpingalettSession *s, const SlettLayer *L, const PreparedLayer *prep, const float *x,
+                               float *y, uint32_t rows, ComputeMode mode) {
+    const uint8_t *image = (const uint8_t *)s->model->image;
+    PredictWorkspace *w = s->w;
+    const uint32_t C = L->in_c, OC = L->rows, block = 64, len = spingalett_i8_interleaved_len(C);
+    const uint32_t R = spingalett_i8_interleaved_rows(OC);
+    const bool tiles = prep->interleaved && rows >= 4;
+    const float *bias = (const float *)(const void *)(image + L->biases);
+    const float *scale = (const float *)(const void *)(image + L->scales);
+    for (uint32_t r = 0; r < rows; r++) {
+        w->xs[r] = spingalett_quantize_activations(x + (size_t)r * C, C, w->xq + (size_t)r * C);
+        s->row_sums[r] = tiles ? 0 : spingalett_engine_permute(w->xq + (size_t)r * C, C, L->precision);
+    }
+    const int threads = threads_for(w, mode, (uint64_t)rows * OC * C, INT_ROWS_THREAD_WORK);
+    (void)threads;
+    SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1,
+        for (int64_t it = 0; it < (int64_t)((OC + block - 1) / block); it++) {
+            const uint32_t j0 = (uint32_t)it * block, n = OC - j0 < block ? OC - j0 : block;
+            if (!tiles) {
+                for (uint32_t r = 0; r < rows; r++)
+                    spingalett_engine_int_rows(image, L, j0, n, w->xq + (size_t)r * C, w->xs[r], s->row_sums[r],
+                                               y + (size_t)r * OC + j0);
+                continue;
+            }
+            /* (the filters interleaved in blocks of 16: block j0 / 16 at j0 len bytes) */
+            int8_t *tile = w->tile + (size_t)spingalett_thread_num() * w->tile_stride;
+            int32_t *acc = (int32_t *)(void *)(tile + w->tile_sums);
+            for (uint32_t r = 0; r < rows; r++) memcpy(tile + (size_t)r * len, w->xq + (size_t)r * C, C);
+            spingalett_i8_interleaved_tile(prep->interleaved + (size_t)j0 * len, prep->tile_sums + j0, n, C, tile, len,
+                                           acc, R);
+            for (uint32_t r = 0; r < rows; r++)
+                for (uint32_t j = 0; j < n; j++)
+                    y[(size_t)r * OC + j0 + j] = spingalett_int_output(bias[j0 + j], scale[j0 + j], w->xs[r],
+                                                                       acc[(size_t)r * R + j]);
+        }
+    );
+}
+
 /* Attention on `rows` rows (row r of the pass, or the picked row r): their keys and values kept first,
    then each query over the keys of its sequence up to its own position. */
 static void session_attention(SpingalettSession *s, const Cache *c, const float *x, float *y, uint32_t rows,
@@ -332,7 +392,10 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
     const float scale = 1.0f / sqrtf((float)head);
     uint64_t work = 0;
     for (uint32_t r = 0; r < rows; r++) work += (uint64_t)(s->row_position[r] + 1u) * head * heads * 2u;
-    SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, work),
+    int threads = threads_for(s->w, mode, work, ATTENTION_THREAD_WORK);
+    if ((uint64_t)threads > (uint64_t)rows * heads) threads = (int)(rows * heads);
+    (void)threads;
+    SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1,
         for (int64_t it = 0; it < (int64_t)rows * heads; it++) {
             const uint32_t r = (uint32_t)(it / heads), h = (uint32_t)(it % heads), g = h / group;
             const uint32_t p = s->row_position[r];
@@ -363,10 +426,12 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
         /* a float linear layer: its bias and activation in the epilogue, row by row as batched prediction's */
         SpingalettBiasActivation epilogue = {(const float *)(const void *)(image + L->biases), L->activation, NULL};
         SpingalettGemmHooks hooks = {NULL, NULL, spingalett_epilogue_bias_activation, &epilogue};
-        spingalett_conv_rows(x[0], L->in_c, rows, prep->panels, L->row_len, L->rows, y, L->out_c, &hooks,
-                             mode == COMPUTE_OPENMP && (uint64_t)rows * L->rows * L->row_len >= ROWS_PARALLEL_WORK,
-                             w->threads);
+        const int threads = threads_for(w, mode, (uint64_t)rows * L->rows * L->row_len, ROWS_THREAD_WORK);
+        spingalett_conv_rows(x[0], L->in_c, rows, prep->panels, L->row_len, L->rows, y, L->out_c, &hooks, threads > 1,
+                             threads);
         return;
+    } else if (L->type == LAYER_CONV2D && rows <= INT_ROWS) {
+        session_int_linear(s, L, prep, x[0], y, rows, mode);
     } else {
         /* batched prediction's pass on a sample of `rows` cells, the activation after it */
         SlettLayer R = *L;

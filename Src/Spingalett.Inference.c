@@ -1709,6 +1709,17 @@ SPG_REGISTER_SUMS static void weight_rows(const uint8_t *image, const SlettLayer
     }
 }
 
+#if !defined(SPINGALETT_INFERENCE_ONLY)
+void spingalett_engine_int_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count, const int8_t *xq,
+                                float x_scale, int32_t xsum, float *y) {
+    weight_rows(image, L, j0, count, NULL, xq, x_scale, xsum, y);
+}
+
+int32_t spingalett_engine_permute(int8_t *xq, uint32_t n, PrecisionMode precision) {
+    return precision == PRECISION_INT8 ? 0 : permute_activations(xq, n, precision == PRECISION_INT4 ? 2u : 4u);
+}
+#endif
+
 void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, void *window, size_t elem) {
     const uint32_t C = L->in_c, KW = L->kernel_w;
     const size_t run = (size_t)KW * C * elem;
