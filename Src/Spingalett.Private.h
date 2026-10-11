@@ -475,6 +475,11 @@ uint32_t spingalett_next_token(const float *logits, uint32_t V, float temperatur
                                SpingalettCandidate *candidates, uint64_t *state);
 /* Whether spingalett_session_new() runs the model (a causal language model); sets no error. */
 bool spingalett_session_runs(const SpingalettModel *model);
+#if !defined(SPINGALETT_RUNTIME)
+/* Frees the deployment model spingalett_generate() keeps in the network (Spingalett.Generate.c): when the
+   network goes, or its layers change. */
+void spingalett_generate_release(NeuralNetwork *net);
+#endif
 
 float random_uniform_weight(void);
 float random_normal_weight(void);

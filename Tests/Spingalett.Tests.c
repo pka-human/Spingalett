@@ -4557,6 +4557,87 @@ static void session_shared(void) {
     printf("  sessions: concurrent sessions on one model and sessions on an unowned model agree\n");
 }
 
+/* The greedy continuation of a prompt by the prediction over the window, a token at a time, as
+   spingalett_generate() computed it before sessions; worst gets the largest difference between the
+   network's logits and those of a session of its deployment model of single precision (in the window). */
+static void greedy_by_window(NeuralNetwork *net, const uint32_t *prompt, uint32_t length, uint32_t count,
+                             uint32_t *tokens, float *worst) {
+    const uint32_t T = net->topology[0], V = net->topology[net->layers - 1] / T;
+    uint32_t *seq = malloc((size_t)(length + count) * sizeof(uint32_t));
+    float *window = malloc((size_t)T * sizeof(float)), *logits = malloc((size_t)T * V * sizeof(float));
+    float *cached = malloc((size_t)V * sizeof(float));
+    memcpy(seq, prompt, (size_t)length * sizeof(uint32_t));
+    SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+    SpingalettSession *s = spingalett_session_new(m, NULL);
+    *worst = 0;
+    for (uint32_t made = 0; made < count; made++) {
+        const uint32_t n = length < T ? length : T, first = length - n;
+        for (uint32_t i = 0; i < T; i++) window[i] = i < n ? (float)seq[first + i] : -1.0f;
+        predict(.net = net, .inputs = window, .sample_count = 1, .outputs = logits);
+        const float *row = logits + (size_t)(n - 1) * V;
+        uint32_t best = 0;
+        for (uint32_t v = 1; v < V; v++) if (row[v] > row[best]) best = v;
+        if (first == 0 && feed_span(s, 0, seq, spingalett_session_length(s, 0), length, false,
+                                    cached - (size_t)(length - 1) * V, V))
+            for (uint32_t v = 0; v < V; v++) *worst = fmaxf(*worst, fabsf(cached[v] - row[v]) / (1.0f + fabsf(row[v])));
+        seq[length++] = tokens[made] = best;
+    }
+    spingalett_session_free(s);
+    spingalett_model_free(m);
+    free(seq); free(window); free(logits); free(cached);
+}
+
+/* spingalett_generate() on the CPU runs a session of the network's deployment model: the greedy tokens of
+   the prediction over the window, past the window too (the window fed again from position 0), the logits
+   within rounding of the network's, draws repeated with their seed and alike in a session of the model,
+   and the model the network keeps made again when its parameters change. */
+static void generate_cached(void) {
+    const uint32_t T = 10, V = 23;
+    for (int kind = 0; kind < 2; kind++) {
+        lcg_state = 900 + (unsigned)kind;
+        NeuralNetwork *net = lm_net(kind, T, V, 16);
+        tf_init(net);
+        const uint32_t prompt[3] = {4, 9, 1};
+        uint32_t ref[30], got[30], a[8], b[8], c[8];
+        float worst;
+        spingalett_set_compute_mode(kind ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+        greedy_by_window(net, prompt, 3, 30, ref, &worst);
+        uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = got, .count = 30);
+        CHECK(made == 30 && !memcmp(got, ref, sizeof ref) && worst < 1e-5f,
+              "generate kind %d: greedy tokens differ from the prediction over the window (%u), or logits %.2e apart",
+              kind, made, worst);
+        printf("  generate kind %d: 30 greedy tokens as the window's prediction, logits within %.1e (relative)\n", kind,
+               (double)worst);
+        spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = a, .count = 7, .temperature = 1.3f,
+                            .top_k = 8, .top_p = 0.9f, .seed = 31);
+        spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = b, .count = 7, .temperature = 1.3f,
+                            .top_k = 8, .top_p = 0.9f, .seed = 31);
+        SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+        SpingalettSession *s = spingalett_session_new(m, NULL);
+        const uint32_t *prompts[1] = {prompt}, lengths[1] = {3};
+        const uint32_t drawn = spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = lengths,
+                                                           .tokens = c, .count = 7, .temperature = 1.3f, .top_k = 8,
+                                                           .top_p = 0.9f, .seed = 31);
+        CHECK(drawn == 7 && !memcmp(a, b, 7 * 4) && !memcmp(a, c, 7 * 4) && spingalett_session_length(s, 0) == 10,
+              "generate kind %d: draws differ between calls or from a session's", kind);
+        spingalett_session_free(s);
+        spingalett_model_free(m);
+        /* new parameters: the kept model is made again */
+        uint32_t last = net->layers - 1;
+        float *w = malloc((size_t)T * 16 * V * sizeof(float));
+        const uint64_t nw = (uint64_t)V * 16;
+        spingalett_get_parameters(net, last, PARAM_WEIGHTS, w, nw);
+        for (uint64_t i = 0; i < nw; i++) w[i] = -w[i] * 1.5f;
+        spingalett_set_parameters(net, last, PARAM_WEIGHTS, w, nw);
+        greedy_by_window(net, prompt, 3, 12, ref, &worst);
+        made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = got, .count = 12);
+        CHECK(made == 12 && !memcmp(got, ref, 12 * 4), "generate kind %d: the kept model has the old parameters", kind);
+        free(w);
+        free_network(net);
+    }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 /* Batched generation: sequences of prompts of different lengths advanced together give the tokens each
    gives alone with its seed (seed + b), greedy and drawn, with a stop token, in FP32 and INT8; a sequence
    that fills its session stops after the token its last position predicts. */
@@ -6420,6 +6501,7 @@ int main(int argc, char **argv) {
         printf("[generator mode, text generation]\n");
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) generator_mode(cm[m]);
+        generate_cached();
         generate_batched();
     }
     if (!*only || !strcmp(only, "predict")) {
