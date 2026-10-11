@@ -18,7 +18,8 @@
  * work from start to end, on a matrix product scratch of its own, so that every sum is taken in an
  * order fixed by the shape, whatever the thread count. A layer that ignores padding marks its sample's
  * keys first (a negative token: padding), and its softmax leaves those keys out, as it leaves out the
- * keys after a causal query; a row without a key left gives zeros.
+ * keys after a causal query; a row without a key left gives zeros. With a sliding window, a block's products
+ * cover the keys of its rows' windows only.
  */
 
 #include "Spingalett.Private.h"
@@ -101,6 +102,7 @@ typedef struct {
     uint32_t cells, heads, kv, head, half, C, out_c, group;
     float scale;
     bool causal;
+    uint32_t window;                /* keys less than this many cells away (0: all) */
     /* ignoring padding: the keys' tokens, the network's inputs (a sample's tokens_stride values, the keys'
        from tokens_at on), or NULL */
     const float *tokens;
@@ -124,7 +126,22 @@ static AttnShape attn_shape(const NeuralNetwork *net, uint32_t l, const BatchWor
     a.group = a.heads / a.kv;
     a.scale = 1.0f / sqrtf((float)a.head);
     a.causal = s->causal;
+    a.window = s->window;
     return a;
+}
+
+/* The keys query i attends to, [*first, *end): up to it when causal, those of its window. */
+static void query_keys(const AttnShape *a, uint32_t i, uint32_t *first, uint32_t *end) {
+    const uint32_t w = a->window;
+    *first = w && i + 1u > w ? i + 1u - w : 0u;
+    *end = a->causal ? i + 1u : w && (uint64_t)i + w < a->cells ? i + w : a->cells;
+}
+
+/* The keys of a block of rows from query i0 on: from the first's first to the last's end. */
+static void block_keys(const AttnShape *a, uint32_t i0, uint32_t rows, uint32_t *lo, uint32_t *hi) {
+    uint32_t end;
+    query_keys(a, i0, lo, &end);
+    query_keys(a, i0 + rows - 1u, &end, hi);
 }
 
 size_t spingalett_attention_scratch(const NeuralNetwork *net, uint32_t l, bool training) {
@@ -177,27 +194,32 @@ static void block_softmax(float *S, size_t ld, uint32_t rows, uint32_t keys, uin
     }
 }
 
-/* block_softmax() leaving out the keys that are not live, in their order: with every key live, the same bits;
-   a row without a live key all zeros (lse 0, never read: its probabilities are 0). */
-static void block_softmax_live(float *S, size_t ld, uint32_t rows, uint32_t keys, uint32_t i0, bool causal,
-                               const uint8_t *live, float *lse) {
+/* block_softmax() of a block whose columns are keys [lo, hi) (column c key lo + c), a row's keys those of its
+   query (query_keys()) that are live (live NULL: all), in their order: the same bits as block_softmax() over
+   the same keys; a row without a key all zeros (lse 0, never read: its probabilities are 0). */
+static void block_softmax_ext(float *S, size_t ld, uint32_t rows, uint32_t lo, uint32_t hi, uint32_t i0,
+                              const AttnShape *a, const uint8_t *live, float *lse) {
     for (uint32_t r = 0; r < rows; r++) {
         float *row = S + r * ld;
-        const uint32_t end = causal ? i0 + r + 1u : keys;
+        uint32_t first, end;
+        query_keys(a, i0 + r, &first, &end);
+        first -= lo;
+        end -= lo;
         float m = -FLT_MAX, sum = 0.0f;
         bool any = false;
-        for (uint32_t j = 0; j < end; j++)
-            if (live[j]) {
-                m = row[j] > m ? row[j] : m;
+        for (uint32_t c = first; c < end; c++)
+            if (!live || live[lo + c]) {
+                m = row[c] > m ? row[c] : m;
                 any = true;
             }
-        for (uint32_t j = 0; j < end; j++) {
-            row[j] = live[j] ? expf(row[j] - m) : 0.0f;
-            sum += row[j];
+        for (uint32_t c = 0; c < first; c++) row[c] = 0.0f;
+        for (uint32_t c = first; c < end; c++) {
+            row[c] = !live || live[lo + c] ? expf(row[c] - m) : 0.0f;
+            sum += row[c];
         }
         const float inv = any ? 1.0f / sum : 0.0f;
-        for (uint32_t j = 0; j < end; j++) row[j] *= inv;
-        for (uint32_t j = end; j < keys; j++) row[j] = 0.0f;
+        for (uint32_t c = first; c < end; c++) row[c] *= inv;
+        for (uint32_t c = end; c < hi - lo; c++) row[c] = 0.0f;
         if (lse) lse[r] = any ? m + logf(sum) : 0.0f;
     }
 }
@@ -232,7 +254,8 @@ void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const fl
             for (uint32_t h = g * a.group; h < (g + 1u) * a.group; h++)
                 for (uint32_t i0 = 0; i0 < a.cells; i0 += ATTN_BLOCK) {
                     const uint32_t rows = a.cells - i0 < ATTN_BLOCK ? a.cells - i0 : ATTN_BLOCK;
-                    const uint32_t keys = a.causal ? i0 + rows : a.cells;
+                    uint32_t lo, hi;            /* the block's keys */
+                    block_keys(&a, i0, rows, &lo, &hi);
                     const float *Q = xs + (size_t)i0 * a.C + (size_t)h * a.head;
                     size_t ldq = a.C;
                     if (rope) {
@@ -240,12 +263,13 @@ void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const fl
                         Q = Qr;
                         ldq = a.head;
                     }
-                    spingalett_gemm_native(gemm, false, true, rows, keys, a.head, a.scale, Q, ldq, K, ldk, 0.0f, S,
-                                           a.cells, false);
+                    spingalett_gemm_native(gemm, false, true, rows, hi - lo, a.head, a.scale, Q, ldq, K + lo * ldk, ldk,
+                                           0.0f, S, a.cells, false);
                     float *row_lse = lse ? lse + ((size_t)smp * a.heads + h) * a.cells + i0 : NULL;
-                    if (live) block_softmax_live(S, a.cells, rows, keys, i0, a.causal, live, row_lse);
-                    else block_softmax(S, a.cells, rows, keys, i0, a.causal, row_lse);
-                    spingalett_gemm_native(gemm, false, false, rows, a.head, keys, 1.0f, S, a.cells, V, a.C, 0.0f,
+                    if (live || a.window) block_softmax_ext(S, a.cells, rows, lo, hi, i0, &a, live, row_lse);
+                    else block_softmax(S, a.cells, rows, hi, i0, a.causal, row_lse);
+                    spingalett_gemm_native(gemm, false, false, rows, a.head, hi - lo, 1.0f, S, a.cells,
+                                           V + (size_t)lo * a.C, a.C, 0.0f,
                                            y + ((size_t)smp * a.cells + i0) * a.out_c + (size_t)h * a.head, a.out_c,
                                            false);
                 }
@@ -283,7 +307,10 @@ void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const f
             for (uint32_t h = g * a.group; h < (g + 1u) * a.group; h++)
                 for (uint32_t i0 = 0; i0 < a.cells; i0 += ATTN_BLOCK) {
                     const uint32_t rows = a.cells - i0 < ATTN_BLOCK ? a.cells - i0 : ATTN_BLOCK;
-                    const uint32_t keys = a.causal ? i0 + rows : a.cells;
+                    uint32_t lo, hi;            /* the block's keys */
+                    block_keys(&a, i0, rows, &lo, &hi);
+                    const uint32_t keys = hi - lo;
+                    const float *Kb = K + lo * ldk, *Vb = V + (size_t)lo * a.C;
                     const float *Q = xs + (size_t)i0 * a.C + (size_t)h * d;
                     size_t ldq = a.C;
                     if (rope) {
@@ -294,21 +321,25 @@ void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const f
                     const float *dO = dy + ((size_t)smp * T + i0) * a.out_c + (size_t)h * d;
                     const float *L = lse + ((size_t)smp * a.heads + h) * T + i0;
                     /* P from the scores and the forward pass's log sums */
-                    spingalett_gemm_native(gemm, false, true, rows, keys, a.head, a.scale, Q, ldq, K, ldk, 0.0f, P, T,
+                    spingalett_gemm_native(gemm, false, true, rows, keys, a.head, a.scale, Q, ldq, Kb, ldk, 0.0f, P, T,
                                            false);
                     for (uint32_t r = 0; r < rows; r++) {
                         float *row = P + r * T;
-                        const uint32_t end = a.causal ? i0 + r + 1u : keys;
+                        uint32_t first, end;
+                        query_keys(&a, i0 + r, &first, &end);
+                        first -= lo;
+                        end -= lo;
+                        for (uint32_t c = 0; c < first; c++) row[c] = 0.0f;
                         if (live)
-                            for (uint32_t j = 0; j < end; j++) row[j] = live[j] ? expf(row[j] - L[r]) : 0.0f;
+                            for (uint32_t c = first; c < end; c++) row[c] = live[lo + c] ? expf(row[c] - L[r]) : 0.0f;
                         else
-                            for (uint32_t j = 0; j < end; j++) row[j] = expf(row[j] - L[r]);
-                        for (uint32_t j = end; j < keys; j++) row[j] = 0.0f;
+                            for (uint32_t c = first; c < end; c++) row[c] = expf(row[c] - L[r]);
+                        for (uint32_t c = end; c < keys; c++) row[c] = 0.0f;
                     }
                     /* dS = P (dP - D) with dP = dO V^T and D = rowsum(dO O) = rowsum(P dP) (the outputs before
                        the layer's activation need not be kept) */
-                    spingalett_gemm_native(gemm, false, true, rows, keys, a.head, 1.0f, dO, a.out_c, V, a.C, 0.0f, dP, T,
-                                           false);
+                    spingalett_gemm_native(gemm, false, true, rows, keys, a.head, 1.0f, dO, a.out_c, Vb, a.C, 0.0f, dP,
+                                           T, false);
                     for (uint32_t r = 0; r < rows; r++) {
                         float dot = 0.0f;
                         for (uint32_t j = 0; j < keys; j++) dot += P[r * T + j] * dP[r * T + j];
@@ -317,19 +348,19 @@ void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const f
                     }
                     /* dQ = dS K / sqrt(d): into its place, rotated back when the queries were rotated */
                     if (rope) {
-                        spingalett_gemm_native(gemm, false, false, rows, a.head, keys, a.scale, dP, T, K, ldk, 0.0f, dQ,
-                                               d, false);
+                        spingalett_gemm_native(gemm, false, false, rows, a.head, keys, a.scale, dP, T, Kb, ldk, 0.0f,
+                                               dQ, d, false);
                         rope_rows(dQ, d, dxs + (size_t)i0 * a.C + (size_t)h * d, a.C, rows, i0, a.half, rope, a.cells,
                                   true);
                     } else {
-                        spingalett_gemm_native(gemm, false, false, rows, a.head, keys, a.scale, dP, T, K, ldk, 0.0f,
+                        spingalett_gemm_native(gemm, false, false, rows, a.head, keys, a.scale, dP, T, Kb, ldk, 0.0f,
                                                dxs + (size_t)i0 * a.C + (size_t)h * d, a.C, false);
                     }
-                    /* dK += dS^T Q / sqrt(d), dV += P^T dO */
-                    spingalett_gemm_native(gemm, true, false, keys, a.head, rows, a.scale, dP, T, Q, ldq, 1.0f, dK, d,
-                                           false);
-                    spingalett_gemm_native(gemm, true, false, keys, a.head, rows, 1.0f, P, T, dO, a.out_c, 1.0f, dV, d,
-                                           false);
+                    /* dK += dS^T Q / sqrt(d), dV += P^T dO (over the block's keys) */
+                    spingalett_gemm_native(gemm, true, false, keys, a.head, rows, a.scale, dP, T, Q, ldq, 1.0f,
+                                           dK + (size_t)lo * d, d, false);
+                    spingalett_gemm_native(gemm, true, false, keys, a.head, rows, 1.0f, P, T, dO, a.out_c, 1.0f,
+                                           dV + (size_t)lo * d, d, false);
                 }
             float *dKx = dxs + (size_t)(a.heads + g) * d, *dVx = dxs + (size_t)(a.heads + a.kv + g) * d;
             if (rope) {

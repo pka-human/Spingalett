@@ -354,6 +354,12 @@ impl Layer {
         self.args.ignore_padding = ignore;
         self
     }
+    /// Attention: a sliding window, keys less than `window` cells away (with causal the cell and the
+    /// `window - 1` before it); 0: every key.
+    pub fn window(mut self, window: u32) -> Self {
+        self.args.window = window;
+        self
+    }
     /// A linear layer computing with the table of the embedding of this index (tied input and output
     /// embeddings); its outputs the embedding's vocabulary.
     pub fn tied(mut self, embedding: u32) -> Self {

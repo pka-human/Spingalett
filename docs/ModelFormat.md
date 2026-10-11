@@ -10,7 +10,7 @@ concatenates several, or pools globally (0.10 on), version 7 for networks with t
 convolutions, upsampling or layer normalization (0.13 on), version 8 for the layers of transformers
 (embeddings, attention, RMS normalization, products of layers), the GELU and SiLU activations and the
 sparse cross-entropy loss (1.2 on), version 9 for the training features of language models: dense and
-linear layers tied to an embedding's table, attention that ignores padding (1.3 on). `spingalett_load()` and
+linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window (1.3 on). `spingalett_load()` and
 `spingalett_load_from_memory()` read versions 1 to 9.
 
 Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
@@ -118,7 +118,7 @@ in version 5 and 112 bytes in versions 6 to 9:
 | 62 | 2 | versions 4 to 9: padding on the left and on the right |
 | 64 | 4 | versions 5 to 9: convolution groups `g` (at least 1, dividing `in_c` and `out_c`; also of transposed convolutions); versions 8 and 9: an attention's heads, an embedding's vocabulary (the rows of its table); 0 for other kinds |
 | 68 | 4 | versions 5 to 9: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); 0 for other kinds |
-| 72 | 4 | versions 5 to 9: batch normalization's momentum, a float in [0, 1] (used only when training); 0 for other kinds |
+| 72 | 4 | versions 5 to 9: batch normalization's momentum, a float in [0, 1] (used only when training); version 9: an attention's sliding window `w`, an integer (0: every key); 0 for other kinds |
 | 76 | 4 | versions 7 to 9: upsampling mode, 0 nearest or 1 bilinear; versions 8 and 9: attention's flags (bit 0: causal; version 9: bit 1, padding ignored, with bits 16 to 31 the index of the embedding whose tokens tell it; other bits 0), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
 | 80 | 4 | versions 6 to 9: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications) |
 | 84 | 4 | versions 6 to 9: the first of them, a layer index from 0 (the network's input) to `i` |
@@ -175,7 +175,8 @@ layer 0): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output chan
   floats for each output cell (`out` floats, the positions'), and is absent (offset 0) otherwise.
 - Attention (version 8): output shape `in_h x in_w x (heads x head)`, the input's channels `(heads +
   2 kv_heads) x head` for a head size `head` (even when the rotary base is not 0); no sections, no
-  window, epsilon and momentum 0. Version 9: with flag bit 1, keys of padding are left out: the embedding
+  window, epsilon and momentum 0 (version 9: offset 72 the sliding window, any value). Version 9: with flag
+  bit 1, keys of padding are left out: the embedding
   `e` of bits 16 to 31 (a layer before it, reading the network's input) has as many cells as the attention
   has keys, key `j`'s token being value `j` of the network's input.
 - RMS normalization (version 8): as layer normalization without beta (no biases section).
@@ -319,9 +320,10 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   by `exp(m_old - m_new)` when it grows. With a rotary base `theta > 0`, queries and keys are first
   rotated: for `i` below `half = head / 2`, `x'_i = x_i cos - x_(i + half) sin` and `x'_(i + half) =
   x_(i + half) cos + x_i sin` with the angle `p theta^(-2 i / head)` of the cell's position `p`, its
-  cosine and sine computed in double and rounded to float. Ignoring padding (version 9), the keys whose
-  tokens are negative (not 0 or more) are left out of the sums as if they were not there; a query left
-  without a key gives zeros.
+  cosine and sine computed in double and rounded to float. With a sliding window `w > 0` (version 9), cell
+  `i` reads the keys `j` with `j + w > i`, and `j < i + w` when not causal (a window of at least the cells is
+  no window). Ignoring padding (version 9), the keys whose tokens are negative (not 0 or more) are left out
+  of the sums as if they were not there; a query left without a key gives zeros.
 - A multiplication multiplies its inputs in their order (`x0 * x1`, then `* x2` and so on).
 - Pooling takes, per channel, the maximum or the mean of the window's cells inside the input;
   padding cells are not counted (a window of 2 x 2 cells over one row of padding averages 2 cells).

@@ -1582,9 +1582,14 @@ static void attn_tiles(uint32_t head, uint32_t op, uint32_t *dmax, uint32_t *bq,
     *threads = *dmax == 32u ? 128u : *dmax == 256u ? 16u : 64u;
 }
 
-/* Whether attention layer l runs on the passes that read padding (SPG_ATTN_EXT). */
+/* The sliding window of attention layer s, 0 when it holds every key (a window of the cells or more). */
+static uint32_t attn_window(const LayerShape *s) {
+    return s->window < s->height * s->width ? s->window : 0u;
+}
+
+/* Whether attention layer l runs on the passes that read padding and windows (SPG_ATTN_EXT). */
 static bool attn_ext(const LayerShape *s) {
-    return s->mask != 0;
+    return s->mask != 0 || attn_window(s) != 0;
 }
 
 /* A pass of attention layer l over n samples (attn.comp's FORWARD, PRE, DQ, DKV): x its queries, keys and
@@ -1602,12 +1607,13 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
                      .kv = s->kv_heads, .d = head,
                      .flags = (s->causal ? SPG_ATTN_CAUSAL : 0u) | (g->geo[l].buffer ? SPG_ATTN_ROPE : 0u) |
                               (stats ? SPG_ATTN_STATS : 0u) | (ext && s->mask ? SPG_ATTN_PAD : 0u),
-                     .scale = 1.0f / sqrtf((float)head),
+                     .scale = 1.0f / sqrtf((float)head), .window = ext ? attn_window(s) : 0u,
                      .tokens = ext && s->mask ? g->act[0].address : x,
                      .tokens_stride = ext && s->mask ? g->net->topology[0] : 0u};
     /* networks in bfloat16 on CUDA, heads of 32, 64 or 128: flash.cu on the matrix units (BQ 0 names it), a
-       block 64 rows (32 for heads of 128). A layer with padding runs on the kernels of single precision
-       (rattn.cu's units of EXT, which read activations kept as bfloat16 too): flash.cu does not read it. */
+       block 64 rows (32 for heads of 128). A layer with padding or a sliding window runs on the kernels of single
+       precision (rattn.cu's units of EXT, which read activations kept as bfloat16 too): flash.cu does not read
+       them. */
     const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE && !ext &&
                      (head == 32u || head == 64u || head == 128u);
     if (mma) {

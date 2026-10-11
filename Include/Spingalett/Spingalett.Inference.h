@@ -12,7 +12,7 @@
  * transposed convolutions, upsampling and layer normalization; 8 for the layers and activations of
  * transformers: embeddings, attention, RMS normalization, products of layers, GELU and SiLU; 9 for the
  * training features of language models: output layers tied to an embedding's table, attention ignoring
- * padding) in place, in the precision its
+ * padding or of a sliding window) in place, in the precision its
  * parameters were saved in. The image can be a file read into memory, a const array
  * compiled into the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing,
  * does no I/O and keeps no global state: apart from the image it only needs a workspace from the
@@ -62,8 +62,8 @@ extern "C" {
    before them, add or concatenate several, or pool globally), 7 with transposed convolutions,
    upsampling or layer normalization, 8 with embeddings, attention, RMS normalization, products of
    layers, the GELU and SiLU activations or the sparse cross-entropy loss, 9 with the training features of
-   language models (output layers tied to an embedding's table, attention ignoring padding), so that
-   engines of earlier releases still run what they can; versions 1 and 2 still load. */
+   language models (output layers tied to an embedding's table, attention ignoring padding or of a sliding
+   window), so that engines of earlier releases still run what they can; versions 1 and 2 still load. */
 #define SPINGALETT_FORMAT_VERSION 9
 
 /* Most inputs a layer can have (SPINGALETT_LAYER_ADD, SPINGALETT_LAYER_CONCAT and SPINGALETT_LAYER_MULTIPLY read
@@ -239,7 +239,8 @@ typedef struct {
     bool ignore_padding;            /* attention: keys whose tokens (the network's inputs) are negative ignored */
     uint32_t tied;                  /* dense and linear layers: the network's layer (an embedding) whose table
                                        are their weights, or 0 */
-    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them) */
+    uint32_t window;                /* attention: keys less than this many cells away (0: all) */
+    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them, window after tied) */
 } SpingalettLayerInfo;
 
 /*

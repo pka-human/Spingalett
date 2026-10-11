@@ -103,10 +103,10 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
    pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs, 7 with
    transposed convolutions, upsampling or layer normalization, 8 with the layers, activations or the
    loss of transformers, 9 with the training features of language models (layers tied to an embedding,
-   attention ignoring padding). */
+   attention ignoring padding or of a sliding window). */
 static uint16_t format_version(const NeuralNetwork *net) {
     for (uint32_t l = 1; l < net->layers; l++)
-        if (net->shapes[l].tied || net->shapes[l].mask) return 9u;
+        if (net->shapes[l].tied || net->shapes[l].mask || net->shapes[l].window) return 9u;
     if (net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) return 8u;
     for (uint32_t l = 1; l < net->layers; l++)
         if (net->shapes[l].type > LAYER_LAYER_NORM || net->act_func[l - 1] >= ACT_GELU) return 8u;
@@ -283,7 +283,8 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             memcpy(&bits, &shape->eps, 4);
             slett_put32(e + 68, bits);
             memcpy(&bits, &shape->momentum, 4);
-            slett_put32(e + 72, bits);
+            /* (version 9: an attention's sliding window in the momentum's field) */
+            slett_put32(e + 72, shape->type == LAYER_ATTENTION && version >= 9u ? shape->window : bits);
         }
         /* the upsampling mode; attention's flags (causal; version 9: ignoring padding, the embedding of the tokens in
            bits 16 to 31), embeddings' positions */
@@ -600,6 +601,7 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
             a.kv_heads = e.kv_heads;
             a.rope_theta = e.theta;
             a.causal = e.causal;
+            a.window = e.window;
         } else if (e.type == LAYER_ADD || e.type == LAYER_CONCAT || e.type == LAYER_GLOBAL_AVG_POOL ||
                    e.type == LAYER_MULTIPLY) {
             /* the inputs give the shape */

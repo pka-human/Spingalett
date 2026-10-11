@@ -64,7 +64,8 @@ public unsafe struct LayerArgs
     public byte positions;
     public byte ignore_padding;
     public uint tied;
-    public fixed ulong reserved[Const.Reserved - 3];
+    public uint window;
+    public fixed ulong reserved[Const.Reserved - 4];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -93,6 +94,7 @@ public unsafe struct NetworkLayer
     public byte positions;
     public byte ignore_padding;
     public uint tied;
+    public uint window;
     public fixed ulong reserved[Const.Reserved - 3];
 }
 

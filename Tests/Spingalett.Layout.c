@@ -28,6 +28,7 @@ int main(void) {
     FIELD(LayerArgs, output_padding_w);
     FIELD(LayerArgs, vocabulary); FIELD(LayerArgs, heads); FIELD(LayerArgs, kv_heads); FIELD(LayerArgs, rope_theta);
     FIELD(LayerArgs, causal); FIELD(LayerArgs, positions); FIELD(LayerArgs, ignore_padding); FIELD(LayerArgs, tied);
+    FIELD(LayerArgs, window);
 
     SIZE(SpingalettNetworkLayer); FIELD(SpingalettNetworkLayer, reserved);
     FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
@@ -40,7 +41,7 @@ int main(void) {
     FIELD(SpingalettNetworkLayer, upsample);
     FIELD(SpingalettNetworkLayer, vocabulary); FIELD(SpingalettNetworkLayer, heads); FIELD(SpingalettNetworkLayer, kv_heads); FIELD(SpingalettNetworkLayer, rope_theta);
     FIELD(SpingalettNetworkLayer, causal); FIELD(SpingalettNetworkLayer, positions); FIELD(SpingalettNetworkLayer, ignore_padding);
-    FIELD(SpingalettNetworkLayer, tied);
+    FIELD(SpingalettNetworkLayer, tied); FIELD(SpingalettNetworkLayer, window);
 
     SIZE(ForwardArgs); FIELD(ForwardArgs, reserved); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
@@ -148,7 +149,7 @@ int main(void) {
     FIELD(SpingalettLayerInfo, input_layers); FIELD(SpingalettLayerInfo, upsample);
     FIELD(SpingalettLayerInfo, vocabulary); FIELD(SpingalettLayerInfo, heads); FIELD(SpingalettLayerInfo, kv_heads); FIELD(SpingalettLayerInfo, rope_theta);
     FIELD(SpingalettLayerInfo, causal); FIELD(SpingalettLayerInfo, positions); FIELD(SpingalettLayerInfo, ignore_padding);
-    FIELD(SpingalettLayerInfo, tied);
+    FIELD(SpingalettLayerInfo, tied); FIELD(SpingalettLayerInfo, window);
 
     SIZE(LRScheduleParams); FIELD(LRScheduleParams, reserved);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);

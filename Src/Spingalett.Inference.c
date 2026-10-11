@@ -1335,6 +1335,11 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         const uint32_t padding = version >= 9u && (layer->mode & 2u) && (layer->mode >> 16) ? 0xFFFF0002u : 0u;
         layer->mask = padding ? layer->mode >> 16 : 0u;
         layer->mode = version >= 9u ? layer->mode & ~(1u | padding) : 0u;
+        /* version 9: the sliding window in the momentum's field */
+        if (version >= 9u) {
+            layer->window = slett_get32(e + 72);
+            layer->momentum = 0.0f;
+        }
     }
     if (version >= 8u && layer->type == LAYER_EMBEDDING) {
         layer->positions = (layer->mode & 1u) != 0;
@@ -1687,6 +1692,7 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
     info->positions = L.positions;
     info->ignore_padding = L.mask != 0;
     info->tied = L.tied;
+    info->window = L.window;
     info->input_count = L.input_count;
     for (uint32_t k = 0; k < L.input_count; k++)
         info->input_layers[k] = spingalett_slett_input((const uint8_t *)model->image, &L, k);
@@ -2263,7 +2269,7 @@ static void rope_rotate(const float *src, float *dst, uint32_t half, const float
 }
 
 void spingalett_engine_attention(const SlettAttention *a, const float *x, const float *table, float *y, float *scratch) {
-    const uint32_t cells = a->cells, heads = a->heads, kv = a->kv, head = a->head;
+    const uint32_t cells = a->cells, heads = a->heads, kv = a->kv, head = a->head, window = a->window;
     const bool causal = a->causal;
     const float *tokens = a->tokens;
     const uint32_t C = (heads + 2u * kv) * head, out_c = heads * head, group = heads / kv, half = head / 2u;
@@ -2285,8 +2291,10 @@ void spingalett_engine_attention(const SlettAttention *a, const float *x, const 
             }
             float *o = y + (size_t)i * out_c + (size_t)h * head, m = -FLT_MAX, sum = 0.0f;
             for (uint32_t d = 0; d < head; d++) o[d] = 0.0f;
-            const uint32_t end = causal ? i + 1u : cells;
-            for (uint32_t j = 0; j < end; j++) {
+            /* its keys: up to it when causal; with a window, less than window cells away */
+            const uint32_t first = window && i + 1u > window ? i + 1u - window : 0u;
+            const uint32_t end = causal ? i + 1u : window && (uint64_t)i + window < cells ? i + window : cells;
+            for (uint32_t j = first; j < end; j++) {
                 if (tokens && !(tokens[j] >= 0.0f)) continue;      /* a key of padding */
                 const float *k = table ? keys + ((size_t)j * kv + g) * head : x + (size_t)j * C + (size_t)(heads + g) * head;
                 const float *v = x + (size_t)j * C + (size_t)(heads + kv + g) * head;
@@ -2315,6 +2323,7 @@ void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, c
     a->heads = L->heads;
     a->kv = L->kv_heads;
     a->head = L->out_c / L->heads;
+    a->window = L->window;
     a->causal = L->causal;
     a->tokens = L->mask ? input : NULL;
 }

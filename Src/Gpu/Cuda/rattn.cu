@@ -24,7 +24,8 @@
  * the order of the head's values, a sum over keys in their order: the same bits on every run. A unit per
  * head size D and pass (OPC); the head d may be smaller than D (zeros past it). Units of EXT (rattn_d<D>_o<OPC>x)
  * compile in the passes of a layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query
- * without a key giving zeros); the others are those of layers without, unchanged. Spec: OP (| SPG_ATTN_EXT), BQ,
+ * without a key giving zeros) or a sliding window (keys less than `window` cells away, the tiles outside every
+ * row's window skipped); the others are those of layers without, unchanged. Spec: OP (| SPG_ATTN_EXT), BQ,
  * DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3), the tiles those of SPG_RATTN_ROWS and SPG_RATTN_THREADS.
  */
 
@@ -68,6 +69,12 @@
 /* Whether key j of sample s is attended to: inside the keys and (EXT with FLAG_PAD) not padding. */
 DEVICE bool live(const SpgAttnPush &p, uint32_t s, uint32_t j) {
     return j < p.cells && (!(p.flags & FLAG_PAD) || F(p.tokens)[s * p.tokens_stride + p.tokens_at + j] >= 0.0f);
+}
+
+/* Whether query i attends to key j by their places: with a window, j less than window cells away (after i too
+   unless causal), as differences in unsigned arithmetic (i - j wraps when j is after i). */
+DEVICE bool in_window(const SpgAttnPush &p, uint32_t i, uint32_t j, bool causal) {
+    return !p.window || (causal ? i - j < p.window : i - j + (p.window - 1u) < 2u * p.window - 1u);
 }
 
 DEVICE float shfl_xor(float v, uint32_t mask) { return __nvvm_shfl_sync_bfly_f32(0xFFFFFFFFu, v, mask, 0x1F); }
@@ -278,12 +285,21 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
     for (uint32_t m = 0; m < RM; m++)
 #pragma unroll
         for (uint32_t k = 0; k < CH; k++) acc[m][k] = float4_{0.0f, 0.0f, 0.0f, 0.0f};
+#if EXT
+    /* with a window, the keys of the block's rows' windows, from a tile of B aligned */
+    const uint32_t w = p.window;
+    const uint32_t jfirst = w ? (i0 + 1u > w ? i0 + 1u - w : 0u) / B * B : 0u;
+    const uint32_t keys = causal ? umin(p.cells, i0 + R) : w ? umin(p.cells, i0 + R - 1u + w) : p.cells;
+#define JFIRST jfirst
+#else
     const uint32_t keys = causal ? umin(p.cells, i0 + R) : p.cells;
+#define JFIRST 0u
+#endif
     if (vec) {
-        fetch(p, HALF, s, 0u, keys_of, ra);
-        fetch(p, HALF, s, 0u, values_of, rb);
+        fetch(p, HALF, s, JFIRST, keys_of, ra);
+        fetch(p, HALF, s, JFIRST, values_of, rb);
     }
-    for (uint32_t j0 = 0; j0 < keys; j0 += B) {
+    for (uint32_t j0 = JFIRST; j0 < keys; j0 += B) {
         const bool next = vec && j0 + B < keys;
         float sc[RM][CN];
 #pragma unroll
@@ -326,7 +342,7 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
             for (uint32_t n = 0; n < CN; n++) {
                 const uint32_t j = j0 + tx + TX * n;
 #if EXT
-                if (!(i < p.cells && kl[n] && (!causal || j <= i))) sc[m][n] = NEG;
+                if (!(i < p.cells && kl[n] && (!causal || j <= i) && in_window(p, i, j, causal))) sc[m][n] = NEG;
 #else
                 if (!(i < p.cells && j < p.cells && (!causal || j <= i))) sc[m][n] = NEG;
 #endif
@@ -361,7 +377,7 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
             for (uint32_t n = 0; n < CN; n++) {
                 const uint32_t j = j0 + tx + TX * n;
 #if EXT
-                const bool valid = i < p.cells && kl[n] && (!causal || j <= i);
+                const bool valid = i < p.cells && kl[n] && (!causal || j <= i) && in_window(p, i, j, causal);
 #else
                 const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
 #endif
@@ -427,7 +443,16 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
 #pragma unroll
     for (uint32_t m = 0; m < RM; m++) kk[m] = live(p, s, j0 + ry * RM + m);
 #endif
+#if EXT
+    /* with a window, the queries of the block's keys' windows */
+    const uint32_t w = p.window;
+    const uint32_t first = causal ? (j0 / B) * B : w ? (j0 + 1u > w ? j0 + 1u - w : 0u) / B * B : 0u;
+    const uint32_t qend = w ? umin(p.cells, j0 + R - 1u + w) : p.cells;
+#define QEND qend
+#else
     const uint32_t first = causal ? (j0 / B) * B : 0u;
+#define QEND p.cells
+#endif
     for (uint32_t h = kh * group; h < (kh + 1u) * group; h++) {
         const uint32_t sa = (s * p.heads + h) * p.cells;
         const Rows queries_of = {p.x, h * d, C, 0u, true, p.scale}, grads_of = {p.dy, h * d, out_c, 2u, false, 1.0f};
@@ -435,7 +460,7 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
             fetch(p, HALF, s, first, queries_of, ra);
             fetch(p, HALF, s, first, grads_of, rb);
         }
-        for (uint32_t q0 = first; q0 < p.cells; q0 += B) {
+        for (uint32_t q0 = first; q0 < QEND; q0 += B) {
             barrier();
             place(p, HALF, sh.q, s, q0, queries_of, ra);
             place(p, HALF, sh.g, s, q0, grads_of, rb);
@@ -445,7 +470,7 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
                 sh.dl[e] = live ? F(p.stats)[rows + sa + q0 + e] : 0.0f;
             }
             barrier();
-            if (vec && q0 + B < p.cells) {
+            if (vec && q0 + B < QEND) {
                 fetch(p, HALF, s, q0 + B, queries_of, ra);
                 fetch(p, HALF, s, q0 + B, grads_of, rb);
             }
@@ -464,7 +489,8 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
                 for (uint32_t n = 0; n < CN; n++) {
                     const uint32_t qc = tx + TX * n, query = q0 + qc;
 #if EXT
-                    const bool valid = query < p.cells && kk[m] && (!causal || key <= query);
+                    const bool valid = query < p.cells && kk[m] && (!causal || key <= query) &&
+                                       in_window(p, query, key, causal);
 #else
                     const bool valid = query < p.cells && key < p.cells && (!causal || key <= query);
 #endif

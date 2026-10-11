@@ -248,6 +248,14 @@ final class Layer
         return $this;
     }
 
+    /** Attention: a sliding window, keys less than $window cells away (with causal the cell and the $window - 1
+        before it). */
+    public function window(int $window): self
+    {
+        $this->fields['window'] = $window;
+        return $this;
+    }
+
     /** Linear: computes with the table of the embedding of index $embedding (tied input and output embeddings). */
     public function tied(int $embedding): self
     {

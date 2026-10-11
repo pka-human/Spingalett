@@ -143,7 +143,7 @@ fn layout_matches_c() {
         epsilon = "epsilon", momentum = "momentum", inputs = "inputs", input_count = "input_count",
         upsample = "upsample", output_padding = "output_padding", output_padding_h = "output_padding_h",
         output_padding_w = "output_padding_w", vocabulary = "vocabulary", heads = "heads", kv_heads = "kv_heads",
-        rope_theta = "rope_theta", causal = "causal", positions = "positions", ignore_padding = "ignore_padding", tied = "tied", reserved = "reserved",
+        rope_theta = "rope_theta", causal = "causal", positions = "positions", ignore_padding = "ignore_padding", tied = "tied", window = "window", reserved = "reserved",
     ]);
     fields!("TrainArgs", sys::TrainArgs, [
         net = "net", training_mode = "training_mode", training_strategy = "training_strategy",
@@ -211,7 +211,7 @@ fn layout_matches_c() {
         weight_count = "weight_count", bias_count = "bias_count", groups = "groups", epsilon = "epsilon",
         momentum = "momentum", input_count = "input_count", inputs = "inputs", upsample = "upsample",
         vocabulary = "vocabulary", heads = "heads", kv_heads = "kv_heads", rope_theta = "rope_theta",
-        causal = "causal", positions = "positions", ignore_padding = "ignore_padding", tied = "tied", reserved = "reserved",
+        causal = "causal", positions = "positions", ignore_padding = "ignore_padding", tied = "tied", window = "window", reserved = "reserved",
     ]);
     fields!("SpingalettModel", sys::Model, [
         input_size = "input_size", output_size = "output_size", layer_count = "layer_count", loss = "loss",

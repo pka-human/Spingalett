@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Sliding window attention** (`SpingalettLayerArgs.window` on attention, Mistral's): each cell attends to
+  the keys less than `window` cells away, with `.causal` the cell and the `window - 1` before it, without
+  the `window - 1` on either side, on the CPU, both GPU backends, the engine and deployment models. The CPU
+  and the GPU's kernels of single precision skip the blocks of keys outside every query's window (in
+  bfloat16 on CUDA such layers run on those kernels, not `flash.cu`); `.slett` format 9 stores the window in
+  the attention's momentum field. `SpingalettNetworkLayer.window`, `SpingalettLayerInfo.window`; Python
+  `add_attention(..., window=w)`, the C++ builder's and the other bindings' options.
 - **Sequences of different lengths in one batch** (`SpingalettLayerArgs.ignore_padding` on attention): the
   keys of padding, tokens of -1 in the network's input (traced through the layers that keep cells one for
   one to the embedding the keys' cells come from), left out of the softmax, a query without a key giving

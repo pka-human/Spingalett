@@ -100,6 +100,8 @@ public sealed unsafe class Layer
     public Layer Tied(uint embedding) { Args.tied = embedding; return this; }
     /// <summary>Attention: keys of padding (tokens of -1) left out (sequences of different lengths in one batch).</summary>
     public Layer IgnorePadding(bool ignore = true) { Args.ignore_padding = (byte)(ignore ? 1 : 0); return this; }
+    /// <summary>Attention: a sliding window, keys less than this many cells away (0: every key).</summary>
+    public Layer Window(uint window) { Args.window = window; return this; }
     /// <summary>The layers it reads (indices that Network.Add returned); none: the last one.</summary>
     public Layer Inputs(params uint[] inputs)
     {

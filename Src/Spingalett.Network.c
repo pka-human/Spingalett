@@ -225,6 +225,7 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->kv_heads = kv;
         shape->theta = args->rope_theta;
         shape->causal = args->causal;
+        shape->window = args->window;
         /* padding: the keys' cells those of an embedding of the network's input */
         shape->mask = args->ignore_padding ? cells_of(net, inputs[0]) : 0u;
         if (args->ignore_padding && !shape->mask)
@@ -744,6 +745,7 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
             a.rope_theta = s->theta;
             a.causal = s->causal;
             a.ignore_padding = s->mask != 0;
+            a.window = s->window;
             break;
         case LAYER_ADD:
         case LAYER_CONCAT:
@@ -807,6 +809,7 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->positions = s->positions;
     layer->ignore_padding = s->mask != 0;
     layer->tied = s->tied;
+    layer->window = s->window;
     if (index > 0) {
         layer->bias_count = spingalett_bias_count(net, index - 1);
         layer->weight_count = spingalett_weight_count(net, index - 1);

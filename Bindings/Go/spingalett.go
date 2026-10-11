@@ -295,6 +295,9 @@ func (l Layer) Tied(e uint32) Layer { l.args.tied = C.uint32_t(e); return l }
 // IgnorePadding leaves the keys of padding (tokens of -1) out of attention (sequences of different lengths in one batch).
 func (l Layer) IgnorePadding(i bool) Layer { l.args.ignore_padding = C.bool(i); return l }
 
+// Window gives attention a sliding window: keys less than w cells away (with causal the cell and the w - 1 before it).
+func (l Layer) Window(w uint32) Layer { l.args.window = C.uint32_t(w); return l }
+
 // Inputs names the layers it reads (indices Add returned; 0 the input layer); none: the last one.
 func (l Layer) Inputs(inputs ...uint32) Layer {
 	for k, i := range inputs {

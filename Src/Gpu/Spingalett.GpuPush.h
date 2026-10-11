@@ -131,14 +131,15 @@ typedef struct {
     uint64_t x, y, dy, dx, stats, table;
     uint32_t n, cells, heads, kv, d, flags;
     float scale;
-    uint32_t pad;
+    uint32_t window;                /* SPG_ATTN_EXT: keys less than window cells away (0: all; less than cells) */
     /* SPG_ATTN_EXT: padding (SPG_ATTN_PAD), the keys' tokens: tokens[s tokens_stride + tokens_at + j] for key j of
        sample s, a negative one a padded key (without, an address and stride that keep loads in x) */
     uint64_t tokens;
     uint32_t tokens_stride, tokens_at;
 } SpgAttnPush;
 enum { SPG_ATTN_FORWARD, SPG_ATTN_PRE, SPG_ATTN_DQ, SPG_ATTN_DKV };
-#define SPG_ATTN_EXT    4u          /* OP: the pass of a layer with padding, the units that read it (CUDA: _x) */
+#define SPG_ATTN_EXT    4u          /* OP: the pass of a layer with padding or a window, the units that read them
+                                       (CUDA: _x) */
 #define SPG_ATTN_CAUSAL 1u
 #define SPG_ATTN_ROPE   2u
 #define SPG_ATTN_STATS  4u          /* FORWARD keeps each query's log of the softmax's sum */

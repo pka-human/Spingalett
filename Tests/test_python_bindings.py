@@ -825,6 +825,17 @@ r = enc.train(np.stack([short, np.arange(8, dtype=np.float32) % V]), np.stack([s
               epochs=2, strategy=sg.Strategy.FULL_BATCH)
 check(r.status == sg.TrainStatus.COMPLETED, "a padded batch trains")
 
+# a sliding window: with queries and keys of zeros and the positions' one-hot vectors as values, a cell's outputs
+# are the mean of the keys' it attends to (itself and the one before it)
+win = sg.Network(sg.Loss.MSE, [6, sg.Embedding(6, 18), sg.Attention(heads=1, causal=True, window=2)])
+table = np.zeros((6, 18), np.float32)
+table[np.arange(6), 12 + np.arange(6)] = 1.0
+win.set_weights(0, table.ravel())
+expect = np.array([[1.0 if j == i or (j == i - 1 and i > 0) else 0.0 for j in range(6)] for i in range(6)])
+expect /= expect.sum(axis=1, keepdims=True)
+check(win.layer(2).window == 2 and win.to_model(sg.Precision.FLOAT32).layers[1].window == 2, "window described")
+check(np.allclose(win.forward(np.arange(6, dtype=np.float32)).reshape(6, 6), expect, atol=1e-6), "window attended to")
+
 # the library versions the bindings accept: major.minor before 1.0, then the major and a minor at least theirs
 check(sg._compatible("0.14.2", "0.14.0") and not sg._compatible("0.13.1", "0.14.0"), "versions of 0.x")
 check(sg._compatible("1.0.0", "1.0.0") and sg._compatible("1.3.0", "1.2.5") and not sg._compatible("1.1.0", "1.2.0")

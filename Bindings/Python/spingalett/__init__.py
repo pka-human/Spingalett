@@ -237,6 +237,7 @@ class _NetworkLayer(Structure):
         ("positions", c_bool),
         ("ignore_padding", c_bool),
         ("tied", c_uint32),
+        ("window", c_uint32),
         ("reserved", c_uint64 * (_RESERVED - 3)),
     ]
 
@@ -324,7 +325,8 @@ class _LayerArgs(Structure):
         ("positions", c_bool),
         ("ignore_padding", c_bool),
         ("tied", c_uint32),
-        ("reserved", c_uint64 * (_RESERVED - 3)),
+        ("window", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 4)),
     ]
 
 
@@ -584,6 +586,7 @@ class _LayerInfo(Structure):
         ("positions", c_bool),
         ("ignore_padding", c_bool),
         ("tied", c_uint32),
+        ("window", c_uint32),
         ("reserved", c_uint64 * (_RESERVED - 3)),
     ]
 
@@ -1115,7 +1118,8 @@ class Attention:
     """Multi-head scaled dot-product attention over the cells of a layer of queries, keys and values side
     by side ((heads + 2 kv_heads) x head size channels a cell): ``kv_heads`` key and value heads (fewer
     than ``heads``: grouped-query attention), ``causal`` masking, rotary position embeddings of base
-    ``rope_theta`` (0: none), ``ignore_padding`` (keys of -1 tokens left out)."""
+    ``rope_theta`` (0: none), ``ignore_padding`` (keys of -1 tokens left out), a sliding ``window`` (keys
+    less than that many cells away; 0: all)."""
     heads: int = 1
     kv_heads: int = 0
     causal: bool = False
@@ -1124,6 +1128,7 @@ class Attention:
     dropout: float = 0.0
     inputs: _Inputs = None
     ignore_padding: bool = False
+    window: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1168,6 +1173,7 @@ class LayerDescription:
     positions: bool = False         # embedding: a learned vector a cell
     tied: int = 0                   # dense and linear layers: the embedding whose table are their weights
     ignore_padding: bool = False    # attention: keys of padding (-1 tokens) left out
+    window: int = 0                 # attention: keys less than this many cells away (0: all)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1381,7 +1387,8 @@ class Network:
                                    inputs=spec.inputs)
             elif isinstance(spec, Attention):
                 self.add_attention(spec.heads, spec.kv_heads, spec.causal, spec.rope_theta, spec.activation,
-                                   spec.dropout, inputs=spec.inputs, ignore_padding=spec.ignore_padding)
+                                   spec.dropout, inputs=spec.inputs, ignore_padding=spec.ignore_padding,
+                                   window=spec.window)
             elif isinstance(spec, RMSNorm):
                 self.add_rms_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, Multiply):
@@ -1558,16 +1565,19 @@ class Network:
 
     def add_attention(self, heads: int = 1, kv_heads: int = 0, causal: bool = False, rope_theta: float = 0.0,
                       activation: Activation = Activation.NONE, dropout: float = 0.0,
-                      inputs: _Inputs = None, ignore_padding: bool = False) -> "Network":
+                      inputs: _Inputs = None, ignore_padding: bool = False, window: int = 0) -> "Network":
         """Append multi-head attention over the cells of a layer whose channels hold each cell's queries,
         keys and values side by side: ``heads`` query vectors, then ``kv_heads`` (0: as many as heads)
         key and value vectors of one head size; ``causal`` lets each cell attend to the cells up to
         itself only, ``rope_theta`` (10000 is usual) rotates queries and keys by position;
         ``ignore_padding`` leaves out the keys of padding (a token of -1 in the network's input, the cells of an
-        embedding of it): sequences of different lengths train in one batch."""
+        embedding of it): sequences of different lengths train in one batch; ``window`` (Mistral's sliding
+        window) lets each cell attend to the keys less than that many cells away only: with ``causal`` the cell
+        and the ``window - 1`` before it, without the ``window - 1`` on either side (0: every key)."""
         return self._add(inputs, type=int(LayerType.ATTENTION), heads=int(heads), kv_heads=int(kv_heads),
                          causal=bool(causal), rope_theta=float(rope_theta), act_func=int(activation),
-                         dropout_rate=float(dropout), ignore_padding=bool(ignore_padding))
+                         dropout_rate=float(dropout), ignore_padding=bool(ignore_padding),
+                         window=int(window))
 
     def add_rms_norm(self, activation: Activation = Activation.NONE, epsilon: float = 1e-5, dropout: float = 0.0,
                      inputs: _Inputs = None) -> "Network":
@@ -1593,7 +1603,8 @@ class Network:
                                 int(info.weight_count), int(info.bias_count), int(info.groups), float(info.epsilon),
                                 float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)),
                                 int(info.vocabulary), int(info.heads), int(info.kv_heads), float(info.rope_theta),
-                                bool(info.causal), bool(info.positions), int(info.tied), bool(info.ignore_padding))
+                                bool(info.causal), bool(info.positions), int(info.tied), bool(info.ignore_padding),
+                                int(info.window))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -2141,6 +2152,7 @@ class LayerInfo:
     positions: bool = False             # embedding: a learned vector a cell
     tied: int = 0                       # dense and linear layers: the embedding (network layer) whose table
     ignore_padding: bool = False        # attention: keys of padding (negative tokens) left out
+    window: int = 0                     # attention: keys less than this many cells away (0: all)
 
 
 class Model:
@@ -2239,7 +2251,7 @@ class Model:
                                  vocabulary=int(info.vocabulary), heads=int(info.heads), kv_heads=int(info.kv_heads),
                                  rope_theta=float(info.rope_theta), causal=bool(info.causal),
                                  positions=bool(info.positions), tied=int(info.tied),
-                                 ignore_padding=bool(info.ignore_padding)))
+                                 ignore_padding=bool(info.ignore_padding), window=int(info.window)))
         return out
 
     def to_bytes(self) -> bytes:

@@ -32,6 +32,7 @@ typedef struct {
                                        weights (its weight_offsets that table's), or 0 */
     uint32_t mask;                  /* attention ignoring padding: the embedding of the network's input whose cells
                                        its keys' are (a negative token: a padded key), or 0 */
+    uint32_t window;                /* attention: keys less than this many cells away (0: all) */
 } LayerShape;
 
 /*

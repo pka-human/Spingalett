@@ -94,7 +94,8 @@ typedef struct {
     bool ignore_padding;            /* attention: keys of padding (negative tokens) ignored */
     uint32_t tied;                  /* dense and linear layers: the embedding whose table they compute with
                                        (weight_count 0: the table is the embedding's), or 0 */
-    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them) */
+    uint32_t window;                /* attention: keys less than this many cells away (0: all) */
+    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them, window after tied) */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -258,7 +259,10 @@ typedef struct {
                                        LLaMA): its outputs the embedding's vocabulary, its inputs a row's values;
                                        the layer keeps its biases, and the table's gradient is the sum of both
                                        layers' (0: weights of its own) */
-    uint64_t reserved[SPINGALETT_RESERVED - 3];
+    uint32_t window;                /* attention: a sliding window (Mistral's): each cell attends to the keys less
+                                       than `window` cells away, with causal the cell itself and the window - 1
+                                       before it, without the window - 1 on either side (0: every key) */
+    uint64_t reserved[SPINGALETT_RESERVED - 4];
 } SpingalettLayerArgs;
 
 typedef struct {
@@ -502,7 +506,8 @@ SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkA
    .positions adds a learned vector a cell. */
 #define spingalett_embedding(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_EMBEDDING, __VA_ARGS__})
 /* Multi-head attention over the cells of a layer of queries, keys and values side by side (a linear layer
-   of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta, .ignore_padding. */
+   of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta, .ignore_padding,
+   .window. */
 #define spingalett_attention(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_ATTENTION, __VA_ARGS__})
 /* RMS normalization over each cell's channels. */
 #define spingalett_rms_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_RMS_NORM, __VA_ARGS__})

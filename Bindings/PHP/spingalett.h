@@ -109,6 +109,7 @@ typedef struct {
     bool positions;
     bool ignore_padding;
     uint32_t tied;
+    uint32_t window;
     uint64_t reserved[8 - 3];
 } SpingalettLayerInfo;
 
@@ -232,6 +233,7 @@ typedef struct {
     bool positions;
     bool ignore_padding;
     uint32_t tied;
+    uint32_t window;
     uint64_t reserved[8 - 3];
 } SpingalettNetworkLayer;
 
@@ -339,7 +341,8 @@ typedef struct {
     bool positions;
     bool ignore_padding;
     uint32_t tied;
-    uint64_t reserved[8 - 3];
+    uint32_t window;
+    uint64_t reserved[8 - 4];
 } SpingalettLayerArgs;
 
 typedef struct {

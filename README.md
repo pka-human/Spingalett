@@ -515,7 +515,7 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 |---|---|---|
 | `spingalett_embedding()` | `vocabulary`, `neurons_amount` (the width), `positions` | Each token id's vector (ids outside the vocabulary give zeros); with `positions`, a learned vector per position added (the layer's biases) |
 | `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs`, `tied` | Each position's channels times a matrix, plus biases; with `tied`, an embedding's index, that embedding's table is the matrix (tied input and output embeddings: one table, its gradient the sum of both layers') |
-| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `ignore_padding`, `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled, the keys of padding left out with `ignore_padding`; outputs the heads' vectors side by side |
+| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `ignore_padding`, `window` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled, the keys of padding left out with `ignore_padding`, the keys `window` or more cells away with `window` (Mistral's sliding window: with `causal` a cell and the `window - 1` before it); outputs the heads' vectors side by side |
 | `spingalett_rms_norm()` | `epsilon` (1e-5) | Each position's channels over their root mean square, times a gain (no biases) |
 | `spingalett_multiply_layers()` | `inputs` | The element-wise product of layers of one shape |
 | `spingalett_dataset_open_tokens()` | `context`, `token_bytes` (2 or 4), `stride`, `offset`, `shuffle` | Windows of a token file: inputs and, as targets, the tokens after them |
@@ -537,7 +537,11 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
   pass recomputes the probabilities from each query's log-sum-exp. On the GPU it runs in tiles
   (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16 on
   CUDA), deterministic like everything else.
-- Networks of these layers save to `.slett` files (format 8; 9 with a tied head, its table stored once),
+- A sliding window costs what it reads: the CPU and the GPU's kernels of single precision skip the blocks of
+  keys outside every query's window (in bfloat16 on CUDA such layers run on those kernels, not on flash
+  attention).
+- Networks of these layers save to `.slett` files (format 8; 9 with a tied head, its table stored once,
+  padding ignored or a sliding window),
   become deployment models in every precision (the linear maps in INT8 down to INT2) and run on the
   runtime and the engine.
 - `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every

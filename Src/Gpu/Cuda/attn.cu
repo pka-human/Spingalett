@@ -8,7 +8,8 @@
    most (DMAX 32, 64, 128, 256 with tiles of 32, 16, 8, 4 rows, THREADS 128, 64, 64, 16; Kernels.def builds
    DMAX 256, the smaller heads run on rattn.cu): the rows' threads, keys and columns as constants, so that
    the arrays of a thread's sums stay in registers. EXT (a unit of its own, attn_d256x) compiles in the passes of a
-   layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query without a key giving zeros).
+   layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query without a key giving zeros) or a
+   sliding window (keys less than `window` cells away, the tiles outside every row's window skipped).
    Spec: OP (| SPG_ATTN_EXT), BQ, DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3). */
 
 #include "common.cuh"
@@ -58,6 +59,20 @@ DEVICE float rotated(const SpgAttnPush &p, uint32_t half, uint32_t at, uint32_t 
     const uint32_t hd = p.d / 2u, i = c < hd ? c : c - hd;
     const float cs = F(p.table)[pos * hd + i], sn = F(p.table)[p.cells * hd + pos * hd + i];
     return c < hd ? v * cs - ld(p.x, at + c + hd, 0u, half) * sn : v * cs + ld(p.x, at + c - hd, 0u, half) * sn;
+}
+
+/* whether query i attends to key j by their places: EXT with a window, j less than window cells away (after i
+   too unless causal) */
+DEVICE bool in_window(const SpgAttnPush &p, uint32_t i, uint32_t j, bool causal) {
+    return !EXT || !p.window || (j + p.window > i && (causal || j < i + p.window));
+}
+
+/* The first (aligned to BQ) and the end of the keys a tile of queries from `at` attends to (keys), or of the
+   queries that attend to a tile of keys from `at` (EXT with a window). */
+DEVICE void window_tiles(const SpgAttnPush &p, uint32_t at, bool keys, bool causal, uint32_t *first, uint32_t *end) {
+    const uint32_t w = p.window, back = !keys && causal ? at : at + 1u > w ? at + 1u - w : 0u;
+    *first = back / BQ * BQ;
+    *end = keys && causal ? umin(p.cells, at + BQ) : umin(p.cells, at + BQ - 1u + w);
 }
 
 /* whether key j of sample s is attended to: not padding (EXT with FLAG_PAD: its token is 0 or more) */
@@ -117,8 +132,14 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
         float m = NEG, l = 0.0f, acc[CPT];
 #pragma unroll
         for (uint32_t k = 0; k < CPT; k++) acc[k] = 0.0f;
+#if EXT
+        uint32_t first = 0, keys = causal ? umin(p.cells, i0 + BQ) : p.cells;
+        if (p.window) window_tiles(p, i0, true, causal, &first, &keys);
+        for (uint32_t j0 = first; j0 < keys; j0 += BQ) {
+#else
         const uint32_t keys = causal ? umin(p.cells, i0 + BQ) : p.cells;
         for (uint32_t j0 = 0; j0 < keys; j0 += BQ) {
+#endif
             barrier();
             for (uint32_t e = tid; e < BQ * d; e += THREADS) {
                 const uint32_t jj = e / d, c = e % d, j = j0 + jj, at = (s * p.cells + j) * C;
@@ -135,7 +156,12 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
                     dot = fma_(sh.a[r * DMAX + c], sh.k[jj * DMAX + c], dot);
                     if (OP == DQ) dot2 = fma_(sh.b[r * DMAX + c], sh.v[jj * DMAX + c], dot2);
                 }
-                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i) && live(p, s, j);
+#if EXT
+                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i) && in_window(p, i, j, causal) &&
+                                   live(p, s, j);
+#else
+                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
+#endif
                 sc[k] = valid ? dot : NEG;
                 dp[k] = dot2;
                 top = max_(top, sc[k]);
@@ -174,16 +200,24 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
             }
         }
         if (OP == FORWARD) {
-            /* (EXT: a query without a key left gives zeros, its log sum 0, never read) */
-            const bool none = EXT && l == 0.0f;
+#if EXT
+            /* (a query without a key left gives zeros, its log sum 0, never read) */
+            const bool none = l == 0.0f;
             const float inv = none ? 0.0f : 1.0f / l;
+#else
+            const float inv = 1.0f / l;
+#endif
             if (i < p.cells) {
 #pragma unroll
                 for (uint32_t k = 0; k < CPT; k++) {
                     const uint32_t c = q + TPR * k;
                     if (c < d) st(p.y, (s * p.cells + i) * out_c + h * d + c, 1u, HALF, acc[k] * inv);
                 }
+#if EXT
                 if ((p.flags & FLAG_STATS) && q == 0u) F(p.stats)[stat] = none ? 0.0f : m + log_(l);
+#else
+                if ((p.flags & FLAG_STATS) && q == 0u) F(p.stats)[stat] = m + log_(l);
+#endif
             }
             return;
         }
@@ -212,8 +246,15 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
     float dk[CPT], dv[CPT];
 #pragma unroll
     for (uint32_t k = 0; k < CPT; k++) dk[k] = dv[k] = 0.0f;
+#if EXT
+    uint32_t qfirst = causal ? j0 : 0u, qend = p.cells;     /* the queries of the tile's keys */
+    if (p.window) window_tiles(p, j0, false, causal, &qfirst, &qend);
+    for (uint32_t h = g * group; h < (g + 1u) * group; h++)
+        for (uint32_t i0 = qfirst; i0 < qend; i0 += BQ) {
+#else
     for (uint32_t h = g * group; h < (g + 1u) * group; h++)
         for (uint32_t i0 = causal ? j0 : 0u; i0 < p.cells; i0 += BQ) {
+#endif
             barrier();
             for (uint32_t e = tid; e < BQ * d; e += THREADS) {
                 const uint32_t rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * C + h * d;
@@ -235,7 +276,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
                     dot2 = fma_(sh.b[rr * DMAX + c], sh.v[r * DMAX + c], dot2);
                 }
 #if EXT
-                const bool valid = ii < p.cells && key && (!causal || j <= ii);
+                const bool valid = ii < p.cells && key && (!causal || j <= ii) && in_window(p, ii, j, causal);
 #else
                 const bool valid = ii < p.cells && j < p.cells && (!causal || j <= ii);
 #endif
