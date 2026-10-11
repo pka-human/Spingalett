@@ -277,6 +277,7 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
         case SPG_KERNEL_bn: case SPG_KERNEL_bn_h: case SPG_KERNEL_output: return 64u;
         case SPG_KERNEL_gemm: case SPG_KERNEL_gemm_mma: return count > 9 ? spec[9] : 0u;
         case SPG_KERNEL_attn: case SPG_KERNEL_attn_h: return count > 3 ? spec[3] : 0u;
+        case SPG_KERNEL_attn_cache: case SPG_KERNEL_attn_cache_h: return count > 1 ? spec[1] : 0u;
         default: return 256u;
     }
 }

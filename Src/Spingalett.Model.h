@@ -60,6 +60,13 @@ typedef struct {
     SpgSignal *lock;
     PreparedLayer *layers;
     _Atomic(PredictWorkspace *) spare;
+#if !defined(SPINGALETT_RUNTIME)
+    /* the full library on a GPU: the model as a network there (models of float weights), made under the lock by
+       the first call that needs it (gpu_state 1; -1: the GPU cannot run it), its calls one at a time (gpu_lock) */
+    struct SpingalettNetwork *gpu_net;
+    SpgSignal *gpu_lock;
+    _Atomic int gpu_state;
+#endif
 } ModelOwner;
 
 /* The model's prepared weights: those of an owned model (prepared under its lock), or new ones that

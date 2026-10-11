@@ -127,7 +127,7 @@ final class Session
         $sampling = $sampling ?? new Sampling();
         $ffi = Library::ffi();
         $kept = [];
-        $pointers = $ffi->new("const uint32_t *[$sequences]");
+        $pointers = $ffi->new("uint32_t *[$sequences]");
         $counts = [];
         foreach (array_values($prompts) as $b => $prompt) {
             if ($prompt === []) {

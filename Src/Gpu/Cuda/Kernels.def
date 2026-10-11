@@ -29,6 +29,7 @@ SPG_CUDA_UNIT(dconv27, dconv, "-DKMAX=27 -DEXACT=1")
 SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
 SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
 SPG_CUDA_UNIT(embed, embed, "")
+SPG_CUDA_UNIT(attn_cache, attn_cache, "")   /* attention over a cache of keys and values (decoding) */
 SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")     /* attention in single precision: heads of up to 256, */
 SPG_CUDA_UNIT(rattn_d32_o0, rattn, "-DD=32u -DOPC=0u")   /* of up to 32, 64, 128 a unit per pass */
 SPG_CUDA_UNIT(rattn_d32_o1, rattn, "-DD=32u -DOPC=1u")

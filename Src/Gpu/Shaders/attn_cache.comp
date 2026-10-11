@@ -1,0 +1,142 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Attention a few rows at a time over the keys and values of the tokens before them, kept per sequence
+ * (decoding with a key-value cache: sessions, spingalett_generate()). A row is one token of a sequence, at a
+ * position (rows: its sequence and position, a pair of uints); x holds each row's queries, keys and values as
+ * an attention layer's input does (heads + 2 kv heads of d values), y its outputs (heads of d values), the
+ * cache the keys then the values of every sequence's positions ([sequences][length][kv][d] each).
+ *
+ *   APPEND  each row's keys (rotated at its position with ROPE) and values into the cache at its sequence and
+ *           position, an invocation a pair of values (c and c + d / 2: the rotation's pairs)
+ *   ATTEND  a workgroup a row and head: the queries (rotated, scaled) in shared memory; in tiles of TILE
+ *           positions up to the row's own, each invocation a position's score, the tile's maximum and sum over
+ *           shared memory in a fixed tree, then each invocation the values of its channels, the positions in
+ *           their order (the softmax online from tile to tile)
+ *
+ * Every sum runs in a fixed order: the same bits on every run.
+ */
+
+#version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint THREADS = 64;
+layout(constant_id = 2) const uint HALF = 0;        /* words: x 0, y 1, cache 2 (half.glsl) */
+layout(local_size_x_id = 1) in;
+
+#define APPEND 0u
+#define ATTEND 1u
+#define FLAG_ROPE 2u
+#define DMAX 256u
+#define TILE 256u
+
+layout(push_constant) uniform Push {
+    F32 x, y, cache;
+    U32 rows;
+    F32 table;
+    uint n, heads, kv, d, span, sequences, flags, cells;
+    float scale;
+    uint pad;
+} p;
+
+#include "half.glsl"
+
+shared float sq[DMAX], ss[TILE], sr[THREADS];
+
+/* the maximum (with sum: the sum) of THREADS values of sr, in a fixed tree; every invocation calls it */
+float reduce(float v, bool sum) {
+    const uint tid = gl_LocalInvocationID.x;
+    sr[tid] = v;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sr[tid] = sum ? sr[tid] + sr[tid + s] : max(sr[tid], sr[tid + s]);
+        barrier();
+    }
+    const float r = sr[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint d = p.d, C = (p.heads + 2u * p.kv) * d, half_d = d / 2u, tid = gl_LocalInvocationID.x;
+    const uint values = p.sequences * p.span * p.kv * d;
+    const bool rope = (p.flags & FLAG_ROPE) != 0u;
+    if (OP == APPEND) {
+        const uint pairs = p.kv * half_d, total = p.n * pairs;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += gl_NumWorkGroups.x * THREADS) {
+            const uint r = i / pairs, kh = i % pairs / half_d, c = i % half_d;
+            const uint seq = p.rows.v[2u * r], pos = p.rows.v[2u * r + 1u];
+            const uint src = r * C + (p.heads + kh) * d;
+            float k0 = ld(p.x, src + c, 0u), k1 = ld(p.x, src + c + half_d, 0u);
+            if (rope) {
+                const float cs = p.table.v[pos * half_d + c], sn = p.table.v[p.cells * half_d + pos * half_d + c];
+                const float a = k0, b = k1;
+                k0 = a * cs - b * sn;
+                k1 = b * cs + a * sn;
+            }
+            const uint at = ((seq * p.span + pos) * p.kv + kh) * d;
+            st(p.cache, at + c, 2u, k0);
+            st(p.cache, at + c + half_d, 2u, k1);
+            st(p.cache, values + at + c, 2u, ld(p.x, src + p.kv * d + c, 0u));
+            st(p.cache, values + at + c + half_d, 2u, ld(p.x, src + p.kv * d + c + half_d, 0u));
+        }
+        return;
+    }
+    const uint r = gl_WorkGroupID.x, h = gl_WorkGroupID.y;
+    const uint seq = p.rows.v[2u * r], pos = p.rows.v[2u * r + 1u], kh = h / (p.heads / p.kv);
+    for (uint c = tid; c < d; c += THREADS) {
+        float v = ld(p.x, r * C + h * d + c, 0u);
+        if (rope) {
+            const uint pc = c < half_d ? c + half_d : c - half_d, ci = c < half_d ? c : c - half_d;
+            const float w = ld(p.x, r * C + h * d + pc, 0u);
+            const float cs = p.table.v[pos * half_d + ci], sn = p.table.v[p.cells * half_d + pos * half_d + ci];
+            v = c < half_d ? v * cs - w * sn : v * cs + w * sn;
+        }
+        sq[c] = v;
+    }
+    barrier();
+    float m = -3.402823466e38, l = 0.0;
+    float o[DMAX / 64u];                    /* channels tid, tid + THREADS, ... (THREADS >= 64) */
+    for (uint j = 0u; j < DMAX / 64u; j++) o[j] = 0.0;
+    for (uint t0 = 0u; t0 <= pos; t0 += TILE) {
+        const uint count = min(TILE, pos + 1u - t0);
+        float best = -3.402823466e38;
+        for (uint t = tid; t < count; t += THREADS) {
+            const uint at = ((seq * p.span + t0 + t) * p.kv + kh) * d;
+            float s = 0.0;
+            for (uint c = 0u; c < d; c++) s += sq[c] * ld(p.cache, at + c, 2u);
+            s *= p.scale;
+            ss[t] = s;
+            best = max(best, s);
+        }
+        const float nm = max(m, reduce(best, false)), a = exp(m - nm);
+        float part = 0.0;
+        for (uint t = tid; t < count; t += THREADS) {
+            const float e = exp(ss[t] - nm);
+            ss[t] = e;
+            part += e;
+        }
+        l = l * a + reduce(part, true);     /* (its barriers make ss visible) */
+        for (uint j = 0u; j < DMAX / 64u; j++) {
+            const uint c = tid + j * THREADS;
+            if (c >= d) break;
+            float acc = o[j] * a;
+            for (uint t = 0u; t < count; t++) acc += ss[t] * ld(p.cache, values + ((seq * p.span + t0 + t) * p.kv + kh) * d + c, 2u);
+            o[j] = acc;
+        }
+        m = nm;
+        barrier();
+    }
+    for (uint j = 0u; j < DMAX / 64u; j++) {
+        const uint c = tid + j * THREADS;
+        if (c >= d) break;
+        st(p.y, r * p.heads * d + h * d + c, 1u, o[j] / l);
+    }
+}

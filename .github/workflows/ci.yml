@@ -163,13 +163,13 @@ jobs:
       # offsets, so that the layout is checked too)
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: "7.4"
+          php-version: "8.0"
           extensions: ffi
           ini-values: ffi.enable=true
           coverage: none
           tools: none
 
-      - name: PHP 7.4
+      - name: PHP 8.0
         working-directory: Bindings/PHP
         run: php tests/run.php
 

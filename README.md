@@ -1652,7 +1652,7 @@ them against the installed library):
 | C# (.NET 8+) | [`Bindings/CSharp`](Bindings/CSharp/README.md) | package `Spingalett` (`LibraryImport`) | dotnet |
 | Go | [`Bindings/Go`](Bindings/Go/README.md) | module `github.com/pka-human/Spingalett/Bindings/Go` (cgo) | go; pkg-config |
 | Java (22+) | [`Bindings/Java`](Bindings/Java/README.md) | `io.github.pkahuman.spingalett` (the foreign function and memory API) | Maven |
-| PHP (7.4+) | [`Bindings/PHP`](Bindings/PHP/README.md) | package `pka-human/spingalett` (the FFI extension; `spingalett.h`, the C declarations) | Composer; `SPINGALETT_LIB_DIR` |
+| PHP (8.0+) | [`Bindings/PHP`](Bindings/PHP/README.md) | package `pka-human/spingalett` (the FFI extension; `spingalett.h`, the C declarations) | Composer; `SPINGALETT_LIB_DIR` |
 
 ```rust
 let mut lm = Network::new(Loss::SparseCrossEntropy)?;

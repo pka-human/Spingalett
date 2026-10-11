@@ -1,7 +1,7 @@
 # Spingalett for PHP
 
 Bindings of [Spingalett](https://github.com/pka-human/Spingalett), a neural-network library in C, through
-PHP's FFI extension (PHP 7.4 and later; nothing to compile): dense, convolutional and transformer layers as
+PHP's FFI extension (PHP 8.0 and later; nothing to compile): dense, convolutional and transformer layers as
 chains or graphs, trained on the CPU or the GPU (CUDA, Vulkan), deployment models from FP32 down to INT2,
 and text generation. `spingalett.h` holds the library's C declarations as FFI parses them (no macros: the
 `*_args` functions take the structures).
@@ -46,8 +46,7 @@ $lm->trainTokens('train.bin', 64, new TrainOptions(epochs: 5));
 $tokens = $lm->generate([72, 101], 100, new Sampling(temperature: 0.8, topK: 40));
 ```
 
-Options go by name from PHP 8; PHP 7.4 gives them in order (`new TrainOptions(1500, 4, 0.05)`) or sets the
-properties. Samples are arrays of numbers, flat or one array a sample, copied into the library's floats once
+Options go by name or in order (`new TrainOptions(1500, 4, 0.05)`), or as properties set afterwards. Samples are arrays of numbers, flat or one array a sample, copied into the library's floats once
 a call; outputs come back flat. `Network::save()`, `Network::load()`, `Model::load()` and
 `Network::toModel(Precision::INT8)` handle files and deployment models, and `Model::session()` a causal
 language model's session, fed a token at a time with the keys and values of earlier tokens kept

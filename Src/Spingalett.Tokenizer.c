@@ -1389,6 +1389,7 @@ static void strs_clear(Strs *s) { s->text.len = 0; s->count = 0; }
 
 static void strs_end(Strs *s, size_t start) {
     if (s->failed) return;
+    if (!bytes_reserve(&s->text, 0)) { s->failed = true; return; }     /* (a string of no bytes: still a buffer) */
     if (s->count == s->cap) {
         size_t cap = s->cap ? 2 * s->cap : 64;
         size_t *o = (size_t *)realloc(s->off, cap * sizeof(size_t));

@@ -77,7 +77,7 @@ All notable changes to this project are documented in this file. The format foll
   `spingalett_lr_warmup_linear()` (a warm-up, then a straight line down to `min_lr`, as BERT and
   GPT-2 were trained). Python: `TrainConfig.accumulation_steps`, `lr_per_step`, `LinearDecay`,
   `WarmupLinear`; the other bindings' options take `accumulation_steps`.
-- **Bindings for PHP** 7.4 and later (`Bindings/PHP`: the Composer package `pka-human/spingalett`,
+- **Bindings for PHP** 8.0 and later (`Bindings/PHP`: the Composer package `pka-human/spingalett`,
   PHP's FFI extension): `spingalett.h`, the library's C declarations as FFI parses them (the `*_args`
   functions, no macros), loaded with the library that `SPINGALETT_LIBRARY`, `SPINGALETT_LIB_DIR` or
   the system's loader gives, or once for all requests (`Library::preload()` under `opcache.preload`,
@@ -86,8 +86,9 @@ All notable changes to this project are documented in this file. The format foll
   parameters, files and deployment models, PHP arrays copied into the library's floats once a call.
   Their tests (`tests/run.php`, no PHPUnit needed) train XOR and a small LLaMA-like model whose
   generation they check, compare every declaration of `spingalett.h` with the C headers and every
-  structure's layout with the C compiler's (`SpingalettLayout`); CI runs them on PHP 7.4 and 8.3
-  against the installed library.
+  structure's layout with the C compiler's (`SpingalettLayout`); CI runs them on PHP 8.0 and 8.3
+  against the installed library. (PHP 7.4's FFI passes no structure holding arrays or enumerations by
+  value, which every `*_args` function takes.)
 - **The inference engine in WebAssembly, and a JavaScript package around it** (`Bindings/JavaScript`,
   the npm package `spingalett`): `Src/Spingalett.Inference.c` built by Clang for wasm32 and `wasm-ld`
   without a C library (`build.sh`), its portable kernels vectorized with SIMD128, the mathematical

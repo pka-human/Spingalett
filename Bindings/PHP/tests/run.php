@@ -15,6 +15,14 @@ declare(strict_types=1);
 
 require __DIR__ . '/../autoload.php';
 
+// A fatal error (a class PHP cannot compile, a declaration FFI rejects) is reported as a failure too.
+register_shutdown_function(function (): void {
+    $e = error_get_last();
+    if ($e !== null && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        report($e['message'] . ' at ' . basename($e['file']) . ':' . $e['line']);
+    }
+});
+
 use Spingalett\Activation;
 use Spingalett\ComputeMode;
 use Spingalett\Init;
@@ -33,12 +41,21 @@ use Spingalett\TrainOptions;
 
 $failures = 0;
 
+/** A failure printed; on GitHub Actions also an annotation, which the run's page shows without the log. */
+function report(string $what): void
+{
+    echo "  FAIL: $what\n";
+    if (getenv('GITHUB_ACTIONS') === 'true') {
+        echo '::error title=PHP ' . PHP_VERSION . '::' . str_replace(['%', "\r", "\n"], ['%25', '%0D', '%0A'], $what) . "\n";
+    }
+}
+
 function check(bool $ok, string $what): void
 {
     global $failures;
     if (!$ok) {
         $failures++;
-        echo "  FAIL: $what\n";
+        report($what);
     }
 }
 

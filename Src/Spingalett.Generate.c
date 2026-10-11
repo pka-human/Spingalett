@@ -12,13 +12,13 @@
  * top_p (spingalett_next_token()). Draws come from a splitmix64 generator seeded once, in an order fixed
  * by the logits: the same tokens for the same logits.
  *
- * On the CPU a causal model runs as its deployment model of single precision, which the network keeps
- * until its parameters change, with a session (spingalett_session_feed()): the prompt fed at once, then
- * each token fed once, attending over the keys and values kept of the tokens before it. Once the tokens
- * fill the window, every step feeds the window of the last context tokens again from its first position
- * on, as the prediction over the window does. The logits are those of the deployment model, which equal
- * the network's prediction to rounding. Other networks, and the GPU, predict on the whole window for
- * every token.
+ * A causal model runs as its deployment model of single precision, which the network keeps until its
+ * parameters change, with a session (spingalett_session_feed(); on the GPU in its compute modes): the prompt
+ * fed at once, then each token fed once, attending over the keys and values kept of the tokens before it.
+ * Once the tokens fill the window, every step feeds the window of the last context tokens again from its
+ * first position on, as the prediction over the window does. The logits are those of the deployment model,
+ * which equal the network's prediction to rounding. Other networks predict on the whole window for every
+ * token.
  */
 
 #include "Spingalett.Private.h"
@@ -26,14 +26,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The network as a deployment model, and the parameters it was made from (the network's host_version). */
+/* The network as a deployment model, and the parameters it was made from (the network's host_version); the
+   session of the last call, kept when it ran on a GPU (whose making takes the model to the device) for the next
+   call of the same compute mode, precision and window. */
 struct SpingalettGenerateModel {
     SpingalettModel *model;
     uint64_t version;
+    SpingalettSession *session;
+    ComputeMode mode;
+    PrecisionMode precision;
+    uint32_t window;
 };
 
 static void model_free(struct SpingalettGenerateModel *g) {
     if (!g) return;
+    spingalett_session_free(g->session);
     spingalett_model_free(g->model);
     free(g);
 }
@@ -63,7 +70,7 @@ static bool generate_cached(NeuralNetwork *net, SpingalettGenerateArgs *a, uint3
         g = NULL;
     }
     if (!g) {
-        g = (struct SpingalettGenerateModel *)malloc(sizeof *g);
+        g = (struct SpingalettGenerateModel *)calloc(1, sizeof *g);
         SpingalettModel *model = g ? spingalett_model_from_network(net, PRECISION_FLOAT32) : NULL;
         if (!model) {
             free(g);
@@ -72,9 +79,20 @@ static bool generate_cached(NeuralNetwork *net, SpingalettGenerateArgs *a, uint3
         g->model = model;
         g->version = version;
     }
-    /* (a model no session runs leaves the error as it was) */
-    SpingalettSessionOptions options = {.max_length = T};
-    SpingalettSession *session = spingalett_session_runs(g->model) ? spingalett_session_new(g->model, &options) : NULL;
+    /* the kept session where it fits this call, else a new one (a model no session runs leaves the error as it
+       was) */
+    const ComputeMode mode = resolve_compute_mode();
+    const PrecisionMode precision = spingalett_get_gpu_precision();
+    SpingalettSession *session = g->session;
+    g->session = NULL;
+    if (session && (g->mode != mode || g->precision != precision || g->window != T)) {
+        spingalett_session_free(session);
+        session = NULL;
+    }
+    if (!session) {
+        SpingalettSessionOptions options = {.max_length = T};
+        session = spingalett_session_runs(g->model) ? spingalett_session_new(g->model, &options) : NULL;
+    }
     if (!session) {
         model_free(atomic_exchange(&net->generate_model, g));
         return false;
@@ -100,7 +118,15 @@ static bool generate_cached(NeuralNetwork *net, SpingalettGenerateArgs *a, uint3
         if (is_stop(a, token)) break;
     }
     free(logits);
-    spingalett_session_free(session);
+    /* (kept on a GPU, whose session costs its model's way to the device; on the CPU made again) */
+    if (spingalett_use_gpu() && *ok && spingalett_session_rewind(session, 0, 0)) {
+        g->session = session;
+        g->mode = mode;
+        g->precision = precision;
+        g->window = T;
+    } else {
+        spingalett_session_free(session);
+    }
     model_free(atomic_exchange(&net->generate_model, g));
     return true;
 }
@@ -130,8 +156,8 @@ uint32_t spingalett_generate_args(SpingalettGenerateArgs args) {
     uint64_t state = args.seed ? args.seed : rng_next64();
     uint32_t made = 0;
     bool ok = true;
-    /* on the CPU through a session; on the GPU, or when no session runs the network, over the window */
-    if (spingalett_use_gpu() || !generate_cached(net, &args, T, V, seq, c, &state, &ok, &made)) {
+    /* through a session (on the GPU in its compute modes); when no session runs the network, over the window */
+    if (!generate_cached(net, &args, T, V, seq, c, &state, &ok, &made)) {
         float *window = (float *)malloc((size_t)T * sizeof(float)), *logits = (float *)malloc((size_t)out * sizeof(float));
         ok = window && logits;
         if (!ok) set_error(SPINGALETT_ERR_ALLOC, "spingalett_generate: out of memory");
