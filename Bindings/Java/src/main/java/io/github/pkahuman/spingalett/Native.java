@@ -85,7 +85,7 @@ final class Native {
             a("device_val_inputs"), a("device_val_targets"), i("val_count"), i("monitor"), l("early_stopping_patience"),
             f("early_stopping_min_delta"), b("restore_best_weights"), i("blas_num_threads"), i("augment_shift"),
             b("augment_flip"), f("label_smoothing"), f("lr_plateau_factor"), l("lr_plateau_patience"),
-            f("lr_plateau_min_lr"), i("accumulation_steps"), b("lr_per_step"), reserved(RESERVED - 1));
+            f("lr_plateau_min_lr"), i("accumulation_steps"), b("lr_per_step"), b("recompute"), reserved(RESERVED - 1));
     static final StructLayout TRAIN_REPORT = struct(i("status"), l("epochs_run"), f("train_loss"), b("has_validation"),
             EVAL_METRICS.withName("validation"), i("monitor"), l("best_epoch"), f("best_value"), b("restored_best"),
             reserved(RESERVED));

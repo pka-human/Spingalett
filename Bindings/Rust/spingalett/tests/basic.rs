@@ -236,7 +236,7 @@ fn layout_matches_c() {
         augment_shift = "augment_shift", augment_flip = "augment_flip", label_smoothing = "label_smoothing",
         lr_plateau_factor = "lr_plateau_factor", lr_plateau_patience = "lr_plateau_patience",
         lr_plateau_min_lr = "lr_plateau_min_lr", accumulation_steps = "accumulation_steps",
-        lr_per_step = "lr_per_step", reserved = "reserved",
+        lr_per_step = "lr_per_step", recompute = "recompute", reserved = "reserved",
     ]);
     fields!("TrainReport", sys::TrainReport, [
         status = "status", epochs_run = "epochs_run", train_loss = "train_loss", has_validation = "has_validation",

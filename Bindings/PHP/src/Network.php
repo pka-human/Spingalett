@@ -326,6 +326,7 @@ final class Network
         $args->max_grad_norm = $o->maxGradNorm;
         $args->label_smoothing = $o->labelSmoothing;
         $args->accumulation_steps = $o->accumulationSteps;
+        $args->recompute = $o->recompute;
         return $args;
     }
 

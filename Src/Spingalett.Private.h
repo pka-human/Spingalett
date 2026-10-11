@@ -143,6 +143,14 @@ typedef struct BatchWorkspace {
        second input), which its backward pass for the queries writes and the second input's takes */
     float **dkv;
     float *dkv_flat;
+    /* activation recomputation (training with recompute): kept[l] whether layer l's outputs live through the
+       backward pass, segment[l] the kept layers below l (a segment: the layers between two kept ones, and the
+       later); the others' outputs, gradients, values before their activation and dropout masks share memory
+       with the other segments' and are computed again before their segment's backward pass. NULL: every layer
+       kept */
+    uint8_t *kept;
+    uint32_t *segment;
+    size_t flat_floats;     /* the floats of flat (the layers' outputs and gradients) */
     bool training;          /* normalize with batch statistics */
     float smoothing;        /* LOSS_SPARSE_CROSS_ENTROPY: label smoothing of the loss's targets */
     uint32_t capacity;
@@ -150,14 +158,21 @@ typedef struct BatchWorkspace {
 
 BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint32_t capacity,
                                                   bool training, bool gather, ComputeMode mode);
+/* A training workspace that recomputes activations (BatchWorkspace.kept). */
+BatchWorkspace *spingalett_batch_workspace_recompute(const NeuralNetwork *net, uint32_t capacity, bool gather,
+                                                     ComputeMode mode);
 void spingalett_batch_workspace_free(BatchWorkspace *ws);
-/* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
-   layers; samples are numbered position_offset + s for the dropout hash. */
 /* Samples per chunk for `count` samples: at most count, SPINGALETT_BATCH_CHUNK and what fits
    SPINGALETT_BATCH_FLOATS activations, at least 1. */
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
+/* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
+   layers; samples are numbered position_offset + s for the dropout hash. */
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
+/* The forward pass of the layers of segment s that are not kept (recomputation), as the full pass computes
+   them. */
+void spingalett_batch_forward_segment(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout,
+                                      uint32_t position_offset, ComputeMode mode, uint32_t s);
 /* Inference: whether layer l (dense or convolution, no activation) feeds only the batch
    normalization l + 1, which then runs in its product's epilogue and l's output is never stored. */
 bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint32_t l);

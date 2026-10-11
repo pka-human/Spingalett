@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Activation recomputation** (`SpingalettTrainArgs.recompute`, checkpointing) on the CPU: the training
+  workspace keeps the outputs of the layers several layers read (a transformer's residual stream, one a
+  block), of batch normalizations and of the output layer; the others' outputs, gradients, values before
+  their activation and dropout masks share memory between the segments between kept layers, and the backward
+  pass computes a segment's outputs again before it (the last segment's still there), propagates its
+  gradients and takes its layers' parameter gradients while they are there (layers tied to an embedding
+  after every segment, in the table's order). The weights are those of training without it, bit for bit
+  (transformer group: GPT-2-like with dropout, LLaMA-like, a tied head, an encoder-decoder, a Mistral-like
+  model and a convolutional graph with batch normalization, on one thread and many, updated in the backward
+  pass, clipped and accumulated). A GPT-like network of six blocks of 256 channels over 256 tokens trains in
+  chunks of 16 samples with a peak of 141 MB instead of 216 MB, in 18.2 s instead of 14.2 s on one thread
+  and 7.8 s instead of 5.6 s on eight (i7-12650H, medians of interleaved runs). The GPU keeps every layer.
+  Python `train(..., recompute=True)` and the other bindings' options.
 - **Cross-attention and encoder-decoders**: an attention layer of two inputs (`.inputs = {q, kv}`) takes the
   queries of layer `q` over the keys and values of the cells of layer `kv` (`2 kv_heads x head size`
   channels), with grouped queries and ignoring the padding of `kv`'s tokens, on the CPU, both GPU backends

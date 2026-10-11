@@ -388,14 +388,13 @@ static bool input_gradient(NeuralNetwork *net, BatchWorkspace *ws, uint32_t c, u
     }
 }
 
-/* Propagates the output deltas back through the hidden layers, from the last layer down: a layer's
-   delta is complete once every later layer that reads it has run. A layer that feeds several gets
+/* Propagates the output deltas back through the hidden layers hi down to lo (all of them: from the last layer
+   down): a layer's delta is complete once every later layer that reads it has run. A layer that feeds several gets
    their gradients in that fixed order (the first written, the others added), so the sums do not
    depend on the thread count, and the derivative of its activation after the last. */
-static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode) {
-    const uint32_t last = net->layers - 1;
-    memcpy(ws->pending, ws->uses, net->layers * sizeof(uint32_t));
-    for (uint32_t c = last; c > 0; c--) {
+static void backprop_layers(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode, uint32_t hi,
+                            uint32_t lo) {
+    for (uint32_t c = hi; c >= lo && c > 0; c--) {
         const uint32_t count = spingalett_input_count(net, c), *in = spingalett_inputs(net, c);
         const LayerType type = net->shapes[c].type;
         if (type == LAYER_BATCH_NORM)       /* also the parameters' gradients, whatever the input */
@@ -437,74 +436,107 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
     }
 }
 
-/* grad = scale * (sum over the chunk) + beta * grad, so chunks of one step accumulate. With an
-   optimizer step `o`, each layer is updated as soon as its gradient is complete, while the
+static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, ComputeMode mode) {
+    memcpy(ws->pending, ws->uses, net->layers * sizeof(uint32_t));
+    backprop_layers(net, ws, N, mode, net->layers - 1, 1);
+}
+
+/* Weight layer l's gradients: grad = scale * (sum over the chunk) + beta * grad, so chunks of one step accumulate.
+   With an optimizer step `o`, each layer is updated as soon as its gradient is complete, while the
    gradient is still in cache (the gradient must then be the whole step's, unclipped). A layer tied to an
    embedding adds its weight gradient to the table's, which the embedding (an earlier layer) has written,
    and the table is updated after it. */
+static void accumulate_layer(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, float scale, float beta,
+                             ComputeMode mode, const OptimizerStep *o, uint32_t l) {
+    const uint32_t src = spingalett_source(net, l + 1);
+    uint32_t in_sz  = net->topology[src];
+    uint32_t out_sz = net->topology[l + 1];
+    LayerType type = net->shapes[l + 1].type;
+    const uint32_t tied = net->shapes[l + 1].tied;
+
+    if (type == LAYER_DENSE) {
+        /* gW[out x in] = delta^T[out x N] * act[N x in] */
+        spingalett_gemm(ws->gemm, mode, true, false, out_sz, in_sz, N, scale,
+                        ws->delta[l + 1], out_sz, ws->act[src], in_sz,
+                        tied ? 1.0f : beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
+
+        float *gB = net->grad_biases + net->bias_offsets[l];
+        if (beta == 0.0f)
+            memset(gB, 0, out_sz * sizeof(float));
+        for (uint32_t s = 0; s < N; s++)
+            spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
+    } else if (type == LAYER_CONV2D) {
+        /* tied: the weight gradient added to the table's, the biases' started at zero */
+        if (tied && beta == 0.0f)
+            memset(net->grad_biases + net->bias_offsets[l], 0, spingalett_bias_count(net, l) * sizeof(float));
+        spingalett_conv_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, tied ? 1.0f : beta,
+                                         ws->conv, ws->gemm, mode);
+    } else if (type == LAYER_CONV_TRANSPOSE2D) {
+        spingalett_conv_transpose_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
+                                                   ws->gemm, mode);
+    } else if (type == LAYER_LAYER_NORM) {
+        spingalett_ln_backward_params(net, l, ws->act[src], ws->delta[l + 1], N, ws->bn_stats[l + 1], scale, beta,
+                                      ws->ln_scratch, mode);
+    } else if (type == LAYER_RMS_NORM) {
+        spingalett_rms_backward_params(net, l, ws->act[src], ws->delta[l + 1], N, ws->bn_stats[l + 1], scale, beta,
+                                       ws->ln_scratch, mode);
+    } else if (type == LAYER_EMBEDDING) {
+        spingalett_embedding_backward(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, mode);
+    } else if (type == LAYER_BATCH_NORM) {
+        /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass) */
+        const double *sums = ws->bn_sums[l + 1];
+        const uint32_t C = net->shapes[l + 1].channels;
+        float *gW = net->grad_weights + net->weight_offsets[l], *gB = net->grad_biases + net->bias_offsets[l];
+        for (uint32_t c = 0; c < C; c++) {
+            float dg = (float)sums[C + c] * scale, db = (float)sums[c] * scale;
+            gW[c] = beta == 0.0f ? dg : dg + beta * gW[c];
+            gB[c] = beta == 0.0f ? db : db + beta * gB[c];
+        }
+    } else {
+        return;                 /* pooling, adding and concatenating layers have no parameters */
+    }
+
+    if (o) {
+        /* a tied table's step after the tied layer's gradient, as the embedding's weights */
+        const uint32_t owner = tied ? tied - 1u : l;
+        uint64_t w = net->weight_offsets[l], b = net->bias_offsets[l];
+        if (tied || type != LAYER_EMBEDDING || !spingalett_table_tied(net, l + 1))
+            optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
+                                   net->grad_weights + w, spingalett_weight_count(net, owner),
+                                   layer_decay(net, owner, o->decay), mode);
+        optimizer_update_array(o, net->biases + b, net->opt_m_biases + b, net->opt_v_biases + b,
+                               net->grad_biases + b, spingalett_bias_count(net, l), 0.0f, mode);
+    }
+}
+
 static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                                        float scale, float beta, ComputeMode mode, const OptimizerStep *o) {
-    for (uint32_t l = 0; l + 1 < net->layers; l++) {
-        const uint32_t src = spingalett_source(net, l + 1);
-        uint32_t in_sz  = net->topology[src];
-        uint32_t out_sz = net->topology[l + 1];
-        LayerType type = net->shapes[l + 1].type;
-        const uint32_t tied = net->shapes[l + 1].tied;
+    for (uint32_t l = 0; l + 1 < net->layers; l++) accumulate_layer(net, ws, N, scale, beta, mode, o, l);
+}
 
-        if (type == LAYER_DENSE) {
-            /* gW[out x in] = delta^T[out x N] * act[N x in] */
-            spingalett_gemm(ws->gemm, mode, true, false, out_sz, in_sz, N, scale,
-                            ws->delta[l + 1], out_sz, ws->act[src], in_sz,
-                            tied ? 1.0f : beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
-
-            float *gB = net->grad_biases + net->bias_offsets[l];
-            if (beta == 0.0f)
-                memset(gB, 0, out_sz * sizeof(float));
-            for (uint32_t s = 0; s < N; s++)
-                spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
-        } else if (type == LAYER_CONV2D) {
-            /* tied: the weight gradient added to the table's, the biases' started at zero */
-            if (tied && beta == 0.0f)
-                memset(net->grad_biases + net->bias_offsets[l], 0, spingalett_bias_count(net, l) * sizeof(float));
-            spingalett_conv_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, tied ? 1.0f : beta,
-                                             ws->conv, ws->gemm, mode);
-        } else if (type == LAYER_CONV_TRANSPOSE2D) {
-            spingalett_conv_transpose_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
-                                                       ws->gemm, mode);
-        } else if (type == LAYER_LAYER_NORM) {
-            spingalett_ln_backward_params(net, l, ws->act[src], ws->delta[l + 1], N, ws->bn_stats[l + 1], scale, beta,
-                                          ws->ln_scratch, mode);
-        } else if (type == LAYER_RMS_NORM) {
-            spingalett_rms_backward_params(net, l, ws->act[src], ws->delta[l + 1], N, ws->bn_stats[l + 1], scale, beta,
-                                           ws->ln_scratch, mode);
-        } else if (type == LAYER_EMBEDDING) {
-            spingalett_embedding_backward(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, mode);
-        } else if (type == LAYER_BATCH_NORM) {
-            /* gamma: sum of dy * xhat, beta: sum of dy (left by the backward pass) */
-            const double *sums = ws->bn_sums[l + 1];
-            const uint32_t C = net->shapes[l + 1].channels;
-            float *gW = net->grad_weights + net->weight_offsets[l], *gB = net->grad_biases + net->bias_offsets[l];
-            for (uint32_t c = 0; c < C; c++) {
-                float dg = (float)sums[C + c] * scale, db = (float)sums[c] * scale;
-                gW[c] = beta == 0.0f ? dg : dg + beta * gW[c];
-                gB[c] = beta == 0.0f ? db : db + beta * gB[c];
-            }
-        } else {
-            continue;               /* pooling, adding and concatenating layers have no parameters */
-        }
-
-        if (o) {
-            /* a tied table's step after the tied layer's gradient, as the embedding's weights */
-            const uint32_t owner = tied ? tied - 1u : l;
-            uint64_t w = net->weight_offsets[l], b = net->bias_offsets[l];
-            if (tied || type != LAYER_EMBEDDING || !spingalett_table_tied(net, l + 1))
-                optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
-                                       net->grad_weights + w, spingalett_weight_count(net, owner),
-                                       layer_decay(net, owner, o->decay), mode);
-            optimizer_update_array(o, net->biases + b, net->opt_m_biases + b, net->opt_v_biases + b,
-                                   net->grad_biases + b, spingalett_bias_count(net, l), 0.0f, mode);
-        }
+/* The backward pass and the parameters' gradients (batch_backprop_hidden(), batch_accumulate_gradients()) of a
+   workspace that recomputes activations: a segment at a time from the last, its outputs computed again (the last
+   segment's are still there from the forward pass), its gradients propagated, its layers' parameter gradients (and
+   optimizer step o) taken while its outputs are there; the gradients of layers tied to an embedding (kept, as their
+   inputs are) after every segment's, so that the table's come in batch_accumulate_gradients()'s order. Every
+   gradient is computed as there, from the same values: the same bits. */
+static void batch_backward_recompute(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, float scale, float beta,
+                                     ComputeMode mode, const OptimizerStep *o, const DropoutContext *dropout,
+                                     uint32_t position_offset) {
+    const uint32_t last = net->layers - 1;
+    memcpy(ws->pending, ws->uses, net->layers * sizeof(uint32_t));
+    for (uint32_t hi = last; hi > 0;) {
+        const uint32_t s = ws->segment[hi];
+        uint32_t lo = hi;
+        while (lo > 1 && ws->segment[lo - 1] == s) lo--;
+        if (s != ws->segment[last]) spingalett_batch_forward_segment(net, ws, N, dropout, position_offset, mode, s);
+        backprop_layers(net, ws, N, mode, hi, lo);
+        for (uint32_t l = lo; l <= hi; l++)
+            if (!net->shapes[l].tied) accumulate_layer(net, ws, N, scale, beta, mode, o, l - 1);
+        hi = lo - 1;
     }
+    for (uint32_t l = 1; l <= last; l++)
+        if (net->shapes[l].tied) accumulate_layer(net, ws, N, scale, beta, mode, o, l - 1);
 }
 
 static float batch_compute_loss(const NeuralNetwork *net, const BatchWorkspace *ws,
@@ -724,7 +756,9 @@ static bool trainer_alloc(Trainer *t) {
         return true;
     if (t->use_batch_path) {
         uint32_t capacity = spingalett_batch_capacity(net, t->chunk_size);
-        t->ws = spingalett_batch_workspace_create(net, capacity, true, t->order != NULL || t->augment, t->mode);
+        const bool gather = t->order != NULL || t->augment;
+        t->ws = t->args->recompute ? spingalett_batch_workspace_recompute(net, capacity, gather, t->mode)
+                                   : spingalett_batch_workspace_create(net, capacity, true, gather, t->mode);
         if (t->ws && net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) t->ws->smoothing = t->args->label_smoothing;
         if (smooth)
             t->smoothed = (float *)spingalett_aligned_alloc((size_t)capacity * out_sz * sizeof(float));
@@ -939,12 +973,18 @@ static float trainer_step(Trainer *t, const float *inputs, const float *targets_
             spingalett_batch_forward(net, ws, n, dropout, c0, t->mode);
             loss += batch_compute_loss(net, ws, targets, n);
             batch_output_deltas(net, ws, targets, NULL, n);
-            batch_backprop_hidden(net, ws, n, t->mode);
             /* the last chunk of an unclipped step updates each layer right after its gradient */
             bool last = c0 + n == count, fused = last && args->max_grad_norm <= 0.0f;
-            if (fused) trainer_begin_step(t);
-            batch_accumulate_gradients(net, ws, n, 1.0f / (float)count, c0 == 0 ? 0.0f : 1.0f, t->mode,
-                                       fused ? &t->opt : NULL);
+            if (ws->kept) {
+                if (fused) trainer_begin_step(t);
+                batch_backward_recompute(net, ws, n, 1.0f / (float)count, c0 == 0 ? 0.0f : 1.0f, t->mode,
+                                         fused ? &t->opt : NULL, dropout, c0);
+            } else {
+                batch_backprop_hidden(net, ws, n, t->mode);
+                if (fused) trainer_begin_step(t);
+                batch_accumulate_gradients(net, ws, n, 1.0f / (float)count, c0 == 0 ? 0.0f : 1.0f, t->mode,
+                                           fused ? &t->opt : NULL);
+            }
             if (last && !fused) {
                 trainer_begin_step(t);
                 apply_gradients(net, &t->opt, args->max_grad_norm, t->mode);

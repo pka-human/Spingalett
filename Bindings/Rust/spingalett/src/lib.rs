@@ -394,6 +394,8 @@ pub struct TrainOptions {
     pub no_shuffle: bool,
     /// Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one).
     pub accumulation_steps: u32,
+    /// Activation recomputation on the CPU: less memory, a forward pass more, the same results.
+    pub recompute: bool,
 }
 
 impl Default for TrainOptions {
@@ -412,6 +414,7 @@ impl Default for TrainOptions {
             label_smoothing: 0.0,
             no_shuffle: false,
             accumulation_steps: 0,
+            recompute: false,
         }
     }
 }
@@ -573,6 +576,7 @@ impl Network {
             max_grad_norm: o.max_grad_norm,
             label_smoothing: o.label_smoothing,
             accumulation_steps: o.accumulation_steps,
+            recompute: o.recompute,
             ..Default::default()
         }
     }

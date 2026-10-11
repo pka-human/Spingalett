@@ -9,7 +9,7 @@ public final class TrainOptions {
     Strategy strategy = Strategy.SMALL_BATCH;
     Optimizer optimizer = Optimizer.ADAM;
     float learningRate = 1e-3f, weightDecay, momentum, beta1, beta2, maxGradNorm, labelSmoothing;
-    boolean noShuffle;
+    boolean noShuffle, recompute;
     int accumulationSteps;
 
     public TrainOptions epochs(int v) { epochs = v; return this; }
@@ -26,4 +26,6 @@ public final class TrainOptions {
     public TrainOptions noShuffle(boolean v) { noShuffle = v; return this; }
     /** Gradient accumulation: an optimizer step after every v mini-batches (0 or 1: every one). */
     public TrainOptions accumulationSteps(int v) { accumulationSteps = v; return this; }
+    /** Activation recomputation on the CPU: less memory, a forward pass more, the same results. */
+    public TrainOptions recompute(boolean v) { recompute = v; return this; }
 }

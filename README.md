@@ -838,6 +838,7 @@ below.
 | `max_grad_norm` | 0 (off) | Clip the global L2 norm of every step's gradient |
 | `lr_scheduler`, `lr_scheduler_data` | none | Learning-rate schedule, see below |
 | `lr_per_step` | false | Evaluate the schedule before every optimizer step instead of every epoch |
+| `recompute` | false | Activation recomputation on the CPU: less memory for about one more forward pass, the same results (see below) |
 | `reset_optimizer` | false | Clear moment estimates and the step counter before training |
 | `nan_check_interval` | 0 (off) | Stop when weights become NaN/Inf, checked every N epochs |
 | `report_interval` | 0 (off) | Log the training loss every N epochs |
@@ -865,6 +866,16 @@ statistics over each mini-batch. Dropout masks and augmentation are drawn by a s
 its step, as for the larger batch. With a generator, a step is `accumulation_steps` calls of it;
 full-batch training ignores the option, its step being the whole set. On the GPU the step's
 mini-batches are its chunks in the same way.
+
+Activation recomputation (checkpointing, `.recompute = true`) trades a forward pass for memory: the
+workspace keeps through the backward pass the outputs of the layers several layers read (a transformer's
+residual stream, one a block), of batch normalizations and of the output layer, and the other layers'
+outputs, gradients and values before their activations for one segment between two kept layers at a time
+(a block), computing a segment's outputs again just before its backward pass. The weights come out bit for
+bit as without it. A GPT-like network of six blocks of 256 channels over 256 tokens trains in chunks of 16
+samples with a peak of 141 MB instead of 216 MB (the parameters and AdamW's moments are 80 MB of either),
+taking 18.2 s instead of 14.2 s on one thread and 7.8 s instead of 5.6 s on eight (i7-12650H). It applies
+to mini-batch and full-batch training on the CPU; the GPU keeps every layer.
 
 Optimizer state (moment estimates and the step counter used for Adam's bias correction) is stored
 in the network, so training can be resumed by calling `spingalett_train()` again or after loading a

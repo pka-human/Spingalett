@@ -4690,6 +4690,87 @@ static void tf_cross(ComputeMode mode) {
            cpu ? ", the engine and deployment models alike" : "");
 }
 
+/* Activation recomputation trains to the bits of training without it: transformers (GPT-2-like with dropout,
+   LLaMA-like, a tied head, an encoder-decoder, a Mistral-like model), a graph of convolutions with batch
+   normalization, on one thread and many, mini-batches updated as their gradients come (the optimizer in the
+   backward pass), clipped, and accumulated over chunks. */
+static void tf_recompute(void) {
+    const uint32_t T = 9, V = 11, N = 48;
+    int nets = 0;
+    for (int which = 0; which < 7; which++) {
+        if (which == 2 || which == 3) continue;
+        for (int mode = 0; mode < 2; mode++)
+            for (int variant = 0; variant < 3; variant++) {
+                float *w[2] = {NULL, NULL};
+                uint64_t count = 0;
+                for (int run = 0; run < 2; run++) {
+                    lcg_state = 9100u + (unsigned)which;
+                    spingalett_seed(17);
+                    NeuralNetwork *net = which == 5 ? lm_net(2, T, V, 16) : tf_net(which, T, V);
+                    if (which == 0) {           /* dropout on a recomputed projection and a recomputed GELU */
+                        net->dropout_rates[5] = 0.25f;
+                        net->dropout_rates[8] = 0.2f;
+                    }
+                    tf_init(net);
+                    float *x, *y;
+                    tf_data(net, N, V, &x, &y);
+                    spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+                    TrainReport r = train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 2,
+                                          .learning_rate = 3e-3f, .optimizer_type = OPTIMIZER_ADAMW,
+                                          .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 16,
+                                          .max_grad_norm = variant == 1 ? 0.5f : 0.0f,
+                                          .accumulation_steps = variant == 2 ? 3u : 0u, .recompute = run == 1);
+                    CHECK(r.status == TRAIN_COMPLETED, "recompute net %d: training failed", which);
+                    count = net->total_weights + net->total_biases;
+                    w[run] = malloc(count * sizeof(float));
+                    memcpy(w[run], net->weights, net->total_weights * sizeof(float));
+                    memcpy(w[run] + net->total_weights, net->biases, net->total_biases * sizeof(float));
+                    free(x); free(y);
+                    free_network(net);
+                }
+                CHECK(!memcmp(w[0], w[1], count * sizeof(float)), "recompute net %d mode %d variant %d: other bits",
+                      which, mode, variant);
+                free(w[0]); free(w[1]);
+            }
+        nets++;
+    }
+    /* a graph of convolutions, batch normalization and a residual connection */
+    float *first = NULL;
+    for (int run = 0; run < 2; run++) {
+        lcg_state = 9200;
+        spingalett_seed(23);                            /* (the shuffle's) */
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+        layer(.net = net, .height = 6, .width = 6, .channels = 2);
+        uint32_t a = conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_RELU);
+        conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1);
+        batch_norm(.net = net, .act_func = ACT_RELU);
+        conv2d(.net = net, .filters = 4, .kernel = 3, .padding = 1, .act_func = ACT_GELU);
+        uint32_t b = conv2d(.net = net, .filters = 4, .kernel = 1);
+        add_layers(.net = net, .inputs = {a, b}, .act_func = ACT_RELU);
+        global_avg_pool2d(.net = net);
+        layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+        for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = frand() * 0.8f - 0.4f;
+        float x[40 * 72], y[40 * 3];
+        for (int i = 0; i < 40 * 72; i++) x[i] = frand();
+        for (int i = 0; i < 40; i++) for (int k = 0; k < 3; k++) y[i * 3 + k] = (float)(i % 3 == k);
+        spingalett_set_compute_mode(COMPUTE_OPENMP);
+        train(.net = net, .inputs = x, .targets = y, .sample_count = 40, .epochs = 3, .learning_rate = 0.05f,
+              .optimizer_type = OPTIMIZER_MOMENTUM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8,
+              .recompute = run == 1);
+        if (run == 0) {
+            first = malloc(net->total_weights * sizeof(float));
+            memcpy(first, net->weights, net->total_weights * sizeof(float));
+        } else {
+            CHECK(!memcmp(first, net->weights, net->total_weights * sizeof(float)),
+                  "recompute: a graph of convolutions trains to other bits");
+            free(first);
+        }
+        free_network(net);
+    }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    printf("  activation recomputation: %d transformers and a convolutional graph train to the same bits\n", nets);
+}
+
 /* Tied input and output embeddings: the head computes with the table, as an untied head holding a copy of it
    does, and the table's step is the sum of the embedding's and the head's; the layers' other parameters step
    alike; ties that do not fit are refused. */
@@ -7732,6 +7813,7 @@ int main(int argc, char **argv) {
         for (int m = 0; m < 2; m++) tf_padding(cm[m]);
         for (int m = 0; m < 2; m++) tf_window(cm[m]);
         for (int m = 0; m < 2; m++) tf_cross(cm[m]);
+        tf_recompute();
         tf_validation();
         tf_learns(COMPUTE_OPENMP);
     }

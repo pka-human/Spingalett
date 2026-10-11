@@ -396,6 +396,7 @@ class _TrainArgs(Structure):
         ("lr_plateau_min_lr", c_float),
         ("accumulation_steps", c_uint32),
         ("lr_per_step", c_bool),
+        ("recompute", c_bool),
         ("reserved", c_uint64 * (_RESERVED - 1)),
     ]
 
@@ -1379,6 +1380,7 @@ class TrainConfig:
     lr_plateau_min_lr: float = 0.0      # ...but not below this
     accumulation_steps: int = 0         # a step after every this many mini-batches (gradient accumulation)
     lr_per_step: bool = False           # lr_scheduler before every optimizer step (its epochs counting steps)
+    recompute: bool = False             # activation recomputation on the CPU: less memory, a forward pass more
 
 
 def _as_float(data) -> np.ndarray:
@@ -2131,6 +2133,7 @@ class Network:
             lr_plateau_min_lr=float(cfg.lr_plateau_min_lr),
             accumulation_steps=int(cfg.accumulation_steps),
             lr_per_step=bool(cfg.lr_per_step),
+            recompute=bool(cfg.recompute),
         )
         r = _call(_train, args)
         del keep

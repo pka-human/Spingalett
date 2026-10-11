@@ -65,7 +65,7 @@ int main(void) {
     FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads); FIELD(TrainArgs, augment_shift);
     FIELD(TrainArgs, augment_flip); FIELD(TrainArgs, label_smoothing);
     FIELD(TrainArgs, lr_plateau_factor); FIELD(TrainArgs, lr_plateau_patience); FIELD(TrainArgs, lr_plateau_min_lr);
-    FIELD(TrainArgs, accumulation_steps); FIELD(TrainArgs, lr_per_step);
+    FIELD(TrainArgs, accumulation_steps); FIELD(TrainArgs, lr_per_step); FIELD(TrainArgs, recompute);
 
     SIZE(EvalMetrics); FIELD(EvalMetrics, reserved); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
 

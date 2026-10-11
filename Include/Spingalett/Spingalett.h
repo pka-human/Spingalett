@@ -382,6 +382,14 @@ typedef struct {
        x steps an epoch; with a generator and sample_count 0, 0 during the first epoch, then the first
        epoch's steps x epochs). Reduce on plateau scales each step's rate. */
     bool lr_per_step;
+    /* Activation recomputation (checkpointing), mini-batch and full-batch training on the CPU: the workspace
+       keeps through the backward pass the outputs of the layers that several layers read (a transformer's
+       residual stream, one a block), of batch normalizations and of the output layer, and the others' only
+       for one segment between them (a block) at a time: their outputs, gradients and values before their
+       activations share memory, and the backward pass computes a segment's outputs again before it. The
+       gradients are those of training without it, bit for bit; it costs about one more forward pass. The GPU
+       keeps every layer. */
+    bool recompute;
     uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettTrainArgs;
 

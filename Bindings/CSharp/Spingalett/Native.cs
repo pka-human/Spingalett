@@ -157,6 +157,7 @@ public unsafe struct TrainArgs
     public float lr_plateau_min_lr;
     public uint accumulation_steps;
     public byte lr_per_step;
+    public byte recompute;
     public fixed ulong reserved[Const.Reserved - 1];
 }
 

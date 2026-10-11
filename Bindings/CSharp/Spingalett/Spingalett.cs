@@ -131,6 +131,8 @@ public sealed record TrainOptions
     public bool NoShuffle { get; init; }
     /// <summary>Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one).</summary>
     public uint AccumulationSteps { get; init; }
+    /// <summary>Activation recomputation on the CPU: less memory, a forward pass more, the same results.</summary>
+    public bool Recompute { get; init; }
 }
 
 public readonly record struct TrainResult(bool Completed, int EpochsRun, float TrainLoss);
@@ -226,6 +228,7 @@ public sealed unsafe class Network : IDisposable
         max_grad_norm = o.MaxGradNorm,
         label_smoothing = o.LabelSmoothing,
         accumulation_steps = o.AccumulationSteps,
+        recompute = (byte)(o.Recompute ? 1 : 0),
     };
 
     static TrainResult Run(TrainArgs args)

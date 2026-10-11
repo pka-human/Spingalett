@@ -863,6 +863,14 @@ check(np.array_equal(back.forward(xs[:4]), seq.forward(xs[:4])) and back.layer(6
 model = seq.to_model(sg.Precision.FLOAT32)
 check(np.allclose(model.predict(xs[:4]), seq.forward(xs[:4]), atol=1e-5) and model.layers[5].token_offset == S,
       "an encoder-decoder deployed")
+# activation recomputation trains to the same weights
+copies = [sg.Network.from_bytes(seq.to_bytes()) for _ in range(2)]
+for net, again in zip(copies, (False, True)):
+    sg.seed(4)
+    net.train(xs[:64], src[:64, :Q], epochs=2, batch_size=16, strategy=sg.Strategy.MINI_BATCH, learning_rate=1e-3,
+              optimizer=sg.Optimizer.ADAMW, recompute=again)
+check(all(np.array_equal(copies[0].get_weights(i), copies[1].get_weights(i)) for i in range(len(seq) - 1)),
+      "activation recomputation: the same weights")
 # sessions: the model a token at a time with a key-value cache, the logits of its batched prediction bit for bit
 for precision in (sg.Precision.FLOAT32, sg.Precision.INT8):
     model = lm.to_model(precision)

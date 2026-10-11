@@ -307,6 +307,7 @@ pub struct TrainArgs {
     pub lr_plateau_min_lr: f32,
     pub accumulation_steps: u32,
     pub lr_per_step: bool,
+    pub recompute: bool,
     pub reserved: [u64; RESERVED - 1],
 }
 

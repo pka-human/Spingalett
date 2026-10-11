@@ -331,6 +331,8 @@ type TrainOptions struct {
 	NoShuffle      bool
 	// AccumulationSteps: an optimizer step after every this many mini-batches (0 or 1: every one).
 	AccumulationSteps uint32
+	// Recompute: activation recomputation on the CPU (less memory, a forward pass more, the same results).
+	Recompute bool
 }
 
 // TrainResult says how a training run ended.
@@ -442,6 +444,7 @@ func (n *Network) trainArgs(o TrainOptions) C.SpingalettTrainArgs {
 	a.max_grad_norm = C.float(o.MaxGradNorm)
 	a.label_smoothing = C.float(o.LabelSmoothing)
 	a.accumulation_steps = C.uint32_t(o.AccumulationSteps)
+	a.recompute = C.bool(o.Recompute)
 	return a
 }
 

@@ -447,6 +447,7 @@ typedef struct {
     float lr_plateau_min_lr;
     uint32_t accumulation_steps;
     bool lr_per_step;
+    bool recompute;
     uint64_t reserved[8 - 1];
 } SpingalettTrainArgs;
 
