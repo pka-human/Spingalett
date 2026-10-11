@@ -29,6 +29,8 @@ cat <<EOF
 | \`spingalett-runtime-$version-*\` | the runtime alone, for each platform above: \`libspingalett-runtime\` (deployment models without training), \`Spingalett.Runtime.h\`, its CMake package and pkg-config file, \`bin/RunModel\` |
 | \`spingalett-$version-py3-none-*.whl\` | the Python package with the library inside, for any Python 3: manylinux 2.28 x86-64 and AArch64, Windows x86-64, macOS universal; \`pip install spingalett\` installs the same from PyPI |
 | \`spingalett-$version-inference-engine.zip\` | the standalone inference engine for firmware: three C files, see its README |
+| \`spingalett-$version.tgz\` | the JavaScript package (the inference engine in WebAssembly, for Node 18+ and browsers): \`npm install ./spingalett-$version.tgz\` |
+| \`spingalett-$version.wasm\` | its WebAssembly module alone, for \`loadEngine(url)\` |
 | \`DigitPad-$version-x86_64.AppImage\` | the digit-drawing demo with a trained model, for x86-64 Linux with glibc 2.34+ |
 | \`DigitPad-$version-windows-x86_64.zip\` | the same demo for 64-bit Windows 10 and 11: unpack it and start \`DigitPad.exe\` |
 | \`SHA256SUMS\` | checksums of all files |

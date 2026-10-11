@@ -220,6 +220,42 @@ jobs:
           cmake --build consumer/build
           consumer/build/c
 
+  # the engine in WebAssembly (Bindings/JavaScript): built by Clang for wasm32 without a C library, and its
+  # package's tests in Node: the module against the native engine's outputs (test/references) and against
+  # the same code built natively by GCC
+  javascript:
+    name: JavaScript (WebAssembly) / Node ${{ matrix.node }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Clang and wasm-ld
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+          clang --version | head -1
+          command -v wasm-ld || command -v wasm-ld-18 || clang -print-prog-name=wasm-ld
+
+      - name: Build
+        working-directory: Bindings/JavaScript
+        run: sh build.sh
+
+      - name: Test
+        working-directory: Bindings/JavaScript
+        run: CC=gcc npm test
+
+      - name: Package
+        working-directory: Bindings/JavaScript
+        run: npm pack --dry-run
+
   runtime:
     name: ${{ matrix.cc }} / runtime alone
     runs-on: ubuntu-24.04

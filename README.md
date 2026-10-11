@@ -27,7 +27,8 @@ model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels whe
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
 alike; programs that only run models link the runtime, a library of that part alone. Models come in
 from ONNX files and PyTorch weights (GPT-2 and LLaMA-like checkpoints in Python), and bindings for
-Python (wheels with the library inside), C++, Rust, .NET, Go, Java and PHP are included.
+Python (wheels with the library inside), C++, Rust, .NET, Go, Java and PHP are included, and for
+JavaScript the inference engine in WebAssembly, which runs models in Node and in browsers.
 
 ## Contents
 
@@ -64,13 +65,13 @@ Python (wheels with the library inside), C++, Rust, .NET, Go, Java and PHP are i
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()` |
-| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap) |
+| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
-| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension) |
-| Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes |
+| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension); JavaScript and TypeScript for the inference engine in WebAssembly |
+| Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes, an npm package |
 
 ## Building
 
@@ -1258,6 +1259,26 @@ with convolutions and pooling. CMake builds it alone with `-DSPINGALETT_INFERENC
 weights in flash: the 784-256-128-10 network with 2.8 KB of RAM, the CNN (INT8, 424 KB of flash)
 with 208 KB.
 
+### WebAssembly: Node and browsers
+
+[`Bindings/JavaScript`](Bindings/JavaScript/README.md) builds the engine for WebAssembly with Clang and
+`wasm-ld`, without a C library (`sh Bindings/JavaScript/build.sh`; the mathematical functions it calls
+round as glibc's do), and wraps it in an npm package `spingalett`: an ES module with TypeScript
+declarations for Node 18 and later and for browsers, around a 62 KB module that imports nothing. A
+model, of any kind and precision the engine runs, is loaded from its bytes and runs sample by sample
+with the native engine's results (integer models bit for bit); language models give the next token's
+logits and generate as `spingalett_generate()` does:
+
+```js
+import { loadModel } from 'spingalett';
+
+const model = await loadModel(await (await fetch('chargpt.slett')).arrayBuffer());
+console.log(model.layers.map((l) => `${l.type} ${l.precision}`));
+const tokens = model.generate([...new TextEncoder().encode('ROMEO:')], 200, { temperature: 0.8, topK: 40 });
+```
+
+Each release attaches the package (`spingalett-<version>.tgz`, for `npm install`) and the module.
+
 ### ModelTool
 
 `Examples/ModelTool.c`, installed with the library:
@@ -1381,6 +1402,9 @@ lm.add(Layer::linear(256))?;
 lm.train_tokens("train.bin", 64, &TrainOptions { epochs: 5, ..Default::default() })?;
 let text = lm.generate(&[72, 101], 100, &Sampling { temperature: 0.8, top_k: 40, ..Default::default() })?;
 ```
+
+JavaScript runs the inference engine itself, compiled to WebAssembly: see
+[WebAssembly: Node and browsers](#webassembly-node-and-browsers).
 
 ## DigitPad demo
 
@@ -1628,7 +1652,8 @@ Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference 
 docs/                 File format specifications (models, data sets)
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
-Bindings/             Bindings for Python, Rust, .NET (C#), Go, Java and PHP
+Bindings/             Bindings for Python, Rust, .NET (C#), Go, Java and PHP; the engine in WebAssembly
+                      for JavaScript
 packaging/            Conan, vcpkg, AUR, conda recipes and the container image (Formula/: Homebrew,
                       bucket/: Scoop, flake.nix: Nix)
 cmake/                CMake package, pkg-config, runtime and inference-only build helpers
