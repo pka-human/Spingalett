@@ -1472,7 +1472,9 @@ sg::Result<sg::Model> int8 = net->to_model(sg::Precision::Int8);
 one, for residual blocks and branches; `add_layers()` and `concat_layers()` take their inputs
 directly. `linear()`, `embedding()`, `attention()`, `rms_norm()` and `multiply_layers()` build
 transformers; `Network::train_tokens()` trains on a token file and `generate()` continues a prompt
-(`sg::Sampling`). `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()`
+(`sg::Sampling`). `Network::from_pretrained(path, context)` loads a Hugging Face model directory or a
+GGUF file, and `sg::Tokenizer::load(path)` its tokenizer (`encode()`, `decode()`, `token()`, `id()`,
+`info()`). `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()`
 gives the C object of a wrapper for whatever the wrapper does not cover.
 
 ## Bindings for other languages

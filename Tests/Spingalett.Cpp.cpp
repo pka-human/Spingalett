@@ -122,7 +122,42 @@ int main() {
         check(st && *st == std::vector<std::uint32_t>{6, 7, 8, 9}, "generate() stops at a stop token");
     }
 
+    /* a tokenizer and a pretrained model of Tests/Data, the window of hf_llama.bin against PyTorch's logits */
+    const std::string data = SPINGALETT_TEST_DATA_DIR;
+    sg::Result<sg::Tokenizer> tok = sg::Tokenizer::load(data + "/hf_llama");
+    check(tok && tok->info().bos == 420 && tok->info().eos == 424 && tok->id("<|begin_of_text|>") == 420u &&
+              tok->token(420) == std::string("<|begin_of_text|>") && !tok->id("no such token"),
+          "Tokenizer::load() of a model directory, its tokens by id and by name");
+    if (tok) {
+        const std::string text = "The quick brown fox jumps over the lazy dog, it's 1234 times!";
+        sg::Result<std::vector<std::uint32_t>> ids = tok->encode(text);
+        sg::Result<std::string> back = ids ? tok->decode(*ids) : std::unexpected(ids.error());
+        sg::Result<std::vector<std::uint32_t>> bot = tok->encode("<|begin_of_text|>", true);
+        check(back && *back == text && bot && *bot == std::vector<std::uint32_t>{420}, "encode() and decode()");
+    }
+    std::vector<float> window;
+    if (std::FILE *f = std::fopen((data + "/hf_llama.bin").c_str(), "rb")) {
+        std::uint32_t head[4] = {0, 0, 0, 0};
+        if (std::fread(head, 4, 4, f) == 4) {
+            window.resize(head[2] + head[3]);
+            if (std::fread(window.data(), 4, window.size(), f) != window.size()) window.clear();
+        }
+        std::fclose(f);
+    }
+    for (const char *name : {"/hf_llama", "/gguf_llama.gguf"}) {
+        const std::uint32_t T = 10;
+        sg::Result<sg::Network> lm = sg::Network::from_pretrained(data + name, T);
+        sg::Result<std::vector<float>> logits = lm && window.size() > T ? lm->predict(std::span<const float>(window).first(T))
+                                                                        : sg::Result<std::vector<float>>(sg::invalid("no model"));
+        bool close = logits && logits->size() == window.size() - T;
+        for (std::size_t i = 0; close && i < logits->size(); i++) close = std::fabs((*logits)[i] - window[T + i]) < 1e-4f;
+        check(close, name[1] == 'h' ? "Network::from_pretrained() of a model directory: PyTorch's logits"
+                                    : "Network::from_pretrained() of a GGUF file: PyTorch's logits");
+    }
+
     /* errors are values */
+    check(!sg::Tokenizer::load("no/such/tokenizer.json") && !sg::Network::from_pretrained("no/such/model"),
+          "a missing tokenizer or model is an error");
     sg::Result<std::vector<float>> partial = net.predict(std::span<const float>(x).first(in + 1));
     check(!partial && partial.error().code == SPINGALETT_ERR_INVALID, "a partial sample is an error");
     sg::Result<sg::Network> missing = sg::Network::load("no/such/file.slett");
