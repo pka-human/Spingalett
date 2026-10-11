@@ -57,3 +57,26 @@ fn main() -> Result<(), spingalett::Error> {
 ```
 
 A `Network` moves between threads but is used by one at a time; a `Model` may be shared by several.
+
+## Pretrained language models and tokenizers
+
+With the library 1.3, `Network::from_pretrained()` reads a Hugging Face model directory (`config.json` and
+safetensors weights, sharded or not; LLaMA, Mistral, Qwen2, GPT-2) or a GGUF file (its weights dequantized
+from F32 down to the k-quants), and `Tokenizer` reads the tokenizer of the same path (a `tokenizer.json`, a
+model directory or a GGUF file), with the ids and texts of Hugging Face's `tokenizers`:
+
+```rust
+use spingalett::{Network, Sampling, Tokenizer};
+
+let mut lm = Network::from_pretrained("SmolLM2-135M.Q4_K_M.gguf", 512)?;    // a window of 512 tokens
+let tok = Tokenizer::load("SmolLM2-135M.Q4_K_M.gguf")?;
+let prompt = tok.encode("<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n", true, false)?;
+let stop = tok.id("<|im_end|>").into_iter().collect();
+let reply = lm.generate(&prompt, 64, &Sampling { temperature: 0.7, top_p: 0.9, stop, ..Default::default() })?;
+println!("{}", tok.decode(&reply, true)?);
+```
+
+`encode(text, special, add_special)`: `special` turns special tokens written in the text into their ids
+(otherwise they are text, so that text from users cannot forge them), `add_special` adds the tokens the
+tokenizer adds around a text (LLaMA's BOS). `token()`, `id()`, `vocabulary()`, `bos()` and `eos()` look the
+vocabulary up. A `Tokenizer` may be shared by several threads.
