@@ -6542,7 +6542,10 @@ static void gpu_session(bool llama) {
     bool same[2] = {false, false};
     for (int bf16 = 0; bf16 < 2 && ok; bf16++) {
         spingalett_set_compute_mode(gpu_mode);
-        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
+        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {     /* (a device without bfloat16) */
+            same[1] = true;
+            break;
+        }
         s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 3});
         ok = s != NULL;
         ok = ok && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = all, .all = true}, 1);
