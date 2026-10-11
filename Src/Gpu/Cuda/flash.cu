@@ -111,6 +111,10 @@ DEVICE void quad_transpose(float (&x)[4][2], uint32_t t) {
 DEVICE float quad_max(float v) { v = max_(v, shfl_xor(v, 1u)); return max_(v, shfl_xor(v, 2u)); }
 DEVICE float quad_sum(float v) { v += shfl_xor(v, 1u); return v + shfl_xor(v, 2u); }
 
+struct uint4_ {
+    uint32_t x, y, z, w;
+} __attribute__((aligned(16)));
+
 /* Rows r0 .. r0 + count - 1 of a head (float `head` of x's cells) into a shared tile [row][SD] of bfloat16:
    rotated with rotate (ROPE), zeros past the cells. Eight values a thread-load, with their pair of the
    other half of the vector where rotated. */
@@ -123,10 +127,26 @@ DEVICE void load_tile(const SpgAttnPush &p, uint32_t HALF, uint16_t *tile, uint3
         float v[8], w[8];
         const bool live = pos < p.cells;
         const uint32_t at = (s * p.cells + pos) * stride + head;
+        if (((HALF >> word) & 1u) && base % 16u == 0u) {     /* (kept as bfloat16: sixteen bytes a load) */
+            const uint4_ zero = {0u, 0u, 0u, 0u};
+            const uint4_ a = live ? *(const uint4_ *)(H(base) + at + c) : zero;
+            const uint4_ b = live && rope ? *(const uint4_ *)(H(base) + at + c + D / 2u) : zero;
+            if (!rope) {
+                *(uint4_ *)(tile + row * SD + c) = a;
+                continue;
+            }
+            const uint32_t wa[4] = {a.x, a.y, a.z, a.w}, wb[4] = {b.x, b.y, b.z, b.w};
 #pragma unroll
-        for (uint32_t k = 0; k < 8u; k++) {
-            v[k] = live ? ld(base, at + c + k, word, HALF) : 0.0f;
-            w[k] = live && rope ? ld(base, at + c + k + D / 2u, word, HALF) : 0.0f;
+            for (uint32_t k = 0; k < 4u; k++) {
+                v[2u * k] = bits_float(wa[k] << 16), v[2u * k + 1u] = bits_float(wa[k] & 0xFFFF0000u);
+                w[2u * k] = bits_float(wb[k] << 16), w[2u * k + 1u] = bits_float(wb[k] & 0xFFFF0000u);
+            }
+        } else {
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) {
+                v[k] = live ? ld(base, at + c + k, word, HALF) : 0.0f;
+                w[k] = live && rope ? ld(base, at + c + k + D / 2u, word, HALF) : 0.0f;
+            }
         }
         if (rope && live) {
             const float *cs = F(p.table) + pos * (D / 2u) + c, *sn = F(p.table) + p.cells * (D / 2u) + pos * (D / 2u) + c;
@@ -147,10 +167,6 @@ DEVICE void load_tile(const SpgAttnPush &p, uint32_t HALF, uint16_t *tile, uint3
         }
     }
 }
-
-struct uint4_ {
-    uint32_t x, y, z, w;
-} __attribute__((aligned(16)));
 
 /* Eight bfloat16 of a row of a tile (two a word, the first value in the low half), as loaded */
 struct Raw {
@@ -232,6 +248,36 @@ DEVICE void scores_a(const float (&s)[NT][4], uint32_t j, uint32_t (&a)[4]) {
     a[1] = pack2(s[2u * j][2], s[2u * j][3]);
     a[2] = pack2(s[2u * j + 1u][0], s[2u * j + 1u][1]);
     a[3] = pack2(s[2u * j + 1u][2], s[2u * j + 1u][3]);
+}
+
+/* Rows of a gradient from a shared tile of floats [row][D] into dx (the rows from `first` of sample s, values
+   `head` on of rows of C): rotated back (ROPE), eight values a thread at a time, sixteen bytes where dx is
+   kept as bfloat16 */
+DEVICE void store_rows(const SpgAttnPush &p, uint32_t HALF, const float *f, uint32_t first, uint32_t count, uint32_t s,
+                       uint32_t head, uint32_t C, uint32_t threads) {
+    const bool wide = (HALF & 8u) && p.dx % 16u == 0u, rope = (p.flags & FLAG_ROPE) != 0u;
+    const uint32_t hd = D / 2u;
+    for (uint32_t e = thread_x(); e < count * (D / 8u); e += threads) {
+        const uint32_t row = e / (D / 8u), c = 8u * (e % (D / 8u)), i = first + row;
+        if (i >= p.cells) continue;
+        float v[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; k++) v[k] = f[row * D + c + k];
+        if (rope) {
+            const uint32_t ii = c < hd ? c : c - hd;
+            const float *cs = F(p.table) + i * hd + ii, *sn = F(p.table) + p.cells * hd + i * hd + ii;
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++)
+                v[k] = c < hd ? v[k] * cs[k] + f[row * D + c + k + hd] * sn[k] : v[k] * cs[k] - f[row * D + c + k - hd] * sn[k];
+        }
+        const uint32_t at = (s * p.cells + i) * C + head + c;
+        if (wide) {
+            ((uint4_ *)p.dx)[at >> 3] = uint4_{pack2(v[0], v[1]), pack2(v[2], v[3]), pack2(v[4], v[5]), pack2(v[6], v[7])};
+            continue;
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; k++) st(p.dx, at + k, 3u, HALF, v[k]);
+    }
 }
 
 struct Shared {
@@ -549,17 +595,7 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
             dq[(r0 + g + 8u) * D + c + 1u] = o[j][3] * scale;
         }
         barrier();
-        for (uint32_t e = thread_x(); e < ROWS * D; e += threads) {
-            const uint32_t row = e / D, c = e % D, i = i0 + row;
-            if (i >= p.cells) continue;
-            float v = dq[row * D + c];
-            if (p.flags & FLAG_ROPE) {
-                const uint32_t hd = D / 2u, ii = c < hd ? c : c - hd;
-                const float cs = F(p.table)[i * hd + ii], sn = F(p.table)[p.cells * hd + i * hd + ii];
-                v = c < hd ? v * cs + dq[row * D + c + hd] * sn : v * cs - dq[row * D + c - hd] * sn;
-            }
-            st(p.dx, (s * p.cells + i) * C + h * D + c, 3u, HALF, v);
-        }
+        store_rows(p, HALF, dq, i0, ROWS, s, h * D, C, threads);
         return;
     }
     /* DKV: the block's keys (and values) of head kh, the warp's 16 of them; queries of the group's heads */
@@ -656,9 +692,11 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
             }
         }
     }
-    /* dK times the scale, rotated back through shared memory; dV as it is */
+    /* dK times the scale, rotated back through shared memory; dV as it is, the four threads of a row exchanging
+       their fragments (quad_transpose()) so that each stores eight consecutive values at once */
     barrier();
     float *dkf = (float *)sh.t;             /* ROWS x D floats */
+    const bool wide = (HALF & 8u) && p.dx % 16u == 0u;
 #pragma unroll
     for (uint32_t j = 0; j < DT; j++) {
         const uint32_t c = 8u * j + 2u * t;
@@ -666,27 +704,33 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
         dkf[(r0 + g) * D + c + 1u] = dk[j][1] * scale;
         dkf[(r0 + g + 8u) * D + c] = dk[j][2] * scale;
         dkf[(r0 + g + 8u) * D + c + 1u] = dk[j][3] * scale;
-        const uint32_t at_a = (s * p.cells + ka_row) * C + (p.heads + p.kv + kh) * D + c;
-        const uint32_t at_b = (s * p.cells + kb_row) * C + (p.heads + p.kv + kh) * D + c;
-        if (ka_row < p.cells) {
-            st(p.dx, at_a, 3u, HALF, dv[j][0]);
-            st(p.dx, at_a + 1u, 3u, HALF, dv[j][1]);
+    }
+#pragma unroll
+    for (uint32_t hh = 0; hh < 2u; hh++) {
+        const uint32_t row = hh ? kb_row : ka_row;
+        if (!wide) {
+#pragma unroll
+            for (uint32_t j = 0; j < DT; j++) {
+                const uint32_t at = (s * p.cells + row) * C + (p.heads + p.kv + kh) * D + 8u * j + 2u * t;
+                if (row < p.cells) {
+                    st(p.dx, at, 3u, HALF, dv[j][2u * hh]);
+                    st(p.dx, at + 1u, 3u, HALF, dv[j][2u * hh + 1u]);
+                }
+            }
+            continue;
         }
-        if (kb_row < p.cells) {
-            st(p.dx, at_b, 3u, HALF, dv[j][2]);
-            st(p.dx, at_b + 1u, 3u, HALF, dv[j][3]);
+#pragma unroll
+        for (uint32_t a = 0; a < DT / 4u; a++) {
+            float x[4][2];
+#pragma unroll
+            for (uint32_t b = 0; b < 4u; b++) x[b][0] = dv[4u * a + b][2u * hh], x[b][1] = dv[4u * a + b][2u * hh + 1u];
+            quad_transpose(x, t);
+            if (row >= p.cells) continue;
+            const uint32_t at = (s * p.cells + row) * C + (p.heads + p.kv + kh) * D + 8u * (4u * a + t);
+            ((uint4_ *)p.dx)[at >> 3] = uint4_{pack2(x[0][0], x[0][1]), pack2(x[1][0], x[1][1]), pack2(x[2][0], x[2][1]),
+                                               pack2(x[3][0], x[3][1])};
         }
     }
     barrier();
-    for (uint32_t e = thread_x(); e < ROWS * D; e += threads) {
-        const uint32_t row = e / D, c = e % D, j = j0 + row;
-        if (j >= p.cells) continue;
-        float v = dkf[row * D + c];
-        if (p.flags & FLAG_ROPE) {
-            const uint32_t hd = D / 2u, ii = c < hd ? c : c - hd;
-            const float cs = F(p.table)[j * hd + ii], sn = F(p.table)[p.cells * hd + j * hd + ii];
-            v = c < hd ? v * cs + dkf[row * D + c + hd] * sn : v * cs - dkf[row * D + c - hd] * sn;
-        }
-        st(p.dx, (s * p.cells + j) * C + (p.heads + kh) * D + c, 3u, HALF, v);
-    }
+    store_rows(p, HALF, dkf, j0, ROWS, s, (p.heads + kh) * D, C, threads);
 }
