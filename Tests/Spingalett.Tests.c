@@ -6269,10 +6269,18 @@ static NeuralNetwork *runtime_net(int k, const char **name) {
     static const char *names[] = {"norm0", "norm1", "norm2", "norm3", "graph0", "graph1", "graph2", "graph3",
                                   "graph4", "graph5", "graph6", "graph7", "conv5", "conv6", "conv7", "conv8",
                                   "conv9", "resnet"};
+    static const char *const lm[] = {"lm0", "lm1"};
     lcg_state = 500u + (unsigned)k;
     if (k == 0) { *name = "mlp"; return deploy_net(); }
     if (k == 1) { *name = "cnn"; return conv_deploy_net(); }
-    if (k - 2 >= (int)(sizeof names / sizeof *names)) return NULL;
+    const int last = 2 + (int)(sizeof names / sizeof *names);
+    if (k >= last + 2) return NULL;
+    if (k >= last) {            /* language models: their sessions too */
+        *name = lm[k - last];
+        NeuralNetwork *net = lm_net(k - last, 12, 29, 16);
+        tf_init(net);
+        return net;
+    }
     *name = names[k - 2];
     NeuralNetwork *net = k < 6 ? norm_net(k - 2) : k < 14 ? graph_net(k - 6) : k < 19 ? conv_net(k - 9)
                                                                                      : resnet(2, 16, 0.0f);
@@ -6296,9 +6304,9 @@ static bool write_floats(const char *dir, const char *name, const char *suffix, 
 /* SpingalettTests export-models DIR: networks of every kind of layer saved as .slett files in every
    precision (and one with its optimizer state), with what the full library's spingalett_model_predict()
    (single-threaded and on four threads), spingalett_model_run() and spingalett_model_evaluate() give for
-   the samples of Spingalett.RuntimeData.h: NAME.st, NAME.omp, NAME.run and NAME.eval, raw floats. The
-   runtime must give the same bits (Spingalett.RuntimeTests.c). DIR/models.txt lists the names and the
-   samples of each. */
+   the samples of Spingalett.RuntimeData.h: NAME.st, NAME.omp, NAME.run and NAME.eval, raw floats, and for
+   language models NAME.sess, the logits of runtime_session(). The runtime must give the same bits
+   (Spingalett.RuntimeTests.c). DIR/models.txt lists the names and the samples of each. */
 static int export_runtime_models(const char *dir) {
     static const char *pnames[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
     char path[1024];
@@ -6312,7 +6320,9 @@ static int export_runtime_models(const char *dir) {
         const uint32_t count = 300, in = net->topology[0], out = net->topology[net->layers - 1];
         float *x = malloc((size_t)count * in * sizeof(float)), *t = malloc((size_t)count * out * sizeof(float));
         float *y = malloc((size_t)count * out * sizeof(float));
-        runtime_inputs(x, (size_t)count * in);
+        const bool lm = net->shapes[1].type == LAYER_EMBEDDING;
+        if (lm) runtime_tokens(x, (size_t)count * in, net->shapes[1].vocabulary);
+        else runtime_inputs(x, (size_t)count * in);
         runtime_targets(t, count, out);
         for (int p = 0; p <= PRECISION_COUNT; p++) {
             /* PRECISION_COUNT: the FLOAT32 network with its (zero) optimizer state, as training saves it */
@@ -6338,6 +6348,12 @@ static int export_runtime_models(const char *dir) {
             EvalMetrics e = spingalett_model_evaluate(m, x, t, count);
             float metrics[2] = {e.loss, e.accuracy};
             ok = ok && write_floats(dir, name, "eval", metrics, 2);
+            if (lm) {
+                const size_t floats = runtime_session_floats(in, out / in);
+                float *logits = malloc(floats * sizeof(float));
+                ok = ok && logits && runtime_session(m, x, logits) && write_floats(dir, name, "sess", logits, floats);
+                free(logits);
+            }
             if (ok) fprintf(list, "%s %u\n", name, count), written++;
             else rc = 1;
             spingalett_model_free(m);
