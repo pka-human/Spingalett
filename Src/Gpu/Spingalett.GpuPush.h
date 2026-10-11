@@ -124,6 +124,7 @@ typedef struct {
 enum { SPG_EMBED_FORWARD, SPG_EMBED_KEYS, SPG_EMBED_HIST, SPG_EMBED_SCAN, SPG_EMBED_SCATTER, SPG_EMBED_GRAD };
 #define SPG_EMBED_FROM 1u           /* the sort's keys in its second pair of arrays */
 #define SPG_EMBED_POS  2u           /* FORWARD adds the positions' vectors */
+#define SPG_EMBED_ROWS 4u           /* FORWARD: n rows of one token each, at the positions keys[] gives (decoding) */
 #define SPG_EMBED_BLOCK 256u        /* keys a block of HIST and SCATTER */
 
 /* attn.comp */
@@ -142,6 +143,17 @@ enum { SPG_ATTN_FORWARD, SPG_ATTN_PRE, SPG_ATTN_DQ, SPG_ATTN_DKV };
 #define SPG_RATTN_ROWS(d, op) ((d) <= 64u || (op) == SPG_ATTN_FORWARD ? 64u : 32u)
 #define SPG_RATTN_THREADS(d, op) \
     ((op) == SPG_ATTN_PRE ? 256u : (d) > 64u && (op) != SPG_ATTN_FORWARD ? 64u : 128u)
+
+/* attn_cache.comp: attention of rows (tokens of sequences at positions: rows[2r], rows[2r + 1]) over a cache of
+   keys then values ([sequences][length][kv][d] each) */
+typedef struct {
+    uint64_t x, y, cache, rows, table;
+    uint32_t n, heads, kv, d, length, sequences, flags, cells;
+    float scale;
+    uint32_t pad;
+} SpgCachePush;
+enum { SPG_CACHE_APPEND, SPG_CACHE_ATTEND };
+#define SPG_CACHE_THREADS 64u       /* Vulkan's workgroups of ATTEND (a row and head); CUDA's: a warp a row and head */
 
 /* rows.comp */
 typedef struct {

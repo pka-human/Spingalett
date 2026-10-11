@@ -1396,11 +1396,12 @@ static uint32_t ln_threads(uint32_t C) {
 }
 
 /* train: each cell's statistics kept for the backward pass */
-static void ln_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act, bool train) {
+/* layer normalization l over `cells` rows of its channels (n samples' cells, or rows of one token each) */
+static void ln_rows(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t cells, uint32_t act, bool train) {
     const NeuralNetwork *net = g->net;
     const uint32_t src = spingalett_source(net, l);
     const LayerShape *s = &net->shapes[l];
-    const uint32_t cells = n * s->height * s->width, T = ln_threads(s->channels);
+    const uint32_t T = ln_threads(s->channels);
     const bool stats = train && g->bn[l].buffer, rms = s->type == LAYER_RMS_NORM;
     /* (RMS: no beta, gamma's address in its place: some drivers, as lavapipe, load from an address the same for
        every thread whatever the branch around the load) */
@@ -1416,6 +1417,11 @@ static void ln_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32
     writes(&a, whole(&g->act[l]));
     if (stats) writes(&a, span(g->bn[l].address, 2ull * cells));
     kernel(r, &a, SPG_KERNEL_ln, spec, 3, &p, sizeof p, groups(cells, 256u / T), 1, 1);
+}
+
+static void ln_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n, uint32_t act, bool train) {
+    const LayerShape *s = &g->net->shapes[l];
+    ln_rows(g, r, l, n * s->height * s->width, act, train);
 }
 
 /* y = act(dense layer l of x + its biases), or with scales (a pair of floats an output: e0, the scales then
@@ -1579,8 +1585,8 @@ static void embed_forward(SpgGpuNet *g, Recorder *r, uint32_t l, uint32_t n) {
     const LayerShape *s = &net->shapes[l];
     const uint32_t tokens = net->topology[src], d = s->channels;
     SpgEmbedPush p = {.x = g->act[src].address, .w = weights_at(g, l - 1), .y = g->act[l].address,
-                      .pos = s->positions ? biases_at(g, l - 1) : 0, .tokens = tokens, .d = d, .vocab = s->vocabulary,
-                      .n = n, .flags = s->positions ? SPG_EMBED_POS : 0u};
+                      .pos = s->positions ? biases_at(g, l - 1) : 0, .keys = g->act[src].address, .tokens = tokens,
+                      .d = d, .vocab = s->vocabulary, .n = n, .flags = s->positions ? SPG_EMBED_POS : 0u};
     uint32_t spec[1] = {SPG_EMBED_FORWARD};
     Access a = {0};
     reads(&a, whole(&g->act[src]));
@@ -3042,4 +3048,380 @@ bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const Spg
     bool result = spingalett_gpu_pass_step_here(g, cfg, step, grad_scale);
     spg_gpu_use(saved);
     return result;
+}
+
+/* ------------------------------------------------------------------------- decoding with key-value caches */
+
+/*
+ * A decoder runs an inference network's layers on a few rows at a time, each a token of one of its
+ * sequences at a position (sessions of language models, spingalett_generate()): an embedding of the tokens
+ * (at the rows' positions), then layers that treat each token alone — products of pointwise layers, layer and
+ * RMS normalizations, additions, products and concatenations of layers — and causal attention, which appends
+ * the rows' keys (rotated) and values to its cache of every sequence's positions and attends over the
+ * positions up to each row's (attn_cache.comp). The commands of a number of rows are recorded once and kept.
+ */
+#define DECODE_KEPT 8u
+
+struct SpgGpuDecoder {
+    SpgGpuNet *g;
+    uint32_t sequences, length, most;   /* the caches' sequences and positions; rows a step, at most */
+    uint32_t vocabulary;                /* the output layer's values a row */
+    SpgGpuArena *arena;
+    SpgGpuBuffer cache;                 /* every attention layer's keys then values */
+    SpgGpuBuffer tokens, info;          /* the step's tokens (floats); each row's sequence and position, then its
+                                           position again (the embedding's keys) */
+    SpgGpuBuffer staging;               /* host-visible: tokens, info, then the logits copied out */
+    size_t info_at, logits_at;          /* where they are in the staging buffer */
+    uint64_t *keys;                     /* per layer: the address of its cache's keys (0: no attention) */
+    uint8_t *half;                      /* per layer: its cache kept as bfloat16 */
+    uint32_t kept_rows[DECODE_KEPT];
+    SpgGpuCommands *kept[DECODE_KEPT];
+    uint32_t next;                      /* the kept commands replaced next */
+};
+
+/* Whether a decoder can run layer l: what decoding computes token by token, or causal attention. */
+static bool decodes(const NeuralNetwork *net, uint32_t l, uint32_t cells, const char **why) {
+    const LayerShape *s = &net->shapes[l];
+    const ActivationFunction act = net->act_func[l - 1];
+    if (l + 1 < net->layers && act == ACT_SOFTMAX) return *why = "softmax inside the network", false;
+    switch (s->type) {
+        case LAYER_EMBEDDING:
+            return l == 1 || (*why = "an embedding past the first layer", false);
+        case LAYER_DENSE:
+            return cells == 1u || (*why = "a dense layer of whole windows", false);
+        case LAYER_CONV2D: {
+            const ConvView v = conv_view(net, l);
+            if (s->kernel_h != 1u || s->kernel_w != 1u || s->stride_h != 1u || s->stride_w != 1u || s->pad_h ||
+                s->pad_w || v.G != 1u)
+                return *why = "a convolution that mixes positions", false;
+            return true;
+        }
+        case LAYER_LAYER_NORM: case LAYER_RMS_NORM: case LAYER_ADD: case LAYER_MULTIPLY: case LAYER_CONCAT:
+            return true;
+        case LAYER_ATTENTION:
+            if (!s->causal) return *why = "attention that is not causal", false;
+            if (s->channels / s->heads > (spg_gpu_using() == SPG_BACKEND_CUDA ? 128u : 256u) ||
+                (s->channels / s->heads) % 2u)
+                return *why = "attention heads of over 128 values (Vulkan: 256), or of an odd number", false;
+            return true;
+        default:
+            return *why = "a layer that mixes positions", false;
+    }
+}
+
+/* Records the step of `rows` rows: every layer's pass on them. */
+static void record_decode(SpgGpuDecoder *d, Recorder *r, uint32_t rows) {
+    SpgGpuNet *g = d->g;
+    const NeuralNetwork *net = g->net;
+    for (uint32_t l = 1; l < net->layers; l++) {
+        const LayerShape *s = &net->shapes[l];
+        const ActivationFunction act = net->act_func[l - 1];
+        const uint32_t src = spingalett_source(net, l), C = s->channels;
+        const uint64_t total = (uint64_t)rows * C;
+        uint32_t later = ACT_NONE;          /* an activation the layer's pass does not apply */
+        if (s->type == LAYER_EMBEDDING) {
+            SpgEmbedPush p = {.x = g->act[0].address, .w = weights_at(g, l - 1), .y = g->act[l].address,
+                              .pos = s->positions ? biases_at(g, l - 1) : 0, .keys = d->info.address + 8ull * rows,
+                              .tokens = 1, .d = C, .vocab = s->vocabulary, .n = rows,
+                              .flags = (s->positions ? SPG_EMBED_POS : 0u) | SPG_EMBED_ROWS};
+            uint32_t spec[1] = {SPG_EMBED_FORWARD};
+            Access a = {0};
+            reads(&a, whole(&g->act[0]));
+            reads(&a, whole(&d->info));
+            reads(&a, weights_of(g, l - 1));
+            if (s->positions) reads(&a, biases_of(g, l - 1));
+            writes(&a, whole(&g->act[l]));
+            kernel(r, &a, SPG_KERNEL_embed, spec, 1, &p, sizeof p, groups(total / (C % 4u ? 1u : 4u), 256u), 1, 1);
+            later = act;
+        } else if (s->type == LAYER_DENSE || s->type == LAYER_CONV2D) {
+            /* a pointwise layer's product on the rows: [rows x in] times its weights [out x in] */
+            const uint32_t K = net->shapes[src].channels;
+            SpgGemmPush p = {.a = g->act[src].address, .b = mm_weights_at(g, l - 1), .c = g->act[l].address,
+                             .e0 = biases_at(g, l - 1), .M = rows, .N = C, .K = K, .lda = K, .ldb = K, .ldc = C,
+                             .alpha = 1.0f, .flags = SPG_GEMM_BIAS};
+            SpgGemmMode m = {SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, act, 1, false, true, true, 0, total, g->bf16, 0,
+                             true, true};
+            Access a = {0};
+            reads(&a, whole(&g->act[src]));
+            reads(&a, mm_weights_of(g, l - 1));
+            reads(&a, biases_of(g, l - 1));
+            writes(&a, whole(&g->act[l]));
+            g->pre_out = NULL;
+            product(r, &a, &p, &m);
+        } else if (s->type == LAYER_LAYER_NORM || s->type == LAYER_RMS_NORM) {
+            ln_rows(g, r, l, rows, act, false);
+        } else if (s->type == LAYER_ADD) {
+            const uint32_t count = spingalett_input_count(net, l), *in = spingalett_inputs(net, l);
+            for (uint32_t k = 1; k < count; k++) {
+                SpgCombinePush p = {g->act[in[k == 1 ? 0 : k]].address, g->act[l].address, g->act[in[1]].address, rows,
+                                    1, C, 0, 0, (k == 1 ? 0u : 1u) | (k + 1 == count ? 2u : 0u)};
+                uint32_t spec[3] = {SPG_COMBINE_ADD, act, 0};
+                Access a = {0};
+                reads(&a, whole(&g->act[in[k == 1 ? 0 : k]]));
+                reads(&a, whole(&g->act[k == 1 ? in[1] : l]));
+                writes(&a, whole(&g->act[l]));
+                kernel(r, &a, SPG_KERNEL_combine, spec, 3, &p, sizeof p, groups(total, 256u), 1, 1);
+            }
+        } else if (s->type == LAYER_CONCAT) {
+            const uint32_t count = spingalett_input_count(net, l), *in = spingalett_inputs(net, l);
+            for (uint32_t k = 0, c0 = 0; k < count; c0 += net->shapes[in[k]].channels, k++) {
+                const uint32_t ck = net->shapes[in[k]].channels;
+                SpgCombinePush p = {g->act[in[k]].address, g->act[l].address, 0, rows, 1, C, c0, ck, 0};
+                uint32_t spec[3] = {SPG_COMBINE_SLICE, act, 0};
+                Access a = {0};
+                reads(&a, whole(&g->act[in[k]]));
+                writes(&a, whole(&g->act[l]));
+                a.group = group_of(l, GROUP_PHASES);
+                kernel(r, &a, SPG_KERNEL_combine, spec, 3, &p, sizeof p, groups((uint64_t)rows * ck, 256u), 1, 1);
+            }
+        } else if (s->type == LAYER_MULTIPLY) {
+            const uint32_t count = spingalett_input_count(net, l), *in = spingalett_inputs(net, l);
+            const uint64_t y = g->act[l].address;
+            for (uint32_t k = 0; k < count; k++) {
+                Access a = {0};
+                reads(&a, whole(&g->act[in[k]]));
+                if (k) reads(&a, whole(&g->act[l]));
+                writes(&a, whole(&g->act[l]));
+                if (k == 0) {
+                    eltwise(g, r, &a, SPG_ELT_COPY, ACT_NONE, y, g->act[in[0]].address, 0, 0, total, 1);
+                } else {
+                    SpgEltwisePush p = {y, g->act[in[k]].address, y, 0, 0, (uint32_t)total, 1, 0, 0, 0.0f, 0, 0};
+                    uint32_t spec[2] = {SPG_ELT_PRODUCT, ACT_NONE};
+                    kernel(r, &a, SPG_KERNEL_eltwise, spec, 2, &p, sizeof p, groups(total, 256u), 1, 1);
+                }
+            }
+            later = act;
+        } else {                            /* LAYER_ATTENTION */
+            const uint32_t head = C / s->heads, cuda = spg_gpu_using() == SPG_BACKEND_CUDA;
+            const uint64_t keys = d->keys[l], values = (uint64_t)d->sequences * d->length * s->kv_heads * head;
+            const uint64_t bytes = 2ull * values * (d->half[l] ? 2u : 4u);
+            SpgCachePush p = {.x = g->act[src].address, .y = g->act[l].address, .cache = keys, .rows = d->info.address,
+                              .table = g->geo[l].buffer ? g->geo[l].address : g->act[src].address, .n = rows,
+                              .heads = s->heads, .kv = s->kv_heads, .d = head, .length = d->length,
+                              .sequences = d->sequences, .flags = g->geo[l].buffer ? SPG_ATTN_ROPE : 0u,
+                              .cells = s->height * s->width, .scale = 1.0f / sqrtf((float)head)};
+            const uint32_t half = (in_half(g, p.x) ? 1u : 0u) | (in_half(g, p.y) ? 2u : 0u) | (d->half[l] ? 4u : 0u);
+            const SpgKernel k = half ? SPG_KERNEL_attn_cache_h : SPG_KERNEL_attn_cache;
+            Access a = {0};
+            reads(&a, whole(&g->act[src]));
+            reads(&a, whole(&d->info));
+            if (g->geo[l].buffer) reads(&a, whole(&g->geo[l]));
+            writes(&a, (Range){keys, keys + bytes});
+            need(r, &a);
+            uint32_t spec[3] = {SPG_CACHE_APPEND, 256u, half};
+            spg_gpu_dispatch(r->c, k, spec, half ? 3u : 2u, &p, sizeof p,
+                             groups((uint64_t)rows * s->kv_heads * (head / 2u), 256u), 1, 1);
+            Access b = {0};
+            reads(&b, whole(&g->act[src]));
+            reads(&b, whole(&d->info));
+            reads(&b, (Range){keys, keys + bytes});
+            if (g->geo[l].buffer) reads(&b, whole(&g->geo[l]));
+            writes(&b, whole(&g->act[l]));
+            need(r, &b);
+            /* (a workgroup a row and head: CUDA's four warps, Vulkan's SPG_CACHE_THREADS invocations) */
+            spec[0] = SPG_CACHE_ATTEND;
+            spec[1] = cuda ? 128u : SPG_CACHE_THREADS;
+            spg_gpu_dispatch(r->c, k, spec, half ? 3u : 2u, &p, sizeof p, rows, s->heads, 1);
+            later = act;
+        }
+        if (later != ACT_NONE) {
+            Access a = {0};
+            reads(&a, whole(&g->act[l]));
+            writes(&a, whole(&g->act[l]));
+            eltwise(g, r, &a, SPG_ELT_BIAS_ACT, later, g->act[l].address, 0, 0, 0, total, C);
+        }
+    }
+}
+
+static void spingalett_gpu_decoder_free_here(SpgGpuDecoder *d) {
+    if (!d) return;
+    for (uint32_t k = 0; k < DECODE_KEPT; k++) spg_gpu_commands_free(d->kept[k]);
+    spg_gpu_buffer_free(&d->staging);
+    spg_gpu_arena_free(d->arena);
+    free(d->keys);
+    free(d->half);
+    free(d);
+}
+
+void spingalett_gpu_decoder_free(SpgGpuDecoder *d) {
+    const SpgBackend saved = spg_gpu_using();
+    if (d) spg_gpu_use(d->g->backend);
+    spingalett_gpu_decoder_free_here(d);
+    spg_gpu_use(saved);
+}
+
+static SpgGpuDecoder *spingalett_gpu_decoder_new_here(SpgGpuNet *g, uint32_t sequences, uint32_t length,
+                                                      const char **why) {
+    const NeuralNetwork *net = g->net;
+    const char *reason = "";
+    if (net->layers < 3 || net->shapes[1].type != LAYER_EMBEDDING || spingalett_source(net, 1) != 0) {
+        if (why) *why = "a network whose first layer is no embedding of tokens";
+        return NULL;
+    }
+    const uint32_t cells = net->shapes[1].height * net->shapes[1].width;
+    for (uint32_t l = 2; l < net->layers; l++)
+        if (!decodes(net, l, cells, &reason)) {
+            if (why) *why = reason;
+            return NULL;
+        }
+    if (length == 0 || length > cells || sequences == 0) {
+        if (why) *why = "sequences or lengths out of range";
+        return NULL;
+    }
+    SpgGpuDecoder *d = (SpgGpuDecoder *)calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->g = g;
+    d->sequences = sequences;
+    d->length = length;
+    d->most = g->capacity * cells;
+    d->vocabulary = net->shapes[net->layers - 1].channels;
+    d->keys = (uint64_t *)calloc(net->layers, sizeof *d->keys);
+    d->half = (uint8_t *)calloc(net->layers, 1);
+    d->arena = spg_gpu_arena_create();
+    if (!d->keys || !d->half || !d->arena) goto fail;
+    /* the caches: an attention layer's keys and values kept as its input is */
+    uint64_t bytes = 0;
+    uint64_t *offset = (uint64_t *)calloc(net->layers, sizeof *offset);
+    if (!offset) goto fail;
+    for (uint32_t l = 2; l < net->layers; l++) {
+        const LayerShape *s = &net->shapes[l];
+        if (s->type != LAYER_ATTENTION) continue;
+        d->half[l] = g->half[spingalett_source(net, l)];
+        offset[l] = bytes;
+        bytes += (2ull * sequences * length * s->kv_heads * (s->channels / s->heads) * (d->half[l] ? 2u : 4u) + 255u) & ~255ull;
+    }
+    spg_gpu_arena_add(d->arena, &d->cache, bytes ? bytes : 256u, SPG_MEMORY_DEVICE);
+    spg_gpu_arena_add(d->arena, &d->tokens, 4ull * d->most, SPG_MEMORY_DEVICE);
+    spg_gpu_arena_add(d->arena, &d->info, 12ull * d->most, SPG_MEMORY_DEVICE);
+    const bool made = spg_gpu_arena_commit(d->arena);
+    d->info_at = 4ull * d->most;
+    d->logits_at = (d->info_at + 12ull * d->most + 15u) & ~(size_t)15u;
+    if (!made || !spg_gpu_buffer_create(&d->staging, d->logits_at + 4ull * d->most * d->vocabulary, true)) {
+        free(offset);
+        goto fail;
+    }
+    for (uint32_t l = 2; l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_ATTENTION) d->keys[l] = d->cache.address + offset[l];
+    free(offset);
+    return d;
+fail:
+    if (why) *why = "out of memory";
+    spingalett_gpu_decoder_free_here(d);
+    return NULL;
+}
+
+SpgGpuDecoder *spingalett_gpu_decoder_new(SpgGpuNet *g, uint32_t sequences, uint32_t length, const char **why) {
+    if (!g) return NULL;
+    const SpgBackend saved = spg_gpu_using();
+    spg_gpu_use(g->backend);
+    SpgGpuDecoder *d = spingalett_gpu_decoder_new_here(g, sequences, length, why);
+    spg_gpu_use(saved);
+    return d;
+}
+
+uint32_t spingalett_gpu_decoder_rows(const SpgGpuDecoder *d) { return d ? d->most : 0; }
+
+/* The commands of a step of `rows` rows: kept ones, or recorded now in place of the oldest. */
+static SpgGpuCommands *decode_commands(SpgGpuDecoder *d, uint32_t rows) {
+    for (uint32_t k = 0; k < DECODE_KEPT; k++)
+        if (d->kept[k] && d->kept_rows[k] == rows) return d->kept[k];
+    SpgGpuNet *g = d->g;
+    const uint32_t L = g->net->layers - 1, slot = d->next;
+    d->next = (d->next + 1u) % DECODE_KEPT;
+    spg_gpu_commands_free(d->kept[slot]);
+    d->kept[slot] = NULL;
+    SpgGpuCommands *c = spg_gpu_commands_create();
+    Recorder *r = c && spg_gpu_record_begin(c) ? (Recorder *)calloc(1, sizeof *r) : NULL;
+    if (!r) {
+        spg_gpu_commands_free(c);
+        return NULL;
+    }
+    r->c = c;
+    r->g = g;
+    spg_gpu_copy(c, &d->staging, 0, &d->tokens, 0, 4ull * rows);
+    spg_gpu_copy(c, &d->staging, d->info_at, &d->info, 0, 12ull * rows);
+    barrier(r);
+    const SpgGpuBuffer input = g->act[0];
+    g->act[0] = d->tokens;
+    record_decode(d, r, rows);
+    g->act[0] = input;
+    barrier(r);
+    spg_gpu_copy(c, &g->act[L], 0, &d->staging, d->logits_at, 4ull * rows * d->vocabulary);
+    spg_gpu_barrier_host(c);
+    free(r);
+    if (!spg_gpu_record_end(c)) {
+        spg_gpu_commands_free(c);
+        return NULL;
+    }
+    d->kept[slot] = c;
+    d->kept_rows[slot] = rows;
+    return c;
+}
+
+static bool spingalett_gpu_decoder_step_here(SpgGpuDecoder *d, uint32_t rows, const uint32_t *tokens,
+                                             const uint32_t *sequence, const uint32_t *position, float *logits) {
+    SpgGpuNet *g = d->g;
+    if (rows == 0 || rows > d->most || g->lost) return false;
+    drain(g);
+    float *t = (float *)d->staging.mapped;
+    uint32_t *info = (uint32_t *)((char *)d->staging.mapped + d->info_at);
+    for (uint32_t k = 0; k < rows; k++) {
+        if (sequence[k] >= d->sequences || position[k] >= d->length) return false;
+        t[k] = (float)tokens[k];
+        info[2u * k] = sequence[k];
+        info[2u * k + 1u] = position[k];
+        info[2u * rows + k] = position[k];
+    }
+    SpgGpuCommands *c = decode_commands(d, rows);
+    if (!c || !spg_gpu_submit(c)) return false;
+    if (!spg_gpu_wait(c)) {
+        g->lost = true;
+        return false;
+    }
+    if (logits) memcpy(logits, (char *)d->staging.mapped + d->logits_at, 4ull * rows * d->vocabulary);
+    return true;
+}
+
+bool spingalett_gpu_decoder_step(SpgGpuDecoder *d, uint32_t rows, const uint32_t *tokens, const uint32_t *sequence,
+                                 const uint32_t *position, float *logits) {
+    if (!d) return false;
+    const SpgBackend saved = spg_gpu_using();
+    spg_gpu_use(d->g->backend);
+    const bool ok = spingalett_gpu_decoder_step_here(d, rows, tokens, sequence, position, logits);
+    spg_gpu_use(saved);
+    return ok;
+}
+
+/* Copies the cached keys and values of a sequence's first `length` positions to another sequence. */
+static bool spingalett_gpu_decoder_copy_here(SpgGpuDecoder *d, uint32_t from, uint32_t to, uint32_t length) {
+    const NeuralNetwork *net = d->g->net;
+    if (from >= d->sequences || to >= d->sequences || length > d->length) return false;
+    if (from == to || length == 0) return true;
+    drain(d->g);
+    SpgGpuCommands *c = spg_gpu_commands_create();
+    bool ok = c && spg_gpu_record_begin(c);
+    for (uint32_t l = 2; ok && l < net->layers; l++) {
+        if (!d->keys[l]) continue;
+        const LayerShape *s = &net->shapes[l];
+        const uint64_t row = (uint64_t)s->kv_heads * (s->channels / s->heads) * (d->half[l] ? 2u : 4u);
+        const uint64_t part = (uint64_t)d->sequences * d->length * row, base = d->keys[l] - d->cache.address;
+        for (uint32_t kv = 0; kv < 2u; kv++)
+            spg_gpu_copy(c, &d->cache, base + kv * part + (uint64_t)from * d->length * row, &d->cache,
+                         base + kv * part + (uint64_t)to * d->length * row, length * row);
+    }
+    if (ok) {
+        spg_gpu_barrier(c);
+        ok = spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
+    }
+    spg_gpu_commands_free(c);
+    return ok;
+}
+
+bool spingalett_gpu_decoder_copy(SpgGpuDecoder *d, uint32_t from, uint32_t to, uint32_t length) {
+    if (!d) return false;
+    const SpgBackend saved = spg_gpu_using();
+    spg_gpu_use(d->g->backend);
+    const bool ok = spingalett_gpu_decoder_copy_here(d, from, to, length);
+    spg_gpu_use(saved);
+    return ok;
 }

@@ -3,9 +3,10 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
-/* embed.comp: token embeddings, forward, and the table's gradient through a stable sort of the batch's
-   tokens (KEYS, then HIST, SCAN and SCATTER per eight bits of the token, then GRAD over each token's run
-   of positions in their order). Spec: OP, HALF (words: y 2, dy 6). 256 threads. */
+/* embed.comp: token embeddings, forward (rows of one token at given positions with SPG_EMBED_ROWS), and the
+   table's gradient through a stable sort of the batch's tokens (KEYS, then HIST, SCAN and SCATTER per eight
+   bits of the token, then GRAD over each token's run of positions in their order). Spec: OP, HALF (words: y 2,
+   dy 6). 256 threads. */
 
 #include "common.cuh"
 
@@ -19,6 +20,12 @@
 
 /* keys and values of the sort: four arrays of `total` uints (keys and positions, read from, written to) */
 DEVICE uint32_t *keys_of(const SpgEmbedPush &p, uint32_t which) { return U(p.keys) + (uint64_t)which * p.total; }
+
+/* the position of a cell: its place in its sample, or with SPG_EMBED_ROWS (rows of one token) keys[cell] */
+DEVICE uint32_t position(const SpgEmbedPush &p, uint32_t cell) {
+    if (p.flags & SPG_EMBED_ROWS) return U(p.keys)[cell];
+    return cell % p.tokens;
+}
 
 KERNEL(embed, SpgEmbedPush) {
     const uint32_t OP = spec.v[0], HALF = spec.v[1];
@@ -36,7 +43,7 @@ KERNEL(embed, SpgEmbedPush) {
                 const float t = x[cell];
                 float4_ v = {0.0f, 0.0f, 0.0f, 0.0f};
                 if (t >= 0.0f && t < (float)p.vocab) v = ((const float4_ *)w)[((uint64_t)(uint32_t)t * d + c) / 4u];
-                if (p.pos) v = add4(v, ((const float4_ *)pos)[((cell % p.tokens) * d + c) / 4u]);
+                if (p.pos) v = add4(v, ((const float4_ *)pos)[((uint64_t)position(p, cell) * d + c) / 4u]);
                 st4(p.y, at, 2u, HALF, v);
             }
             return;
@@ -46,7 +53,7 @@ KERNEL(embed, SpgEmbedPush) {
             const uint32_t cell = i / d, c = i % d;
             const float t = x[cell];
             float v = t >= 0.0f && t < (float)p.vocab ? w[(uint64_t)(uint32_t)t * d + c] : 0.0f;
-            if (p.pos) v += pos[(cell % p.tokens) * d + c];
+            if (p.pos) v += pos[(uint64_t)position(p, cell) * d + c];
             st(p.y, i, 2u, HALF, v);
         }
         return;
