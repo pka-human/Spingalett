@@ -1425,6 +1425,10 @@ resnet = sg.Network.from_torch(torch_module, torch.rand(1, 3, 32, 32))   # throu
 gpt = sg.gpt2_from_state_dict(GPT2LMHeadModel.from_pretrained("gpt2").state_dict(), heads=12, context=256)
 gpt.train_from_tokens("train.bin", epochs=1, batch_size=8, optimizer=sg.Optimizer.ADAMW, learning_rate=3e-4)
 print(gpt.generate([15496, 11, 314], 50, temperature=0.8, top_k=40))
+
+lm = sg.Network.from_pretrained("SmolLM2-135M.Q4_K_M.gguf", context=512)    # or a Hugging Face directory
+tok = sg.Tokenizer("SmolLM2-135M.Q4_K_M.gguf")
+print(tok.decode(lm.generate(tok.encode("The three primary colors are"), 24)))
 ```
 
 See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
