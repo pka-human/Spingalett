@@ -36,7 +36,26 @@ lm.TrainTokens("train.bin", stride: 64, new TrainOptions { Epochs = 5 });
 uint[] tokens = lm.Generate(new uint[] { 72, 101 }, 100, new Sampling { Temperature = 0.8f, TopK = 40 });
 ```
 
-A `Network` is used by one thread at a time; a `Model` (`Network.ToModel`, `Model.Load`) may be shared.
+Pretrained language models and their tokenizers (library 1.3 or later): `Network.FromPretrained` reads a
+Hugging Face model directory (`config.json` and safetensors weights; LLaMA, Mistral, Qwen2, GPT-2) or a GGUF
+file (its weights dequantized from F32 to the k-quants), and `Tokenizer` a `tokenizer.json`, a model directory
+or a GGUF file, encoding and decoding as Hugging Face's `tokenizers` does:
+
+```csharp
+using var model = Network.FromPretrained("SmolLM2-135M.Q4_K_M.gguf", context: 512);   // or a model directory
+using var tok = Tokenizer.Load("SmolLM2-135M.Q4_K_M.gguf");
+uint[] prompt = tok.Encode("<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\n", special: true);
+uint[] reply = model.Generate(prompt, 64, new Sampling { Temperature = 0.7f, Stop = new[] { tok.Id("<|im_end|>")!.Value } });
+Console.WriteLine(tok.Decode(reply));
+```
+
+`Encode(text, special, addSpecial)`: `special` turns special tokens written in the text into their ids (by
+default they are text), `addSpecial` adds the tokens the tokenizer puts around a text (LLaMA's BOS);
+`Decode(ids, skipSpecial)`, `Token(id)`, `Id(token)`, `Vocabulary`, `Bos`, `Eos`, `Pad` and `Unk` (null when
+the tokenizer has none) complete it.
+
+A `Network` is used by one thread at a time; a `Model` (`Network.ToModel`, `Model.Load`) and a `Tokenizer` may
+be shared.
 
 Tests: `dotnet run --project Spingalett.Tests` with the library on `LD_LIBRARY_PATH`;
 `SPINGALETT_LAYOUT=/path/to/Bin/SpingalettLayout` also compares every structure's layout with the C

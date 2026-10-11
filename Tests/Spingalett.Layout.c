@@ -135,6 +135,21 @@ int main(void) {
     FIELD(SpingalettSessionGenerateArgs, top_k); FIELD(SpingalettSessionGenerateArgs, top_p);
     FIELD(SpingalettSessionGenerateArgs, seed); FIELD(SpingalettSessionGenerateArgs, stop_tokens);
     FIELD(SpingalettSessionGenerateArgs, stop_count);
+    SIZE(SpingalettTokenizerInfo); FIELD(SpingalettTokenizerInfo, reserved);
+    FIELD(SpingalettTokenizerInfo, vocabulary); FIELD(SpingalettTokenizerInfo, added); FIELD(SpingalettTokenizerInfo, bos);
+    FIELD(SpingalettTokenizerInfo, eos); FIELD(SpingalettTokenizerInfo, pad); FIELD(SpingalettTokenizerInfo, unk);
+
+    SIZE(SpingalettTokenizeArgs); FIELD(SpingalettTokenizeArgs, reserved);
+    FIELD(SpingalettTokenizeArgs, tokenizer); FIELD(SpingalettTokenizeArgs, text); FIELD(SpingalettTokenizeArgs, length);
+    FIELD(SpingalettTokenizeArgs, tokens); FIELD(SpingalettTokenizeArgs, capacity); FIELD(SpingalettTokenizeArgs, special);
+    FIELD(SpingalettTokenizeArgs, add_special);
+
+    SIZE(SpingalettDetokenizeArgs); FIELD(SpingalettDetokenizeArgs, reserved);
+    FIELD(SpingalettDetokenizeArgs, tokenizer); FIELD(SpingalettDetokenizeArgs, tokens); FIELD(SpingalettDetokenizeArgs, count);
+    FIELD(SpingalettDetokenizeArgs, text); FIELD(SpingalettDetokenizeArgs, capacity); FIELD(SpingalettDetokenizeArgs, skip_special);
+
+    SIZE(SpingalettPretrainedArgs); FIELD(SpingalettPretrainedArgs, reserved);
+    FIELD(SpingalettPretrainedArgs, path); FIELD(SpingalettPretrainedArgs, context);
 
     SIZE(PredictArgs); FIELD(PredictArgs, reserved);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);

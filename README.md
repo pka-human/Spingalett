@@ -56,7 +56,7 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
-| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens) with a key-value cache (sessions of deployment models: each token computed once, several sequences generated together), GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens) with a key-value cache (sessions of deployment models: each token computed once, several sequences generated together), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) and GGUF files (dequantized from 15 types) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
@@ -570,6 +570,130 @@ spingalett_session_free(s);
 - `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every
   epoch. In Python, `gpt2_from_state_dict()` and `llama_from_state_dict()` make networks of GPT-2
   checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2).
+
+### Tokenizers
+
+`spingalett_tokenizer_load()` reads the tokenizer of a language model: a Hugging Face
+`tokenizer.json` file, a model directory holding one (its `tokenizer_config.json` then names the
+BOS and EOS tokens) or a GGUF file (see below). `spingalett_tokenize()` turns UTF-8 text into token ids and
+`spingalett_detokenize()` ids back into text, id for id and byte for byte as Hugging Face's
+`tokenizers` library does:
+
+```c
+SpingalettTokenizer *tok = spingalett_tokenizer_load("models/SmolLM2-135M");     /* NULL on error */
+uint32_t ids[256];
+int64_t n = spingalett_tokenize(.tokenizer = tok, .text = "<|im_start|>user\nHello!<|im_end|>",
+                                .tokens = ids, .capacity = 256, .special = true);
+char text[1024];
+spingalett_detokenize(.tokenizer = tok, .tokens = ids, .count = (size_t)n, .text = text, .capacity = sizeof text);
+uint32_t end = spingalett_tokenizer_id(tok, "<|im_end|>");                /* a chat format's stop token */
+SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);            /* vocabulary, BOS, EOS, ... */
+spingalett_tokenizer_free(tok);
+```
+
+| Family | Models | What the file holds |
+|---|---|---|
+| Byte-level BPE | GPT-2, SmolLM | ByteLevel pre-tokenizer (GPT-2's expression), digits apart |
+| tiktoken's encodings | LLaMA 3 (cl100k), Qwen2 (cl100k with single digits, NFC), GPT-4o-like (o200k) | a Split by the expression, then ByteLevel; ignore_merges |
+| SentencePiece's BPE | LLaMA 2, TinyLlama, Mistral, Phi-3 | Prepend and Replace of `▁` (or Metaspace), byte fallback to `<0xXX>` tokens |
+
+- The steps are those of the `tokenizers` library: added tokens found first (leftmost, longest,
+  with their `lstrip`, `rstrip` and `single_word` rules), the normalizers (NFC, Prepend, Replace,
+  Strip), the pre-tokenizers (ByteLevel, Split, Metaspace, Digits), the BPE merges by rank, the
+  template of the post-processor (`.add_special`: LLaMA's BOS), and in decoding ByteLevel,
+  ByteFallback, Replace, Fuse, Strip and Metaspace. Merges go through a heap of candidate pairs, so a
+  piece of n characters takes n log n steps; a SentencePiece text, which is one piece, is merged word
+  by word where the vocabulary shows that no merge joins a word to the `▁` after it (the same
+  tokens, without a heap of the whole text). Other models (WordPiece, Unigram), normalizers and
+  expressions are refused with an error that names them.
+- The pre-tokenizers' regular expressions are matched by hand, not by a regular expression library:
+  GPT-2's, cl100k's (with up to three or single digits) and o200k's (with tekken's variant) are
+  recognized by their text and matched with the semantics of the Oniguruma expressions the
+  `tokenizers` library runs, letters, numbers and marks from the Unicode tables of
+  `Src/Spingalett.Unicode.h` (written by `Src/make_unicode.py`).
+- Special tokens written in a text become their ids only with `.special = true`; by default they are
+  text like any other, so that text from users cannot forge a chat format's control tokens. Added
+  tokens that are not special are always found. `.skip_special` leaves special tokens out of
+  decoded text; bytes that are no UTF-8 (a character split between tokens) decode to U+FFFD.
+- Both calls return the full count (tokens, or bytes of text) also when the array is too small,
+  writing what fits: call again with room for all. Input that is not UTF-8 is an error.
+- On the tokenizers of GPT-2, LLaMA 3.2, Qwen2.5, SmolLM2, TinyLlama, Mistral 7B (v0.1 and v0.3) and
+  Phi-3, the ids and decoded texts equal those of `tokenizers` 0.23 on texts of every script, emoji,
+  combining marks, whitespace runs, digits and special tokens. On an i7-12650H 0.9 MB of prose and
+  code encode in 0.055 s with GPT-2's tokenizer (0.30 s in `tokenizers` 0.23), 0.030 s with LLaMA
+  3's (0.25 s), 0.075 s with Qwen2.5's (0.27 s) and 0.067 s with TinyLlama's (0.31 s), medians of
+  seven runs on one thread.
+
+### Pretrained language models
+
+`spingalett_load_pretrained()` makes a network of a Hugging Face model directory: `config.json` and
+the weights in `model.safetensors`, or in the shards `model.safetensors.index.json` lists. The model
+types are `llama`, `mistral`, `qwen2` and `gpt2`; the network takes a window of `.context` token ids
+and gives every position's logits, so it generates, trains further (fine-tuning), saves and deploys
+like any other:
+
+```c
+NeuralNetwork *net = spingalett_load_pretrained(.path = "models/SmolLM2-135M", .context = 512);
+SpingalettTokenizer *tok = spingalett_tokenizer_load("models/SmolLM2-135M");
+uint32_t prompt[512], tokens[64];
+int64_t n = spingalett_tokenize(.tokenizer = tok, .text = "The history of computing", .tokens = prompt, .capacity = 512);
+uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = (uint32_t)n, .tokens = tokens,
+                                    .count = 64, .temperature = 0.7f, .top_p = 0.9f,
+                                    .stop_tokens = &(uint32_t){spingalett_tokenizer_info(tok).eos}, .stop_count = 1);
+```
+
+- LLaMA, Mistral and Qwen2 become RMS normalizations, grouped-query attention with rotary
+  embeddings (the queries', keys' and values' projections in one linear layer, with Qwen2's biases;
+  a `head_dim` of its own), and SwiGLU as a SiLU layer times a linear one; GPT-2 layer
+  normalizations, learned positions, its GELU (`gelu_new`: the tanh form) and its Conv1D weights,
+  transposed. A missing `lm_head.weight` (tied embeddings) becomes a copy of the embeddings. These
+  are the networks of the Python bindings' `llama_from_state_dict()` and `gpt2_from_state_dict()`,
+  which give the same logits bit for bit.
+- Weights in F32, F16 or BF16 are decoded straight from the mapped files into the network, whose
+  arrays are reserved at their final sizes first, so a model is never copied: SmolLM2-135M (BF16)
+  loads in 0.17 s on an i7-12650H.
+- `Examples/Pretrained.c` continues a prompt with any of these models, printing each token as it
+  comes: `Bin/Pretrained models/SmolLM2-135M "The three primary colors are" 64`.
+- `.context` 0 takes the model's positions (GPT-2's all, LLaMA's up to 2048). Mistral's sliding
+  window is not applied: attention covers the whole window, which is exact while the context is
+  within the sliding window (a warning says when it is not). Scaled rotary embeddings (LLaMA 3.1's
+  `llama3`, YaRN) are refused, as is anything else the layers do not compute, with an error that
+  names it.
+- On SmolLM2-135M the logits are those of `transformers` within 2.4e-4 (of logits up to 42), on
+  Qwen2.5-0.5B-Instruct within 4e-4 (of 24), and the greedy continuations are the same; on Hugging
+  Face's tiny random LLaMA and GPT-2 within 2e-7. The
+  `pretrained` test group checks tiny LLaMA (BF16, sharded), Qwen2 (F16, biases, tied), Mistral
+  and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) against PyTorch, within 2e-6.
+
+GGUF files, llama.cpp's, load the same way: `.path` names the file, `spingalett_tokenizer_load()` reads
+its vocabulary, and the network is that of its `general.architecture` (`llama`, which covers Mistral,
+`qwen2` or `gpt2`) with the hyper-parameters of its metadata:
+
+```c
+NeuralNetwork *net = spingalett_load_pretrained(.path = "SmolLM2-135M.Q4_K_M.gguf", .context = 512);
+SpingalettTokenizer *tok = spingalett_tokenizer_load("SmolLM2-135M.Q4_K_M.gguf");
+```
+
+- Quantized weights become floats as llama.cpp's `dequantize_row_*()` computes them: F32, F16, BF16,
+  Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, the k-quants Q2_K to Q6_K, and IQ4_NL and IQ4_XS, which quantized
+  files of widths that are no multiple of 256 hold where k-quants cannot be. The network keeps
+  floats (quantize it again with `spingalett_model_from_network()` to deploy it). The other i-quants
+  are refused, naming the tensor and its type. On quantized files of SmolLM2-135M, TinyStories and
+  Qwen2.5-0.5B (tensors of Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q3_K, Q4_K, Q5_K, Q6_K and IQ4_NL), and on
+  random blocks of every type above, the weights are those of the `gguf` Python package's
+  dequantization, bit for bit (the dequantization is compiled in IEEE order, so they are the same on
+  every platform); a Q4_K_M file of SmolLM2-135M loads in 0.18 s on an i7-12650H.
+- llama.cpp's converter stores LLaMA's queries and keys with the rows of each head's two halves
+  interleaved, for its rotation of adjacent pairs; they are put back in Hugging Face's order, which
+  the library's rotation of halves expects (Qwen2's are stored in that order already).
+- A vocabulary of the `gpt2` model is a byte-level BPE of its merges, cut by the pre-tokenizer
+  `tokenizer.ggml.pre` names (`llama-bpe`, `qwen2`, `smollm`, `gpt-2`, ...); one of the `llama` model
+  is SentencePiece's BPE of its scores, with byte fallback and the space before each text and after
+  each special token, as llama.cpp and the `sentencepiece` library encode it. Control tokens are
+  special, user-defined tokens are found in any text, and `tokenizer.ggml.add_bos_token` gives the
+  BOS of `.add_special`. The GGUF vocabularies of SmolLM2, Qwen2.5 and TinyStories give the ids of
+  the `tokenizer.json` files they were converted from (TinyStories' finds its special tokens in the
+  normalized text, which llama.cpp does not: with `.special` those differ).
 
 ### Importing models: ONNX and PyTorch
 
@@ -1401,6 +1525,10 @@ resnet = sg.Network.from_torch(torch_module, torch.rand(1, 3, 32, 32))   # throu
 gpt = sg.gpt2_from_state_dict(GPT2LMHeadModel.from_pretrained("gpt2").state_dict(), heads=12, context=256)
 gpt.train_from_tokens("train.bin", epochs=1, batch_size=8, optimizer=sg.Optimizer.ADAMW, learning_rate=3e-4)
 print(gpt.generate([15496, 11, 314], 50, temperature=0.8, top_k=40))
+
+lm = sg.Network.from_pretrained("SmolLM2-135M.Q4_K_M.gguf", context=512)    # or a Hugging Face directory
+tok = sg.Tokenizer("SmolLM2-135M.Q4_K_M.gguf")
+print(tok.decode(lm.generate(tok.encode("The three primary colors are"), 24)))
 ```
 
 See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
@@ -1444,16 +1572,20 @@ sg::Result<sg::Model> int8 = net->to_model(sg::Precision::Int8);
 one, for residual blocks and branches; `add_layers()` and `concat_layers()` take their inputs
 directly. `linear()`, `embedding()`, `attention()`, `rms_norm()` and `multiply_layers()` build
 transformers; `Network::train_tokens()` trains on a token file and `generate()` continues a prompt
-(`sg::Sampling`). `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()`
+(`sg::Sampling`). `Network::from_pretrained(path, context)` loads a Hugging Face model directory or a
+GGUF file, and `sg::Tokenizer::load(path)` its tokenizer (`encode()`, `decode()`, `token()`, `id()`,
+`info()`). `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()`
 gives the C object of a wrapper for whatever the wrapper does not cover.
 
 ## Bindings for other languages
 
-`Bindings/` holds bindings for Rust, .NET, Go, Java and PHP over the shared library: networks of
-every kind of layer built in each language's style, training on arrays or token files, prediction,
-evaluation, generation, parameters, files and deployment models. Each one's tests train XOR and a
-small LLaMA-like model whose generation they check, and compare every structure the binding lays out
-with the C compiler's layout (CI runs them against the installed library):
+`Bindings/` holds bindings for Rust, .NET, Go, Java and PHP over the shared library: networks of every
+kind of layer built in each language's style, training on arrays or token files, prediction,
+evaluation, generation, parameters, files and deployment models, pretrained language models (Hugging
+Face directories, GGUF files) and their tokenizers. Each one's tests train XOR and a small LLaMA-like
+model whose generation they check, check the tokenizers and pretrained models against the C tests'
+expectations, and compare every structure the binding lays out with the C compiler's layout (CI runs
+them against the installed library):
 
 | Language | Directory | Interface | Builds with |
 |---|---|---|---|
@@ -1719,8 +1851,8 @@ Src/                  Library sources (network, training, kernels, serialization
 Src/Gpu/              The GPU backends: device layer, network executor, Vulkan's compute shaders
                       (Shaders/) and the CUDA kernels (Cuda/)
 Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, CharGPT (a
-                      character-level GPT), throughput benchmark (C and PyTorch counterpart),
-                      DatasetTool, ModelTool
+                      character-level GPT), Pretrained (a Hugging Face or GGUF language model continuing a
+                      prompt), throughput benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
 Examples/Runtime/     RunModel, a program of the runtime alone
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets)

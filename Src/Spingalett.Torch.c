@@ -995,3 +995,28 @@ bool spingalett_load_pytorch(NeuralNetwork *net, const char *path, const char *c
     spingalett_file_close(&file);
     return ok;
 }
+
+/* The safetensors reader for the checkpoints of language models (Spingalett.Pretrained.c). */
+bool spingalett_safetensors(const uint8_t *data, size_t size, SpgTensor **tensors, size_t *count, char *error,
+                            size_t error_size) {
+    Weights w = {0};
+    bool ok = read_safetensors(data, size, &w);
+    *tensors = NULL;
+    *count = 0;
+    if (ok && w.count && !(*tensors = (SpgTensor *)malloc(w.count * sizeof(SpgTensor)))) ok = werr(&w, "out of memory");
+    for (size_t k = 0; ok && k < w.count; k++) {
+        const Weight *t = &w.items[k];
+        SpgTensor *o = &(*tensors)[k];
+        o->name = t->name.s;
+        o->name_len = t->name.n;
+        o->dtype = t->dtype;
+        o->ndims = t->ndims;
+        memcpy(o->dims, t->dims, sizeof o->dims);
+        o->data = t->data;
+        o->bytes = t->bytes;
+    }
+    if (ok) *count = w.count;
+    else snprintf(error, error_size, "%s", w.error[0] ? w.error : "safetensors: the file cannot be read");
+    free(w.items);
+    return ok;
+}

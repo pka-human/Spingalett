@@ -52,7 +52,7 @@ __all__ = [
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
-    "gpt2_from_state_dict", "llama_from_state_dict",
+    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer",
 ]
 
 
@@ -628,6 +628,51 @@ class _LRScheduleParams(Structure):
     ]
 
 
+class _TokenizerInfo(Structure):
+    _fields_ = [
+        ("vocabulary", c_uint32),
+        ("added", c_uint32),
+        ("bos", c_uint32),
+        ("eos", c_uint32),
+        ("pad", c_uint32),
+        ("unk", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _TokenizeArgs(Structure):
+    _fields_ = [
+        ("tokenizer", c_void_p),
+        ("text", c_char_p),
+        ("length", c_size_t),
+        ("tokens", POINTER(c_uint32)),
+        ("capacity", c_size_t),
+        ("special", c_bool),
+        ("add_special", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _DetokenizeArgs(Structure):
+    _fields_ = [
+        ("tokenizer", c_void_p),
+        ("tokens", POINTER(c_uint32)),
+        ("count", c_size_t),
+        ("text", c_void_p),
+        ("capacity", c_size_t),
+        ("skip_special", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _PretrainedArgs(Structure):
+    _fields_ = [
+        ("path", c_char_p),
+        ("context", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 # --------------------------------------------------------------------------- library loading
 
 def _library_names() -> List[str]:
@@ -797,6 +842,33 @@ _set_log_callback = _bind("spingalett_set_log_callback", None, [_LogCallbackFn])
 _set_log_level = _bind("spingalett_set_log_level", None, [c_int])
 _set_verbose = _bind("spingalett_set_verbose", None, [c_bool])
 _seed = _bind("spingalett_seed", None, [c_uint64])
+
+
+def _bind_optional(name, restype, argtypes):
+    """A function of a later library than the oldest these bindings accept: None when it is missing, so that the
+    rest of the bindings still work with an older library."""
+    try:
+        return _bind(name, restype, argtypes)
+    except AttributeError:
+        return None
+
+
+# 1.3: tokenizers and pretrained language models
+_tokenizer_load = _bind_optional("spingalett_tokenizer_load", c_void_p, [c_char_p])
+_tokenizer_from_memory = _bind_optional("spingalett_tokenizer_from_memory", c_void_p, [c_char_p, c_size_t])
+_tokenizer_free = _bind_optional("spingalett_tokenizer_free", None, [c_void_p])
+_tokenizer_info = _bind_optional("spingalett_tokenizer_info", _TokenizerInfo, [c_void_p])
+_tokenizer_token = _bind_optional("spingalett_tokenizer_token", c_char_p, [c_void_p, c_uint32])
+_tokenizer_id = _bind_optional("spingalett_tokenizer_id", c_uint32, [c_void_p, c_char_p])
+_tokenize = _bind_optional("spingalett_tokenize_args", ctypes.c_int64, [_TokenizeArgs])
+_detokenize = _bind_optional("spingalett_detokenize_args", ctypes.c_int64, [_DetokenizeArgs])
+_load_pretrained = _bind_optional("spingalett_load_pretrained_args", _NetPtr, [_PretrainedArgs])
+
+
+def _require(fn, what: str):
+    if fn is None:
+        raise SpingalettError(-1, f"{what} needs Spingalett 1.3 or later (the library is {_LIBRARY_VERSION})")
+    return fn
 
 
 def library_path() -> str:
@@ -2043,6 +2115,20 @@ class Network:
         return cls._wrap(ptr)
 
     @classmethod
+    def from_pretrained(cls, path, context: int = 0) -> "Network":
+        """A language model as a network: a Hugging Face model directory (``config.json`` and safetensors weights,
+        sharded or not; ``model_type`` llama, mistral, qwen2 or gpt2) or a GGUF file (``general.architecture``
+        llama, qwen2 or gpt2, its weights dequantized from F32 to the k-quants), see spingalett_load_pretrained().
+        ``context`` is the network's window of tokens (0: the model's positions, LLaMA's at most 2048); the network
+        gives every position's logits and generates, trains and saves like any other. Its tokenizer:
+        :class:`Tokenizer` on the same path."""
+        args = _PretrainedArgs(path=_encode_path(path), context=int(context))
+        ptr = _call(_require(_load_pretrained, "Network.from_pretrained"), args)
+        if not ptr:
+            raise SpingalettError(-1, f"could not load {path!s}")
+        return cls._wrap(ptr)
+
+    @classmethod
     def from_torch(cls, module, example_input) -> "Network":
         """A network computing what a PyTorch module computes, through an ONNX export in memory
         (``torch.onnx.export``; ``example_input`` is a tensor of the module's input shape, NCHW for
@@ -2496,6 +2582,149 @@ class Trainer:
 
 
 # --------------------------------------------------------------------------- data sets
+
+# --------------------------------------------------------------------------- tokenizers
+
+NO_TOKEN = 0xFFFFFFFF
+
+
+class Tokenizer:
+    """The tokenizer of a language model (spingalett_tokenizer_load()): a Hugging Face ``tokenizer.json`` file, a
+    model directory holding one (its ``tokenizer_config.json`` names BOS and EOS), a GGUF file, or the bytes of a
+    ``tokenizer.json`` or GGUF file. Byte-level BPE (GPT-2, SmolLM), tiktoken's encodings (LLaMA 3, Qwen2) and
+    SentencePiece's BPE (LLaMA 2, Mistral, Phi-3), encoding and decoding as Hugging Face's ``tokenizers`` does::
+
+        tok = sg.Tokenizer("models/SmolLM2-135M")
+        ids = tok.encode("<|im_start|>user\\nHi<|im_end|>", special=True)
+        text = tok.decode(ids)
+    """
+
+    def __init__(self, source):
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            ptr = _call(_require(_tokenizer_from_memory, "Tokenizer"), data, len(data))
+        else:
+            ptr = _call(_require(_tokenizer_load, "Tokenizer"), _encode_path(source))
+        if not ptr:
+            raise SpingalettError(-1, "could not load the tokenizer")
+        self._ptr = ptr
+
+    @classmethod
+    def load(cls, path) -> "Tokenizer":
+        return cls(os.fspath(path))
+
+    @classmethod
+    def from_bytes(cls, data) -> "Tokenizer":
+        return cls(bytes(data))
+
+    def close(self) -> None:
+        ptr = getattr(self, "_ptr", None)
+        if ptr:
+            self._ptr = None
+            _tokenizer_free(ptr)
+
+    def __enter__(self) -> "Tokenizer":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # interpreter shutdown may have torn down ctypes already
+            pass
+
+    @property
+    def _handle(self):
+        if not getattr(self, "_ptr", None):
+            raise ValueError("tokenizer is closed")
+        return self._ptr
+
+    def encode(self, text: str, special: bool = False, add_special: bool = False) -> List[int]:
+        """The ids of a text. ``special``: special tokens written in it (``<|im_start|>``) become their ids (by
+        default they are text, so that text from users cannot forge them); ``add_special``: the tokens the tokenizer
+        adds around a text (LLaMA's BOS), as ``tokenizers``' ``add_special_tokens=True``."""
+        data = text.encode("utf-8")
+        capacity = len(data) + 16
+        while True:
+            ids = (c_uint32 * capacity)()
+            args = _TokenizeArgs(tokenizer=self._handle, text=data if data else b"", length=len(data), tokens=ids,
+                                 capacity=capacity, special=special, add_special=add_special)
+            count = _call(_tokenize, args)
+            if count < 0:
+                raise SpingalettError(-1, "could not encode the text")
+            if count <= capacity:
+                return list(ids[:count])
+            capacity = int(count)
+
+    def decode(self, tokens, skip_special: bool = False) -> str:
+        """The text of ids (``skip_special``: without the special tokens); bytes that are no UTF-8, as a character
+        split between tokens, become U+FFFD."""
+        ids = np.ascontiguousarray(tokens, dtype=np.uint32).reshape(-1)
+        pointer = ids.ctypes.data_as(POINTER(c_uint32))
+        capacity = 4 * len(ids) + 64
+        while True:
+            buffer = ctypes.create_string_buffer(capacity)
+            args = _DetokenizeArgs(tokenizer=self._handle, tokens=pointer, count=len(ids),
+                                   text=ctypes.cast(buffer, c_void_p), capacity=capacity, skip_special=skip_special)
+            size = _call(_detokenize, args)
+            if size < 0:
+                raise SpingalettError(-1, "could not decode the tokens")
+            if size < capacity:
+                return buffer.raw[:size].decode("utf-8", errors="replace")
+            capacity = int(size) + 1
+
+    def token(self, id: int) -> Optional[str]:
+        """The token of an id as the vocabulary writes it ("Ġthe", "▁the", "<|im_start|>"), None for no token."""
+        s = _tokenizer_token(self._handle, int(id) & 0xFFFFFFFF)
+        return s.decode("utf-8", errors="replace") if s is not None else None
+
+    def id(self, token: str) -> Optional[int]:
+        """The id of a token as the vocabulary writes it (added tokens first), None when there is none."""
+        i = _tokenizer_id(self._handle, token.encode("utf-8"))
+        return None if i == NO_TOKEN else int(i)
+
+    def _info(self) -> _TokenizerInfo:
+        return _tokenizer_info(self._handle)
+
+    @property
+    def vocabulary(self) -> int:
+        """Token ids: the largest one + 1."""
+        return int(self._info().vocabulary)
+
+    def __len__(self) -> int:
+        return self.vocabulary
+
+    @property
+    def added(self) -> int:
+        return int(self._info().added)
+
+    @property
+    def bos(self) -> Optional[int]:
+        v = self._info().bos
+        return None if v == NO_TOKEN else int(v)
+
+    @property
+    def eos(self) -> Optional[int]:
+        v = self._info().eos
+        return None if v == NO_TOKEN else int(v)
+
+    @property
+    def pad(self) -> Optional[int]:
+        v = self._info().pad
+        return None if v == NO_TOKEN else int(v)
+
+    @property
+    def unk(self) -> Optional[int]:
+        v = self._info().unk
+        return None if v == NO_TOKEN else int(v)
+
+    def __repr__(self) -> str:
+        if not getattr(self, "_ptr", None):
+            return "Tokenizer(closed)"
+        return f"Tokenizer(vocabulary={self.vocabulary}, bos={self.bos}, eos={self.eos})"
+
 
 # --------------------------------------------------------------------------- language models from PyTorch
 

@@ -99,6 +99,77 @@ fn transformer_generates() {
     assert_eq!(net.generate(&[3, 4, 5], 20, &stop).unwrap(), vec![6, 7, 8, 9]);
 }
 
+/// The repository's test data (Tests/Data).
+fn data(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../Tests/Data").join(name)
+}
+
+fn unhex(hex: &str) -> String {
+    if hex == "-" {
+        return String::new();
+    }
+    let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn tokenizer_gives_hugging_faces_ids() {
+    // tokenizer_llama3.txt: "special add text", the ids (their count first), the text decoded, and without
+    // special tokens, as Hugging Face's tokenizers gives them (Tests/make_tokenizer_tests.py)
+    let tok = sg::Tokenizer::load(data("tokenizer_llama3.json")).unwrap();
+    let expected = std::fs::read_to_string(data("tokenizer_llama3.txt")).unwrap();
+    let lines: Vec<&str> = expected.lines().filter(|l| !l.starts_with('#')).collect();
+    let mut cases = 0;
+    for case in lines.chunks(4) {
+        let head: Vec<&str> = case[0].split_whitespace().collect();
+        let (special, add, text) = (head[0] == "1", head[1] == "1", unhex(head[2]));
+        let ids: Vec<u32> = case[1].split_whitespace().skip(1).map(|x| x.parse().unwrap()).collect();
+        assert_eq!(tok.encode(&text, special, add).unwrap(), ids, "{text:?} (special {special}, add {add})");
+        assert_eq!(tok.decode(&ids, false).unwrap(), unhex(case[2]), "{text:?} decoded");
+        assert_eq!(tok.decode(&ids, true).unwrap(), unhex(case[3]), "{text:?} decoded without special tokens");
+        cases += 1;
+    }
+    assert!(cases >= 100, "{cases} cases");
+    assert_eq!((tok.vocabulary(), tok.bos(), tok.eos(), tok.unk()), (425, Some(420), Some(421), None));
+    assert_eq!(tok.id("<|begin_of_text|>"), Some(420));
+    assert_eq!(tok.token(420).as_deref(), Some("<|begin_of_text|>"));
+    assert_eq!((tok.id("no such token"), tok.token(1 << 30)), (None, None));
+    let long = "Tokenizers cut text into pieces, ".repeat(300);
+    assert_eq!(tok.decode(&tok.encode(&long, false, false).unwrap(), false).unwrap(), long);
+    let bytes = std::fs::read(data("tokenizer_llama3.json")).unwrap();
+    let again = sg::Tokenizer::from_bytes(&bytes).unwrap();
+    assert_eq!(again.encode("Hello world", false, true).unwrap(), tok.encode("Hello world", false, true).unwrap());
+    assert!(sg::Tokenizer::load("/nonexistent/tokenizer.json").is_err());
+}
+
+/// A window of tokens and the logits PyTorch gives it (NAME.bin of Tests/make_pretrained_tests.py).
+fn window(name: &str) -> (Vec<f32>, Vec<f32>) {
+    let raw = std::fs::read(data(name)).unwrap();
+    assert_eq!(&raw[..4], b"SPGT");
+    let word = |k: usize| u32::from_le_bytes(raw[4 * k..4 * k + 4].try_into().unwrap()) as usize;
+    let (t, n) = (word(2), word(3));
+    let floats: Vec<f32> = raw[16..].chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    (floats[..t].to_vec(), floats[t..t + n].to_vec())
+}
+
+#[test]
+fn pretrained_models_give_pytorchs_logits() {
+    sg::set_verbose(false);
+    let (tokens, logits) = window("hf_llama.bin");
+    for path in ["hf_llama", "gguf_llama.gguf"] {
+        let mut lm = Network::from_pretrained(data(path), tokens.len() as u32).unwrap();
+        assert_eq!(lm.output_size() as usize, logits.len());
+        let got = lm.predict(&tokens).unwrap();
+        let worst = got.iter().zip(&logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{path}: logits differ from PyTorch's by {worst}");
+    }
+    let tok = sg::Tokenizer::load(data("hf_llama")).unwrap();
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog, it's 1234 times!", false, false).unwrap();
+    assert_eq!(ids[..tokens.len()].iter().map(|&i| i as f32).collect::<Vec<_>>(), tokens);
+    assert_eq!(tok.eos(), Some(424));                   // tokenizer_config.json's eos_token
+    assert!(Network::from_pretrained("/nonexistent/model", 0).is_err());
+}
+
 /// SpingalettLayout's dump: "Struct size N" and "Struct.field offset".
 fn layout() -> Option<HashMap<String, usize>> {
     let tool = std::env::var("SPINGALETT_LAYOUT").ok()?;
@@ -216,5 +287,18 @@ fn layout_matches_c() {
         input_size = "input_size", output_size = "output_size", layer_count = "layer_count", loss = "loss",
         workspace_size = "workspace_size", image = "image", image_size = "image_size", reserved = "reserved",
     ]);
+    fields!("SpingalettTokenizerInfo", sys::TokenizerInfo, [
+        vocabulary = "vocabulary", added = "added", bos = "bos", eos = "eos", pad = "pad", unk = "unk",
+        reserved = "reserved",
+    ]);
+    fields!("SpingalettTokenizeArgs", sys::TokenizeArgs, [
+        tokenizer = "tokenizer", text = "text", length = "length", tokens = "tokens", capacity = "capacity",
+        special = "special", add_special = "add_special", reserved = "reserved",
+    ]);
+    fields!("SpingalettDetokenizeArgs", sys::DetokenizeArgs, [
+        tokenizer = "tokenizer", tokens = "tokens", count = "count", text = "text", capacity = "capacity",
+        skip_special = "skip_special", reserved = "reserved",
+    ]);
+    fields!("SpingalettPretrainedArgs", sys::PretrainedArgs, [path = "path", context = "context", reserved = "reserved"]);
     assert!(bad.is_empty(), "layout mismatches:\n{}", bad.join("\n"));
 }

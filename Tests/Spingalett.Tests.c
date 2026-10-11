@@ -8,8 +8,8 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad conv norm graph onnx equiv cont optim sched dropout gen predict valid
- *                                step data io model xor
+ *   Spingalett.Tests [group]     groups: grad conv norm graph onnx tokenizer pretrained equiv cont optim sched
+ *                                dropout gen predict valid step data io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 
 #ifndef SPINGALETT_TEST_DATA_DIR
 #define SPINGALETT_TEST_DATA_DIR "Data"
@@ -5006,6 +5007,477 @@ static void pytorch_transposed(void) {
     free(data);
 }
 
+/* ---- tokenizers: the ids and texts of Hugging Face's tokenizers library (Tests/make_tokenizer_tests.py) ---- */
+
+/* Bytes of a hex string ("-" for none) into out; returns their count. */
+static size_t unhex(const char *hex, char *out) {
+    size_t n = 0;
+    if (hex[0] == '-') return 0;
+    for (; isxdigit((unsigned char)hex[0]) && isxdigit((unsigned char)hex[1]); hex += 2) {
+        int hi = hex[0] <= '9' ? hex[0] - '0' : (hex[0] | 32) - 'a' + 10, lo = hex[1] <= '9' ? hex[1] - '0' : (hex[1] | 32) - 'a' + 10;
+        out[n++] = (char)(hi * 16 + lo);
+    }
+    return n;
+}
+
+/* Every case of an expectations file (tokenizer_NAME.txt) for a tokenizer file of Tests/Data: the ids (also
+   counted without room, and cut short by a small array), and both decodings ("*": not checked). */
+static void tokenizer_cases(const char *name, const char *file, const char *expectations, int least) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, file);
+    SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+    CHECK(tok, "%s: %s", path, spingalett_last_error_message());
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, expectations);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "%s: no expected ids", path);
+    if (!tok || !f) { if (f) fclose(f); spingalett_tokenizer_free(tok); return; }
+    enum { LINE = 1 << 16 };
+    char *line = malloc(LINE), *text = malloc(LINE), *want = malloc(LINE), *got = malloc(LINE);
+    uint32_t *ids = malloc(LINE * sizeof(uint32_t)), *expect = malloc(LINE * sizeof(uint32_t));
+    int cases = 0, wrong_ids = 0, wrong_text = 0;
+    while (fgets(line, LINE, f)) {
+        if (line[0] == '#') continue;
+        int special = 0, add = 0, used = 0;
+        char *hex = malloc(LINE);
+        if (sscanf(line, "%d %d %s", &special, &add, hex) != 3) { free(hex); break; }
+        size_t n = unhex(hex, text);
+        free(hex);
+        text[n] = '\0';
+        unsigned count = 0;
+        if (!fgets(line, LINE, f) || sscanf(line, "%u%n", &count, &used) != 1 || count >= LINE) break;
+        char *p = line + used;
+        for (unsigned k = 0; k < count; k++) expect[k] = (uint32_t)strtoul(p, &p, 10);
+        cases++;
+        int64_t m = spingalett_tokenize(.tokenizer = tok, .text = n ? text : "", .length = n, .tokens = ids,
+                                        .capacity = LINE, .special = special, .add_special = add);
+        int64_t counted = spingalett_tokenize(.tokenizer = tok, .text = n ? text : "", .length = n, .special = special,
+                                              .add_special = add);
+        bool same = m == (int64_t)count && counted == m && (count == 0 || !memcmp(ids, expect, count * sizeof(uint32_t)));
+        if (same && count > 1) {        /* a short array: the count still, the first tokens written */
+            uint32_t few[2] = {UINT32_MAX, UINT32_MAX - 1};
+            same = spingalett_tokenize(.tokenizer = tok, .text = text, .length = n, .tokens = few, .capacity = 1,
+                                       .special = special, .add_special = add) == (int64_t)count &&
+                   few[0] == expect[0] && few[1] == UINT32_MAX - 1;
+        }
+        if (!same && ++wrong_ids <= 3)
+            printf("  %s: \"%.60s\" (special %d, add %d) gives %lld tokens, %u expected\n", name, text, special, add,
+                   (long long)m, count);
+        for (int skip = 0; skip < 2; skip++) {
+            if (!fgets(line, LINE, f)) break;
+            if (line[0] == '*') continue;
+            size_t wn = unhex(line, want);
+            int64_t len = spingalett_detokenize(.tokenizer = tok, .tokens = expect, .count = count, .text = got,
+                                                .capacity = LINE, .skip_special = skip);
+            int64_t measured = spingalett_detokenize(.tokenizer = tok, .tokens = expect, .count = count, .skip_special = skip);
+            if ((len != (int64_t)wn || measured != len || memcmp(got, want, wn) || got[wn] != '\0') && ++wrong_text <= 3)
+                printf("  %s: ids of \"%.60s\" decode to \"%.60s\" (skip %d)\n", name, text, len >= 0 ? got : "(error)", skip);
+        }
+    }
+    CHECK(cases >= least && !wrong_ids && !wrong_text, "%s: %d of %d texts tokenized and %d decoded differently from the "
+          "reference", name, wrong_ids, cases, wrong_text);
+    /* every token found by its string (the lowest id of equal ones) */
+    SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+    uint32_t lookups = 0;
+    for (uint32_t id = 0; id < info.vocabulary; id++) {
+        const char *s = spingalett_tokenizer_token(tok, id);
+        lookups += s && spingalett_tokenizer_id(tok, s) <= id;
+    }
+    CHECK(lookups == info.vocabulary && !spingalett_tokenizer_token(tok, info.vocabulary) &&
+          spingalett_tokenizer_id(tok, "no such token \x01") == SPINGALETT_NO_TOKEN,
+          "%s: %u of %u tokens found by their strings", name, lookups, info.vocabulary);
+    printf("  %-20s %3d texts, %u tokens\n", name, cases, info.vocabulary);
+    fclose(f);
+    free(line); free(text); free(want); free(got); free(ids); free(expect);
+    spingalett_tokenizer_free(tok);
+}
+
+/* The tokens a tokenizer names, the errors of calls and of malformed files. */
+static void tokenizer_api(void) {
+    char path[512];
+    static const struct { const char *name; uint32_t bos, eos, unk, added; } named[] = {
+        {"llama3", 420, 421, SPINGALETT_NO_TOKEN, 5}, {"spm", 1, 2, 0, 5}, {"gpt2", SPINGALETT_NO_TOKEN, 0, SPINGALETT_NO_TOKEN, 2},
+        {"qwen2", SPINGALETT_NO_TOKEN, 420, SPINGALETT_NO_TOKEN, 3},
+    };
+    for (size_t k = 0; k < sizeof named / sizeof *named; k++) {
+        snprintf(path, sizeof path, "%s/tokenizer_%s.json", SPINGALETT_TEST_DATA_DIR, named[k].name);
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+        CHECK(tok && info.bos == named[k].bos && info.eos == named[k].eos && info.unk == named[k].unk &&
+              info.added == named[k].added, "tokenizer_%s: BOS %u, EOS %u, unknown %u, %u added", named[k].name, info.bos,
+              info.eos, info.unk, info.added);
+        spingalett_tokenizer_free(tok);
+    }
+    snprintf(path, sizeof path, "%s/tokenizer_llama3.json", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *json = read_file(path, &size);
+    SpingalettTokenizer *tok = json ? spingalett_tokenizer_from_memory(json, (size_t)size) : NULL;
+    CHECK(tok, "a tokenizer from memory: %s", spingalett_last_error_message());
+    uint32_t ids[64], bot = spingalett_tokenizer_id(tok, "<|begin_of_text|>");
+    CHECK(bot == 420 && !strcmp(spingalett_tokenizer_token(tok, 420), "<|begin_of_text|>"), "special tokens by name");
+    /* the text from users cannot forge special tokens unless asked */
+    int64_t plain = spingalett_tokenize(.tokenizer = tok, .text = "<|begin_of_text|>", .tokens = ids, .capacity = 64);
+    int64_t asked = spingalett_tokenize(.tokenizer = tok, .text = "<|begin_of_text|>", .tokens = ids, .capacity = 64, .special = true);
+    CHECK(plain > 1 && asked == 1 && ids[0] == 420, "special tokens: %lld tokens as text, %lld when asked", (long long)plain,
+          (long long)asked);
+    /* errors */
+    spingalett_clear_error();
+    CHECK(spingalett_tokenize(.tokenizer = tok, .text = "bad \xC3\x28 UTF-8", .tokens = ids, .capacity = 64) == -1 &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "text that is not UTF-8 accepted");
+    CHECK(spingalett_tokenize(.tokenizer = NULL, .text = "x") == -1 && spingalett_tokenize(.tokenizer = tok, .text = NULL) == -1 &&
+          spingalett_tokenize(.tokenizer = tok, .text = "x", .capacity = 4) == -1, "tokenize without its arguments");
+    const uint32_t beyond[2] = {5, 100000};
+    char text[64];
+    CHECK(spingalett_detokenize(.tokenizer = tok, .tokens = beyond, .count = 2, .text = text, .capacity = 64) == -1 &&
+          spingalett_detokenize(.tokenizer = tok, .tokens = NULL, .count = 2) == -1, "ids of no token decoded");
+    const uint32_t hello[3] = {420, 72, 73};
+    int64_t full = spingalett_detokenize(.tokenizer = tok, .tokens = hello, .count = 3, .text = text, .capacity = 64);
+    int64_t cut = spingalett_detokenize(.tokenizer = tok, .tokens = hello, .count = 3, .text = text, .capacity = 4);
+    CHECK(full > 3 && cut == full && strlen(text) == 3, "a text cut to its capacity: %lld bytes, \"%s\"", (long long)cut, text);
+    spingalett_tokenizer_free(tok);
+    /* truncated files never load and never crash */
+    int accepted = 0;
+    for (long cut_at = 0; json && cut_at < size; cut_at += 89) {
+        SpingalettTokenizer *t = spingalett_tokenizer_from_memory(json, (size_t)cut_at);
+        accepted += t != NULL;
+        spingalett_tokenizer_free(t);
+    }
+    CHECK(accepted == 0, "%d truncated tokenizer files loaded", accepted);
+    free(json);
+    /* files of what is not supported, or not consistent, name the problem */
+    static const struct { const char *json, *message; } bad[] = {
+        {"{\"model\": {\"type\": \"WordPiece\", \"vocab\": {\"a\": 0}}}", "WordPiece"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0, \"b\": 1}, \"merges\": [\"a b\"]}}", "merge"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"pre_tokenizer\": {\"type\": \"Whitespace\"}}",
+         "Whitespace"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"pre_tokenizer\": {\"type\": \"Split\", "
+         "\"pattern\": {\"Regex\": \"\\\\w+\"}, \"behavior\": \"Isolated\"}}", "pattern"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 99999999}, \"merges\": []}}", "id"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": [\"a\"]}}", "merge"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"normalizer\": {\"type\": \"NFKD\"}}", "NFKD"},
+        {"[1, 2, 3]", "tokenizer"},
+        {"{\"model\": {\"vocab\": {\"\\ud800\": 0}, \"merges\": []}}", "escape"},
+    };
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        SpingalettTokenizer *t = spingalett_tokenizer_from_memory(bad[k].json, strlen(bad[k].json));
+        CHECK(!t && strstr(spingalett_last_error_message(), bad[k].message), "malformed tokenizer %zu: \"%s\"", k,
+              t ? "loaded" : spingalett_last_error_message());
+        spingalett_tokenizer_free(t);
+    }
+    char deep[2100];
+    memset(deep, '[', 1000);
+    memset(deep + 1000, ']', 1000);
+    CHECK(!spingalett_tokenizer_from_memory(deep, 2000), "a JSON document nested 1000 deep loaded");
+    CHECK(!spingalett_tokenizer_load("no/such/tokenizer.json") && spingalett_tokenizer_info(NULL).vocabulary == 0 &&
+          !spingalett_tokenizer_token(NULL, 0), "tokenizers that do not exist");
+}
+
+/* ---- language models from their files: Hugging Face's directories (Tests/make_pretrained_tests.py) ---- */
+
+#if defined(_WIN32)
+#include <direct.h>
+#define make_dir(p) _mkdir(p)
+#define remove_dir(p) _rmdir(p)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define make_dir(p) mkdir(p, 0755)
+#define remove_dir(p) rmdir(p)
+#endif
+
+static const char pretrained_text[] = "The quick brown fox jumps over the lazy dog, it's 1234 times!";
+
+/* A model's logits for a window of tokens against PyTorch's (NAME.bin), the tokens its directory's tokenizer
+   gives the text against those of the file. */
+static void pretrained_model(const char *name, bool tokenizer) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, name);
+    long size = 0;
+    unsigned char *data = read_file(path, &size);
+    CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+    if (!data) return;
+    const uint32_t T = rd32(data + 8), out = rd32(data + 12);
+    const float *tokens = (const float *)(const void *)(data + 16), *expected = tokens + T;
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, name);
+    NeuralNetwork *net = spingalett_load_pretrained(.path = path, .context = T);
+    CHECK(net && spingalett_input_size(net) == T && spingalett_output_size(net) == out &&
+          spingalett_network_loss(net) == LOSS_SPARSE_CROSS_ENTROPY, "%s: %s", name, spingalett_last_error_message());
+    if (tokenizer) {
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        uint32_t ids[64];
+        int64_t n = tok ? spingalett_tokenize(.tokenizer = tok, .text = pretrained_text, .tokens = ids, .capacity = 64) : -1;
+        bool same = n >= (int64_t)T;
+        for (uint32_t k = 0; same && k < T; k++) same = (float)ids[k] == tokens[k];
+        CHECK(same, "%s: its tokenizer gives the text other tokens (%s)", name, tok ? "" : spingalett_last_error_message());
+        spingalett_tokenizer_free(tok);
+    }
+    if (net) {
+        float *y = malloc((size_t)out * sizeof(float)), worst = 0.0f;
+        predict(.net = net, .inputs = tokens, .sample_count = 1, .outputs = y);
+        for (uint32_t i = 0; i < out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
+        CHECK(worst < 1e-4f, "%s: logits differ from PyTorch's by %g", name, worst);
+        printf("  %-12s %3u tokens x %3u logits, |logits - PyTorch| %.1e\n", name, T, out / T, worst);
+        free(y);
+        free_network(net);
+    }
+    free(data);
+}
+
+static void write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+/* Directories of what cannot be loaded name the problem; damaged files never load. */
+static void pretrained_errors(void) {
+    const char *dir = "spingalett_test_hf";
+    char path[512], src[512];
+    (void)make_dir(dir);
+    static const struct { const char *config, *message; } bad[] = {
+        {"{\"model_type\": \"bert\"}", "bert"},
+        {"{\"model_type\": \"llama\", \"hidden_size\": 16, \"num_hidden_layers\": 1, \"num_attention_heads\": 4}",
+         "model.safetensors"},
+        {"{\"model_type\": \"llama\", \"rope_scaling\": {\"rope_type\": \"llama3\", \"factor\": 8.0}}", "llama3"},
+        {"{\"model_type\": \"llama\", \"hidden_act\": \"gelu\"}", "gelu"},
+        {"{\"model_type\": \"gpt2\", \"n_embd\": 16, \"activation_function\": \"tanh\"}", "activation"},
+        {"{\"model_type\": ", "config.json"},
+    };
+    snprintf(path, sizeof path, "%s/config.json", dir);
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        write_text(path, bad[k].config);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+        CHECK(!net && strstr(spingalett_last_error_message(), bad[k].message), "config %zu: \"%s\"", k,
+              net ? "loaded" : spingalett_last_error_message());
+        free_network(net);
+    }
+    /* Mistral's weights under a config of another width, and truncated */
+    snprintf(src, sizeof src, "%s/hf_mistral/config.json", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *config = read_file(src, &size);
+    snprintf(src, sizeof src, "%s/hf_mistral/model.safetensors", SPINGALETT_TEST_DATA_DIR);
+    long wsize = 0;
+    unsigned char *weights = read_file(src, &wsize);
+    CHECK(config && weights, "hf_mistral cannot be read");
+    char weights_path[512];
+    snprintf(weights_path, sizeof weights_path, "%s/model.safetensors", dir);
+    if (config && weights) {
+        config[size] = '\0';
+        char *wide = malloc((size_t)size + 8), *at = strstr((char *)config, "\"hidden_size\": 16");
+        if (at) {
+            snprintf(wide, (size_t)size + 8, "%.*s\"hidden_size\": 32%s", (int)(at - (char *)config), (char *)config,
+                     at + strlen("\"hidden_size\": 16"));
+            write_text(path, wide);
+            write_file(weights_path, weights, wsize);
+            NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+            CHECK(!net && strstr(spingalett_last_error_message(), "shape"), "a checkpoint of another width: \"%s\"",
+                  net ? "loaded" : spingalett_last_error_message());
+            free_network(net);
+        }
+        free(wide);
+        write_text(path, (const char *)config);
+        int accepted = 0;
+        for (long cut = 0; cut < wsize; cut += 397) {
+            write_file(weights_path, weights, cut);
+            NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+            accepted += net != NULL;
+            free_network(net);
+        }
+        CHECK(accepted == 0, "%d truncated checkpoints loaded", accepted);
+        /* a window beyond Mistral's sliding window: loaded, with a warning */
+        write_file(weights_path, weights, wsize);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = dir, .context = 20);
+        CHECK(net && spingalett_input_size(net) == 20, "a context beyond the sliding window: %s", spingalett_last_error_message());
+        free_network(net);
+        remove(weights_path);
+    }
+    /* an index that names a shard outside the directory */
+    char index[512];
+    snprintf(index, sizeof index, "%s/model.safetensors.index.json", dir);
+    write_text(index, "{\"weight_map\": {\"model.embed_tokens.weight\": \"../model.safetensors\"}}");
+    NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+    CHECK(!net && strstr(spingalett_last_error_message(), "outside"), "a shard outside the directory: \"%s\"",
+          net ? "loaded" : spingalett_last_error_message());
+    free_network(net);
+    remove(index);
+    remove(path);
+    remove_dir(dir);
+    CHECK(!spingalett_load_pretrained(.path = "no/such/model") && !spingalett_load_pretrained(.path = NULL),
+          "models that do not exist");
+    free(config);
+    free(weights);
+}
+
+/* ---- GGUF files (Tests/make_pretrained_tests.py) ---- */
+
+/* The logits of a network for the window of NAME.bin into y; the window and the expected logits through the
+   pointers into the file's bytes (*data, to free). False when the file is missing or does not fit. */
+static bool window_logits(NeuralNetwork *net, const char *name, float **y, uint32_t *count, const float **expected,
+                          unsigned char **data) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, name);
+    long size = 0;
+    *data = read_file(path, &size);
+    *y = NULL;
+    if (!*data || size < 16 || memcmp(*data, "SPGT", 4) || !net) return false;
+    const uint32_t T = rd32(*data + 8);
+    *count = rd32(*data + 12);
+    const float *tokens = (const float *)(const void *)(*data + 16);
+    *expected = tokens + T;
+    if (spingalett_input_size(net) != T || spingalett_output_size(net) != *count) return false;
+    *y = malloc((size_t)*count * sizeof(float));
+    return predict(.net = net, .inputs = tokens, .sample_count = 1, .outputs = *y);
+}
+
+static void gguf_models(void) {
+    char path[512];
+    /* the checkpoints' weights as llama.cpp's converter writes them (LLaMA's queries and keys permuted, GPT-2's
+       Conv1D matrices transposed): the networks of the directories, bit for bit */
+    static const char *const forms[3][2] = {{"gguf_llama.gguf", "hf_llama"}, {"gguf_qwen2.gguf", "hf_qwen2"},
+                                            {"gguf_gpt2.gguf", "hf_gpt2"}};
+    float *yg, *yh, worst = 0.0f;
+    const float *expected;
+    uint32_t count = 0;
+    unsigned char *data, *data2;
+    bool ok;
+    for (int k = 0; k < 3; k++) {
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, forms[k][0]);
+        NeuralNetwork *g = spingalett_load_pretrained(.path = path, .context = 10);
+        CHECK(g, "%s: %s", forms[k][0], spingalett_last_error_message());
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, forms[k][1]);
+        NeuralNetwork *h = spingalett_load_pretrained(.path = path, .context = 10);
+        ok = window_logits(g, forms[k][1], &yg, &count, &expected, &data) &&
+             window_logits(h, forms[k][1], &yh, &count, &expected, &data2);
+        worst = 0.0f;
+        for (uint32_t i = 0; ok && i < count; i++) worst = fmaxf(worst, fabsf(yg[i] - expected[i]));
+        CHECK(ok && !memcmp(yg, yh, (size_t)count * sizeof(float)) && worst < 1e-4f,
+              "%s: logits differ from the directory's network's or PyTorch's (%g)", forms[k][0], worst);
+        if (ok) printf("  %-20s the directory's logits bit for bit, |logits - PyTorch| %.1e\n", forms[k][0], worst);
+        free(yg); free(yh); free(data); free(data2);
+        free_network(g); free_network(h);
+    }
+    /* matrices of fifteen types: the logits of their dequantized weights, each matrix's sums */
+    snprintf(path, sizeof path, "%s/gguf_quant.gguf", SPINGALETT_TEST_DATA_DIR);
+    NeuralNetwork *q = spingalett_load_pretrained(.path = path, .context = 10);
+    CHECK(q, "gguf_quant.gguf: %s", spingalett_last_error_message());
+    ok = window_logits(q, "gguf_quant", &yg, &count, &expected, &data);
+    float scale = 1.0f;
+    worst = 0.0f;
+    for (uint32_t i = 0; ok && i < count; i++) {
+        worst = fmaxf(worst, fabsf(yg[i] - expected[i]));
+        scale = fmaxf(scale, fabsf(expected[i]));
+    }
+    CHECK(ok && worst < 1e-4f * scale, "gguf_quant.gguf: logits differ from PyTorch's by %g (of %g)", worst, scale);
+    free(yg);
+    free(data);
+    snprintf(path, sizeof path, "%s/gguf_quant.txt", SPINGALETT_TEST_DATA_DIR);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "%s: no expected sums", path);
+    char line[512], type[16];
+    int matrices = 0, wrong = 0;
+    double worst_sum = 0.0;
+    while (q && f && fgets(line, sizeof line, f)) {
+        unsigned layer, first, rows, cols;
+        double sum, squares, weighted;
+        if (line[0] == '#' || sscanf(line, "%u %u %15s %u %u %lf %lf %lf", &layer, &first, type, &rows, &cols, &sum, &squares,
+                                     &weighted) != 8)
+            continue;
+        SpingalettNetworkLayer d;
+        const bool known = spingalett_network_layer(q, layer, &d);
+        const uint64_t table_rows = d.type == LAYER_EMBEDDING ? d.vocabulary : d.bias_count;
+        if (!known || !table_rows || d.weight_count / table_rows != cols || first + rows > table_rows) {
+            wrong++;
+            continue;
+        }
+        float *w = malloc((size_t)d.weight_count * sizeof(float));
+        spingalett_get_parameters(q, layer, PARAM_WEIGHTS, w, d.weight_count);
+        double s = 0, s2 = 0, sw = 0;
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t c = 0; c < cols; c++) {
+                const double v = w[(size_t)(first + r) * cols + c];
+                s += v; s2 += v * v; sw += v * (r + 1.0) * (c + 1.0);
+            }
+        /* the same weights, added in the same order: the same sums, exactly */
+        const double err = fmax(fabs(s - sum) / fmax(1.0, fabs(sum)), fmax(fabs(s2 - squares) / squares,
+                                                                         fabs(sw - weighted) / fmax(1.0, fabs(weighted))));
+        worst_sum = fmax(worst_sum, err);
+        if ((s != sum || s2 != squares || sw != weighted) && ++wrong <= 3)
+            printf("  gguf_quant.gguf: the %s matrix of layer %u differs (%g)\n", type, layer, err);
+        matrices++;
+        free(w);
+    }
+    if (f) fclose(f);
+    CHECK(matrices == 16 && !wrong, "gguf_quant.gguf: %d of %d matrices dequantized differently", wrong, matrices);
+    printf("  %-20s 16 matrices of 15 types as dequantized (%.0e), |logits - PyTorch| %.1e\n", "gguf_quant.gguf", worst_sum,
+           worst);
+    free_network(q);
+    /* the vocabularies: a byte-level BPE (LLaMA 3's form, Hugging Face's ids) and SentencePiece's BPE (its ids) */
+    tokenizer_cases("gguf_llama.gguf", "gguf_llama.gguf", "tokenizer_llama3.txt", 100);
+    tokenizer_cases("gguf_qwen2.gguf", "gguf_qwen2.gguf", "tokenizer_qwen2.txt", 100);
+    tokenizer_cases("gguf_spm.gguf", "gguf_spm.gguf", "gguf_spm.txt", 60);
+    static const struct { const char *file; uint32_t bos, eos, unk; } named[] = {
+        {"gguf_llama.gguf", 420, 424, SPINGALETT_NO_TOKEN}, {"gguf_qwen2.gguf", SPINGALETT_NO_TOKEN, 420, SPINGALETT_NO_TOKEN},
+        {"gguf_spm.gguf", 1, 2, 0}};
+    for (size_t k = 0; k < sizeof named / sizeof *named; k++) {
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, named[k].file);
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+        CHECK(tok && info.bos == named[k].bos && info.eos == named[k].eos && info.unk == named[k].unk,
+              "%s: BOS %u, EOS %u, unknown %u", named[k].file, info.bos, info.eos, info.unk);
+        spingalett_tokenizer_free(tok);
+    }
+}
+
+/* Damaged and unsupported GGUF files never load and never crash. */
+static void gguf_errors(void) {
+    char path[512];
+    const char *file = "spingalett_test.gguf";
+    snprintf(path, sizeof path, "%s/gguf_llama.gguf", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *gguf = read_file(path, &size);
+    CHECK(gguf, "%s cannot be read", path);
+    int accepted = 0, tokenizers = 0;
+    for (long cut = 0; gguf && cut < size; cut += 1009) {
+        write_file(file, gguf, cut);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = file);
+        SpingalettTokenizer *tok = spingalett_tokenizer_from_memory(gguf, (size_t)cut);
+        accepted += net != NULL;
+        tokenizers += tok != NULL;
+        free_network(net);
+        spingalett_tokenizer_free(tok);
+    }
+    CHECK(accepted == 0 && tokenizers == 0, "%d truncated GGUF files loaded, %d tokenizers", accepted, tokenizers);
+    /* a tensor of a type that is not read, a version that is not, counts beyond the file */
+    snprintf(path, sizeof path, "%s/gguf_quant.gguf", SPINGALETT_TEST_DATA_DIR);
+    long qsize = 0;
+    unsigned char *quant = read_file(path, &qsize);
+    static const char name[] = "blk.0.attn_q.weight";
+    unsigned char *at = NULL;
+    for (long i = 0; quant && i + (long)sizeof name < qsize && !at; i++)
+        if (!memcmp(quant + i, name, sizeof name - 1)) at = quant + i;
+    CHECK(at, "gguf_quant.gguf: no %s", name);
+    if (at) {
+        at[sizeof name - 1 + 4 + 16] = 16;          /* the type after its two dimensions: IQ2_XXS */
+        write_file(file, quant, qsize);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = file);
+        CHECK(!net && strstr(spingalett_last_error_message(), "type 16"), "a tensor of a type not read: \"%s\"",
+              net ? "loaded" : spingalett_last_error_message());
+        free_network(net);
+    }
+    static const unsigned char v1[] = {'G', 'G', 'U', 'F', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    static const unsigned char huge[] = {'G', 'G', 'U', 'F', 3, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0};
+    write_file(file, v1, sizeof v1);
+    NeuralNetwork *net = spingalett_load_pretrained(.path = file);
+    CHECK(!net && strstr(spingalett_last_error_message(), "version 1"), "a GGUF file of version 1: \"%s\"",
+          net ? "loaded" : spingalett_last_error_message());
+    free_network(net);
+    write_file(file, huge, sizeof huge);
+    net = spingalett_load_pretrained(.path = file);
+    CHECK(!net && !spingalett_tokenizer_from_memory(huge, sizeof huge), "a GGUF file of 2^40 tensors loaded");
+    free_network(net);
+    remove(file);
+    free(gguf);
+    free(quant);
+}
+
 /* ---- the GPU (COMPUTE_VULKAN, or COMPUTE_CUDA in the group "cuda") against the CPU ---- */
 
 /* The compute mode of the GPU group's tests: gpu_mode, or COMPUTE_CUDA. */
@@ -6522,6 +6994,28 @@ int main(int argc, char **argv) {
         onnx_models();
         pytorch_weights();
         pytorch_transposed();
+    }
+    if (!*only || !strcmp(only, "tokenizer")) {
+        printf("[tokenizers]\n");
+        static const char *const names[] = {"gpt2", "llama3", "qwen2", "o200k", "spm", "metaspace"};
+        for (size_t k = 0; k < sizeof names / sizeof *names; k++) {
+            char file[64], expectations[64], label[64];
+            snprintf(file, sizeof file, "tokenizer_%s.json", names[k]);
+            snprintf(expectations, sizeof expectations, "tokenizer_%s.txt", names[k]);
+            snprintf(label, sizeof label, "tokenizer_%s", names[k]);
+            tokenizer_cases(label, file, expectations, 100);
+        }
+        tokenizer_api();
+    }
+    if (!*only || !strcmp(only, "pretrained")) {
+        printf("[pretrained language models]\n");
+        pretrained_model("hf_llama", true);
+        pretrained_model("hf_qwen2", true);
+        pretrained_model("hf_mistral", false);
+        pretrained_model("hf_gpt2", true);
+        pretrained_errors();
+        gguf_models();
+        gguf_errors();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");

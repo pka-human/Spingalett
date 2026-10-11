@@ -107,6 +107,12 @@ onnx = sg.Network.from_onnx("model.onnx")
 lm = sg.Network.from_torch(my_gpt, torch.randint(0, 50257, (1, 256)))   # attention, RMS norm, SwiGLU ... as layers
 logits = lm.forward(tokens.astype(np.float32))      # tokens: (samples, 256) ids; logits: (samples, 256 x 50257)
 
+# a pretrained language model and its tokenizer, from a Hugging Face directory or a GGUF file, read by the C library
+lm = sg.Network.from_pretrained("models/SmolLM2-135M", context=512)       # or "SmolLM2-135M.Q4_K_M.gguf"
+tok = sg.Tokenizer("models/SmolLM2-135M")
+prompt = tok.encode("<|im_start|>user\nWhat is a tokenizer?<|im_end|>\n<|im_start|>assistant\n", special=True)
+print(tok.decode(lm.generate(prompt, 64, temperature=0.7, top_p=0.9, stop=[tok.id("<|im_end|>")])))
+
 # a language model: GPT-2 from Hugging Face's weights (or nanoGPT's), trained further on a token file, sampled
 from transformers import GPT2LMHeadModel
 gpt = sg.gpt2_from_state_dict(GPT2LMHeadModel.from_pretrained("gpt2").state_dict(), heads=12, context=256)
@@ -144,6 +150,8 @@ with sg.Network.load("xor.slett") as net:
 | `add_embedding(vocabulary, size, positions=False)`, `add_linear(neurons, activation=NONE)`, `add_attention(heads=1, kv_heads=0, causal=False, rope_theta=0)`, `add_rms_norm(epsilon=1e-5)`, `add_multiply(inputs)` | transformers: a window of token ids (the input layer, `add_layer(tokens)`) as vectors, a linear map of each position, multi-head attention over packed queries, keys and values (grouped-query, causal, rotary), RMS normalization, element-wise products (SwiGLU); activations `GELU`, `GELU_TANH`, `SILU`; `Loss.SPARSE_CROSS_ENTROPY` takes `target_size` class indices a sample |
 | `train_from_tokens(path, token_bytes=0, stride=0, offset=0, shuffle=True, ...)`, `generate(prompt, count, temperature=0, top_k=0, top_p=0, seed=0, stop=())` | a language model on the windows of a token file (nanoGPT's `.bin`, llm.c's), through the C reader; the continuation of a prompt of token ids, a token at a time |
 | `gpt2_from_state_dict(state, heads, context=None, activation=None)`, `llama_from_state_dict(state, heads, kv_heads=None, context=2048, rope_theta=10000, epsilon=1e-6)` | networks of PyTorch checkpoints: GPT-2 (Hugging Face's or nanoGPT's state dict) and LLaMA's form in Hugging Face's names (LLaMA, Mistral, Qwen2); the weights copied, the networks train, generate and save as any other |
+| `Network.from_pretrained(path, context=0)` | a language model read by the C library: a Hugging Face model directory (`config.json`, safetensors weights, sharded or not; `llama`, `mistral`, `qwen2`, `gpt2`) or a GGUF file (`llama`, `qwen2`, `gpt2`; weights dequantized from F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K to Q6_K, IQ4_NL, IQ4_XS); the same networks as the two functions above, without PyTorch |
+| `Tokenizer(path or bytes)`: `encode(text, special=False, add_special=False)`, `decode(ids, skip_special=False)`, `token(id)`, `id(token)`, `vocabulary`, `bos`, `eos`, `pad`, `unk`, `added` | a language model's tokenizer in C (a `tokenizer.json`, a model directory or a GGUF file): byte-level BPE, tiktoken's encodings and SentencePiece's BPE, the ids and texts of Hugging Face's `tokenizers`; `special` turns special tokens written in the text into their ids, `add_special` adds the template's (LLaMA's BOS) |
 | `inputs=` on every `add_*`, `last`, `len(net)` | a layer reads the one before it, or the earlier layers `inputs` names (indices; negative ones count back from the new layer); `last` is the index of the layer added last |
 | `add_add(inputs, activation=NONE, dropout=0)`, `add_concat(inputs, ...)`, `add_global_avg_pool(dropout=0, inputs=None)` | the sum of layers of one shape (residual connections), layers side by side along the channels, the mean of each channel |
 | `Network.from_onnx(path or bytes)`, `Network.from_torch(module, example_input)` | ONNX models (and PyTorch modules, exported to ONNX in memory) as networks with channels-last inputs: transpose NCHW images with `x.transpose(0, 2, 3, 1)`; transformers (an `example_input` of token ids `[1, T]`, or of vectors `[1, T, C]`) with their embeddings, normalizations, attention (grouped-query, causal, rotary) and gated MLPs as the library's layers, token ids given as floats |

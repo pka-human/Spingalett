@@ -120,6 +120,58 @@ All notable changes to this project are documented in this file. The format foll
   each token's channels with a scale of their own (`docs/ModelFormat.md`); their results differ from
   1.2's within the quantization's error. Tests: `transformer` (later tokens leave earlier logits
   unchanged, bit for bit, batched and in single runs).
+- **Tokenizers** of language models in C: `spingalett_tokenizer_load()` reads a Hugging Face
+  `tokenizer.json` (or a model directory, whose `tokenizer_config.json` names BOS and EOS),
+  `spingalett_tokenize()` encodes UTF-8 text and `spingalett_detokenize()` decodes ids, with
+  `spingalett_tokenizer_info()`, `spingalett_tokenizer_token()` and `spingalett_tokenizer_id()`
+  (`SpingalettTokenizer`, `SpingalettTokenizerInfo`, `SPINGALETT_NO_TOKEN`). Byte-level BPE (GPT-2,
+  SmolLM), tiktoken's encodings (LLaMA 3's cl100k, Qwen2's with single digits and NFC, o200k) and
+  SentencePiece's BPE with byte fallback (LLaMA 2, Mistral, Phi-3), as the `tokenizers` library runs
+  them: added tokens with their strip rules, special ones found only when asked (`.special`), the
+  normalizers, pre-tokenizers, decoders and templates those files use, merges by rank through a heap
+  (n log n in a piece's length; SentencePiece's texts merged word by word where the vocabulary allows
+  it). The pre-tokenizers' regular expressions are matched by hand with Oniguruma's semantics, over
+  Unicode tables written by `Src/make_unicode.py`. On the tokenizers of GPT-2, LLaMA 3.2, Qwen2.5,
+  SmolLM2, TinyLlama, Mistral 7B and Phi-3 the ids and texts equal those of `tokenizers` 0.23, and
+  encoding runs 3.6 to 8.3 times as fast (0.9 MB of prose and code on an i7-12650H, one thread). The
+  `tokenizer` test group checks six small tokenizers of these families
+  (`Tests/make_tokenizer_tests.py`) against the library's ids.
+- **Hugging Face checkpoints in C**: `spingalett_load_pretrained()` (`SpingalettPretrainedArgs`: `path`,
+  `context`) makes a network of a model directory, `config.json` and safetensors weights (one file, or
+  the shards of `model.safetensors.index.json`; F32, F16, BF16), of the model types `llama`, `mistral`,
+  `qwen2` and `gpt2`: the networks of the Python bindings' `llama_from_state_dict()` and
+  `gpt2_from_state_dict()`, which give the same logits bit for bit, with Qwen2's biases, explicit
+  `head_dim`, tied embeddings, GPT-2's Conv1D weights. The arrays are reserved at their final sizes and
+  each tensor is decoded once from the mapped file into its layer (SmolLM2-135M loads in 0.17 s on an
+  i7-12650H). Mistral's sliding window is not applied (exact within the window; a warning beyond it);
+  scaled rotary embeddings are refused. On SmolLM2-135M and Qwen2.5-0.5B-Instruct the logits agree with
+  `transformers` within 2.4e-4 and 4e-4 and the greedy continuations are the same. The `pretrained` test
+  group compares tiny LLaMA,
+  Qwen2, Mistral and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) with PyTorch.
+- **GGUF files**, llama.cpp's (versions 2 and 3), in `spingalett_load_pretrained()` and
+  `spingalett_tokenizer_load()` / `_from_memory()`: the network of `general.architecture` llama
+  (LLaMA, Mistral), qwen2 or gpt2 with the hyper-parameters of the metadata, its weights dequantized as
+  llama.cpp's `dequantize_row_*()` computes them (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K,
+  Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS; in IEEE order, the same weights on every platform), LLaMA's
+  queries and keys taken back from llama.cpp's order of their rows; the vocabulary of the `gpt2` model
+  as a byte-level BPE by the pre-tokenizer the file names, that of the `llama` model as SentencePiece's
+  BPE of its scores. On quantized SmolLM2-135M, TinyStories and Qwen2.5-0.5B-Instruct files the weights
+  equal the `gguf` package's dequantization bit for bit, and their vocabularies give the ids of the
+  `tokenizer.json` files they came from; the `pretrained` group checks GGUF files of the weights of
+  `hf_llama`, `hf_qwen2` and `hf_gpt2` (their directories' logits bit for bit), a model of fifteen
+  types (each matrix against a reference written
+  with llama.cpp's formulas and checked against `gguf`'s), a SentencePiece vocabulary against the
+  `sentencepiece` library's ids, and damaged files.
+- Tokenizers and pretrained models in every binding: Python's `sg.Tokenizer` (`encode()`, `decode()`,
+  `token()`, `id()`, `bos`, `eos`, ...) and `Network.from_pretrained(path, context)`, which give the
+  logits of the 1.2 loader `llama_from_state_dict()` bit for bit without PyTorch; C++'s
+  `spingalett::Tokenizer` and `Network::from_pretrained()`; Rust's, C#'s, Go's and Java's `Tokenizer`
+  and pretrained loading, each tested on the `tokenizer` group's expectations and on `hf_llama` in both of
+  its forms, their structures compared with the C layout. The functions of 1.3 are bound optionally in
+  Python and Java, so that the bindings still load a library of 1.2.
+- `Examples/Pretrained.c`: a Hugging Face or GGUF language model continuing a prompt, printing each
+  token as it comes.
+- An internal JSON reader (`Src/Spingalett.Json.c`) for the files of language models.
 
 ## [1.2.0] - 2026-10-11
 
