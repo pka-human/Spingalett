@@ -11,7 +11,7 @@ package:
 
 source:
   url: https://github.com/pka-human/Spingalett/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  sha256: 5c18d1f70721406695233704d0dd0fb541e61ae2c648d85e0ac69ca185579a12
 
 build:
   number: 0

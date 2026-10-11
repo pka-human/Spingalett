@@ -14,7 +14,7 @@ optdepends=('vulkan-icd-loader: training and inference on GPUs through Vulkan'
             'nvidia-utils: training and inference on NVIDIA GPUs through CUDA'
             'python-numpy: the Python bindings (Bindings/Python)')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/pka-human/Spingalett/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('5c18d1f70721406695233704d0dd0fb541e61ae2c648d85e0ac69ca185579a12')
 
 build() {
     # the baseline instruction set, with the kernels of later ones chosen at run time; the CUDA kernels compiled
