@@ -7,6 +7,48 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- **Inference with a key-value cache on the CPU:** sessions of deployment models run a causal language
+  model (its first layer an embedding of the tokens, its other layers treating each position alone but
+  for causal attention) a token at a time. Each attention layer keeps the keys (rotated, with rotary
+  embeddings) and values of every token a sequence has been fed, so that a new token costs one row
+  through every layer and its attention over those instead of a pass over the window.
+  `spingalett_session_new()` (`SpingalettSessionOptions`: `max_length`, `sequences`) opens one, or
+  refuses a model with the reason; `spingalett_session_feed()` (`SpingalettSessionFeed`) appends tokens
+  to several sequences in one pass, a prompt at once, the last layer computed on the rows whose logits
+  are asked for only; `spingalett_session_rewind()`, `spingalett_session_copy()`,
+  `spingalett_session_length()`, `spingalett_session_vocabulary()`, `spingalett_session_free()`. The
+  logits are those `spingalett_model_predict()` gives each position of the whole window, bit for bit,
+  in every precision and however the tokens come (alone, as a prompt, with other sequences): the float
+  linear layers run on their filters packed once per model by new kernels for few rows that sum in the
+  order of the batched forward kernel, the integer ones sum in integers, attention attends as the
+  engine does. Several sessions may run on one model from several threads. Part of the runtime. Tests:
+  `model` (GPT-2-like and LLaMA-like models, narrow and wide, every precision, one thread and many,
+  against batched prediction; refused models and arguments; four threads), `runtime.library` (the
+  runtime's sessions give the library's bits).
+- **Batched generation:** `spingalett_session_generate()` continues several sequences of a session
+  together, the steps' rows computed at once, each sequence drawing as `spingalett_generate()` draws
+  (temperature, top-k, top-p, stop tokens; sequence b with seed + b): the same tokens as alone. Tests:
+  `gen`.
+- New functions `spingalett_session_new()`, `spingalett_session_free()`, `spingalett_session_feed()`,
+  `spingalett_session_rewind()`, `spingalett_session_copy()`, `spingalett_session_length()`,
+  `spingalett_session_vocabulary()` and `spingalett_session_generate_args()`
+  (`spingalett_session_generate()`), in the symbol version `SPINGALETT_1.3` of the library and the
+  runtime; new structs `SpingalettSessionOptions`, `SpingalettSessionFeed` and
+  `SpingalettSessionGenerateArgs`. In Python, `Model.session()` (`Session`: `feed()`, `feed_many()`,
+  `rewind()`, `copy()`, `length()`, `generate()`).
+
+### Changed
+- `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single
+  precision in a session (kept in the network until its parameters or layers change): the prompt fed
+  at once, then each token once; once the tokens fill the window, the window of the last tokens is fed
+  again from its first position, as the prediction over the window does, so the tokens are those of
+  1.2 (the logits equal the network's prediction to rounding, within 1e-6 relative in the tests). On an
+  Intel Core i7-12650H the CharGPT model (256 wide, 4 blocks, a window of 128) generates 3230 tokens a
+  second on one thread, 44 times 1.2's 72.7, and 3568 on six threads (121 in 1.2); a call generating
+  one token takes 1.8 ms instead of 11.7. Other networks and the GPU modes predict over the window as
+  before.
+
 ### Fixed
 - Integer deployment models of language models (INT8, INT4, INT2; in the engine, batched and in the
   runtime) quantized the input of each linear layer with one scale for the whole sequence, so that a

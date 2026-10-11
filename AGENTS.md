@@ -25,6 +25,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Engine.h` | Internals shared by the engine and the desktop library (layer table, kernels, scratch rules) |
 | `Src/Spingalett.Inference.c` | The standalone engine: `.slett` parsing, per-sample kernels for every precision. Must stay free of heap, stdio, files and OpenMP (`model.engine_symbols` checks) and compile as C99 |
 | `Src/Spingalett.Model.c` | Batched deployment models (`spingalett_model_predict`): weights prepared once per owned model, a workspace kept between calls |
+| `Src/Spingalett.Session.c`, `Src/Spingalett.Model.h` | Sessions of deployment models (`spingalett_session_feed`): a causal language model a token at a time with a key-value cache, batched generation; `Model.h` is what they share with `Model.c` (prepared layers, workspaces, the passes of single layers) |
 | `cmake/Runtime.cmake`, `Src/Spingalett.Runtime.map` | The runtime library: the sources that load and run models, compiled with the library's flags (`spingalett_build`) and `SPINGALETT_RUNTIME`, its exports and their symbol versions |
 | `Src/Spingalett.Int8Tiles.c` | Batched INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product) |
 | `Src/Spingalett.GEMM.c` | Float matrix kernels, including implicit im2col and epilogues |
@@ -175,10 +176,19 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   trained on the CPU, made a trainer, or had its GPU copy's parameters brought back
   (`spingalett_training_state()`, which `spingalett_gpu_download()` calls); code that reads them
   before (saving optimizer state, `spingalett_get_parameters()` of a gradient) treats them as zero.
+- **Sessions give batched prediction's bits.** A session's row equals what `spingalett_model_predict()`
+  gives its position in the whole window, whatever rows it is computed with (`model`, `gen` and
+  `runtime.library` compare with `memcmp`): the float linear layers sum on `spingalett_conv_rows()` in
+  the order of `spingalett_conv_direct_forward()`'s kernel for a pointwise convolution (a change to one is
+  a change to the other), the integer ones of a language model quantize each token alone
+  (`SlettLayer.cells`, in the engine and in `Model.c` alike), attention goes through
+  `spingalett_engine_attend()`, and sigmoid and tanh take the vector or scalar path of the row's place in
+  a whole sample (`activate_rows()`). A layer that mixes positions in a new way keeps sessions from
+  running the model (`session_model()`), or needs its own pass.
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
   `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
-  read afterwards (`model_shared` in the `model` group runs four threads; run it under
-  ThreadSanitizer when changing that code).
+  read afterwards (`model_shared` in the `model` group runs four threads, `session_shared` four sessions
+  of one model; run them under ThreadSanitizer when changing that code).
 
 ## Performance work
 
