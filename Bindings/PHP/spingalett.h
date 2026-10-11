@@ -589,49 +589,6 @@ bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const cha
 bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size,
                                          const char *const *modules, uint32_t module_count);
 
-/* Tokenizers and pretrained language models. */
-typedef struct SpingalettTokenizer SpingalettTokenizer;
-typedef struct {
-    uint32_t vocabulary;
-    uint32_t added;
-    uint32_t bos, eos;
-    uint32_t pad, unk;
-    uint64_t reserved[8];
-} SpingalettTokenizerInfo;
-SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
-SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
-void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
-SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
-const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
-uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
-typedef struct {
-    const SpingalettTokenizer *tokenizer;
-    const char *text;
-    size_t length;
-    uint32_t *tokens;
-    size_t capacity;
-    bool special;
-    bool add_special;
-    uint64_t reserved[8];
-} SpingalettTokenizeArgs;
-int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
-typedef struct {
-    const SpingalettTokenizer *tokenizer;
-    const uint32_t *tokens;
-    size_t count;
-    char *text;
-    size_t capacity;
-    bool skip_special;
-    uint64_t reserved[8];
-} SpingalettDetokenizeArgs;
-int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
-typedef struct {
-    const char *path;
-    uint32_t context;
-    uint64_t reserved[8];
-} SpingalettPretrainedArgs;
-SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args);
-
 SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
 bool spingalett_export_c_header(const SpingalettNetwork *net, const char *path, const char *name,
                                 SpingalettPrecisionMode precision);
@@ -739,3 +696,45 @@ uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t re
 
 void spingalett_print_network(const SpingalettNetwork *net);
 void spingalett_network_free(SpingalettNetwork *net);
+
+typedef struct SpingalettTokenizer SpingalettTokenizer;
+typedef struct {
+    uint32_t vocabulary;
+    uint32_t added;
+    uint32_t bos, eos;
+    uint32_t pad, unk;
+    uint64_t reserved[8];
+} SpingalettTokenizerInfo;
+SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
+SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
+void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
+SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
+const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
+uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const char *text;
+    size_t length;
+    uint32_t *tokens;
+    size_t capacity;
+    bool special;
+    bool add_special;
+    uint64_t reserved[8];
+} SpingalettTokenizeArgs;
+int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const uint32_t *tokens;
+    size_t count;
+    char *text;
+    size_t capacity;
+    bool skip_special;
+    uint64_t reserved[8];
+} SpingalettDetokenizeArgs;
+int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+typedef struct {
+    const char *path;
+    uint32_t context;
+    uint64_t reserved[8];
+} SpingalettPretrainedArgs;
+SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args);

@@ -61,7 +61,11 @@ DEVICE void st8(uint64_t x, uint32_t i, uint32_t w, uint32_t half, const float (
 
 /* Outputs n .. n + 7 of row m (n a multiple of eight) through the epilogue at once, as store_one() computes each
    (with GENERAL every activation, and with FLAG_PRE EPI_BIAS_ACT's values before it at e1) */
+#define ANY_ACT 0xFFFFFFFFu        /* store_eight()'s ACTC: the activation of the spec, chosen as each value needs it */
+template <uint32_t ACTC = ANY_ACT>
 DEVICE void store_eight(const Epi &e, float slope, uint32_t z, uint32_t coff, uint32_t m, uint32_t n, float (&v)[8]) {
+    const uint32_t act = ACTC == ANY_ACT ? e.act : ACTC;
+    (void)act;
     if (e.epi == EPI_PARTIAL) {
         float4_ *at = (float4_ *)e.c + (((z * e.M + m) * e.N + n) >> 2);
         at[0] = float4_{v[0], v[1], v[2], v[3]};
@@ -79,7 +83,7 @@ DEVICE void store_eight(const Epi &e, float slope, uint32_t z, uint32_t coff, ui
 #if GENERAL
         if (e.flags & FLAG_PRE) st8(e.e1, at, 2u, e.half, v);
 #pragma unroll
-        for (uint32_t k = 0; k < 8u; k++) v[k] = activate(v[k], e.act);
+        for (uint32_t k = 0; k < 8u; k++) v[k] = activate(v[k], act);
 #else
 #pragma unroll
         for (uint32_t k = 0; k < 8u; k++) v[k] = sloped(v[k], slope);
@@ -91,7 +95,7 @@ DEVICE void store_eight(const Epi &e, float slope, uint32_t z, uint32_t coff, ui
 #pragma unroll
         for (uint32_t k = 0; k < 8u; k++) {
 #if GENERAL
-            v[k] = activate(v[k] * sc[k] + sh[k], e.act);
+            v[k] = activate(v[k] * sc[k] + sh[k], act);
 #else
             v[k] = sloped(v[k] * sc[k] + sh[k], slope);
 #endif
@@ -111,7 +115,7 @@ DEVICE void store_eight(const Epi &e, float slope, uint32_t z, uint32_t coff, ui
 #pragma unroll
             for (uint32_t k = 0; k < 8u; k++) {
 #if GENERAL
-                v[k] *= derivative(d[k], e.act);
+                v[k] *= derivative(d[k], act);
 #else
                 v[k] *= sloped_derivative(d[k], slope);
 #endif
@@ -121,6 +125,11 @@ DEVICE void store_eight(const Epi &e, float slope, uint32_t z, uint32_t coff, ui
     (void)slope;
     st8(e.c, at, 2u, e.half, v);
 }
+
+template <uint32_t V>
+struct Const {
+    static constexpr uint32_t value = V;
+};
 
 template <uint32_t BM, uint32_t BN, uint32_t BK, uint32_t TI, uint32_t TJ, uint32_t STAGES, uint32_t AMODE, uint32_t BMODE>
 struct Pipe {
@@ -329,14 +338,22 @@ struct Pipe {
                     scratch[2u * (gi * THREADS + tid)] = float4_{v[0], v[1], v[2], v[3]};
                     scratch[2u * (gi * THREADS + tid) + 1u] = float4_{v[4], v[5], v[6], v[7]};
                 }
+                /* the activations of language models with their own loops, the others' chosen value by value
+                   (a jump a value cost GELU's products in inference a fifth of their time) */
+                auto finish = [&](auto actc) __attribute__((always_inline)) {
 #pragma unroll 1
-                for (uint32_t gi = 0; gi < GS; gi++) {
-                    const uint32_t gr = g0 + gi, i = gr / TJ, h = gr / (TJ / 2u) % 2u, a = gr % (TJ / 2u);
-                    const uint32_t m = row(i, h), n = column(a);
-                    const float4_ lo = scratch[2u * (gi * THREADS + tid)], hi = scratch[2u * (gi * THREADS + tid) + 1u];
-                    float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-                    if (m < p.M && n < p.N) store_eight(e, slope, z, coff, m, n, v);
-                }
+                    for (uint32_t gi = 0; gi < GS; gi++) {
+                        const uint32_t gr = g0 + gi, i = gr / TJ, h = gr / (TJ / 2u) % 2u, a = gr % (TJ / 2u);
+                        const uint32_t m = row(i, h), n = column(a);
+                        const float4_ lo = scratch[2u * (gi * THREADS + tid)], hi = scratch[2u * (gi * THREADS + tid) + 1u];
+                        float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                        if (m < p.M && n < p.N) store_eight<decltype(actc)::value>(e, slope, z, coff, m, n, v);
+                    }
+                };
+                if (ACT == ACT_GELU) finish(Const<ACT_GELU>{});
+                else if (ACT == ACT_GELU_TANH) finish(Const<ACT_GELU_TANH>{});
+                else if (ACT == ACT_SILU) finish(Const<ACT_SILU>{});
+                else finish(Const<ANY_ACT>{});
             }
 #else
             /* each epilogue a loop of its own (an unrolled loop that branched between them all ran 18,000 instructions

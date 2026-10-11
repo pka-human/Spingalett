@@ -295,6 +295,15 @@ static uint64_t sample_floats(const NeuralNetwork *net, bool training) {
    SPINGALETT_BATCH_CHUNK, and the same groups. */
 #define TRAINING_CHUNK 4096u
 
+/* Values of a chunk's largest layer, at most (its outputs, and in training its values before the activation
+   where they are kept): the passes between products read and write layers that stay in the GPU's cache. A GPT
+   of Examples/Benchmark.c (layers of 256 tokens of 384 and 1,536 values) trains its batches of 64 sequences
+   1.04 times as fast in chunks of 16 as in the chunks of 32 that memory allowed in bfloat16 on an RTX 4050
+   Laptop GPU (24 MB of L2), 1.08 times as fast as in one chunk, and 1.03 times in single precision (chunks of
+   8 are slower), and infers 512 sequences 1.04 times as fast in chunks of 32 as in chunks of 64. Training
+   with batch normalization keeps its chunks. */
+#define CHUNK_VALUES (1ull << 24)
+
 /* Bytes of the activations of an inference chunk, at most: a chunk whose layers' outputs stay in the
    GPU's cache from one layer to the next runs faster than a larger one (the U-Net of
    Examples/Benchmark.c infers 1.57 times as fast in chunks of 32 MB as in chunks of 2,048 images on an
@@ -316,12 +325,29 @@ uint32_t spingalett_gpu_capacity(const NeuralNetwork *net, uint32_t want, bool t
     /* half the device's memory for the chunk's buffers (the parameters and scratch are smaller) */
     uint64_t per = sample_floats(net, training) * 4u, cap = memory / 2u / (per ? per : 1u);
     uint32_t chunk = TRAINING_CHUNK;
+    bool normalized = false;
     for (uint32_t l = 1; l < net->layers; l++)
-        if (net->shapes[l].type == LAYER_BATCH_NORM) chunk = SPINGALETT_BATCH_CHUNK;
+        if (net->shapes[l].type == LAYER_BATCH_NORM) chunk = SPINGALETT_BATCH_CHUNK, normalized = true;
     if (training && cap > chunk) cap = chunk;
     /* inference in chunks that keep to the cache, of 64 samples at least */
     const uint64_t cached = INFERENCE_BYTES / inference_bytes(net);
     if (!training && cap > cached) cap = cached < 64u ? 64u : cached;
+    /* the samples asked for in k chunks of alike size whose largest layer keeps to CHUNK_VALUES (k a divisor of
+       them where one is near): in inference, and in training without batch normalization */
+    if ((!training || !normalized) && want > 1u) {
+        uint64_t largest = 0;
+        for (uint32_t l = 1; l + 1 < net->layers; l++) {
+            const uint64_t v = (uint64_t)net->topology[l] * (training && keeps_pre(net, l) ? 2u : 1u);
+            largest = v > largest ? v : largest;
+        }
+        uint64_t k = ((uint64_t)want * largest + CHUNK_VALUES - 1u) / CHUNK_VALUES;
+        if (k > 1u) {
+            for (uint64_t d = k; d <= 2u * k && d <= want; d++)
+                if (want % d == 0) { k = d; break; }
+            const uint64_t fit = (want + k - 1u) / k;
+            if (fit < cap) cap = fit;
+        }
+    }
     /* a layer's values of a chunk indexed by kernels with signed 32-bit integers, as SPIR-V indexes */
     uint32_t widest = 1;
     for (uint32_t l = 0; l < net->layers; l++) widest = net->topology[l] > widest ? net->topology[l] : widest;
