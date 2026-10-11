@@ -641,10 +641,11 @@ SpingalettTokenizer *tok = spingalett_tokenizer_load("SmolLM2-135M.Q4_K_M.gguf")
   Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, the k-quants Q2_K to Q6_K, and IQ4_NL and IQ4_XS, which quantized
   files of widths that are no multiple of 256 hold where k-quants cannot be. The network keeps
   floats (quantize it again with `spingalett_model_from_network()` to deploy it). The other i-quants
-  are refused, naming the tensor and its type. On the quantized SmolLM2-135M files of every type
-  above, the weights are those of the `gguf` Python package's dequantization, bit for bit (the
-  dequantization is compiled in IEEE order, so they are the same on every platform), and a Q4_K_M
-  file loads in 0.18 s on an i7-12650H.
+  are refused, naming the tensor and its type. On quantized files of SmolLM2-135M, TinyStories and
+  Qwen2.5-0.5B (tensors of Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q3_K, Q4_K, Q5_K, Q6_K and IQ4_NL), and on
+  random blocks of every type above, the weights are those of the `gguf` Python package's
+  dequantization, bit for bit (the dequantization is compiled in IEEE order, so they are the same on
+  every platform); a Q4_K_M file of SmolLM2-135M loads in 0.18 s on an i7-12650H.
 - llama.cpp's converter stores LLaMA's queries and keys with the rows of each head's two halves
   interleaved, for its rotation of adjacent pairs; they are put back in Hugging Face's order, which
   the library's rotation of halves expects (Qwen2's are stored in that order already).
@@ -653,8 +654,9 @@ SpingalettTokenizer *tok = spingalett_tokenizer_load("SmolLM2-135M.Q4_K_M.gguf")
   is SentencePiece's BPE of its scores, with byte fallback and the space before each text and after
   each special token, as llama.cpp and the `sentencepiece` library encode it. Control tokens are
   special, user-defined tokens are found in any text, and `tokenizer.ggml.add_bos_token` gives the
-  BOS of `.add_special`. GGUF vocabularies of SmolLM2 and TinyStories give the ids of the
-  `tokenizer.json` files they were converted from.
+  BOS of `.add_special`. The GGUF vocabularies of SmolLM2, Qwen2.5 and TinyStories give the ids of
+  the `tokenizer.json` files they were converted from (TinyStories' finds its special tokens in the
+  normalized text, which llama.cpp does not: with `.special` those differ).
 
 ### Importing models: ONNX and PyTorch
 
