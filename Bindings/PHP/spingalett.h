@@ -163,6 +163,45 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
 SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs,
                                                 const float *targets, uint32_t count);
 
+typedef struct SpingalettSession SpingalettSession;
+typedef struct {
+    uint32_t max_length;
+    uint32_t sequences;
+    uint64_t reserved[8];
+} SpingalettSessionOptions;
+SpingalettSession *spingalett_session_new(const SpingalettModel *model, const SpingalettSessionOptions *options);
+void spingalett_session_free(SpingalettSession *session);
+uint32_t spingalett_session_vocabulary(const SpingalettSession *session);
+uint32_t spingalett_session_length(const SpingalettSession *session, uint32_t sequence);
+typedef struct {
+    uint32_t sequence;
+    const uint32_t *tokens;
+    uint32_t count;
+    float *logits;
+    bool all;
+    uint64_t reserved[8];
+} SpingalettSessionFeed;
+bool spingalett_session_feed(SpingalettSession *session, const SpingalettSessionFeed *feeds, uint32_t count);
+bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
+bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
+typedef struct {
+    SpingalettSession *session;
+    uint32_t sequences;
+    const uint32_t *const *prompts;
+    const uint32_t *prompt_lengths;
+    uint32_t *tokens;
+    uint32_t *made;
+    uint32_t count;
+    float temperature;
+    uint32_t top_k;
+    float top_p;
+    uint64_t seed;
+    const uint32_t *stop_tokens;
+    uint32_t stop_count;
+    uint64_t reserved[8];
+} SpingalettSessionGenerateArgs;
+uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
+
 /* Networks and training (Spingalett.h). */
 
 typedef enum {

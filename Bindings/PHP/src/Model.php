@@ -83,6 +83,15 @@ final class Model
         return Native::read($y, 'float', $outputs);
     }
 
+    /**
+     * A session of this causal language model: $sequences sequences of up to $maxLength tokens (0: the
+     * model's window) fed a token at a time (Session).
+     */
+    public function session(int $maxLength = 0, int $sequences = 1): Session
+    {
+        return new Session($this, $maxLength, $sequences);
+    }
+
     /** The mean loss (the loss the network trained with) and accuracy over samples. */
     public function evaluate(array $inputs, array $targets): Metrics
     {
