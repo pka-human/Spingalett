@@ -202,6 +202,10 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
         set_error(SPINGALETT_ERR_INVALID, message);
         return NULL;
     }
+    if ((uint64_t)(sequences / cells + 1u) * cells > UINT32_MAX) {     /* (a pass's rows count in 32 bits) */
+        set_error(SPINGALETT_ERR_INVALID, "session: too many sequences");
+        return NULL;
+    }
     SpingalettSession *s = (SpingalettSession *)calloc(1, sizeof *s);
     if (!s) {
         set_error(SPINGALETT_ERR_ALLOC, "session: allocation failed");
