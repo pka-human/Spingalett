@@ -28,7 +28,7 @@
  * through a softmax, times the values, is an attention layer whose input is the queries', keys' and
  * values' products merged into one linear layer (the scale folded into the queries' weights, rotary
  * embeddings recognised from their tables); a learned position table added to an embedding is its
- * positions.
+ * positions. ONNX Runtime's fused operators become the same layers.
  */
 
 #include "Spingalett.Private.h"
@@ -4069,6 +4069,206 @@ static bool convert_gather(Importer *im, const Node *n) {
     return lazy_value(im, n->outputs[0], true, li, dims, 3, true) != NULL;
 }
 
+/* ------------------------------------------------------------------------- ONNX Runtime's fused operators */
+
+/* The heads of a sequence's channels [off, off + heads x head) as [1, heads, T, head] (transposed:
+   [1, heads, head, T]). */
+static bool heads_view(Importer *im, uint32_t si, uint32_t off, uint32_t heads, uint32_t head, bool transposed,
+                       View *v) {
+    const Value *s = &im->values[si];
+    plain_view(s, si, v);
+    const int64_t first = 0, T = seq_tokens(s);
+    if (v->nd == 2 && !view_squeeze(v, &first, 1, true)) return false;
+    const int64_t t[4] = {1, T, heads, head};
+    static const int64_t perm[4] = {0, 2, 1, 3}, permt[4] = {0, 2, 3, 1};
+    return view_slice(v, 2, off, (int64_t)heads * head) && view_reshape(v, t, 4) &&
+           view_transpose(v, transposed ? permt : perm);
+}
+
+/* count values of a constant from first on, as a constant without a name; NO_VALUE on an error. */
+static uint32_t const_slice(Importer *im, uint32_t ci, uint64_t first, uint64_t count) {
+    const float *d = constant_floats(im, &im->values[ci]);
+    if (!d) return NO_VALUE;
+    float *part = (float *)malloc((size_t)(count ? count : 1) * sizeof(float));
+    Value *v = part ? new_value(im, (Str){"", 0}, false) : NULL;
+    if (!v) { free(part); return out_of_memory(im), NO_VALUE; }
+    memcpy(part, im->values[ci].data + first, (size_t)count * sizeof(float));
+    v->constant = v->owned = true;
+    v->data = part;
+    v->ndims = 1;
+    v->dims[0] = (int64_t)count;
+    v->count = count;
+    v->ctype = ONNX_FLOAT;
+    return value_index(im, v);
+}
+
+/* Whether a fused operator reads only its first inputs (below first: the others, a mask, a cache, a bias of
+   positions, are absent) and only its first output is read. */
+static bool fused_plain(Importer *im, const Node *n, int first) {
+    for (int k = first; k < n->ninputs; k++)
+        if (n->inputs[k].n)
+            return node_fail(im, n, "reads a mask, a cache or a bias of positions, which the attention layer does not "
+                             "have");
+    for (int k = 1; k < n->noutputs; k++)
+        if (n->outputs[k].n && readers(im, n->outputs[k]))
+            return node_fail(im, n, "outputs its keys, values or statistics to other nodes");
+    return true;
+}
+
+/* com.microsoft's Attention: the input's queries, keys and values by constant weights [in, 3 hidden] (and a
+   bias), split into num_heads heads; causal when unidirectional. */
+static bool convert_ms_attention(Importer *im, const Node *n) {
+    if (n->ninputs < 2) return node_fail(im, n, "lacks its input or weights");
+    if (!fused_plain(im, n, 3)) return false;
+    if (attr_int(n, "do_rotary", 0) != 0) return node_fail(im, n, "rotates its queries and keys (do_rotary)");
+    const int64_t H = attr_int(n, "num_heads", 0);
+    Value *x = find(im, n->inputs[0]), *W = find(im, n->inputs[1]);
+    Value *B = n->ninputs > 2 && n->inputs[2].n ? find(im, n->inputs[2]) : NULL;
+    if (!x || x->constant || !W || !W->constant || W->ndims != 2 || H <= 0 || kind_of(im, x) == LZ_VIEW ||
+        (n->ninputs > 2 && n->inputs[2].n && (!B || !B->constant)))
+        return node_fail(im, n, "needs a sequence, constant weights (and bias) and its number of heads");
+    const int64_t cols = W->dims[1];
+    int64_t hq = cols / 3, hk = cols / 3, hv = cols - 2 * (cols / 3);
+    const Attr *qs = attr(n, "qkv_hidden_sizes");
+    if (qs && qs->nints == 3) hq = qs->ints[0], hk = qs->ints[1], hv = qs->ints[2];
+    if (hq <= 0 || hq != hk || hq + hk + hv != cols || hq % H || hv % H || hq / H != hv / H)
+        return node_fail(im, n, "has queries, keys and values of sizes the attention layer does not read");
+    View arr, q, k, v;
+    const uint32_t r = token_linear(im, n, value_index(im, x), value_index(im, W), true, 1.0f,
+                                    B ? value_index(im, B) : NO_VALUE, 1.0f, &arr);
+    if (r == NO_VALUE) return false;
+    const uint32_t head = (uint32_t)(hq / H);
+    if (!heads_view(im, r, 0, (uint32_t)H, head, false, &q) ||
+        !heads_view(im, r, (uint32_t)hq, (uint32_t)H, head, true, &k) ||
+        !heads_view(im, r, (uint32_t)(hq + hk), (uint32_t)H, head, false, &v))
+        return node_fail(im, n, "has heads that do not fit its input");
+    const int64_t lead[2] = {1, H};
+    const Attr *sa = attr(n, "scale");
+    const float scale = sa && sa->f != 0.0f ? sa->f : 1.0f / sqrtf((float)head);
+    return make_attention(im, n, &q, &k, &v, scale, attr_int(n, "unidirectional", 0) != 0, lead, 2, 0, true);
+}
+
+/* com.microsoft's MultiHeadAttention: queries, keys and values [N, T, C] (with a bias of all three added),
+   split into num_heads heads; causal when unidirectional. */
+static bool convert_ms_mha(Importer *im, const Node *n) {
+    if (n->ninputs < 3 || !n->inputs[1].n || !n->inputs[2].n)
+        return node_fail(im, n, "reads packed queries, keys and values, which the importer does not");
+    if (!fused_plain(im, n, 4)) return false;
+    const int64_t H = attr_int(n, "num_heads", 0);
+    uint32_t idx[3];
+    for (int i = 0; i < 3; i++) {
+        const Value *x = find(im, n->inputs[i]);
+        if (!x || x->constant || kind_of(im, x) == LZ_VIEW || !seq_base(im, x))
+            return node_fail(im, n, "reads queries, keys or values that are not sequences [N, T, C]");
+        idx[i] = value_index(im, x);
+    }
+    const uint32_t Cq = seq_channels(&im->values[idx[0]]), Ck = seq_channels(&im->values[idx[1]]);
+    const uint32_t Cv = seq_channels(&im->values[idx[2]]);
+    if (H <= 0 || Cq != Ck || Cq % H || Cv % H || Cq / H != Cv / H)
+        return node_fail(im, n, "has queries, keys and values of sizes the attention layer does not read");
+    if (n->ninputs > 3 && n->inputs[3].n) {
+        /* the bias: the products' */
+        const Value *b = find(im, n->inputs[3]);
+        if (!b || !b->constant || b->count != (uint64_t)Cq + Ck + Cv)
+            return node_fail(im, n, "adds a bias of another size");
+        const uint32_t bi = value_index(im, b);
+        const uint64_t at[3] = {0, Cq, (uint64_t)Cq + Ck}, size[3] = {Cq, Ck, Cv};
+        for (int i = 0; i < 3; i++) {
+            const uint32_t part = const_slice(im, bi, at[i], size[i]);
+            if (part == NO_VALUE) return false;
+            if ((idx[i] = rows_const(im, n, E_ADD, idx[i], part, false, false)) == NO_VALUE) return false;
+        }
+    }
+    View q, k, v;
+    const uint32_t head = (uint32_t)(Cq / H);
+    if (!heads_view(im, idx[0], 0, (uint32_t)H, head, false, &q) ||
+        !heads_view(im, idx[1], 0, (uint32_t)H, head, true, &k) ||
+        !heads_view(im, idx[2], 0, (uint32_t)H, head, false, &v))
+        return node_fail(im, n, "has heads that do not fit its inputs");
+    const int64_t lead[2] = {1, H};
+    const Attr *sa = attr(n, "scale");
+    const float scale = sa && sa->f != 0.0f ? sa->f : 1.0f / sqrtf((float)head);
+    return make_attention(im, n, &q, &k, &v, scale, attr_int(n, "unidirectional", 0) != 0, lead, 2, 0, true);
+}
+
+/* com.microsoft's SkipLayerNormalization (rms: SkipSimplifiedLayerNormalization): the normalization of
+   input + skip (+ bias, a product's); output 3 the sum. */
+static bool convert_skip_norm(Importer *im, const Node *n, bool rms) {
+    const int bias_at = rms ? 3 : 4;
+    if (n->ninputs < 3) return node_fail(im, n, "lacks its input, skip or scale");
+    for (int k = 1; k <= 2 && k < n->noutputs; k++)
+        if (n->outputs[k].n && readers(im, n->outputs[k]))
+            return node_fail(im, n, "outputs its statistics to other nodes");
+    const Value *a = find(im, n->inputs[0]), *b = find(im, n->inputs[1]);
+    if (!a || !b || a->constant || b->constant) return node_fail(im, n, "needs a computed input and skip");
+    uint32_t ai = value_index(im, a);
+    const uint32_t bi = value_index(im, b);
+    if (bias_at < n->ninputs && n->inputs[bias_at].n) {
+        const Value *c = find(im, n->inputs[bias_at]);
+        if (!c || !c->constant) return node_fail(im, n, "adds a bias that is not constant");
+        if ((ai = rows_const(im, n, E_ADD, ai, value_index(im, c), false, false)) == NO_VALUE) return false;
+    }
+    Value *x = &im->values[ai], *y = &im->values[bi];
+    if (kind_of(im, x) == LZ_VIEW || kind_of(im, y) == LZ_VIEW || !materialize(im, x) || !materialize(im, y)) {
+        return im->error[0] ? false : node_fail(im, n, "reads rearranged tokens");
+    }
+    if (!x->seq || !y->seq || seq_tokens(x) != seq_tokens(y) || seq_channels(x) != seq_channels(y))
+        return node_fail(im, n, "adds tensors that are not sequences of one shape");
+    const uint32_t C = seq_channels(x);
+    int64_t dims[3];
+    const int nd = x->ndims;
+    memcpy(dims, x->dims, (size_t)nd * sizeof *dims);
+    const uint32_t sum = add_layers(.net = im->net, .inputs = {x->layer, y->layer}, .input_count = 2);
+    if (!added(im, sum, n)) return false;
+    const Value *gamma = constant_input(im, n, 2, C);
+    if (!gamma) return false;
+    const bool shifted = !rms && n->ninputs > 3 && n->inputs[3].n;
+    const Value *beta = shifted ? constant_input(im, n, 3, C) : NULL;
+    if (shifted && !beta) return false;
+    const float eps = attr_float(n, "epsilon", 1e-5f), e = eps > 0.0f && eps < 1.0f ? eps : 1e-5f;
+    const uint32_t l = rms ? rms_norm(.net = im->net, .inputs = {sum}, .input_count = 1, .epsilon = e)
+                           : layer_norm(.net = im->net, .inputs = {sum}, .input_count = 1, .epsilon = e);
+    if (!added(im, l, n)) return false;
+    im->bias_open = false;
+    memcpy(layer_weights(im->net, l), gamma->data, C * sizeof(float));
+    if (!rms) {
+        if (beta) memcpy(layer_biases(im->net, l), beta->data, C * sizeof(float));
+        else memset(layer_biases(im->net, l), 0, C * sizeof(float));
+    }
+    if (!seq_value(im, n->outputs[0], true, l, dims, nd)) return false;
+    return n->noutputs < 4 || !n->outputs[3].n || seq_value(im, n->outputs[3], true, sum, dims, nd) != NULL;
+}
+
+/* com.microsoft's Gelu (erf), FastGelu (tanh) and BiasGelu (erf): of input 0 plus a constant bias (input
+   1, a product's). */
+static bool convert_ms_gelu(Importer *im, const Node *n, uint8_t op) {
+    const Value *x = n->ninputs > 0 ? find(im, n->inputs[0]) : NULL;
+    if (!x || x->constant) return node_fail(im, n, "needs a computed input");
+    uint32_t xi = value_index(im, x);
+    if (n->ninputs > 1 && n->inputs[1].n) {
+        const Value *c = find(im, n->inputs[1]);
+        if (!c || !c->constant) return node_fail(im, n, "adds a bias that is not constant");
+        if ((xi = rows_const(im, n, E_ADD, xi, value_index(im, c), false, false)) == NO_VALUE) return false;
+    }
+    if (kind_of(im, &im->values[xi]) == LZ_VIEW) return node_fail(im, n, "applies GELU to rearranged tokens");
+    return expr_unary(im, n, op, &im->values[xi]);
+}
+
+static bool convert_microsoft(Importer *im, const Node *n) {
+    const Str op = n->op;
+    if (str_is(op, "Attention")) return convert_ms_attention(im, n);
+    if (str_is(op, "MultiHeadAttention")) return convert_ms_mha(im, n);
+    if (str_is(op, "SkipLayerNormalization")) return convert_skip_norm(im, n, false);
+    if (str_is(op, "SkipSimplifiedLayerNormalization")) return convert_skip_norm(im, n, true);
+    if (str_is(op, "Gelu") || str_is(op, "BiasGelu")) return convert_ms_gelu(im, n, E_GELU);
+    if (str_is(op, "FastGelu")) return convert_ms_gelu(im, n, E_GELU_TANH);
+    if (str_is(op, "SimplifiedLayerNormalization")) {
+        const Value *x = n->ninputs > 0 ? find(im, n->inputs[0]) : NULL;
+        return x && (x->seq || x->lazy) ? tok_norm(im, n, true) : convert_layer_norm(im, n, true);
+    }
+    return fail(im, "ONNX import: operator %.*s of the domain com.microsoft (node '%.*s') is not supported", op, n->name);
+}
+
 /* What a lazy value is made into when a layer reads it. */
 static uint32_t make(Importer *im, uint32_t li) {
     switch (im->lazies[li].kind) {
@@ -4149,6 +4349,7 @@ static bool convert_tokens(Importer *im, const Node *n) {
 }
 
 static bool convert_node(Importer *im, const Node *n) {
+    if (str_is(n->domain, "com.microsoft")) return convert_microsoft(im, n);
     if (n->domain.n && !str_is(n->domain, "ai.onnx"))
         return fail(im, "ONNX import: operator %.*s of the domain %.*s is not supported", n->op, n->domain);
     if (folds(im, n)) return fold(im, n);
