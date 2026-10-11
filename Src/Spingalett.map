@@ -121,3 +121,15 @@ SPINGALETT_1.2 {
         spingalett_generate_args;
         spingalett_target_size;
 } SPINGALETT_1.1;
+
+SPINGALETT_1.3 {
+    global:
+        spingalett_detokenize_args;
+        spingalett_tokenize_args;
+        spingalett_tokenizer_free;
+        spingalett_tokenizer_from_memory;
+        spingalett_tokenizer_id;
+        spingalett_tokenizer_info;
+        spingalett_tokenizer_load;
+        spingalett_tokenizer_token;
+} SPINGALETT_1.2;

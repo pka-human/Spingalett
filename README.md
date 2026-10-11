@@ -55,7 +55,7 @@ Python (wheels with the library inside), C++, Rust, .NET, Go and Java are includ
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
-| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
@@ -533,6 +533,59 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 - `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every
   epoch. In Python, `gpt2_from_state_dict()` and `llama_from_state_dict()` make networks of GPT-2
   checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2).
+
+### Tokenizers
+
+`spingalett_tokenizer_load()` reads the tokenizer of a language model: a Hugging Face
+`tokenizer.json` file, or a model directory holding one (its `tokenizer_config.json` then names the
+BOS and EOS tokens). `spingalett_tokenize()` turns UTF-8 text into token ids and
+`spingalett_detokenize()` ids back into text, id for id and byte for byte as Hugging Face's
+`tokenizers` library does:
+
+```c
+SpingalettTokenizer *tok = spingalett_tokenizer_load("models/SmolLM2-135M");     /* NULL on error */
+uint32_t ids[256];
+int64_t n = spingalett_tokenize(.tokenizer = tok, .text = "<|im_start|>user\nHello!<|im_end|>",
+                                .tokens = ids, .capacity = 256, .special = true);
+char text[1024];
+spingalett_detokenize(.tokenizer = tok, .tokens = ids, .count = (size_t)n, .text = text, .capacity = sizeof text);
+uint32_t end = spingalett_tokenizer_id(tok, "<|im_end|>");                /* a chat format's stop token */
+SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);            /* vocabulary, BOS, EOS, ... */
+spingalett_tokenizer_free(tok);
+```
+
+| Family | Models | What the file holds |
+|---|---|---|
+| Byte-level BPE | GPT-2, SmolLM | ByteLevel pre-tokenizer (GPT-2's expression), digits apart |
+| tiktoken's encodings | LLaMA 3 (cl100k), Qwen2 (cl100k with single digits, NFC), GPT-4o-like (o200k) | a Split by the expression, then ByteLevel; ignore_merges |
+| SentencePiece's BPE | LLaMA 2, TinyLlama, Mistral, Phi-3 | Prepend and Replace of `▁` (or Metaspace), byte fallback to `<0xXX>` tokens |
+
+- The steps are those of the `tokenizers` library: added tokens found first (leftmost, longest,
+  with their `lstrip`, `rstrip` and `single_word` rules), the normalizers (NFC, Prepend, Replace,
+  Strip), the pre-tokenizers (ByteLevel, Split, Metaspace, Digits), the BPE merges by rank, the
+  template of the post-processor (`.add_special`: LLaMA's BOS), and in decoding ByteLevel,
+  ByteFallback, Replace, Fuse, Strip and Metaspace. Merges go through a heap of candidate pairs, so a
+  piece of n characters takes n log n steps; a SentencePiece text, which is one piece, is merged word
+  by word where the vocabulary shows that no merge joins a word to the `▁` after it (the same
+  tokens, without a heap of the whole text). Other models (WordPiece, Unigram), normalizers and
+  expressions are refused with an error that names them.
+- The pre-tokenizers' regular expressions are matched by hand, not by a regular expression library:
+  GPT-2's, cl100k's (with up to three or single digits) and o200k's (with tekken's variant) are
+  recognized by their text and matched with the semantics of the Oniguruma expressions the
+  `tokenizers` library runs, letters, numbers and marks from the Unicode tables of
+  `Src/Spingalett.Unicode.h` (written by `Src/make_unicode.py`).
+- Special tokens written in a text become their ids only with `.special = true`; by default they are
+  text like any other, so that text from users cannot forge a chat format's control tokens. Added
+  tokens that are not special are always found. `.skip_special` leaves special tokens out of
+  decoded text; bytes that are no UTF-8 (a character split between tokens) decode to U+FFFD.
+- Both calls return the full count (tokens, or bytes of text) also when the array is too small,
+  writing what fits: call again with room for all. Input that is not UTF-8 is an error.
+- On the tokenizers of GPT-2, LLaMA 3.2, Qwen2.5, SmolLM2, TinyLlama, Mistral 7B (v0.1 and v0.3) and
+  Phi-3, the ids and decoded texts equal those of `tokenizers` 0.23 on texts of every script, emoji,
+  combining marks, whitespace runs, digits and special tokens. On an i7-12650H 0.9 MB of prose and
+  code encode in 0.055 s with GPT-2's tokenizer (0.30 s in `tokenizers` 0.23), 0.030 s with LLaMA
+  3's (0.25 s), 0.075 s with Qwen2.5's (0.27 s) and 0.067 s with TinyLlama's (0.31 s), medians of
+  seven runs on one thread.
 
 ### Importing models: ONNX and PyTorch
 

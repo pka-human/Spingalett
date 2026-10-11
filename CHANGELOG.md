@@ -7,6 +7,25 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- **Tokenizers** of language models in C: `spingalett_tokenizer_load()` reads a Hugging Face
+  `tokenizer.json` (or a model directory, whose `tokenizer_config.json` names BOS and EOS),
+  `spingalett_tokenize()` encodes UTF-8 text and `spingalett_detokenize()` decodes ids, with
+  `spingalett_tokenizer_info()`, `spingalett_tokenizer_token()` and `spingalett_tokenizer_id()`
+  (`SpingalettTokenizer`, `SpingalettTokenizerInfo`, `SPINGALETT_NO_TOKEN`). Byte-level BPE (GPT-2,
+  SmolLM), tiktoken's encodings (LLaMA 3's cl100k, Qwen2's with single digits and NFC, o200k) and
+  SentencePiece's BPE with byte fallback (LLaMA 2, Mistral, Phi-3), as the `tokenizers` library runs
+  them: added tokens with their strip rules, special ones found only when asked (`.special`), the
+  normalizers, pre-tokenizers, decoders and templates those files use, merges by rank through a heap
+  (n log n in a piece's length; SentencePiece's texts merged word by word where the vocabulary allows
+  it). The pre-tokenizers' regular expressions are matched by hand with Oniguruma's semantics, over
+  Unicode tables written by `Src/make_unicode.py`. On the tokenizers of GPT-2, LLaMA 3.2, Qwen2.5,
+  SmolLM2, TinyLlama, Mistral 7B and Phi-3 the ids and texts equal those of `tokenizers` 0.23, and
+  encoding runs 3.6 to 8.3 times as fast (0.9 MB of prose and code on an i7-12650H, one thread). The
+  `tokenizer` test group checks six small tokenizers of these families
+  (`Tests/make_tokenizer_tests.py`) against the library's ids.
+- An internal JSON reader (`Src/Spingalett.Json.c`) for the files of language models.
+
 ## [1.2.0] - 2026-10-11
 
 "Transformers": the networks of today's language models in every part of the library at once,

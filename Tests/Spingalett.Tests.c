@@ -8,8 +8,8 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad conv norm graph onnx equiv cont optim sched dropout gen predict valid
- *                                step data io model xor
+ *   Spingalett.Tests [group]     groups: grad conv norm graph onnx tokenizer equiv cont optim sched dropout gen
+ *                                predict valid step data io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 
 #ifndef SPINGALETT_TEST_DATA_DIR
 #define SPINGALETT_TEST_DATA_DIR "Data"
@@ -4537,6 +4538,169 @@ static void pytorch_transposed(void) {
     free(data);
 }
 
+/* ---- tokenizers: the ids and texts of Hugging Face's tokenizers library (Tests/make_tokenizer_tests.py) ---- */
+
+/* Bytes of a hex string ("-" for none) into out; returns their count. */
+static size_t unhex(const char *hex, char *out) {
+    size_t n = 0;
+    if (hex[0] == '-') return 0;
+    for (; isxdigit((unsigned char)hex[0]) && isxdigit((unsigned char)hex[1]); hex += 2) {
+        int hi = hex[0] <= '9' ? hex[0] - '0' : (hex[0] | 32) - 'a' + 10, lo = hex[1] <= '9' ? hex[1] - '0' : (hex[1] | 32) - 'a' + 10;
+        out[n++] = (char)(hi * 16 + lo);
+    }
+    return n;
+}
+
+/* Every case of tokenizer_NAME.txt: the ids (also counted without room, and cut short by a small array),
+   and both decodings. */
+static void tokenizer_cases(const char *name) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/tokenizer_%s.json", SPINGALETT_TEST_DATA_DIR, name);
+    SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+    CHECK(tok, "%s: %s", path, spingalett_last_error_message());
+    snprintf(path, sizeof path, "%s/tokenizer_%s.txt", SPINGALETT_TEST_DATA_DIR, name);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "%s: no expected ids", path);
+    if (!tok || !f) { if (f) fclose(f); spingalett_tokenizer_free(tok); return; }
+    enum { LINE = 1 << 16 };
+    char *line = malloc(LINE), *text = malloc(LINE), *want = malloc(LINE), *got = malloc(LINE);
+    uint32_t *ids = malloc(LINE * sizeof(uint32_t)), *expect = malloc(LINE * sizeof(uint32_t));
+    int cases = 0, wrong_ids = 0, wrong_text = 0;
+    while (fgets(line, LINE, f)) {
+        if (line[0] == '#') continue;
+        int special = 0, add = 0, used = 0;
+        char *hex = malloc(LINE);
+        if (sscanf(line, "%d %d %s", &special, &add, hex) != 3) { free(hex); break; }
+        size_t n = unhex(hex, text);
+        free(hex);
+        text[n] = '\0';
+        unsigned count = 0;
+        if (!fgets(line, LINE, f) || sscanf(line, "%u%n", &count, &used) != 1 || count >= LINE) break;
+        char *p = line + used;
+        for (unsigned k = 0; k < count; k++) expect[k] = (uint32_t)strtoul(p, &p, 10);
+        cases++;
+        int64_t m = spingalett_tokenize(.tokenizer = tok, .text = n ? text : "", .length = n, .tokens = ids,
+                                        .capacity = LINE, .special = special, .add_special = add);
+        int64_t counted = spingalett_tokenize(.tokenizer = tok, .text = n ? text : "", .length = n, .special = special,
+                                              .add_special = add);
+        bool same = m == (int64_t)count && counted == m && (count == 0 || !memcmp(ids, expect, count * sizeof(uint32_t)));
+        if (same && count > 1) {        /* a short array: the count still, the first tokens written */
+            uint32_t few[2] = {UINT32_MAX, UINT32_MAX - 1};
+            same = spingalett_tokenize(.tokenizer = tok, .text = text, .length = n, .tokens = few, .capacity = 1,
+                                       .special = special, .add_special = add) == (int64_t)count &&
+                   few[0] == expect[0] && few[1] == UINT32_MAX - 1;
+        }
+        if (!same && ++wrong_ids <= 3)
+            printf("  %s: \"%.60s\" (special %d, add %d) gives %lld tokens, %u expected\n", name, text, special, add,
+                   (long long)m, count);
+        for (int skip = 0; skip < 2; skip++) {
+            if (!fgets(line, LINE, f)) break;
+            size_t wn = unhex(line, want);
+            int64_t len = spingalett_detokenize(.tokenizer = tok, .tokens = expect, .count = count, .text = got,
+                                                .capacity = LINE, .skip_special = skip);
+            int64_t measured = spingalett_detokenize(.tokenizer = tok, .tokens = expect, .count = count, .skip_special = skip);
+            if ((len != (int64_t)wn || measured != len || memcmp(got, want, wn) || got[wn] != '\0') && ++wrong_text <= 3)
+                printf("  %s: ids of \"%.60s\" decode to \"%.60s\" (skip %d)\n", name, text, len >= 0 ? got : "(error)", skip);
+        }
+    }
+    CHECK(cases >= 100 && !wrong_ids && !wrong_text, "%s: %d of %d texts tokenized and %d decoded differently from Hugging "
+          "Face's", name, wrong_ids, cases, wrong_text);
+    /* every token found by its string (the lowest id of equal ones) */
+    SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+    uint32_t lookups = 0;
+    for (uint32_t id = 0; id < info.vocabulary; id++) {
+        const char *s = spingalett_tokenizer_token(tok, id);
+        lookups += s && spingalett_tokenizer_id(tok, s) <= id;
+    }
+    CHECK(lookups == info.vocabulary && !spingalett_tokenizer_token(tok, info.vocabulary) &&
+          spingalett_tokenizer_id(tok, "no such token \x01") == SPINGALETT_NO_TOKEN,
+          "%s: %u of %u tokens found by their strings", name, lookups, info.vocabulary);
+    printf("  tokenizer_%-10s %3d texts, %u tokens\n", name, cases, info.vocabulary);
+    fclose(f);
+    free(line); free(text); free(want); free(got); free(ids); free(expect);
+    spingalett_tokenizer_free(tok);
+}
+
+/* The tokens a tokenizer names, the errors of calls and of malformed files. */
+static void tokenizer_api(void) {
+    char path[512];
+    static const struct { const char *name; uint32_t bos, eos, unk, added; } named[] = {
+        {"llama3", 420, 421, SPINGALETT_NO_TOKEN, 5}, {"spm", 1, 2, 0, 5}, {"gpt2", SPINGALETT_NO_TOKEN, 0, SPINGALETT_NO_TOKEN, 2},
+        {"qwen2", SPINGALETT_NO_TOKEN, 420, SPINGALETT_NO_TOKEN, 3},
+    };
+    for (size_t k = 0; k < sizeof named / sizeof *named; k++) {
+        snprintf(path, sizeof path, "%s/tokenizer_%s.json", SPINGALETT_TEST_DATA_DIR, named[k].name);
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+        CHECK(tok && info.bos == named[k].bos && info.eos == named[k].eos && info.unk == named[k].unk &&
+              info.added == named[k].added, "tokenizer_%s: BOS %u, EOS %u, unknown %u, %u added", named[k].name, info.bos,
+              info.eos, info.unk, info.added);
+        spingalett_tokenizer_free(tok);
+    }
+    snprintf(path, sizeof path, "%s/tokenizer_llama3.json", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *json = read_file(path, &size);
+    SpingalettTokenizer *tok = json ? spingalett_tokenizer_from_memory(json, (size_t)size) : NULL;
+    CHECK(tok, "a tokenizer from memory: %s", spingalett_last_error_message());
+    uint32_t ids[64], bot = spingalett_tokenizer_id(tok, "<|begin_of_text|>");
+    CHECK(bot == 420 && !strcmp(spingalett_tokenizer_token(tok, 420), "<|begin_of_text|>"), "special tokens by name");
+    /* the text from users cannot forge special tokens unless asked */
+    int64_t plain = spingalett_tokenize(.tokenizer = tok, .text = "<|begin_of_text|>", .tokens = ids, .capacity = 64);
+    int64_t asked = spingalett_tokenize(.tokenizer = tok, .text = "<|begin_of_text|>", .tokens = ids, .capacity = 64, .special = true);
+    CHECK(plain > 1 && asked == 1 && ids[0] == 420, "special tokens: %lld tokens as text, %lld when asked", (long long)plain,
+          (long long)asked);
+    /* errors */
+    spingalett_clear_error();
+    CHECK(spingalett_tokenize(.tokenizer = tok, .text = "bad \xC3\x28 UTF-8", .tokens = ids, .capacity = 64) == -1 &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "text that is not UTF-8 accepted");
+    CHECK(spingalett_tokenize(.tokenizer = NULL, .text = "x") == -1 && spingalett_tokenize(.tokenizer = tok, .text = NULL) == -1 &&
+          spingalett_tokenize(.tokenizer = tok, .text = "x", .capacity = 4) == -1, "tokenize without its arguments");
+    const uint32_t beyond[2] = {5, 100000};
+    char text[64];
+    CHECK(spingalett_detokenize(.tokenizer = tok, .tokens = beyond, .count = 2, .text = text, .capacity = 64) == -1 &&
+          spingalett_detokenize(.tokenizer = tok, .tokens = NULL, .count = 2) == -1, "ids of no token decoded");
+    const uint32_t hello[3] = {420, 72, 73};
+    int64_t full = spingalett_detokenize(.tokenizer = tok, .tokens = hello, .count = 3, .text = text, .capacity = 64);
+    int64_t cut = spingalett_detokenize(.tokenizer = tok, .tokens = hello, .count = 3, .text = text, .capacity = 4);
+    CHECK(full > 3 && cut == full && strlen(text) == 3, "a text cut to its capacity: %lld bytes, \"%s\"", (long long)cut, text);
+    spingalett_tokenizer_free(tok);
+    /* truncated files never load and never crash */
+    int accepted = 0;
+    for (long cut_at = 0; json && cut_at < size; cut_at += 89) {
+        SpingalettTokenizer *t = spingalett_tokenizer_from_memory(json, (size_t)cut_at);
+        accepted += t != NULL;
+        spingalett_tokenizer_free(t);
+    }
+    CHECK(accepted == 0, "%d truncated tokenizer files loaded", accepted);
+    free(json);
+    /* files of what is not supported, or not consistent, name the problem */
+    static const struct { const char *json, *message; } bad[] = {
+        {"{\"model\": {\"type\": \"WordPiece\", \"vocab\": {\"a\": 0}}}", "WordPiece"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0, \"b\": 1}, \"merges\": [\"a b\"]}}", "merge"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"pre_tokenizer\": {\"type\": \"Whitespace\"}}",
+         "Whitespace"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"pre_tokenizer\": {\"type\": \"Split\", "
+         "\"pattern\": {\"Regex\": \"\\\\w+\"}, \"behavior\": \"Isolated\"}}", "pattern"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 99999999}, \"merges\": []}}", "id"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": [\"a\"]}}", "merge"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"normalizer\": {\"type\": \"NFKD\"}}", "NFKD"},
+        {"[1, 2, 3]", "tokenizer"},
+        {"{\"model\": {\"vocab\": {\"\\ud800\": 0}, \"merges\": []}}", "escape"},
+    };
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        SpingalettTokenizer *t = spingalett_tokenizer_from_memory(bad[k].json, strlen(bad[k].json));
+        CHECK(!t && strstr(spingalett_last_error_message(), bad[k].message), "malformed tokenizer %zu: \"%s\"", k,
+              t ? "loaded" : spingalett_last_error_message());
+        spingalett_tokenizer_free(t);
+    }
+    char deep[2100];
+    memset(deep, '[', 1000);
+    memset(deep + 1000, ']', 1000);
+    CHECK(!spingalett_tokenizer_from_memory(deep, 2000), "a JSON document nested 1000 deep loaded");
+    CHECK(!spingalett_tokenizer_load("no/such/tokenizer.json") && spingalett_tokenizer_info(NULL).vocabulary == 0 &&
+          !spingalett_tokenizer_token(NULL, 0), "tokenizers that do not exist");
+}
+
 /* ---- the GPU (COMPUTE_VULKAN, or COMPUTE_CUDA in the group "cuda") against the CPU ---- */
 
 /* The compute mode of the GPU group's tests: gpu_mode, or COMPUTE_CUDA. */
@@ -6035,6 +6199,12 @@ int main(int argc, char **argv) {
         onnx_models();
         pytorch_weights();
         pytorch_transposed();
+    }
+    if (!*only || !strcmp(only, "tokenizer")) {
+        printf("[tokenizers]\n");
+        static const char *const names[] = {"gpt2", "llama3", "qwen2", "o200k", "spm", "metaspace"};
+        for (size_t k = 0; k < sizeof names / sizeof *names; k++) tokenizer_cases(names[k]);
+        tokenizer_api();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");
