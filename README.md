@@ -27,7 +27,7 @@ model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels whe
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
 alike; programs that only run models link the runtime, a library of that part alone. Models come in
 from ONNX files and PyTorch weights (GPT-2 and LLaMA-like checkpoints in Python), and bindings for
-Python (wheels with the library inside), C++, Rust, .NET, Go and Java are included.
+Python (wheels with the library inside), C++, Rust, .NET, Go, Java and PHP are included.
 
 ## Contents
 
@@ -69,7 +69,7 @@ Python (wheels with the library inside), C++, Rust, .NET, Go and Java are includ
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
-| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API) |
+| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension) |
 | Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes |
 
 ## Building
@@ -1354,8 +1354,8 @@ gives the C object of a wrapper for whatever the wrapper does not cover.
 
 ## Bindings for other languages
 
-`Bindings/` holds bindings for Rust, .NET, Go and Java over the shared library: networks of every
-kind of layer built in each language's style, training on arrays or token files, prediction,
+`Bindings/` holds bindings for Rust, .NET, Go, Java and PHP over the shared library: networks of
+every kind of layer built in each language's style, training on arrays or token files, prediction,
 evaluation, generation, parameters, files and deployment models. Each one's tests train XOR and a
 small LLaMA-like model whose generation they check, and compare every structure the binding lays out
 with the C compiler's layout (CI runs them against the installed library):
@@ -1366,6 +1366,7 @@ with the C compiler's layout (CI runs them against the installed library):
 | C# (.NET 8+) | [`Bindings/CSharp`](Bindings/CSharp/README.md) | package `Spingalett` (`LibraryImport`) | dotnet |
 | Go | [`Bindings/Go`](Bindings/Go/README.md) | module `github.com/pka-human/Spingalett/Bindings/Go` (cgo) | go; pkg-config |
 | Java (22+) | [`Bindings/Java`](Bindings/Java/README.md) | `io.github.pkahuman.spingalett` (the foreign function and memory API) | Maven |
+| PHP (7.4+) | [`Bindings/PHP`](Bindings/PHP/README.md) | package `pka-human/spingalett` (the FFI extension; `spingalett.h`, the C declarations) | Composer; `SPINGALETT_LIB_DIR` |
 
 ```rust
 let mut lm = Network::new(Loss::SparseCrossEntropy)?;
@@ -1627,7 +1628,7 @@ Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference 
 docs/                 File format specifications (models, data sets)
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
-Bindings/             Bindings for Python, Rust, .NET (C#), Go and Java
+Bindings/             Bindings for Python, Rust, .NET (C#), Go, Java and PHP
 packaging/            Conan, vcpkg, AUR, conda recipes and the container image (Formula/: Homebrew,
                       bucket/: Scoop, flake.nix: Nix)
 cmake/                CMake package, pkg-config, runtime and inference-only build helpers
