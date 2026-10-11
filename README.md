@@ -69,7 +69,7 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
-| Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
+| Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`) of CNNs, MLPs and transformers, PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
 | Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension); JavaScript and TypeScript for the inference engine in WebAssembly |
 | Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes, an npm package |
 
@@ -555,6 +555,37 @@ in an external file next to the model (`torch.onnx.export` of models over 2 GB) 
 model's folder when importing from its path. Files are mapped rather than read, and each tensor goes
 into its layer in one pass: on an i7-12650H a 100 MB ResNet-50 imports in 0.09 s and a 500 MB model
 in 0.17 s.
+
+Transformers import into the library's own layers (models exported with an example of one sample, or
+with a dynamic batch). An input of token ids (`[N, T]`, integers) becomes an input layer of `T`
+values and `Gather` from a constant table an embedding, a learned position table added to it
+(GPT-2's) its positions; an input `[N, T, C]` becomes a layer of `1 x T` cells. `MatMul` and `Gemm`
+by constant weights on the tokens become linear layers; layer normalization and RMS normalization
+over each token (`LayerNormalization`, `RMSNormalization`, or written out with `ReduceMean`, `Pow`,
+`Sqrt` and `Div`) become theirs; element-wise expressions are recognised as the activations they
+compute (GELU as `Gelu` or written out in its erf or tanh form, SiLU as `x * Sigmoid(x)`), and
+products of two layers (`Mul`, SwiGLU's gate) become multiplication layers. Attention as exporters
+write it out becomes one attention layer: queries, keys and values from one product or three, split
+into heads by `Reshape`, `Transpose`, `Split` or `Slice`, the product of queries and keys scaled (on
+either side or both, as `scaled_dot_product_attention` exports it), masked causally (`Where`, or an
+added triangle of `-inf`), a `Softmax` over the keys, the product with the values, keys and values
+repeated for grouped queries (`Expand`, `Tile`), and rotary embeddings (`rotate_half` with tables of
+cosines and sines, whose base the importer reads from the tables). The queries', keys' and values'
+products become the one linear layer the attention layer reads, a scale other than
+`1/sqrt(head size)` folded into the queries' weights. Opset 23's `Attention` imports the same way,
+and so do the fused operators of ONNX Runtime's transformer optimizer (`com.microsoft`'s
+`Attention`, `MultiHeadAttention`, `SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`,
+`FastGelu`, `BiasGelu`). Nodes whose inputs are all constants are computed on import, the shape
+arithmetic both exporters leave in graphs among them. GPT-2-, LLaMA- (grouped queries, rotary
+embeddings, SwiGLU), Gemma- and BERT-like models and `nn.TransformerEncoderLayer`, exported by
+either exporter at opsets 14 to 23, import into the layers the library builds such models of (a
+GPT-2 block is 9 layers) and agree with PyTorch to the rounding of single precision (within 3e-6 on
+the tests' models); a language model takes the sparse cross-entropy loss, so it trains further and
+generates as it is, and a model of GPT-2 small's size (124M parameters, 650 MB) imports in 0.57 s.
+What no layer computes is named in the error: a softmax over each token's channels (the library's
+softmax spans a layer's outputs), a product of two computed tensors outside an attention, masks or
+caches given as inputs, rotary embeddings over part of a head or of interleaved pairs, attention
+between two sequences.
 
 PyTorch weights load into a network built with the same layers:
 `spingalett_load_pytorch(net, "model.pt", NULL, 0)` reads a state dict saved with `torch.save`

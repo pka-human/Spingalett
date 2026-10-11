@@ -33,6 +33,44 @@ All notable changes to this project are documented in this file. The format foll
   (`test/references`: integer models bit for bit, float ones within 1e-5 of each sample's largest
   output), and to the same code built natively (every model bit for bit). CI builds and tests it;
   releases attach the package (`npm pack`) and the module.
+- **ONNX import of transformers** (`spingalett_import_onnx()`, `ModelTool import`,
+  `Network.from_onnx()` and `Network.from_torch()` in Python), as both of PyTorch's exporters write
+  them at opsets 14 to 23 (from an example of one sample, or with a dynamic batch), into the layers
+  the library builds such models of:
+  - inputs of token ids `[N, T]` (an input layer of `T` indices) and sequences `[N, T, C]` (a layer of
+    `1 x T` cells); `Gather` from a constant table as an embedding, a learned position table added
+    to it as its positions (constant tables of token types added too);
+  - `MatMul` and `Gemm` by constant weights on the tokens (also on tokens as rows `[N T, C]`, as
+    Hugging Face's `Conv1D` writes them) as linear layers, a constant added as their bias;
+    `LayerNormalization`, `RMSNormalization` and their written-out forms over each token;
+  - element-wise expressions recognised as the activations they compute, by their values at points
+    where activations differ: GELU (`Gelu`, its erf and tanh forms written out), SiLU
+    (`x * Sigmoid(x)`), ReLU, sigmoid, tanh; `Mul` of two layers (SwiGLU's and GeGLU's gates) as a
+    multiplication layer; the same of vectors and maps (an MLP's GELU and layer normalization written
+    out, `Gelu` and `RMSNormalization` of vectors);
+  - attention written out folded into one attention layer: queries, keys and values from one product
+    or three, split into heads (`Reshape`, `Transpose`, `Split`, `Slice`, `Gather`, `Squeeze`), the
+    scores scaled (`Mul` or `Div`, of the scores or of the queries and keys), masked causally (`Where`
+    or an added triangle of `-inf` or of a large negative value), `Softmax` over the keys, the
+    product with the values; keys and values repeated for grouped-query and multi-query attention
+    (`Expand`, `Tile`); rotary embeddings (`rotate_half` with tables of cosines and sines, their base
+    read from the tables); the queries', keys' and values' products merged into one linear layer,
+    their biases and any scale other than `1/sqrt(head size)` folded into its weights;
+  - opset 23's `Attention` and `RMSNormalization`, and the fused operators of ONNX Runtime's
+    transformer optimizer: `com.microsoft`'s `Attention`, `MultiHeadAttention`,
+    `SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`, `SimplifiedLayerNormalization`,
+    `Gelu`, `FastGelu` and `BiasGelu`;
+  - nodes whose inputs are all constants computed on import (`Shape`, `Gather`, `Slice`, `Concat`,
+    `Range`, `Trilu`, `Where`, arithmetic and the others of shape computations); `ReduceMean` over a
+    sequence's tokens as global average pooling;
+  - language models (token ids in, logits a token out) take the sparse cross-entropy loss;
+  - what no layer computes is named in the error: a softmax over each token's channels, a product
+    of two computed tensors outside an attention, masks and caches given as inputs, rotary
+    embeddings over part of a head or of interleaved pairs.
+  GPT-2-, LLaMA-, Gemma- and BERT-like models and `nn.TransformerEncoderLayer` agree with PyTorch to
+  the rounding of single precision (within 3e-6 on the tests' models: `onnx_gpt*`, `onnx_llama*`,
+  `onnx_encoder*`, `onnx_ort_fused` in `Tests/Data`); a model of GPT-2 small's size (124M parameters,
+  650 MB) imports in 0.57 s on an i7-12650H.
 
 ## [1.2.0] - 2026-10-11
 
