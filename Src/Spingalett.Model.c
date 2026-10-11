@@ -9,9 +9,7 @@
  * spingalett_model_run computes for the integer layers, evaluation, and C header export.
  */
 
-#include "Spingalett.Private.h"
-#include "Spingalett.Thread.h"
-#include <stdatomic.h>
+#include "Spingalett.Model.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,33 +21,6 @@
 #endif
 
 /* ------------------------------------------------------------------------- owning models */
-
-/* A layer's weights in the forms batched prediction runs on, built from the image. */
-typedef struct {
-    float *dequant;                             /* FP16 / BF16 weights as float */
-    int8_t *unpacked;                           /* integer convolution filters transposed (short windows,
-                                                   depthwise convolutions), or INT4 / INT2 rows as bytes */
-    int32_t *sums;                              /* sums of the integer rows, for the 4 x 4 kernels */
-    int8_t *interleaved;                        /* rows interleaved for tiles of samples or pixels
-                                                   (spingalett_i8_interleaved_tile) */
-    int32_t *tile_sums;                         /* the sums of the interleaved rows */
-    float *filters;                             /* a float transposed convolution's filters as those of the
-                                                   convolution whose data gradient it is */
-    bool ready;                                 /* all but a dense layer's interleaved rows are built */
-} PreparedLayer;
-
-typedef struct PredictWorkspace PredictWorkspace;
-
-/* What a model made by the library owns: its image, its weights prepared for batched prediction
-   (built by the first call that needs them, under the lock, and only read afterwards), and the
-   workspace of an earlier call, which the next call takes if it fits. Models filled in by
-   spingalett_model_init own nothing, and prepare their weights on every call. */
-typedef struct {
-    void *image;
-    SpgSignal *lock;
-    PreparedLayer *layers;
-    _Atomic(PredictWorkspace *) spare;
-} ModelOwner;
 
 static void owner_free(ModelOwner *owner, uint32_t layers);
 
@@ -149,32 +120,10 @@ void spingalett_model_free(SpingalettModel *model) {
 
 /* ------------------------------------------------------------------------- batched inference */
 
-#define MODEL_CHUNK 1024u                        /* samples per pass through the layers, at most */
-
-struct PredictWorkspace {
-    float *act[2];                              /* [chunk x max_width] each; for a graph (format 6) act[0]
-                                                   holds every output at chunk times its offset */
-    int8_t *xq;                                 /* [chunk x max_int_inputs] */
-    float *xs;                                  /* activation scales: a sample's, or a cell's (SlettLayer.cells) */
-    int8_t *window;                             /* a quantized convolution window or one pixel's sums, per thread */
-    size_t window_stride;
-    int8_t *tile;                               /* a tile of activations and its sums, per thread */
-    size_t tile_stride, tile_sums;              /* bytes per thread, offset of the sums */
-    float *conv;                                /* gathered windows of float convolutions (OpenBLAS) */
-    float *norm;                                /* batch normalization coefficients */
-    SpingalettGemmScratch *gemm;
-    /* what the workspace was made for, and its size */
-    int threads;
-    uint32_t chunk;
-    ComputeMode mode;
-    bool dense_tiles;
-    size_t bytes;
-};
-
 /* A workspace that is no larger than this stays with its model for the next call. */
 #define SPARE_WORKSPACE_MAX ((size_t)32 << 20)
 
-static void predict_workspace_free(PredictWorkspace *w) {
+void spingalett_predict_workspace_free(PredictWorkspace *w) {
     if (!w) return;
     spingalett_aligned_free(w->act[0]);
     spingalett_aligned_free(w->act[1]);
@@ -198,6 +147,7 @@ static void prepared_free(PreparedLayer *layers, uint32_t count) {
         spingalett_aligned_free(p->interleaved);
         spingalett_aligned_free(p->tile_sums);
         spingalett_aligned_free(p->filters);
+        spingalett_aligned_free(p->panels);
     }
     free(layers);
 }
@@ -205,7 +155,7 @@ static void prepared_free(PreparedLayer *layers, uint32_t count) {
 static void owner_free(ModelOwner *owner, uint32_t layers) {
     if (!owner) return;
     prepared_free(owner->layers, layers);
-    predict_workspace_free(atomic_load(&owner->spare));
+    spingalett_predict_workspace_free(atomic_load(&owner->spare));
     spg_signal_free(owner->lock);
     spingalett_aligned_free(owner->image);
     free(owner);
@@ -352,13 +302,57 @@ static bool prepare_model(const SpingalettModel *model, PreparedLayer *layers, b
     return true;
 }
 
+/* Packs the filters of the float linear layers of a language model for sessions (spingalett_conv_rows()). */
+static bool prepare_panels(const SpingalettModel *model, PreparedLayer *layers) {
+    const uint8_t *image = (const uint8_t *)model->image;
+    const bool language_model = spingalett_slett_language_model(image);
+    for (uint32_t i = 0; i < model->layer_count; i++) {
+        SlettLayer L;
+        spingalett_slett_layer(image, i, &L);
+        PreparedLayer *p = &layers[i];
+        if (p->panels || !spingalett_session_panels(&L, language_model)) continue;
+        float *panels = (float *)spingalett_aligned_alloc(spingalett_conv_direct_packed_floats(L.rows, L.row_len) *
+                                                          sizeof(float));
+        if (!panels) return false;
+        spingalett_conv_pack(p->dequant ? p->dequant : (const float *)(const void *)(image + L.weights), L.row_len,
+                             L.rows, panels);
+        p->panels = panels;
+    }
+    return true;
+}
+
+PreparedLayer *spingalett_model_layers(const SpingalettModel *model, bool dense_tiles, bool sessions) {
+    ModelOwner *owner = (ModelOwner *)model->owner_;
+    PreparedLayer *layers;
+    bool ok;
+    if (owner) {
+        spg_lock(owner->lock);
+        if (!owner->layers) owner->layers = (PreparedLayer *)calloc(model->layer_count, sizeof(PreparedLayer));
+        layers = owner->layers;
+        ok = layers && prepare_model(model, layers, dense_tiles) && (!sessions || prepare_panels(model, layers));
+        spg_unlock(owner->lock);
+        return ok ? layers : NULL;
+    }
+    layers = (PreparedLayer *)calloc(model->layer_count, sizeof(PreparedLayer));
+    ok = layers && prepare_model(model, layers, dense_tiles) && (!sessions || prepare_panels(model, layers));
+    if (!ok) {
+        prepared_free(layers, model->layer_count);
+        return NULL;
+    }
+    return layers;
+}
+
+void spingalett_model_release_layers(const SpingalettModel *model, PreparedLayer *layers) {
+    if (layers && !model->owner_) prepared_free(layers, model->layer_count);
+}
+
 static void *workspace_alloc(PredictWorkspace *w, size_t bytes) {
     w->bytes += bytes;
     return spingalett_aligned_alloc(bytes);
 }
 
-static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, uint32_t chunk, ComputeMode mode,
-                                                  bool dense_tiles) {
+PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *model, uint32_t chunk, ComputeMode mode,
+                                                      bool dense_tiles, bool sessions) {
     PredictWorkspace *w = (PredictWorkspace *)calloc(1, sizeof *w);
     if (!w) return NULL;
     const uint8_t *image = (const uint8_t *)model->image;
@@ -369,6 +363,7 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
     w->chunk = chunk;
     w->mode = mode;
     w->dense_tiles = dense_tiles;
+    w->sessions = sessions;
     uint32_t int_inputs = 0, int_window = 0, norm_channels = 0, transposed_window = 0, scales = 1;
     size_t conv_floats = 0, tile_x = 0, tile_acc = 0;
     bool has_float = false, ok = true;
@@ -377,8 +372,8 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
         spingalett_slett_layer(image, i, &L);
         if (L.type == LAYER_BATCH_NORM && L.out_c > norm_channels) norm_channels = L.out_c;
         if (L.type == LAYER_ATTENTION) {
-            /* the engine's pass, sample by sample: its scratch per thread */
-            if (slett_conv_scratch(&L) > transposed_window) transposed_window = (uint32_t)slett_conv_scratch(&L);
+            /* the engine's pass, sample by sample: its scratch per thread (sessions attend over their caches) */
+            if (!sessions && slett_conv_scratch(&L) > transposed_window) transposed_window = (uint32_t)slett_conv_scratch(&L);
             continue;
         }
         if (L.type == LAYER_EMBEDDING || L.type == LAYER_RMS_NORM) continue;
@@ -410,7 +405,7 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
                 uint32_t per_thread = layer_columns(&L) ? L.rows * 4u : L.groups > 1 ? L.row_len : 4u * L.row_len;
                 if (per_thread > int_window) int_window = per_thread;
             }
-        } else {
+        } else if (!sessions) {      /* (sessions run the float linear layers on their panels) */
             has_float = true;
             if (conv) {
                 LayerShape in = input_shape(&L), out = output_shape(&L);
@@ -462,7 +457,7 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
         ok = w->gemm != NULL;
     }
     if (!ok) {
-        predict_workspace_free(w);
+        spingalett_predict_workspace_free(w);
         return NULL;
     }
     return w;
@@ -635,8 +630,8 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const Pr
 
 /* An addition, product, concatenation or global pooling over n samples, sample by sample with the engine's
    functions, so that the results are the engine's (x[k]: input k, units[k] per sample). */
-static void predict_combine(const SlettLayer *L, const float *const *x, const uint32_t *units, const uint32_t *channels,
-                            float *y, uint32_t n, ComputeMode mode) {
+void spingalett_predict_combine(const SlettLayer *L, const float *const *x, const uint32_t *units,
+                                const uint32_t *channels, float *y, uint32_t n, ComputeMode mode) {
     SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, (uint64_t)n * L->outputs * L->input_count),
         for (int64_t s = 0; s < (int64_t)n; s++) {
             const float *xs[SPINGALETT_MAX_INPUTS];
@@ -652,10 +647,9 @@ static void predict_combine(const SlettLayer *L, const float *const *x, const ui
     (void)mode;
 }
 
-/* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included. A dense
-   layer's interleaved rows are read only in calls with dense_tiles (others may be building them). */
-static void predict_layer(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, bool dense_tiles,
-                          const float *x, float *y, uint32_t n, PredictWorkspace *w, ComputeMode mode) {
+/* (A dense layer's interleaved rows are read only in calls with dense_tiles: others may be building them.) */
+void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, bool dense_tiles,
+                              const float *x, float *y, uint32_t n, PredictWorkspace *w, ComputeMode mode) {
     uint32_t in = L->inputs, out = L->outputs;
     const float *dequant = prep->dequant;
     const float *bias = (const float *)(const void *)(image + L->biases);
@@ -851,18 +845,8 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
 
     /* the weights: prepared once for a model that owns them, for this call otherwise */
     ModelOwner *owner = (ModelOwner *)model->owner_;
-    PreparedLayer *layers = NULL;
-    bool ok;
-    if (owner) {
-        spg_lock(owner->lock);
-        if (!owner->layers) owner->layers = (PreparedLayer *)calloc(model->layer_count, sizeof(PreparedLayer));
-        layers = owner->layers;
-        ok = layers && prepare_model(model, layers, dense_tiles);
-        spg_unlock(owner->lock);
-    } else {
-        layers = (PreparedLayer *)calloc(model->layer_count, sizeof(PreparedLayer));
-        ok = layers && prepare_model(model, layers, dense_tiles);
-    }
+    PreparedLayer *layers = spingalett_model_layers(model, dense_tiles, false);
+    bool ok = layers != NULL;
 
     /* the workspace of an earlier call when it fits this one */
     PredictWorkspace *w = owner ? atomic_exchange(&owner->spare, NULL) : NULL;
@@ -870,14 +854,15 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
 #if defined(_OPENMP)
     if (mode == COMPUTE_OPENMP) threads = omp_get_max_threads();
 #endif
-    if (w && (w->chunk < chunk || w->threads != threads || w->mode != mode || (dense_tiles && !w->dense_tiles))) {
-        predict_workspace_free(w);
+    if (w && (w->chunk < chunk || w->threads != threads || w->mode != mode || (dense_tiles && !w->dense_tiles) ||
+              w->sessions)) {
+        spingalett_predict_workspace_free(w);
         w = NULL;
     }
-    if (ok && !w) w = predict_workspace_create(model, chunk, mode, dense_tiles);
+    if (ok && !w) w = spingalett_predict_workspace_create(model, chunk, mode, dense_tiles, false);
     if (!ok || !w) {
-        predict_workspace_free(w);
-        if (!owner) prepared_free(layers, model->layer_count);
+        spingalett_predict_workspace_free(w);
+        spingalett_model_release_layers(model, layers);
         set_error(SPINGALETT_ERR_ALLOC, "model predict: workspace allocation failed");
         return false;
     }
@@ -891,7 +876,7 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
             spingalett_slett_layer(image, i, &L);
             if (!graph) {
                 float *y = i + 1 == model->layer_count ? out : w->act[i & 1u];
-                predict_layer(image, &L, &layers[i], dense_tiles, x, y, n, w, mode);
+                spingalett_predict_layer(image, &L, &layers[i], dense_tiles, x, y, n, w, mode);
                 x = y;
                 continue;
             }
@@ -907,14 +892,14 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
             }
             if (L.type == LAYER_ADD || L.type == LAYER_CONCAT || L.type == LAYER_GLOBAL_AVG_POOL ||
                 L.type == LAYER_MULTIPLY)
-                predict_combine(&L, xs, units, channels, y, n, mode);
+                spingalett_predict_combine(&L, xs, units, channels, y, n, mode);
             else
-                predict_layer(image, &L, &layers[i], dense_tiles, xs[0], y, n, w, mode);
+                spingalett_predict_layer(image, &L, &layers[i], dense_tiles, xs[0], y, n, w, mode);
         }
     }
     if (owner && w->bytes <= SPARE_WORKSPACE_MAX) w = atomic_exchange(&owner->spare, w);
-    predict_workspace_free(w);
-    if (!owner) prepared_free(layers, model->layer_count);
+    spingalett_predict_workspace_free(w);
+    spingalett_model_release_layers(model, layers);
     return true;
 }
 

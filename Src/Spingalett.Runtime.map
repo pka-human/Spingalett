@@ -34,3 +34,22 @@ SPINGALETT_1.0 {
     local:
         *;
 };
+
+/* the full library's versions that add no function of the runtime, so that its versions descend alike */
+SPINGALETT_1.1 {
+} SPINGALETT_1.0;
+
+SPINGALETT_1.2 {
+} SPINGALETT_1.1;
+
+SPINGALETT_1.3 {
+    global:
+        spingalett_session_copy;
+        spingalett_session_feed;
+        spingalett_session_free;
+        spingalett_session_generate_args;
+        spingalett_session_length;
+        spingalett_session_new;
+        spingalett_session_rewind;
+        spingalett_session_vocabulary;
+} SPINGALETT_1.2;

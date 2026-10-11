@@ -120,6 +120,96 @@ SPINGALETT_API bool spingalett_model_predict(const SpingalettModel *model, const
 SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs,
                                                      const float *targets, uint32_t count);
 
+/*
+ * Sessions: a causal language model run a token at a time, with a key-value cache. The model's input is a
+ * window of token ids read by an embedding (its first layer), its output each position's logits (the
+ * vocabulary: the output's channels), and its layers treat each position alone (linear layers: 1 x 1
+ * convolutions of one group; normalizations; additions, products and concatenations of layers) but for
+ * causal attention, whose keys (rotated, with rotary embeddings) and values the session keeps for every
+ * token it has been fed. A token fed then costs one row through every layer and its queries' attention
+ * over the tokens before it, instead of a pass over the whole window: a prompt fed at once runs its
+ * tokens through each layer together, and so do the tokens of several sequences fed in one call (batched
+ * generation). A session holds `sequences` sequences of at most max_length tokens (the model's window at
+ * most, positions 0 to max_length - 1), each with a cache of its own.
+ *
+ * The logits of a position are those spingalett_model_predict() gives it for the window holding the
+ * sequence's tokens: bit for bit for integer models, and for float ones too where batched prediction
+ * multiplies with the library's kernels (every mode but SPINGALETT_COMPUTE_OPENBLAS, which takes
+ * OpenBLAS's order: equal to rounding); however the tokens were fed, alone or with others. A session runs
+ * on the CPU, on the threads of the compute mode, and is used from one thread at a time; any number of
+ * sessions may run on one model at once, from any threads. The model must outlive its sessions.
+ */
+typedef struct SpingalettSession SpingalettSession;
+
+typedef struct {
+    uint32_t max_length;            /* tokens a sequence holds at most: the model's window at most; 0 for it */
+    uint32_t sequences;             /* sequences the session holds (0: 1) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettSessionOptions;
+
+/* Opens a session on a causal language model (options NULL: the defaults). NULL with the error set for
+   other models (the message says what the session cannot run), or when memory runs out. */
+SPINGALETT_API SpingalettSession *spingalett_session_new(const SpingalettModel *model,
+                                                         const SpingalettSessionOptions *options);
+SPINGALETT_API void spingalett_session_free(SpingalettSession *session);
+/* Logits a position has: the size of the vocabulary. */
+SPINGALETT_API uint32_t spingalett_session_vocabulary(const SpingalettSession *session);
+/* Tokens a sequence holds (0 for a sequence out of range). */
+SPINGALETT_API uint32_t spingalett_session_length(const SpingalettSession *session, uint32_t sequence);
+
+/* Tokens for one sequence of a session (spingalett_session_feed()). */
+typedef struct {
+    uint32_t sequence;              /* which of the session's sequences */
+    const uint32_t *tokens;         /* [count] the tokens after those the sequence holds */
+    uint32_t count;
+    float *logits;                  /* [vocabulary]: the logits of the token after the last of them; with all,
+                                       [count x vocabulary]: of the token after each of them; NULL: none */
+    bool all;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettSessionFeed;
+
+/* Appends tokens to `count` sequences of the session (each named once), the rows of all of them computed
+   together, and writes the logits asked for. A token outside the vocabulary embeds as zeros, as in
+   spingalett_model_predict(). Returns false (the sequences unchanged) when a sequence would hold more than
+   max_length tokens, a feed asks for logits without tokens, or memory runs out. */
+SPINGALETT_API bool spingalett_session_feed(SpingalettSession *session, const SpingalettSessionFeed *feeds,
+                                            uint32_t count);
+/* Truncates a sequence to its first `length` tokens (no more than it holds): the next token fed goes to
+   position `length`. 0 empties it. */
+SPINGALETT_API bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
+/* Makes sequence `to` a copy of sequence `from` (its tokens and their keys and values): a prompt fed once
+   serves several continuations. */
+SPINGALETT_API bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
+
+typedef struct {
+    SpingalettSession *session;
+    uint32_t sequences;             /* sequences 0 .. sequences - 1 of the session generate (0: 1) */
+    const uint32_t *const *prompts; /* [sequences] tokens fed to each first, at least one each, after what
+                                       it holds */
+    const uint32_t *prompt_lengths; /* [sequences] */
+    uint32_t *tokens;               /* [sequences x count] the tokens generated: sequence b's from b count on */
+    uint32_t *made;                 /* [sequences] how many each generated (NULL: not reported) */
+    uint32_t count;                 /* tokens each generates at most */
+    float temperature;              /* the logits divided by it before the softmax; 0: the most likely token
+                                       each step (the first of equals), no draws */
+    uint32_t top_k;                 /* draws among the top_k most likely tokens only (0: all) */
+    float top_p;                    /* and among the most likely whose probabilities add up to top_p at least
+                                       (0 or 1: all) */
+    uint64_t seed;                  /* sequence b draws from a generator seeded with seed + b */
+    const uint32_t *stop_tokens;    /* [stop_count] tokens that end a sequence's generation once generated */
+    uint32_t stop_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettSessionGenerateArgs;
+
+/* Continues several sequences together, a token each per step, the steps' rows computed at once, each
+   sequence drawing as spingalett_generate() draws (the same tokens for the same logits and seed, whatever
+   other sequences run with it). A sequence stops after count tokens, after a stop token (written as its
+   last), or after the token that follows a full sequence (max_length tokens). Afterwards each holds its
+   prompt and the tokens generated, but the token after a full sequence. Returns how many tokens the
+   sequences wrote together, 0 on error. */
+#define spingalett_session_generate(...) spingalett_session_generate_args((SpingalettSessionGenerateArgs){__VA_ARGS__})
+SPINGALETT_API uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
+
 #ifdef __cplusplus
 }
 #endif
