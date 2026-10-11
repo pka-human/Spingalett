@@ -6,13 +6,17 @@
 /*
  * flash: attn.comp's FORWARD, DQ and DKV on the matrix units (mma.sync m16n8k16, bfloat16 operands,
  * single-precision sums), for networks whose products are in bfloat16. A warp takes 16 rows (queries, or
- * keys in DKV), a block WARPS of them; the other side's tiles of BT rows pass through shared memory (rows
+ * keys in DKV; FORWARD's warps MT tiles of 16 queries, so that each fragment of keys and values they read serves
+ * MT products), a block WARPS of them; the other side's tiles of BT rows pass through shared memory (rows
  * of D + 8 bfloat16, so that the eight rows ldmatrix reads fall in distinct banks). Queries and keys are
  * rotated (ROPE) and rounded to bfloat16 as they are loaded; the scores are scaled in single precision.
  *
  *   FORWARD  S = Q K^T a tile of keys at a time, the softmax online in registers (a row's maximum and sum
  *            combined over the four threads that hold it, in a fixed pattern), O += P V with P rounded to
- *            bfloat16 as the matrix units take it; y = O / sum, and the log sum with STATS.
+ *            bfloat16 as the matrix units take it (each thread's part of a row's sum added up at the end); y =
+ *            O / sum, and the log sum with STATS. The mask only on
+ *            the tiles that cross the diagonal or the cells' end; causal tiles of keys all after a warp's
+ *            queries skipped.
  *   DQ       S and P = exp(S - lse) again, dP = dO V^T, dS = P (dP - rowsum(dO o)), dQ += dS K.
  *   DKV      per tile of keys, over the group's query heads and tiles of queries in order: S^T = K Q^T,
  *            P^T, dP^T = V dO^T, dS^T, dV += P^T dO, dK += dS^T Q.
@@ -34,8 +38,9 @@
 #define D 64u
 #define OPC 0u
 #endif
-#define WARPS (D <= 64u ? 4u : 2u)         /* warps a block: 16 rows each */
-#define ROWS (16u * WARPS)                 /* rows of a block */
+#define WARPS (D <= 64u ? 4u : 2u)         /* warps a block */
+#define MT (OPC == 0u && D <= 64u ? 2u : 1u)   /* tiles of 16 rows a warp: FORWARD's two (heads of up to 64) */
+#define ROWS (16u * MT * WARPS)            /* rows of a block */
 #define BT (D <= 64u ? 64u : 32u)          /* rows of the other side's tiles */
 #define SD (D + 8u)                        /* bfloat16 a row in shared memory */
 #define NT (BT / 8u)                       /* n-tiles of 8 of a tile of scores */
@@ -71,8 +76,36 @@ DEVICE void mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
-DEVICE uint32_t pack2(float lo, float hi) { return to_bf16(lo) | to_bf16(hi) << 16; }
+/* two values rounded to bfloat16 (to the nearest, ties to even, as to_bf16() rounds all but NaN) in a word, the
+   first in the low half: one instruction */
+DEVICE uint32_t pack2(float lo, float hi) {
+    uint32_t r;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
 DEVICE float shfl_xor(float v, uint32_t mask) { return __nvvm_shfl_sync_bfly_f32(0xFFFFFFFFu, v, mask, 0x1F); }
+
+/* x[b] (b < 4): this thread's pair of values of fragment b of a group of four, of a row the four threads of a quad
+   hold (thread t its columns 2t and 2t + 1 of each fragment); after the exchange (a 4 x 4 transpose in two steps of
+   shuffles), x[b] holds columns 2b and 2b + 1 of fragment t: the eight columns of one fragment */
+DEVICE void quad_transpose(float (&x)[4][2], uint32_t t) {
+#pragma unroll
+    for (uint32_t b = 0; b < 4u; b += 2u)       /* with the thread t ^ 1 */
+#pragma unroll
+        for (uint32_t k = 0; k < 2u; k++) {
+            const float r = shfl_xor((t & 1u) ? x[b][k] : x[b + 1u][k], 1u);
+            if (t & 1u) x[b][k] = r;
+            else x[b + 1u][k] = r;
+        }
+#pragma unroll
+    for (uint32_t d = 0; d < 2u; d++)           /* with the thread t ^ 2 */
+#pragma unroll
+        for (uint32_t k = 0; k < 2u; k++) {
+            const float r = shfl_xor((t & 2u) ? x[d][k] : x[2u + d][k], 2u);
+            if (t & 2u) x[d][k] = r;
+            else x[2u + d][k] = r;
+        }
+}
 
 /* the maximum (sum) of a row's values over the four threads of a quad that hold it: xor 1, then xor 2 */
 DEVICE float quad_max(float v) { v = max_(v, shfl_xor(v, 1u)); return max_(v, shfl_xor(v, 2u)); }
@@ -203,7 +236,7 @@ DEVICE void scores_a(const float (&s)[NT][4], uint32_t j, uint32_t (&a)[4]) {
 
 struct Shared {
     uint16_t a[ROWS * SD];          /* the block's rows: queries (FORWARD, DQ) or keys (DKV) */
-    uint16_t b[ROWS * SD];          /* DQ: the outputs' gradient of the queries; DKV: the values */
+    uint16_t b[OPC == 0u ? 8u : ROWS * SD];     /* DQ: the outputs' gradient of the queries; DKV: the values */
     uint16_t t[BT * SD], u[BT * SD];    /* the other side's tile: keys and values, or queries and dO */
     float l[BT], d[BT];             /* DKV: the tile's queries' log sums and rowsum(dO o) */
 };
@@ -216,29 +249,218 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
     const bool causal = (p.flags & FLAG_CAUSAL) != 0u;
     const float NEG = -3.402823466e38f, scale = p.scale;
     const uint32_t s = block_z(), rows_all = p.n * p.heads * p.cells;
-    if (OP == FORWARD || OP == DQ) {
+    if (OP == FORWARD) {
+        /* a warp's MT tiles of 16 queries: each fragment of the keys and values it reads from shared memory serves
+           MT products */
+        const uint32_t h = block_y(), kh = h / group, i0 = block_x() * ROWS, r0 = 16u * MT * w;
+        load_tile(p, HALF, sh.a, s, i0, ROWS, h * D, C, p.x, 0u, true, threads);
+        barrier();
+        uint32_t qa[MT][KS][4];
+#pragma unroll
+        for (uint32_t mt = 0; mt < MT; mt++)
+#pragma unroll
+            for (uint32_t k = 0; k < KS; k++) frag_a(sh.a, r0 + 16u * mt, k, qa[mt][k]);
+        const uint32_t sa = (s * p.heads + h) * p.cells;
+        float o[MT][DT][4], m_[MT][2], l_[MT][2];
+#pragma unroll
+        for (uint32_t mt = 0; mt < MT; mt++) {
+#pragma unroll
+            for (uint32_t j = 0; j < DT; j++) o[mt][j][0] = o[mt][j][1] = o[mt][j][2] = o[mt][j][3] = 0.0f;
+            m_[mt][0] = m_[mt][1] = NEG;
+            l_[mt][0] = l_[mt][1] = 0.0f;
+        }
+        const uint32_t keys = causal ? umin(p.cells, i0 + ROWS) : p.cells;
+        const bool fast = (HALF & 1u) != 0u;        /* (x kept as bfloat16: its tiles a step ahead) */
+        Raw rk[NCH], rv[NCH];
+        if (fast) {
+            fetch_tile(p, s, 0u, (p.heads + kh) * D, C, p.x, true, rk);
+            fetch_tile(p, s, 0u, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+        }
+        for (uint32_t j0 = 0; j0 < keys; j0 += BT) {
+            barrier();
+            if (fast) {
+                put_tile(p, sh.t, j0, true, rk);
+                put_tile(p, sh.u, j0, false, rv);
+            } else {
+                load_tile(p, HALF, sh.t, s, j0, BT, (p.heads + kh) * D, C, p.x, 0u, true, threads);
+                load_tile(p, HALF, sh.u, s, j0, BT, (p.heads + p.kv + kh) * D, C, p.x, 0u, false, threads);
+            }
+            barrier();
+            if (fast && j0 + BT < keys) {
+                fetch_tile(p, s, j0 + BT, (p.heads + kh) * D, C, p.x, true, rk);
+                fetch_tile(p, s, j0 + BT, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+            }
+            /* (causal: a tile of keys all after the warp's queries adds nothing to them) */
+            if (causal && j0 >= i0 + r0 + 16u * MT) continue;
+            float sc[MT][NT][4];
+#pragma unroll
+            for (uint32_t mt = 0; mt < MT; mt++)
+#pragma unroll
+                for (uint32_t j = 0; j < NT; j++) sc[mt][j][0] = sc[mt][j][1] = sc[mt][j][2] = sc[mt][j][3] = 0.0f;
+#pragma unroll
+            for (uint32_t k = 0; k < KS; k++)
+#pragma unroll
+                for (uint32_t j = 0; j < NT; j += 2u) {
+                    uint32_t b[4];
+                    frag_b(sh.t, 8u * j, k, b);
+#pragma unroll
+                    for (uint32_t mt = 0; mt < MT; mt++) {
+                        mma(sc[mt][j], qa[mt][k], b[0], b[1]);
+                        mma(sc[mt][j + 1u], qa[mt][k], b[2], b[3]);
+                    }
+                }
+#pragma unroll
+            for (uint32_t mt = 0; mt < MT; mt++) {
+                /* the scale, and the mask (keys past the cells, after the query when causal) on the tiles that need
+                   it: this thread's rows g and g + 8 of the tile */
+                const uint32_t q0 = i0 + r0 + 16u * mt, ra = q0 + g, rb = ra + 8u;
+                const bool edge = j0 + BT > p.cells || q0 + 16u > p.cells || (causal && j0 + BT - 1u > q0);
+                if (edge) {
+#pragma unroll
+                    for (uint32_t j = 0; j < NT; j++)
+#pragma unroll
+                        for (uint32_t e = 0; e < 4u; e++) {
+                            const uint32_t key = j0 + 8u * j + 2u * t + (e & 1u), row = e < 2u ? ra : rb;
+                            const bool valid = key < p.cells && row < p.cells && (!causal || key <= row);
+                            sc[mt][j][e] = valid ? sc[mt][j][e] * scale : NEG;
+                        }
+                } else {
+#pragma unroll
+                    for (uint32_t j = 0; j < NT; j++)
+#pragma unroll
+                        for (uint32_t e = 0; e < 4u; e++) sc[mt][j][e] *= scale;
+                }
+                float ta = NEG, tb = NEG;
+#pragma unroll
+                for (uint32_t j = 0; j < NT; j++) {
+                    ta = max_(ta, max_(sc[mt][j][0], sc[mt][j][1]));
+                    tb = max_(tb, max_(sc[mt][j][2], sc[mt][j][3]));
+                }
+                ta = quad_max(ta);
+                tb = quad_max(tb);
+                const float na = max_(m_[mt][0], ta), nb = max_(m_[mt][1], tb);
+                const float aa = na == NEG ? 1.0f : exp_(m_[mt][0] - na), ab = nb == NEG ? 1.0f : exp_(m_[mt][1] - nb);
+                /* (each thread's part of its rows' sums; the four parts added at the end) */
+                float suma = 0.0f, sumb = 0.0f;
+                if (edge) {
+#pragma unroll
+                    for (uint32_t j = 0; j < NT; j++) {
+                        sc[mt][j][0] = sc[mt][j][0] == NEG ? 0.0f : exp_(sc[mt][j][0] - na);
+                        sc[mt][j][1] = sc[mt][j][1] == NEG ? 0.0f : exp_(sc[mt][j][1] - na);
+                        sc[mt][j][2] = sc[mt][j][2] == NEG ? 0.0f : exp_(sc[mt][j][2] - nb);
+                        sc[mt][j][3] = sc[mt][j][3] == NEG ? 0.0f : exp_(sc[mt][j][3] - nb);
+                    }
+                } else {
+#pragma unroll
+                    for (uint32_t j = 0; j < NT; j++) {
+                        sc[mt][j][0] = exp_(sc[mt][j][0] - na);
+                        sc[mt][j][1] = exp_(sc[mt][j][1] - na);
+                        sc[mt][j][2] = exp_(sc[mt][j][2] - nb);
+                        sc[mt][j][3] = exp_(sc[mt][j][3] - nb);
+                    }
+                }
+#pragma unroll
+                for (uint32_t j = 0; j < NT; j++) {
+                    suma += sc[mt][j][0] + sc[mt][j][1];
+                    sumb += sc[mt][j][2] + sc[mt][j][3];
+                }
+                l_[mt][0] = l_[mt][0] * aa + suma;
+                l_[mt][1] = l_[mt][1] * ab + sumb;
+                m_[mt][0] = na;
+                m_[mt][1] = nb;
+#pragma unroll
+                for (uint32_t j = 0; j < DT; j++) {
+                    o[mt][j][0] *= aa; o[mt][j][1] *= aa;
+                    o[mt][j][2] *= ab; o[mt][j][3] *= ab;
+                }
+            }
+            /* O += P V: P's rows as A fragments, V's [key][d] tile transposed into B fragments */
+#pragma unroll
+            for (uint32_t k = 0; k < BT / 16u; k++) {
+                uint32_t pa[MT][4];
+#pragma unroll
+                for (uint32_t mt = 0; mt < MT; mt++) scores_a(sc[mt], k, pa[mt]);
+#pragma unroll
+                for (uint32_t j = 0; j < DT; j += 2u) {
+                    uint32_t b[4];
+                    frag_bt(sh.u, 8u * j, k, b);
+#pragma unroll
+                    for (uint32_t mt = 0; mt < MT; mt++) {
+                        mma(o[mt][j], pa[mt], b[0], b[1]);
+                        mma(o[mt][j + 1u], pa[mt], b[2], b[3]);
+                    }
+                }
+            }
+        }
+        /* y = O / sum: the four threads of a row exchange their pairs of four fragments (quad_transpose()), after
+           which each stores eight consecutive values at once (sixteen bytes of bfloat16, or two of floats) */
+        const bool wide = (p.y % 16u) == 0u;
+#pragma unroll
+        for (uint32_t mt = 0; mt < MT; mt++) {
+            const uint32_t ra = i0 + r0 + 16u * mt + g, rb = ra + 8u;
+            l_[mt][0] = quad_sum(l_[mt][0]);
+            l_[mt][1] = quad_sum(l_[mt][1]);
+            const float ia = 1.0f / l_[mt][0], ib = 1.0f / l_[mt][1];
+#pragma unroll
+            for (uint32_t hh = 0; hh < 2u; hh++) {
+                const uint32_t row = hh ? rb : ra;
+                const float inv = hh ? ib : ia;
+                if (!wide) {
+#pragma unroll
+                    for (uint32_t j = 0; j < DT; j++) {
+                        const uint32_t c = 8u * j + 2u * t;
+                        if (row < p.cells) {
+                            st(p.y, (s * p.cells + row) * out_c + h * D + c, 1u, HALF, o[mt][j][2u * hh] * inv);
+                            st(p.y, (s * p.cells + row) * out_c + h * D + c + 1u, 1u, HALF, o[mt][j][2u * hh + 1u] * inv);
+                        }
+                    }
+                    continue;
+                }
+#pragma unroll
+                for (uint32_t a = 0; a < DT / 4u; a++) {
+                    float x[4][2];
+#pragma unroll
+                    for (uint32_t b = 0; b < 4u; b++)
+                        x[b][0] = o[mt][4u * a + b][2u * hh] * inv, x[b][1] = o[mt][4u * a + b][2u * hh + 1u] * inv;
+                    quad_transpose(x, t);
+                    if (row >= p.cells) continue;
+                    const uint32_t at = (s * p.cells + row) * out_c + h * D + 8u * (4u * a + t);
+                    if (HALF & 2u)
+                        ((uint4_ *)p.y)[at >> 3] = uint4_{pack2(x[0][0], x[0][1]), pack2(x[1][0], x[1][1]),
+                                                          pack2(x[2][0], x[2][1]), pack2(x[3][0], x[3][1])};
+                    else {
+                        ((float4_ *)p.y)[at >> 2] = float4_{x[0][0], x[0][1], x[1][0], x[1][1]};
+                        ((float4_ *)p.y)[(at >> 2) + 1u] = float4_{x[2][0], x[2][1], x[3][0], x[3][1]};
+                    }
+                }
+            }
+            if ((p.flags & FLAG_STATS) && t == 0u) {
+                if (ra < p.cells) F(p.stats)[sa + ra] = m_[mt][0] + log_(l_[mt][0]);
+                if (rb < p.cells) F(p.stats)[sa + rb] = m_[mt][1] + log_(l_[mt][1]);
+            }
+        }
+        return;
+    }
+    if (OP == DQ) {
         const uint32_t h = block_y(), kh = h / group, i0 = block_x() * ROWS, r0 = 16u * w;
         load_tile(p, HALF, sh.a, s, i0, ROWS, h * D, C, p.x, 0u, true, threads);
-        if (OP == DQ) load_tile(p, HALF, sh.b, s, i0, ROWS, h * D, out_c, p.dy, 2u, false, threads);
+        load_tile(p, HALF, sh.b, s, i0, ROWS, h * D, out_c, p.dy, 2u, false, threads);
         barrier();
         uint32_t qa[KS][4], da[KS][4];
 #pragma unroll
         for (uint32_t k = 0; k < KS; k++) {
             frag_a(sh.a, r0, k, qa[k]);
-            if (OP == DQ) frag_a(sh.b, r0, k, da[k]);
+            frag_a(sh.b, r0, k, da[k]);
         }
         /* this thread's rows: g and g + 8 of the warp's */
         const uint32_t ra = i0 + r0 + g, rb = ra + 8u;
         const uint32_t sa = (s * p.heads + h) * p.cells;
         float lse_a = 0.0f, lse_b = 0.0f, del_a = 0.0f, del_b = 0.0f;
-        if (OP == DQ) {
-            if (ra < p.cells) { lse_a = F(p.stats)[sa + ra]; del_a = F(p.stats)[rows_all + sa + ra]; }
-            if (rb < p.cells) { lse_b = F(p.stats)[sa + rb]; del_b = F(p.stats)[rows_all + sa + rb]; }
-        }
+        if (ra < p.cells) { lse_a = F(p.stats)[sa + ra]; del_a = F(p.stats)[rows_all + sa + ra]; }
+        if (rb < p.cells) { lse_b = F(p.stats)[sa + rb]; del_b = F(p.stats)[rows_all + sa + rb]; }
         float o[DT][4];
 #pragma unroll
         for (uint32_t j = 0; j < DT; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
-        float m_a = NEG, m_b = NEG, l_a = 0.0f, l_b = 0.0f;
         const uint32_t keys = causal ? umin(p.cells, i0 + ROWS) : p.cells;
         const bool fast = (HALF & 1u) != 0u;        /* (x kept as bfloat16: its tiles a step ahead) */
         Raw rk[NCH], rv[NCH];
@@ -281,51 +503,6 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
                     const bool valid = key < p.cells && row < p.cells && (!causal || key <= row);
                     sc[j][e] = valid ? sc[j][e] * scale : NEG;
                 }
-            if (OP == FORWARD) {
-                float ta = NEG, tb = NEG;
-#pragma unroll
-                for (uint32_t j = 0; j < NT; j++) {
-                    ta = max_(ta, max_(sc[j][0], sc[j][1]));
-                    tb = max_(tb, max_(sc[j][2], sc[j][3]));
-                }
-                ta = quad_max(ta);
-                tb = quad_max(tb);
-                const float na = max_(m_a, ta), nb = max_(m_b, tb);
-                const float aa = na == NEG ? 1.0f : exp_(m_a - na), ab = nb == NEG ? 1.0f : exp_(m_b - nb);
-                float suma = 0.0f, sumb = 0.0f;
-#pragma unroll
-                for (uint32_t j = 0; j < NT; j++) {
-                    sc[j][0] = sc[j][0] == NEG ? 0.0f : exp_(sc[j][0] - na);
-                    sc[j][1] = sc[j][1] == NEG ? 0.0f : exp_(sc[j][1] - na);
-                    sc[j][2] = sc[j][2] == NEG ? 0.0f : exp_(sc[j][2] - nb);
-                    sc[j][3] = sc[j][3] == NEG ? 0.0f : exp_(sc[j][3] - nb);
-                    suma += sc[j][0] + sc[j][1];
-                    sumb += sc[j][2] + sc[j][3];
-                }
-                l_a = l_a * aa + quad_sum(suma);
-                l_b = l_b * ab + quad_sum(sumb);
-                m_a = na;
-                m_b = nb;
-#pragma unroll
-                for (uint32_t j = 0; j < DT; j++) {
-                    o[j][0] *= aa; o[j][1] *= aa;
-                    o[j][2] *= ab; o[j][3] *= ab;
-                }
-                /* O += P V: P's rows as A fragments, V's [key][d] tile transposed into B fragments */
-#pragma unroll
-                for (uint32_t k = 0; k < BT / 16u; k++) {
-                    uint32_t pa[4];
-                    scores_a(sc, k, pa);
-#pragma unroll
-                    for (uint32_t j = 0; j < DT; j += 2u) {
-                        uint32_t b[4];
-                        frag_bt(sh.u, 8u * j, k, b);
-                        mma(o[j], pa, b[0], b[1]);
-                        mma(o[j + 1u], pa, b[2], b[3]);
-                    }
-                }
-                continue;
-            }
             /* DQ: P = exp(S - lse), dP = dO V^T, dS = P (dP - delta), dQ += dS K */
             float dp[NT][4];
 #pragma unroll
@@ -359,26 +536,6 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgAtt
                     mma(o[j + 1u], pa, b[2], b[3]);
                 }
             }
-        }
-        if (OP == FORWARD) {
-            const float ia = 1.0f / l_a, ib = 1.0f / l_b;
-#pragma unroll
-            for (uint32_t j = 0; j < DT; j++) {
-                const uint32_t c = 8u * j + 2u * t;
-                if (ra < p.cells) {
-                    st(p.y, (s * p.cells + ra) * out_c + h * D + c, 1u, HALF, o[j][0] * ia);
-                    st(p.y, (s * p.cells + ra) * out_c + h * D + c + 1u, 1u, HALF, o[j][1] * ia);
-                }
-                if (rb < p.cells) {
-                    st(p.y, (s * p.cells + rb) * out_c + h * D + c, 1u, HALF, o[j][2] * ib);
-                    st(p.y, (s * p.cells + rb) * out_c + h * D + c + 1u, 1u, HALF, o[j][3] * ib);
-                }
-            }
-            if ((p.flags & FLAG_STATS) && t == 0u) {
-                if (ra < p.cells) F(p.stats)[sa + ra] = m_a + log_(l_a);
-                if (rb < p.cells) F(p.stats)[sa + rb] = m_b + log_(l_b);
-            }
-            return;
         }
         /* dQ: the scale, then rotated back through shared memory (as floats over the rows' tile) */
         barrier();

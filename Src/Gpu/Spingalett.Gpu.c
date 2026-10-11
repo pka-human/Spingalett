@@ -1592,13 +1592,15 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
                               (stats ? SPG_ATTN_STATS : 0u),
                      .scale = 1.0f / sqrtf((float)head)};
     /* networks in bfloat16 on CUDA, heads of 32, 64 or 128: flash.cu on the matrix units (BQ 0 names it), a
-       block 64 rows (32 for heads of 128) */
+       block 64 rows of four warps (32 of two for heads of 128; FORWARD 128 rows of four warps for heads of up to
+       64) */
     const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE &&
                      (head == 32u || head == 64u || head == 128u);
     if (mma) {
         dmax = head;
         bq = head <= 64u ? 64u : 32u;
         threads = 2u * bq;
+        if (op == SPG_ATTN_FORWARD && head <= 64u) bq = 128u;
     }
     const uint32_t spec[4] = {op, mma ? 0u : bq, dmax, threads};
     if (g->geo[l].buffer) reads(a, whole(&g->geo[l]));

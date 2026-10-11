@@ -4932,9 +4932,10 @@ static void gpu_transformer(int which) {
 }
 
 /* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA) against single
-   precision: predictions, one step's change of every parameter, and two runs alike. */
-static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
-    const uint32_t T = 80, V = 37, n = 20, heads = 4, d = heads * head;
+   precision: predictions, one step's change of every parameter, and two runs alike; over T tokens (several
+   blocks of queries, the last partial), causal or not. */
+static void gpu_flash(uint32_t head, bool rope, uint32_t kv, uint32_t T, bool causal) {
+    const uint32_t V = 37, n = T > 100u ? 6u : 20u, heads = 4, d = heads * head;
     /* runs: the GPU in single precision, the CPU, the GPU in bfloat16 twice */
     float *pred[3] = {NULL, NULL, NULL}, *delta[3] = {NULL, NULL, NULL}, *again = NULL;
     uint64_t count = 0;
@@ -4949,7 +4950,7 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
         embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = !rope,
                   .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         linear(.net = net, .neurons_amount = (heads + 2u * kv) * head, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
-        attention(.net = net, .heads = heads, .kv_heads = kv, .causal = true, .rope_theta = rope ? 10000.0f : 0.0f);
+        attention(.net = net, .heads = heads, .kv_heads = kv, .causal = causal, .rope_theta = rope ? 10000.0f : 0.0f);
         /* (a GELU kept for its derivative: on CUDA the products' epilogues store both) */
         linear(.net = net, .neurons_amount = 64, .act_func = ACT_GELU, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         linear(.net = net, .neurons_amount = V, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
@@ -4989,8 +4990,8 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
     const double cpu_step = gpu_max_scaled(delta[0], delta[1], count);
     CHECK(cpu_pred < 1e-4 && cpu_step < 1e-3, "gpu attention head %u: predictions %.2e, step %.2e from the CPU's", head,
           cpu_pred, cpu_step);
-    printf("  gpu attention head %u%s%s: predictions %.1e, step %.1e from the CPU's", head, rope ? ", rotary" : "",
-           kv < 4u ? ", grouped" : "", cpu_pred, cpu_step);
+    printf("  gpu attention head %u%s%s, %u tokens%s: predictions %.1e, step %.1e from the CPU's", head, rope ? ", rotary" : "",
+           kv < 4u ? ", grouped" : "", T, causal ? "" : ", not causal", cpu_pred, cpu_step);
     if (pred[2]) {
         const double predicted = gpu_max_scaled(pred[0], pred[2], (size_t)n * V);
         const double stepped = gpu_max_scaled(delta[0], delta[2], count);
@@ -6182,9 +6183,12 @@ int main(int argc, char **argv) {
             gpu_bf16();
             for (int k = 0; k < 4; k++) gpu_transformer(k);
             gpu_transformer_trainer();
-            gpu_flash(32, false, 4);
-            gpu_flash(64, true, 2);
-            gpu_flash(128, true, 1);
+            gpu_flash(32, false, 4, 80, true);
+            gpu_flash(64, true, 2, 80, true);
+            gpu_flash(128, true, 1, 80, true);
+            gpu_flash(64, false, 4, 300, true);
+            gpu_flash(64, true, 2, 200, false);
+            gpu_flash(32, false, 2, 150, true);
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }
