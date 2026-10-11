@@ -107,7 +107,8 @@ test('a model reports its sizes, loss, format and layers', () => {
     const gpt = engine.loadModel(language('gpt_fp32'));
     assert.equal(gpt.layers[0].positions, true);
     assert.deepEqual(gpt.layers.filter((l) => l.type === 'layer_norm').length, 5);
-    assert.deepEqual(gpt.layers.filter((l) => l.activation.startsWith('gelu')).map((l) => l.activation), ['gelu', 'gelu_tanh']);
+    assert.deepEqual(gpt.layers.filter((l) => l.activation.startsWith('gelu')).map((l) => l.activation),
+        ['gelu', 'gelu_tanh']);
     gpt.free();
 });
 
@@ -122,7 +123,8 @@ test('runs take arrays or Float32Arrays, write into a given output, and batches 
     assert.deepEqual(out, first);
     const batch = model.runBatch(x);
     assert.equal(batch.length, 5 * m);
-    for (let s = 0; s < 5; s++) assert.deepEqual(batch.subarray(s * m, (s + 1) * m), model.run(x.subarray(s * n, (s + 1) * n)));
+    for (let s = 0; s < 5; s++)
+        assert.deepEqual(batch.subarray(s * m, (s + 1) * m), model.run(x.subarray(s * n, (s + 1) * n)));
     const nested = [0, 1, 2, 3, 4].map((s) => Array.from(x.subarray(s * n, (s + 1) * n)));
     assert.deepEqual(model.runBatch(nested), batch);
     assert.deepEqual(model.runBatch(Array.from(x)), batch);
@@ -164,9 +166,11 @@ test('freed models give their memory back; models of one engine run side by side
     const a = engine.loadModel(runtime('graph6_int8')), b = engine.loadModel(runtime('graph7_bf16'));
     const xa = samples(a, 3), xb = samples(b, 3);
     const ya = a.runBatch(xa), yb = b.runBatch(xb);
+    const sample = (model, x, s) => x.subarray(s * model.inputSize, (s + 1) * model.inputSize);
+    const outputs = (model, y, s) => y.subarray(s * model.outputSize, (s + 1) * model.outputSize);
     for (let s = 0; s < 3; s++) {
-        assert.deepEqual(b.run(xb.subarray(s * b.inputSize, (s + 1) * b.inputSize)), yb.subarray(s * b.outputSize, (s + 1) * b.outputSize));
-        assert.deepEqual(a.run(xa.subarray(s * a.inputSize, (s + 1) * a.inputSize)), ya.subarray(s * a.outputSize, (s + 1) * a.outputSize));
+        assert.deepEqual(b.run(sample(b, xb, s)), outputs(b, yb, s));
+        assert.deepEqual(a.run(sample(a, xa, s)), outputs(a, ya, s));
     }
     a.free();
     b.free();
@@ -214,7 +218,11 @@ test('generation: greedy, seeded draws, top-k, stop tokens and onToken', () => {
     const space = tokens(' ')[0];
     assert.deepEqual(model.generate(prompt, 16, { stop: [space] }), [space]);
     const seen = [];
-    assert.deepEqual(model.generate(prompt, 16, { onToken: (t, i) => { seen.push([t, i]); return i < 2; } }), greedy.slice(0, 3));
+    const onToken = (t, i) => {
+        seen.push([t, i]);
+        return i < 2;
+    };
+    assert.deepEqual(model.generate(prompt, 16, { onToken }), greedy.slice(0, 3));
     assert.deepEqual(seen, greedy.slice(0, 3).map((t, i) => [t, i]));
     assert.throws(() => model.generate([], 4), RangeError);
     model.free();

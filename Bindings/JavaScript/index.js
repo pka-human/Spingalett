@@ -306,7 +306,8 @@ export class Model {
             throw new RangeError(`spingalett: the outputs need a Float32Array of ${outputSize} values`);
         const { f32 } = this.#open();
         const e = this.#engine;
-        const x = (e._call('spg_model_input', this.#handle) >>> 0) / 4, y = (e._call('spg_model_output', this.#handle) >>> 0) / 4;
+        const x = (e._call('spg_model_input', this.#handle) >>> 0) / 4;
+        const y = (e._call('spg_model_output', this.#handle) >>> 0) / 4;
         f32.set(input, x);
         const rc = e._call('spg_model_run', this.#handle);
         if (rc !== 0) throw new SpingalettError(rc, 'running a sample');
@@ -349,7 +350,7 @@ export class Model {
 
     #languageModel() {
         if (!this.isLanguageModel)
-            throw new Error('spingalett: the model is no language model (an embedding first, logits for every input token)');
+            throw new Error('spingalett: the model is no language model (an embedding first, logits for every token)');
     }
 
     /**
@@ -377,7 +378,8 @@ export class Model {
      */
     generate(prompt, count, { temperature = 0, topK = 0, topP = 0, seed = 0, stop = [], onToken } = {}) {
         this.#languageModel();
-        if (!prompt || prompt.length === 0) throw new RangeError('spingalett: generate needs a prompt of one token at least');
+        if (!prompt || prompt.length === 0)
+            throw new RangeError('spingalett: generate needs a prompt of one token at least');
         const state = { s: BigInt(seed) & MASK64 };
         if (state.s === 0n) state.s = randomSeed();
         const t = Math.fround(temperature), p = Math.fround(topP), stops = new Set(stop);

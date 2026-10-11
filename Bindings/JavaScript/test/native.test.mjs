@@ -65,7 +65,8 @@ test('built natively, the module\'s code gives its bits', { skip: !compiler() &&
             const { worst, differ } = compare(y, runNative(native, m.path, m.count), outputSize);
             assert.equal(differ, 0, `${m.name}: ${differ} values differ, by ${worst} at most`);
         }
-        for (const g of GENERATIONS) assert.deepEqual(generate(g), generateNative(native, MODELS.find((m) => m.name === g.model).path, g));
+        for (const g of GENERATIONS)
+            assert.deepEqual(generate(g), generateNative(native, MODELS.find((m) => m.name === g.model).path, g));
         t.diagnostic(`${MODELS.length} models and ${GENERATIONS.length} generations bit for bit`);
     } finally {
         native.dispose();
