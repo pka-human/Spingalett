@@ -1681,7 +1681,8 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
   GELU, SiLU, the sparse cross-entropy, token files, generation, GPT-2 and LLaMA checkpoints),
   flash attention on CUDA, bindings for Rust, .NET, Go and Java, packages for the usual managers
 - 1.3: a KV cache and batched generation, mixed precision with loss scaling, gradient
-  checkpointing, deployment models on the GPU
+  checkpointing, deployment models on the GPU, ahead of PyTorch where 1.2 is not (the GPT in
+  bfloat16 on CUDA, transformers' training on the CPU and on Vulkan), bindings for PHP
 - 1.4 to 2.0: training across several GPUs, mixture-of-experts layers, Arm and Apple GPUs, sequence
   models beyond attention
 
