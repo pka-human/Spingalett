@@ -184,10 +184,20 @@ jobs:
             fi
           done
 
+      # (a failure's first errors also as annotations, which the API gives without signing in)
       - name: Build
         run: |
-          cmake --build Build --parallel
-          cmake --build BuildRuntime --parallel
+          for build in Build BuildRuntime; do
+            status=0
+            cmake --build $build --parallel > build.log 2>&1 || status=$?
+            cat build.log
+            if [ "$status" -ne 0 ]; then
+              grep -m8 -E "error|Error|undefined reference|FAILED" build.log | while IFS= read -r line; do
+                echo "::error::$build: ${line:0:900}"
+              done
+              exit 1
+            fi
+          done
 
       - name: Test
         run: |
