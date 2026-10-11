@@ -76,6 +76,65 @@ using (var lm = new Network(Loss.SparseCrossEntropy))
     Check(lm.Generate(new uint[] { 3, 4, 5 }, 20, new Sampling { Stop = new uint[] { 9 } }).SequenceEqual(new uint[] { 6, 7, 8, 9 }), "stop tokens");
 }
 
+// tokenizers and pretrained language models: the files of Tests/Data, when the tests run within the repository
+string? data = null;
+for (var dir = new DirectoryInfo(Directory.GetCurrentDirectory()); dir != null && data == null; dir = dir.Parent)
+    if (File.Exists(Path.Combine(dir.FullName, "Tests", "Data", "tokenizer_llama3.json"))) data = Path.Combine(dir.FullName, "Tests", "Data");
+if (data is null)
+{
+    Console.WriteLine("Tests/Data not found: tokenizers and pretrained models not checked");
+}
+else
+{
+    // every case of Hugging Face's ids and texts (Tests/make_tokenizer_tests.py), by the tokenizer.json and its GGUF form
+    static string Unhex(string hex) => hex == "-" ? "" : System.Text.Encoding.UTF8.GetString(Convert.FromHexString(hex));
+    var lines = File.ReadAllLines(Path.Combine(data, "tokenizer_llama3.txt")).Where(l => !l.StartsWith('#')).ToArray();
+    foreach (var file in new[] { "tokenizer_llama3.json", "gguf_llama.gguf" })
+    {
+        using var tok = Tokenizer.Load(Path.Combine(data, file));
+        int wrong = 0, cases = 0;
+        for (int k = 0; k + 3 < lines.Length; k += 4, cases++)
+        {
+            var head = lines[k].Split(' ');
+            string text = Unhex(head[2]);
+            uint[] ids = lines[k + 1].Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1).Select(uint.Parse).ToArray();
+            if (!tok.Encode(text, head[0] == "1", head[1] == "1").SequenceEqual(ids)) wrong++;
+            if (tok.Decode(ids) != Unhex(lines[k + 2]) || tok.Decode(ids, skipSpecial: true) != Unhex(lines[k + 3])) wrong++;
+        }
+        Check(cases >= 100 && wrong == 0, $"{file}: {wrong} of {cases} texts encoded or decoded otherwise than by Hugging Face's");
+    }
+    using (var tok = Tokenizer.FromBytes(File.ReadAllBytes(Path.Combine(data, "tokenizer_llama3.json"))))
+    {
+        Check(tok.Bos == 420 && tok.Eos == 421 && tok.Vocabulary == 425 && tok.Added == 5 && tok.Unk is null, "BOS, EOS, vocabulary");
+        Check(tok.Id("<|begin_of_text|>") == 420 && tok.Token(420) == "<|begin_of_text|>" && tok.Id("no such token") is null &&
+              tok.Token(1u << 30) is null, "tokens by id and by name");
+        Check(tok.Encode("<|begin_of_text|>", special: true).SequenceEqual(new uint[] { 420 }) && tok.Encode("<|begin_of_text|>").Length > 1,
+              "special tokens only when asked");
+        string longText = string.Concat(Enumerable.Repeat("Tokenizers cut text into pieces, ", 300));
+        Check(tok.Decode(tok.Encode(longText)) == longText, "a long text encoded and decoded");
+    }
+    try { Tokenizer.Load(Path.Combine(data, "no_such_tokenizer.json")); Check(false, "a missing tokenizer"); } catch (SpingalettException) { }
+
+    // a Hugging Face directory and its weights in a GGUF file against PyTorch's logits (Tests/make_pretrained_tests.py)
+    var bin = File.ReadAllBytes(Path.Combine(data, "hf_llama.bin"));
+    uint window = BitConverter.ToUInt32(bin, 8), count = BitConverter.ToUInt32(bin, 12);
+    var tokens = new float[window];
+    var logits = new float[count];
+    Buffer.BlockCopy(bin, 16, tokens, 0, (int)window * 4);
+    Buffer.BlockCopy(bin, 16 + (int)window * 4, logits, 0, (int)count * 4);
+    foreach (var model in new[] { "hf_llama", "gguf_llama.gguf" })
+    {
+        using var lm = Network.FromPretrained(Path.Combine(data, model), window);
+        var got = lm.Predict(tokens);
+        float worst = got.Length == logits.Length ? got.Zip(logits).Max(p => Math.Abs(p.First - p.Second)) : float.PositiveInfinity;
+        Check(lm.TargetSize == window && worst < 1e-4f, $"{model}: logits {worst} from PyTorch's");
+    }
+    using (var tok = Tokenizer.Load(Path.Combine(data, "hf_llama")))
+        Check(tok.Encode("The quick brown fox jumps over the lazy dog, it's 1234 times!").Take((int)window).Select(i => (float)i)
+                 .SequenceEqual(tokens) && tok.Bos == 420 && tok.Eos == 424, "the tokenizer of a model directory");
+    try { Network.FromPretrained(Path.Combine(data, "no_such_model")); Check(false, "a missing model"); } catch (SpingalettException) { }
+}
+
 // the structures' layout against the C compiler's
 string? tool = Environment.GetEnvironmentVariable("SPINGALETT_LAYOUT");
 if (tool is null)
@@ -116,6 +175,10 @@ else
     Layout("SpingalettTokenReaderOptions", typeof(Spingalett.Native.TokenReaderOptions), All(typeof(Spingalett.Native.TokenReaderOptions)));
     Layout("SpingalettDatasetInfo", typeof(Spingalett.Native.DatasetInfo), All(typeof(Spingalett.Native.DatasetInfo)));
     Layout("SpingalettNetworkLayer", typeof(Spingalett.Native.NetworkLayer), All(typeof(Spingalett.Native.NetworkLayer)));
+    Layout("SpingalettTokenizerInfo", typeof(Spingalett.Native.TokenizerInfo), All(typeof(Spingalett.Native.TokenizerInfo)));
+    Layout("SpingalettTokenizeArgs", typeof(Spingalett.Native.TokenizeArgs), All(typeof(Spingalett.Native.TokenizeArgs)));
+    Layout("SpingalettDetokenizeArgs", typeof(Spingalett.Native.DetokenizeArgs), All(typeof(Spingalett.Native.DetokenizeArgs)));
+    Layout("SpingalettPretrainedArgs", typeof(Spingalett.Native.PretrainedArgs), All(typeof(Spingalett.Native.PretrainedArgs)));
     Layout("SpingalettModel", typeof(Spingalett.Native.Model), "input_size", "output_size", "layer_count", "loss",
            "workspace_size", "image", "image_size", "reserved");
 }
