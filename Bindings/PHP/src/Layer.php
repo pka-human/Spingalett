@@ -241,6 +241,36 @@ final class Layer
         return $this;
     }
 
+    /** Attention: keys of padding (tokens of -1) left out (sequences of different lengths in one batch). */
+    public function ignorePadding(bool $ignore = true): self
+    {
+        $this->fields['ignore_padding'] = $ignore;
+        return $this;
+    }
+
+    /** Attention: a sliding window, keys less than $window cells away (with causal the cell and the $window - 1
+        before it). */
+    public function window(int $window): self
+    {
+        $this->fields['window'] = $window;
+        return $this;
+    }
+
+    /** An embedding of part of its input: $count tokens (0: the rest) from value $offset on. */
+    public function tokens(int $offset, int $count = 0): self
+    {
+        $this->fields['token_offset'] = $offset;
+        $this->fields['token_count'] = $count;
+        return $this;
+    }
+
+    /** Linear: computes with the table of the embedding of index $embedding (tied input and output embeddings). */
+    public function tied(int $embedding): self
+    {
+        $this->fields['tied'] = $embedding;
+        return $this;
+    }
+
     /** The layers it reads (indices Network::add() returned; 0 the input layer); none: the one before. */
     public function inputs(int ...$inputs): self
     {

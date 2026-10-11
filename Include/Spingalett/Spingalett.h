@@ -91,7 +91,13 @@ typedef struct {
     float rope_theta;               /* attention: base of the rotary position embeddings, 0 for none */
     bool causal;                    /* attention: each cell attends to itself and the cells before it */
     bool positions;                 /* embedding: a learned vector added a cell */
-    uint64_t reserved[SPINGALETT_RESERVED - 2];     /* (vocabulary took the padding before them) */
+    bool ignore_padding;            /* attention: keys of padding (negative tokens) ignored */
+    uint32_t tied;                  /* dense and linear layers: the embedding whose table they compute with
+                                       (weight_count 0: the table is the embedding's), or 0 */
+    uint32_t window;                /* attention: keys less than this many cells away (0: all) */
+    uint32_t token_offset;          /* embedding: the first of its input's values it reads (its cells the
+                                       width's from there on) */
+    uint64_t reserved[SPINGALETT_RESERVED - 4];     /* (vocabulary took the padding before them, window after tied) */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -168,16 +174,20 @@ typedef uint32_t (*SpingalettDataGeneratorFn)(float *inputs, float *targets, uin
 /*
  * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
  * completed in this spingalett_train() call (0 for the first), `initial_lr` is SpingalettTrainArgs.learning_rate.
- * Returns the learning rate for the coming epoch; negative or NaN results are ignored.
+ * Returns the learning rate for the coming epoch; negative or NaN results are ignored. With
+ * SpingalettTrainArgs.lr_per_step it is called before every optimizer step instead, with the steps
+ * taken in this call (0 for the first) and the steps the call takes in all in place of the epochs.
  */
 typedef float (*SpingalettLRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
 
-/* Parameters of the built-in schedulers, passed as lr_scheduler_data (NULL = defaults). */
+/* Parameters of the built-in schedulers, passed as lr_scheduler_data (NULL = defaults). With
+   lr_per_step, warmup_epochs and step_size count optimizer steps. */
 typedef struct {
-    size_t warmup_epochs;   /* linear_warmup, warmup_cosine; 0 = 5% of the run (at least 1) */
+    size_t warmup_epochs;   /* linear_warmup, warmup_cosine, warmup_linear; 0 = 5% of the run (at least 1) */
     size_t step_size;       /* step_decay: epochs between decays; 0 = a third of the run */
     float  gamma;           /* step_decay: decay factor; 0 = 0.1 */
-    float  min_lr;          /* cosine_decay, warmup_cosine: final learning rate; default 0 */
+    float  min_lr;          /* cosine_decay, warmup_cosine, linear_decay, warmup_linear: final learning
+                               rate; default 0 */
     uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettLRScheduleParams;
 
@@ -239,7 +249,26 @@ typedef struct {
                                        (language models) */
     bool positions;                 /* embedding: a learned vector added to each cell (absolute position
                                        embeddings, as GPT-2's) */
-    uint64_t reserved[SPINGALETT_RESERVED - 3];
+    bool ignore_padding;            /* attention: keys at padding ignored, so that sequences of different lengths
+                                       train in one batch, padded with the token -1 (which an embedding reads as
+                                       zeros and the sparse cross-entropy as no target): a key is padding when
+                                       its token is negative, its cells those of an embedding of the network's
+                                       input through layers that keep them one for one (linear layers,
+                                       normalizations, additions, products, concatenations, attention); a query
+                                       without a key to attend to gives zeros */
+    uint32_t tied;                  /* dense and linear layers: the index of an earlier embedding whose table
+                                       the layer takes as its weights, tied input and output embeddings (GPT-2,
+                                       LLaMA): its outputs the embedding's vocabulary, its inputs a row's values;
+                                       the layer keeps its biases, and the table's gradient is the sum of both
+                                       layers' (0: weights of its own) */
+    uint32_t window;                /* attention: a sliding window (Mistral's): each cell attends to the keys less
+                                       than `window` cells away, with causal the cell itself and the window - 1
+                                       before it, without the window - 1 on either side (0: every key) */
+    uint32_t token_offset;          /* embedding: the first of its input's values it reads, when the input (of
+                                       height 1) holds several sequences: an encoder's and a decoder's tokens
+                                       side by side (0 with token_count 0: all of them) */
+    uint32_t token_count;           /* embedding: how many values from token_offset on, its cells (0: the rest) */
+    uint64_t reserved[SPINGALETT_RESERVED - 5];
 } SpingalettLayerArgs;
 
 typedef struct {
@@ -335,7 +364,33 @@ typedef struct {
     float lr_plateau_factor;
     size_t lr_plateau_patience;
     float lr_plateau_min_lr;
-    uint64_t reserved[SPINGALETT_RESERVED];
+
+    /* Gradient accumulation: an optimizer step after every accumulation_steps mini-batches of
+       batch_size samples (generator mode: after every accumulation_steps calls of the generator), with
+       the mean gradient of the step's samples; 0 or 1: a step a mini-batch. It applies to mini-batch
+       training, and to per-sample training as mini-batches of one sample; full-batch training ignores
+       it (its step is the whole set). The step's samples run in chunks of batch_size: its gradient is
+       that of one mini-batch of accumulation_steps x batch_size samples computed in chunks of
+       batch_size samples, which spingalett_train() does for batches larger than the samples its
+       workspace holds, bit for bit; against a larger batch computed in larger chunks it differs in
+       the order of the sums only (and batch normalization takes its statistics over each chunk).
+       Dropout masks and augmentation are drawn by the sample's position in its step, as for the larger
+       batch. Workspace memory is that of batch_size samples. */
+    uint32_t accumulation_steps;
+    /* The learning-rate schedule (lr_scheduler) evaluated before every optimizer step rather than every
+       epoch: its `epoch` the steps taken in this call, its `total_epochs` the steps of the call (epochs
+       x steps an epoch; with a generator and sample_count 0, 0 during the first epoch, then the first
+       epoch's steps x epochs). Reduce on plateau scales each step's rate. */
+    bool lr_per_step;
+    /* Activation recomputation (checkpointing), mini-batch and full-batch training on the CPU: the workspace
+       keeps through the backward pass the outputs of the layers that several layers read (a transformer's
+       residual stream, one a block), of batch normalizations and of the output layer, and the others' only
+       for one segment between them (a block) at a time: their outputs, gradients and values before their
+       activations share memory, and the backward pass computes a segment's outputs again before it. The
+       gradients are those of training without it, bit for bit; it costs about one more forward pass. The GPU
+       keeps every layer. */
+    bool recompute;
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettTrainArgs;
 
 typedef struct {
@@ -458,13 +513,18 @@ SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkA
 /* The layers of transformers. A sequence of n tokens is a layer of 1 x n cells, each of its channels
    (the input layer: n values, the tokens' indices as floats). */
 /* A dense layer of .neurons_amount outputs applied to each cell alike: a 1 x 1 convolution, the linear
-   layers of transformers over their tokens. */
+   layers of transformers over their tokens; with .tied, the product with an embedding's table (a language
+   model's head tied to its token embeddings). */
 #define spingalett_linear(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_CONV2D, .kernel = 1, __VA_ARGS__})
 /* Token embeddings: each input value the index of a row of .vocabulary rows of .neurons_amount values;
    .positions adds a learned vector a cell. */
 #define spingalett_embedding(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_EMBEDDING, __VA_ARGS__})
 /* Multi-head attention over the cells of a layer of queries, keys and values side by side (a linear layer
-   of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta. */
+   of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta, .ignore_padding,
+   .window. With two inputs, .inputs = {q, kv}, cross-attention (an encoder-decoder's): the queries of the
+   cells of layer q (heads x head size channels) over the keys and values of the cells of layer kv (2 kv_heads
+   x head size channels: the key heads', then the value heads'), as many cells as q's out; neither causal nor
+   windowed nor rotary, .ignore_padding the keys of padding of kv's cells. */
 #define spingalett_attention(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_ATTENTION, __VA_ARGS__})
 /* RMS normalization over each cell's channels. */
 #define spingalett_rms_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_RMS_NORM, __VA_ARGS__})
@@ -503,11 +563,17 @@ SPINGALETT_API float spingalett_derivative(float x, SpingalettActivationFunction
 #define spingalett_forward(...) spingalett_forward_args((SpingalettForwardArgs){__VA_ARGS__})
 SPINGALETT_API float *spingalett_forward_args(SpingalettForwardArgs args);
 
-/* Built-in learning-rate schedules (see SpingalettLRScheduleParams). */
+/* Built-in learning-rate schedules (see SpingalettLRScheduleParams), by epochs or, with lr_per_step, by
+   optimizer steps. */
 SPINGALETT_API float spingalett_lr_cosine_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 SPINGALETT_API float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+/* A straight line from initial_lr (epoch 0) down to min_lr (reached after the last epoch). */
+SPINGALETT_API float spingalett_lr_linear_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+/* A linear warmup over warmup_epochs (as spingalett_lr_linear_warmup), then a straight line down to min_lr
+   over the rest of the run (the schedule of BERT and GPT-2). */
+SPINGALETT_API float spingalett_lr_warmup_linear(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 
 /* Batched inference: writes the outputs of all samples. Uses matrix-matrix products on every
    backend, so it is much faster than calling spingalett_forward() per sample. Returns false on error. */
@@ -711,8 +777,8 @@ SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
 SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
 SPINGALETT_API void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
 SPINGALETT_API SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
-/* The token of an id as the vocabulary writes it ("Ġthe" in byte-level vocabularies, "▁the" in
-   SentencePiece's, "<|im_start|>"), valid while the tokenizer lives; NULL for an id of no token. */
+/* The token of an id as the vocabulary writes it (in UTF-8: byte-level vocabularies write a space as U+0120,
+   SentencePiece's as U+2581; "<|im_start|>"), valid while the tokenizer lives; NULL for an id of no token. */
 SPINGALETT_API const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
 /* The id of a token as the vocabulary writes it (added tokens first), SPINGALETT_NO_TOKEN when none. */
 SPINGALETT_API uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
@@ -772,12 +838,12 @@ typedef struct {
  * normalizations, grouped-query attention with rotary embeddings (the queries', keys' and values'
  * projections, with Qwen2's biases, in one linear layer), and a SwiGLU MLP (a SiLU layer times a linear
  * one); GPT-2 layer normalizations, learned positions, a GELU MLP and its Conv1D weights transposed. The
- * language model head is lm_head.weight (output.weight), or a copy of the embeddings (tied). The network
- * takes a window of `context` token ids and gives every position's logits
- * (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it generates (spingalett_generate()), trains and saves like any
- * other. Mistral's sliding window is not applied: attention covers the whole context, which is exact for
- * contexts within the window (a warning says when the context exceeds it). Scaled rotary embeddings (LLaMA
- * 3.1's, YaRN) are refused. The tokenizer comes from spingalett_tokenizer_load() on the same path. NULL on
+ * language model head is lm_head.weight (output.weight), or, in a checkpoint without one, tied to the
+ * embedding (SpingalettLayerArgs.tied: one table for both, trained by both). The network takes a window of
+ * `context` token ids and gives every position's logits (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it generates
+ * (spingalett_generate()), trains and saves like any other. Mistral's sliding window (config.json's
+ * sliding_window, a GGUF file's attention.sliding_window) is the attention layers' window. Scaled rotary
+ * embeddings (LLaMA 3.1's, YaRN) are refused. The tokenizer comes from spingalett_tokenizer_load() on the same path. NULL on
  * error.
  */
 #define spingalett_load_pretrained(...) spingalett_load_pretrained_args((SpingalettPretrainedArgs){__VA_ARGS__})

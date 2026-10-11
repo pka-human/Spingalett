@@ -44,6 +44,7 @@ typedef struct {
     uint32_t context;               /* tokens a sample: the network's window */
     float eps;                      /* the normalizations' */
     float theta;                    /* rotary embeddings' base (LLaMA) */
+    uint32_t window;                /* a sliding window (Mistral's): the keys of the last `window` tokens (0: all) */
     ActivationFunction act;         /* GPT-2's MLP */
 } SpgTransformer;
 

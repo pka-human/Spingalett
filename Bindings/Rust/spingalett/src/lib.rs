@@ -348,6 +348,31 @@ impl Layer {
         self.args.positions = positions;
         self
     }
+    /// Attention: keys of padding (tokens of -1 in the network's input) left out, for sequences of different
+    /// lengths in one batch.
+    pub fn ignore_padding(mut self, ignore: bool) -> Self {
+        self.args.ignore_padding = ignore;
+        self
+    }
+    /// An embedding of part of its input: `count` tokens (0: the rest) from value `offset` on of its one row (an
+    /// encoder's and a decoder's tokens side by side in one input).
+    pub fn tokens(mut self, offset: u32, count: u32) -> Self {
+        self.args.token_offset = offset;
+        self.args.token_count = count;
+        self
+    }
+    /// Attention: a sliding window, keys less than `window` cells away (with causal the cell and the
+    /// `window - 1` before it); 0: every key.
+    pub fn window(mut self, window: u32) -> Self {
+        self.args.window = window;
+        self
+    }
+    /// A linear layer computing with the table of the embedding of this index (tied input and output
+    /// embeddings); its outputs the embedding's vocabulary.
+    pub fn tied(mut self, embedding: u32) -> Self {
+        self.args.tied = embedding;
+        self
+    }
 }
 
 /// Options of Network::train() (the defaults: 10 epochs of mini-batches of 32, Adam at 0.001).
@@ -367,6 +392,10 @@ pub struct TrainOptions {
     pub label_smoothing: f32,
     /// Keep the samples in order.
     pub no_shuffle: bool,
+    /// Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one).
+    pub accumulation_steps: u32,
+    /// Activation recomputation on the CPU: less memory, a forward pass more, the same results.
+    pub recompute: bool,
 }
 
 impl Default for TrainOptions {
@@ -384,6 +413,8 @@ impl Default for TrainOptions {
             max_grad_norm: 0.0,
             label_smoothing: 0.0,
             no_shuffle: false,
+            accumulation_steps: 0,
+            recompute: false,
         }
     }
 }
@@ -544,6 +575,8 @@ impl Network {
             beta2: o.beta2,
             max_grad_norm: o.max_grad_norm,
             label_smoothing: o.label_smoothing,
+            accumulation_steps: o.accumulation_steps,
+            recompute: o.recompute,
             ..Default::default()
         }
     }

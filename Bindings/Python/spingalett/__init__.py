@@ -48,7 +48,7 @@ __all__ = [
     "Model", "LayerInfo", "DeviceData", "Session",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
-    "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
+    "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine", "LinearDecay", "WarmupLinear",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
@@ -235,7 +235,11 @@ class _NetworkLayer(Structure):
         ("rope_theta", c_float),
         ("causal", c_bool),
         ("positions", c_bool),
-        ("reserved", c_uint64 * (_RESERVED - 2)),
+        ("ignore_padding", c_bool),
+        ("tied", c_uint32),
+        ("window", c_uint32),
+        ("token_offset", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 4)),
     ]
 
 
@@ -320,7 +324,12 @@ class _LayerArgs(Structure):
         ("rope_theta", c_float),
         ("causal", c_bool),
         ("positions", c_bool),
-        ("reserved", c_uint64 * (_RESERVED - 3)),
+        ("ignore_padding", c_bool),
+        ("tied", c_uint32),
+        ("window", c_uint32),
+        ("token_offset", c_uint32),
+        ("token_count", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 5)),
     ]
 
 
@@ -385,7 +394,10 @@ class _TrainArgs(Structure):
         ("lr_plateau_factor", c_float),
         ("lr_plateau_patience", c_size_t),
         ("lr_plateau_min_lr", c_float),
-        ("reserved", c_uint64 * _RESERVED),
+        ("accumulation_steps", c_uint32),
+        ("lr_per_step", c_bool),
+        ("recompute", c_bool),
+        ("reserved", c_uint64 * (_RESERVED - 1)),
     ]
 
 
@@ -614,7 +626,11 @@ class _LayerInfo(Structure):
         ("rope_theta", c_float),
         ("causal", c_bool),
         ("positions", c_bool),
-        ("reserved", c_uint64 * (_RESERVED - 2)),
+        ("ignore_padding", c_bool),
+        ("tied", c_uint32),
+        ("window", c_uint32),
+        ("token_offset", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 4)),
     ]
 
 
@@ -1043,6 +1059,23 @@ class WarmupCosine(_BuiltinSchedule):
         super().__init__(warmup_epochs=warmup_epochs, min_lr=min_lr)
 
 
+class LinearDecay(_BuiltinSchedule):
+    """A straight line from ``learning_rate`` down to ``min_lr`` over the run."""
+    _symbol = "spingalett_lr_linear_decay"
+
+    def __init__(self, min_lr: float = 0.0):
+        super().__init__(min_lr=min_lr)
+
+
+class WarmupLinear(_BuiltinSchedule):
+    """Linear warmup over ``warmup_epochs`` (0 = 5% of the run), then a straight line down to ``min_lr``
+    (the schedule of BERT and GPT-2)."""
+    _symbol = "spingalett_lr_warmup_linear"
+
+    def __init__(self, warmup_epochs: int = 0, min_lr: float = 0.0):
+        super().__init__(warmup_epochs=warmup_epochs, min_lr=min_lr)
+
+
 Schedule = Union[_BuiltinSchedule, Callable[[int, int, float], float]]
 
 
@@ -1180,18 +1213,21 @@ class LayerNorm:
 @dataclasses.dataclass(frozen=True)
 class Linear:
     """A dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution): the linear
-    layers of transformers over their tokens."""
+    layers of transformers over their tokens; with ``tied`` (an embedding's index), the transposed product
+    with that embedding's table (tied input and output embeddings)."""
     neurons: int
     activation: Activation = Activation.NONE
     init: Init = Init.LECUN
     dropout: float = 0.0
     inputs: _Inputs = None
+    tied: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
 class Embedding:
     """Token embeddings: each input value the index of a row of ``vocabulary`` rows of ``size`` values;
-    with ``positions``, a learned vector a cell added (GPT-2's absolute positions)."""
+    with ``positions``, a learned vector a cell added (GPT-2's absolute positions); ``token_offset`` and
+    ``token_count`` (0: the rest) the input's values it reads (an encoder's and a decoder's tokens side by side)."""
     vocabulary: int
     size: int
     positions: bool = False
@@ -1199,6 +1235,8 @@ class Embedding:
     init: Init = Init.LECUN
     dropout: float = 0.0
     inputs: _Inputs = None
+    token_offset: int = 0
+    token_count: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1206,7 +1244,8 @@ class Attention:
     """Multi-head scaled dot-product attention over the cells of a layer of queries, keys and values side
     by side ((heads + 2 kv_heads) x head size channels a cell): ``kv_heads`` key and value heads (fewer
     than ``heads``: grouped-query attention), ``causal`` masking, rotary position embeddings of base
-    ``rope_theta`` (0: none)."""
+    ``rope_theta`` (0: none), ``ignore_padding`` (keys of -1 tokens left out), a sliding ``window`` (keys
+    less than that many cells away; 0: all)."""
     heads: int = 1
     kv_heads: int = 0
     causal: bool = False
@@ -1214,6 +1253,8 @@ class Attention:
     activation: Activation = Activation.NONE
     dropout: float = 0.0
     inputs: _Inputs = None
+    ignore_padding: bool = False
+    window: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1256,6 +1297,10 @@ class LayerDescription:
     rope_theta: float = 0.0         # attention: base of the rotary position embeddings (0: none)
     causal: bool = False            # attention: each cell attends to the cells up to itself
     positions: bool = False         # embedding: a learned vector a cell
+    tied: int = 0                   # dense and linear layers: the embedding whose table are their weights
+    ignore_padding: bool = False    # attention: keys of padding (-1 tokens) left out
+    window: int = 0                 # attention: keys less than this many cells away (0: all)
+    token_offset: int = 0           # embedding: the first of its input's values it reads
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1333,6 +1378,9 @@ class TrainConfig:
     lr_plateau_factor: float = 0.0      # reduce on plateau: multiply the learning rate by this...
     lr_plateau_patience: int = 0        # ...after this many epochs without improvement (0: off)
     lr_plateau_min_lr: float = 0.0      # ...but not below this
+    accumulation_steps: int = 0         # a step after every this many mini-batches (gradient accumulation)
+    lr_per_step: bool = False           # lr_scheduler before every optimizer step (its epochs counting steps)
+    recompute: bool = False             # activation recomputation on the CPU: less memory, a forward pass more
 
 
 def _as_float(data) -> np.ndarray:
@@ -1460,13 +1508,15 @@ class Network:
             elif isinstance(spec, LayerNorm):
                 self.add_layer_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, Linear):
-                self.add_linear(spec.neurons, spec.activation, spec.init, spec.dropout, inputs=spec.inputs)
+                self.add_linear(spec.neurons, spec.activation, spec.init, spec.dropout, inputs=spec.inputs,
+                                tied=spec.tied)
             elif isinstance(spec, Embedding):
                 self.add_embedding(spec.vocabulary, spec.size, spec.positions, spec.activation, spec.init, spec.dropout,
-                                   inputs=spec.inputs)
+                                   inputs=spec.inputs, token_offset=spec.token_offset, token_count=spec.token_count)
             elif isinstance(spec, Attention):
                 self.add_attention(spec.heads, spec.kv_heads, spec.causal, spec.rope_theta, spec.activation,
-                                   spec.dropout, inputs=spec.inputs)
+                                   spec.dropout, inputs=spec.inputs, ignore_padding=spec.ignore_padding,
+                                   window=spec.window)
             elif isinstance(spec, RMSNorm):
                 self.add_rms_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, Multiply):
@@ -1622,32 +1672,46 @@ class Network:
                          dropout_rate=float(dropout))
 
     def add_linear(self, neurons: int, activation: Activation = Activation.NONE, init: Init = Init.LECUN,
-                   dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
+                   dropout: float = 0.0, inputs: _Inputs = None, tied: int = 0) -> "Network":
         """Append a dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution),
-        the linear layers of transformers over their tokens."""
+        the linear layers of transformers over their tokens. ``tied``, an earlier embedding's index, makes it
+        compute with that embedding's table (``neurons`` its vocabulary, its inputs a row's values): tied input
+        and output embeddings, the table trained by both layers' gradients; the layer keeps its biases."""
         return self._add(inputs, type=int(LayerType.CONV2D), filters=int(neurons), kernel=1,
-                         act_func=int(activation), weight_initialization=int(init), dropout_rate=float(dropout))
+                         act_func=int(activation), weight_initialization=int(init), dropout_rate=float(dropout),
+                         tied=int(tied))
 
     def add_embedding(self, vocabulary: int, size: int, positions: bool = False,
                       activation: Activation = Activation.NONE, init: Init = Init.LECUN, dropout: float = 0.0,
-                      inputs: _Inputs = None) -> "Network":
+                      inputs: _Inputs = None, token_offset: int = 0, token_count: int = 0) -> "Network":
         """Append token embeddings: each input value (a token's index, as a float) the row of a table of
         ``vocabulary`` rows of ``size`` values (indices outside it give zeros), plus with ``positions`` a
-        learned vector a cell. A sequence of n tokens (an input layer of n values) gives n cells."""
+        learned vector a cell. A sequence of n tokens (an input layer of n values) gives n cells; with
+        ``token_offset`` and ``token_count`` (0: the rest), the embedding reads those values of its input only (an
+        encoder-decoder's input holds the source's tokens, then the target's: an embedding each, the second
+        reading the input layer, ``inputs=[0]``)."""
         return self._add(inputs, type=int(LayerType.EMBEDDING), vocabulary=int(vocabulary), neurons_amount=int(size),
                          positions=bool(positions), act_func=int(activation), weight_initialization=int(init),
-                         dropout_rate=float(dropout))
+                         dropout_rate=float(dropout), token_offset=int(token_offset), token_count=int(token_count))
 
     def add_attention(self, heads: int = 1, kv_heads: int = 0, causal: bool = False, rope_theta: float = 0.0,
                       activation: Activation = Activation.NONE, dropout: float = 0.0,
-                      inputs: _Inputs = None) -> "Network":
+                      inputs: _Inputs = None, ignore_padding: bool = False, window: int = 0) -> "Network":
         """Append multi-head attention over the cells of a layer whose channels hold each cell's queries,
         keys and values side by side: ``heads`` query vectors, then ``kv_heads`` (0: as many as heads)
         key and value vectors of one head size; ``causal`` lets each cell attend to the cells up to
-        itself only, ``rope_theta`` (10000 is usual) rotates queries and keys by position."""
+        itself only, ``rope_theta`` (10000 is usual) rotates queries and keys by position;
+        ``ignore_padding`` leaves out the keys of padding (a token of -1 in the network's input, the cells of an
+        embedding of it): sequences of different lengths train in one batch; ``window`` (Mistral's sliding
+        window) lets each cell attend to the keys less than that many cells away only: with ``causal`` the cell
+        and the ``window - 1`` before it, without the ``window - 1`` on either side (0: every key). With two
+        ``inputs``, ``[q, kv]``, cross-attention: the queries of layer q (heads x head size channels) over the keys
+        and values of layer kv (2 kv_heads x head size: the key heads', then the value heads'), neither causal nor
+        windowed nor rotary; ``ignore_padding`` then leaves out the keys of padding of kv's tokens."""
         return self._add(inputs, type=int(LayerType.ATTENTION), heads=int(heads), kv_heads=int(kv_heads),
                          causal=bool(causal), rope_theta=float(rope_theta), act_func=int(activation),
-                         dropout_rate=float(dropout))
+                         dropout_rate=float(dropout), ignore_padding=bool(ignore_padding),
+                         window=int(window))
 
     def add_rms_norm(self, activation: Activation = Activation.NONE, epsilon: float = 1e-5, dropout: float = 0.0,
                      inputs: _Inputs = None) -> "Network":
@@ -1673,7 +1737,8 @@ class Network:
                                 int(info.weight_count), int(info.bias_count), int(info.groups), float(info.epsilon),
                                 float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)),
                                 int(info.vocabulary), int(info.heads), int(info.kv_heads), float(info.rope_theta),
-                                bool(info.causal), bool(info.positions))
+                                bool(info.causal), bool(info.positions), int(info.tied), bool(info.ignore_padding),
+                                int(info.window), int(info.token_offset))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -2066,6 +2131,9 @@ class Network:
             lr_plateau_factor=float(cfg.lr_plateau_factor),
             lr_plateau_patience=int(cfg.lr_plateau_patience),
             lr_plateau_min_lr=float(cfg.lr_plateau_min_lr),
+            accumulation_steps=int(cfg.accumulation_steps),
+            lr_per_step=bool(cfg.lr_per_step),
+            recompute=bool(cfg.recompute),
         )
         r = _call(_train, args)
         del keep
@@ -2233,6 +2301,10 @@ class LayerInfo:
     rope_theta: float = 0.0             # attention: base of the rotary position embeddings (0: none)
     causal: bool = False                # attention: each cell attends to the cells up to itself
     positions: bool = False             # embedding: a learned vector a cell
+    tied: int = 0                       # dense and linear layers: the embedding (network layer) whose table
+    ignore_padding: bool = False        # attention: keys of padding (negative tokens) left out
+    window: int = 0                     # attention: keys less than this many cells away (0: all)
+    token_offset: int = 0               # embedding: the first of its input's values it reads
 
 
 class Model:
@@ -2331,7 +2403,9 @@ class Model:
                                  input_layers=tuple(int(info.input_layers[k]) for k in range(info.input_count)),
                                  vocabulary=int(info.vocabulary), heads=int(info.heads), kv_heads=int(info.kv_heads),
                                  rope_theta=float(info.rope_theta), causal=bool(info.causal),
-                                 positions=bool(info.positions)))
+                                 positions=bool(info.positions), tied=int(info.tied),
+                                 ignore_padding=bool(info.ignore_padding), window=int(info.window),
+                                 token_offset=int(info.token_offset)))
         return out
 
     def to_bytes(self) -> bytes:
@@ -2749,9 +2823,10 @@ def gpt2_from_state_dict(state, heads: int, context: Optional[int] = None,
     values' weights. ``heads`` is the model's attention heads (12 for GPT-2 small); ``context`` the window of
     the network (tokens a sample; at most the model's positions, all of them when None); ``activation`` the
     MLP's GELU (default: Hugging Face's tanh approximation, nanoGPT's erf). The language model head is
-    ``lm_head.weight`` when the state dict has one, else tied to the token embeddings, as GPT-2's is. The
-    network's input is a window of token ids, its outputs each position's logits; it trains on, generates
-    with and saves like any other (the weights are copied, the head no longer tied)."""
+    ``lm_head.weight`` when the state dict has one that differs from the token embeddings, else a linear layer
+    tied to the embedding's table (``tied=1``), as GPT-2's is: the table is stored once and trained by the
+    gradients of both. The network's input is a window of token ids, its outputs each position's logits; it
+    trains on, generates with and saves like any other (the weights are copied)."""
     p = _prefix(state, "wte.weight")
     wte, wpe = _tensor(state[p + "wte.weight"]), _tensor(state[p + "wpe.weight"])
     vocabulary, width = wte.shape
@@ -2797,23 +2872,35 @@ def gpt2_from_state_dict(state, heads: int, context: Optional[int] = None,
         x = net.last
     net.add_layer_norm()
     sets.append((net.last - 1, _tensor(state[p + "ln_f.weight"]), bias(p + "ln_f.bias", width)))
-    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else wte
-    net.add_linear(vocabulary)
-    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    _head(net, state, wte, vocabulary, sets)
     for index, w, b in sets:
-        net.set_weights(index, w)
+        if w is not None:
+            net.set_weights(index, w)
         net.set_biases(index, b)
     return net
 
 
+def _head(net: "Network", state, table: np.ndarray, vocabulary: int, sets) -> None:
+    """The language model head: lm_head.weight, or (when the state dict has none, or the token embeddings'
+    values: the checkpoint ties them) a linear layer tied to the embedding, layer 1."""
+    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else None
+    if head is None or np.array_equal(head, table):
+        net.add_linear(vocabulary, tied=1)
+        sets.append((net.last - 1, None, np.zeros(vocabulary, dtype=np.float32)))
+    else:
+        net.add_linear(vocabulary)
+        sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+
+
 def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, context: int = 2048,
-                          rope_theta: float = 10000.0, epsilon: float = 1e-6) -> "Network":
+                          rope_theta: float = 10000.0, epsilon: float = 1e-6, window: int = 0) -> "Network":
     """A LLaMA-like model from its state dict in Hugging Face's names (LlamaForCausalLM, and the models of its
     form: Mistral, Qwen2 with its queries', keys' and values' biases, ...): RMS normalization, grouped-query
     attention with rotary embeddings (rotate_half, as Hugging Face stores the weights), a SwiGLU MLP. ``heads``
     and ``kv_heads`` are the config's num_attention_heads and num_key_value_heads (None: as many), ``rope_theta``
-    and ``epsilon`` its rope_theta and rms_norm_eps; ``context`` the network's window of tokens. The language
-    model head is lm_head.weight, else tied to the token embeddings."""
+    and ``epsilon`` its rope_theta and rms_norm_eps, ``window`` Mistral's sliding_window (0: none); ``context`` the
+    network's window of tokens. The language model head is lm_head.weight when it differs from the token
+    embeddings, else (tie_word_embeddings) a linear layer tied to the embedding's table."""
     p = _prefix(state, "embed_tokens.weight")
     embed = _tensor(state[p + "embed_tokens.weight"])
     vocabulary, width = embed.shape
@@ -2839,7 +2926,7 @@ def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, con
         net.add_linear(sum(sizes))
         sets.append((net.last - 1, np.concatenate(qkv),
                      np.concatenate([bias(h + f"self_attn.{n}_proj.bias", m) for n, m in zip("qkv", sizes)])))
-        net.add_attention(heads=heads, kv_heads=kv_heads, rope_theta=rope_theta, causal=True)
+        net.add_attention(heads=heads, kv_heads=kv_heads, rope_theta=rope_theta, causal=True, window=window)
         net.add_linear(width)
         sets.append((net.last - 1, _tensor(state[h + "self_attn.o_proj.weight"]), bias(h + "self_attn.o_proj.bias", width)))
         net.add_add([x, net.last])
@@ -2860,11 +2947,10 @@ def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, con
         x = net.last
     net.add_rms_norm(epsilon=epsilon)
     sets.append((net.last - 1, _tensor(state[p + "norm.weight"]), None))
-    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else embed
-    net.add_linear(vocabulary)
-    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    _head(net, state, embed, vocabulary, sets)
     for index, w, b in sets:
-        net.set_weights(index, w)
+        if w is not None:
+            net.set_weights(index, w)
         if b is not None:
             net.set_biases(index, b)
     if head_size * heads != width:

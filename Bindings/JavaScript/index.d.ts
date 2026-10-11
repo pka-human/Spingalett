@@ -91,7 +91,7 @@ export class Engine {
     readonly formatVersion: number;
     /** Bytes of the module's memory: it grows as models are loaded, and is reused as they are freed. */
     readonly memorySize: number;
-    /** Checks a .slett image (format 3 to 8: header, layer table, bounds and CRC-32 checksums), copies it
+    /** Checks a .slett image (format 3 to 9: header, layer table, bounds and CRC-32 checksums), copies it
         into the engine's memory and opens it. Throws a SpingalettError for an image it refuses. */
     loadModel(bytes: ModelBytes): Model;
 }
@@ -111,7 +111,7 @@ export class Model {
     readonly workspaceSize: number;
     /** Bytes of the image. */
     readonly imageSize: number;
-    /** The image's .slett format version (3 to 8). */
+    /** The image's .slett format version (3 to 9). */
     readonly formatVersion: number;
     /** The weight layers, first hidden layer first. */
     readonly layers: readonly LayerInfo[];

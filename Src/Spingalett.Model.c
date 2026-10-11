@@ -10,6 +10,9 @@
  */
 
 #include "Spingalett.Model.h"
+#if !defined(SPINGALETT_RUNTIME)
+#include "Spingalett.Gpu.h"
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -47,6 +50,9 @@ static SpingalettModel *adopt_image(void *image, size_t size) {
     owner->image = image;
     owner->lock = lock;
     atomic_init(&owner->spare, NULL);
+#if !defined(SPINGALETT_RUNTIME)
+    atomic_init(&owner->gpu_state, 0);
+#endif
     model->owner_ = owner;
     return model;
 }
@@ -154,6 +160,10 @@ static void prepared_free(PreparedLayer *layers, uint32_t count) {
 
 static void owner_free(ModelOwner *owner, uint32_t layers) {
     if (!owner) return;
+#if !defined(SPINGALETT_RUNTIME)
+    if (owner->gpu_net) spingalett_network_free(owner->gpu_net);
+    spg_signal_free(owner->gpu_lock);
+#endif
     prepared_free(owner->layers, layers);
     spingalett_predict_workspace_free(atomic_load(&owner->spare));
     spg_signal_free(owner->lock);
@@ -647,9 +657,11 @@ void spingalett_predict_combine(const SlettLayer *L, const float *const *x, cons
     (void)mode;
 }
 
-/* (A dense layer's interleaved rows are read only in calls with dense_tiles: others may be building them.) */
+/* (input: the network's inputs, n rows of input_size, whose tokens attention ignoring padding reads. A dense
+   layer's interleaved rows are read only in calls with dense_tiles: others may be building them.) */
 void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, bool dense_tiles,
-                              const float *x, float *y, uint32_t n, PredictWorkspace *w, ComputeMode mode) {
+                              const float *input, uint32_t input_size, const float *x, const float *kv, float *y,
+                              uint32_t n, PredictWorkspace *w, ComputeMode mode) {
     uint32_t in = L->inputs, out = L->outputs;
     const float *dequant = prep->dequant;
     const float *bias = (const float *)(const void *)(image + L->biases);
@@ -670,15 +682,17 @@ void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const P
                 } else if (L->type == LAYER_EMBEDDING) {
                     spingalett_engine_embedding(image, L, xs, ys);
                 } else if (L->type == LAYER_ATTENTION) {
-                    const uint32_t cells = L->out_h * L->out_w, head = L->out_c / L->heads;
+                    SlettAttention a;
+                    spingalett_engine_attention_of(image, L, input ? input + (size_t)s * input_size : NULL, &a);
+                    if (kv) a.kv_input = kv + (size_t)s * a.kcells * 2u * a.kv * a.head;  /* (cross-attention) */
                     /* (no scratch without rotary embeddings: the window may not exist) */
                     float *scratch = NULL, *table = NULL;
                     if (L->theta > 0.0f) {
                         scratch = (float *)(void *)(w->window + (size_t)spingalett_thread_num() * w->window_stride);
-                        table = scratch + (size_t)cells * L->kv_heads * head + head;
-                        spingalett_engine_rope_table(cells, head, L->theta, table);
+                        table = scratch + (size_t)a.cells * a.kv * a.head + a.head;
+                        spingalett_engine_rope_table(a.cells, a.head, L->theta, table);
                     }
-                    spingalett_engine_attention(xs, cells, L->heads, L->kv_heads, head, L->causal, table, ys, scratch);
+                    spingalett_engine_attention(&a, xs, table, ys, scratch);
                 } else {
                     spingalett_engine_layer_norm(xs, L->out_h * L->out_w, L->out_c, gamma, bias, L->eps, ys, NULL);
                 }
@@ -822,12 +836,66 @@ void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const P
     );
 }
 
+#if !defined(SPINGALETT_RUNTIME)
+/* The model as a network on the GPU of the compute mode (the full library): an owned model whose weights are floats
+   (FP32, FP16, BF16), made from its image by the first call that needs it, under the lock; NULL for integer
+   models (their sums in integers, on the CPU), models the GPU cannot run, and models that own nothing. */
+static NeuralNetwork *model_gpu_network(const SpingalettModel *model) {
+    ModelOwner *owner = (ModelOwner *)model->owner_;
+    if (!owner) return NULL;
+    int state = atomic_load(&owner->gpu_state);
+    if (state == 0) {
+        spg_lock(owner->lock);
+        state = atomic_load(&owner->gpu_state);
+        if (state == 0) {
+            const uint8_t *image = (const uint8_t *)model->image;
+            bool floats = true;
+            for (uint32_t i = 0; i < model->layer_count && floats; i++) {
+                SlettLayer L;
+                spingalett_slett_layer(image, i, &L);
+                floats = L.precision != PRECISION_INT8 && L.precision != PRECISION_INT4 && L.precision != PRECISION_INT2;
+            }
+            const char *why = NULL;
+            NeuralNetwork *net = NULL;
+            if (floats) {
+                spingalett_log_quiet(1);   /* (the network's layers are the model's: not logged again) */
+                net = spingalett_load_from_memory(model->image, model->image_size);
+                spingalett_log_quiet(-1);
+            }
+            owner->gpu_lock = net && spingalett_gpu_supports(net, &why) ? spg_signal_create() : NULL;
+            if (owner->gpu_lock) {
+                owner->gpu_net = net;
+                state = 1;
+            } else {
+                if (net) spingalett_network_free(net);
+                state = -1;
+            }
+            atomic_store(&owner->gpu_state, state);
+        }
+        spg_unlock(owner->lock);
+    }
+    return state == 1 ? owner->gpu_net : NULL;
+}
+#endif
+
 bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs) {
     if (!model || !model->image || !inputs || !outputs) {
         set_error(SPINGALETT_ERR_INVALID, "model predict: model, inputs or outputs is NULL");
         return false;
     }
     if (count == 0) return true;
+#if !defined(SPINGALETT_RUNTIME)
+    /* on a GPU: models of float weights there, one call at a time (the device's own order of work) */
+    NeuralNetwork *gpu = spingalett_use_gpu() ? model_gpu_network(model) : NULL;
+    if (gpu) {
+        ModelOwner *owner = (ModelOwner *)model->owner_;
+        spg_lock(owner->gpu_lock);
+        const bool done = spingalett_predict_args((SpingalettPredictArgs){.net = gpu, .inputs = inputs,
+                                                                          .sample_count = count, .outputs = outputs});
+        spg_unlock(owner->gpu_lock);
+        return done;
+    }
+#endif
 
     ComputeMode mode = resolve_compute_mode();
     const uint8_t *image = (const uint8_t *)model->image;
@@ -876,7 +944,8 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
             spingalett_slett_layer(image, i, &L);
             if (!graph) {
                 float *y = i + 1 == model->layer_count ? out : w->act[i & 1u];
-                spingalett_predict_layer(image, &L, &layers[i], dense_tiles, x, y, n, w, mode);
+                spingalett_predict_layer(image, &L, &layers[i], dense_tiles, inputs + (size_t)start * model->input_size,
+                                         model->input_size, x, NULL, y, n, w, mode);
                 x = y;
                 continue;
             }
@@ -894,7 +963,9 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
                 L.type == LAYER_MULTIPLY)
                 spingalett_predict_combine(&L, xs, units, channels, y, n, mode);
             else
-                spingalett_predict_layer(image, &L, &layers[i], dense_tiles, xs[0], y, n, w, mode);
+                spingalett_predict_layer(image, &L, &layers[i], dense_tiles, x, model->input_size, xs[0],
+                                         L.type == LAYER_ATTENTION && L.input_count == 2 ? xs[1] : NULL, y, n, w,
+                                         mode);
         }
     }
     if (owner && w->bytes <= SPARE_WORKSPACE_MAX) w = atomic_exchange(&owner->spare, w);

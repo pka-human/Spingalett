@@ -10,8 +10,9 @@
  * pooling layers; 5 for networks with batch normalization or grouped convolutions; 6 for networks
  * whose layers read other layers than the one before them, such as residual connections; 7 for
  * transposed convolutions, upsampling and layer normalization; 8 for the layers and activations of
- * transformers: embeddings, attention, RMS normalization, products of layers, GELU and SiLU) in place,
- * in the precision its
+ * transformers: embeddings, attention, RMS normalization, products of layers, GELU and SiLU; 9 for the
+ * training features of language models: output layers tied to an embedding's table, attention ignoring
+ * padding or of a sliding window) in place, in the precision its
  * parameters were saved in. The image can be a file read into memory, a const array
  * compiled into the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing,
  * does no I/O and keeps no global state: apart from the image it only needs a workspace from the
@@ -62,9 +63,10 @@ extern "C" {
    normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one
    before them, add or concatenate several, or pool globally), 7 with transposed convolutions,
    upsampling or layer normalization, 8 with embeddings, attention, RMS normalization, products of
-   layers, the GELU and SiLU activations or the sparse cross-entropy loss, so that engines of earlier
-   releases still run what they can; versions 1 and 2 still load. */
-#define SPINGALETT_FORMAT_VERSION 8
+   layers, the GELU and SiLU activations or the sparse cross-entropy loss, 9 with the training features of
+   language models (output layers tied to an embedding's table, attention ignoring padding or of a sliding
+   window), so that engines of earlier releases still run what they can; versions 1 and 2 still load. */
+#define SPINGALETT_FORMAT_VERSION 9
 
 /* Most inputs a layer can have (SPINGALETT_LAYER_ADD, SPINGALETT_LAYER_CONCAT and SPINGALETT_LAYER_MULTIPLY read
    several). */
@@ -236,11 +238,16 @@ typedef struct {
     float rope_theta;               /* attention: base of the rotary position embeddings, 0 for none */
     bool causal;                    /* attention: each cell attends to itself and the cells before it */
     bool positions;                 /* embedding: a learned vector added a cell */
-    uint64_t reserved[SPINGALETT_RESERVED - 2];     /* (vocabulary took the padding before them) */
+    bool ignore_padding;            /* attention: keys whose tokens (the network's inputs) are negative ignored */
+    uint32_t tied;                  /* dense and linear layers: the network's layer (an embedding) whose table
+                                       are their weights, or 0 */
+    uint32_t window;                /* attention: keys less than this many cells away (0: all) */
+    uint32_t token_offset;          /* embedding: the first of its input's values it reads */
+    uint64_t reserved[SPINGALETT_RESERVED - 4];     /* (vocabulary took the padding before them, window after tied) */
 } SpingalettLayerInfo;
 
 /*
- * Checks a .slett image (format version 3 to 8: header, layer table, shapes, bounds and CRC-32
+ * Checks a .slett image (format version 3 to 9: header, layer table, shapes, bounds and CRC-32
  * checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in
  * use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region).
  * Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format

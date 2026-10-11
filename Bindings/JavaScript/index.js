@@ -21,7 +21,7 @@ const ERRORS = {
     1: 'out of memory',
     2: 'invalid argument or model contents (a damaged image, a checksum mismatch or an unsupported layer)',
     3: 'the image is truncated',
-    4: 'unsupported .slett format version (this engine reads versions 3 to 8)',
+    4: 'unsupported .slett format version (this engine reads versions 3 to 9)',
 };
 
 /** An error of the engine; `code` is one of Spingalett.Inference.h's SPINGALETT_ERR_* codes. */
@@ -138,7 +138,7 @@ export class Engine {
     }
 
     /**
-     * Checks a .slett image (format version 3 to 8: header, layer table, bounds and CRC-32 checksums)
+     * Checks a .slett image (format version 3 to 9: header, layer table, bounds and CRC-32 checksums)
      * and opens it: the image is copied into the engine's memory, with the model's workspace.
      */
     loadModel(bytes) {
@@ -275,7 +275,7 @@ export class Model {
     get workspaceSize() { return this.#info.workspaceSize; }
     /** Bytes of the .slett image. */
     get imageSize() { return this.#info.imageSize; }
-    /** The image's .slett format version (3 to 8). */
+    /** The image's .slett format version (3 to 9). */
     get formatVersion() { return this.#info.formatVersion; }
 
     /** The weight layers (spingalett_model_layer()), first hidden layer first. */

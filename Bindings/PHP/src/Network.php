@@ -176,7 +176,8 @@ final class Network
         try {
             $args = $this->trainArgs($options);
             $args->training_mode = 1;                   // SPINGALETT_MODE_GENERATOR_FUNCTION
-            $args->generator = $ffi->spingalett_dataset_generator;
+            // (cast to the field's type: PHP 8.0's FFI assigns no function pointer of another declaration)
+            $args->generator = $ffi->cast('SpingalettDataGeneratorFn', $ffi->spingalett_dataset_generator);
             $args->generator_data = $reader;
             $args->sample_count = $ffi->spingalett_dataset_info($reader)->count;
             return self::run($args);
@@ -346,6 +347,8 @@ final class Network
         $args->beta2 = $o->beta2;
         $args->max_grad_norm = $o->maxGradNorm;
         $args->label_smoothing = $o->labelSmoothing;
+        $args->accumulation_steps = $o->accumulationSteps;
+        $args->recompute = $o->recompute;
         return $args;
     }
 

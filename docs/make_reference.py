@@ -110,7 +110,7 @@ def render():
           'without the prefix of 0.x are in `Spingalett.Short.h`; the C++ interface is `Spingalett.hpp`.', '']
     parsed = []
     for header, title in HEADERS:
-        text = open(os.path.join(ROOT, 'Include', 'Spingalett', header)).read()
+        text = open(os.path.join(ROOT, 'Include', 'Spingalett', header), encoding='utf-8').read()
         text = text.split('#if defined(SPINGALETT_SHORT_NAMES)')[0]     # the short names: not listed
         parsed.append((header, title, items(text)))
     # an index of the names, each linking to its entry (GitHub's anchors: the heading's text, lower case,
@@ -136,11 +136,11 @@ def render():
 if __name__ == '__main__':
     text = render()
     if '--check' in sys.argv:
-        current = open(OUT).read() if os.path.exists(OUT) else ''
+        current = open(OUT, encoding='utf-8').read() if os.path.exists(OUT) else ''
         if current != text:
             print('docs/Reference.md is out of date: run python docs/make_reference.py')
             sys.exit(1)
         print('docs/Reference.md is up to date')
     else:
-        open(OUT, 'w').write(text)
+        open(OUT, 'w', encoding='utf-8', newline='\n').write(text)
         print('wrote', os.path.relpath(OUT, ROOT))

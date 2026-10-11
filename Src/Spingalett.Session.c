@@ -21,6 +21,9 @@
  */
 
 #include "Spingalett.Model.h"
+#if !defined(SPINGALETT_RUNTIME)
+#include "Spingalett.Gpu.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +51,7 @@
 /* The keys and values one attention layer keeps for every sequence. */
 typedef struct {
     uint32_t heads, kv, head;
+    uint32_t window;                /* a sliding window: the keys of the last `window` positions (0: all) */
     float *keys, *values;           /* [sequences x max_length x kv x head] each, the keys rotated */
     float *table;                   /* the rotary embeddings of max_length positions (cosines, then sines), or NULL */
 } Cache;
@@ -73,6 +77,15 @@ struct SpingalettSession {
     uint32_t query_floats;
     float *gathered, *out;          /* the last layer's inputs on the picked rows, and its outputs */
     size_t gathered_floats, out_floats;
+#if !defined(SPINGALETT_RUNTIME)
+    /* on a GPU (its compute modes, the full library): the model as a network there, run a step of rows at a time
+       by a decoder that keeps the caches; the logits of a step's rows */
+    NeuralNetwork *gpu_net;
+    SpgGpuNet *gpu;
+    SpgGpuDecoder *decoder;
+    float *gpu_logits;
+    uint32_t *row_token_id;
+#endif
 };
 
 /* ------------------------------------------------------------------------- the model */
@@ -91,6 +104,10 @@ static bool session_model(const SpingalettModel *model, uint32_t *cells, uint32_
     SlettLayer L;
     spingalett_slett_layer(image, 0, &L);
     *cells = L.out_h * L.out_w;
+    if (L.token_offset != 0 || *cells != L.inputs) {
+        snprintf(why, size, "its embedding reads part of the input");
+        return false;
+    }
     for (uint32_t i = 1; i < model->layer_count; i++) {
         spingalett_slett_layer(image, i, &L);
         const char *name = (unsigned)L.type < LAYER_TYPE_COUNT ? layer_names[L.type] : "unknown";
@@ -151,6 +168,13 @@ static void caches_free(Cache *caches, uint32_t layers) {
 
 void spingalett_session_free(SpingalettSession *s) {
     if (!s) return;
+#if !defined(SPINGALETT_RUNTIME)
+    spingalett_gpu_decoder_free(s->decoder);
+    spingalett_gpu_net_free(s->gpu);
+    if (s->gpu_net) spingalett_network_free(s->gpu_net);
+    free(s->gpu_logits);
+    free(s->row_token_id);
+#endif
     caches_free(s->caches, s->layers);
     spingalett_model_release_layers(s->model, s->prepared);
     spingalett_predict_workspace_free(s->w);
@@ -181,6 +205,39 @@ static bool session_workspace(SpingalettSession *s, ComputeMode mode) {
     s->queries = (float *)spingalett_aligned_alloc((size_t)threads * s->query_floats * sizeof(float));
     return s->w && s->queries;
 }
+
+#if !defined(SPINGALETT_RUNTIME)
+/* The session on the GPU of the compute mode: the model's image made a network there (its weights as floats,
+   the products in the GPU's precision), a decoder with the caches of every sequence; false (and the session on the
+   CPU) when the GPU cannot run it. */
+static bool session_gpu(SpingalettSession *s) {
+    if (!spingalett_use_gpu()) return false;
+    const char *why = NULL;
+    spingalett_log_quiet(1);           /* (the network's layers are the model's: not logged again) */
+    s->gpu_net = spingalett_load_from_memory(s->model->image, s->model->image_size);
+    spingalett_log_quiet(-1);
+    if (!s->gpu_net || !spingalett_gpu_supports(s->gpu_net, &why)) goto fail;
+    s->gpu = spingalett_gpu_net_create(s->gpu_net, s->m, NULL);
+    if (!s->gpu || !spingalett_gpu_upload(s->gpu)) goto fail;
+    s->decoder = spingalett_gpu_decoder_new(s->gpu, s->sequences, s->max_length, &why);
+    if (!s->decoder) goto fail;
+    const uint32_t rows = spingalett_gpu_decoder_rows(s->decoder);
+    s->gpu_logits = (float *)malloc((size_t)rows * s->vocabulary * sizeof(float));
+    s->row_token_id = (uint32_t *)malloc((size_t)rows * sizeof(uint32_t));
+    if (!s->gpu_logits || !s->row_token_id) goto fail;
+    s->capacity = rows < s->capacity ? rows : s->capacity;
+    return true;
+fail:
+    spingalett_log(LOG_DEBUG, "session: on the CPU (the GPU cannot run the model%s%s)", why ? ": " : "", why ? why : "");
+    spingalett_gpu_decoder_free(s->decoder);
+    spingalett_gpu_net_free(s->gpu);
+    if (s->gpu_net) spingalett_network_free(s->gpu_net);
+    free(s->gpu_logits);
+    free(s->row_token_id);
+    s->decoder = NULL, s->gpu = NULL, s->gpu_net = NULL, s->gpu_logits = NULL, s->row_token_id = NULL;
+    return false;
+}
+#endif
 
 SpingalettSession *spingalett_session_new(const SpingalettModel *model, const SpingalettSessionOptions *options) {
     if (!model || !model->image) {
@@ -231,6 +288,9 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
     s->picked_position = (uint32_t *)malloc((size_t)s->capacity * sizeof(uint32_t));
     bool ok = s->length && s->caches && s->row_sequence && s->row_position && s->row_token && s->row_logits &&
               s->row_sums && s->picked && s->picked_position;
+#if !defined(SPINGALETT_RUNTIME)
+    if (ok && session_gpu(s)) return s;
+#endif
     const uint8_t *image = (const uint8_t *)model->image;
     for (uint32_t i = 0; ok && i < s->layers; i++) {
         SlettLayer L;
@@ -238,7 +298,7 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
         if (L.type == LAYER_CONV2D) s->token_work += (uint64_t)L.rows * L.row_len;
         if (L.type != LAYER_ATTENTION) continue;
         Cache *c = &s->caches[i];
-        c->heads = L.heads, c->kv = L.kv_heads, c->head = L.out_c / L.heads;
+        c->heads = L.heads, c->kv = L.kv_heads, c->head = L.out_c / L.heads, c->window = L.window;
         const size_t floats = (size_t)sequences * max_length * c->kv * c->head;
         c->keys = (float *)spingalett_aligned_alloc(floats * sizeof(float));
         c->values = (float *)spingalett_aligned_alloc(floats * sizeof(float));
@@ -285,6 +345,16 @@ bool spingalett_session_copy(SpingalettSession *s, uint32_t from, uint32_t to) {
         return false;
     }
     if (from == to) return true;
+#if !defined(SPINGALETT_RUNTIME)
+    if (s->decoder) {
+        if (!spingalett_gpu_decoder_copy(s->decoder, from, to, s->length[from])) {
+            set_error(SPINGALETT_ERR_ALLOC, "session copy: the GPU failed");
+            return false;
+        }
+        s->length[to] = s->length[from];
+        return true;
+    }
+#endif
     for (uint32_t i = 0; i < s->layers; i++) {
         const Cache *c = &s->caches[i];
         if (!c->keys) continue;
@@ -374,7 +444,8 @@ static void session_int_linear(SpingalettSession *s, const SlettLayer *L, const 
 }
 
 /* Attention on `rows` rows (row r of the pass, or the picked row r): their keys and values kept first,
-   then each query over the keys of its sequence up to its own position. */
+   then each query over the keys of its sequence up to its own position (with a window, the last `window` of
+   them). Every key is live: tokens are 0 or more, so that a layer ignoring padding finds none. */
 static void session_attention(SpingalettSession *s, const Cache *c, const float *x, float *y, uint32_t rows,
                               ComputeMode mode) {
     const uint32_t heads = c->heads, kv = c->kv, head = c->head, half = head / 2u, group = heads / kv;
@@ -406,8 +477,9 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
                 spingalett_engine_rope_rotate(q, rotated, half, c->table + (size_t)p * half, sines + (size_t)p * half);
                 q = rotated;
             }
-            const size_t at = s->row_sequence[r] * sequence + (size_t)g * head;
-            spingalett_engine_attend(q, c->keys + at, per, c->values + at, per, p + 1u, head, scale,
+            const uint32_t first = c->window && p + 1u > c->window ? p + 1u - c->window : 0u;
+            const size_t at = s->row_sequence[r] * sequence + first * per + (size_t)g * head;
+            spingalett_engine_attend(q, c->keys + at, per, c->values + at, per, p + 1u - first, head, scale, NULL,
                                      y + (size_t)r * out_c + (size_t)h * head);
         }
     );
@@ -445,7 +517,7 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
             for (uint32_t k = 0; k < L->input_count; k++) units[k] = rows * channels[k];
             spingalett_predict_combine(&R, x, units, channels, y, 1, mode);
         } else {
-            spingalett_predict_layer(image, &R, prep, false, x[0], y, 1, w, mode);
+            spingalett_predict_layer(image, &R, prep, false, NULL, 0, x[0], NULL, y, 1, w, mode);
         }
     }
     activate_rows(y, rows, L->out_c, pos, s->cells, L->activation);
@@ -512,6 +584,41 @@ static bool session_pass(SpingalettSession *s, uint32_t rows, ComputeMode mode) 
     return true;
 }
 
+#if !defined(SPINGALETT_RUNTIME)
+/* A feed on the GPU: the feeds' tokens in steps of the decoder's rows, every row's logits copied where asked. */
+static bool session_feed_gpu(SpingalettSession *s, const SpingalettSessionFeed *feeds, uint32_t count) {
+    for (uint32_t f = 0, t = 0;;) {
+        uint32_t rows = 0;
+        while (rows < s->capacity && f < count) {
+            const SpingalettSessionFeed *e = &feeds[f];
+            if (t >= e->count) {
+                f++, t = 0;
+                continue;
+            }
+            s->row_sequence[rows] = e->sequence;
+            s->row_position[rows] = s->length[e->sequence] + t;
+            s->row_token_id[rows] = e->tokens[t];
+            s->row_logits[rows] = !e->logits ? NULL : e->all ? e->logits + (size_t)t * s->vocabulary
+                                : t + 1 == e->count ? e->logits : NULL;
+            rows++, t++;
+        }
+        if (!rows) break;
+        bool any = false;
+        for (uint32_t r = 0; r < rows; r++) any = any || s->row_logits[r];
+        if (!spingalett_gpu_decoder_step(s->decoder, rows, s->row_token_id, s->row_sequence, s->row_position,
+                                         any ? s->gpu_logits : NULL)) {
+            set_error(SPINGALETT_ERR_ALLOC, "session feed: the GPU failed");
+            return false;
+        }
+        for (uint32_t r = 0; r < rows; r++)
+            if (s->row_logits[r])
+                memcpy(s->row_logits[r], s->gpu_logits + (size_t)r * s->vocabulary, s->vocabulary * sizeof(float));
+    }
+    for (uint32_t f = 0; f < count; f++) s->length[feeds[f].sequence] += feeds[f].count;
+    return true;
+}
+#endif
+
 bool spingalett_session_feed(SpingalettSession *s, const SpingalettSessionFeed *feeds, uint32_t count) {
     if (!s || (count && !feeds)) {
         set_error(SPINGALETT_ERR_INVALID, "session feed: session or feeds is NULL");
@@ -529,6 +636,9 @@ bool spingalett_session_feed(SpingalettSession *s, const SpingalettSessionFeed *
         }
     }
     const ComputeMode mode = resolve_compute_mode();
+#if !defined(SPINGALETT_RUNTIME)
+    if (s->decoder) return session_feed_gpu(s, feeds, count);
+#endif
     if (!session_workspace(s, mode)) {
         set_error(SPINGALETT_ERR_ALLOC, "session feed: workspace allocation failed");
         return false;

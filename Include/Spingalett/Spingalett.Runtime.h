@@ -38,10 +38,11 @@ typedef enum {
 
 typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *message);
 
-/* Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU in every
-   mode: on all its threads with SPINGALETT_COMPUTE_OPENMP and the GPU modes, on one otherwise. The
-   runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with a warning, as in
-   a full library built without it. */
+/* Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU: on all its
+   threads with SPINGALETT_COMPUTE_OPENMP, on one otherwise; in the full library's GPU modes those of
+   float weights (FP32, FP16, BF16) and sessions run on the GPU, integer ones (their sums in integers) on all
+   the CPU's threads. The runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded,
+   with a warning, as in a full library built without it; nor a GPU. */
 typedef enum {
     SPINGALETT_COMPUTE_SINGLE_THREADED,
     SPINGALETT_COMPUTE_OPENMP,
@@ -113,7 +114,10 @@ SPINGALETT_API SpingalettModel *spingalett_model_load(const char *path);
 SPINGALETT_API SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
 SPINGALETT_API void spingalett_model_free(SpingalettModel *model);
 /* Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all
-   threads in SPINGALETT_COMPUTE_OPENMP mode. Returns false on error. */
+   threads in SPINGALETT_COMPUTE_OPENMP mode; in the full library's GPU modes, a model of float weights that
+   owns its image (spingalett_model_load(), _from_memory(), _from_network()) as a network on the GPU, made by
+   the first call and kept, its calls one at a time, the outputs the CPU's to rounding. Returns false on
+   error. */
 SPINGALETT_API bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count,
                                              float *outputs);
 /* Mean loss (the model's loss function, as spingalett_evaluate() computes it) and accuracy over a data set. */
@@ -136,8 +140,11 @@ SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettM
  * sequence's tokens: bit for bit for integer models, and for float ones too where batched prediction
  * multiplies with the library's kernels (every mode but SPINGALETT_COMPUTE_OPENBLAS, which takes
  * OpenBLAS's order: equal to rounding); however the tokens were fed, alone or with others. A session runs
- * on the CPU, on the threads of the compute mode, and is used from one thread at a time; any number of
- * sessions may run on one model at once, from any threads. The model must outlive its sessions.
+ * on the CPU, on the threads of the compute mode, or in the full library's GPU modes on the GPU (its model
+ * a network there, its products in the GPU's precision, the keys and values in its memory: the logits the
+ * CPU's to rounding, still the same bits however the tokens were fed), and is used from one thread at a
+ * time; any number of sessions may run on one model at once, from any threads. The model must outlive its
+ * sessions.
  */
 typedef struct SpingalettSession SpingalettSession;
 

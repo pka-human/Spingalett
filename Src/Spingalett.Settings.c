@@ -69,8 +69,16 @@ bool spingalett_get_verbose(void) {
     return atomic_load(&s_verbose);
 }
 
+/* Messages below warnings kept quiet on this thread while the library does on the user's behalf what would log
+   them (a network made from a model's image for a session on the GPU). */
+static _Thread_local int s_quiet;
+
+void spingalett_log_quiet(int delta) { s_quiet += delta; }
+
 void spingalett_log(LogLevel level, const char *fmt, ...) {
     if (level < atomic_load(&s_log_level))
+        return;
+    if (s_quiet > 0 && level < LOG_WARNING)
         return;
 
     if (!atomic_load(&s_verbose) && level < LOG_WARNING)

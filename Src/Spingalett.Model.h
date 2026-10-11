@@ -60,6 +60,13 @@ typedef struct {
     SpgSignal *lock;
     PreparedLayer *layers;
     _Atomic(PredictWorkspace *) spare;
+#if !defined(SPINGALETT_RUNTIME)
+    /* the full library on a GPU: the model as a network there (models of float weights), made under the lock by
+       the first call that needs it (gpu_state 1; -1: the GPU cannot run it), its calls one at a time (gpu_lock) */
+    struct SpingalettNetwork *gpu_net;
+    SpgSignal *gpu_lock;
+    _Atomic int gpu_state;
+#endif
 } ModelOwner;
 
 /* The model's prepared weights: those of an owned model (prepared under its lock), or new ones that
@@ -75,10 +82,13 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
                                                       bool dense_tiles, bool sessions);
 void spingalett_predict_workspace_free(PredictWorkspace *w);
 
-/* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included. A dense layer's
-   interleaved rows are read only in calls with dense_tiles. */
+/* One layer over n samples: x [n x inputs] -> y [n x outputs], activation included (input: the network's inputs,
+   n rows of input_size, whose tokens attention ignoring padding reads; NULL for other layers; kv: the second
+   input of cross-attention, else NULL). A dense layer's interleaved rows are read only in calls with
+   dense_tiles. */
 void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const PreparedLayer *prep, bool dense_tiles,
-                              const float *x, float *y, uint32_t n, PredictWorkspace *w, ComputeMode mode);
+                              const float *input, uint32_t input_size, const float *x, const float *kv, float *y,
+                              uint32_t n, PredictWorkspace *w, ComputeMode mode);
 /* An addition, product, concatenation or global pooling over n samples (x[k]: input k, units[k] per
    sample, channels[k] a cell). */
 void spingalett_predict_combine(const SlettLayer *L, const float *const *x, const uint32_t *units,

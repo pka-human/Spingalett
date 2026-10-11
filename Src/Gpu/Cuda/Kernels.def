@@ -29,6 +29,7 @@ SPG_CUDA_UNIT(dconv27, dconv, "-DKMAX=27 -DEXACT=1")
 SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
 SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
 SPG_CUDA_UNIT(embed, embed, "")
+SPG_CUDA_UNIT(attn_cache, attn_cache, "")   /* attention over a cache of keys and values (decoding) */
 SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")     /* attention in single precision: heads of up to 256, */
 SPG_CUDA_UNIT(rattn_d32_o0, rattn, "-DD=32u -DOPC=0u")   /* of up to 32, 64, 128 a unit per pass */
 SPG_CUDA_UNIT(rattn_d32_o1, rattn, "-DD=32u -DOPC=1u")
@@ -42,6 +43,17 @@ SPG_CUDA_UNIT(rattn_d128_o0, rattn, "-DD=128u -DOPC=0u")
 SPG_CUDA_UNIT(rattn_d128_o1, rattn, "-DD=128u -DOPC=1u")
 SPG_CUDA_UNIT(rattn_d128_o2, rattn, "-DD=128u -DOPC=2u")
 SPG_CUDA_UNIT(rattn_d128_o3, rattn, "-DD=128u -DOPC=3u")
+/* the same for layers with padding (EXT, SPG_ATTN_EXT): the units above stay those of layers without */
+SPG_CUDA_UNIT(attn_d256x, attn, "-DDMAX=256u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d32_o0x, rattn, "-DD=32u -DOPC=0u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d32_o2x, rattn, "-DD=32u -DOPC=2u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d32_o3x, rattn, "-DD=32u -DOPC=3u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d64_o0x, rattn, "-DD=64u -DOPC=0u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d64_o2x, rattn, "-DD=64u -DOPC=2u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d64_o3x, rattn, "-DD=64u -DOPC=3u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d128_o0x, rattn, "-DD=128u -DOPC=0u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d128_o2x, rattn, "-DD=128u -DOPC=2u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d128_o3x, rattn, "-DD=128u -DOPC=3u -DEXT=1")
 /* attention on the matrix units (networks in bfloat16): a unit per head size and pass (0 FORWARD, 2 DQ, 3 DKV) */
 SPG_CUDA_UNIT(flash_d32_o0, flash, "-DD=32u -DOPC=0u")
 SPG_CUDA_UNIT(flash_d32_o2, flash, "-DD=32u -DOPC=2u")
