@@ -4350,6 +4350,12 @@ static void onnx_models(void) {
         {"onnx_resnet_dynamo", 0, LOSS_CROSS_ENTROPY}, {"onnx_matmul", 2, LOSS_CROSS_ENTROPY},
         {"onnx_unet", 14, LOSS_CROSS_ENTROPY}, {"onnx_unet_dynamo", 14, LOSS_CROSS_ENTROPY},
         {"onnx_layernorm", 6, LOSS_CROSS_ENTROPY}, {"onnx_layernorm_dynamo", 6, LOSS_CROSS_ENTROPY},
+        /* transformers: GPT-2's and LLaMA's blocks, PyTorch's encoder layer */
+        {"onnx_gpt", 22, LOSS_SPARSE_CROSS_ENTROPY}, {"onnx_gpt_dynamo", 22, LOSS_SPARSE_CROSS_ENTROPY},
+        {"onnx_gpt_opset14", 22, LOSS_SPARSE_CROSS_ENTROPY}, {"onnx_llama", 26, LOSS_SPARSE_CROSS_ENTROPY},
+        {"onnx_llama_dynamo", 26, LOSS_SPARSE_CROSS_ENTROPY}, {"onnx_llama_opset23", 26, LOSS_SPARSE_CROSS_ENTROPY},
+        {"onnx_encoder", 13, LOSS_MSE}, {"onnx_encoder_dynamo", 13, LOSS_MSE},
+        {"onnx_ort_fused", 17, LOSS_SPARSE_CROSS_ENTROPY},      /* ONNX Runtime's fused operators */
     };
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         char path[512];
@@ -4382,6 +4388,21 @@ static void onnx_models(void) {
             spingalett_model_free(m);
         }
         CHECK(mworst < 1e-5f, "%s: the model differs from PyTorch's outputs by %g", cases[c].name, mworst);
+        /* the transformers' layers as the library builds such models: GPT-2's embedding with positions
+           and causal attention of 2 heads, LLaMA's 4 query heads over 2 key and value heads with rotary
+           embeddings of base 10000 */
+        const bool gpt = !strncmp(cases[c].name, "onnx_gpt", 8), llama = !strncmp(cases[c].name, "onnx_llama", 10);
+        for (uint32_t l = 1; (gpt || llama) && l < net->layers; l++) {
+            SpingalettNetworkLayer d;
+            spingalett_network_layer(net, l, &d);
+            if (d.type == LAYER_EMBEDDING)
+                CHECK(d.positions == gpt, "%s: an embedding %s positions", cases[c].name, gpt ? "without" : "with");
+            if (d.type == LAYER_ATTENTION)
+                CHECK(d.causal && d.heads == (gpt ? 2u : 4u) && d.kv_heads == 2u &&
+                      (gpt ? d.rope_theta == 0.0f : fabsf(d.rope_theta - 10000.0f) < 1.0f),
+                      "%s: attention of %u heads, %u key heads, causal %d, rotary base %g", cases[c].name, d.heads,
+                      d.kv_heads, d.causal, (double)d.rope_theta);
+        }
         printf("  %-20s %3u layers, %llu parameters, |outputs - PyTorch| %.1e (model %.1e)\n", cases[c].name, net->layers,
                (unsigned long long)spingalett_parameter_count(net), worst, mworst);
         free(y);
@@ -4418,6 +4439,16 @@ static void onnx_models(void) {
     spingalett_clear_error();
     CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Resize"),
           "an unsupported Resize: %s", spingalett_last_error_message());
+    /* what transformers hold that no layer computes is named too: a softmax over each token's channels, a
+       product of two computed tensors outside an attention */
+    snprintf(path, sizeof path, "%s/onnx_tokens_softmax.onnx", SPINGALETT_TEST_DATA_DIR);
+    spingalett_clear_error();
+    CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Softmax"),
+          "a softmax over each token: %s", spingalett_last_error_message());
+    snprintf(path, sizeof path, "%s/onnx_gram.onnx", SPINGALETT_TEST_DATA_DIR);
+    spingalett_clear_error();
+    CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "MatMul"),
+          "a product of two computed tensors: %s", spingalett_last_error_message());
     static const unsigned char junk[] = {0x0a, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x12};
     CHECK(!spingalett_import_onnx_from_memory(junk, sizeof junk) && !spingalett_import_onnx_from_memory(junk, 0) &&
           !spingalett_import_onnx_from_memory(NULL, 4), "junk accepted as an ONNX model");
@@ -4433,6 +4464,34 @@ static void onnx_models(void) {
     }
     CHECK(accepted == 0, "%d truncated models imported", accepted);
     free(model);
+    /* nor do truncations of transformers, and bytes changed at random (which may still be a model)
+       never crash: the import reads untrusted files */
+    static const char *const damaged[] = {"onnx_llama", "onnx_gpt_dynamo", "onnx_encoder"};
+    uint32_t seed = 12345u;
+    for (size_t d = 0; d < sizeof damaged / sizeof damaged[0]; d++) {
+        snprintf(path, sizeof path, "%s/%s.onnx", SPINGALETT_TEST_DATA_DIR, damaged[d]);
+        model = read_file(path, &size);
+        CHECK(model != NULL, "%s: cannot be read", path);
+        if (!model) continue;
+        accepted = 0;
+        for (long cut = 0; cut < size; cut += 61) {
+            NeuralNetwork *net = spingalett_import_onnx_from_memory(model, (size_t)cut);
+            accepted += net != NULL;
+            free_network(net);
+        }
+        CHECK(accepted == 0, "%s: %d truncated models imported", damaged[d], accepted);
+        unsigned char *copy = malloc((size_t)size);
+        for (int trial = 0; copy && trial < 300; trial++) {
+            memcpy(copy, model, (size_t)size);
+            for (int k = 0; k < 4; k++) {
+                seed = seed * 1664525u + 1013904223u;
+                copy[(seed >> 8) % (uint32_t)size] ^= (unsigned char)(1u << (seed >> 29));
+            }
+            free_network(spingalett_import_onnx_from_memory(copy, (size_t)size));
+        }
+        free(copy);
+        free(model);
+    }
 }
 
 /* PyTorch state dicts (torch.save and safetensors, Tests/make_test_models.py) in a network built to

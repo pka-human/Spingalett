@@ -9,16 +9,25 @@ onnx_external.data). State dicts: torch_cnn.pt (torch.save; torch_cnn_strided.pt
 are views) and torch_cnn.safetensors, and torch_transposed.pt, of the networks the tests build by
 hand. For each, NAME.bin holds "SPGT", then as 32-bit little-endian integers the sample count, the
 floats per input and per output, then the inputs and the expected outputs as floats (maps channels
-last, as Spingalett reads and writes them). The models are small, seeded and fixed, so the files only
-change when this script does.
+last, as Spingalett reads and writes them; token indices as floats). The models are small, seeded and
+fixed, so the files only change when this script does.
+
+Transformers (onnx_gpt*, onnx_llama*, onnx_encoder*) are exported by both exporters and at the operator
+sets that change how they are written (14: layer normalization and GELU written out; 20: their
+operators; 23: RMSNormalization and Attention); the newer exporter's debugging metadata (stack traces,
+shapes of intermediate values) is removed from their files, which leaves the graphs as written and the
+files a fifth of the size. onnx_ort_fused is a graph of ONNX Runtime's fused operators, built by hand.
+onnx_tokens_softmax and onnx_gram hold what the importer refuses.
 """
 import io
+import math
 import os
 import struct
 
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data")
 
@@ -156,6 +165,274 @@ class Transposed(nn.Module):
         return self.head(y.mean((1, 2)))
 
 
+class GptAttention(nn.Module):
+    """nanoGPT's causal self-attention: queries, keys and values of one product, split into heads, the
+    scores scaled and masked by a lower-triangular buffer, a softmax, the output projection."""
+
+    def __init__(self, d, heads, context):
+        super().__init__()
+        self.qkv, self.proj, self.heads = nn.Linear(d, 3 * d), nn.Linear(d, d), heads
+        self.register_buffer("mask", torch.tril(torch.ones(context, context)).view(1, 1, context, context))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+        q, k, v = (t.view(B, T, self.heads, C // self.heads).transpose(1, 2) for t in (q, k, v))
+        scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        scores = scores.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        y = torch.softmax(scores, dim=-1) @ v
+        return self.proj(y.transpose(1, 2).contiguous().view(B, T, C))
+
+
+class GptBlock(nn.Module):
+    def __init__(self, d, heads, context, gelu):
+        super().__init__()
+        self.ln1, self.attn, self.ln2 = nn.LayerNorm(d), GptAttention(d, heads, context), nn.LayerNorm(d)
+        self.fc, self.out, self.gelu = nn.Linear(d, 4 * d), nn.Linear(4 * d, d), gelu
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        return x + self.out(F.gelu(self.fc(self.ln2(x)), approximate=self.gelu))
+
+
+class Gpt(nn.Module):
+    """A GPT-2-like language model: token embeddings and learned positions, blocks of layer
+    normalization, causal attention and a GELU MLP (GPT-2's tanh form in the first block, the erf form
+    in the second), a final normalization and a head tied to the token table."""
+
+    def __init__(self, vocabulary=11, d=8, heads=2, context=6):
+        super().__init__()
+        self.tokens, self.positions = nn.Embedding(vocabulary, d), nn.Embedding(context, d)
+        self.blocks = nn.ModuleList([GptBlock(d, heads, context, g) for g in ("tanh", "none")])
+        self.norm, self.head = nn.LayerNorm(d), nn.Linear(d, vocabulary, bias=False)
+        self.head.weight = self.tokens.weight
+
+    def forward(self, idx):
+        x = self.tokens(idx) + self.positions(torch.arange(idx.shape[1], device=idx.device))
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.norm(x))
+
+
+class RMSNorm(nn.Module):
+    """LLaMA's RMS normalization, written out (the TorchScript exporter has no nn.RMSNorm)."""
+
+    def __init__(self, d, eps=1e-6):
+        super().__init__()
+        self.weight, self.eps = nn.Parameter(torch.ones(d)), eps
+
+    def forward(self, x):
+        return self.weight * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps))
+
+
+def rotate_half(x):
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+class LlamaAttention(nn.Module):
+    """Hugging Face's LLaMA attention: queries, keys and values of their own products, rotary
+    embeddings (rotate_half, cosine and sine tables), grouped-query heads (the keys and values repeated
+    by repeat_kv, or by the attention itself), causal scaled dot-product attention."""
+
+    def __init__(self, d, heads, kv_heads, native):
+        super().__init__()
+        self.heads, self.kv_heads, self.head, self.native = heads, kv_heads, d // heads, native
+        self.q = nn.Linear(d, d, bias=False)
+        self.k = nn.Linear(d, kv_heads * self.head, bias=False)
+        self.v = nn.Linear(d, kv_heads * self.head, bias=False)
+        self.o = nn.Linear(d, d, bias=False)
+
+    def forward(self, x, cos, sin):
+        B, T, _ = x.shape
+        q = self.q(x).view(B, T, self.heads, self.head).transpose(1, 2)
+        k = self.k(x).view(B, T, self.kv_heads, self.head).transpose(1, 2)
+        v = self.v(x).view(B, T, self.kv_heads, self.head).transpose(1, 2)
+        q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+        if self.native:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        else:
+            groups = self.heads // self.kv_heads
+            k = k[:, :, None].expand(B, self.kv_heads, groups, T, self.head).reshape(B, self.heads, T, self.head)
+            v = v[:, :, None].expand(B, self.kv_heads, groups, T, self.head).reshape(B, self.heads, T, self.head)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.o(y.transpose(1, 2).reshape(B, T, -1))
+
+
+class LlamaBlock(nn.Module):
+    def __init__(self, d, heads, kv_heads, hidden, native):
+        super().__init__()
+        norm = (lambda: nn.RMSNorm(d, eps=1e-6)) if native else (lambda: RMSNorm(d))
+        self.n1, self.attn, self.n2 = norm(), LlamaAttention(d, heads, kv_heads, native), norm()
+        self.gate, self.up = nn.Linear(d, hidden, bias=False), nn.Linear(d, hidden, bias=False)
+        self.down = nn.Linear(hidden, d, bias=False)
+
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.n1(x), cos, sin)
+        h = self.n2(x)
+        return x + self.down(F.silu(self.gate(h)) * self.up(h))
+
+
+class Llama(nn.Module):
+    """A LLaMA-like language model: RMS normalization, grouped-query causal attention with rotary
+    embeddings of base 10000, a SwiGLU MLP; native: nn.RMSNorm and the attention's own grouping."""
+
+    def __init__(self, vocabulary=13, d=16, heads=4, kv_heads=2, hidden=24, context=6, native=False):
+        super().__init__()
+        self.tokens = nn.Embedding(vocabulary, d)
+        self.blocks = nn.ModuleList([LlamaBlock(d, heads, kv_heads, hidden, native) for _ in range(2)])
+        self.norm = nn.RMSNorm(d, eps=1e-6) if native else RMSNorm(d)
+        self.head = nn.Linear(d, vocabulary, bias=False)
+        head = d // heads
+        angles = torch.outer(torch.arange(context).float(), 1.0 / 10000.0 ** (torch.arange(0, head, 2).float() / head))
+        self.register_buffer("cos", torch.cat([angles, angles], -1).cos(), persistent=False)
+        self.register_buffer("sin", torch.cat([angles, angles], -1).sin(), persistent=False)
+
+    def forward(self, idx):
+        T = idx.shape[1]
+        x = self.tokens(idx)
+        for block in self.blocks:
+            x = block(x, self.cos[:T], self.sin[:T])
+        return self.head(self.norm(x))
+
+
+class Encoder(nn.Module):
+    """A transformer encoder over vectors: a projection, nn.TransformerEncoderLayer (PyTorch's
+    multi-head attention without a mask, a ReLU MLP, normalization after each), the tokens averaged,
+    a head."""
+
+    def __init__(self, features=5, d=8, heads=2, classes=3):
+        super().__init__()
+        self.inp = nn.Linear(features, d)
+        self.layer = nn.TransformerEncoderLayer(d, heads, 16, dropout=0.0, batch_first=True)
+        self.head = nn.Linear(d, classes)
+
+    def forward(self, x):
+        return self.head(self.layer(self.inp(x)).mean(1))
+
+
+class TokensSoftmax(nn.Module):
+    """A softmax over each token's channels, which no layer computes (refused)."""
+
+    def __init__(self):
+        super().__init__()
+        self.tokens, self.head = nn.Embedding(7, 4), nn.Linear(4, 7)
+
+    def forward(self, idx):
+        return torch.softmax(self.head(self.tokens(idx)), -1)
+
+
+class Gram(nn.Module):
+    """A product of two computed tensors outside an attention (refused)."""
+
+    def __init__(self):
+        super().__init__()
+        self.tokens = nn.Embedding(7, 4)
+
+    def forward(self, idx):
+        x = self.tokens(idx)
+        return x @ x.transpose(1, 2)
+
+
+def transformers():
+    torch.manual_seed(17)
+    gpt, llama, native, encoder = Gpt(), Llama(), Llama(native=True), Encoder()
+    tokens = lambda m: torch.randint(0, m.tokens.num_embeddings, (3, 6))
+    vectors = lambda m: torch.randn(3, 6, 5)
+    yield "onnx_gpt", gpt, tokens, dict(dynamo=False)
+    yield "onnx_gpt_dynamo", gpt, tokens, dict(dynamo=True)
+    yield "onnx_gpt_opset14", gpt, tokens, dict(dynamo=False, opset_version=14)
+    yield "onnx_llama", llama, tokens, dict(dynamo=False)
+    yield "onnx_llama_dynamo", llama, tokens, dict(dynamo=True)
+    yield "onnx_llama_opset23", native, tokens, dict(dynamo=True, opset_version=23)
+    yield "onnx_encoder", encoder, vectors, dict(dynamo=False)
+    yield "onnx_encoder_dynamo", encoder, vectors, dict(dynamo=True)
+    yield "onnx_tokens_softmax", TokensSoftmax(), tokens, dict(dynamo=False)
+    yield "onnx_gram", Gram(), tokens, dict(dynamo=False)
+
+
+def ort_fused(T=6, V=11, d=8, heads=2):
+    """A graph of the fused operators ONNX Runtime's transformer optimizer writes (com.microsoft's
+    Attention, SkipLayerNormalization, FastGelu, SkipSimplifiedLayerNormalization, MultiHeadAttention,
+    BiasGelu), built by hand, and its outputs computed in PyTorch: the model, the token inputs, the
+    expected outputs."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+    torch.manual_seed(19)
+    r = lambda *shape, s=0.4: torch.randn(*shape) * s
+    w = dict(wte=r(V, d, s=1.0), wpe=r(T, d), g0=1 + r(d, s=0.2), b0=r(d, s=0.1), wqkv=r(d, 3 * d), bqkv=r(3 * d, s=0.1),
+             wp=r(d, d), bp=r(d, s=0.1), g1=1 + r(d, s=0.2), b1=r(d, s=0.1), wf=r(d, 2 * d), bf=r(2 * d, s=0.1),
+             wo=r(2 * d, d), bo=r(d, s=0.1), g2=1 + r(d, s=0.2), wq=r(d, d), wk=r(d, d), wv=r(d, d), bm=r(3 * d, s=0.1),
+             w2=r(d, d), b2=r(d, s=0.1), wh=r(d, V))
+    ms = dict(domain="com.microsoft")
+    nodes = [
+        helper.make_node("Gather", ["wte", "idx"], ["e"]),
+        helper.make_node("Add", ["e", "wpe"], ["x0"]),
+        helper.make_node("LayerNormalization", ["x0", "g0", "b0"], ["h"], axis=-1, epsilon=1e-5),
+        helper.make_node("Attention", ["h", "wqkv", "bqkv"], ["a"], num_heads=heads, unidirectional=1, **ms),
+        helper.make_node("MatMul", ["a", "wp"], ["p"]),
+        helper.make_node("SkipLayerNormalization", ["p", "x0", "g1", "b1", "bp"], ["n1", "", "", "s1"], epsilon=1e-5, **ms),
+        helper.make_node("MatMul", ["n1", "wf"], ["f"]),
+        helper.make_node("FastGelu", ["f", "bf"], ["g"], **ms),
+        helper.make_node("MatMul", ["g", "wo"], ["o"]),
+        helper.make_node("SkipSimplifiedLayerNormalization", ["o", "s1", "g2", "bo"], ["y", "", "", "s2"], epsilon=1e-6, **ms),
+        helper.make_node("MatMul", ["y", "wq"], ["q"]),
+        helper.make_node("MatMul", ["y", "wk"], ["k"]),
+        helper.make_node("MatMul", ["y", "wv"], ["v"]),
+        helper.make_node("MultiHeadAttention", ["q", "k", "v", "bm"], ["m"], num_heads=heads, unidirectional=1, **ms),
+        helper.make_node("MatMul", ["m", "w2"], ["m2"]),
+        helper.make_node("BiasGelu", ["m2", "b2"], ["z"], **ms),
+        helper.make_node("Add", ["z", "s2"], ["zs"]),
+        helper.make_node("MatMul", ["zs", "wh"], ["logits"]),
+    ]
+    graph = helper.make_graph(nodes, "ort_fused", [helper.make_tensor_value_info("idx", TensorProto.INT64, [1, T])],
+                              [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, T, V])],
+                              [numpy_helper.from_array(t.numpy(), k) for k, t in w.items()])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)])
+
+    def attention(q, k, v):
+        B, S, C = q.shape
+        q, k, v = (t.view(B, S, heads, C // heads).transpose(1, 2) for t in (q, k, v))
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(B, S, C)
+
+    def rms(x, g, eps):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * g
+
+    idx = torch.randint(0, V, (3, T))
+    x0 = w["wte"][idx] + w["wpe"]
+    h = F.layer_norm(x0, (d,), w["g0"], w["b0"], 1e-5)
+    qkv = h @ w["wqkv"] + w["bqkv"]
+    s1 = attention(*qkv.split(d, -1)) @ w["wp"] + w["bp"] + x0
+    n1 = F.layer_norm(s1, (d,), w["g1"], w["b1"], 1e-5)
+    s2 = F.gelu(n1 @ w["wf"] + w["bf"], approximate="tanh") @ w["wo"] + w["bo"] + s1
+    y = rms(s2, w["g2"], 1e-6)
+    bq, bk, bv = w["bm"].split(d)
+    m = attention(y @ w["wq"] + bq, y @ w["wk"] + bk, y @ w["wv"] + bv)
+    logits = (F.gelu(m @ w["w2"] + w["b2"]) + s2) @ w["wh"]
+    return model.SerializeToString(), idx, logits
+
+
+def randomize_norms(model):
+    for m in model.modules():
+        if isinstance(m, (nn.LayerNorm, nn.RMSNorm, RMSNorm)):     # parameters other than the initial ones
+            m.weight.data.uniform_(0.5, 1.5)
+            if getattr(m, "bias", None) is not None:
+                m.bias.data.uniform_(-0.2, 0.2)
+
+
+def strip_metadata(data):
+    """The model without the exporter's debugging metadata: doc strings, node metadata, value_info."""
+    import onnx
+    m = onnx.load_from_string(data)
+    del m.graph.value_info[:]
+    for n in m.graph.node:
+        n.doc_string = ""
+        del n.metadata_props[:]
+    m.graph.doc_string = ""
+    del m.metadata_props[:]
+    return m.SerializeToString()
+
+
 def write_expected(name, x, y):
     inputs = x.numpy().transpose(0, 2, 3, 1) if x.dim() == 4 else x.numpy()
     outputs = (y.numpy().transpose(0, 2, 3, 1) if y.dim() == 4 else y.numpy()).reshape(x.shape[0], -1)
@@ -187,6 +464,25 @@ def main():
             f.write(buffer.getvalue())
         write_expected(name, x, y)
         print(f"{name}: {len(buffer.getvalue())} bytes")
+
+    for name, model, make_input, options in transformers():
+        model.eval()
+        randomize_norms(model)
+        x = make_input(model)
+        with torch.no_grad():
+            y = model(x)
+        buffer = io.BytesIO()
+        torch.onnx.export(model, (x[:1],), buffer, **options)
+        data = strip_metadata(buffer.getvalue()) if options["dynamo"] else buffer.getvalue()
+        with open(os.path.join(OUT, name + ".onnx"), "wb") as f:
+            f.write(data)
+        write_expected(name, x, y)
+        print(f"{name}: {len(data)} bytes")
+    data, x, y = ort_fused()
+    with open(os.path.join(OUT, "onnx_ort_fused.onnx"), "wb") as f:
+        f.write(data)
+    write_expected("onnx_ort_fused", x, y)
+    print(f"onnx_ort_fused: {len(data)} bytes")
 
     from safetensors.torch import save_file
     torch.manual_seed(11)
