@@ -103,10 +103,15 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
    pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs, 7 with
    transposed convolutions, upsampling or layer normalization, 8 with the layers, activations or the
    loss of transformers, 9 with the training features of language models (layers tied to an embedding,
-   attention ignoring padding or of a sliding window). */
+   attention ignoring padding or of a sliding window, cross-attention, embeddings of part of their input). */
 static uint16_t format_version(const NeuralNetwork *net) {
-    for (uint32_t l = 1; l < net->layers; l++)
-        if (net->shapes[l].tied || net->shapes[l].mask || net->shapes[l].window) return 9u;
+    for (uint32_t l = 1; l < net->layers; l++) {
+        const LayerShape *s = &net->shapes[l];
+        if (s->tied || s->mask || s->window || (s->type == LAYER_ATTENTION && spingalett_input_count(net, l) == 2) ||
+            (s->type == LAYER_EMBEDDING &&
+             (s->token_offset || (uint64_t)s->height * s->width != net->topology[spingalett_source(net, l)])))
+            return 9u;
+    }
     if (net->loss_func == LOSS_SPARSE_CROSS_ENTROPY) return 8u;
     for (uint32_t l = 1; l < net->layers; l++)
         if (net->shapes[l].type > LAYER_LAYER_NORM || net->act_func[l - 1] >= ACT_GELU) return 8u;
@@ -299,6 +304,7 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
             slett_put32(e + 108, bits);
         }
         if (version >= 9u && shape->tied) slett_put32(e + 104, shape->tied);     /* the embedding whose table */
+        if (version >= 9u && shape->type == LAYER_EMBEDDING) slett_put32(e + 104, shape->token_offset);
         if (version >= 6u) {
             const uint32_t count = spingalett_input_count(net, l + 1), *in = spingalett_inputs(net, l + 1);
             slett_put32(e + 80, count);
@@ -596,6 +602,10 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
             a.neurons_amount = e.out_c;
             a.vocabulary = e.vocabulary;
             a.positions = e.positions;
+            if (e.token_offset || e.out_h * e.out_w != e.inputs) {      /* (version 9: a range of tokens) */
+                a.token_offset = e.token_offset;
+                a.token_count = e.out_h * e.out_w;
+            }
         } else if (e.type == LAYER_ATTENTION) {
             a.heads = e.heads;
             a.kv_heads = e.kv_heads;

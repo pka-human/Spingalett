@@ -256,6 +256,14 @@ final class Layer
         return $this;
     }
 
+    /** An embedding of part of its input: $count tokens (0: the rest) from value $offset on. */
+    public function tokens(int $offset, int $count = 0): self
+    {
+        $this->fields['token_offset'] = $offset;
+        $this->fields['token_count'] = $count;
+        return $this;
+    }
+
     /** Linear: computes with the table of the embedding of index $embedding (tied input and output embeddings). */
     public function tied(int $embedding): self
     {

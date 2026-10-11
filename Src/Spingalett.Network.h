@@ -33,6 +33,7 @@ typedef struct {
     uint32_t mask;                  /* attention ignoring padding: the embedding of the network's input whose cells
                                        its keys' are (a negative token: a padded key), or 0 */
     uint32_t window;                /* attention: keys less than this many cells away (0: all) */
+    uint32_t token_offset;          /* embedding: the first of its input's values it reads (its cells from there) */
 } LayerShape;
 
 /*
@@ -127,6 +128,11 @@ static inline const uint32_t *spingalett_inputs(const NeuralNetwork *net, uint32
 
 static inline uint32_t spingalett_source(const NeuralNetwork *net, uint32_t l) {
     return net->input_list[net->input_offsets[l]];
+}
+
+/* The layer of attention layer l's keys and values: its second input (cross-attention) or its source. */
+static inline uint32_t spingalett_attention_kv(const NeuralNetwork *net, uint32_t l) {
+    return net->input_list[net->input_offsets[l] + (spingalett_input_count(net, l) == 2 ? 1u : 0u)];
 }
 
 /* Weight layer l as a matrix: rows (dense outputs, conv and transposed conv filters, normalization

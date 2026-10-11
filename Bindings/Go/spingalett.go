@@ -298,6 +298,13 @@ func (l Layer) IgnorePadding(i bool) Layer { l.args.ignore_padding = C.bool(i); 
 // Window gives attention a sliding window: keys less than w cells away (with causal the cell and the w - 1 before it).
 func (l Layer) Window(w uint32) Layer { l.args.window = C.uint32_t(w); return l }
 
+// Tokens makes an embedding read part of its input: count tokens (0: the rest) from value offset on.
+func (l Layer) Tokens(offset, count uint32) Layer {
+	l.args.token_offset = C.uint32_t(offset)
+	l.args.token_count = C.uint32_t(count)
+	return l
+}
+
 // Inputs names the layers it reads (indices Add returned; 0 the input layer); none: the last one.
 func (l Layer) Inputs(inputs ...uint32) Layer {
 	for k, i := range inputs {

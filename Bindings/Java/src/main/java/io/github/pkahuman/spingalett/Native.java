@@ -68,13 +68,13 @@ final class Native {
             i("groups"), f("epsilon"), f("momentum"), MemoryLayout.sequenceLayout(MAX_INPUTS, JAVA_INT).withName("inputs"),
             i("input_count"), i("upsample"), i("output_padding"), i("output_padding_h"), i("output_padding_w"),
             i("vocabulary"), i("heads"), i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), b("ignore_padding"), i("tied"),
-            i("window"), reserved(RESERVED - 4));
+            i("window"), i("token_offset"), i("token_count"), reserved(RESERVED - 5));
     static final StructLayout NETWORK_LAYER = struct(i("type"), i("height"), i("width"), i("channels"), i("outputs"),
             i("activation"), f("dropout_rate"), i("kernel_h"), i("kernel_w"), i("stride_h"), i("stride_w"), i("padding_h"),
             i("padding_w"), l("weight_count"), l("bias_count"), i("groups"), f("epsilon"), f("momentum"), i("input_count"),
             MemoryLayout.sequenceLayout(MAX_INPUTS, JAVA_INT).withName("inputs"), i("upsample"), i("vocabulary"), i("heads"),
             i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), b("ignore_padding"), i("tied"), i("window"),
-            reserved(RESERVED - 3));
+            i("token_offset"), reserved(RESERVED - 4));
     static final StructLayout TRAIN_ARGS = struct(a("net"), i("training_mode"), i("training_strategy"),
             i("optimizer_type"), a("inputs"), a("targets"), a("device_inputs"), a("device_targets"), a("generator"),
             a("generator_data"), i("sample_count"), i("batch_size"), b("do_not_shuffle"), l("epochs"), f("learning_rate"),

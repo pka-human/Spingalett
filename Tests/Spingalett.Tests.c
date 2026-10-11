@@ -4163,6 +4163,32 @@ static NeuralNetwork *tf_net(int which, uint32_t T, uint32_t V) {
             add_layers(.net = net, .inputs = {x, a});
             linear(.net = net, .neurons_amount = V);
             return net;
+        case 6: {   /* an encoder-decoder: the first T / 2 tokens the source, the rest the target; the decoder's causal
+                       self-attention, then cross-attention (grouped, ignoring the source's padding) over the encoder */
+            const uint32_t S = T / 2;
+            net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+            layer(.net = net, .neurons_amount = T);
+            x = embedding(.net = net, .vocabulary = V, .neurons_amount = 8, .positions = true, .token_count = S);
+            linear(.net = net, .neurons_amount = 24);
+            attention(.net = net, .heads = 2, .ignore_padding = true);
+            a = linear(.net = net, .neurons_amount = 8);
+            x = add_layers(.net = net, .inputs = {x, a});
+            const uint32_t encoder = layer_norm(.net = net);
+            b = embedding(.net = net, .inputs = {0}, .input_count = 1, .vocabulary = V, .neurons_amount = 8,
+                          .positions = true, .token_offset = S);
+            linear(.net = net, .neurons_amount = 24);
+            attention(.net = net, .heads = 2, .causal = true);
+            a = linear(.net = net, .neurons_amount = 8);
+            b = add_layers(.net = net, .inputs = {b, a});
+            c = linear(.net = net, .neurons_amount = 8);                         /* 2 query heads of 4 */
+            a = linear(.net = net, .inputs = {encoder}, .neurons_amount = 8);    /* 1 key and 1 value head */
+            attention(.net = net, .inputs = {c, a}, .heads = 2, .kv_heads = 1, .ignore_padding = true,
+                      .act_func = ACT_GELU);
+            a = linear(.net = net, .neurons_amount = 8);
+            add_layers(.net = net, .inputs = {b, a});
+            linear(.net = net, .neurons_amount = V);
+            return net;
+        }
         default:    /* products of three layers and of a layer with itself, SiLU and GELU outputs read twice */
             net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
             layer(.net = net, .neurons_amount = T);
@@ -4339,7 +4365,7 @@ static void tf_learns(ComputeMode mode) {
    batches. */
 static void tf_models(void) {
     const uint32_t T = 9, V = 10, N = 37;
-    for (int which = 0; which < 6; which++) {
+    for (int which = 0; which < 7; which++) {
         lcg_state = 4242 + which;
         NeuralNetwork *net = tf_net(which, T, V);
         tf_init(net);
@@ -4614,6 +4640,56 @@ static void tf_window(ComputeMode mode) {
            cpu ? ", the engine and deployment models alike" : "");
 }
 
+/* Cross-attention read off its outputs: the source's tokens (the input's first S values, an embedding of them the
+   keys and values) are positions whose values are one-hot vectors, the target's (the rest, an embedding of them
+   the queries) queries of zeros, so that every target cell outputs the mean of the one-hot vectors of the source's
+   keys it attends to: all of them, or (padding) those whose tokens are not -1, zeros for none; as predict()
+   computes it in the given mode and (on the CPU) as the engine and deployment models do. */
+static void tf_cross(ComputeMode mode) {
+    enum { S = 6, Q = 5, N = 3 };
+    const bool cpu = mode == COMPUTE_SINGLE_THREADED || mode == COMPUTE_OPENMP || mode == COMPUTE_OPENBLAS;
+    for (int padding = 0; padding < 2; padding++) {
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = net, .neurons_amount = S + Q);
+        const uint32_t enc = embedding(.net = net, .vocabulary = S, .neurons_amount = 2 * S, .token_count = S);
+        const uint32_t dec = embedding(.net = net, .inputs = {0}, .input_count = 1, .vocabulary = 4, .neurons_amount = S,
+                                       .token_offset = S);
+        attention(.net = net, .inputs = {dec, enc}, .heads = 1, .ignore_padding = padding);
+        memset(net->weights, 0, net->total_weights * sizeof(float));
+        for (uint32_t t = 0; t < S; t++) net->weights[(size_t)t * 2 * S + S + t] = 1.0f;    /* value: one-hot t */
+        float x[N * (S + Q)], out[N * Q * S], one[N * Q * S], batch[N * Q * S];
+        for (uint32_t n = 0; n < N; n++)
+            for (uint32_t t = 0; t < S + Q; t++)      /* sample 1 with holes in its source, sample 2 all padding */
+                x[n * (S + Q) + t] = t >= S ? (float)((t + n) % 4) : padding && (n == 2 || (n == 1 && (t == 2 || t >= 4)))
+                                                                   ? -1.0f : (float)t;
+        spingalett_set_compute_mode(mode);
+        predict(.net = net, .inputs = x, .sample_count = N, .outputs = out);
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        float expect[N * Q * S];
+        for (uint32_t n = 0; n < N; n++) {
+            uint32_t live = 0;
+            for (uint32_t j = 0; j < S; j++) live += x[n * (S + Q) + j] >= 0.0f;
+            for (uint32_t i = 0; i < Q; i++)
+                for (uint32_t j = 0; j < S; j++)
+                    expect[(n * Q + i) * S + j] = x[n * (S + Q) + j] >= 0.0f ? 1.0f / (float)live : 0.0f;
+        }
+        bool ok = max_abs_diff(out, expect, N * Q * S) < 1e-6f;
+        if (cpu) {
+            SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+            void *ws = m ? malloc(m->workspace_size) : NULL;
+            for (uint32_t n = 0; m && n < N; n++) ok = ok && !spingalett_model_run(m, x + n * (S + Q), one + n * Q * S, ws);
+            ok = ok && m && spingalett_model_predict(m, x, N, batch) && !memcmp(one, batch, sizeof one) &&
+                 max_abs_diff(one, expect, N * Q * S) < 1e-6f;
+            free(ws);
+            spingalett_model_free(m);
+        }
+        CHECK(ok, "cross-attention%s: other keys attended to", padding ? " ignoring padding" : "");
+        free_network(net);
+    }
+    printf("  %scross-attention: the source's keys attended to (all, or but padding)%s\n", cpu ? "" : "gpu ",
+           cpu ? ", the engine and deployment models alike" : "");
+}
+
 /* Tied input and output embeddings: the head computes with the table, as an untied head holding a copy of it
    does, and the table's step is the sum of the embedding's and the head's; the layers' other parameters step
    alike; ties that do not fit are refused. */
@@ -4758,6 +4834,41 @@ static void tf_validation(void) {
     CHECK(o[0] == net->weights[2] && o[1] == net->weights[3] && o[2] == 0 && o[3] == 0 && o[4] == 0 && o[5] == 0,
           "embedding: tokens outside the table give zeros");
     free_network(net);
+
+    /* embeddings of part of the input, and cross-attention, that do not fit */
+    net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = 7);
+    CHECK(embedding(.net = net, .vocabulary = 5, .neurons_amount = 4, .token_offset = 7) == SPINGALETT_NO_LAYER,
+          "an embedding past its input accepted");
+    CHECK(embedding(.net = net, .vocabulary = 5, .neurons_amount = 4, .token_offset = 3, .token_count = 5) ==
+          SPINGALETT_NO_LAYER, "an embedding's range beyond its input accepted");
+    const uint32_t enc = embedding(.net = net, .vocabulary = 5, .neurons_amount = 8, .token_count = 3);
+    const uint32_t dec = embedding(.net = net, .inputs = {0}, .input_count = 1, .vocabulary = 5, .neurons_amount = 4,
+                                   .token_offset = 3);
+    CHECK(net->shapes[enc].width == 3 && net->shapes[dec].width == 4 && net->shapes[dec].token_offset == 3,
+          "embeddings of part of the input: their cells");
+    CHECK(attention(.net = net, .inputs = {dec, enc}, .heads = 2, .kv_heads = 1) == SPINGALETT_NO_LAYER,
+          "cross-attention of keys and values of other heads accepted");
+    CHECK(attention(.net = net, .inputs = {dec, enc}, .heads = 2, .causal = true) == SPINGALETT_NO_LAYER,
+          "causal cross-attention accepted");
+    CHECK(attention(.net = net, .inputs = {dec, enc}, .heads = 2, .window = 2) == SPINGALETT_NO_LAYER,
+          "cross-attention of a window accepted");
+    CHECK(attention(.net = net, .inputs = {dec, enc}, .heads = 2, .rope_theta = 1e4f) == SPINGALETT_NO_LAYER,
+          "rotary cross-attention accepted");
+    CHECK(attention(.net = net, .inputs = {0, enc}, .input_count = 2, .heads = 2) == SPINGALETT_NO_LAYER,
+          "cross-attention of the input layer's queries accepted");
+    CHECK(attention(.net = net, .inputs = {dec, enc, dec}, .heads = 2) == SPINGALETT_NO_LAYER,
+          "attention of three layers accepted");
+    CHECK(attention(.net = net, .inputs = {dec, enc}, .heads = 2, .ignore_padding = true) != SPINGALETT_NO_LAYER,
+          "a fitting cross-attention refused");
+    CHECK(net->shapes[net->layers - 1].width == 4 && net->shapes[net->layers - 1].mask == enc,
+          "cross-attention: the queries' cells, the padding of the keys' tokens");
+    free_network(net);
+    net = new_spingalett(.loss_func = LOSS_MSE);
+    layer(.net = net, .height = 2, .width = 3, .channels = 1);
+    CHECK(embedding(.net = net, .vocabulary = 5, .neurons_amount = 4, .token_count = 2) == SPINGALETT_NO_LAYER,
+          "a range of the tokens of a map of rows accepted");
+    free_network(net);
     spingalett_set_log_level(LOG_WARNING);
 }
 
@@ -4846,7 +4957,7 @@ static void session_equivalence(void) {
 static void session_validation(void) {
     spingalett_set_log_level(LOG_NONE);
     const uint32_t T = 6, V = 7;
-    NeuralNetwork *nets[4];
+    NeuralNetwork *nets[5];
     nets[0] = tf_net(2, T, V);                          /* attention over a map: no embedding */
     nets[1] = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);  /* attention that is not causal */
     layer(.net = nets[1], .neurons_amount = T);
@@ -4862,7 +4973,8 @@ static void session_validation(void) {
     layer(.net = nets[3], .neurons_amount = T);
     embedding(.net = nets[3], .vocabulary = V, .neurons_amount = 4);
     layer(.net = nets[3], .neurons_amount = 5);
-    for (int k = 0; k < 4; k++) {
+    nets[4] = tf_net(6, T, V);                          /* an encoder-decoder: embeddings of part of the input */
+    for (int k = 0; k < 5; k++) {
         SpingalettModel *m = spingalett_model_from_network(nets[k], PRECISION_FLOAT32);
         spingalett_clear_error();
         CHECK(m && !spingalett_session_new(m, NULL) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
@@ -6444,6 +6556,72 @@ static void gpu_masked(uint32_t head, bool causal, uint32_t window, bool padding
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* Cross-attention on the GPU: an encoder-decoder's queries (37 target tokens) over the keys and values of 50 source
+   tokens, heads of 32 to 256, grouped or not, ignoring the source's padding or not, against the CPU's predictions
+   and step, two runs alike, and in bfloat16 (on CUDA the kernels of single precision) close to single precision. */
+static void gpu_cross(uint32_t head, uint32_t kv, bool padding) {
+    const uint32_t S = 50, Q = 37, V = 23, n = 12, heads = 2, d = heads * head;
+    float *x = (float *)malloc((size_t)n * (S + Q) * sizeof(float)), *t = (float *)malloc((size_t)n * Q * sizeof(float));
+    lcg_state = 707u + head + kv;
+    for (uint32_t s = 0; s < n; s++) {
+        const uint32_t L = padding ? 1u + (s * 19u + 3u) % S : S;          /* the source's real tokens, then -1 */
+        for (uint32_t i = 0; i < S + Q; i++)
+            x[s * (S + Q) + i] = i < S && i >= L ? -1.0f : (float)((uint32_t)(frand() * 4096.0f) % V);
+        for (uint32_t i = 0; i < Q; i++) t[s * Q + i] = (float)((uint32_t)(frand() * 4096.0f) % V);
+    }
+    float *pred[4] = {NULL, NULL, NULL, NULL}, *step[4] = {NULL, NULL, NULL, NULL};
+    uint64_t count = 0;
+    for (int run = 0; run < 4; run++) {
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = S + Q);
+        const uint32_t e = embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = true, .token_count = S);
+        const uint32_t k = linear(.net = net, .inputs = {e}, .neurons_amount = 2 * kv * head);
+        embedding(.net = net, .inputs = {0}, .input_count = 1, .vocabulary = V, .neurons_amount = d, .positions = true,
+                  .token_offset = S);
+        const uint32_t q = linear(.net = net, .neurons_amount = d);
+        attention(.net = net, .inputs = {q, k}, .heads = heads, .kv_heads = kv, .ignore_padding = padding);
+        linear(.net = net, .neurons_amount = V);
+        lcg_state = 92;
+        for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
+        spingalett_set_compute_mode(run == 0 ? COMPUTE_OPENMP : gpu_mode);
+        if (run == 3 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+            free_network(net);
+            break;
+        }
+        pred[run] = (float *)malloc((size_t)n * Q * V * sizeof(float));
+        predict(.net = net, .inputs = x, .outputs = pred[run], .sample_count = n);
+        count = net->total_weights;
+        step[run] = (float *)malloc(count * sizeof(float));
+        memcpy(step[run], net->weights, count * sizeof(float));
+        train(.net = net, .inputs = x, .targets = t, .sample_count = n, .epochs = 1, .learning_rate = 1.0f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH, .report_interval = 0);
+        SpingalettNetworkLayer first;
+        spingalett_network_layer(net, 1, &first);
+        float *probe = (float *)malloc(first.weight_count * sizeof(float));
+        spingalett_get_parameters(net, 1, PARAM_WEIGHTS, probe, first.weight_count);       /* (brings them back) */
+        free(probe);
+        for (uint64_t i = 0; i < count; i++) step[run][i] -= net->weights[i];
+        spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        free_network(net);
+    }
+    const double p = gpu_max_scaled(pred[0], pred[1], (size_t)n * Q * V), s = gpu_max_scaled(step[0], step[1], count);
+    const bool same = !memcmp(step[1], step[2], count * sizeof(float)) &&
+                      !memcmp(pred[1], pred[2], (size_t)n * Q * V * sizeof(float));
+    CHECK(p < 1e-4 && s < 1e-3 && same, "gpu cross-attention head %u kv %u%s: predictions %.2e, step %.2e from the "
+          "CPU's, deterministic %d", head, kv, padding ? " padding" : "", p, s, same);
+    printf("  gpu cross-attention head %u, %u key head%s%s: predictions %.1e, step %.1e from the CPU's, deterministic %s",
+           head, kv, kv > 1 ? "s" : "", padding ? ", the source padded" : "", p, s, same ? "yes" : "no");
+    if (pred[3]) {
+        const double bp = gpu_max_scaled(pred[1], pred[3], (size_t)n * Q * V), bs = gpu_max_scaled(step[1], step[3], count);
+        CHECK(bp < 2e-2 && bs < 6e-2, "gpu cross-attention head %u bf16: predictions %.2e, step %.2e", head, bp, bs);
+        printf("; bf16 %.1e, step %.1e", bp, bs);
+    }
+    printf("\n");
+    for (int r = 0; r < 4; r++) { free(pred[r]); free(step[r]); }
+    free(x); free(t);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 /* The step API on a transformer, on the GPU against the CPU: forward, the sparse loss's backward pass with
    label smoothing, two passes a step. */
 static void gpu_transformer_trainer(void) {
@@ -7545,7 +7723,7 @@ int main(int argc, char **argv) {
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         TrainingStrategy strats[] = {STRATEGY_FULL_BATCH, STRATEGY_SMALL_BATCH};
         for (int m = 0; m < 2; m++) for (int s = 0; s < 2; s++)
-            for (int k = 0; k < 6; k++) tf_gradcheck(k, cm[m], strats[s]);
+            for (int k = 0; k < 7; k++) tf_gradcheck(k, cm[m], strats[s]);
         tf_gradcheck(1, cm[2], STRATEGY_FULL_BATCH);
         tf_determinism();
         tf_models();
@@ -7553,6 +7731,7 @@ int main(int argc, char **argv) {
         tf_tied();
         for (int m = 0; m < 2; m++) tf_padding(cm[m]);
         for (int m = 0; m < 2; m++) tf_window(cm[m]);
+        for (int m = 0; m < 2; m++) tf_cross(cm[m]);
         tf_validation();
         tf_learns(COMPUTE_OPENMP);
     }
@@ -7735,7 +7914,7 @@ int main(int argc, char **argv) {
             gpu_device_data();
             gpu_device_data_threads();
             gpu_bf16();
-            for (int k = 0; k < 6; k++) gpu_transformer(k);
+            for (int k = 0; k < 7; k++) gpu_transformer(k);
             gpu_transformer_trainer();
             gpu_flash(32, false, 4, 80, true);
             gpu_flash(64, true, 2, 80, true);
@@ -7752,6 +7931,11 @@ int main(int argc, char **argv) {
             gpu_masked(128, true, 40, true);
             gpu_masked(256, false, 17, false);
             tf_window(gpu_mode);
+            gpu_cross(32, 2, true);
+            gpu_cross(64, 1, false);
+            gpu_cross(128, 1, true);
+            gpu_cross(256, 2, true);
+            tf_cross(gpu_mode);
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }

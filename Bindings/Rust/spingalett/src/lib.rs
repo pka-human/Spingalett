@@ -354,6 +354,13 @@ impl Layer {
         self.args.ignore_padding = ignore;
         self
     }
+    /// An embedding of part of its input: `count` tokens (0: the rest) from value `offset` on of its one row (an
+    /// encoder's and a decoder's tokens side by side in one input).
+    pub fn tokens(mut self, offset: u32, count: u32) -> Self {
+        self.args.token_offset = offset;
+        self.args.token_count = count;
+        self
+    }
     /// Attention: a sliding window, keys less than `window` cells away (with causal the cell and the
     /// `window - 1` before it); 0: every key.
     pub fn window(mut self, window: u32) -> Self {

@@ -242,7 +242,8 @@ typedef struct {
     uint32_t tied;                  /* dense and linear layers: the network's layer (an embedding) whose table
                                        are their weights, or 0 */
     uint32_t window;                /* attention: keys less than this many cells away (0: all) */
-    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them, window after tied) */
+    uint32_t token_offset;          /* embedding: the first of its input's values it reads */
+    uint64_t reserved[SPINGALETT_RESERVED - 4];     /* (vocabulary took the padding before them, window after tied) */
 } SpingalettLayerInfo;
 
 /*

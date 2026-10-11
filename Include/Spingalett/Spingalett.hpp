@@ -513,10 +513,15 @@ public:
         a.tied = embedding;
         return add(a);
     }
-    Builder &embedding(std::uint32_t vocabulary, std::uint32_t width, bool positions = false) {
+    /* (token_offset, token_count: an embedding of part of its input, count tokens (0: the rest) from value offset
+       on: an encoder's and a decoder's tokens side by side) */
+    Builder &embedding(std::uint32_t vocabulary, std::uint32_t width, bool positions = false,
+                       std::uint32_t token_offset = 0, std::uint32_t token_count = 0) {
         SpingalettLayerArgs a = args(SPINGALETT_LAYER_EMBEDDING, Activation::None, width);
         a.vocabulary = vocabulary;
         a.positions = positions;
+        a.token_offset = token_offset;
+        a.token_count = token_count;
         a.weight_initialization = SPINGALETT_INIT_LECUN;
         return add(a);
     }
@@ -530,6 +535,16 @@ public:
         a.ignore_padding = ignore_padding;
         a.window = window;
         return add(a);
+    }
+    /* cross-attention: the queries of layer `queries` (heads x head size channels) over the keys and values of
+       layer `keys_values` (2 kv_heads x head size: the key heads', then the value heads') */
+    Builder &cross_attention(std::uint32_t queries, std::uint32_t keys_values, std::uint32_t heads,
+                             std::uint32_t kv_heads = 0, bool ignore_padding = false) {
+        SpingalettLayerArgs a = args(SPINGALETT_LAYER_ATTENTION, Activation::None, 0);
+        a.heads = heads;
+        a.kv_heads = kv_heads;
+        a.ignore_padding = ignore_padding;
+        return from({queries, keys_values}).add(a);
     }
     Builder &rms_norm(float epsilon = 0.0f) {
         SpingalettLayerArgs a = args(SPINGALETT_LAYER_RMS_NORM, Activation::None, 0);

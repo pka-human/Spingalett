@@ -24,9 +24,10 @@
  * the order of the head's values, a sum over keys in their order: the same bits on every run. A unit per
  * head size D and pass (OPC); the head d may be smaller than D (zeros past it). Units of EXT (rattn_d<D>_o<OPC>x)
  * compile in the passes of a layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query
- * without a key giving zeros) or a sliding window (keys less than `window` cells away, the tiles outside every
- * row's window skipped); the others are those of layers without, unchanged. Spec: OP (| SPG_ATTN_EXT), BQ,
- * DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3), the tiles those of SPG_RATTN_ROWS and SPG_RATTN_THREADS.
+ * without a key giving zeros), a sliding window (keys less than `window` cells away, the tiles outside every
+ * row's window skipped) or cross-attention (FLAG_CROSS: the keys and values in kvx, of kcells cells); the others
+ * are those of layers without, unchanged. Spec: OP (| SPG_ATTN_EXT), BQ, DMAX, THREADS, HALF (words: x 0, y 1,
+ * dy 2, dx 3, kvx 12), the tiles those of SPG_RATTN_ROWS and SPG_RATTN_THREADS.
  */
 
 #include "common.cuh"
@@ -65,10 +66,16 @@
 #define FLAG_ROPE   2u
 #define FLAG_STATS  4u
 #define FLAG_PAD    8u
+#define FLAG_CROSS  16u
+#if !EXT
+#define CQ C                    /* (the queries' floats a cell) */
+#endif
 
-/* Whether key j of sample s is attended to: inside the keys and (EXT with FLAG_PAD) not padding. */
+/* Whether key j of sample s is attended to (EXT): inside the keys (cross-attention's kcells) and (FLAG_PAD) not
+   padding. */
 DEVICE bool live(const SpgAttnPush &p, uint32_t s, uint32_t j) {
-    return j < p.cells && (!(p.flags & FLAG_PAD) || F(p.tokens)[s * p.tokens_stride + p.tokens_at + j] >= 0.0f);
+    return j < ((p.flags & FLAG_CROSS) ? p.kcells : p.cells) &&
+           (!(p.flags & FLAG_PAD) || F(p.tokens)[s * p.tokens_stride + p.tokens_at + j] >= 0.0f);
 }
 
 /* Whether query i attends to key j by their places: with a window, j less than window cells away (after i too
@@ -95,19 +102,29 @@ DEVICE float4_ fma4s(float a, float4_ b, float4_ c) {
 }
 
 /* Where a tile's rows come from: float `head` on of each cell's `stride` floats of base (push-constant word
-   `word`), rotated with rotate (ROPE), times mul. */
+   `word`), rotated with rotate (ROPE), times mul; EXT: of `cells` cells (cross-attention's keys: kcells). */
 struct Rows {
     uint64_t base;
     uint32_t head, stride, word;
     bool rotate;
     float mul;
+#if EXT
+    uint32_t cells;
+#endif
 };
+#if EXT
+#define ROWS(base, head, stride, word, rotate, mul, cells) Rows{base, head, stride, word, rotate, mul, cells}
+#define ROW_CELLS(r) (r).cells
+#else
+#define ROWS(base, head, stride, word, rotate, mul, cells) Rows{base, head, stride, word, rotate, mul}
+#define ROW_CELLS(r) p.cells
+#endif
 
 /* Value c of row pos (zero past the cells or the head's d values) */
 DEVICE float value(const SpgAttnPush &p, uint32_t HALF, uint32_t s, uint32_t pos, uint32_t c, const Rows &r) {
     const uint32_t d = p.d, hd = d / 2u;
-    if (pos >= p.cells || c >= d) return 0.0f;
-    const uint32_t at = (s * p.cells + pos) * r.stride + r.head;
+    if (pos >= ROW_CELLS(r) || c >= d) return 0.0f;
+    const uint32_t at = (s * ROW_CELLS(r) + pos) * r.stride + r.head;
     float v = ld(r.base, at + c, r.word, HALF);
     if (r.rotate && (p.flags & FLAG_ROPE)) {
         const uint32_t i = c < hd ? c : c - hd;
@@ -119,8 +136,8 @@ DEVICE float value(const SpgAttnPush &p, uint32_t HALF, uint32_t s, uint32_t pos
 
 /* Values c .. c + 3 of row pos, a head of exactly D values: as value() computes them, four at a time */
 DEVICE float4_ chunk(const SpgAttnPush &p, uint32_t HALF, uint32_t s, uint32_t pos, uint32_t c, const Rows &r) {
-    if (pos >= p.cells) return float4_{0.0f, 0.0f, 0.0f, 0.0f};
-    const uint32_t at = (s * p.cells + pos) * r.stride + r.head;
+    if (pos >= ROW_CELLS(r)) return float4_{0.0f, 0.0f, 0.0f, 0.0f};
+    const uint32_t at = (s * ROW_CELLS(r) + pos) * r.stride + r.head;
     float4_ v = ld4(r.base, at + c, r.word, HALF);
     if (r.rotate && (p.flags & FLAG_ROPE)) {
         const uint32_t hd = D / 2u, i = c < hd ? c : c - hd;
@@ -259,15 +276,28 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
     const uint32_t tid = thread_x(), tx = tid % TX, ry = tid / TX, s = block_z();
     const uint32_t C = (p.heads + 2u * p.kv) * d, group = p.heads / p.kv;
     const bool causal = (p.flags & FLAG_CAUSAL) != 0u, vec = d == D;
+#if EXT
+    /* cross-attention: the queries' floats a cell (CQ), the keys' cells (KC), floats a cell (CK), first head (KB),
+       word of their base (KW) */
+    const bool cross = (p.flags & FLAG_CROSS) != 0u;
+    const uint32_t CQ = cross ? out_c : C, KC = cross ? p.kcells : p.cells, CK = cross ? 2u * p.kv * d : C;
+    const uint32_t KB = cross ? 0u : p.heads, KW = cross ? 12u : 0u;
+    const uint64_t KX = cross ? p.kvx : p.x;
+#endif
     const float NEG = -3.402823466e38f;
     float4_ ra[LC], rb[LC];         /* the next tile's rows, as fetch() loads them */
 #if OPC == FORWARD || OPC == DQ
     const uint32_t h = block_y(), kh = h / group, i0 = block_x() * R, sa = (s * p.heads + h) * p.cells;
+#if EXT
+    const Rows keys_of = ROWS(KX, (KB + kh) * d, CK, KW, true, 1.0f, KC);
+    const Rows values_of = ROWS(KX, (KB + p.kv + kh) * d, CK, KW, false, 1.0f, KC);
+#else
     const Rows keys_of = {p.x, (p.heads + kh) * d, C, 0u, true, 1.0f};
     const Rows values_of = {p.x, (p.heads + p.kv + kh) * d, C, 0u, false, 1.0f};
-    load_rows(p, HALF, sh.q, s, i0, R, Rows{p.x, h * d, C, 0u, true, p.scale});
+#endif
+    load_rows(p, HALF, sh.q, s, i0, R, ROWS(p.x, h * d, CQ, 0u, true, p.scale, p.cells));
 #if OPC == DQ
-    load_rows(p, HALF, sh.g, s, i0, R, Rows{p.dy, h * d, out_c, 2u, false, 1.0f});
+    load_rows(p, HALF, sh.g, s, i0, R, ROWS(p.dy, h * d, out_c, 2u, false, 1.0f, p.cells));
     float lse[RM], del[RM];
 #pragma unroll
     for (uint32_t m = 0; m < RM; m++) {
@@ -289,7 +319,7 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
     /* with a window, the keys of the block's rows' windows, from a tile of B aligned */
     const uint32_t w = p.window;
     const uint32_t jfirst = w ? (i0 + 1u > w ? i0 + 1u - w : 0u) / B * B : 0u;
-    const uint32_t keys = causal ? umin(p.cells, i0 + R) : w ? umin(p.cells, i0 + R - 1u + w) : p.cells;
+    const uint32_t keys = causal ? umin(p.cells, i0 + R) : w ? umin(p.cells, i0 + R - 1u + w) : KC;
 #define JFIRST jfirst
 #else
     const uint32_t keys = causal ? umin(p.cells, i0 + R) : p.cells;
@@ -425,14 +455,19 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
     barrier();
     for (uint32_t e = tid; e < R * D; e += T) {
         const uint32_t row = e / D, c = e % D, i = i0 + row;
-        if (i < p.cells && c < d) st(p.dx, (s * p.cells + i) * C + h * d + c, 3u, HALF, unrotated(p, sh.q + row * SQ, i, c));
+        if (i < p.cells && c < d) st(p.dx, (s * p.cells + i) * CQ + h * d + c, 3u, HALF, unrotated(p, sh.q + row * SQ, i, c));
     }
 #endif
 #elif OPC == DKV
     /* the block's keys and values of head kh; the queries of the group's heads */
     const uint32_t kh = block_y(), j0 = block_x() * R;
+#if EXT
+    load_rows(p, HALF, sh.k, s, j0, R, ROWS(KX, (KB + kh) * d, CK, KW, true, 1.0f, KC));
+    load_rows(p, HALF, sh.v, s, j0, R, ROWS(KX, (KB + p.kv + kh) * d, CK, KW, false, 1.0f, KC));
+#else
     load_rows(p, HALF, sh.k, s, j0, R, Rows{p.x, (p.heads + kh) * d, C, 0u, true, 1.0f});
     load_rows(p, HALF, sh.v, s, j0, R, Rows{p.x, (p.heads + p.kv + kh) * d, C, 0u, false, 1.0f});
+#endif
     float4_ dk[RM][CH], dv[RM][CH];
 #pragma unroll
     for (uint32_t m = 0; m < RM; m++)
@@ -455,7 +490,8 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
 #endif
     for (uint32_t h = kh * group; h < (kh + 1u) * group; h++) {
         const uint32_t sa = (s * p.heads + h) * p.cells;
-        const Rows queries_of = {p.x, h * d, C, 0u, true, p.scale}, grads_of = {p.dy, h * d, out_c, 2u, false, 1.0f};
+        const Rows queries_of = ROWS(p.x, h * d, CQ, 0u, true, p.scale, p.cells);
+        const Rows grads_of = ROWS(p.dy, h * d, out_c, 2u, false, 1.0f, p.cells);
         if (vec) {
             fetch(p, HALF, s, first, queries_of, ra);
             fetch(p, HALF, s, first, grads_of, rb);
@@ -517,10 +553,17 @@ extern "C" __global__ void __launch_bounds__(T) SPG_ENTRY(const SpgAttnPush p, c
     barrier();
     for (uint32_t e = tid; e < R * D; e += T) {
         const uint32_t row = e / D, c = e % D, j = j0 + row;
+#if EXT
+        if (j >= KC || c >= d) continue;
+        const uint32_t at = (s * KC + j) * CK;
+        st(p.dx, at + (KB + kh) * d + c, 3u, HALF, unrotated(p, sh.k + row * SQ, j, c));
+        st(p.dx, at + (KB + p.kv + kh) * d + c, 3u, HALF, sh.v[row * SQ + c]);
+#else
         if (j >= p.cells || c >= d) continue;
         const uint32_t at = (s * p.cells + j) * C;
         st(p.dx, at + (p.heads + kh) * d + c, 3u, HALF, unrotated(p, sh.k + row * SQ, j, c));
         st(p.dx, at + (p.heads + p.kv + kh) * d + c, 3u, HALF, sh.v[row * SQ + c]);
+#endif
     }
 #endif
 #endif

@@ -136,14 +136,20 @@ typedef struct {
        sample s, a negative one a padded key (without, an address and stride that keep loads in x) */
     uint64_t tokens;
     uint32_t tokens_stride, tokens_at;
+    /* SPG_ATTN_EXT with SPG_ATTN_CROSS: the keys and values (word 12), 2 kv d floats a cell of kcells cells a sample
+       (x then holds the queries, heads d floats a cell; DQ's dx their gradient, DKV's that of kvx); other passes of
+       EXT x (loads that stay in x), the others 0 */
+    uint64_t kvx;
+    uint32_t kcells, pad_;
 } SpgAttnPush;
 enum { SPG_ATTN_FORWARD, SPG_ATTN_PRE, SPG_ATTN_DQ, SPG_ATTN_DKV };
-#define SPG_ATTN_EXT    4u          /* OP: the pass of a layer with padding or a window, the units that read them
-                                       (CUDA: _x) */
+#define SPG_ATTN_EXT    4u          /* OP: the pass of a layer with padding, a window or cross-attention, the units
+                                       that read them (CUDA: _x) */
 #define SPG_ATTN_CAUSAL 1u
 #define SPG_ATTN_ROPE   2u
 #define SPG_ATTN_STATS  4u          /* FORWARD keeps each query's log of the softmax's sum */
 #define SPG_ATTN_PAD    8u          /* (EXT) keys of padding left out */
+#define SPG_ATTN_CROSS  16u         /* (EXT) cross-attention: keys and values in kvx */
 /* rattn.cu (CUDA, single precision, heads up to 128): rows of a block (queries; keys in DKV) and its threads,
    for a unit's head size d (32, 64, 128) and pass */
 #define SPG_RATTN_ROWS(d, op) ((d) <= 64u || (op) == SPG_ATTN_FORWARD ? 64u : 32u)

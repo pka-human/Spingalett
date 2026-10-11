@@ -180,7 +180,9 @@ pub struct LayerArgs {
     pub ignore_padding: bool,
     pub tied: u32,
     pub window: u32,
-    pub reserved: [u64; RESERVED - 4],
+    pub token_offset: u32,
+    pub token_count: u32,
+    pub reserved: [u64; RESERVED - 5],
 }
 
 impl Default for LayerArgs {
@@ -224,7 +226,8 @@ pub struct NetworkLayer {
     pub ignore_padding: bool,
     pub tied: u32,
     pub window: u32,
-    pub reserved: [u64; RESERVED - 3],
+    pub token_offset: u32,
+    pub reserved: [u64; RESERVED - 4],
 }
 
 impl Default for NetworkLayer {

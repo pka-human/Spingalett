@@ -8,9 +8,10 @@
    most (DMAX 32, 64, 128, 256 with tiles of 32, 16, 8, 4 rows, THREADS 128, 64, 64, 16; Kernels.def builds
    DMAX 256, the smaller heads run on rattn.cu): the rows' threads, keys and columns as constants, so that
    the arrays of a thread's sums stay in registers. EXT (a unit of its own, attn_d256x) compiles in the passes of a
-   layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query without a key giving zeros) or a
-   sliding window (keys less than `window` cells away, the tiles outside every row's window skipped).
-   Spec: OP (| SPG_ATTN_EXT), BQ, DMAX, THREADS, HALF (words: x 0, y 1, dy 2, dx 3). */
+   layer with padding (FLAG_PAD: keys whose tokens are negative left out, a query without a key giving zeros), a
+   sliding window (keys less than `window` cells away, the tiles outside every row's window skipped) or
+   cross-attention (FLAG_CROSS: the keys and values in kvx, of kcells cells). Spec: OP (| SPG_ATTN_EXT), BQ, DMAX,
+   THREADS, HALF (words: x 0, y 1, dy 2, dx 3, kvx 12). */
 
 #include "common.cuh"
 
@@ -46,6 +47,12 @@
 #define FLAG_ROPE   2u
 #define FLAG_STATS  4u
 #define FLAG_PAD    8u
+#define FLAG_CROSS  16u
+#if !EXT                        /* (the queries' floats a cell, the keys' cells and their floats a cell) */
+#define CQ C
+#define KC p.cells
+#define CK C
+#endif
 
 struct Shared {
     float a[BQ * DMAX], b[BQ * DMAX], k[BQ * DMAX], v[BQ * DMAX];
@@ -74,6 +81,17 @@ DEVICE void window_tiles(const SpgAttnPush &p, uint32_t at, bool keys, bool caus
     *first = back / BQ * BQ;
     *end = keys && causal ? umin(p.cells, at + BQ) : umin(p.cells, at + BQ - 1u + w);
 }
+
+#if EXT
+/* value c of key j's vector of head g, or (value) of its value vector, sample s: in x after the queries, or
+   (cross) in kvx; keys rotated with ROPE. KC: the keys' cells, CK: a cell's floats. */
+DEVICE float kv_value(const SpgAttnPush &p, uint32_t half, uint32_t s, uint32_t j, uint32_t g, uint32_t c, bool value,
+                      bool cross, uint32_t KC, uint32_t CK) {
+    const uint32_t at = (s * KC + j) * CK;
+    if (cross) return ld(p.kvx, at + ((value ? p.kv : 0u) + g) * p.d + c, 12u, half);
+    return value ? ld(p.x, at + (p.heads + p.kv + g) * p.d + c, 0u, half) : rotated(p, half, at + (p.heads + g) * p.d, j, c);
+}
+#endif
 
 /* whether key j of sample s is attended to: not padding (EXT with FLAG_PAD: its token is 0 or more) */
 DEVICE bool live(const SpgAttnPush &p, uint32_t s, uint32_t j) {
@@ -106,6 +124,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
     const uint32_t tid = thread_x(), r = tid / TPR, q = tid % TPR, d = p.d;
     const uint32_t C = (p.heads + 2u * p.kv) * d, out_c = p.heads * d, group = p.heads / p.kv;
     const bool causal = (p.flags & FLAG_CAUSAL) != 0u;
+#if EXT
+    const bool cross = (p.flags & FLAG_CROSS) != 0u;
+    const uint32_t CQ = cross ? out_c : C, KC = cross ? p.kcells : p.cells, CK = cross ? 2u * p.kv * d : C;
+#endif
     const float NEG = -3.402823466e38f;
     const uint32_t rows = p.n * p.heads * p.cells;
     if (OP == PRE) {
@@ -122,7 +144,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
     if (OP == FORWARD || OP == DQ) {
         const uint32_t h = block_y(), g = h / group, i0 = block_x() * BQ, i = i0 + r;
         for (uint32_t e = tid; e < BQ * d; e += THREADS) {
-            const uint32_t rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * C + h * d;
+            const uint32_t rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * CQ + h * d;
             sh.a[rr * DMAX + c] = ii < p.cells ? rotated(p, HALF, at, ii, c) * p.scale : 0.0f;
             if (OP == DQ) sh.b[rr * DMAX + c] = ii < p.cells ? ld(p.dy, (s * p.cells + ii) * out_c + h * d + c, 2u, HALF) : 0.0f;
         }
@@ -133,19 +155,25 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
 #pragma unroll
         for (uint32_t k = 0; k < CPT; k++) acc[k] = 0.0f;
 #if EXT
-        uint32_t first = 0, keys = causal ? umin(p.cells, i0 + BQ) : p.cells;
+        uint32_t first = 0, keys = causal ? umin(p.cells, i0 + BQ) : KC;
         if (p.window) window_tiles(p, i0, true, causal, &first, &keys);
         for (uint32_t j0 = first; j0 < keys; j0 += BQ) {
+            barrier();
+            for (uint32_t e = tid; e < BQ * d; e += THREADS) {
+                const uint32_t jj = e / d, c = e % d, j = j0 + jj;
+                sh.k[jj * DMAX + c] = j < KC ? kv_value(p, HALF, s, j, g, c, false, cross, KC, CK) : 0.0f;
+                sh.v[jj * DMAX + c] = j < KC ? kv_value(p, HALF, s, j, g, c, true, cross, KC, CK) : 0.0f;
+            }
 #else
         const uint32_t keys = causal ? umin(p.cells, i0 + BQ) : p.cells;
         for (uint32_t j0 = 0; j0 < keys; j0 += BQ) {
-#endif
             barrier();
             for (uint32_t e = tid; e < BQ * d; e += THREADS) {
                 const uint32_t jj = e / d, c = e % d, j = j0 + jj, at = (s * p.cells + j) * C;
                 sh.k[jj * DMAX + c] = j < p.cells ? rotated(p, HALF, at + (p.heads + g) * d, j, c) : 0.0f;
                 sh.v[jj * DMAX + c] = j < p.cells ? ld(p.x, at + (p.heads + p.kv + g) * d + c, 0u, HALF) : 0.0f;
             }
+#endif
             barrier();
             float sc[KPT], dp[KPT], top = NEG;
 #pragma unroll
@@ -157,7 +185,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
                     if (OP == DQ) dot2 = fma_(sh.b[r * DMAX + c], sh.v[jj * DMAX + c], dot2);
                 }
 #if EXT
-                const bool valid = i < p.cells && j < p.cells && (!causal || j <= i) && in_window(p, i, j, causal) &&
+                const bool valid = i < p.cells && j < KC && (!causal || j <= i) && in_window(p, i, j, causal) &&
                                    live(p, s, j);
 #else
                 const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
@@ -229,20 +257,26 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
 #pragma unroll
             for (uint32_t k = 0; k < CPT; k++) {
                 const uint32_t c = q + TPR * k;
-                if (c < d) st(p.dx, (s * p.cells + i) * C + h * d + c, 3u, HALF, unrotated(p, sh.a + r * DMAX, i, c));
+                if (c < d) st(p.dx, (s * p.cells + i) * CQ + h * d + c, 3u, HALF, unrotated(p, sh.a + r * DMAX, i, c));
             }
         return;
     }
     /* DKV */
     const uint32_t g = block_y(), j0 = block_x() * BQ, j = j0 + r;
 #if EXT
-    const bool key = j < p.cells && live(p, s, j);     /* (padding: a key left out gets no gradient) */
-#endif
+    const bool key = j < KC && live(p, s, j);     /* (padding: a key left out gets no gradient) */
+    for (uint32_t e = tid; e < BQ * d; e += THREADS) {
+        const uint32_t jj = e / d, c = e % d, jk = j0 + jj;
+        sh.k[jj * DMAX + c] = jk < KC ? kv_value(p, HALF, s, jk, g, c, false, cross, KC, CK) : 0.0f;
+        sh.v[jj * DMAX + c] = jk < KC ? kv_value(p, HALF, s, jk, g, c, true, cross, KC, CK) : 0.0f;
+    }
+#else
     for (uint32_t e = tid; e < BQ * d; e += THREADS) {
         const uint32_t jj = e / d, c = e % d, jk = j0 + jj, at = (s * p.cells + jk) * C;
         sh.k[jj * DMAX + c] = jk < p.cells ? rotated(p, HALF, at + (p.heads + g) * d, jk, c) : 0.0f;
         sh.v[jj * DMAX + c] = jk < p.cells ? ld(p.x, at + (p.heads + p.kv + g) * d + c, 0u, HALF) : 0.0f;
     }
+#endif
     float dk[CPT], dv[CPT];
 #pragma unroll
     for (uint32_t k = 0; k < CPT; k++) dk[k] = dv[k] = 0.0f;
@@ -257,7 +291,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
 #endif
             barrier();
             for (uint32_t e = tid; e < BQ * d; e += THREADS) {
-                const uint32_t rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * C + h * d;
+                const uint32_t rr = e / d, c = e % d, ii = i0 + rr, at = (s * p.cells + ii) * CQ + h * d;
                 sh.a[rr * DMAX + c] = ii < p.cells ? rotated(p, HALF, at, ii, c) * p.scale : 0.0f;
                 sh.b[rr * DMAX + c] = ii < p.cells ? ld(p.dy, (s * p.cells + ii) * out_c + h * d + c, 2u, HALF) : 0.0f;
             }
@@ -299,6 +333,17 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
 #pragma unroll
     for (uint32_t k = 0; k < CPT; k++) sh.k[r * DMAX + q + TPR * k] = dk[k];
     barrier();
+#if EXT
+    if (j >= KC) return;
+    const uint32_t at = (s * KC + j) * CK, kb = cross ? 0u : p.heads;   /* (cross: the keys first in a cell) */
+#pragma unroll
+    for (uint32_t k = 0; k < CPT; k++) {
+        const uint32_t c = q + TPR * k;
+        if (c >= d) continue;
+        st(p.dx, at + (kb + g) * d + c, 3u, HALF, unrotated(p, sh.k + r * DMAX, j, c));
+        st(p.dx, at + (kb + p.kv + g) * d + c, 3u, HALF, dv[k]);
+    }
+#else
     if (j >= p.cells) return;
     const uint32_t at = (s * p.cells + j) * C;
 #pragma unroll
@@ -308,4 +353,5 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgAttnPus
         st(p.dx, at + (p.heads + g) * d + c, 3u, HALF, unrotated(p, sh.k + r * DMAX, j, c));
         st(p.dx, at + (p.heads + p.kv + g) * d + c, 3u, HALF, dv[k]);
     }
+#endif
 }

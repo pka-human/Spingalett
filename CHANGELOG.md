@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Cross-attention and encoder-decoders**: an attention layer of two inputs (`.inputs = {q, kv}`) takes the
+  queries of layer `q` over the keys and values of the cells of layer `kv` (`2 kv_heads x head size`
+  channels), with grouped queries and ignoring the padding of `kv`'s tokens, on the CPU, both GPU backends
+  (the passes of `SPG_ATTN_EXT`, the keys and values a second input of the push constants; the units of
+  other layers keep their PTX), the engine and deployment models. An embedding reads part of its input
+  (`SpingalettLayerArgs.token_offset`, `token_count`), so that one input holds the source's tokens and the
+  target's. `.slett` format 9 stores both (an attention entry of two inputs, an embedding's token offset at
+  offset 104); `SpingalettNetworkLayer.token_offset`, `SpingalettLayerInfo.token_offset`; Python
+  `add_embedding(..., token_offset=, token_count=)` and `add_attention(..., inputs=[q, kv])`, the C++
+  builder's `cross_attention()` and the other bindings' `tokens` options. Sessions refuse such models (they
+  run causal language models). The transformer group checks an encoder-decoder's gradients numerically and
+  which keys the decoder's queries read; on the GPU heads of 32 to 256 match the CPU (predictions 6e-7, steps
+  1.7e-5 at most) on Vulkan and CUDA.
 - **Sliding window attention** (`SpingalettLayerArgs.window` on attention, Mistral's): each cell attends to
   the keys less than `window` cells away, with `.causal` the cell and the `window - 1` before it, without
   the `window - 1` on either side, on the CPU, both GPU backends, the engine and deployment models. The CPU

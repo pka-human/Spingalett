@@ -139,6 +139,10 @@ typedef struct BatchWorkspace {
     float *attn;
     SpingalettGemmScratch **attn_gemm;
     int attn_threads;
+    /* training: the gradient of cross-attention layer l's keys and values (dkv[l], capacity x the outputs of its
+       second input), which its backward pass for the queries writes and the second input's takes */
+    float **dkv;
+    float *dkv_flat;
     bool training;          /* normalize with batch statistics */
     float smoothing;        /* LOSS_SPARSE_CROSS_ENTROPY: label smoothing of the loss's targets */
     uint32_t capacity;
@@ -312,12 +316,14 @@ void spingalett_multiply_backward(const float *const *x, uint32_t count, uint32_
    scratch a thread needs, the forward pass (y without activation; lse, when training, each query's log
    of the softmax's sum) and the input's gradient dx from dy = dL/dy (lse the forward pass's), with one
    scratch of spingalett_attention_scratch() floats and one matrix product scratch a
-   thread (ws->attn, ws->attn_gemm). */
+   thread (ws->attn, ws->attn_gemm). Cross-attention reads its keys and values from kvx (the second input; NULL
+   for self-attention) and writes their gradient to dkv; dx then holds the queries' only. */
 size_t spingalett_attention_scratch(const NeuralNetwork *net, uint32_t l, bool training);
-void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
-                                  float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
-void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
-                                   uint32_t n, const float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, const float *kvx, float *y,
+                                  uint32_t n, float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *kvx,
+                                   const float *dy, float *dx, float *dkv, uint32_t n, const float *lse,
+                                   const float *rope, BatchWorkspace *ws, ComputeMode mode);
 /* The sparse cross-entropy of one sample (LOSS_SPARSE_CROSS_ENTROPY): `cells` rows of C logits z and a
    target a cell (a class index; outside 0 .. C - 1: none), the targets smoothed (one-hot times 1 -
    smoothing, plus smoothing / C at every class). Returns the mean loss over the cells with targets (0

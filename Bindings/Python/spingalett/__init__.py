@@ -238,7 +238,8 @@ class _NetworkLayer(Structure):
         ("ignore_padding", c_bool),
         ("tied", c_uint32),
         ("window", c_uint32),
-        ("reserved", c_uint64 * (_RESERVED - 3)),
+        ("token_offset", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 4)),
     ]
 
 
@@ -326,7 +327,9 @@ class _LayerArgs(Structure):
         ("ignore_padding", c_bool),
         ("tied", c_uint32),
         ("window", c_uint32),
-        ("reserved", c_uint64 * (_RESERVED - 4)),
+        ("token_offset", c_uint32),
+        ("token_count", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 5)),
     ]
 
 
@@ -625,7 +628,8 @@ class _LayerInfo(Structure):
         ("ignore_padding", c_bool),
         ("tied", c_uint32),
         ("window", c_uint32),
-        ("reserved", c_uint64 * (_RESERVED - 3)),
+        ("token_offset", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 4)),
     ]
 
 
@@ -1221,7 +1225,8 @@ class Linear:
 @dataclasses.dataclass(frozen=True)
 class Embedding:
     """Token embeddings: each input value the index of a row of ``vocabulary`` rows of ``size`` values;
-    with ``positions``, a learned vector a cell added (GPT-2's absolute positions)."""
+    with ``positions``, a learned vector a cell added (GPT-2's absolute positions); ``token_offset`` and
+    ``token_count`` (0: the rest) the input's values it reads (an encoder's and a decoder's tokens side by side)."""
     vocabulary: int
     size: int
     positions: bool = False
@@ -1229,6 +1234,8 @@ class Embedding:
     init: Init = Init.LECUN
     dropout: float = 0.0
     inputs: _Inputs = None
+    token_offset: int = 0
+    token_count: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1292,6 +1299,7 @@ class LayerDescription:
     tied: int = 0                   # dense and linear layers: the embedding whose table are their weights
     ignore_padding: bool = False    # attention: keys of padding (-1 tokens) left out
     window: int = 0                 # attention: keys less than this many cells away (0: all)
+    token_offset: int = 0           # embedding: the first of its input's values it reads
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1502,7 +1510,7 @@ class Network:
                                 tied=spec.tied)
             elif isinstance(spec, Embedding):
                 self.add_embedding(spec.vocabulary, spec.size, spec.positions, spec.activation, spec.init, spec.dropout,
-                                   inputs=spec.inputs)
+                                   inputs=spec.inputs, token_offset=spec.token_offset, token_count=spec.token_count)
             elif isinstance(spec, Attention):
                 self.add_attention(spec.heads, spec.kv_heads, spec.causal, spec.rope_theta, spec.activation,
                                    spec.dropout, inputs=spec.inputs, ignore_padding=spec.ignore_padding,
@@ -1673,13 +1681,16 @@ class Network:
 
     def add_embedding(self, vocabulary: int, size: int, positions: bool = False,
                       activation: Activation = Activation.NONE, init: Init = Init.LECUN, dropout: float = 0.0,
-                      inputs: _Inputs = None) -> "Network":
+                      inputs: _Inputs = None, token_offset: int = 0, token_count: int = 0) -> "Network":
         """Append token embeddings: each input value (a token's index, as a float) the row of a table of
         ``vocabulary`` rows of ``size`` values (indices outside it give zeros), plus with ``positions`` a
-        learned vector a cell. A sequence of n tokens (an input layer of n values) gives n cells."""
+        learned vector a cell. A sequence of n tokens (an input layer of n values) gives n cells; with
+        ``token_offset`` and ``token_count`` (0: the rest), the embedding reads those values of its input only (an
+        encoder-decoder's input holds the source's tokens, then the target's: an embedding each, the second
+        reading the input layer, ``inputs=[0]``)."""
         return self._add(inputs, type=int(LayerType.EMBEDDING), vocabulary=int(vocabulary), neurons_amount=int(size),
                          positions=bool(positions), act_func=int(activation), weight_initialization=int(init),
-                         dropout_rate=float(dropout))
+                         dropout_rate=float(dropout), token_offset=int(token_offset), token_count=int(token_count))
 
     def add_attention(self, heads: int = 1, kv_heads: int = 0, causal: bool = False, rope_theta: float = 0.0,
                       activation: Activation = Activation.NONE, dropout: float = 0.0,
@@ -1691,7 +1702,10 @@ class Network:
         ``ignore_padding`` leaves out the keys of padding (a token of -1 in the network's input, the cells of an
         embedding of it): sequences of different lengths train in one batch; ``window`` (Mistral's sliding
         window) lets each cell attend to the keys less than that many cells away only: with ``causal`` the cell
-        and the ``window - 1`` before it, without the ``window - 1`` on either side (0: every key)."""
+        and the ``window - 1`` before it, without the ``window - 1`` on either side (0: every key). With two
+        ``inputs``, ``[q, kv]``, cross-attention: the queries of layer q (heads x head size channels) over the keys
+        and values of layer kv (2 kv_heads x head size: the key heads', then the value heads'), neither causal nor
+        windowed nor rotary; ``ignore_padding`` then leaves out the keys of padding of kv's tokens."""
         return self._add(inputs, type=int(LayerType.ATTENTION), heads=int(heads), kv_heads=int(kv_heads),
                          causal=bool(causal), rope_theta=float(rope_theta), act_func=int(activation),
                          dropout_rate=float(dropout), ignore_padding=bool(ignore_padding),
@@ -1722,7 +1736,7 @@ class Network:
                                 float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)),
                                 int(info.vocabulary), int(info.heads), int(info.kv_heads), float(info.rope_theta),
                                 bool(info.causal), bool(info.positions), int(info.tied), bool(info.ignore_padding),
-                                int(info.window))
+                                int(info.window), int(info.token_offset))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -2287,6 +2301,7 @@ class LayerInfo:
     tied: int = 0                       # dense and linear layers: the embedding (network layer) whose table
     ignore_padding: bool = False        # attention: keys of padding (negative tokens) left out
     window: int = 0                     # attention: keys less than this many cells away (0: all)
+    token_offset: int = 0               # embedding: the first of its input's values it reads
 
 
 class Model:
@@ -2386,7 +2401,8 @@ class Model:
                                  vocabulary=int(info.vocabulary), heads=int(info.heads), kv_heads=int(info.kv_heads),
                                  rope_theta=float(info.rope_theta), causal=bool(info.causal),
                                  positions=bool(info.positions), tied=int(info.tied),
-                                 ignore_padding=bool(info.ignore_padding), window=int(info.window)))
+                                 ignore_padding=bool(info.ignore_padding), window=int(info.window),
+                                 token_offset=int(info.token_offset)))
         return out
 
     def to_bytes(self) -> bytes:

@@ -95,7 +95,9 @@ typedef struct {
     uint32_t tied;                  /* dense and linear layers: the embedding whose table they compute with
                                        (weight_count 0: the table is the embedding's), or 0 */
     uint32_t window;                /* attention: keys less than this many cells away (0: all) */
-    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them, window after tied) */
+    uint32_t token_offset;          /* embedding: the first of its input's values it reads (its cells the
+                                       width's from there on) */
+    uint64_t reserved[SPINGALETT_RESERVED - 4];     /* (vocabulary took the padding before them, window after tied) */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -262,7 +264,11 @@ typedef struct {
     uint32_t window;                /* attention: a sliding window (Mistral's): each cell attends to the keys less
                                        than `window` cells away, with causal the cell itself and the window - 1
                                        before it, without the window - 1 on either side (0: every key) */
-    uint64_t reserved[SPINGALETT_RESERVED - 4];
+    uint32_t token_offset;          /* embedding: the first of its input's values it reads, when the input (of
+                                       height 1) holds several sequences: an encoder's and a decoder's tokens
+                                       side by side (0 with token_count 0: all of them) */
+    uint32_t token_count;           /* embedding: how many values from token_offset on, its cells (0: the rest) */
+    uint64_t reserved[SPINGALETT_RESERVED - 5];
 } SpingalettLayerArgs;
 
 typedef struct {
@@ -507,7 +513,10 @@ SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkA
 #define spingalett_embedding(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_EMBEDDING, __VA_ARGS__})
 /* Multi-head attention over the cells of a layer of queries, keys and values side by side (a linear layer
    of (heads + 2 kv_heads) x head size outputs): .heads, .kv_heads, .causal, .rope_theta, .ignore_padding,
-   .window. */
+   .window. With two inputs, .inputs = {q, kv}, cross-attention (an encoder-decoder's): the queries of the
+   cells of layer q (heads x head size channels) over the keys and values of the cells of layer kv (2 kv_heads
+   x head size channels: the key heads', then the value heads'), as many cells as q's out; neither causal nor
+   windowed nor rotary, .ignore_padding the keys of padding of kv's cells. */
 #define spingalett_attention(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_ATTENTION, __VA_ARGS__})
 /* RMS normalization over each cell's channels. */
 #define spingalett_rms_norm(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_RMS_NORM, __VA_ARGS__})

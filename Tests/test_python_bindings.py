@@ -835,6 +835,34 @@ expect = np.array([[1.0 if j == i or (j == i - 1 and i > 0) else 0.0 for j in ra
 expect /= expect.sum(axis=1, keepdims=True)
 check(win.layer(2).window == 2 and win.to_model(sg.Precision.FLOAT32).layers[1].window == 2, "window described")
 check(np.allclose(win.forward(np.arange(6, dtype=np.float32)).reshape(6, 6), expect, atol=1e-6), "window attended to")
+
+# an encoder-decoder: 6 source tokens then 5 target tokens in one input, cross-attention from the decoder to the
+# encoder; it learns to copy the source's first tokens, saves and loads, and deploys
+S, Q = 6, 5
+seq = sg.Network(sg.Loss.SPARSE_CROSS_ENTROPY, [S + Q])
+seq.add_embedding(V, 16, positions=True, token_count=S).add_linear(48).add_attention(heads=2).add_layer_norm()
+encoder = seq.last
+seq.add_linear(32, inputs=[encoder])
+kv = seq.last
+seq.add_embedding(V, 16, positions=True, token_offset=S, inputs=[0]).add_linear(48)
+seq.add_attention(heads=2, causal=True).add_linear(16)
+seq.add_attention(heads=2, inputs=[seq.last, kv]).add_linear(V)
+check(seq.layer(1).token_offset == 0 and seq.layer(1).shape[1] == S and seq.layer(6).token_offset == S and
+      seq.layer(6).shape[1] == Q and seq.layer(10).inputs == (9, kv), "an encoder-decoder described")
+rng = np.random.default_rng(3)
+src = rng.integers(0, V, (256, S)).astype(np.float32)
+xs = np.concatenate([src, np.zeros((256, Q), np.float32)], axis=1)
+xs[:, S + 1:] = src[:, :Q - 1]                      # the target's tokens so far: the source's, shifted
+r = seq.train(xs, src[:, :Q], epochs=60, batch_size=32, strategy=sg.Strategy.MINI_BATCH, learning_rate=1e-2,
+              optimizer=sg.Optimizer.ADAM)
+m = seq.evaluate(xs, src[:, :Q])
+check(r.status == sg.TrainStatus.COMPLETED and m.accuracy > 0.9, f"an encoder-decoder learns to copy ({m.accuracy:.3f})")
+back = sg.Network.from_bytes(seq.to_bytes())
+check(np.array_equal(back.forward(xs[:4]), seq.forward(xs[:4])) and back.layer(6).token_offset == S,
+      "an encoder-decoder saved and loaded")
+model = seq.to_model(sg.Precision.FLOAT32)
+check(np.allclose(model.predict(xs[:4]), seq.forward(xs[:4]), atol=1e-5) and model.layers[5].token_offset == S,
+      "an encoder-decoder deployed")
 # sessions: the model a token at a time with a key-value cache, the logits of its batched prediction bit for bit
 for precision in (sg.Precision.FLOAT32, sg.Precision.INT8):
     model = lm.to_model(precision)

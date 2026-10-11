@@ -576,8 +576,24 @@ spingalett_session_free(s);
 - A sliding window costs what it reads: the CPU and the GPU's kernels of single precision skip the blocks of
   keys outside every query's window (in bfloat16 on CUDA such layers run on those kernels, not on flash
   attention).
+- Encoder-decoders take the source's tokens and then the target's in one input: an embedding reads each part
+  (`.token_offset`, `.token_count`; the decoder's names the input layer, `.inputs = {0}, .input_count = 1`),
+  and cross-attention, an attention of two inputs, takes the decoder's queries over the encoder's keys and
+  values (a linear layer of `2 kv_heads x head size` outputs reading the encoder), ignoring the source's
+  padding with `.ignore_padding`:
+
+  ```c
+  uint32_t src = embedding(.net = net, .vocabulary = V, .neurons_amount = 512, .positions = true,
+                           .token_count = 64);                 /* the first 64 tokens: the source */
+  /* ... the encoder's blocks, its output e ... */
+  uint32_t kv = linear(.net = net, .inputs = {e}, .neurons_amount = 2 * 512);
+  uint32_t tgt = embedding(.net = net, .inputs = {0}, .input_count = 1, .vocabulary = V,
+                           .neurons_amount = 512, .positions = true, .token_offset = 64);
+  /* ... the decoder's causal self-attention, its queries q = linear(512) ... */
+  attention(.net = net, .inputs = {q, kv}, .heads = 8, .ignore_padding = true);
+  ```
 - Networks of these layers save to `.slett` files (format 8; 9 with a tied head, its table stored once,
-  padding ignored or a sliding window),
+  padding ignored, a sliding window, cross-attention or embeddings of part of their input),
   become deployment models in every precision (the linear maps in INT8 down to INT2) and run on the
   runtime and the engine.
 - `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every

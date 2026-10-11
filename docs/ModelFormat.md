@@ -10,8 +10,8 @@ concatenates several, or pools globally (0.10 on), version 7 for networks with t
 convolutions, upsampling or layer normalization (0.13 on), version 8 for the layers of transformers
 (embeddings, attention, RMS normalization, products of layers), the GELU and SiLU activations and the
 sparse cross-entropy loss (1.2 on), version 9 for the training features of language models: dense and
-linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window (1.3
-on). `spingalett_load()` and `spingalett_load_from_memory()` read versions 1 to 9.
+linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window,
+cross-attention and embeddings of part of their input (1.3 on). `spingalett_load()` and `spingalett_load_from_memory()` read versions 1 to 9.
 
 Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
 (`spingalett_model_init()` in `Spingalett.Inference.h`) checks the image and computes directly from
@@ -120,11 +120,11 @@ in version 5 and 112 bytes in versions 6 to 9:
 | 68 | 4 | versions 5 to 9: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); 0 for other kinds |
 | 72 | 4 | versions 5 to 9: batch normalization's momentum, a float in [0, 1] (used only when training); version 9: an attention's sliding window `w`, an integer (0: every key); 0 for other kinds |
 | 76 | 4 | versions 7 to 9: upsampling mode, 0 nearest or 1 bilinear; versions 8 and 9: attention's flags (bit 0: causal; version 9: bit 1, padding ignored, with bits 16 to 31 the index of the embedding whose tokens tell it; other bits 0), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
-| 80 | 4 | versions 6 to 9: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications) |
+| 80 | 4 | versions 6 to 9: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications; version 9: 2 for cross-attention) |
 | 84 | 4 | versions 6 to 9: the first of them, a layer index from 0 (the network's input) to `i` |
 | 88 | 8 | versions 6 to 9: offset of the input list, `k` 32-bit layer indices (the first equal to the one above, all from 0 to `i`), when `k` is 2 or more; 0 otherwise |
 | 96 | 8 | versions 6 to 9: byte offset of the layer's output among the activations (a multiple of 16); 0 for the last layer |
-| 104 | 4 | versions 8 and 9: an attention's key and value heads (at least 1, dividing its heads); version 9 also: a dense or convolution layer's tied embedding, the index of an embedding layer before it whose table are its weights (0: weights of its own); 0 for other kinds; versions 6 and 7: reserved, 0 |
+| 104 | 4 | versions 8 and 9: an attention's key and value heads (at least 1, dividing its heads); version 9 also: a dense or convolution layer's tied embedding, the index of an embedding layer before it whose table are its weights (0: weights of its own), an embedding's token offset, the first of its input's values it reads; 0 for other kinds; versions 6 and 7: reserved, 0 |
 | 108 | 4 | versions 8 and 9: an attention's base of the rotary position embeddings, a float at least 0 (0: none); 0 for other kinds; versions 6 and 7: reserved, 0 |
 
 The input shape of entry `i` is the output shape of entry `i - 1` in versions 4 and 5, and the
@@ -173,12 +173,19 @@ layer 0): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output chan
   vocabulary (offset 64) rows of `n = out_c` values in the file's precision (with row scales for the
   integer ones); its biases section, when flag bit 0 (offset 76) is set, holds a vector of `out_c`
   floats for each output cell (`out` floats, the positions'), and is absent (offset 0) otherwise.
+  Version 9: an embedding of part of its input reads, of an input of one row (`in_h` 1), the `out_w` values
+  from its token offset `o` (offset 104) on, `o + out_w` at most `in_w x in_c` (an encoder's and a decoder's
+  tokens side by side in one input, an embedding each).
 - Attention (version 8): output shape `in_h x in_w x (heads x head)`, the input's channels `(heads +
   2 kv_heads) x head` for a head size `head` (even when the rotary base is not 0); no sections, no
   window, epsilon and momentum 0 (version 9: offset 72 the sliding window, any value). Version 9: with flag
   bit 1, keys of padding are left out: the embedding
   `e` of bits 16 to 31 (a layer before it, reading the network's input) has as many cells as the attention
-  has keys, key `j`'s token being value `j` of the network's input.
+  has keys, key `j`'s token being value `o + j` of the network's input (`o` the embedding's token offset).
+  Cross-attention (version 9): `k` = 2, the first input the queries (`in_c` = `heads x head`), the second, a
+  layer other than the network's input, the keys and values of its own cells (`2 kv_heads x head` channels,
+  the key heads' then the value heads'), the first input a layer too; neither causal, nor windowed, nor
+  rotary (offset 108 0), and its padding that of the second input's cells.
 - RMS normalization (version 8): as layer normalization without beta (no biases section).
 - Multiplication (version 8): as addition, `k` inputs of the entry's output shape.
 - A dense layer or convolution tied to an embedding (version 9, offset 104 the embedding's layer index `t`,
@@ -262,9 +269,12 @@ the file size; for integer layers but embeddings, when `n` exceeds 131072 (so th
 fits a 32-bit accumulator); in version 9, when a tied layer names no embedding before it, or one whose
 rows, row length, precision, weights or scales differ from its own, or is a convolution of another window,
 or an attention's flags have bits other than those above, bit 1 without an embedding, or an embedding that
-reads another layer than the input or has another number of cells than its keys;
+reads another layer than the input or has another number of cells than its keys, or a cross-attention reads the
+network's input or keys and values of other channels, or is causal, windowed or rotary, or an embedding's range
+lies beyond its input or its input has several rows;
 and in versions 6 to 9, when an entry reads a layer that is not before it,
-more than 16 layers, several layers without being an addition, concatenation or multiplication, or
+more than 16 layers, several layers without being an addition, concatenation, multiplication or (version 9)
+cross-attention, or
 layers whose shapes do not
 fit, when `in` differs from the units of its first input, or when an output (other than the last
 one) does not lie within the activations, is misaligned or overlaps the output of an input of its
@@ -314,9 +324,9 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   `y = (x - mean) * (1 / sqrt(var + eps)) * gamma[c] + beta[c]`.
 - RMS normalization computes, per cell, `r = 1 / sqrt((sum over c of x^2) * (1 / C) + eps)` in float
   (the sum in channel order), then `y = x * r * gamma[c]`.
-- An embedding copies, for each input value `t`, row `t` of its table (decoded as the weights of a
-  dense layer are) when `0 <= t < vocabulary` (`t` taken as an integer), zeros otherwise, then adds
-  the position's vector of its cell when it has them.
+- An embedding copies, for each input value `t` (version 9: of its range), row `t` of its table (decoded as
+  the weights of a dense layer are) when `0 <= t < vocabulary` (`t` taken as an integer), zeros otherwise,
+  then adds the position's vector of its cell when it has them.
 - Attention computes, for each query head `h` (reading key and value head `g = h / (heads /
   kv_heads)`) and each cell `i`, the scores `s_j = (q_i . k_j) / sqrt(head)` over the cells `j` (up to
   `i` when causal) in order, each dot product summed in order, and `y = (sum_j exp(s_j - m) v_j) /
@@ -327,7 +337,9 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   cosine and sine computed in double and rounded to float. With a sliding window `w > 0` (version 9), cell
   `i` reads the keys `j` with `j + w > i`, and `j < i + w` when not causal (a window of at least the cells is
   no window). Ignoring padding (version 9), the keys whose tokens are negative (not 0 or more) are left out
-  of the sums as if they were not there; a query left without a key gives zeros.
+  of the sums as if they were not there; a query left without a key gives zeros. Cross-attention (version 9)
+  computes the same with the queries of its first input and the keys and values of its second, every query
+  over every key of its sample.
 - A multiplication multiplies its inputs in their order (`x0 * x1`, then `* x2` and so on).
 - Pooling takes, per channel, the maximum or the mean of the window's cells inside the input;
   padding cells are not counted (a window of 2 x 2 cells over one row of padding averages 2 cells).

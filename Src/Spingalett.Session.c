@@ -92,6 +92,10 @@ static bool session_model(const SpingalettModel *model, uint32_t *cells, uint32_
     SlettLayer L;
     spingalett_slett_layer(image, 0, &L);
     *cells = L.out_h * L.out_w;
+    if (L.token_offset != 0 || *cells != L.inputs) {
+        snprintf(why, size, "its embedding reads part of the input");
+        return false;
+    }
     for (uint32_t i = 1; i < model->layer_count; i++) {
         spingalett_slett_layer(image, i, &L);
         const char *name = (unsigned)L.type < LAYER_TYPE_COUNT ? layer_names[L.type] : "unknown";
@@ -448,7 +452,7 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
             for (uint32_t k = 0; k < L->input_count; k++) units[k] = rows * channels[k];
             spingalett_predict_combine(&R, x, units, channels, y, 1, mode);
         } else {
-            spingalett_predict_layer(image, &R, prep, false, NULL, 0, x[0], y, 1, w, mode);
+            spingalett_predict_layer(image, &R, prep, false, NULL, 0, x[0], NULL, y, 1, w, mode);
         }
     }
     activate_rows(y, rows, L->out_c, pos, s->cells, L->activation);

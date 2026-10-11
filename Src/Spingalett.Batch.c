@@ -35,6 +35,8 @@ void spingalett_batch_workspace_free(BatchWorkspace *ws) {
     spingalett_aligned_free(ws->pre_flat);
     spingalett_aligned_free(ws->rope_flat);
     spingalett_aligned_free(ws->attn);
+    spingalett_aligned_free(ws->dkv_flat);
+    free(ws->dkv);
     for (int t = 0; ws->attn_gemm && t < ws->attn_threads; t++) spingalett_gemm_scratch_free(ws->attn_gemm[t]);
     free(ws->attn_gemm);
     free(ws->pre);
@@ -222,6 +224,21 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
             off += a->height * a->width * (a->channels / a->heads);
         }
     }
+    /* cross-attention, training: its keys' and values' gradient */
+    size_t dkv_floats = 0;
+    for (uint32_t l = 1; training && l < net->layers; l++)
+        if (net->shapes[l].type == LAYER_ATTENTION && spingalett_input_count(net, l) == 2)
+            dkv_floats += (size_t)capacity * net->topology[spingalett_attention_kv(net, l)];
+    if (dkv_floats > 0) {
+        ws->dkv = (float **)calloc(net->layers, sizeof(float *));
+        ws->dkv_flat = (float *)spingalett_aligned_alloc(dkv_floats * sizeof(float));
+        if (!ws->dkv || !ws->dkv_flat) goto fail;
+        for (uint32_t l = 1, off = 0; l < net->layers; l++)
+            if (net->shapes[l].type == LAYER_ATTENTION && spingalett_input_count(net, l) == 2) {
+                ws->dkv[l] = ws->dkv_flat + off;
+                off += capacity * net->topology[spingalett_attention_kv(net, l)];
+            }
+    }
     if (attn_floats > 0) {
         int threads = 1;
 #if defined(_OPENMP)
@@ -309,8 +326,9 @@ static void batch_layer(NeuralNetwork *net, BatchWorkspace *ws, uint32_t l, cons
             spingalett_embedding_forward(net, l - 1, X, y, N, act, mode);
             break;
         case LAYER_ATTENTION:
-            spingalett_attention_forward(net, l - 1, X, y, N, ws->training ? ws->bn_stats[l] : NULL, ws->rope[l], ws,
-                                         mode);
+            spingalett_attention_forward(net, l - 1, X, spingalett_input_count(net, l) == 2 ?
+                                         ws->act[spingalett_attention_kv(net, l)] : NULL, y, N,
+                                         ws->training ? ws->bn_stats[l] : NULL, ws->rope[l], ws, mode);
             if (act != ACT_NONE) apply_activation_bulk(y, (uint64_t)N * curr_size, act);
             break;
         case LAYER_ADD:

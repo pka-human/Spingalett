@@ -102,6 +102,8 @@ public sealed unsafe class Layer
     public Layer IgnorePadding(bool ignore = true) { Args.ignore_padding = (byte)(ignore ? 1 : 0); return this; }
     /// <summary>Attention: a sliding window, keys less than this many cells away (0: every key).</summary>
     public Layer Window(uint window) { Args.window = window; return this; }
+    /// <summary>An embedding of part of its input: count tokens (0: the rest) from value offset on.</summary>
+    public Layer Tokens(uint offset, uint count = 0) { Args.token_offset = offset; Args.token_count = count; return this; }
     /// <summary>The layers it reads (indices that Network.Add returned); none: the last one.</summary>
     public Layer Inputs(params uint[] inputs)
     {

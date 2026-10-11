@@ -110,7 +110,8 @@ typedef struct {
     bool ignore_padding;
     uint32_t tied;
     uint32_t window;
-    uint64_t reserved[8 - 3];
+    uint32_t token_offset;
+    uint64_t reserved[8 - 4];
 } SpingalettLayerInfo;
 
 int spingalett_model_init(SpingalettModel *model, const void *image, size_t size);
@@ -273,7 +274,8 @@ typedef struct {
     bool ignore_padding;
     uint32_t tied;
     uint32_t window;
-    uint64_t reserved[8 - 3];
+    uint32_t token_offset;
+    uint64_t reserved[8 - 4];
 } SpingalettNetworkLayer;
 
 typedef enum {
@@ -381,7 +383,9 @@ typedef struct {
     bool ignore_padding;
     uint32_t tied;
     uint32_t window;
-    uint64_t reserved[8 - 4];
+    uint32_t token_offset;
+    uint32_t token_count;
+    uint64_t reserved[8 - 5];
 } SpingalettLayerArgs;
 
 typedef struct {

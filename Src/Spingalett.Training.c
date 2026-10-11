@@ -352,8 +352,15 @@ static bool input_gradient(NeuralNetwork *net, BatchWorkspace *ws, uint32_t c, u
             spingalett_rms_backward_data(net, c - 1, ws->act[i], ws->delta[c], dst, N, ws->bn_stats[c], mode);
             return false;
         case LAYER_ATTENTION:
-            spingalett_attention_backward(net, c - 1, ws->act[i], ws->delta[c], dst, N, ws->bn_stats[c], ws->rope[c], ws,
-                                          mode);
+            /* cross-attention: the pass for the queries (input 0, before input 1) leaves the keys' and values'
+               gradient in dkv[c] for the second input (never the network's input) */
+            if (k == 1) {
+                memcpy(dst, ws->dkv[c], (size_t)N * cur_sz * sizeof(float));
+                return false;
+            }
+            spingalett_attention_backward(net, c - 1, ws->act[i], spingalett_input_count(net, c) == 2 ?
+                                          ws->act[in[1]] : NULL, ws->delta[c], dst, ws->dkv ? ws->dkv[c] : NULL, N,
+                                          ws->bn_stats[c], ws->rope[c], ws, mode);
             return false;
         case LAYER_MULTIPLY: {
             const float *x[SPINGALETT_MAX_INPUTS];

@@ -9,7 +9,7 @@ import java.lang.foreign.ValueLayout;
 /** A layer to add to a network: made by a kind's method, then options (each returns the layer). */
 public final class Layer {
     int type, neurons, act, init, height, width, channels, filters, kernel, stride, padding, groups, upsample;
-    int outputPadding, vocabulary, heads, kvHeads, tied, window;
+    int outputPadding, vocabulary, heads, kvHeads, tied, window, tokenOffset, tokenCount;
     float dropout, epsilon, ropeTheta;
     boolean causal, positions, ignorePadding;
     int[] inputs = new int[0];
@@ -96,6 +96,8 @@ public final class Layer {
     public Layer ignorePadding(boolean v) { ignorePadding = v; return this; }
     /** Attention: a sliding window, keys less than w cells away (with causal the cell and the w - 1 before it). */
     public Layer window(int w) { window = w; return this; }
+    /** An embedding of part of its input: count tokens (0: the rest) from value offset on. */
+    public Layer tokens(int offset, int count) { tokenOffset = offset; tokenCount = count; return this; }
     /** The layers it reads (indices that Network.add returned; 0 the input layer); none: the last one. */
     public Layer inputs(int... names) {
         if (names.length > Native.MAX_INPUTS) throw new IllegalArgumentException("a layer reads at most 16 layers");
@@ -132,6 +134,8 @@ public final class Layer {
         Native.set(s, L, "tied", tied);
         Native.set(s, L, "ignore_padding", (byte) (ignorePadding ? 1 : 0));
         Native.set(s, L, "window", window);
+        Native.set(s, L, "token_offset", tokenOffset);
+        Native.set(s, L, "token_count", tokenCount);
         long at = L.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("inputs"));
         for (int k = 0; k < inputs.length; k++) s.set(ValueLayout.JAVA_INT, at + 4L * k, inputs[k]);
         Native.set(s, L, "input_count", inputs.length);

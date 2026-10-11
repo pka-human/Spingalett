@@ -79,8 +79,10 @@ static bool layer_inputs(const NeuralNetwork *net, const LayerArgs *args, uint32
         }
         *count = n;
     }
-    if (*count > 1 && args->type != LAYER_ADD && args->type != LAYER_CONCAT && args->type != LAYER_MULTIPLY)
-        return layer_error("Only add, concatenation and multiplication layers read several layers");
+    if (*count > 1 && args->type != LAYER_ADD && args->type != LAYER_CONCAT && args->type != LAYER_MULTIPLY &&
+        !(args->type == LAYER_ATTENTION && *count == 2))
+        return layer_error("Only add, concatenation and multiplication layers read several layers (cross-attention "
+                           "two)");
     return true;
 }
 
@@ -188,13 +190,21 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->channels = in->channels;
         units = (uint64_t)shape->height * shape->width * shape->channels;
     } else if (args->type == LAYER_EMBEDDING) {
-        /* a row of the table for every value of the input: h x (w c) cells */
+        /* a row of the table for every value of the input: h x (w c) cells; with a range of tokens, the input's
+           values [token_offset, token_offset + token_count) of its one row */
         const LayerShape *in = &net->shapes[inputs[0]];
         if (args->vocabulary == 0)
             return layer_error("An embedding needs a vocabulary (the rows of its table)");
         if (args->neurons_amount == 0)
             return layer_error("An embedding needs neurons_amount (the values of a row)");
-        const uint64_t width = (uint64_t)in->width * in->channels;
+        uint64_t width = (uint64_t)in->width * in->channels;
+        if (args->token_offset || args->token_count) {
+            if (in->height != 1 || args->token_offset >= width ||
+                (uint64_t)args->token_offset + args->token_count > width)
+                return layer_error("An embedding's range of tokens lies within its input's one row (of height 1)");
+            width = args->token_count ? args->token_count : width - args->token_offset;
+            shape->token_offset = args->token_offset;
+        }
         if (width > 65535)
             return layer_error("Layer heights and widths are limited to 65535");
         shape->height = in->height;
@@ -206,14 +216,27 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         if ((uint64_t)args->vocabulary * args->neurons_amount > (1ull << 40))
             return layer_error("Embedding tables are limited to 2^40 values");
     } else if (args->type == LAYER_ATTENTION) {
-        /* queries, keys and values of every cell side by side; the heads' results side by side */
+        /* queries, keys and values of every cell side by side; the heads' results side by side. Cross-attention:
+           the queries of the first input's cells over the keys and values of the second's */
         const LayerShape *in = &net->shapes[inputs[0]];
+        const bool cross = count == 2;
         const uint32_t heads = args->heads ? args->heads : 1u, kv = args->kv_heads ? args->kv_heads : heads;
         if (heads > 4096 || kv > heads || heads % kv != 0)
             return layer_error("Attention: kv_heads must divide heads (at most 4096)");
-        if (in->channels % (heads + 2u * kv) != 0)
+        if (cross) {
+            const LayerShape *keys = &net->shapes[inputs[1]];
+            if (inputs[0] == 0 || inputs[1] == 0)
+                return layer_error("Cross-attention reads layers of queries and of keys and values, not the network's "
+                                   "input");
+            if (args->causal || args->window || args->rope_theta != 0.0f)
+                return layer_error("Cross-attention is neither causal nor of a sliding window nor rotary");
+            if (in->channels % heads != 0 || keys->channels != 2u * kv * (in->channels / heads))
+                return layer_error("Cross-attention reads heads x head size channels a cell of queries, and 2 "
+                                   "kv_heads x head size of keys and values");
+        } else if (in->channels % (heads + 2u * kv) != 0) {
             return layer_error("Attention reads (heads + 2 kv_heads) x head size channels a cell");
-        const uint32_t head = in->channels / (heads + 2u * kv);
+        }
+        const uint32_t head = in->channels / (cross ? heads : heads + 2u * kv);
         if (!(args->rope_theta >= 0.0f && args->rope_theta < INFINITY))
             return layer_error("Attention: rope_theta must be 0 (none) or positive");
         if (args->rope_theta > 0.0f && head % 2u != 0)
@@ -227,7 +250,7 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         shape->causal = args->causal;
         shape->window = args->window;
         /* padding: the keys' cells those of an embedding of the network's input */
-        shape->mask = args->ignore_padding ? cells_of(net, inputs[0]) : 0u;
+        shape->mask = args->ignore_padding ? cells_of(net, inputs[cross ? 1 : 0]) : 0u;
         if (args->ignore_padding && !shape->mask)
             return layer_error("Attention: ignore_padding needs keys whose cells are an embedding's of the network's "
                                "input, through layers that keep cells one for one");
@@ -739,6 +762,10 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
             a.neurons_amount = s->channels;
             a.vocabulary = s->vocabulary;
             a.positions = s->positions;
+            if (s->token_offset || (uint64_t)s->height * s->width != net->topology[spingalett_source(net, l)]) {
+                a.token_offset = s->token_offset;
+                a.token_count = s->height * s->width;
+            }
             break;
         case LAYER_ATTENTION:
             a.heads = s->heads;
@@ -811,6 +838,7 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->ignore_padding = s->mask != 0;
     layer->tied = s->tied;
     layer->window = s->window;
+    layer->token_offset = s->token_offset;
     if (index > 0) {
         layer->bias_count = spingalett_bias_count(net, index - 1);
         layer->weight_count = spingalett_weight_count(net, index - 1);

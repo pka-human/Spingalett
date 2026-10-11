@@ -66,7 +66,9 @@ public unsafe struct LayerArgs
     public byte ignore_padding;
     public uint tied;
     public uint window;
-    public fixed ulong reserved[Const.Reserved - 4];
+    public uint token_offset;
+    public uint token_count;
+    public fixed ulong reserved[Const.Reserved - 5];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -96,7 +98,8 @@ public unsafe struct NetworkLayer
     public byte ignore_padding;
     public uint tied;
     public uint window;
-    public fixed ulong reserved[Const.Reserved - 3];
+    public uint token_offset;
+    public fixed ulong reserved[Const.Reserved - 4];
 }
 
 [StructLayout(LayoutKind.Sequential)]
