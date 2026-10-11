@@ -1065,7 +1065,7 @@ bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *dat
 
 ### `SpingalettTokenizer`
 
-Tokenizers of language models: the byte-pair encodings of Hugging Face's tokenizer.json files (GPT-2's byte-level BPE and tiktoken's encodings as LLaMA 3, Qwen2 and SmolLM use them; SentencePiece's BPE with byte fallback as LLaMA 2, Mistral and Phi-3 use it). A text is encoded as Hugging Face's tokenizers library encodes it: the added tokens found in it, the rest normalized (NFC, prepended and replaced strings), cut into pieces by the pre-tokenizers (byte-level, the regular expressions of GPT-2, cl100k and o200k, digits, Metaspace, splits on strings) and each piece merged pair by pair in the order of the merges, in time n log n of the piece's length. Decoding reverses it (byte-level, byte fallback, Metaspace, replacements, stripping). Other models (WordPiece, Unigram) and patterns are refused, naming what is missing. A tokenizer is read-only once loaded: threads may share it.
+Tokenizers of language models: the byte-pair encodings of Hugging Face's tokenizer.json files (GPT-2's byte-level BPE and tiktoken's encodings as LLaMA 3, Qwen2 and SmolLM use them; SentencePiece's BPE with byte fallback as LLaMA 2, Mistral and Phi-3 use it) and of GGUF files' vocabularies (the BPE of merges of their "gpt2" model, by the pre-tokenizer they name; SentencePiece's BPE of scores of their "llama" model, as llama.cpp and sentencepiece encode). A text is encoded as Hugging Face's tokenizers library encodes it: the added tokens found in it, the rest normalized (NFC, prepended and replaced strings), cut into pieces by the pre-tokenizers (byte-level, the regular expressions of GPT-2, cl100k and o200k, digits, Metaspace, splits on strings) and each piece merged pair by pair in the order of the merges, in time n log n of the piece's length. Decoding reverses it (byte-level, byte fallback, Metaspace, replacements, stripping). Other models (WordPiece, Unigram) and patterns are refused, naming what is missing. A tokenizer is read-only once loaded: threads may share it.
 
 ```c
 typedef struct SpingalettTokenizer SpingalettTokenizer;
@@ -1086,8 +1086,9 @@ typedef struct {
     uint32_t vocabulary;            /* token ids: the largest one + 1 (the model's tokens and the added ones) */
     uint32_t added;                 /* added tokens (special ones, such as "<|endoftext|>", and others) */
     uint32_t bos, eos;              /* the tokens beginning and ending a text (SPINGALETT_NO_TOKEN when unknown):
-                                       tokenizer_config.json's bos_token and eos_token, else the template's
-                                       tokens or special tokens named so ("<s>", "</s>", "<|endoftext|>") */
+                                       tokenizer_config.json's bos_token and eos_token, a GGUF file's ids, else
+                                       the template's tokens or special tokens named so ("<s>", "</s>",
+                                       "<|endoftext|>") */
     uint32_t pad, unk;              /* padding, and the token of what the vocabulary lacks */
     uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettTokenizerInfo;
@@ -1095,7 +1096,7 @@ typedef struct {
 
 ### `spingalett_tokenizer_load()`
 
-Reads a tokenizer.json file, or a model directory holding one (its tokenizer_config.json, when there is one, names the BOS and EOS tokens). NULL on error.
+Reads a tokenizer.json file, a model directory holding one (its tokenizer_config.json, when there is one, names the BOS and EOS tokens) or a GGUF file's vocabulary. NULL on error.
 
 ```c
 SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
@@ -1103,7 +1104,7 @@ SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
 
 ### `spingalett_tokenizer_from_memory()`
 
-The bytes of a tokenizer.json file in memory; they are not kept.
+The bytes of a tokenizer.json file, or of a GGUF file, in memory; they are not kept.
 
 ```c
 SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
@@ -1204,8 +1205,8 @@ int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
 
 ```c
 typedef struct {
-    const char *path;               /* a model directory of Hugging Face's form: config.json and model.safetensors,
-                                       or the shards model.safetensors.index.json names */
+    const char *path;               /* a model directory of Hugging Face's form (config.json and model.safetensors,
+                                       or the shards model.safetensors.index.json names), or a GGUF file */
     uint32_t context;               /* tokens a sample, the network's window: 0 = the model's positions (GPT-2's
                                        all, LLaMA's at most 2048) */
     uint64_t reserved[SPINGALETT_RESERVED];
@@ -1214,7 +1215,7 @@ typedef struct {
 
 ### `spingalett_load_pretrained()`
 
-A language model as a network: the model_type of config.json llama, mistral, qwen2 or gpt2, its weights from safetensors files (F32, F16 or BF16; mapped, each tensor decoded once into its layer). LLaMA, Mistral and Qwen2 become RMS normalizations, grouped-query attention with rotary embeddings (the queries', keys' and values' projections, with Qwen2's biases, in one linear layer), and a SwiGLU MLP (a SiLU layer times a linear one); GPT-2 layer normalizations, learned positions, a GELU MLP and its Conv1D weights transposed. The language model head is lm_head.weight, or a copy of the embeddings (tied). The network takes a window of `context` token ids and gives every position's logits (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it generates (spingalett_generate()), trains and saves like any other. Mistral's sliding window is not applied: attention covers the whole context, which is exact for contexts within the window (a warning says when the context exceeds it). Scaled rotary embeddings (LLaMA 3.1's, YaRN) are refused. The tokenizer comes from spingalett_tokenizer_load() on the same directory. NULL on error.
+A language model as a network: the model_type of config.json llama, mistral, qwen2 or gpt2, its weights from safetensors files (F32, F16 or BF16; mapped, each tensor decoded once into its layer); or the general.architecture of a GGUF file (version 2 or 3) llama (LLaMA, Mistral), qwen2 or gpt2, its hyper-parameters from its metadata and its weights dequantized to floats as llama.cpp dequantizes them (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS), LLaMA's queries and keys taken back from llama.cpp's order of their rows. LLaMA, Mistral and Qwen2 become RMS normalizations, grouped-query attention with rotary embeddings (the queries', keys' and values' projections, with Qwen2's biases, in one linear layer), and a SwiGLU MLP (a SiLU layer times a linear one); GPT-2 layer normalizations, learned positions, a GELU MLP and its Conv1D weights transposed. The language model head is lm_head.weight (output.weight), or a copy of the embeddings (tied). The network takes a window of `context` token ids and gives every position's logits (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it generates (spingalett_generate()), trains and saves like any other. Mistral's sliding window is not applied: attention covers the whole context, which is exact for contexts within the window (a warning says when the context exceeds it). Scaled rotary embeddings (LLaMA 3.1's, YaRN) are refused. The tokenizer comes from spingalett_tokenizer_load() on the same path. NULL on error.
 
 ```c
 #define spingalett_load_pretrained(...) spingalett_load_pretrained_args((SpingalettPretrainedArgs){__VA_ARGS__})

@@ -2023,10 +2023,7 @@ SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t s
         set_error(SPINGALETT_ERR_INVALID, "tokenizer: data is NULL");
         return NULL;
     }
-    if (size >= 4 && !memcmp(data, "GGUF", 4)) {
-        set_error(SPINGALETT_ERR_INVALID, "tokenizer: GGUF files are not read yet");
-        return NULL;
-    }
+    if (size >= 4 && !memcmp(data, "GGUF", 4)) return spingalett_gguf_tokenizer((const uint8_t *)data, size);
     return load_json((const char *)data, size, NULL, 0);
 }
 
@@ -2183,20 +2180,29 @@ SpingalettTokenizer *spingalett_tokenizer_build(const SpgTokenizerSpec *spec) {
         }
         ok = ok && merges_from_scores(t, spec->scores);
     } else if (ok) {
-        /* byte-level BPE: the pre-tokenizer llama.cpp names */
+        /* byte-level BPE: the pre-tokenizer of the tokenizer.json llama.cpp's converter recognized (its name) */
         const char *pre = spec->pre ? spec->pre : "default";
         int digits = 0;
+        bool digits_apart = false;          /* SmolLM's and StarCoder's: each digit a piece, then GPT-2's */
         if (!strcmp(pre, "llama3") || !strcmp(pre, "llama-bpe") || !strcmp(pre, "llama-v3") || !strcmp(pre, "smaug-bpe") ||
-            !strcmp(pre, "dbrx") || !strcmp(pre, "falcon3") || !strcmp(pre, "pixtral"))
+            !strcmp(pre, "dbrx") || !strcmp(pre, "falcon3") || !strcmp(pre, "pixtral")) {
             digits = 3;
-        else if (!strcmp(pre, "qwen2") || !strcmp(pre, "deepseek-r1-qwen") || !strcmp(pre, "megrez"))
+            /* LLaMA 3's tokenizer.json looks whole pieces up first (ignore_merges), as llama.cpp does for these */
+            t->ignore_merges = strcmp(pre, "smaug-bpe") && strcmp(pre, "dbrx");
+        } else if (!strcmp(pre, "qwen2") || !strcmp(pre, "deepseek-r1-qwen") || !strcmp(pre, "megrez"))
             digits = 1;
+        else if (!strcmp(pre, "smollm") || !strcmp(pre, "starcoder"))
+            digits_apart = true;
         else if (strcmp(pre, "default") && strcmp(pre, "gpt-2") && strcmp(pre, "gpt2"))
             spingalett_log(LOG_WARNING, "GGUF: the pre-tokenizer '%s' is unknown; GPT-2's is used", pre);
         if (digits == 1) ok = add_step(&t->norm, &t->norm_count, STEP_NFC) != NULL;
         if (ok && digits) {
             ok = (st = add_step(&t->pre, &t->pre_count, STEP_SPLIT)) != NULL;
             if (ok) { st->pattern = PATTERN_CL100K; st->digits = digits; st->behavior = SPLIT_ISOLATED; }
+        }
+        if (ok && digits_apart) {
+            ok = (st = add_step(&t->pre, &t->pre_count, STEP_DIGITS)) != NULL;
+            if (ok) st->individual = true;
         }
         ok = ok && (st = add_step(&t->pre, &t->pre_count, STEP_BYTE_LEVEL));
         if (ok) st->use_regex = digits == 0;

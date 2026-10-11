@@ -55,7 +55,7 @@ Python (wheels with the library inside), C++, Rust, .NET, Go and Java are includ
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
-| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) and GGUF files (dequantized from 15 types) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
@@ -537,8 +537,8 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 ### Tokenizers
 
 `spingalett_tokenizer_load()` reads the tokenizer of a language model: a Hugging Face
-`tokenizer.json` file, or a model directory holding one (its `tokenizer_config.json` then names the
-BOS and EOS tokens). `spingalett_tokenize()` turns UTF-8 text into token ids and
+`tokenizer.json` file, a model directory holding one (its `tokenizer_config.json` then names the
+BOS and EOS tokens) or a GGUF file (see below). `spingalett_tokenize()` turns UTF-8 text into token ids and
 `spingalett_detokenize()` ids back into text, id for id and byte for byte as Hugging Face's
 `tokenizers` library does:
 
@@ -624,6 +624,34 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
   greedy continuation is the same; on Hugging Face's tiny random LLaMA and GPT-2 within 2e-7. The
   `pretrained` test group checks tiny LLaMA (BF16, sharded), Qwen2 (F16, biases, tied), Mistral
   and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) against PyTorch, within 2e-6.
+
+GGUF files, llama.cpp's, load the same way: `.path` names the file, `spingalett_tokenizer_load()` reads
+its vocabulary, and the network is that of its `general.architecture` (`llama`, which covers Mistral,
+`qwen2` or `gpt2`) with the hyper-parameters of its metadata:
+
+```c
+NeuralNetwork *net = spingalett_load_pretrained(.path = "SmolLM2-135M.Q4_K_M.gguf", .context = 512);
+SpingalettTokenizer *tok = spingalett_tokenizer_load("SmolLM2-135M.Q4_K_M.gguf");
+```
+
+- Quantized weights become floats as llama.cpp's `dequantize_row_*()` computes them: F32, F16, BF16,
+  Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, the k-quants Q2_K to Q6_K, and IQ4_NL and IQ4_XS, which quantized
+  files of widths that are no multiple of 256 hold where k-quants cannot be. The network keeps
+  floats (quantize it again with `spingalett_model_from_network()` to deploy it). The other i-quants
+  are refused, naming the tensor and its type. On the quantized SmolLM2-135M files of every type
+  above, the weights are those of the `gguf` Python package's dequantization, bit for bit (the
+  dequantization is compiled in IEEE order, so they are the same on every platform), and a Q4_K_M
+  file loads in 0.18 s on an i7-12650H.
+- llama.cpp's converter stores LLaMA's queries and keys with the rows of each head's two halves
+  interleaved, for its rotation of adjacent pairs; they are put back in Hugging Face's order, which
+  the library's rotation of halves expects (Qwen2's are stored in that order already).
+- A vocabulary of the `gpt2` model is a byte-level BPE of its merges, cut by the pre-tokenizer
+  `tokenizer.ggml.pre` names (`llama-bpe`, `qwen2`, `smollm`, `gpt-2`, ...); one of the `llama` model
+  is SentencePiece's BPE of its scores, with byte fallback and the space before each text and after
+  each special token, as llama.cpp and the `sentencepiece` library encode it. Control tokens are
+  special, user-defined tokens are found in any text, and `tokenizer.ggml.add_bos_token` gives the
+  BOS of `.add_special`. GGUF vocabularies of SmolLM2 and TinyStories give the ids of the
+  `tokenizer.json` files they were converted from.
 
 ### Importing models: ONNX and PyTorch
 

@@ -35,6 +35,18 @@ All notable changes to this project are documented in this file. The format foll
   scaled rotary embeddings are refused. On SmolLM2-135M the logits agree with `transformers` within
   2.4e-4 and the greedy continuation is the same. The `pretrained` test group compares tiny LLaMA,
   Qwen2, Mistral and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) with PyTorch.
+- **GGUF files**, llama.cpp's (versions 2 and 3), in `spingalett_load_pretrained()` and
+  `spingalett_tokenizer_load()` / `_from_memory()`: the network of `general.architecture` llama
+  (LLaMA, Mistral), qwen2 or gpt2 with the hyper-parameters of the metadata, its weights dequantized as
+  llama.cpp's `dequantize_row_*()` computes them (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K,
+  Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS; in IEEE order, the same weights on every platform), LLaMA's
+  queries and keys taken back from llama.cpp's order of their rows; the vocabulary of the `gpt2` model
+  as a byte-level BPE by the pre-tokenizer the file names, that of the `llama` model as SentencePiece's
+  BPE of its scores. On quantized SmolLM2-135M files the weights equal the `gguf` package's
+  dequantization bit for bit; the `pretrained` group checks a GGUF file of `hf_llama`'s weights (the
+  directory's logits bit for bit), a model of fifteen types (each matrix against a reference written
+  with llama.cpp's formulas and checked against `gguf`'s), a SentencePiece vocabulary against the
+  `sentencepiece` library's ids, and damaged files.
 - An internal JSON reader (`Src/Spingalett.Json.c`) for the files of language models.
 
 ## [1.2.0] - 2026-10-11

@@ -50,8 +50,61 @@ static bool part_into(SpgTensorSource *src, SpgPart part, uint32_t block, float 
 /* An optional bias: read, or zeros. */
 static bool bias_into(SpgTensorSource *src, SpgPart part, uint32_t block, float *dst, uint32_t rows) {
     if (src->has(src, part, block)) return part_into(src, part, block, dst, 1, rows);
-    memset(dst, 0, (size_t)rows * sizeof(float));
+    if (dst) memset(dst, 0, (size_t)rows * sizeof(float));
     return true;
+}
+
+/* Where layer l's weights (biases) begin, plus an offset; NULL without a network (a dry run). */
+static float *weights_at(NeuralNetwork *net, uint32_t l, uint64_t offset) {
+    return net ? net->weights + net->weight_offsets[l - 1] + offset : NULL;
+}
+
+static float *biases_at(NeuralNetwork *net, uint32_t l, uint64_t offset) {
+    return net ? net->biases + net->bias_offsets[l - 1] + offset : NULL;
+}
+
+/* Every part into its layer; without a network (src->dry), every part's presence and shape checked. */
+static bool read_parts(const SpgTransformer *t, SpgTensorSource *src, NeuralNetwork *net, const Block *blocks,
+                       uint32_t embed, uint32_t norm, uint32_t head) {
+    const bool gpt2 = t->arch == SPG_ARCH_GPT2;
+    const uint32_t C = t->context, W = t->width, V = t->vocabulary, F = t->hidden;
+    const uint32_t Q = t->heads * t->head_size, KV = t->kv_heads * t->head_size;
+    src->dry = net == NULL;
+    bool ok = part_into(src, SPG_PART_EMBED, 0, weights_at(net, embed, 0), V, W);
+    if (ok && gpt2) ok = part_into(src, SPG_PART_POSITIONS, 0, biases_at(net, embed, 0), C, W);
+    for (uint32_t b = 0; ok && b < t->layers; b++) {
+        const Block k = net ? blocks[b] : (Block){1, 1, 1, 1, 1, 1, 1};
+        ok = part_into(src, SPG_PART_ATTN_NORM, b, weights_at(net, k.attn_norm, 0), 1, W) &&
+             (!gpt2 || bias_into(src, SPG_PART_ATTN_NORM_BIAS, b, biases_at(net, k.attn_norm, 0), W)) &&
+             part_into(src, SPG_PART_FFN_NORM, b, weights_at(net, k.ffn_norm, 0), 1, W) &&
+             (!gpt2 || bias_into(src, SPG_PART_FFN_NORM_BIAS, b, biases_at(net, k.ffn_norm, 0), W));
+        if (ok && gpt2) {
+            ok = part_into(src, SPG_PART_QKV, b, weights_at(net, k.qkv, 0), 3 * W, W) &&
+                 bias_into(src, SPG_PART_QKV_BIAS, b, biases_at(net, k.qkv, 0), 3 * W);
+        } else if (ok) {
+            ok = part_into(src, SPG_PART_Q, b, weights_at(net, k.qkv, 0), Q, W) &&
+                 part_into(src, SPG_PART_K, b, weights_at(net, k.qkv, (uint64_t)Q * W), KV, W) &&
+                 part_into(src, SPG_PART_V, b, weights_at(net, k.qkv, (uint64_t)(Q + KV) * W), KV, W) &&
+                 bias_into(src, SPG_PART_Q_BIAS, b, biases_at(net, k.qkv, 0), Q) &&
+                 bias_into(src, SPG_PART_K_BIAS, b, biases_at(net, k.qkv, Q), KV) &&
+                 bias_into(src, SPG_PART_V_BIAS, b, biases_at(net, k.qkv, Q + KV), KV) &&
+                 part_into(src, SPG_PART_GATE, b, weights_at(net, k.gate, 0), F, W) &&
+                 bias_into(src, SPG_PART_GATE_BIAS, b, biases_at(net, k.gate, 0), F);
+        }
+        ok = ok && part_into(src, SPG_PART_O, b, weights_at(net, k.o, 0), W, Q) &&
+             bias_into(src, SPG_PART_O_BIAS, b, biases_at(net, k.o, 0), W) &&
+             part_into(src, SPG_PART_UP, b, weights_at(net, k.up, 0), F, W) &&
+             bias_into(src, SPG_PART_UP_BIAS, b, biases_at(net, k.up, 0), F) &&
+             part_into(src, SPG_PART_DOWN, b, weights_at(net, k.down, 0), W, F) &&
+             bias_into(src, SPG_PART_DOWN_BIAS, b, biases_at(net, k.down, 0), W);
+    }
+    ok = ok && part_into(src, SPG_PART_NORM, 0, weights_at(net, norm, 0), 1, W) &&
+         (!gpt2 || bias_into(src, SPG_PART_NORM_BIAS, 0, biases_at(net, norm, 0), W));
+    if (ok && src->has(src, SPG_PART_HEAD, 0)) ok = part_into(src, SPG_PART_HEAD, 0, weights_at(net, head, 0), V, W);
+    else if (ok && net) memcpy(weights_at(net, head, 0), weights_at(net, embed, 0), (size_t)V * W * sizeof(float));
+    if (ok && net) memset(biases_at(net, head, 0), 0, (size_t)V * sizeof(float));
+    src->dry = false;
+    return ok;
 }
 
 NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSource *src) {
@@ -59,11 +112,14 @@ NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSo
     const uint64_t C = t->context, W = t->width, V = t->vocabulary, F = t->hidden, L = t->layers;
     const uint64_t Q = (uint64_t)t->heads * t->head_size, KV = (uint64_t)t->kv_heads * t->head_size;
     if (!C || C > 65535 || !W || !V || V > (1u << 24) || !L || !t->heads || !t->kv_heads || t->heads % t->kv_heads ||
-        !t->head_size || !F || (!gpt2 && t->head_size % 2)) {
+        !t->head_size || !F || (!gpt2 && t->head_size % 2) || W > (1u << 20) || F > (1u << 20) || Q + 2 * KV > (1u << 20) ||
+        L > 65535) {
         set_error(SPINGALETT_ERR_INVALID, "pretrained: the model's hyper-parameters are invalid (or a context beyond "
                   "65535 tokens, a vocabulary beyond 2^24)");
         return NULL;
     }
+    /* every tensor where the hyper-parameters say, before anything the size of the model is allocated */
+    if (!read_parts(t, src, NULL, NULL, 0, 0, 0)) return NULL;
     /* the final sizes, so that the arrays are never moved */
     uint64_t neurons = C + C * W + L * C * (gpt2 ? 10 * W + F : 6 * W + Q + 2 * KV + Q + 3 * F) + C * W + C * V;
     uint64_t weights = V * W + L * (2 * W + (Q + 2 * KV) * W + W * Q + (gpt2 ? 2 : 3) * F * W) + W + V * W;
@@ -99,7 +155,7 @@ NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSo
         x = add_layers(.net = net, .inputs = {x, k->down});
         ok = x != SPINGALETT_NO_LAYER && k->attn_norm != SPINGALETT_NO_LAYER && k->qkv != SPINGALETT_NO_LAYER &&
              k->o != SPINGALETT_NO_LAYER && k->ffn_norm != SPINGALETT_NO_LAYER && k->up != SPINGALETT_NO_LAYER &&
-             k->down != SPINGALETT_NO_LAYER;
+             k->down != SPINGALETT_NO_LAYER && (gpt2 || (k->gate != SPINGALETT_NO_LAYER && k->gate != 0));
     }
     if (ok) {
         norm = gpt2 ? layer_norm(.net = net, .epsilon = t->eps) : rms_norm(.net = net, .epsilon = t->eps);
@@ -107,43 +163,7 @@ NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSo
         ok = embed != SPINGALETT_NO_LAYER && norm != SPINGALETT_NO_LAYER && head != SPINGALETT_NO_LAYER;
     }
     /* the parameters, part by part */
-#define WT(l) (net->weights + net->weight_offsets[(l) - 1])
-#define BS(l) (net->biases + net->bias_offsets[(l) - 1])
-    ok = ok && part_into(src, SPG_PART_EMBED, 0, WT(embed), (uint32_t)V, (uint32_t)W);
-    if (ok && gpt2) ok = part_into(src, SPG_PART_POSITIONS, 0, BS(embed), (uint32_t)C, (uint32_t)W);
-    for (uint32_t b = 0; ok && b < L; b++) {
-        const Block *k = &blocks[b];
-        ok = part_into(src, SPG_PART_ATTN_NORM, b, WT(k->attn_norm), 1, (uint32_t)W) &&
-             (!gpt2 || bias_into(src, SPG_PART_ATTN_NORM_BIAS, b, BS(k->attn_norm), (uint32_t)W)) &&
-             part_into(src, SPG_PART_FFN_NORM, b, WT(k->ffn_norm), 1, (uint32_t)W) &&
-             (!gpt2 || bias_into(src, SPG_PART_FFN_NORM_BIAS, b, BS(k->ffn_norm), (uint32_t)W));
-        if (ok && gpt2) {
-            ok = part_into(src, SPG_PART_QKV, b, WT(k->qkv), (uint32_t)(3 * W), (uint32_t)W) &&
-                 bias_into(src, SPG_PART_QKV_BIAS, b, BS(k->qkv), (uint32_t)(3 * W));
-        } else if (ok) {
-            float *w = WT(k->qkv), *bq = BS(k->qkv);
-            ok = part_into(src, SPG_PART_Q, b, w, (uint32_t)Q, (uint32_t)W) &&
-                 part_into(src, SPG_PART_K, b, w + Q * W, (uint32_t)KV, (uint32_t)W) &&
-                 part_into(src, SPG_PART_V, b, w + (Q + KV) * W, (uint32_t)KV, (uint32_t)W) &&
-                 bias_into(src, SPG_PART_Q_BIAS, b, bq, (uint32_t)Q) && bias_into(src, SPG_PART_K_BIAS, b, bq + Q, (uint32_t)KV) &&
-                 bias_into(src, SPG_PART_V_BIAS, b, bq + Q + KV, (uint32_t)KV) &&
-                 part_into(src, SPG_PART_GATE, b, WT(k->gate), (uint32_t)F, (uint32_t)W) &&
-                 bias_into(src, SPG_PART_GATE_BIAS, b, BS(k->gate), (uint32_t)F);
-        }
-        ok = ok && part_into(src, SPG_PART_O, b, WT(k->o), (uint32_t)W, (uint32_t)Q) &&
-             bias_into(src, SPG_PART_O_BIAS, b, BS(k->o), (uint32_t)W) &&
-             part_into(src, SPG_PART_UP, b, WT(k->up), (uint32_t)F, (uint32_t)W) &&
-             bias_into(src, SPG_PART_UP_BIAS, b, BS(k->up), (uint32_t)F) &&
-             part_into(src, SPG_PART_DOWN, b, WT(k->down), (uint32_t)W, (uint32_t)F) &&
-             bias_into(src, SPG_PART_DOWN_BIAS, b, BS(k->down), (uint32_t)W);
-    }
-    ok = ok && part_into(src, SPG_PART_NORM, 0, WT(norm), 1, (uint32_t)W) &&
-         (!gpt2 || bias_into(src, SPG_PART_NORM_BIAS, 0, BS(norm), (uint32_t)W));
-    if (ok && src->has(src, SPG_PART_HEAD, 0)) ok = part_into(src, SPG_PART_HEAD, 0, WT(head), (uint32_t)V, (uint32_t)W);
-    else if (ok) memcpy(WT(head), WT(embed), (size_t)(V * W) * sizeof(float));     /* tied to the embeddings */
-    if (ok) memset(BS(head), 0, (size_t)V * sizeof(float));
-#undef WT
-#undef BS
+    ok = ok && read_parts(t, src, net, blocks, embed, norm, head);
     free(blocks);
     if (!ok) {
         free_network(net);
@@ -238,6 +258,7 @@ static bool hf_read(SpgTensorSource *s, SpgPart part, uint32_t block, float *dst
                  "integer", name);
         return false;
     }
+    if (s->dry) return true;
     const uint64_t count = (uint64_t)rows * cols;
     if (!transposed) {
         spingalett_decode_parallel(dst, t->data, t->dtype, count);
@@ -518,6 +539,15 @@ SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args
     const bool directory = config && exists(config);
     free(config);
     if (directory) return load_directory(args.path, args.context);
-    set_error(SPINGALETT_ERR_FILE_IO, "pretrained: the path is no model directory (config.json)");
-    return NULL;
+    /* a GGUF file: mapped while its tensors are dequantized */
+    SpgFileView file;
+    if (!exists(args.path) || !spingalett_file_open(&file, args.path)) {
+        set_error(SPINGALETT_ERR_FILE_IO, "pretrained: the path is neither a model directory (config.json) nor a file");
+        return NULL;
+    }
+    NeuralNetwork *net = NULL;
+    if (file.size >= 4 && !memcmp(file.data, "GGUF", 4)) net = spingalett_gguf_network(file.data, file.size, args.context);
+    else set_error(SPINGALETT_ERR_INVALID, "pretrained: the file is not a GGUF file");
+    spingalett_file_close(&file);
+    return net;
 }

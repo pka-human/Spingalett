@@ -35,3 +35,7 @@ typedef struct {
 
 /* NULL with the error set when the vocabulary cannot be used. */
 SpingalettTokenizer *spingalett_tokenizer_build(const SpgTokenizerSpec *spec);
+
+/* The tokenizer of a GGUF file in memory (Spingalett.Gguf.c), which keeps nothing of its bytes; NULL with
+   the error set. */
+SpingalettTokenizer *spingalett_gguf_tokenizer(const uint8_t *data, size_t size);

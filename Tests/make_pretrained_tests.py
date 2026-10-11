@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 pka_human (pka_human@proton.me)
 """Writes the language models of the `pretrained` test group into Tests/Data: tiny random checkpoints in
-Hugging Face's form, with the logits a PyTorch reference computes for a window of tokens:
+Hugging Face's form and GGUF files, with the logits a PyTorch reference computes for a window of tokens:
 
-    python Tests/make_pretrained_tests.py      # needs torch, safetensors and numpy
+    python Tests/make_pretrained_tests.py      # needs torch, safetensors, numpy, tokenizers and sentencepiece
+                                               # (and checks its dequantization with gguf's where installed)
 
 - hf_llama/: LLaMA with grouped-query attention (4 query heads, 2 key and value heads), rotary embeddings
   of base 500000, weights in bfloat16 in two shards and model.safetensors.index.json, LLaMA 3's form of
@@ -17,8 +18,20 @@ Hugging Face's form, with the logits a PyTorch reference computes for a window o
 
 NAME.bin holds "SPGT", then as 32-bit little-endian integers 1, the tokens and the logits a window has (T
 and T x vocabulary), then the tokens (as floats) and the logits. The tokens are those the directory's
-tokenizer gives TEXT, cut to the window (the first ones, for the model without a tokenizer). The files are
-seeded and fixed, so they change only when this script does.
+tokenizer gives TEXT, cut to the window (the first ones, for the model without a tokenizer).
+
+GGUF files, written by the small writer below as llama.cpp's converter writes them:
+
+- gguf_llama.gguf: hf_llama's weights (queries and keys permuted into llama.cpp's order, matrices in
+  bfloat16, vectors in float32) and its tokenizer as a vocabulary of the "gpt2" model ("llama-bpe");
+- gguf_quant.gguf (version 2): a LLaMA of width 256 whose sixteen matrices are random blocks of fifteen
+  types, from F32 to the k-quants and IQ4_NL, IQ4_XS; gguf_quant.bin the logits of its weights as
+  llama.cpp's formulas dequantize them (the numpy functions below, checked against the gguf package's
+  where it is installed), gguf_quant.txt each matrix's sums;
+- gguf_spm.gguf: a vocabulary of SentencePiece's BPE trained by the sentencepiece library (the "llama"
+  model: scores, byte tokens), without tensors; gguf_spm.txt the ids sentencepiece gives a set of texts.
+
+The files are seeded and fixed, so they change only when this script does.
 """
 import json
 import math
@@ -166,13 +179,407 @@ def write(name, config, sd, logits_fn, tokenizer=None, shards=1, tokenizer_confi
     print(f"{name}: {len(sd)} tensors, {size} bytes, logits in [{logits.min():.2f}, {logits.max():.2f}]")
 
 
+# ---------------------------------------------------------------------------------------------------- GGUF
+
+GGUF_UINT32, GGUF_INT32, GGUF_FLOAT32, GGUF_BOOL, GGUF_STRING, GGUF_ARRAY = 4, 5, 6, 7, 8, 9
+# ggml's types: id, values a block, bytes a block
+GGML = {"F32": (0, 1, 4), "F16": (1, 1, 2), "Q4_0": (2, 32, 18), "Q4_1": (3, 32, 20), "Q5_0": (6, 32, 22),
+        "Q5_1": (7, 32, 24), "Q8_0": (8, 32, 34), "Q2_K": (10, 256, 84), "Q3_K": (11, 256, 110), "Q4_K": (12, 256, 144),
+        "Q5_K": (13, 256, 176), "Q6_K": (14, 256, 210), "IQ4_NL": (20, 32, 18), "IQ4_XS": (23, 256, 136),
+        "BF16": (30, 1, 2)}
+IQ4 = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
+
+
+def gguf_string(s):
+    b = s.encode("utf-8")
+    return struct.pack("<Q", len(b)) + b
+
+
+def gguf_value(kind, value):
+    if kind == GGUF_STRING:
+        return gguf_string(value)
+    if kind == GGUF_ARRAY:
+        item, items = value
+        return struct.pack("<IQ", item, len(items)) + b"".join(gguf_value(item, v) for v in items)
+    return struct.pack({GGUF_UINT32: "<I", GGUF_INT32: "<i", GGUF_FLOAT32: "<f", GGUF_BOOL: "<?"}[kind], value)
+
+
+def gguf_file(path, metadata, tensors, version=3, alignment=32):
+    """A GGUF file: metadata [(key, type, value)], tensors [(name, dims innermost first, ggml type, bytes)]."""
+    out = bytearray(b"GGUF" + struct.pack("<IQQ", version, len(tensors), len(metadata)))
+    for key, kind, value in metadata:
+        out += gguf_string(key) + struct.pack("<I", kind) + gguf_value(kind, value)
+    offset = 0
+    for name, dims, kind, data in tensors:
+        out += gguf_string(name) + struct.pack("<I", len(dims)) + struct.pack(f"<{len(dims)}Q", *dims)
+        out += struct.pack("<IQ", GGML[kind][0], offset)
+        offset += (len(data) + alignment - 1) // alignment * alignment
+    out += b"\0" * (-len(out) % alignment)
+    for _, _, _, data in tensors:
+        out += data + b"\0" * (-len(data) % alignment)
+    with open(path, "wb") as f:
+        f.write(out)
+    return len(out)
+
+
+def half(raw):
+    return np.frombuffer(raw.tobytes(), dtype="<f2").astype(np.float32)
+
+
+def dequantize(data, kind, n):
+    """n values of a ggml type: llama.cpp's dequantize_row_*() in float32, in its order of operations."""
+    if kind in ("F32", "F16", "BF16"):
+        if kind == "BF16":
+            return (np.frombuffer(data, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
+        return np.frombuffer(data, dtype="<f4" if kind == "F32" else "<f2").astype(np.float32)
+    _, block, size = GGML[kind]
+    b = np.frombuffer(data, dtype=np.uint8).reshape(-1, size)
+    f32 = np.float32
+    if kind in ("Q4_0", "Q4_1", "IQ4_NL"):
+        d = half(b[:, 0:2])[:, None]
+        qs = b[:, 4:20] if kind == "Q4_1" else b[:, 2:18]
+        q = np.concatenate([qs & 0xF, qs >> 4], 1)
+        if kind == "IQ4_NL":
+            return (d * IQ4[q]).reshape(-1)
+        if kind == "Q4_0":
+            return ((q.astype(f32) - 8) * d).reshape(-1)
+        return (q.astype(f32) * d + half(b[:, 2:4])[:, None]).reshape(-1)
+    if kind in ("Q5_0", "Q5_1"):
+        d = half(b[:, 0:2])[:, None]
+        at = 2 if kind == "Q5_0" else 4
+        qh = b[:, at:at + 4].copy().view("<u4")[:, 0].astype(np.uint32)
+        qs = b[:, at + 4:at + 20]
+        j = np.arange(16, dtype=np.uint32)
+        h0 = ((qh[:, None] >> j) << 4) & 0x10
+        h1 = (qh[:, None] >> (j + 12)) & 0x10
+        q = np.concatenate([(qs & 0xF) | h0, (qs >> 4) | h1], 1).astype(f32)
+        if kind == "Q5_0":
+            return ((q - 16) * d).reshape(-1)
+        return (q * d + half(b[:, 2:4])[:, None]).reshape(-1)
+    if kind == "Q8_0":
+        return (b[:, 2:34].view(np.int8).astype(f32) * half(b[:, 0:2])[:, None]).reshape(-1)
+    out = np.zeros((b.shape[0], 256), dtype=f32)
+    if kind == "Q2_K":
+        sc, qs, d, dmin = b[:, :16], b[:, 16:80], half(b[:, 80:82]), half(b[:, 82:84])
+        y, is_ = 0, 0
+        for nb in range(2):
+            q = qs[:, nb * 32:nb * 32 + 32]
+            for j in range(4):
+                for half_ in range(2):
+                    s = sc[:, is_]; is_ += 1
+                    dl, ml = d * (s & 0xF).astype(f32), dmin * (s >> 4).astype(f32)
+                    out[:, y:y + 16] = dl[:, None] * ((q[:, half_ * 16:half_ * 16 + 16] >> (2 * j)) & 3).astype(f32) - ml[:, None]
+                    y += 16
+        return out.reshape(-1)
+    if kind == "Q3_K":
+        hm, qs, d = b[:, :32], b[:, 32:96], half(b[:, 108:110])
+        aux = b[:, 96:108].copy().view("<u4").astype(np.uint32)
+        k1, k2, tmp = np.uint32(0x03030303), np.uint32(0x0f0f0f0f), aux[:, 2].copy()
+        a = np.stack([(aux[:, 0] & k2) | (((tmp >> 0) & k1) << 4), (aux[:, 1] & k2) | (((tmp >> 2) & k1) << 4),
+                      ((aux[:, 0] >> 4) & k2) | (((tmp >> 4) & k1) << 4), ((aux[:, 1] >> 4) & k2) | (((tmp >> 6) & k1) << 4)], 1)
+        scales = a.astype("<u4").view(np.uint8).view(np.int8).astype(np.int32)
+        y, is_, m = 0, 0, 1
+        for nb in range(2):
+            q = qs[:, nb * 32:nb * 32 + 32]
+            for j in range(4):
+                for half_ in range(2):
+                    dl = d * (scales[:, is_] - 32).astype(f32); is_ += 1
+                    lo = ((q[:, half_ * 16:half_ * 16 + 16] >> (2 * j)) & 3).astype(np.int32)
+                    hi = np.where(hm[:, half_ * 16:half_ * 16 + 16] & m, 0, 4)
+                    out[:, y:y + 16] = dl[:, None] * (lo - hi).astype(f32)
+                    y += 16
+                m <<= 1
+        return out.reshape(-1)
+
+    def scale_min(sc, j):
+        if j < 4:
+            return sc[:, j] & 63, sc[:, j + 4] & 63
+        return (sc[:, j + 4] & 0xF) | ((sc[:, j - 4] >> 6) << 4), (sc[:, j + 4] >> 4) | ((sc[:, j] >> 6) << 4)
+
+    if kind in ("Q4_K", "Q5_K"):
+        d, dmin, sc = half(b[:, 0:2]), half(b[:, 2:4]), b[:, 4:16]
+        qh, ql = (b[:, 16:48], b[:, 48:176]) if kind == "Q5_K" else (None, b[:, 16:144])
+        y = 0
+        for j in range(4):
+            q = ql[:, j * 32:j * 32 + 32]
+            for half_ in range(2):
+                s, mn = scale_min(sc, 2 * j + half_)
+                dl, ml = d * s.astype(f32), dmin * mn.astype(f32)
+                v = (q >> 4) if half_ else (q & 0xF)
+                if qh is not None:
+                    v = v + np.where(qh & (1 << (2 * j + half_)), 16, 0)
+                out[:, y:y + 32] = dl[:, None] * v.astype(f32) - ml[:, None]
+                y += 32
+        return out.reshape(-1)
+    if kind == "Q6_K":
+        ql, qh, sc, d = b[:, :128], b[:, 128:192], b[:, 192:208].view(np.int8).astype(f32), half(b[:, 208:210])
+        for nb in range(2):
+            l_, h_, s_ = ql[:, nb * 64:nb * 64 + 64], qh[:, nb * 32:nb * 32 + 32], sc[:, nb * 8:nb * 8 + 8]
+            for part, (lo, shift) in enumerate(((l_[:, :32] & 0xF, 0), (l_[:, 32:] & 0xF, 2), (l_[:, :32] >> 4, 4),
+                                                (l_[:, 32:] >> 4, 6))):
+                q = (lo | (((h_ >> shift) & 3) << 4)).astype(np.int32) - 32
+                for half_ in range(2):
+                    out[:, nb * 128 + part * 32 + half_ * 16:nb * 128 + part * 32 + half_ * 16 + 16] = \
+                        (d * s_[:, 2 * part + half_])[:, None] * q[:, half_ * 16:half_ * 16 + 16].astype(f32)
+        return out.reshape(-1)
+    # IQ4_XS
+    d, sh, sl, qs = half(b[:, 0:2]), b[:, 2:4].copy().view("<u2")[:, 0].astype(np.int32), b[:, 4:8], b[:, 8:136]
+    for ib in range(8):
+        ls = ((sl[:, ib // 2] >> (4 * (ib % 2))) & 0xF).astype(np.int32) | (((sh >> (2 * ib)) & 3) << 4)
+        dl = d * (ls - 32).astype(f32)
+        q = qs[:, ib * 16:ib * 16 + 16]
+        out[:, ib * 32:ib * 32 + 16] = dl[:, None] * IQ4[q & 0xF]
+        out[:, ib * 32 + 16:ib * 32 + 32] = dl[:, None] * IQ4[q >> 4]
+    return out.reshape(-1)
+
+
+# where each type keeps its half-precision scales (byte offset, low, high)
+SCALES = {"Q4_0": [(0, 0.005, 0.03)], "Q4_1": [(0, 0.005, 0.03), (2, -0.2, 0.0)], "Q5_0": [(0, 0.003, 0.015)],
+          "Q5_1": [(0, 0.003, 0.015), (2, -0.2, 0.0)], "Q8_0": [(0, 0.0005, 0.002)], "Q2_K": [(80, 0.002, 0.01), (82, 0.002, 0.01)],
+          "Q3_K": [(108, 0.001, 0.003)], "Q4_K": [(0, 0.0001, 0.0005), (2, 0.0001, 0.0005)],
+          "Q5_K": [(0, 0.00005, 0.00025), (2, 0.00005, 0.00025)], "Q6_K": [(208, 0.00002, 0.0001)],
+          "IQ4_NL": [(0, 0.0005, 0.002)], "IQ4_XS": [(0, 0.00002, 0.0001)]}
+
+
+def quantized(rows, cols, kind, rng):
+    """Random blocks of a type for a [rows][cols] matrix (random quants and scales, half-precision fields set to
+    sizes that keep the weights below 1), and its values."""
+    if kind in ("F32", "F16", "BF16"):
+        w = (rng.standard_normal((rows, cols)) * 0.2).astype(np.float32)
+        if kind == "F32":
+            data = w.astype("<f4").tobytes()
+        elif kind == "F16":
+            data = w.astype("<f2").tobytes()
+        else:
+            data = (w.view(np.uint32) >> 16).astype("<u2").tobytes()
+        return data, dequantize(data, kind, rows * cols).reshape(rows, cols)
+    _, block, size = GGML[kind]
+    raw = rng.integers(0, 256, size=(rows * cols // block, size), dtype=np.uint8)
+    for at, lo, hi in SCALES[kind]:
+        raw[:, at:at + 2] = rng.uniform(lo, hi, raw.shape[0]).astype("<f2").view(np.uint8).reshape(-1, 2)
+    data = raw.tobytes()
+    return data, dequantize(data, kind, rows * cols).reshape(rows, cols)
+
+
+def permute(w, heads):
+    """llama.cpp's order of a head's rows (its converter's permute())."""
+    return w.reshape(heads, 2, w.shape[0] // heads // 2, *w.shape[1:]).swapaxes(1, 2).reshape(w.shape)
+
+
+def unpermute(w, heads):
+    return w.reshape(heads, w.shape[0] // heads // 2, 2, *w.shape[1:]).swapaxes(1, 2).reshape(w.shape)
+
+
+def llama_metadata(cfg, name):
+    H = cfg["num_attention_heads"]
+    head = [("llama.attention.key_length", GGUF_UINT32, cfg["head_dim"]), ("llama.attention.value_length", GGUF_UINT32,
+            cfg["head_dim"])] if "head_dim" in cfg else []
+    return head + [("general.architecture", GGUF_STRING, "llama"), ("general.name", GGUF_STRING, name),
+            ("general.alignment", GGUF_UINT32, 32), ("llama.context_length", GGUF_UINT32, cfg["max_position_embeddings"]),
+            ("llama.embedding_length", GGUF_UINT32, cfg["hidden_size"]), ("llama.block_count", GGUF_UINT32, cfg["num_hidden_layers"]),
+            ("llama.feed_forward_length", GGUF_UINT32, cfg["intermediate_size"]), ("llama.attention.head_count", GGUF_UINT32, H),
+            ("llama.attention.head_count_kv", GGUF_UINT32, cfg["num_key_value_heads"]),
+            ("llama.attention.layer_norm_rms_epsilon", GGUF_FLOAT32, cfg["rms_norm_eps"]),
+            ("llama.rope.freq_base", GGUF_FLOAT32, cfg["rope_theta"]),
+            ("llama.rope.dimension_count", GGUF_UINT32, cfg.get("head_dim", cfg["hidden_size"] // H))]
+
+
+def gguf_from_hf(cfg, sd, tokenizer_json):
+    """hf_llama's weights in a GGUF file, as llama.cpp's converter writes them: queries and keys permuted, matrices in
+    bfloat16 (lossless for these), vectors in float32; its tokenizer as a byte-level BPE of merges."""
+    H, KV = cfg["num_attention_heads"], cfg["num_key_value_heads"]
+    names = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": "output_norm.weight",
+             "lm_head.weight": "output.weight"}
+    parts = {"input_layernorm": "attn_norm", "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
+             "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output", "post_attention_layernorm": "ffn_norm",
+             "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
+    tensors = []
+    for key in sorted(sd):
+        w = sd[key].to(torch.float32).numpy()
+        if key in names:
+            name = names[key]
+        else:
+            layer, part = key[len("model.layers."):].split(".", 1)
+            part, suffix = part.rsplit(".", 1)
+            name = f"blk.{layer}.{parts[part]}.{suffix}"
+            if part == "self_attn.q_proj":
+                w = permute(w, H)
+            elif part == "self_attn.k_proj":
+                w = permute(w, KV)
+        kind = "BF16" if w.ndim == 2 else "F32"
+        data = (w.view(np.uint32) >> 16).astype("<u2").tobytes() if kind == "BF16" else w.astype("<f4").tobytes()
+        tensors.append((name, list(w.shape[::-1]), kind, data))
+    tok = json.load(open(os.path.join(DATA, tokenizer_json), encoding="utf-8"))
+    vocab = {i: t for t, i in tok["model"]["vocab"].items()}
+    types = {i: 1 for i in vocab}
+    for a in tok["added_tokens"]:
+        vocab[a["id"]], types[a["id"]] = a["content"], 3 if a["special"] else 4
+    count = max(vocab) + 1
+    merges = [m if isinstance(m, str) else " ".join(m) for m in tok["model"]["merges"]]
+    metadata = llama_metadata(cfg, "hf_llama") + [
+        ("tokenizer.ggml.model", GGUF_STRING, "gpt2"), ("tokenizer.ggml.pre", GGUF_STRING, "llama-bpe"),
+        ("tokenizer.ggml.tokens", GGUF_ARRAY, (GGUF_STRING, [vocab[i] for i in range(count)])),
+        ("tokenizer.ggml.token_type", GGUF_ARRAY, (GGUF_INT32, [types[i] for i in range(count)])),
+        ("tokenizer.ggml.merges", GGUF_ARRAY, (GGUF_STRING, merges)),
+        ("tokenizer.ggml.bos_token_id", GGUF_UINT32, tok["model"]["vocab"].get("<|begin_of_text|>", 420)),
+        ("tokenizer.ggml.eos_token_id", GGUF_UINT32, 424), ("tokenizer.ggml.add_bos_token", GGUF_BOOL, True)]
+    size = gguf_file(os.path.join(DATA, "gguf_llama.gguf"), metadata, tensors)
+    print(f"gguf_llama.gguf: hf_llama's weights, {len(tensors)} tensors, {size} bytes")
+
+
+# the quantized model's matrices: its type, and whether llama.cpp permutes its rows
+QUANT_TYPES = {"token_embd": "Q4_K", "output": "Q6_K",
+               "blk.0.attn_q": "Q2_K", "blk.0.attn_k": "F32", "blk.0.attn_v": "F16", "blk.0.ffn_gate": "Q5_K",
+               "blk.0.ffn_up": "Q3_K", "blk.0.attn_output": "Q4_0", "blk.0.ffn_down": "Q5_0",
+               "blk.1.attn_q": "IQ4_XS", "blk.1.attn_k": "BF16", "blk.1.attn_v": "Q4_1", "blk.1.ffn_gate": "Q4_K",
+               "blk.1.ffn_up": "Q8_0", "blk.1.attn_output": "Q5_1", "blk.1.ffn_down": "IQ4_NL"}
+
+
+def gguf_quantized():
+    """A LLaMA of width 256 (the k-quants' blocks) whose matrices are of fifteen types (GGUF version 2, no
+    vocabulary); the logits of its dequantized weights (queries and keys back in Hugging Face's order) by the
+    PyTorch reference, and per matrix the sums the test checks its dequantization by."""
+    cfg = {"vocab_size": 32, "hidden_size": 256, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 2,
+           "num_key_value_heads": 1, "head_dim": 16, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+           "max_position_embeddings": 64}
+    V, d, F, H, KV, hd = 32, 256, 32, 2, 1, 16
+    rng = np.random.default_rng(77)
+    shapes = {"token_embd": (V, d), "output": (V, d), "attn_q": (H * hd, d), "attn_k": (KV * hd, d), "attn_v": (KV * hd, d),
+              "attn_output": (d, H * hd), "ffn_gate": (F, d), "ffn_up": (F, d), "ffn_down": (d, F)}
+    hf = {"token_embd": "model.embed_tokens", "output": "lm_head", "attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj",
+          "attn_v": "self_attn.v_proj", "attn_output": "self_attn.o_proj", "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj",
+          "ffn_down": "mlp.down_proj"}
+    tensors, sd, sums = [], {}, []
+    for name, kind in QUANT_TYPES.items():
+        part = name.split(".")[-1]
+        rows, cols = shapes[part]
+        data, w = quantized(rows, cols, kind, rng)
+        tensors.append((name + ".weight", [cols, rows], kind, data))
+        if part == "attn_q":
+            w = unpermute(w, H)
+        elif part == "attn_k":
+            w = unpermute(w, KV)
+        key = (hf[part] if "." not in name else f"model.layers.{name.split('.')[1]}.{hf[part]}") + ".weight"
+        sd[key] = torch.from_numpy(w.copy())
+    for name in ("output_norm", "blk.0.attn_norm", "blk.0.ffn_norm", "blk.1.attn_norm", "blk.1.ffn_norm"):
+        w = (1 + rng.standard_normal(d) * 0.1).astype(np.float32)
+        tensors.append((name + ".weight", [d], "F32", w.tobytes()))
+        key = "model.norm.weight" if name == "output_norm" else \
+            f"model.layers.{name.split('.')[1]}.{'input_layernorm' if 'attn' in name else 'post_attention_layernorm'}.weight"
+        sd[key] = torch.from_numpy(w)
+    size = gguf_file(os.path.join(DATA, "gguf_quant.gguf"), llama_metadata(cfg, "quantized"), tensors, version=2)
+    tokens = list(range(1, 1 + T))
+    with torch.no_grad():
+        logits = ref_llama(sd, cfg, torch.tensor(tokens)).numpy().astype(np.float32)
+    with open(os.path.join(DATA, "gguf_quant.bin"), "wb") as f:
+        f.write(b"SPGT" + struct.pack("<3I", 1, T, T * V))
+        f.write(np.array(tokens, dtype=np.float32).tobytes() + logits.tobytes())
+    # the sums of each matrix as the network holds it: layer, then the sum, the sum of squares and the sum weighted by
+    # (row + 1) (col + 1) (which sees the order of rows and values), in double precision value after value in the
+    # order of the rows, as the test adds them, so that they agree exactly when the weights do
+    lines = ["# gguf_quant.gguf: layer index, first row of the matrix in the layer, type, rows, cols, sum, sum of squares, "
+             "weighted sum"]
+    layer_of = {"token_embd": 1, "output": 2 + 11 * 2 + 1}
+    for name, kind in QUANT_TYPES.items():
+        part = name.split(".")[-1]
+        if "." in name:
+            b = int(name.split(".")[1])
+            layer = 2 + 11 * b + {"attn_q": 1, "attn_k": 1, "attn_v": 1, "attn_output": 3, "ffn_gate": 6, "ffn_up": 7,
+                                  "ffn_down": 9}[part]
+            key = f"model.layers.{b}.{hf[part]}.weight"
+        else:
+            layer, key = layer_of[part], hf[part] + ".weight"
+        first = {"attn_q": 0, "attn_k": H * hd, "attn_v": H * hd + KV * hd}.get(part, 0)
+        w = sd[key].numpy()
+        s = s2 = sw = 0.0
+        for r, row in enumerate(w.astype(np.float64).tolist()):
+            for c, v in enumerate(row):
+                s += v
+                s2 += v * v
+                sw += v * (r + 1.0) * (c + 1.0)
+        lines.append(f"{layer} {first} {kind} {w.shape[0]} {w.shape[1]} {s!r} {s2!r} {sw!r}")
+    with open(os.path.join(DATA, "gguf_quant.txt"), "w", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    try:                                    # gguf-py's dequantization, where it is installed: the reference's own check
+        from gguf.quants import dequantize as gguf_dequantize
+        from gguf.constants import GGMLQuantizationType
+        for name, dims, kind, data in tensors:
+            want = gguf_dequantize(np.frombuffer(data, dtype=np.uint8), GGMLQuantizationType(GGML[kind][0])).reshape(-1)
+            assert np.array_equal(want.astype(np.float32), dequantize(data, kind, len(want))), name
+        print("  (the dequantization agrees with gguf-py's on every type)")
+    except ImportError:
+        pass
+    print(f"gguf_quant.gguf: {len(tensors)} tensors of {len(set(QUANT_TYPES.values()))} types, {size} bytes")
+
+
+SPM_TEXTS = ["", "Hello world", " Hello", "Hello ", "  two  spaces", "It's 12345 café naïve", "Tabs\tand\nnewlines\n",
+             "你好，世界！", "Emoji 😀 👍🏽", "unknown ꙮ ǅ chars", "<s>Hello</s>", "a<s>b", "Hello <s> world </s>",
+             "<unk> x", "xxxxxxxxxxxxxxxx", "The quick brown fox jumps over the lazy dog."]
+
+
+def gguf_sentencepiece():
+    """A vocabulary of SentencePiece's BPE (trained by the sentencepiece library, with byte fallback) in a GGUF file
+    of no tensors, and the ids and texts sentencepiece gives the texts (the special tokens found in the text and each
+    piece between them encoded with its own space prefix, as llama.cpp does)."""
+    import io
+    import re
+    import sentencepiece as spm
+    model = io.BytesIO()
+    lines = [line for text in CORPUS_SPM for line in text.split("\n") if line]
+    spm.SentencePieceTrainer.train(sentence_iterator=iter(lines), model_writer=model, model_type="bpe", vocab_size=330,
+                                   byte_fallback=True, character_coverage=0.9995, normalization_rule_name="identity",
+                                   remove_extra_whitespaces=False, split_digits=True, bos_id=1, eos_id=2, unk_id=0,
+                                   minloglevel=2)
+    sp = spm.SentencePieceProcessor(model_proto=model.getvalue())
+    count = sp.get_piece_size()
+    kinds = [2 if sp.is_unknown(i) else 3 if sp.is_control(i) else 6 if sp.is_byte(i) else 5 if sp.is_unused(i) else 1
+             for i in range(count)]
+    metadata = [("general.architecture", GGUF_STRING, "llama"), ("general.alignment", GGUF_UINT32, 32),
+                ("tokenizer.ggml.model", GGUF_STRING, "llama"),
+                ("tokenizer.ggml.tokens", GGUF_ARRAY, (GGUF_STRING, [sp.id_to_piece(i) for i in range(count)])),
+                ("tokenizer.ggml.scores", GGUF_ARRAY, (GGUF_FLOAT32, [sp.get_score(i) for i in range(count)])),
+                ("tokenizer.ggml.token_type", GGUF_ARRAY, (GGUF_INT32, kinds)),
+                ("tokenizer.ggml.bos_token_id", GGUF_UINT32, 1), ("tokenizer.ggml.eos_token_id", GGUF_UINT32, 2),
+                ("tokenizer.ggml.unknown_token_id", GGUF_UINT32, 0), ("tokenizer.ggml.add_bos_token", GGUF_BOOL, True),
+                ("tokenizer.ggml.add_space_prefix", GGUF_BOOL, True)]
+    size = gguf_file(os.path.join(DATA, "gguf_spm.gguf"), metadata, [])
+    specials = {"<s>": 1, "</s>": 2, "<unk>": 0}
+    out = ["# gguf_spm.gguf: special add text, then the ids, the text decoded, and without special tokens"]
+    for special in (1, 0):
+        for add in (0, 1):
+            for text in SPM_TEXTS:
+                pieces = re.split("(<s>|</s>|<unk>)", text) if special else [text]
+                ids = [1] if add else []
+                for p in pieces:
+                    if p in specials and special:
+                        ids.append(specials[p])
+                    elif p:
+                        ids += sp.encode(p)
+                # sentencepiece decodes without the special tokens; "*": the text with them is not checked
+                decoded = sp.decode([i for i in ids if i not in (0, 1, 2)])
+                hexed = [s.encode("utf-8").hex() or "-" for s in (text, decoded)]
+                out += [f"{special} {add} {hexed[0]}", " ".join(map(str, [len(ids)] + ids)), "*", hexed[1]]
+    with open(os.path.join(DATA, "gguf_spm.txt"), "w", newline="\n") as f:
+        f.write("\n".join(out) + "\n")
+    print(f"gguf_spm.gguf: {count} tokens, {size} bytes")
+
+
+CORPUS_SPM = [
+    "The quick brown fox jumps over the lazy dog. It's a dog's life; we'll see what they've done.",
+    "Tokenizers cut text into pieces: words, numbers like 12345 and 3.14159, and punctuation!",
+    "Le café est très bon, naïve résumé, straße. Hello world, hello there, two  spaces and tabs\tand lines.",
+    "你好，世界！Привет, мир! Emoji are bytes too.",
+] * 20
+
+
 def main():
     gen = torch.Generator().manual_seed(2024)
     llama = {"architectures": ["LlamaForCausalLM"], "model_type": "llama", "vocab_size": 425, "hidden_size": 16,
              "intermediate_size": 24, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
              "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "max_position_embeddings": 64, "hidden_act": "silu",
              "tie_word_embeddings": False, "torch_dtype": "bfloat16", "rope_scaling": None}
-    write("hf_llama", llama, llama_weights(llama, torch.bfloat16, False, False, gen), ref_llama, "tokenizer_llama3.json",
+    llama_sd = llama_weights(llama, torch.bfloat16, False, False, gen)
+    write("hf_llama", llama, llama_sd, ref_llama, "tokenizer_llama3.json",
           shards=2, tokenizer_config={"bos_token": "<|begin_of_text|>", "eos_token": "<|eot_id|>"})
     qwen2 = {"architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2", "vocab_size": 423, "hidden_size": 16,
              "intermediate_size": 24, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1,
@@ -188,6 +595,9 @@ def main():
             "n_head": 4, "n_positions": 32, "n_ctx": 32, "layer_norm_epsilon": 1e-5, "activation_function": "gelu_new",
             "scale_attn_weights": True, "torch_dtype": "float32"}
     write("hf_gpt2", gpt2, gpt2_weights(gpt2, gen), ref_gpt2, "tokenizer_gpt2.json")
+    gguf_from_hf(llama, llama_sd, "tokenizer_llama3.json")
+    gguf_quantized()
+    gguf_sentencepiece()
 
 
 if __name__ == "__main__":

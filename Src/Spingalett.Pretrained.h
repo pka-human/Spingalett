@@ -52,8 +52,10 @@ typedef struct SpgTensorSource {
     /* Whether the model has a part (block: the block of a block's part). */
     bool (*has)(struct SpgTensorSource *s, SpgPart part, uint32_t block);
     /* A part's values into dst, rows x cols in row-major order (a vector: one row); false with s->error set
-       when the model lacks it, its shape differs or it cannot be decoded. */
+       when the model lacks it, its shape differs or it cannot be decoded. With dry set, the part is checked
+       and dst is not touched. */
     bool (*read)(struct SpgTensorSource *s, SpgPart part, uint32_t block, float *dst, uint32_t rows, uint32_t cols);
+    bool dry;
     char error[256];
 } SpgTensorSource;
 
@@ -63,3 +65,7 @@ NeuralNetwork *spingalett_build_transformer(const SpgTransformer *t, SpgTensorSo
 
 /* Decodes n elements of a type to floats, in chunks on the OpenMP threads when there are many. */
 void spingalett_decode_parallel(float *dst, const uint8_t *src, int dtype, uint64_t n);
+
+/* The network of a GGUF file in memory (Spingalett.Gguf.c), whose bytes it no longer needs once made; NULL
+   with the error set. */
+NeuralNetwork *spingalett_gguf_network(const uint8_t *data, size_t size, uint32_t context);

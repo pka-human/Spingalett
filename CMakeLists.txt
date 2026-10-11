@@ -242,10 +242,11 @@ elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID
 endif()
 
 # The inference engine and batched model inference compute in IEEE order (no reassociation,
-# reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
+# reciprocals or contraction), so the two agree bit for bit and match the standalone engine; GGUF's
+# dequantization too, so that a quantized file gives llama.cpp's weights on every platform.
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
-    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c
+    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c Src/Spingalett.Gguf.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
 endif()
 
