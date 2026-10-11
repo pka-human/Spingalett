@@ -615,6 +615,8 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 - Weights in F32, F16 or BF16 are decoded straight from the mapped files into the network, whose
   arrays are reserved at their final sizes first, so a model is never copied: SmolLM2-135M (BF16)
   loads in 0.17 s on an i7-12650H.
+- `Examples/Pretrained.c` continues a prompt with any of these models, printing each token as it
+  comes: `Bin/Pretrained models/SmolLM2-135M "The three primary colors are" 64`.
 - `.context` 0 takes the model's positions (GPT-2's all, LLaMA's up to 2048). Mistral's sliding
   window is not applied: attention covers the whole window, which is exact while the context is
   within the sliding window (a warning says when it is not). Scaled rotary embeddings (LLaMA 3.1's
@@ -1745,8 +1747,8 @@ Src/                  Library sources (network, training, kernels, serialization
 Src/Gpu/              The GPU backends: device layer, network executor, Vulkan's compute shaders
                       (Shaders/) and the CUDA kernels (Cuda/)
 Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, CharGPT (a
-                      character-level GPT), throughput benchmark (C and PyTorch counterpart),
-                      DatasetTool, ModelTool
+                      character-level GPT), Pretrained (a Hugging Face or GGUF language model continuing a
+                      prompt), throughput benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
 Examples/Runtime/     RunModel, a program of the runtime alone
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets)
