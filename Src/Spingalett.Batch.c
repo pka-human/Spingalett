@@ -452,7 +452,8 @@ static void activate_part(const NeuralNetwork *net, BatchWorkspace *ws, uint32_t
     if (pre) {
         /* the activation of the values kept; a dropout mask alone, the derivative from them */
         memcpy(row, pre + (size_t)s * size + at, (size_t)len * sizeof(float));
-        apply_activation_batch(row, len, act);
+        if (act == ACT_SOFTMAX) apply_activation_batch(row, len, act);
+        else spingalett_activate_training(row, len, act);
     } else {
         if (net->shapes[l].type == LAYER_DENSE)
             spingalett_vec_axpy(row, net->biases + net->bias_offsets[l - 1] + at, len, 1.0f);

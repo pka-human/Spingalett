@@ -517,6 +517,12 @@ void apply_softmax(float *layer, uint32_t size);
 void apply_activation_batch(float *data, uint32_t size, ActivationFunction act);
 void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act);
 void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total, ActivationFunction act);
+/* The activation of training's forward pass, from the values before it that training keeps (GELU, SiLU):
+   GELU, its tanh form and SiLU in vectors (erf as the GPU computes it, the vector exp), as their derivatives in
+   apply_derivative_batch(); inference (spingalett_engine_activate_one(), the engine's) keeps libm's erff and
+   expf, which the engine on its own, its WebAssembly build and sessions agree on. Other activations as
+   apply_activation_bulk(). */
+void spingalett_activate_training(float *data, uint64_t total, ActivationFunction act);
 
 void     rng_seed(uint64_t seed);
 uint32_t rng_next(void);

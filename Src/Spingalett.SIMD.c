@@ -81,6 +81,21 @@ static inline __m256 tanh256_ps(__m256 x) {
     __m256 r = _mm256_blendv_ps(large, small, _mm256_cmp_ps(ax, _mm256_set1_ps(0.3f), _CMP_LT_OQ));
     return _mm256_or_ps(r, _mm256_and_ps(sign_bit, x));
 }
+
+/* erf(z) as the GPU computes it (Abramowitz and Stegun 7.1.26: |error| < 1.5e-7), and *e = exp(-z^2), which
+   GELU's derivative needs as well (x phi(x) = x exp(-z^2) / sqrt(2 pi) at z = x / sqrt(2)). */
+static inline __m256 erf256_ps(__m256 z, __m256 *e) {
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f), one = _mm256_set1_ps(1.0f);
+    const __m256 a = _mm256_andnot_ps(sign_bit, z);
+    const __m256 t = _mm256_div_ps(one, FMADD256(_mm256_set1_ps(0.3275911f), a, one));
+    __m256 q = FMADD256(_mm256_set1_ps(1.061405429f), t, _mm256_set1_ps(-1.453152027f));
+    q = FMADD256(q, t, _mm256_set1_ps(1.421413741f));
+    q = FMADD256(q, t, _mm256_set1_ps(-0.284496736f));
+    q = FMADD256(q, t, _mm256_set1_ps(0.254829592f));
+    *e = exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), _mm256_mul_ps(a, a)));
+    const __m256 r = FNMADD256(_mm256_mul_ps(q, t), *e, one);
+    return _mm256_or_ps(r, _mm256_and_ps(sign_bit, z));
+}
 #endif
 
 void apply_softmax(float *layer, uint32_t size) {
@@ -174,6 +189,40 @@ void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act) 
         data[i] = spingalett_activate_value(data[i], act);
 }
 
+void spingalett_activate_training(float *data, uint64_t total, ActivationFunction act) {
+    uint64_t i = 0;
+#if defined(__AVX2__)
+    const __m256 half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f);
+    if (act == ACT_GELU) {
+        for (; i + 8u <= total; i += 8u) {
+            const __m256 x = _mm256_loadu_ps(data + i);
+            __m256 e;
+            const __m256 erf = erf256_ps(_mm256_mul_ps(x, _mm256_set1_ps(0.70710678118654752f)), &e);
+            _mm256_storeu_ps(data + i, _mm256_mul_ps(_mm256_mul_ps(half, x), _mm256_add_ps(one, erf)));
+        }
+    } else if (act == ACT_GELU_TANH) {
+        for (; i + 8u <= total; i += 8u) {
+            const __m256 x = _mm256_loadu_ps(data + i);
+            const __m256 x3 = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
+            const __m256 u = _mm256_mul_ps(_mm256_set1_ps(0.79788456080286536f),
+                                           FMADD256(_mm256_set1_ps(0.044715f), x3, x));
+            _mm256_storeu_ps(data + i, _mm256_mul_ps(_mm256_mul_ps(half, x), _mm256_add_ps(one, tanh256_ps(u))));
+        }
+    } else if (act == ACT_SILU) {
+        for (; i + 8u <= total; i += 8u) {
+            const __m256 x = _mm256_loadu_ps(data + i);
+            const __m256 e = exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), x));
+            _mm256_storeu_ps(data + i, _mm256_div_ps(x, _mm256_add_ps(one, e)));
+        }
+    }
+#endif
+    if (act == ACT_GELU || act == ACT_GELU_TANH || act == ACT_SILU) {
+        for (; i < total; i++) data[i] = spingalett_engine_activate_one(data[i], act);
+        return;
+    }
+    apply_activation_bulk(data, total, act);
+}
+
 void spingalett_epilogue_bias_activation(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols,
                                          float *c, size_t ldc) {
     const SpingalettBiasActivation *e = (const SpingalettBiasActivation *)ctx;
@@ -246,6 +295,38 @@ void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total,
             __m256 a = _mm256_loadu_ps(act_data + i);
             __m256 d = _mm256_loadu_ps(deriv + i);
             _mm256_storeu_ps(deriv + i, _mm256_mul_ps(d, FNMADD256(a, a, one)));
+        }
+    }
+#endif
+#if defined(__AVX2__)
+    /* GELU and SiLU from the values before the activation, with spingalett_activate_training()'s functions */
+    if (act == ACT_GELU) {
+        const __m256 half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f);
+        for (; i + 8u <= total; i += 8u) {
+            const __m256 x = _mm256_loadu_ps(act_data + i);
+            __m256 e;
+            const __m256 erf = erf256_ps(_mm256_mul_ps(x, _mm256_set1_ps(0.70710678118654752f)), &e);
+            const __m256 g = FMADD256(_mm256_mul_ps(x, _mm256_set1_ps(0.39894228040143268f)), e,
+                                      _mm256_mul_ps(half, _mm256_add_ps(one, erf)));
+            _mm256_storeu_ps(deriv + i, _mm256_mul_ps(_mm256_loadu_ps(deriv + i), g));
+        }
+    } else if (act == ACT_GELU_TANH) {
+        const __m256 half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f), k = _mm256_set1_ps(0.79788456080286536f);
+        for (; i + 8u <= total; i += 8u) {
+            const __m256 x = _mm256_loadu_ps(act_data + i), x2 = _mm256_mul_ps(x, x);
+            const __m256 t = tanh256_ps(_mm256_mul_ps(k, FMADD256(_mm256_set1_ps(0.044715f), _mm256_mul_ps(x2, x), x)));
+            const __m256 du = _mm256_mul_ps(k, FMADD256(_mm256_set1_ps(3.0f * 0.044715f), x2, one));
+            const __m256 g = FMADD256(_mm256_mul_ps(_mm256_mul_ps(half, x), FNMADD256(t, t, one)), du,
+                                      _mm256_mul_ps(half, _mm256_add_ps(one, t)));
+            _mm256_storeu_ps(deriv + i, _mm256_mul_ps(_mm256_loadu_ps(deriv + i), g));
+        }
+    } else if (act == ACT_SILU) {
+        const __m256 one = _mm256_set1_ps(1.0f);
+        for (; i + 8u <= total; i += 8u) {
+            const __m256 x = _mm256_loadu_ps(act_data + i);
+            const __m256 sg = _mm256_div_ps(one, _mm256_add_ps(one, exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), x))));
+            const __m256 g = _mm256_mul_ps(sg, FMADD256(x, _mm256_sub_ps(one, sg), one));
+            _mm256_storeu_ps(deriv + i, _mm256_mul_ps(_mm256_loadu_ps(deriv + i), g));
         }
     }
 #endif
