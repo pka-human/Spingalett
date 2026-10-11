@@ -94,6 +94,16 @@ static size_t ln_stats_floats(const NeuralNetwork *net, uint32_t l, uint32_t cap
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count) {
     uint64_t per_sample = net->total_neurons ? net->total_neurons : 1u;
     uint64_t cap = SPINGALETT_BATCH_FLOATS / per_sample;
+    /* the most cells a layer has: a chunk's products take its samples times them as rows */
+    uint64_t cells = 1;
+    for (uint32_t l = 1; l < net->layers; l++) {
+        const uint64_t c = (uint64_t)net->shapes[l].height * net->shapes[l].width;
+        if (c > cells) cells = c;
+    }
+    if (cap * cells < SPINGALETT_BATCH_ROWS) {
+        const uint64_t rows = (SPINGALETT_BATCH_ROWS + cells - 1) / cells, most = SPINGALETT_NETWORK_FLOATS / per_sample;
+        cap = rows < most ? rows : most > cap ? most : cap;
+    }
     if (cap > SPINGALETT_BATCH_CHUNK) cap = SPINGALETT_BATCH_CHUNK;
     if (cap < 1) cap = 1;
     return count < cap ? count : (uint32_t)cap;

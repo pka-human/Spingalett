@@ -106,9 +106,16 @@ typedef struct {
 /* Samples per batch-path chunk: bounds workspace memory (full-batch training over a large dataset
    runs in chunks whose gradients are accumulated) while keeping the GEMMs large. Networks with more
    than SPINGALETT_BATCH_FLOATS / SPINGALETT_BATCH_CHUNK activations per sample (convolutions) take
-   fewer samples per chunk, so that one chunk's activations stay near SPINGALETT_BATCH_FLOATS. */
+   fewer samples per chunk, so that one chunk's activations stay near SPINGALETT_BATCH_FLOATS. A
+   network's products then take a chunk's samples times their cells as rows: a sample of few cells but
+   many values (a sequence of a language model, millions of values over 256 cells) left chunks of one or
+   two, products over 256 or 512 rows that kept six threads busy half the time; such chunks take more
+   samples, up to SPINGALETT_BATCH_ROWS rows or SPINGALETT_NETWORK_FLOATS values (GPT on the CPU trained 1.5
+   times as fast). Deployment models size their chunks by SPINGALETT_BATCH_FLOATS alone. */
 #define SPINGALETT_BATCH_CHUNK 2048u
 #define SPINGALETT_BATCH_FLOATS (1u << 24)
+#define SPINGALETT_BATCH_ROWS 2048u
+#define SPINGALETT_NETWORK_FLOATS (1u << 26)
 
 typedef struct SpingalettGemmScratch SpingalettGemmScratch;
 
@@ -180,8 +187,9 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
 BatchWorkspace *spingalett_batch_workspace_recompute(const NeuralNetwork *net, uint32_t capacity, bool gather,
                                                      ComputeMode mode);
 void spingalett_batch_workspace_free(BatchWorkspace *ws);
-/* Samples per chunk for `count` samples: at most count, SPINGALETT_BATCH_CHUNK and what fits
-   SPINGALETT_BATCH_FLOATS activations, at least 1. */
+/* Samples per chunk for `count` samples: at most count and SPINGALETT_BATCH_CHUNK, what fits
+   SPINGALETT_BATCH_FLOATS activations, or more for products of fewer than SPINGALETT_BATCH_ROWS rows (up to
+   SPINGALETT_NETWORK_FLOATS activations), at least 1. */
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
 /* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
    layers; samples are numbered position_offset + s for the dropout hash. */
