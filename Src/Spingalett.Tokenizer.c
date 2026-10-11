@@ -206,9 +206,10 @@ static size_t decompose(uint32_t cp, uint32_t *out, int depth) {
 /* NFC of s (n bytes of UTF-8) appended to *out; text below U+0300 is its own NFC. */
 typedef struct { char *buf; size_t len, cap; } Bytes;
 
+/* (a buffer exists after the first call, even for no bytes: offsets into it are never applied to NULL) */
 static bool bytes_reserve(Bytes *b, size_t more) {
     if (more > SIZE_MAX / 2 - b->len) return false;
-    if (b->len + more <= b->cap) return true;
+    if (b->buf && b->len + more <= b->cap) return true;
     size_t cap = b->cap ? b->cap : 256;
     while (cap < b->len + more) cap *= 2;
     char *p = (char *)realloc(b->buf, cap);
