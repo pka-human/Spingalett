@@ -155,7 +155,7 @@ struct PredictWorkspace {
     float *act[2];                              /* [chunk x max_width] each; for a graph (format 6) act[0]
                                                    holds every output at chunk times its offset */
     int8_t *xq;                                 /* [chunk x max_int_inputs] */
-    float *xs;                                  /* per-sample activation scales */
+    float *xs;                                  /* activation scales: a sample's, or a cell's (SlettLayer.cells) */
     int8_t *window;                             /* a quantized convolution window or one pixel's sums, per thread */
     size_t window_stride;
     int8_t *tile;                               /* a tile of activations and its sums, per thread */
@@ -369,7 +369,7 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
     w->chunk = chunk;
     w->mode = mode;
     w->dense_tiles = dense_tiles;
-    uint32_t int_inputs = 0, int_window = 0, norm_channels = 0, transposed_window = 0;
+    uint32_t int_inputs = 0, int_window = 0, norm_channels = 0, transposed_window = 0, scales = 1;
     size_t conv_floats = 0, tile_x = 0, tile_acc = 0;
     bool has_float = false, ok = true;
     for (uint32_t i = 0; i < model->layer_count; i++) {
@@ -399,6 +399,7 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
         bool conv = L.type == LAYER_CONV2D;
         if (spingalett_precision_is_int(L.precision)) {
             if (L.inputs > int_inputs) int_inputs = L.inputs;
+            if (L.cells && L.out_h * L.out_w > scales) scales = L.out_h * L.out_w;     /* a scale a cell */
             if (layer_tiled(&L, dense_tiles)) {
                 size_t x = (size_t)SPINGALETT_I8_TILE * spingalett_i8_interleaved_len(L.row_len);
                 size_t acc = (size_t)SPINGALETT_I8_TILE * spingalett_i8_interleaved_rows(L.rows) * sizeof(int32_t);
@@ -435,7 +436,7 @@ static PredictWorkspace *predict_workspace_create(const SpingalettModel *model, 
     }
     if (ok && int_inputs) {
         w->xq = (int8_t *)workspace_alloc(w, (size_t)chunk * int_inputs);
-        w->xs = (float *)workspace_alloc(w, (size_t)chunk * sizeof(float));
+        w->xs = (float *)workspace_alloc(w, (size_t)chunk * scales * sizeof(float));
         ok = w->xq && w->xs;
         if (ok && tile_x) {
             w->tile_sums = (tile_x + 63u) & ~(size_t)63u;
@@ -518,10 +519,17 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const Pr
                            L->pad_h == 0 && L->pad_w == 0;
     bool parallel = use_omp_int(mode, items * K * OC);
 
-    SPINGALETT_PARALLEL_FOR(parallel,
-        for (int64_t s = 0; s < (int64_t)n; s++)
-            w->xs[s] = spingalett_quantize_activations(x + (size_t)s * in, in, w->xq + (size_t)s * in);
-    );
+    /* each sample quantized as a whole, or each cell (pointwise: item g's channels at g C) */
+    if (L->cells)
+        SPINGALETT_PARALLEL_FOR(parallel,
+            for (int64_t g = 0; g < (int64_t)items; g++)
+                w->xs[g] = spingalett_quantize_activations(x + (size_t)g * C, C, w->xq + (size_t)g * C);
+        );
+    else
+        SPINGALETT_PARALLEL_FOR(parallel,
+            for (int64_t s = 0; s < (int64_t)n; s++)
+                w->xs[s] = spingalett_quantize_activations(x + (size_t)s * in, in, w->xq + (size_t)s * in);
+        );
 
     if (prep->interleaved) {
         /* a tile of pixels at a time against all filters */
@@ -540,7 +548,7 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const Pr
                     if (pointwise) memcpy(windows + (size_t)i * len, xq + p * C, K);
                     else spingalett_gather_window(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), windows + (size_t)i * len, 1);
                     ys[i] = y + (size_t)s * out + p * OC;
-                    xs[i] = w->xs[s];
+                    xs[i] = w->xs[L->cells ? g : s];
                 }
                 tile_outputs(prep->interleaved, prep->tile_sums, bias, scale, OC, K, w, t, count, ys, xs);
             }
@@ -566,7 +574,7 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const Pr
                     const int8_t *xq = w->xq + (size_t)s * in;
                     if (pointwise) memcpy(windows + i * K, xq + p * C, K);
                     else spingalett_gather_window(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), windows + i * K, 1);
-                    smp[i] = s;
+                    smp[i] = L->cells ? g : s;     /* where its scale is */
                     ys[i] = y + (size_t)s * out + p * OC;
                 }
                 for (uint32_t j = 0; j < OC; j += 4) {
@@ -600,7 +608,8 @@ static void predict_int_conv(const uint8_t *image, const SlettLayer *L, const Pr
                     spingalett_conv_columns_i8(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), filters, acc);
                 else
                     spingalett_conv_depthwise_i8(xq, L, (uint32_t)(p / L->out_w), (uint32_t)(p % L->out_w), filters, acc);
-                for (uint32_t j = 0; j < OC; j++) yo[j] = spingalett_int_output(bias[j], scale[j], w->xs[s], acc[j]);
+                const float xs = w->xs[L->cells ? item : s];
+                for (uint32_t j = 0; j < OC; j++) yo[j] = spingalett_int_output(bias[j], scale[j], xs, acc[j]);
                 continue;
             }
             /* grouped: each group's filters with the window of its channels */

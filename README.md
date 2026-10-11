@@ -1110,7 +1110,8 @@ spingalett_model_free(model);
 ```
 
 INT8, INT4 and INT2 layers run in integer arithmetic: each layer quantizes its input to 8 bits per
-sample (the largest magnitude maps to 127), multiplies it with the weights in 32-bit integers
+sample (the largest magnitude maps to 127; per token for the linear layers of language models, whose
+tokens then do not depend on each other), multiplies it with the weights in 32-bit integers
 (AVX2 with VNNI where available, SSE2, NEON with the dot-product extension where available, the Arm
 DSP extension, or portable C) and rescales each output by its weight row's scale. With AVX2 and
 NEON, INT4 and INT2 codes are decoded in registers, so they run about as fast as INT8 from a half or

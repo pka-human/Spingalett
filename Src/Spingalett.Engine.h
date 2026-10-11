@@ -58,6 +58,9 @@ typedef struct {
     uint32_t heads, kv_heads;                       /* version 8: attention */
     float theta;                                    /* version 8: attention: rotary embeddings' base */
     bool causal, positions;                         /* version 8: attention, embedding */
+    bool cells;                                     /* an integer linear layer of a language model
+                                                       (slett_token_linear()): each cell's channels
+                                                       quantized with a scale of their own */
 } SlettLayer;
 
 typedef struct {
@@ -163,6 +166,21 @@ static inline bool slett_conv_columns(const SlettLayer *L) {
    transposed tap by tap, wt[t * rows + j], and each output pixel accumulates all filters at once. */
 static inline bool slett_conv_depthwise(const SlettLayer *L) {
     return L->type == LAYER_CONV2D && L->groups > 1 && L->in_c == L->groups;
+}
+
+/* A 1 x 1 convolution with stride 1 and no padding: a linear map of each cell. */
+static inline bool slett_conv_pointwise(const SlettLayer *L) {
+    return L->type == LAYER_CONV2D && L->kernel_h == 1 && L->kernel_w == 1 && L->stride_h == 1 && L->stride_w == 1 &&
+           L->pad_h == 0 && L->pad_w == 0;
+}
+
+/* The linear layers of a language model (a model whose first layer is an embedding: its cells are
+   tokens), integer pointwise convolutions of one group, quantize each cell's channels with a scale of
+   their own (SlettLayer.cells), not the sample's: a token's outputs then depend on that token alone,
+   so that a causal model's earlier positions never see the later ones, and a sequence computed a token
+   at a time (spingalett_session_feed()) gives the integer sums of the whole sequence. */
+static inline bool slett_token_linear(const SlettLayer *L, bool language_model) {
+    return language_model && L->groups == 1 && spingalett_precision_is_int(L->precision) && slett_conv_pointwise(L);
 }
 
 /* Forward passes of the layers that combine others, on one sample, in the order the batched ones

@@ -2103,8 +2103,9 @@ class LayerInfo:
 
 class Model:
     """A read-only network for inference that computes in the precision its weights are stored in:
-    INT8, INT4 and INT2 layers quantize their input to 8 bits per sample and use integer kernels,
-    FLOAT32, FP16 and BFLOAT16 layers compute in float. Create one with :meth:`Network.to_model`,
+    INT8, INT4 and INT2 layers quantize their input to 8 bits per sample (per token in the linear layers
+    of language models) and use integer kernels, FLOAT32, FP16 and BFLOAT16 layers compute in float.
+    Create one with :meth:`Network.to_model`,
     :meth:`Model.load` or :meth:`Model.from_bytes`; :meth:`to_bytes` gives the .slett image, which
     the standalone C engine runs in place."""
 

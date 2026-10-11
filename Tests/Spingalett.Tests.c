@@ -4247,6 +4247,73 @@ static void tf_models(void) {
     }
 }
 
+/* Causal language models of width d (heads of 4 or more values) over T tokens of V: GPT-2-like (kind 0:
+   learned positions, layer normalization, multi-head attention, a GELU MLP) and LLaMA-like (kind 1: RMS
+   normalization, grouped-query attention with rotary embeddings, SwiGLU), two blocks each. */
+static NeuralNetwork *lm_net(int kind, uint32_t T, uint32_t V, uint32_t d) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = T);
+    uint32_t x = embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = kind == 0);
+    const uint32_t heads = d >= 16 ? 4 : 2, kv = kind == 0 ? heads : heads / 2, head = d / heads;
+    for (int b = 0; b < 2; b++) {
+        if (kind == 0) layer_norm(.net = net);
+        else rms_norm(.net = net);
+        linear(.net = net, .neurons_amount = (heads + 2 * kv) * head);
+        attention(.net = net, .heads = heads, .kv_heads = kv, .rope_theta = kind == 0 ? 0.0f : 10000.0f, .causal = true);
+        uint32_t a = linear(.net = net, .neurons_amount = d);
+        x = add_layers(.net = net, .inputs = {x, a});
+        uint32_t n = kind == 0 ? layer_norm(.net = net) : rms_norm(.net = net, .epsilon = 1e-6f);
+        if (kind == 0) {
+            linear(.net = net, .neurons_amount = 3 * d, .act_func = ACT_GELU);
+        } else {
+            uint32_t g = linear(.net = net, .neurons_amount = 3 * d, .act_func = ACT_SILU);
+            uint32_t u = linear(.net = net, .inputs = {n}, .neurons_amount = 3 * d);
+            multiply_layers(.net = net, .inputs = {g, u});
+        }
+        a = linear(.net = net, .neurons_amount = d);
+        x = add_layers(.net = net, .inputs = {x, a});
+    }
+    if (kind == 0) layer_norm(.net = net);
+    else rms_norm(.net = net);
+    linear(.net = net, .neurons_amount = V);
+    return net;
+}
+
+/* Integer language models quantize each token's activations alone: a later token leaves the logits of
+   the earlier ones as they were, batched and in single runs (narrow models run the engine's short windows,
+   wide ones its four pixels at a time). */
+static void tf_token_quantization(void) {
+    const uint32_t T = 11, V = 13, N = 5;
+    for (int kind = 0; kind < 2; kind++)
+        for (uint32_t d = 8; d <= 48; d += 40) {
+            lcg_state = 610 + (unsigned)(kind * 100) + d;
+            NeuralNetwork *net = lm_net(kind, T, V, d);
+            tf_init(net);
+            float *x = malloc((size_t)N * T * sizeof(float)), *y = malloc((size_t)N * T * V * sizeof(float));
+            float *z = malloc((size_t)N * T * V * sizeof(float)), *r = malloc((size_t)N * T * V * sizeof(float));
+            for (uint32_t i = 0; i < N * T; i++) x[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
+            for (int p = PRECISION_INT8; p < PRECISION_COUNT; p++) {
+                SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+                CHECK(m != NULL, "token quantization: model");
+                if (!m) continue;
+                spingalett_model_predict(m, x, N, y);
+                for (uint32_t s = 0; s < N; s++) x[s * T + T - 1] = (float)(((uint32_t)x[s * T + T - 1] + 5u) % V);
+                spingalett_model_predict(m, x, N, z);
+                for (uint32_t s = 0; s < N; s++) spingalett_model_run(m, x + (size_t)s * T, r + (size_t)s * T * V, NULL);
+                bool same = true;
+                for (uint32_t s = 0; s < N; s++)
+                    same = same && !memcmp(y + (size_t)s * T * V, z + (size_t)s * T * V, (size_t)(T - 1) * V * 4);
+                CHECK(same && !memcmp(z, r, (size_t)N * T * V * 4), "token quantization: kind %d width %u p=%d: the "
+                      "earlier tokens' logits changed with the last token (%d), or batches differ from runs", kind, d, p,
+                      !same);
+                spingalett_model_free(m);
+            }
+            free(x); free(y); free(z); free(r);
+            free_network(net);
+        }
+    printf("  integer language models: each token quantized alone, earlier logits independent of later tokens\n");
+}
+
 static void tf_validation(void) {
     spingalett_set_log_level(LOG_NONE);
     NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
@@ -6027,6 +6094,7 @@ int main(int argc, char **argv) {
         tf_gradcheck(1, cm[2], STRATEGY_FULL_BATCH);
         tf_determinism();
         tf_models();
+        tf_token_quantization();
         tf_validation();
         tf_learns(COMPUTE_OPENMP);
     }

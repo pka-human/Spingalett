@@ -7,6 +7,15 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+- Integer deployment models of language models (INT8, INT4, INT2; in the engine, batched and in the
+  runtime) quantized the input of each linear layer with one scale for the whole sequence, so that a
+  later token changed the logits of the earlier ones of a causal model. In a model whose first layer is
+  an embedding, integer convolutions of 1 x 1 windows, stride 1, no padding and one group now quantize
+  each token's channels with a scale of their own (`docs/ModelFormat.md`); their results differ from
+  1.2's within the quantization's error. Tests: `transformer` (later tokens leave earlier logits
+  unchanged, bit for bit, batched and in single runs).
+
 ## [1.2.0] - 2026-10-11
 
 "Transformers": the networks of today's language models in every part of the library at once,

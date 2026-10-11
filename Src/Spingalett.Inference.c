@@ -1356,6 +1356,8 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         layer->rows = layer->vocabulary;
         layer->row_len = layer->out_c;
     }
+    /* (embeddings exist from version 8 on) */
+    layer->cells = version >= 8u && index > 0 && slett_token_linear(layer, entry_at(image, 0)[10] == LAYER_EMBEDDING);
 }
 
 uint64_t spingalett_slett_act_offset(const uint8_t *image, uint32_t j) {
@@ -1831,11 +1833,15 @@ static void conv_forward_columns(const uint8_t *image, const SlettLayer *L, cons
     spingalett_conv_transpose_filters(image, L, scratch);
     if (is_int) {
         const float *scale = (const float *)(const void *)(image + L->scales);
-        float x_scale = spingalett_quantize_activations(x, L->inputs, xq);
+        float x_scale = L->cells ? 0.0f : spingalett_quantize_activations(x, L->inputs, xq);
         int32_t *acc = (int32_t *)sums;
         for (uint32_t oh = 0; oh < L->out_h; oh++)
             for (uint32_t ow = 0; ow < L->out_w; ow++) {
                 float *o = y + ((size_t)oh * L->out_w + ow) * R;
+                if (L->cells) {             /* (pointwise: the cell is its window) */
+                    const size_t at = ((size_t)oh * L->out_w + ow) * L->in_c;
+                    x_scale = spingalett_quantize_activations(x + at, L->in_c, xq + at);
+                }
                 spingalett_conv_columns_i8(xq, L, oh, ow, (const int8_t *)scratch, acc);
                 for (uint32_t j = 0; j < R; j++) o[j] = spingalett_int_output(bias[j], scale[j], x_scale, acc[j]);
             }
@@ -2003,7 +2009,7 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
     const bool pointwise = L->kernel_h == 1 && L->kernel_w == 1 && L->stride_h == 1 && L->stride_w == 1 &&
                            L->pad_h == 0 && L->pad_w == 0;
     const uint32_t per_byte = L->precision == PRECISION_INT4 ? 2u : 4u;
-    float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    float x_scale = is_int && !L->cells ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
     if (L->precision == PRECISION_INT8) {
         /* four pixels at a time (their windows fill the scratch of one float window), each filter
            read once for the four; the integer sums are those of one pixel at a time */
@@ -2013,13 +2019,15 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
         const uint32_t pixels = L->out_h * L->out_w;
         int8_t *windows = (int8_t *)window;
         int32_t *wsum = (int32_t *)(void *)((uint8_t *)window + slett_align((uint64_t)K * 4u));
+        float scales[4] = {x_scale, x_scale, x_scale, x_scale};
         if (spingalett_dot_i8_4x4_sums && pixels >= 4u)
             for (uint32_t j = 0; j < OC; j++) wsum[j] = spingalett_sum_i8(weights + (size_t)j * K, K);
         for (uint32_t p0 = 0; p0 < pixels; p0 += 4u) {
             uint32_t count = pixels - p0 < 4u ? pixels - p0 : 4u;
             for (uint32_t i = 0; i < count; i++) {
                 uint32_t p = p0 + i;
-                if (pointwise) memcpy(windows + (size_t)i * K, xq + (size_t)p * L->in_c, K);
+                if (L->cells) scales[i] = spingalett_quantize_activations(x + (size_t)p * K, K, windows + (size_t)i * K);
+                else if (pointwise) memcpy(windows + (size_t)i * K, xq + (size_t)p * L->in_c, K);
                 else spingalett_gather_window(xq, L, p / L->out_w, p % L->out_w, windows + (size_t)i * K, 1);
             }
             for (uint32_t j = 0; j < OC; j += 4u) {
@@ -2035,7 +2043,7 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
                 }
                 for (uint32_t i = 0; i < count; i++)
                     for (uint32_t r = 0; r < rows; r++)
-                        y[(size_t)(p0 + i) * OC + j + r] = spingalett_int_output(bias[j + r], scale[j + r], x_scale, acc[4u * r + i]);
+                        y[(size_t)(p0 + i) * OC + j + r] = spingalett_int_output(bias[j + r], scale[j + r], scales[i], acc[4u * r + i]);
             }
         }
         return;
@@ -2046,6 +2054,7 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
             const float *xw = x + p * L->in_c;
             const int8_t *qw = xq + p * L->in_c;
             int32_t xsum = 0;
+            if (L->cells) x_scale = spingalett_quantize_activations(xw, K, xq + p * L->in_c);
             if (!pointwise || packed) {         /* packed rows permute their activations in place */
                 if (is_int && pointwise) memcpy(window, qw, K);
                 else spingalett_gather_window(is_int ? (const void *)xq : (const void *)x, L, oh, ow, window, is_int ? 1u : 4u);
