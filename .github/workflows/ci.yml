@@ -113,7 +113,7 @@ jobs:
   # the bindings of other languages against the library, installed: their tests, and their structures' layout
   # against the C compiler's (SpingalettLayout)
   bindings:
-    name: bindings (Rust, .NET, Go, Java)
+    name: bindings (Rust, .NET, Go, Java, PHP)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -158,6 +158,32 @@ jobs:
       - name: Java
         working-directory: Bindings/Java
         run: mvn -B -q test
+
+      # PHP: the oldest version the bindings support, then a current one (which gives the structures'
+      # offsets, so that the layout is checked too)
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"
+          extensions: ffi
+          ini-values: ffi.enable=true
+          coverage: none
+          tools: none
+
+      - name: PHP 7.4
+        working-directory: Bindings/PHP
+        run: php tests/run.php
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: ffi
+          ini-values: ffi.enable=true
+          coverage: none
+          tools: composer
+
+      - name: PHP
+        working-directory: Bindings/PHP
+        run: composer validate && php tests/run.php
 
   inference-only:
     name: inference engine alone
