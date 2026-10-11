@@ -169,7 +169,9 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push
   constants' bfloat16 buffers. A kernel that reads or writes activations through anything but
   `ld()`/`st()` (`half.glsl`) or the products' loads reads garbage in bfloat16: every new kernel
-  that touches activations needs a variant and an entry in `half_words[]`.
+  that touches activations needs a variant and an entry in `half_words[]`. The kernels of the matrix
+  units, which exist only with 16-bit storage (`gemm_mma.comp`, and `flash.comp`, Vulkan's flash
+  attention), have no variant: their HALF is a constant their caller computes (`product()`, `attn_pass()`).
 - **Normalizations applied by their readers.** On the GPU a batch normalization read only by an
   addition (`fold[]`) or by a depthwise convolution (`pro[]`, dwconv.comp's PRO) has no outputs: its
   reader applies it to the normalization's input as it reads. Code that reads a layer's outputs goes

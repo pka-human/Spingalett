@@ -1628,8 +1628,23 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
         threads = 2u * bq;
         if (op == SPG_ATTN_FORWARD && head <= 64u) bq = 128u;
     }
-    const uint32_t spec[4] = {op, mma ? 0u : bq, dmax, threads};
     if (g->geo[l].buffer) reads(a, whole(&g->geo[l]));
+    /* networks in bfloat16 on Vulkan: flash.comp where the device has its cooperative matrices and room for its
+       tiles, told which of x, y, dy and dx are kept as bfloat16 (HALF) */
+    uint32_t warps, bt;
+    if (g->bf16 && (x | y | dy | dx) % 16u == 0 && spg_flash_tiles(head, op, &warps, &bt)) {
+        const uint64_t words[4] = {x, y, dy, dx};
+        uint32_t mask = 0;
+        for (uint32_t w = 0; w < 4u; w++)
+            if (in_half(g, words[w])) mask |= 1u << w;
+        const uint32_t sg = spg_gpu_subgroup_size();
+        const uint32_t fspec[7] = {op, head, warps, bt, sg, mask, warps * sg};
+        need(r, a);
+        spg_gpu_dispatch(r->c, SPG_KERNEL_flash, fspec, 7, &p, sizeof p, (cells + 16u * warps - 1u) / (16u * warps),
+                         op == SPG_ATTN_DKV ? s->kv_heads : s->heads, n);
+        return;
+    }
+    const uint32_t spec[4] = {op, mma ? 0u : bq, dmax, threads};
     const uint32_t tiles = (cells + bq - 1u) / bq;
     if (op == SPG_ATTN_PRE)
         kernel(r, a, SPG_KERNEL_attn, spec, 4, &p, sizeof p, groups((uint64_t)n * s->heads * cells, threads), 1, 1);

@@ -446,6 +446,30 @@ void spg_gemm(SpgGpuCommands *c, SpgGemmPush *p, const SpgGemmMode *mode) {
     dispatch_tile(c, p, mode, vec, &t, mma);
 }
 
+/* ------------------------------------------------------------------------- flash attention */
+
+/* Bytes of shared memory flash.comp takes for a head size, pass, subgroups a workgroup and tile of the other side
+   (its header counts them). */
+static uint32_t flash_shared(uint32_t d, uint32_t op, uint32_t warps, uint32_t bt) {
+    const uint32_t sd = d + 8u, ps = (bt > d ? bt : d) + 8u, np = op == SPG_ATTN_DKV ? 2u : 1u;
+    const uint32_t fs = op == SPG_ATTN_FORWARD && 16u * (bt + 4u) > 640u ? 16u * (bt + 4u) : 640u;
+    return 4u * bt * sd + 2u * warps * np * 16u * ps + 4u * warps * fs + (op == SPG_ATTN_FORWARD ? 64u * warps : 4u) +
+           (op == SPG_ATTN_DKV ? 8u * bt : 8u);
+}
+
+bool spg_flash_tiles(uint32_t head, uint32_t op, uint32_t *warps, uint32_t *bt) {
+    const uint32_t sg = spg_gpu_subgroup_size();
+    if (spg_gpu_using() != SPG_BACKEND_VULKAN || op == SPG_ATTN_PRE || (head != 32u && head != 64u && head != 128u) ||
+        (sg != 16u && sg != 32u && sg != 64u) || !spg_gpu_mma_bf16() || !spg_gpu_kernel_built(SPG_KERNEL_flash))
+        return false;
+    *bt = head <= 64u ? 64u : 32u;
+    for (*warps = 4u; *warps >= 2u; *warps /= 2u)
+        if (flash_shared(head, op, *warps, *bt) <= spg_gpu_shared_memory() && *warps * sg <= 1024u &&
+            (*bt * head / 8u) % (2u * *warps * sg) == 0)
+            return true;
+    return false;
+}
+
 /* ------------------------------------------------------------------------- convolution geometry */
 
 static void geometry(uint32_t *geo, uint32_t rh, uint32_t rw, uint32_t gh, uint32_t gw, uint32_t gc, uint32_t sh,

@@ -260,6 +260,8 @@ static uint32_t cub_max_workgroups(uint32_t axis) { return axis == 0 ? 0x7FFFFFF
 static bool cub_mma_bf16(void) { return cub_open(); }          /* (Ampere and later: mma.sync of bfloat16) */
 static bool cub_bf16_storage(void) { return cub_open(); }
 static bool cub_host_writes(void) { return false; }
+/* (flash.comp is Vulkan's: flash attention runs on attn's units of flash.cu here) */
+static bool cub_kernel_built(SpgKernel kernel) { return kernel != SPG_KERNEL_flash; }
 
 /* ------------------------------------------------------------------------- kernels */
 
@@ -972,8 +974,8 @@ static bool cub_wait(void *commands) {
 
 const SpgGpuOps spg_cuda_ops = {
     cub_open, cub_device_name, cub_memory, cub_shared_memory, cub_subgroup_size, cub_max_workgroups, cub_mma_bf16,
-    cub_bf16_storage, cub_host_writes, cub_buffer_create, cub_buffer_free, cub_arena_create, cub_arena_add,
-    cub_arena_commit, cub_arena_free, cub_commands_create, cub_commands_free, cub_commands_untimed,
+    cub_bf16_storage, cub_host_writes, cub_kernel_built, cub_buffer_create, cub_buffer_free, cub_arena_create,
+    cub_arena_add, cub_arena_commit, cub_arena_free, cub_commands_create, cub_commands_free, cub_commands_untimed,
     cub_commands_stamps, cub_timestamp, cub_timestamps, cub_record_begin, cub_dispatch, cub_prepare, cub_barrier,
     cub_barrier_host, cub_copy, cub_fill, cub_record_end, cub_submit, cub_wait,
 };

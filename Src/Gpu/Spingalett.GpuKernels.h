@@ -45,6 +45,12 @@ uint32_t spg_gemm_split(uint32_t M, uint32_t N, uint32_t K, uint32_t G, uint32_t
 uint32_t spg_gemm_tiles(bool mma);
 void spg_gemm_tile(bool mma, uint32_t index, uint32_t *bm, uint32_t *bn, uint32_t *bk, uint32_t *tm, uint32_t *tn);
 
+/* Whether flash.comp (Vulkan) runs a pass of attention (SPG_ATTN_FORWARD, DQ or DKV) of heads of `head` values,
+   and its subgroups a workgroup (*warps, of 16 rows each) and rows of the other side's tiles (*bt): heads of 32, 64
+   or 128 on devices with bfloat16 cooperative matrices, subgroups of 16 to 64 invocations, and room in shared
+   memory (four subgroups, else two; tiles of 64 rows, of 32 for heads of 128). */
+bool spg_flash_tiles(uint32_t head, uint32_t op, uint32_t *warps, uint32_t *bt);
+
 /* A monotonic clock, in seconds. */
 double spg_seconds(void);
 

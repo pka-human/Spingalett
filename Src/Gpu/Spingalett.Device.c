@@ -70,6 +70,7 @@ uint32_t spg_gpu_max_workgroups(uint32_t axis) { return OPS ? OPS->max_workgroup
 bool spg_gpu_mma_bf16(void) { return OPS && OPS->mma_bf16(); }
 bool spg_gpu_bf16_storage(void) { return OPS && OPS->bf16_storage(); }
 bool spg_gpu_host_writes(void) { return OPS && OPS->host_writes(); }
+bool spg_gpu_kernel_built(SpgKernel kernel) { return OPS && OPS->kernel_built(kernel); }
 
 bool spg_gpu_buffer_create(SpgGpuBuffer *buffer, size_t bytes, bool host_visible) {
     memset(buffer, 0, sizeof *buffer);
