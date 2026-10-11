@@ -711,8 +711,8 @@ SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
 SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
 SPINGALETT_API void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
 SPINGALETT_API SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
-/* The token of an id as the vocabulary writes it ("Ġthe" in byte-level vocabularies, "▁the" in
-   SentencePiece's, "<|im_start|>"), valid while the tokenizer lives; NULL for an id of no token. */
+/* The token of an id as the vocabulary writes it (in UTF-8: byte-level vocabularies write a space as U+0120,
+   SentencePiece's as U+2581; "<|im_start|>"), valid while the tokenizer lives; NULL for an id of no token. */
 SPINGALETT_API const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
 /* The id of a token as the vocabulary writes it (added tokens first), SPINGALETT_NO_TOKEN when none. */
 SPINGALETT_API uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
