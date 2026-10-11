@@ -6,7 +6,7 @@ without the prefix of 0.x are in `Spingalett.Short.h`; the C++ interface is `Spi
 
 **Spingalett.h:** [`SpingalettWeightInitialization`](#spingalettweightinitialization), [`SpingalettTrainingMode`](#spingaletttrainingmode), [`SpingalettTrainingStrategy`](#spingaletttrainingstrategy), [`SpingalettOptimizerType`](#spingalettoptimizertype), [`SpingalettAutoSaveMode`](#spingalettautosavemode), [`SpingalettNetwork`](#spingalettnetwork), [`SpingalettDeviceData`](#spingalettdevicedata), [`SpingalettNetworkLayer`](#spingalettnetworklayer), [`SpingalettParameterKind`](#spingalettparameterkind), [`SpingalettMonitorMetric`](#spingalettmonitormetric), [`SpingalettTrainProgress`](#spingaletttrainprogress), [`SpingalettTrainCallback`](#spingaletttraincallback), [`SpingalettTrainStatus`](#spingaletttrainstatus), [`SpingalettTrainReport`](#spingaletttrainreport), [`SpingalettDataGeneratorFn`](#spingalettdatageneratorfn), [`SpingalettLRSchedulerFn`](#spingalettlrschedulerfn), [`SpingalettLRScheduleParams`](#spingalettlrscheduleparams), [`SpingalettNetworkArgs`](#spingalettnetworkargs), [`SpingalettLayerArgs`](#spingalettlayerargs), [`SpingalettForwardArgs`](#spingalettforwardargs), [`SpingalettTrainArgs`](#spingaletttrainargs), [`SpingalettPredictArgs`](#spingalettpredictargs), [`SpingalettEvaluateArgs`](#spingalettevaluateargs), [`SpingalettSaveArgs`](#spingalettsaveargs), [`SpingalettOptimizerArgs`](#spingalettoptimizerargs), [`SpingalettTrainer`](#spingaletttrainer), [`SpingalettDataset`](#spingalettdataset), [`spingalett_gpu_device()`](#spingalett_gpu_device), [`spingalett_cuda_device()`](#spingalett_cuda_device), [`spingalett_set_gpu_precision()`](#spingalett_set_gpu_precision), [`spingalett_get_gpu_precision()`](#spingalett_get_gpu_precision), [`spingalett_seed()`](#spingalett_seed), [`spingalett_network_new()`](#spingalett_network_new), [`spingalett_network_new_args()`](#spingalett_network_new_args), [`SPINGALETT_NO_LAYER`](#spingalett_no_layer), [`spingalett_layer()`](#spingalett_layer), [`spingalett_conv2d()`](#spingalett_conv2d), [`spingalett_max_pool2d()`](#spingalett_max_pool2d), [`spingalett_avg_pool2d()`](#spingalett_avg_pool2d), [`spingalett_batch_norm()`](#spingalett_batch_norm), [`spingalett_add_layers()`](#spingalett_add_layers), [`spingalett_concat_layers()`](#spingalett_concat_layers), [`spingalett_global_avg_pool2d()`](#spingalett_global_avg_pool2d), [`spingalett_conv_transpose2d()`](#spingalett_conv_transpose2d), [`spingalett_upsample2d()`](#spingalett_upsample2d), [`spingalett_layer_norm()`](#spingalett_layer_norm), [`spingalett_linear()`](#spingalett_linear), [`spingalett_embedding()`](#spingalett_embedding), [`spingalett_attention()`](#spingalett_attention), [`spingalett_rms_norm()`](#spingalett_rms_norm), [`spingalett_multiply_layers()`](#spingalett_multiply_layers), [`spingalett_append_layer()`](#spingalett_append_layer), [`spingalett_layer_count()`](#spingalett_layer_count), [`spingalett_network_layer()`](#spingalett_network_layer), [`spingalett_input_size()`](#spingalett_input_size), [`spingalett_output_size()`](#spingalett_output_size), [`spingalett_target_size()`](#spingalett_target_size), [`spingalett_parameter_count()`](#spingalett_parameter_count), [`spingalett_network_loss()`](#spingalett_network_loss), [`spingalett_optimizer_steps()`](#spingalett_optimizer_steps), [`spingalett_get_parameters()`](#spingalett_get_parameters), [`spingalett_set_parameters()`](#spingalett_set_parameters), [`spingalett_activate()`](#spingalett_activate), [`spingalett_derivative()`](#spingalett_derivative), [`spingalett_forward()`](#spingalett_forward), [`spingalett_forward_args()`](#spingalett_forward_args), [`spingalett_lr_cosine_decay()`](#spingalett_lr_cosine_decay), [`spingalett_lr_linear_warmup()`](#spingalett_lr_linear_warmup), [`spingalett_lr_step_decay()`](#spingalett_lr_step_decay), [`spingalett_lr_warmup_cosine()`](#spingalett_lr_warmup_cosine), [`spingalett_predict()`](#spingalett_predict), [`spingalett_predict_args()`](#spingalett_predict_args), [`spingalett_evaluate()`](#spingalett_evaluate), [`spingalett_evaluate_args()`](#spingalett_evaluate_args), [`spingalett_train()`](#spingalett_train), [`spingalett_train_args()`](#spingalett_train_args), [`SpingalettGenerateArgs`](#spingalettgenerateargs), [`spingalett_generate()`](#spingalett_generate), [`spingalett_generate_args()`](#spingalett_generate_args), [`spingalett_device_data_new()`](#spingalett_device_data_new), [`spingalett_device_data_free()`](#spingalett_device_data_free), [`spingalett_device_data_count()`](#spingalett_device_data_count), [`spingalett_device_data_size()`](#spingalett_device_data_size), [`spingalett_device_data_read()`](#spingalett_device_data_read), [`spingalett_trainer_new()`](#spingalett_trainer_new), [`spingalett_trainer_free()`](#spingalett_trainer_free), [`spingalett_trainer_forward()`](#spingalett_trainer_forward), [`spingalett_trainer_backward()`](#spingalett_trainer_backward), [`spingalett_trainer_backward_output_grads()`](#spingalett_trainer_backward_output_grads), [`spingalett_trainer_step()`](#spingalett_trainer_step), [`spingalett_trainer_zero_grad()`](#spingalett_trainer_zero_grad), [`spingalett_trainer_set_label_smoothing()`](#spingalett_trainer_set_label_smoothing), [`spingalett_train_on_batch()`](#spingalett_train_on_batch), [`spingalett_save()`](#spingalett_save), [`spingalett_save_args()`](#spingalett_save_args), [`spingalett_load()`](#spingalett_load), [`spingalett_save_to_memory()`](#spingalett_save_to_memory), [`spingalett_load_from_memory()`](#spingalett_load_from_memory), [`spingalett_free()`](#spingalett_free), [`spingalett_import_onnx()`](#spingalett_import_onnx), [`spingalett_import_onnx_from_memory()`](#spingalett_import_onnx_from_memory), [`spingalett_load_pytorch()`](#spingalett_load_pytorch), [`spingalett_load_pytorch_from_memory()`](#spingalett_load_pytorch_from_memory), [`spingalett_model_from_network()`](#spingalett_model_from_network), [`spingalett_export_c_header()`](#spingalett_export_c_header), [`spingalett_load_idx()`](#spingalett_load_idx), [`spingalett_load_csv()`](#spingalett_load_csv), [`spingalett_load_cifar()`](#spingalett_load_cifar), [`spingalett_dataset_set_class_names()`](#spingalett_dataset_set_class_names), [`spingalett_dataset_shuffle()`](#spingalett_dataset_shuffle), [`spingalett_dataset_split()`](#spingalett_dataset_split), [`spingalett_dataset_free()`](#spingalett_dataset_free), [`SpingalettDatasetEncoding`](#spingalettdatasetencoding), [`SpingalettTargetSet`](#spingaletttargetset), [`SpingalettDatasetSaveOptions`](#spingalettdatasetsaveoptions), [`SpingalettDatasetInfo`](#spingalettdatasetinfo), [`SpingalettDatasetReaderOptions`](#spingalettdatasetreaderoptions), [`SpingalettDatasetReader`](#spingalettdatasetreader), [`spingalett_save_dataset()`](#spingalett_save_dataset), [`spingalett_load_dataset()`](#spingalett_load_dataset), [`spingalett_load_dataset_from_memory()`](#spingalett_load_dataset_from_memory), [`spingalett_load_dataset_targets()`](#spingalett_load_dataset_targets), [`spingalett_load_dataset_from_memory_targets()`](#spingalett_load_dataset_from_memory_targets), [`spingalett_dataset_open()`](#spingalett_dataset_open), [`spingalett_dataset_open_ex()`](#spingalett_dataset_open_ex), [`spingalett_dataset_open_u8()`](#spingalett_dataset_open_u8), [`SpingalettTokenReaderOptions`](#spingaletttokenreaderoptions), [`spingalett_dataset_open_tokens()`](#spingalett_dataset_open_tokens), [`spingalett_dataset_target_set_name()`](#spingalett_dataset_target_set_name), [`spingalett_dataset_class_name()`](#spingalett_dataset_class_name), [`spingalett_dataset_target_set_size()`](#spingalett_dataset_target_set_size), [`spingalett_dataset_close()`](#spingalett_dataset_close), [`spingalett_dataset_info()`](#spingalett_dataset_info), [`spingalett_dataset_read()`](#spingalett_dataset_read), [`spingalett_dataset_generator()`](#spingalett_dataset_generator), [`spingalett_print_network()`](#spingalett_print_network), [`spingalett_network_free()`](#spingalett_network_free)
 
-**Spingalett.Runtime.h:** [`SpingalettLogLevel`](#spingalettloglevel), [`SpingalettLogCallback`](#spingalettlogcallback), [`SpingalettComputeMode`](#spingalettcomputemode), [`SpingalettEvalMetrics`](#spingalettevalmetrics), [`spingalett_version()`](#spingalett_version), [`spingalett_last_error_code()`](#spingalett_last_error_code), [`spingalett_last_error_message()`](#spingalett_last_error_message), [`spingalett_clear_error()`](#spingalett_clear_error), [`spingalett_cpu_kernels()`](#spingalett_cpu_kernels), [`spingalett_get_compute_mode()`](#spingalett_get_compute_mode), [`spingalett_set_compute_mode()`](#spingalett_set_compute_mode), [`spingalett_get_num_threads()`](#spingalett_get_num_threads), [`spingalett_set_num_threads()`](#spingalett_set_num_threads), [`spingalett_set_log_callback()`](#spingalett_set_log_callback), [`spingalett_set_log_level()`](#spingalett_set_log_level), [`spingalett_set_verbose()`](#spingalett_set_verbose), [`spingalett_get_verbose()`](#spingalett_get_verbose), [`spingalett_model_load()`](#spingalett_model_load), [`spingalett_model_from_memory()`](#spingalett_model_from_memory), [`spingalett_model_free()`](#spingalett_model_free), [`spingalett_model_predict()`](#spingalett_model_predict), [`spingalett_model_evaluate()`](#spingalett_model_evaluate)
+**Spingalett.Runtime.h:** [`SpingalettLogLevel`](#spingalettloglevel), [`SpingalettLogCallback`](#spingalettlogcallback), [`SpingalettComputeMode`](#spingalettcomputemode), [`SpingalettEvalMetrics`](#spingalettevalmetrics), [`spingalett_version()`](#spingalett_version), [`spingalett_last_error_code()`](#spingalett_last_error_code), [`spingalett_last_error_message()`](#spingalett_last_error_message), [`spingalett_clear_error()`](#spingalett_clear_error), [`spingalett_cpu_kernels()`](#spingalett_cpu_kernels), [`spingalett_get_compute_mode()`](#spingalett_get_compute_mode), [`spingalett_set_compute_mode()`](#spingalett_set_compute_mode), [`spingalett_get_num_threads()`](#spingalett_get_num_threads), [`spingalett_set_num_threads()`](#spingalett_set_num_threads), [`spingalett_set_log_callback()`](#spingalett_set_log_callback), [`spingalett_set_log_level()`](#spingalett_set_log_level), [`spingalett_set_verbose()`](#spingalett_set_verbose), [`spingalett_get_verbose()`](#spingalett_get_verbose), [`spingalett_model_load()`](#spingalett_model_load), [`spingalett_model_from_memory()`](#spingalett_model_from_memory), [`spingalett_model_free()`](#spingalett_model_free), [`spingalett_model_predict()`](#spingalett_model_predict), [`spingalett_model_evaluate()`](#spingalett_model_evaluate), [`SpingalettSession`](#spingalettsession), [`SpingalettSessionOptions`](#spingalettsessionoptions), [`spingalett_session_new()`](#spingalett_session_new), [`spingalett_session_free()`](#spingalett_session_free), [`spingalett_session_vocabulary()`](#spingalett_session_vocabulary), [`spingalett_session_length()`](#spingalett_session_length), [`SpingalettSessionFeed`](#spingalettsessionfeed), [`spingalett_session_feed()`](#spingalett_session_feed), [`spingalett_session_rewind()`](#spingalett_session_rewind), [`spingalett_session_copy()`](#spingalett_session_copy), [`SpingalettSessionGenerateArgs`](#spingalettsessiongenerateargs), [`spingalett_session_generate()`](#spingalett_session_generate), [`spingalett_session_generate_args()`](#spingalett_session_generate_args)
 
 **Spingalett.Inference.h:** [`SPINGALETT_FORMAT_VERSION`](#spingalett_format_version), [`SPINGALETT_MAX_INPUTS`](#spingalett_max_inputs), [`SPINGALETT_MODEL_EXTENSION`](#spingalett_model_extension), [`SPINGALETT_DATASET_EXTENSION`](#spingalett_dataset_extension), [`SPINGALETT_RESERVED`](#spingalett_reserved), [`SPINGALETT_OK`](#spingalett_ok), [`SPINGALETT_ERR_ALLOC`](#spingalett_err_alloc), [`SPINGALETT_ERR_INVALID`](#spingalett_err_invalid), [`SPINGALETT_ERR_FILE_IO`](#spingalett_err_file_io), [`SPINGALETT_ERR_FORMAT_VERSION`](#spingalett_err_format_version), [`SpingalettActivationFunction`](#spingalettactivationfunction), [`SpingalettLossFunction`](#spingalettlossfunction), [`SpingalettLayerType`](#spingalettlayertype), [`SpingalettUpsampleMode`](#spingalettupsamplemode), [`SpingalettPrecisionMode`](#spingalettprecisionmode), [`SpingalettModel`](#spingalettmodel), [`SpingalettLayerInfo`](#spingalettlayerinfo), [`spingalett_model_init()`](#spingalett_model_init), [`spingalett_model_run()`](#spingalett_model_run), [`spingalett_model_layer()`](#spingalett_model_layer)
 
@@ -1568,6 +1568,134 @@ Mean loss (the model's loss function, as spingalett_evaluate() computes it) and 
 SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs, const float *targets, uint32_t count);
 ```
 
+### `SpingalettSession`
+
+Sessions: a causal language model run a token at a time, with a key-value cache. The model's input is a window of token ids read by an embedding (its first layer), its output each position's logits (the vocabulary: the output's channels), and its layers treat each position alone (linear layers: 1 x 1 convolutions of one group; normalizations; additions, products and concatenations of layers) but for causal attention, whose keys (rotated, with rotary embeddings) and values the session keeps for every token it has been fed. A token fed then costs one row through every layer and its queries' attention over the tokens before it, instead of a pass over the whole window: a prompt fed at once runs its tokens through each layer together, and so do the tokens of several sequences fed in one call (batched generation). A session holds `sequences` sequences of at most max_length tokens (the model's window at most, positions 0 to max_length - 1), each with a cache of its own.
+
+The logits of a position are those spingalett_model_predict() gives it for the window holding the sequence's tokens: bit for bit for integer models, and for float ones too where batched prediction multiplies with the library's kernels (every mode but SPINGALETT_COMPUTE_OPENBLAS, which takes OpenBLAS's order: equal to rounding); however the tokens were fed, alone or with others. A session runs on the CPU, on the threads of the compute mode, and is used from one thread at a time; any number of sessions may run on one model at once, from any threads. The model must outlive its sessions.
+
+```c
+typedef struct SpingalettSession SpingalettSession;
+```
+
+### `SpingalettSessionOptions`
+
+```c
+typedef struct {
+    uint32_t max_length;            /* tokens a sequence holds at most: the model's window at most; 0 for it */
+    uint32_t sequences;             /* sequences the session holds (0: 1) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettSessionOptions;
+```
+
+### `spingalett_session_new()`
+
+Opens a session on a causal language model (options NULL: the defaults). NULL with the error set for other models (the message says what the session cannot run), or when memory runs out.
+
+```c
+SpingalettSession *spingalett_session_new(const SpingalettModel *model, const SpingalettSessionOptions *options);
+```
+
+### `spingalett_session_free()`
+
+```c
+void spingalett_session_free(SpingalettSession *session);
+```
+
+### `spingalett_session_vocabulary()`
+
+Logits a position has: the size of the vocabulary.
+
+```c
+uint32_t spingalett_session_vocabulary(const SpingalettSession *session);
+```
+
+### `spingalett_session_length()`
+
+Tokens a sequence holds (0 for a sequence out of range).
+
+```c
+uint32_t spingalett_session_length(const SpingalettSession *session, uint32_t sequence);
+```
+
+### `SpingalettSessionFeed`
+
+Tokens for one sequence of a session (spingalett_session_feed()).
+
+```c
+typedef struct {
+    uint32_t sequence;              /* which of the session's sequences */
+    const uint32_t *tokens;         /* [count] the tokens after those the sequence holds */
+    uint32_t count;
+    float *logits;                  /* [vocabulary]: the logits of the token after the last of them; with all,
+                                       [count x vocabulary]: of the token after each of them; NULL: none */
+    bool all;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettSessionFeed;
+```
+
+### `spingalett_session_feed()`
+
+Appends tokens to `count` sequences of the session (each named once), the rows of all of them computed together, and writes the logits asked for. A token outside the vocabulary embeds as zeros, as in spingalett_model_predict(). Returns false (the sequences unchanged) when a sequence would hold more than max_length tokens, a feed asks for logits without tokens, or memory runs out.
+
+```c
+bool spingalett_session_feed(SpingalettSession *session, const SpingalettSessionFeed *feeds, uint32_t count);
+```
+
+### `spingalett_session_rewind()`
+
+Truncates a sequence to its first `length` tokens (no more than it holds): the next token fed goes to position `length`. 0 empties it.
+
+```c
+bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
+```
+
+### `spingalett_session_copy()`
+
+Makes sequence `to` a copy of sequence `from` (its tokens and their keys and values): a prompt fed once serves several continuations.
+
+```c
+bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
+```
+
+### `SpingalettSessionGenerateArgs`
+
+```c
+typedef struct {
+    SpingalettSession *session;
+    uint32_t sequences;             /* sequences 0 .. sequences - 1 of the session generate (0: 1) */
+    const uint32_t *const *prompts; /* [sequences] tokens fed to each first, at least one each, after what
+                                       it holds */
+    const uint32_t *prompt_lengths; /* [sequences] */
+    uint32_t *tokens;               /* [sequences x count] the tokens generated: sequence b's from b count on */
+    uint32_t *made;                 /* [sequences] how many each generated (NULL: not reported) */
+    uint32_t count;                 /* tokens each generates at most */
+    float temperature;              /* the logits divided by it before the softmax; 0: the most likely token
+                                       each step (the first of equals), no draws */
+    uint32_t top_k;                 /* draws among the top_k most likely tokens only (0: all) */
+    float top_p;                    /* and among the most likely whose probabilities add up to top_p at least
+                                       (0 or 1: all) */
+    uint64_t seed;                  /* sequence b draws from a generator seeded with seed + b */
+    const uint32_t *stop_tokens;    /* [stop_count] tokens that end a sequence's generation once generated */
+    uint32_t stop_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettSessionGenerateArgs;
+```
+
+### `spingalett_session_generate()`
+
+Continues several sequences together, a token each per step, the steps' rows computed at once, each sequence drawing as spingalett_generate() draws (the same tokens for the same logits and seed, whatever other sequences run with it). A sequence stops after count tokens, after a stop token (written as its last), or after the token that follows a full sequence (max_length tokens). Afterwards each holds its prompt and the tokens generated, but the token after a full sequence. Returns how many tokens the sequences wrote together, 0 on error.
+
+```c
+#define spingalett_session_generate(...) spingalett_session_generate_args((SpingalettSessionGenerateArgs){__VA_ARGS__})
+```
+
+### `spingalett_session_generate_args()`
+
+```c
+uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
+```
+
 The runtime's names of 0.x, without the prefix, when SPINGALETT_SHORT_NAMES is defined (as the engine's: outside the include guard, so that including the header again after defining it gives them).
 
 ## Spingalett.Inference.h
@@ -1580,7 +1708,7 @@ Runs a network stored as a .slett image (format version 3; 4 for networks with c
 
 This header and Src/Spingalett.Inference.c are self-contained. Compiled together with -DSPINGALETT_INFERENCE_ONLY (and Include/ on the include path) they give inference without the rest of the library: no training code, no file I/O, no OpenMP, no heap. The full library includes this header from Spingalett.h and adds loading, quantization and batched inference on top of it.
 
-Layers whose weights are stored as INT8, INT4 or INT2 run in integer arithmetic: the layer's input is quantized to 8 bits with a scale chosen per sample (its largest magnitude maps to 127), the dot products with the weights accumulate in 32-bit integers, and each output is rescaled by its weight row's scale. FLOAT32, FP16 and BFLOAT16 layers run in float. Convolutions compute each output pixel as such dot products of the filters with the window it reads; pooling and batch normalization run in float, and so do the layers that add or concatenate the outputs of others.
+Layers whose weights are stored as INT8, INT4 or INT2 run in integer arithmetic: the layer's input is quantized to 8 bits with a scale chosen per sample (its largest magnitude maps to 127), the dot products with the weights accumulate in 32-bit integers, and each output is rescaled by its weight row's scale. In a language model (a model whose first layer is an embedding) the linear layers (convolutions of 1 x 1 windows, stride 1, no padding and one group) choose a scale per cell, a token's, so that a token's outputs depend on that token only. FLOAT32, FP16 and BFLOAT16 layers run in float. Convolutions compute each output pixel as such dot products of the filters with the window it reads; pooling and batch normalization run in float, and so do the layers that add or concatenate the outputs of others.
 
 ### `SPINGALETT_FORMAT_VERSION`
 

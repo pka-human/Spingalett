@@ -124,6 +124,12 @@ g = lm.add_linear(1376, activation=sg.Activation.SILU).last
 lm.add_linear(1376, inputs=n).add_multiply([g, lm.last]).add_linear(512).add_add([x, lm.last])
 lm.add_rms_norm().add_linear(32000)
 
+# its deployment model a token at a time with a key-value cache: four continuations of one prompt together
+with lm.to_model(sg.Precision.INT8) as model, model.session(sequences=4) as s:
+    logits = s.feed([1, 450, 4996])                 # the prompt's tokens at once: the next token's logits
+    for b in range(1, 4): s.copy(0, b)
+    print(s.generate([[int(logits.argmax())]] * 4, 50, temperature=0.8, top_k=40, seed=1))
+
 with sg.Network.load("xor.slett") as net:
     print(net.topology, net.forward([1, 0]))
     # deployment: a read-only INT8 model with integer kernels, and a C header for firmware
@@ -163,6 +169,7 @@ with sg.Network.load("xor.slett") as net:
 | `model.predict(x)` / `model(x)`, `model.evaluate(x, y)` | 1-D input -> vector, 2-D batch -> matrix; `Metrics(loss, accuracy)` |
 | `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding, groups, epsilon, input_layers)` per layer (normalizations after a dense or convolution layer are folded into it); image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
+| `model.session(max_length=0, sequences=1)` / `Session(model, ...)` | a causal language model run a token at a time with a key-value cache: `feed(tokens, sequence=0, all=False)` (the next token's logits, or every fed token's), `feed_many([(sequence, tokens), ...])` (several sequences in one pass), `rewind(length, sequence=0)`, `copy(source, target)`, `length(sequence=0)`, `vocabulary`, `generate(prompts, count, temperature=0, top_k=0, top_p=0, seed=0, stop=())` (sequences advanced together, sequence b drawing with seed + b); the logits are `predict()`'s for each position bit for bit; `Network.generate()` runs one on the CPU |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings; `ComputeMode.CUDA` (NVIDIA) and `ComputeMode.VULKAN` train and predict on the GPU |
 | `DeviceData(values)` | a data set in the GPU's memory (rows of float32, an array `(n, ...)` flattened to a row a sample), copied there once; `train()`, `validation_data`, `forward()` and `evaluate()` take it in place of an array (inputs, targets or both), and with the GPU modes gather, augment and smooth their batches on the device; `len(d)`, `d.shape`, `d.numpy(first=0, count=None)`, `close()` or a `with` block |
 | `set_gpu_precision(Precision.BFLOAT16)`, `get_gpu_precision()` | the GPU's matrix products in bfloat16 on its matrix units, or `FLOAT32` (the default); returns whether the GPU multiplies in that precision |
@@ -177,4 +184,4 @@ Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bind
 that the library can serve them (`library_version()`), because they mirror its struct layouts: the
 same major version and at least their own minor one (before 1.0, the same major.minor version). A
 `Network` is not thread-safe: use one per thread. A `Model` is read-only and can be shared between
-threads.
+threads; a `Session` is used by one thread at a time, and any number of them may share a model.

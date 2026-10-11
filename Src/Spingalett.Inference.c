@@ -1356,6 +1356,8 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         layer->rows = layer->vocabulary;
         layer->row_len = layer->out_c;
     }
+    /* (embeddings exist from version 8 on) */
+    layer->cells = version >= 8u && index > 0 && slett_token_linear(layer, entry_at(image, 0)[10] == LAYER_EMBEDDING);
 }
 
 uint64_t spingalett_slett_act_offset(const uint8_t *image, uint32_t j) {
@@ -1707,6 +1709,17 @@ SPG_REGISTER_SUMS static void weight_rows(const uint8_t *image, const SlettLayer
     }
 }
 
+#if !defined(SPINGALETT_INFERENCE_ONLY)
+void spingalett_engine_int_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count, const int8_t *xq,
+                                float x_scale, int32_t xsum, float *y) {
+    weight_rows(image, L, j0, count, NULL, xq, x_scale, xsum, y);
+}
+
+int32_t spingalett_engine_permute(int8_t *xq, uint32_t n, PrecisionMode precision) {
+    return precision == PRECISION_INT8 ? 0 : permute_activations(xq, n, precision == PRECISION_INT4 ? 2u : 4u);
+}
+#endif
+
 void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, uint32_t ow, void *window, size_t elem) {
     const uint32_t C = L->in_c, KW = L->kernel_w;
     const size_t run = (size_t)KW * C * elem;
@@ -1831,11 +1844,15 @@ static void conv_forward_columns(const uint8_t *image, const SlettLayer *L, cons
     spingalett_conv_transpose_filters(image, L, scratch);
     if (is_int) {
         const float *scale = (const float *)(const void *)(image + L->scales);
-        float x_scale = spingalett_quantize_activations(x, L->inputs, xq);
+        float x_scale = L->cells ? 0.0f : spingalett_quantize_activations(x, L->inputs, xq);
         int32_t *acc = (int32_t *)sums;
         for (uint32_t oh = 0; oh < L->out_h; oh++)
             for (uint32_t ow = 0; ow < L->out_w; ow++) {
                 float *o = y + ((size_t)oh * L->out_w + ow) * R;
+                if (L->cells) {             /* (pointwise: the cell is its window) */
+                    const size_t at = ((size_t)oh * L->out_w + ow) * L->in_c;
+                    x_scale = spingalett_quantize_activations(x + at, L->in_c, xq + at);
+                }
                 spingalett_conv_columns_i8(xq, L, oh, ow, (const int8_t *)scratch, acc);
                 for (uint32_t j = 0; j < R; j++) o[j] = spingalett_int_output(bias[j], scale[j], x_scale, acc[j]);
             }
@@ -2003,7 +2020,7 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
     const bool pointwise = L->kernel_h == 1 && L->kernel_w == 1 && L->stride_h == 1 && L->stride_w == 1 &&
                            L->pad_h == 0 && L->pad_w == 0;
     const uint32_t per_byte = L->precision == PRECISION_INT4 ? 2u : 4u;
-    float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
+    float x_scale = is_int && !L->cells ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
     if (L->precision == PRECISION_INT8) {
         /* four pixels at a time (their windows fill the scratch of one float window), each filter
            read once for the four; the integer sums are those of one pixel at a time */
@@ -2013,13 +2030,15 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
         const uint32_t pixels = L->out_h * L->out_w;
         int8_t *windows = (int8_t *)window;
         int32_t *wsum = (int32_t *)(void *)((uint8_t *)window + slett_align((uint64_t)K * 4u));
+        float scales[4] = {x_scale, x_scale, x_scale, x_scale};
         if (spingalett_dot_i8_4x4_sums && pixels >= 4u)
             for (uint32_t j = 0; j < OC; j++) wsum[j] = spingalett_sum_i8(weights + (size_t)j * K, K);
         for (uint32_t p0 = 0; p0 < pixels; p0 += 4u) {
             uint32_t count = pixels - p0 < 4u ? pixels - p0 : 4u;
             for (uint32_t i = 0; i < count; i++) {
                 uint32_t p = p0 + i;
-                if (pointwise) memcpy(windows + (size_t)i * K, xq + (size_t)p * L->in_c, K);
+                if (L->cells) scales[i] = spingalett_quantize_activations(x + (size_t)p * K, K, windows + (size_t)i * K);
+                else if (pointwise) memcpy(windows + (size_t)i * K, xq + (size_t)p * L->in_c, K);
                 else spingalett_gather_window(xq, L, p / L->out_w, p % L->out_w, windows + (size_t)i * K, 1);
             }
             for (uint32_t j = 0; j < OC; j += 4u) {
@@ -2035,7 +2054,7 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
                 }
                 for (uint32_t i = 0; i < count; i++)
                     for (uint32_t r = 0; r < rows; r++)
-                        y[(size_t)(p0 + i) * OC + j + r] = spingalett_int_output(bias[j + r], scale[j + r], x_scale, acc[4u * r + i]);
+                        y[(size_t)(p0 + i) * OC + j + r] = spingalett_int_output(bias[j + r], scale[j + r], scales[i], acc[4u * r + i]);
             }
         }
         return;
@@ -2046,6 +2065,7 @@ static void conv_forward(const uint8_t *image, const SlettLayer *L, const float 
             const float *xw = x + p * L->in_c;
             const int8_t *qw = xq + p * L->in_c;
             int32_t xsum = 0;
+            if (L->cells) x_scale = spingalett_quantize_activations(xw, K, xq + p * L->in_c);
             if (!pointwise || packed) {         /* packed rows permute their activations in place */
                 if (is_int && pointwise) memcpy(window, qw, K);
                 else spingalett_gather_window(is_int ? (const void *)xq : (const void *)x, L, oh, ow, window, is_int ? 1u : 4u);
@@ -2223,13 +2243,36 @@ void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, fl
     }
 }
 
-/* A head vector rotated by its position's angles (the table's row p: cosines, and sines cells * half on). */
-static void rope_rotate(const float *src, float *dst, uint32_t half, const float *cosines, const float *sines) {
+void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, const float *cosines,
+                                  const float *sines) {
     for (uint32_t i = 0; i < half; i++) {
         const float a = src[i], b = src[i + half], c = cosines[i], sn = sines[i];
         dst[i] = a * c - b * sn;
         dst[i + half] = b * c + a * sn;
     }
+}
+
+void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,
+                              size_t value_stride, uint32_t count, uint32_t head, float scale, float *o) {
+    float m = -FLT_MAX, sum = 0.0f;
+    for (uint32_t d = 0; d < head; d++) o[d] = 0.0f;
+    for (uint32_t j = 0; j < count; j++) {
+        const float *k = keys + (size_t)j * key_stride, *v = values + (size_t)j * value_stride;
+        float score = 0.0f;
+        for (uint32_t d = 0; d < head; d++) score += q[d] * k[d];
+        score *= scale;
+        if (score > m) {            /* a new maximum: what was summed so far scaled down to it */
+            const float r = expf(m - score);
+            sum *= r;
+            for (uint32_t d = 0; d < head; d++) o[d] *= r;
+            m = score;
+        }
+        const float w = expf(score - m);
+        sum += w;
+        for (uint32_t d = 0; d < head; d++) o[d] += w * v[d];
+    }
+    const float inv = 1.0f / sum;
+    for (uint32_t d = 0; d < head; d++) o[d] *= inv;
 }
 
 void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads, uint32_t kv, uint32_t head,
@@ -2241,37 +2284,23 @@ void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads,
     if (table)
         for (uint32_t p = 0; p < cells; p++)
             for (uint32_t g = 0; g < kv; g++)
-                rope_rotate(x + (size_t)p * C + (size_t)(heads + g) * head, keys + ((size_t)p * kv + g) * head, half,
-                            table + (size_t)p * half, table + (size_t)cells * half + (size_t)p * half);
+                spingalett_engine_rope_rotate(x + (size_t)p * C + (size_t)(heads + g) * head,
+                                              keys + ((size_t)p * kv + g) * head, half, table + (size_t)p * half,
+                                              table + (size_t)cells * half + (size_t)p * half);
     for (uint32_t h = 0; h < heads; h++) {
         const uint32_t g = h / group;
+        /* key j of head g: rotated in the scratch, kv heads a cell, or in the input */
+        const float *k = table ? keys + (size_t)g * head : x + (size_t)(heads + g) * head;
+        const size_t key_stride = table ? (size_t)kv * head : C;
         for (uint32_t i = 0; i < cells; i++) {
             const float *qi = x + (size_t)i * C + (size_t)h * head;
             if (table) {
-                rope_rotate(qi, q, half, table + (size_t)i * half, table + (size_t)cells * half + (size_t)i * half);
+                spingalett_engine_rope_rotate(qi, q, half, table + (size_t)i * half,
+                                              table + (size_t)cells * half + (size_t)i * half);
                 qi = q;
             }
-            float *o = y + (size_t)i * out_c + (size_t)h * head, m = -FLT_MAX, sum = 0.0f;
-            for (uint32_t d = 0; d < head; d++) o[d] = 0.0f;
-            const uint32_t end = causal ? i + 1u : cells;
-            for (uint32_t j = 0; j < end; j++) {
-                const float *k = table ? keys + ((size_t)j * kv + g) * head : x + (size_t)j * C + (size_t)(heads + g) * head;
-                const float *v = x + (size_t)j * C + (size_t)(heads + kv + g) * head;
-                float score = 0.0f;
-                for (uint32_t d = 0; d < head; d++) score += qi[d] * k[d];
-                score *= scale;
-                if (score > m) {            /* a new maximum: what was summed so far scaled down to it */
-                    const float r = expf(m - score);
-                    sum *= r;
-                    for (uint32_t d = 0; d < head; d++) o[d] *= r;
-                    m = score;
-                }
-                const float w = expf(score - m);
-                sum += w;
-                for (uint32_t d = 0; d < head; d++) o[d] += w * v[d];
-            }
-            const float inv = 1.0f / sum;
-            for (uint32_t d = 0; d < head; d++) o[d] *= inv;
+            spingalett_engine_attend(qi, k, key_stride, x + (size_t)(heads + kv + g) * head, C, causal ? i + 1u : cells,
+                                     head, scale, y + (size_t)i * out_c + (size_t)h * head);
         }
     }
 }
@@ -2310,17 +2339,18 @@ static void decode_row(const uint8_t *image, const SlettLayer *L, uint32_t row, 
     }
 }
 
-void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y) {
-    const uint32_t tokens = L->inputs, d = L->out_c;
-    const float *positions = L->positions ? (const float *)(const void *)(image + L->biases) : NULL;
-    for (uint32_t p = 0; p < tokens; p++) {
-        float *o = y + (size_t)p * d;
-        const float t = x[p];
-        if (t >= 0.0f && t < (float)L->rows) decode_row(image, L, (uint32_t)t, o);
-        else memset(o, 0, (size_t)d * sizeof(float));
-        if (positions)
-            for (uint32_t c = 0; c < d; c++) o[c] += positions[(size_t)p * d + c];
+void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float token, uint32_t position, float *y) {
+    const uint32_t d = L->out_c;
+    if (token >= 0.0f && token < (float)L->rows) decode_row(image, L, (uint32_t)token, y);
+    else memset(y, 0, (size_t)d * sizeof(float));
+    if (L->positions) {
+        const float *at = (const float *)(const void *)(image + L->biases) + (size_t)position * d;
+        for (uint32_t c = 0; c < d; c++) y[c] += at[c];
     }
+}
+
+void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y) {
+    for (uint32_t p = 0; p < L->inputs; p++) spingalett_engine_embed(image, L, x[p], p, y + (size_t)p * L->out_c);
 }
 
 /* One layer on one sample: x [inputs] -> y [outputs], activation included. */

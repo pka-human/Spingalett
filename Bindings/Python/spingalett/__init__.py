@@ -45,7 +45,7 @@ __all__ = [
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
     "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample", "Linear", "Embedding", "Attention", "RMSNorm", "Multiply",
-    "Model", "LayerInfo", "DeviceData",
+    "Model", "LayerInfo", "DeviceData", "Session",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine",
@@ -546,6 +546,44 @@ class _Model(Structure):
 _ModelPtr = POINTER(_Model)
 
 
+class _SessionOptions(Structure):
+    _fields_ = [
+        ("max_length", c_uint32),
+        ("sequences", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _SessionFeed(Structure):
+    _fields_ = [
+        ("sequence", c_uint32),
+        ("tokens", POINTER(c_uint32)),
+        ("count", c_uint32),
+        ("logits", POINTER(c_float)),
+        ("all", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _SessionGenerateArgs(Structure):
+    _fields_ = [
+        ("session", c_void_p),
+        ("sequences", c_uint32),
+        ("prompts", POINTER(POINTER(c_uint32))),
+        ("prompt_lengths", POINTER(c_uint32)),
+        ("tokens", POINTER(c_uint32)),
+        ("made", POINTER(c_uint32)),
+        ("count", c_uint32),
+        ("temperature", c_float),
+        ("top_k", c_uint32),
+        ("top_p", c_float),
+        ("seed", c_uint64),
+        ("stop_tokens", POINTER(c_uint32)),
+        ("stop_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 class _LayerInfo(Structure):
     _fields_ = [
         ("type", c_int),
@@ -725,6 +763,14 @@ _model_free = _bind("spingalett_model_free", None, [_ModelPtr])
 _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
 _model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, _FloatArray, c_uint32, _FloatArray])
 _model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _FloatArray, _FloatArray, c_uint32])
+_session_new = _bind("spingalett_session_new", c_void_p, [_ModelPtr, POINTER(_SessionOptions)])
+_session_free = _bind("spingalett_session_free", None, [c_void_p])
+_session_vocabulary = _bind("spingalett_session_vocabulary", c_uint32, [c_void_p])
+_session_length = _bind("spingalett_session_length", c_uint32, [c_void_p, c_uint32])
+_session_feed = _bind("spingalett_session_feed", c_bool, [c_void_p, POINTER(_SessionFeed), c_uint32])
+_session_rewind = _bind("spingalett_session_rewind", c_bool, [c_void_p, c_uint32, c_uint32])
+_session_copy = _bind("spingalett_session_copy", c_bool, [c_void_p, c_uint32, c_uint32])
+_session_generate = _bind("spingalett_session_generate_args", c_uint32, [_SessionGenerateArgs])
 _load = _bind("spingalett_load", _NetPtr, [c_char_p])
 _import_onnx = _bind("spingalett_import_onnx", _NetPtr, [c_char_p])
 _import_onnx_from_memory = _bind("spingalett_import_onnx_from_memory", _NetPtr, [c_char_p, c_size_t])
@@ -1811,7 +1857,9 @@ class Network:
         whose outputs are the logits of every token of its vocabulary for each input token: the most likely
         token (``temperature`` 0), or a draw from the softmax of the logits over ``temperature`` among the
         ``top_k`` most likely and those whose probabilities add up to ``top_p``. ``seed`` (0: the library's
-        generator) makes draws repeatable; a token of ``stop`` ends the generation (it is returned last)."""
+        generator) makes draws repeatable; a token of ``stop`` ends the generation (it is returned last).
+        On the CPU a causal model runs as its deployment model of single precision in a :class:`Session`,
+        each token computed once."""
         p = np.ascontiguousarray(np.asarray(prompt, dtype=np.uint32).ravel())
         if p.size == 0:
             raise ValueError("generate needs a prompt of one token at least")
@@ -2103,8 +2151,9 @@ class LayerInfo:
 
 class Model:
     """A read-only network for inference that computes in the precision its weights are stored in:
-    INT8, INT4 and INT2 layers quantize their input to 8 bits per sample and use integer kernels,
-    FLOAT32, FP16 and BFLOAT16 layers compute in float. Create one with :meth:`Network.to_model`,
+    INT8, INT4 and INT2 layers quantize their input to 8 bits per sample (per token in the linear layers
+    of language models) and use integer kernels, FLOAT32, FP16 and BFLOAT16 layers compute in float.
+    Create one with :meth:`Network.to_model`,
     :meth:`Model.load` or :meth:`Model.from_bytes`; :meth:`to_bytes` gives the .slett image, which
     the standalone C engine runs in place."""
 
@@ -2230,12 +2279,131 @@ class Model:
             raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
         return _metrics(_call(_model_evaluate, self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0]))
 
+    def session(self, max_length: int = 0, sequences: int = 1) -> "Session":
+        """A :class:`Session` of this causal language model: ``sequences`` sequences of at most
+        ``max_length`` tokens (0: the model's window) run a token at a time with a key-value cache."""
+        return Session(self, max_length, sequences)
+
     def __repr__(self) -> str:
         if not getattr(self, "_ptr", None):
             return "<spingalett.Model (closed)>"
         shape = [self.input_size] + [l.outputs for l in self.layers]
         precisions = sorted({l.precision.name for l in self.layers})
         return f"<spingalett.Model {shape} {'/'.join(precisions)} {self.size} bytes>"
+
+
+class Session:
+    """A causal language model (a :class:`Model` whose first layer embeds token ids and whose other layers
+    treat each position alone but for causal attention) run a token at a time: the keys and values of
+    every token fed are kept, so that a token costs one row through each layer and its attention over
+    the tokens before it. A session holds ``sequences`` sequences of at most ``max_length`` tokens;
+    the tokens of several sequences fed in one call (:meth:`feed_many`, :meth:`generate`) run through
+    the layers together. The logits are those :meth:`Model.predict` gives each position of the window,
+    bit for bit. A session is used from one thread at a time; several may share a model.
+
+    ::
+
+        with model.session() as s:
+            logits = s.feed(prompt)               # the next token's logits
+            logits = s.feed([int(logits.argmax())])
+    """
+
+    def __init__(self, model: Model, max_length: int = 0, sequences: int = 1):
+        model._model  # raise if closed
+        self._owner = model                       # keeps the model alive
+        options = _SessionOptions(int(max_length), int(sequences))
+        self._ptr = _call(_session_new, model._ptr, ctypes.byref(options))
+        if not self._ptr:
+            raise SpingalettError(-1, "could not create the session")
+        self.vocabulary = int(_session_vocabulary(self._ptr))
+        self.sequences = max(int(sequences), 1)
+
+    # ---- lifetime
+    def close(self) -> None:
+        ptr = getattr(self, "_ptr", None)
+        if ptr:
+            self._ptr = None
+            _session_free(ptr)
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _session(self):
+        if not getattr(self, "_ptr", None):
+            raise ValueError("session is closed")
+        return self._ptr
+
+    # ---- sequences
+    def length(self, sequence: int = 0) -> int:
+        """Tokens the sequence holds."""
+        return int(_session_length(self._session(), int(sequence)))
+
+    def rewind(self, length: int, sequence: int = 0) -> None:
+        """Truncate the sequence to its first ``length`` tokens (0 empties it)."""
+        _call(_session_rewind, self._session(), int(sequence), int(length))
+
+    def copy(self, source: int, target: int) -> None:
+        """Make sequence ``target`` a copy of sequence ``source``: a prompt fed once serves several
+        continuations."""
+        _call(_session_copy, self._session(), int(source), int(target))
+
+    def feed(self, tokens, sequence: int = 0, all: bool = False) -> np.ndarray:
+        """Append token ids to a sequence; returns the logits of the token after the last of them
+        (``vocabulary`` floats), or with ``all`` of the token after each (one row per token)."""
+        return self.feed_many([(sequence, tokens)], all=all)[0]
+
+    def feed_many(self, items, all: bool = False) -> List[np.ndarray]:
+        """Append tokens to several sequences in one pass: ``items`` holds (sequence, tokens) pairs, each
+        sequence named once; returns the logits of each as :meth:`feed` does."""
+        keep, outs = [], []
+        feeds = (_SessionFeed * max(len(items), 1))()
+        u32, f32 = POINTER(c_uint32), POINTER(c_float)
+        for k, (sequence, tokens) in enumerate(items):
+            t = np.ascontiguousarray(np.asarray(tokens, dtype=np.uint32).ravel())
+            out = np.empty((t.size, self.vocabulary) if all else self.vocabulary, dtype=np.float32)
+            keep.append(t)
+            outs.append(out)
+            feeds[k] = _SessionFeed(int(sequence), t.ctypes.data_as(u32), t.size,
+                                    out.ctypes.data_as(f32) if t.size else None, bool(all))
+        _call(_session_feed, self._session(), feeds, len(items))
+        return outs
+
+    def generate(self, prompts, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
+                 seed: int = 0, stop=()) -> List[List[int]]:
+        """Continue sequences 0 .. len(prompts) - 1 together, each first fed its prompt (token ids, at least
+        one), by up to ``count`` tokens each, drawn as :meth:`Network.generate` draws (sequence b with
+        seed ``seed + b``); a token of ``stop`` ends a sequence (it is returned last), and so does a full
+        sequence. Returns each sequence's tokens."""
+        ps = [np.ascontiguousarray(np.asarray(p, dtype=np.uint32).ravel()) for p in prompts]
+        if not ps or any(p.size == 0 for p in ps):
+            raise ValueError("generate needs a prompt of one token at least for each sequence")
+        u32 = POINTER(c_uint32)
+        pointers = (u32 * len(ps))(*[p.ctypes.data_as(u32) for p in ps])
+        lengths = (c_uint32 * len(ps))(*[p.size for p in ps])
+        count = max(int(count), 0)
+        out = np.zeros(len(ps) * max(count, 1), dtype=np.uint32)
+        made = (c_uint32 * len(ps))()
+        s = np.ascontiguousarray(np.asarray(list(stop), dtype=np.uint32))
+        args = _SessionGenerateArgs(self._session(), len(ps), pointers, lengths, out.ctypes.data_as(u32), made, count,
+                                    float(temperature), int(top_k), float(top_p), int(seed),
+                                    s.ctypes.data_as(u32) if s.size else None, s.size)
+        _call(_session_generate, args)
+        return [out[b * count:b * count + made[b]].tolist() for b in range(len(ps))]
+
+    def __repr__(self) -> str:
+        if not getattr(self, "_ptr", None):
+            return "<spingalett.Session (closed)>"
+        lengths = [self.length(b) for b in range(self.sequences)]
+        return f"<spingalett.Session {self.sequences} sequences {lengths} tokens, vocabulary {self.vocabulary}>"
 
 
 # --------------------------------------------------------------------------- low-level training

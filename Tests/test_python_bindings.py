@@ -791,6 +791,36 @@ check(drawn == lm.generate([3, 4, 5], 20, temperature=1.0, top_p=0.9, seed=8) an
 check(lm.generate([3, 4, 5], 20, stop=[9]) == [6, 7, 8, 9], "generate: stop tokens")
 os.remove(tokens_path)
 
+# sessions: the model a token at a time with a key-value cache, the logits of its batched prediction bit for bit
+for precision in (sg.Precision.FLOAT32, sg.Precision.INT8):
+    model = lm.to_model(precision)
+    window = [(5 + i) % V for i in range(T)]
+    whole = model.predict(np.array(window, dtype=np.float32)).reshape(T, V)
+    with model.session(sequences=3) as s:
+        check(s.vocabulary == V and s.length() == 0, "session: vocabulary and length")
+        alone = np.array([s.feed([t]) for t in window])
+        check(np.array_equal(alone, whole) and s.length() == T, f"session {precision.name}: a token at a time")
+        s.rewind(4)
+        rest, both = s.feed_many([(0, window[4:]), (1, window)], all=True)
+        check(np.array_equal(rest, whole[4:]) and np.array_equal(both, whole),
+              f"session {precision.name}: two sequences in one call, after a rewind")
+        s.copy(1, 2); s.rewind(9, sequence=2)
+        check(np.array_equal(s.feed(window[9:], sequence=2), whole[-1]), f"session {precision.name}: a copy")
+        for b in range(3): s.rewind(0, sequence=b)
+        together = s.generate([[3, 4, 5], [7], [1, 2]], 8, temperature=0.8, top_k=5, seed=21)
+    alone = []
+    for b, prompt in enumerate([[3, 4, 5], [7], [1, 2]]):
+        with model.session() as one:
+            alone += one.generate([prompt], 8, temperature=0.8, top_k=5, seed=21 + b)
+    check(together == alone and all(len(t) == 8 for t in together), f"session {precision.name}: batched generation")
+    with model.session() as s:
+        check(s.generate([[3, 4, 5]], 20)[0] == [(6 + i) % V for i in range(20)][:T - 3 + 1],
+              f"session {precision.name}: greedy generation stops after a full sequence")
+try:
+    sg.Network(sg.Loss.MSE, [4, 3]).to_model(sg.Precision.FLOAT32).session(); check(False, "a session of an MLP")
+except sg.SpingalettError as e:
+    check("causal language model" in str(e), "a session of an MLP is refused")
+
 # the library versions the bindings accept: major.minor before 1.0, then the major and a minor at least theirs
 check(sg._compatible("0.14.2", "0.14.0") and not sg._compatible("0.13.1", "0.14.0"), "versions of 0.x")
 check(sg._compatible("1.0.0", "1.0.0") and sg._compatible("1.3.0", "1.2.5") and not sg._compatible("1.1.0", "1.2.0")

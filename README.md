@@ -56,7 +56,7 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
-| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens) with a key-value cache (sessions of deployment models: each token computed once, several sequences generated together), GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
@@ -64,7 +64,7 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
-| Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()` |
+| Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()`, sessions of language models (`spingalett_session_feed()`) |
 | Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
@@ -519,6 +519,42 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 | `spingalett_multiply_layers()` | `inputs` | The element-wise product of layers of one shape |
 | `spingalett_dataset_open_tokens()` | `context`, `token_bytes` (2 or 4), `stride`, `offset`, `shuffle` | Windows of a token file: inputs and, as targets, the tokens after them |
 | `spingalett_generate()` | `prompt`, `count`, `temperature` (0: greedy), `top_k`, `top_p`, `seed`, `stop_tokens` | Tokens continuing the prompt |
+
+A deployment model of a causal language model (its first layer an embedding of the tokens, its other
+layers treating each position alone but for causal attention) runs a token at a time in a session:
+each attention layer keeps the keys and values of the tokens a sequence has been fed, so that a new
+token costs one row through every layer and its attention over those, not a pass over the window. A
+session holds several sequences; the tokens of several fed in one call (a prompt, or a token of each
+sequence) run through the layers together, so that sequences generated together share each product.
+The logits are those `spingalett_model_predict()` gives each position of the whole window, bit for
+bit, however the tokens come, in every precision (integer models too: the linear layers of a language
+model quantize each token alone); sessions are part of the runtime. On the CPU `spingalett_generate()`
+runs one, on the network's deployment model of single precision (kept in the network until its
+parameters change), with the tokens it gave before: the CharGPT model (256 wide, 4 blocks, a window of
+128) generates 3230 tokens a second on one thread of an Intel Core i7-12650H where predicting the
+window for every token gave 72.7, and 3568 on six threads where it gave 121.
+
+```c
+SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);   /* or spingalett_model_load() */
+SpingalettSession *s = spingalett_session_new(model, &(SpingalettSessionOptions){.sequences = 4});
+const uint32_t *prompts[4] = {p0, p1, p2, p3};
+uint32_t lengths[4] = {3, 5, 1, 2}, tokens[4 * 100], made[4];
+spingalett_session_generate(.session = s, .sequences = 4, .prompts = prompts, .prompt_lengths = lengths,
+                            .tokens = tokens, .made = made, .count = 100, .temperature = 0.8f, .top_k = 40,
+                            .seed = 1);                             /* sequence b's tokens from tokens + 100 b */
+
+float logits[50257];                                                /* or a token at a time */
+spingalett_session_rewind(s, 0, 0);
+spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 0, .tokens = p0, .count = 3, .logits = logits}, 1);
+spingalett_session_free(s);
+```
+
+| Call | Arguments | What it does |
+|---|---|---|
+| `spingalett_session_new()` | a model; `max_length` (the model's window at most), `sequences` | A session, or NULL with the reason for a model that is no causal language model |
+| `spingalett_session_feed()` | per sequence: `tokens`, `count`, `logits`, `all` | Appends tokens to several sequences in one pass; the logits of the token after the last (or after each) |
+| `spingalett_session_rewind()`, `spingalett_session_copy()`, `spingalett_session_length()` | a sequence, a length; two sequences | Truncates a sequence; copies one (a prompt fed once for several continuations) |
+| `spingalett_session_generate()` | `sequences`, `prompts`, `count`, `temperature`, `top_k`, `top_p`, `seed` (sequence b: seed + b), `stop_tokens` | Sequences continued together, each drawing as `spingalett_generate()` draws |
 
 - The rotary embeddings rotate the halves of each head's queries and keys (the `rotate_half` form
   of GPT-NeoX and of Hugging Face's LLaMA weights). GELU comes in its erf form (`ACT_GELU`) and
@@ -1142,7 +1178,8 @@ spingalett_model_free(model);
 ```
 
 INT8, INT4 and INT2 layers run in integer arithmetic: each layer quantizes its input to 8 bits per
-sample (the largest magnitude maps to 127), multiplies it with the weights in 32-bit integers
+sample (the largest magnitude maps to 127; per token for the linear layers of language models, whose
+tokens then do not depend on each other), multiplies it with the weights in 32-bit integers
 (AVX2 with VNNI where available, SSE2, NEON with the dot-product extension where available, the Arm
 DSP extension, or portable C) and rescales each output by its weight row's scale. With AVX2 and
 NEON, INT4 and INT2 codes are decoded in registers, so they run about as fast as INT8 from a half or
@@ -1172,7 +1209,11 @@ size of INT2 layers. A model stays safe to use from several threads at once. Mod
 `spingalett_model_init()` over an image of your own prepare on every call. Float layers on one
 sample or a few compute through dot products rather than the batched kernels, so their outputs can
 differ in the last bits from those of the same samples in a larger batch; integer layers compute
-exactly what `spingalett_model_run()` computes, in batches of any size.
+exactly what `spingalett_model_run()` computes, in batches of any size. A model of a language model
+also runs in sessions, a token at a time with a key-value cache (see
+[Transformers and language models](#transformers-and-language-models)): the first session packs the
+float linear layers' filters once more for its kernels of few rows (the float size of those layers
+again), which the model keeps for every session.
 
 Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
 (`spingalett_model_evaluate()`):
@@ -1207,7 +1248,8 @@ Sapphire Rapids), one sample at a time and batched:
 Programs that only run trained models can link the runtime instead of the library.
 `libspingalett-runtime`, declared by `Spingalett.Runtime.h`, holds what this section describes:
 `.slett` files loaded as models, `spingalett_model_predict()` and `spingalett_model_evaluate()` with
-the library's kernels, threads and choice of instruction sets at run time, the engine of
+the library's kernels, threads and choice of instruction sets at run time, sessions of language models
+(`spingalett_session_feed()`, generation with a key-value cache), the engine of
 `Spingalett.Inference.h`, errors, logging and the thread settings. It has no networks, training,
 data sets, importers or GPU backend, which leaves 510 KB of the full library's 2.0 MB without the
 CUDA backend's kernels and 12.6 MB with them (the x86-64 release builds, with the kernels for AVX2 and
@@ -1251,6 +1293,7 @@ them with `SPINGALETT_ERR_FORMAT_VERSION`, and `ModelTool convert` rewrites them
 | Header | `Spingalett.h` | `Spingalett.Runtime.h` | `Spingalett.Inference.h` |
 | Training, networks, data sets, importers, the GPU | yes | | |
 | `.slett` models from FP32 to INT2 | yes | yes | yes |
+| Sessions of language models (key-value cache) | yes | yes | |
 | Batches, threads, kernels chosen at run time | yes | yes | one sample at a time |
 | Heap, files | yes | yes | |
 | Size | 12.6 MB (x86-64; 2.0 MB without CUDA) | 510 KB (x86-64) | about 12 KB of code on a Cortex-M4 |

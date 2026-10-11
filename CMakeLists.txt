@@ -241,11 +241,11 @@ elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID
     message(STATUS "Spingalett: INT8 kernels for the ARM dot product instructions chosen at run time")
 endif()
 
-# The inference engine and batched model inference compute in IEEE order (no reassociation,
-# reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
+# The inference engine, batched model inference and sessions compute in IEEE order (no reassociation,
+# reciprocals or contraction), so that they agree bit for bit and match the standalone engine.
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
-    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c
+    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c Src/Spingalett.Session.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
 endif()
 

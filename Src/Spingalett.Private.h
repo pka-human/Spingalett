@@ -463,6 +463,24 @@ uint32_t rng_next(void);
 uint64_t rng_next64(void);
 float    rng_next_float(void);
 
+/* The next token of text generation from a row of V logits (Spingalett.Session.c): the most likely
+   (temperature 0: the first of equals), or a draw from the softmax of the logits divided by the
+   temperature among the top_k most likely and the most likely whose probabilities add up to top_p, from a
+   splitmix64 generator (*state) in an order fixed by the logits. candidates holds V. */
+typedef struct {
+    float p;
+    uint32_t token;
+} SpingalettCandidate;
+uint32_t spingalett_next_token(const float *logits, uint32_t V, float temperature, uint32_t top_k, float top_p,
+                               SpingalettCandidate *candidates, uint64_t *state);
+/* Whether spingalett_session_new() runs the model (a causal language model); sets no error. */
+bool spingalett_session_runs(const SpingalettModel *model);
+#if !defined(SPINGALETT_RUNTIME)
+/* Frees the deployment model spingalett_generate() keeps in the network (Spingalett.Generate.c): when the
+   network goes, or its layers change. */
+void spingalett_generate_release(NeuralNetwork *net);
+#endif
+
 float random_uniform_weight(void);
 float random_normal_weight(void);
 
@@ -637,6 +655,16 @@ void spingalett_conv_direct_backward_data(const LayerShape *in, const LayerShape
 void spingalett_conv_direct_backward_weights(const LayerShape *in, const LayerShape *out, uint32_t g, const float *x,
                                              const float *dy, uint32_t n, float scale, float beta, float *gW,
                                              float *scratch, bool parallel, int threads);
+/* The rows of a pointwise convolution of one group (a linear layer) against its filters packed once: N
+   filters of K weights (W, rows of K) packed by spingalett_conv_pack() into
+   spingalett_conv_direct_packed_floats(N, K) floats; spingalett_conv_rows() then computes y[r][0..N) =
+   x[r] . filters for r < rows (x rows ldx floats apart, y rows ldy apart), each sum in the order the
+   forward kernel takes it (spingalett_conv_direct_forward()), so that a row gets the bits a whole sample's
+   pass gives it, however many rows there are: sessions run a token at a time on it. The epilogue (or
+   NULL) runs on every block of rows and columns, its columns starting at multiples of 8. */
+void spingalett_conv_pack(const float *W, uint32_t K, uint32_t N, float *packed);
+void spingalett_conv_rows(const float *x, size_t ldx, uint32_t rows, const float *packed, uint32_t K, uint32_t N,
+                          float *y, size_t ldy, const SpingalettGemmHooks *epilogue, bool parallel, int threads);
 /* Threads a GEMM scratch was made for. */
 int spingalett_gemm_scratch_threads(const SpingalettGemmScratch *scratch);
 

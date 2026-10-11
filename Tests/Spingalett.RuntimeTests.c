@@ -12,7 +12,8 @@
  * written by earlier releases, which every 1.x runtime must run: integer models give the engine's
  * single runs bit for bit, float ones agree with them within rounding. With EXPORT_DIR, written by
  * "SpingalettTests export-models", every model there must give the full library's results bit for
- * bit: batched on one thread and on four, sample by sample, and evaluated.
+ * bit: batched on one thread and on four, sample by sample, evaluated, and for language models in a
+ * session.
  */
 
 #include <Spingalett/Spingalett.Runtime.h>
@@ -103,6 +104,9 @@ static void api(const char *data_dir) {
         CHECK(spingalett_model_predict(m, in, 2, out) && spingalett_model_predict(m, in, 2, out) && warnings == 1,
               "OpenBLAS falls back with one warning (%d)", warnings);
         spingalett_set_log_callback(NULL);
+        spingalett_clear_error();
+        CHECK(!spingalett_session_new(m, NULL) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "a session of a model that is no language model");
         free(in);
         free(out);
         spingalett_model_free(m);
@@ -139,6 +143,15 @@ static bool is_integer(const SpingalettModel *m) {
     return spingalett_model_layer(m, 0, &info) && info.precision >= SPINGALETT_PRECISION_INT8;
 }
 
+/* The samples of a model: token ids for a language model (its first layer an embedding). */
+static void samples(const SpingalettModel *m, float *x, size_t n) {
+    SpingalettLayerInfo info;
+    if (spingalett_model_layer(m, 0, &info) && info.type == SPINGALETT_LAYER_EMBEDDING)
+        runtime_tokens(x, n, info.vocabulary);
+    else
+        runtime_inputs(x, n);
+}
+
 /* The engine's outputs for each sample (spingalett_model_run with a workspace of the caller's). */
 static void run_samples(const SpingalettModel *m, const float *x, unsigned count, float *y) {
     void *workspace = malloc(m->workspace_size ? m->workspace_size : 4);
@@ -165,7 +178,7 @@ static void release_models(const char *data_dir) {
         float *t = (float *)malloc((size_t)count * out * sizeof(float));
         float *ref = (float *)malloc((size_t)count * out * sizeof(float));
         float *y = (float *)malloc((size_t)count * out * sizeof(float));
-        runtime_inputs(x, (size_t)count * in);
+        samples(m, x, (size_t)count * in);
         runtime_targets(t, count, out);
         run_samples(m, x, count, ref);
         const bool exact = is_integer(m);
@@ -210,7 +223,7 @@ static bool same_as(const char *dir, const char *name, const char *suffix, const
 /* Models written by the full library, with its results: the runtime's must be the same bits. */
 static void library_models(const char *dir) {
     Entry *entries = (Entry *)malloc(512 * sizeof(Entry));
-    int n = read_list(dir, entries, 512), same = 0;
+    int n = read_list(dir, entries, 512), same = 0, sessions = 0;
     printf("[the full library's models]\n");
     CHECK(n > 0, "no models listed in %s", dir);
     for (int i = 0; i < n; i++) {
@@ -220,7 +233,7 @@ static void library_models(const char *dir) {
         const size_t outputs = (size_t)count * out;
         float *x = (float *)malloc((size_t)count * in * sizeof(float)), *t = (float *)malloc(outputs * sizeof(float));
         float *y = (float *)malloc(outputs * sizeof(float));
-        runtime_inputs(x, (size_t)count * in);
+        samples(m, x, (size_t)count * in);
         runtime_targets(t, count, out);
         spingalett_set_compute_mode(SPINGALETT_COMPUTE_SINGLE_THREADED);
         bool st = spingalett_model_predict(m, x, count, y) && same_as(dir, entries[i].name, "st", y, outputs);
@@ -232,13 +245,25 @@ static void library_models(const char *dir) {
         SpingalettEvalMetrics e = spingalett_model_evaluate(m, x, t, count);
         float metrics[2] = {e.loss, e.accuracy};
         bool eval = same_as(dir, entries[i].name, "eval", metrics, 2);
-        CHECK(st && omp && run && eval, "%s: the full library's results (one thread %d, four %d, single runs %d, "
-              "evaluation %d)", entries[i].name, st, omp, run, eval);
-        same += st && omp && run && eval;
+        /* a language model's session (the others have none: the error set, no file to compare) */
+        bool session = true;
+        SpingalettSession *probe = spingalett_session_new(m, NULL);
+        if (probe) {
+            const size_t floats = runtime_session_floats(in, out / in);
+            float *logits = (float *)malloc(floats * sizeof(float));
+            session = logits && runtime_session(m, x, logits) && same_as(dir, entries[i].name, "sess", logits, floats);
+            free(logits);
+            sessions++;
+        }
+        spingalett_session_free(probe);
+        CHECK(st && omp && run && eval && session, "%s: the full library's results (one thread %d, four %d, single "
+              "runs %d, evaluation %d, session %d)", entries[i].name, st, omp, run, eval, session);
+        same += st && omp && run && eval && session;
         free(x); free(t); free(y);
         spingalett_model_free(m);
     }
-    printf("  %d of %d models: the full library's bits\n", same, n);
+    printf("  %d of %d models: the full library's bits (%d language models in sessions too)\n", same, n, sessions);
+    CHECK(sessions > 0, "no language models among the full library's");
     free(entries);
 }
 
