@@ -182,7 +182,8 @@ static bool aligned(uint64_t address, uint32_t group, uint32_t width) {
 static bool vector_c(const SpgGemmPush *p, const SpgGemmMode *m) {
     if (m->epi == SPG_EPI_PARTIAL) return p->c % 16u == 0 && p->N % 4u == 0;
     if (!aligned(p->c, p->c_group, 4u) || p->ldc % 4u != 0) return false;
-    if (m->epi == SPG_EPI_BIAS_ACT && (p->flags & SPG_GEMM_BIAS)) return p->e0 % 16u == 0;
+    if (m->epi == SPG_EPI_BIAS_PRE && p->e1 % 16u != 0) return false;
+    if ((m->epi == SPG_EPI_BIAS_ACT || m->epi == SPG_EPI_BIAS_PRE) && (p->flags & SPG_GEMM_BIAS)) return p->e0 % 16u == 0;
     if (m->epi == SPG_EPI_SCALE_ACT) return p->e0 % 16u == 0 && p->e1 % 16u == 0;
     if (m->epi == SPG_EPI_DERIV) return p->e0 % 16u == 0;
     return true;
@@ -431,6 +432,11 @@ void spg_gemm(SpgGpuCommands *c, SpgGemmPush *p, const SpgGemmMode *mode) {
     const bool mma = mode->bf16 && spg_gpu_mma_bf16();
     SpgGemmMode m = *mode;
     if (!mma) m.half = 0;
+    /* (Vulkan: the values before the activation stored by pipelines of their own, the others' code unchanged: a
+       test of the flag in every product's epilogue cost the MLP of Examples/Benchmark.c 6% of its training in
+       single precision and 14% of its inference) */
+    if (spg_gpu_using() == SPG_BACKEND_VULKAN && m.epi == SPG_EPI_BIAS_ACT && (p->flags & SPG_GEMM_PRE))
+        m.epi = SPG_EPI_BIAS_PRE;
     /* vectors of four floats, four bfloat16 or (wide) eight bfloat16 of the operands kept as such */
     const bool wide_a = m.vec_a && (m.half & 1u) && m.wide_a && vectors(p, &m, true, 8u),
                wide_b = m.vec_b && (m.half & 2u) && m.wide_b && vectors(p, &m, false, 8u);

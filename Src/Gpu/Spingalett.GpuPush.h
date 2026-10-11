@@ -23,10 +23,13 @@ typedef struct {
 
 enum { SPG_A_ROW, SPG_A_COL, SPG_A_CONV };
 enum { SPG_B_ROW, SPG_B_COL, SPG_B_CONV };
-enum { SPG_EPI_STORE, SPG_EPI_BIAS_ACT, SPG_EPI_SCALE_ACT, SPG_EPI_PARTIAL, SPG_EPI_DERIV };
+enum { SPG_EPI_STORE, SPG_EPI_BIAS_ACT, SPG_EPI_SCALE_ACT, SPG_EPI_PARTIAL, SPG_EPI_DERIV,
+       SPG_EPI_BIAS_PRE };          /* (Vulkan's EPI_BIAS_ACT with SPG_GEMM_PRE: a pipeline of its own, set by
+                                       spg_gemm(), so that the others stay as they were) */
 #define SPG_GEMM_BIAS 1u            /* flags: EPI_BIAS_ACT adds e0 */
-#define SPG_GEMM_PRE  2u            /* EPI_BIAS_ACT also stores its values before the activation at e1 (CUDA's
-                                       gemm_mma.cu and epi.cu: as C, laid out and kept like it) */
+#define SPG_GEMM_PRE  2u            /* EPI_BIAS_ACT also stores its values before the activation at e1, laid out
+                                       and kept like C (gemm.comp, gemm_mma.comp; CUDA's units with GENERAL and
+                                       epi.cu) */
 #define SPG_GEMM_BAND_SHIFT 8u      /* CUDA's gemm.cu: bits 8 to 11, the log of the tiles of rows a band of blocks
                                        takes (gemm_common.cuh's band_tile()), which the backend sets */
 

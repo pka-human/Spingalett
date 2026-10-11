@@ -161,9 +161,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   floats, or its bfloat16 copy (`data_half()`), never floats in place of bfloat16.
 - **Values before the activation.** GELU's and SiLU's derivatives take the layer's values before
   its activation, which training keeps in `pre[]` (`keeps_pre()`; with dropout the mask then holds
-  the mask alone). On CUDA the product of a dense or convolution layer stores them itself
-  (`pre_out`, `SPG_GEMM_PRE`, honoured by the units built with `GENERAL` and by `epi.cu`); elsewhere
-  the layer writes `pre[]` and an element-wise pass the activation.
+  the mask alone). The product of a dense or convolution layer stores them itself (`pre_out`,
+  `SPG_GEMM_PRE`, honoured by gemm.comp's and gemm_mma.comp's epilogues, and on CUDA by the units
+  built with `GENERAL` and by `epi.cu`); other layers write `pre[]` and an element-wise pass the
+  activation.
 - **Activations as bfloat16.** With `PRECISION_BFLOAT16` the executor keeps layers' outputs and
   gradients as bfloat16 (`kept_half()`): products find which operands are such by address
   (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push

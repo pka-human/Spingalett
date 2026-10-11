@@ -113,6 +113,11 @@ All notable changes to this project are documented in this file. The format foll
   0.18 ms instead of 2.2, 3.9 and 3.9 ms (CUDA's `flash.cu`: 0.11, 0.12, 0.18), and the GPT in bfloat16 on
   Vulkan trains 179,000 tokens a second instead of 53,800 (3.3 times) and infers 572,000 instead of 225,000
   (2.5 times). `SpingalettGpuTests` compares the two ways on the same inputs (`bench attn` times them).
+- Training on Vulkan applies GELU and SiLU in the products' epilogues, which store the values before the
+  activation for its derivative too (`SPG_GEMM_PRE`, as CUDA's products do, in pipelines of their own so
+  that the other products' code stays as it was), rather than the product writing those and an
+  element-wise pass the activation: the GPT of `Examples/Benchmark.c` trains 1.01 times as fast on an RTX
+  4050 Laptop GPU, in bfloat16 and in single precision.
 - `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single
   precision in a session (kept in the network until its parameters or layers change): the prompt fed
   at once, then each token once; once the tokens fill the window, the window of the last tokens is fed

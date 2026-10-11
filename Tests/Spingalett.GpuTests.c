@@ -550,11 +550,10 @@ static double gelu(double x) { return 0.5 * x * (1.0 + erf(x / sqrt(2.0))); }
 static double gelu_derivative(double x) { return 0.5 * (1.0 + erf(x / sqrt(2.0))) + x * exp(-0.5 * x * x) * 0.39894228040143268; }
 
 /* A dense layer's products on the matrix units as training in bfloat16 runs them: operands and results kept as
-   bfloat16, read eight values at once; the forward pass with its bias and GELU (on CUDA the values before it kept),
+   bfloat16, read eight values at once; the forward pass with its bias and GELU (the values before it kept),
    or ReLU, or a batch normalization's scale and shift; the data gradient times GELU's or ReLU's derivative, added
    to what C holds (beta 1); the weight gradient in slices. Every tile must give the same bits (gemm_mma.cu's and gemm_pipe.cu's), near a reference in double. */
 static void test_dense_half(uint32_t n, uint32_t in, uint32_t out) {
-    const bool keeps_pre = spg_gpu_using() == SPG_BACKEND_CUDA;     /* (SPG_GEMM_PRE: CUDA's products only) */
     const size_t nx = (size_t)n * in, nw = (size_t)out * in, ny = (size_t)n * out;
     uint16_t *x = malloc(nx * 2), *w = malloc(nw * 2), *d = malloc(ny * 2), *pre_in = malloc(nx * 2), *c0 = malloc(nx * 2);
     float *bias = malloc(out * 4), *scale = malloc(out * 4);
@@ -612,7 +611,7 @@ static void test_dense_half(uint32_t n, uint32_t in, uint32_t out) {
             if (pass < 2) {             /* forward: GELU with the values before it, or ReLU */
                 p = (SpgGemmPush){.a = bx.address, .b = bw.address, .c = by.address, .e0 = bb.address,
                                   .e1 = bpre.address, .M = n, .N = out, .K = in, .lda = in, .ldb = in, .ldc = out,
-                                  .alpha = 1.0f, .flags = SPG_GEMM_BIAS | (pass == 0 && keeps_pre ? SPG_GEMM_PRE : 0u)};
+                                  .alpha = 1.0f, .flags = SPG_GEMM_BIAS | (pass == 0 ? SPG_GEMM_PRE : 0u)};
                 m = (SpgGemmMode){SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, pass == 0 ? SPINGALETT_ACT_GELU : SPINGALETT_ACT_RELU,
                                   1, false, true, true, tile, 0, true, 7u, true, true};
             } else if (pass == 2 || pass == 4) {    /* data gradient onto c0, times GELU's or ReLU's derivative */
@@ -634,7 +633,7 @@ static void test_dense_half(uint32_t n, uint32_t in, uint32_t out) {
             }
             if (run(&p, &m, 1) == 0.0) { failures++; continue; }
             if (pass < 2) {
-                for (int b = 0; b < (pass == 0 && keeps_pre ? 2 : 1); b++) {
+                for (int b = 0; b < (pass == 0 ? 2 : 1); b++) {
                     uint16_t *h = (uint16_t *)got;
                     download(h, b ? &bpre : &by, ny * 2);
                     float *v = (float *)((uint16_t *)got + ny);
