@@ -223,9 +223,20 @@ void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, fl
    keys are rotated first, in scratch of slett_attention_floats() floats. */
 void spingalett_engine_attention(const float *x, uint32_t cells, uint32_t heads, uint32_t kv, uint32_t head,
                                  bool causal, const float *table, float *y, float *scratch);
+/* A head vector rotated by its position's angles (cosines and sines: the table's halves of its row). */
+void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, const float *cosines,
+                                   const float *sines);
+/* One query's attention over `count` keys and values (key j at keys + j key_stride, its value at values + j
+   value_stride) as spingalett_engine_attention() computes it, into o[head]: the scores in the order of the
+   keys, times scale, the softmax online. Sessions (spingalett_session_feed()) attend over the keys they
+   keep with it, so that their results are the engine's. */
+void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,
+                              size_t value_stride, uint32_t count, uint32_t head, float scale, float *o);
 /* An embedding of one sample: a row of L's table (in its precision, as floats) for every input value, zeros
    for values outside it, plus the position's vector with positions. */
 void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);
+/* The same for one cell: token (an input value) at `position`. */
+void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float token, uint32_t position, float *y);
 static inline uint64_t slett_attention_floats(uint32_t cells, uint32_t kv, uint32_t head, bool rope) {
     return rope ? (uint64_t)cells * kv * head + (uint64_t)cells * head + head : 0u;
 }
