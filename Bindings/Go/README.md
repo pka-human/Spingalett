@@ -53,3 +53,30 @@ func main() {
 ```
 
 A `Network` is used by one goroutine at a time; a `Model` may be shared.
+
+## Pretrained language models and tokenizers
+
+`LoadPretrained` makes a network of a Hugging Face model directory (`config.json` and safetensors weights,
+sharded or not; LLaMA, Mistral, Qwen2, GPT-2) or of a GGUF file (quantized weights dequantized to floats),
+and `LoadTokenizer` reads its tokenizer (a `tokenizer.json`, the directory, or the GGUF file), which
+encodes and decodes as Hugging Face's `tokenizers` library does:
+
+```go
+lm, err := sg.LoadPretrained("models/SmolLM2-135M", 512) // or "SmolLM2-135M.Q4_K_M.gguf"
+if err != nil {
+	log.Fatal(err)
+}
+defer lm.Close()
+tok, _ := sg.LoadTokenizer("models/SmolLM2-135M")
+defer tok.Close()
+prompt, _ := tok.Encode("<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n", true, false)
+end, _ := tok.ID("<|im_end|>")
+reply, _ := lm.Generate(prompt, 64, sg.Sampling{Temperature: 0.7, TopP: 0.9, Stop: []uint32{end}})
+text, _ := tok.Decode(reply, true)
+fmt.Println(text)
+```
+
+`Encode(text, special, addSpecial)`: with `special`, special tokens written in the text become their ids
+(otherwise they are text, so that text from users cannot forge them); `addSpecial` adds the tokens the
+tokenizer puts around a text (LLaMA's BOS). `Token`, `ID`, `Vocabulary`, `BOS` and `EOS` describe the
+vocabulary. A `Tokenizer` may be shared by goroutines.

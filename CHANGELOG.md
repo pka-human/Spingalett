@@ -76,6 +76,145 @@ All notable changes to this project are documented in this file. The format foll
   (`test/references`: integer models bit for bit, float ones within 1e-5 of each sample's largest
   output), and to the same code built natively (every model bit for bit). CI builds and tests it;
   releases attach the package (`npm pack`) and the module.
+- **ONNX import of transformers** (`spingalett_import_onnx()`, `ModelTool import`,
+  `Network.from_onnx()` and `Network.from_torch()` in Python), as both of PyTorch's exporters write
+  them at opsets 14 to 23 (from an example of one sample, or with a dynamic batch), into the layers
+  the library builds such models of:
+  - inputs of token ids `[N, T]` (an input layer of `T` indices) and sequences `[N, T, C]` (a layer of
+    `1 x T` cells); `Gather` from a constant table as an embedding, a learned position table added
+    to it as its positions (constant tables of token types added too);
+  - `MatMul` and `Gemm` by constant weights on the tokens (also on tokens as rows `[N T, C]`, as
+    Hugging Face's `Conv1D` writes them) as linear layers, a constant added as their bias;
+    `LayerNormalization`, `RMSNormalization` and their written-out forms over each token;
+  - element-wise expressions recognised as the activations they compute, by their values at points
+    where activations differ: GELU (`Gelu`, its erf and tanh forms written out), SiLU
+    (`x * Sigmoid(x)`), ReLU, sigmoid, tanh; `Mul` of two layers (SwiGLU's and GeGLU's gates) as a
+    multiplication layer; the same of vectors and maps (an MLP's GELU and layer normalization written
+    out, `Gelu` and `RMSNormalization` of vectors);
+  - attention written out folded into one attention layer: queries, keys and values from one product
+    or three, split into heads (`Reshape`, `Transpose`, `Split`, `Slice`, `Gather`, `Squeeze`), the
+    scores scaled (`Mul` or `Div`, of the scores or of the queries and keys), masked causally (`Where`
+    or an added triangle of `-inf` or of a large negative value), `Softmax` over the keys, the
+    product with the values; keys and values repeated for grouped-query and multi-query attention
+    (`Expand`, `Tile`); rotary embeddings (`rotate_half` with tables of cosines and sines, their base
+    read from the tables); the queries', keys' and values' products merged into one linear layer,
+    their biases and any scale other than `1/sqrt(head size)` folded into its weights;
+  - opset 23's `Attention` and `RMSNormalization`, and the fused operators of ONNX Runtime's
+    transformer optimizer: `com.microsoft`'s `Attention`, `MultiHeadAttention`,
+    `SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`, `SimplifiedLayerNormalization`,
+    `Gelu`, `FastGelu` and `BiasGelu`;
+  - nodes whose inputs are all constants computed on import (`Shape`, `Gather`, `Slice`, `Concat`,
+    `Range`, `Trilu`, `Where`, arithmetic and the others of shape computations); `ReduceMean` over a
+    sequence's tokens as global average pooling;
+  - language models (token ids in, logits a token out) take the sparse cross-entropy loss;
+  - what no layer computes is named in the error: a softmax over each token's channels, a product
+    of two computed tensors outside an attention, masks and caches given as inputs, rotary
+    embeddings over part of a head or of interleaved pairs.
+  GPT-2-, LLaMA-, Gemma- and BERT-like models and `nn.TransformerEncoderLayer` agree with PyTorch to
+  the rounding of single precision (within 3e-6 on the tests' models: `onnx_gpt*`, `onnx_llama*`,
+  `onnx_encoder*`, `onnx_ort_fused` in `Tests/Data`); a model of GPT-2 small's size (124M parameters,
+  650 MB) imports in 0.57 s on an i7-12650H.
+- **Inference with a key-value cache on the CPU:** sessions of deployment models run a causal language
+  model (its first layer an embedding of the tokens, its other layers treating each position alone but
+  for causal attention) a token at a time. Each attention layer keeps the keys (rotated, with rotary
+  embeddings) and values of every token a sequence has been fed, so that a new token costs one row
+  through every layer and its attention over those instead of a pass over the window.
+  `spingalett_session_new()` (`SpingalettSessionOptions`: `max_length`, `sequences`) opens one, or
+  refuses a model with the reason; `spingalett_session_feed()` (`SpingalettSessionFeed`) appends tokens
+  to several sequences in one pass, a prompt at once, the last layer computed on the rows whose logits
+  are asked for only; `spingalett_session_rewind()`, `spingalett_session_copy()`,
+  `spingalett_session_length()`, `spingalett_session_vocabulary()`, `spingalett_session_free()`. The
+  logits are those `spingalett_model_predict()` gives each position of the whole window, bit for bit,
+  in every precision and however the tokens come (alone, as a prompt, with other sequences): the float
+  linear layers run on their filters packed once per model by new kernels for few rows that sum in the
+  order of the batched forward kernel, the integer ones sum in integers, attention attends as the
+  engine does. Several sessions may run on one model from several threads. Part of the runtime. Tests:
+  `model` (GPT-2-like and LLaMA-like models, narrow and wide, every precision, one thread and many,
+  against batched prediction; refused models and arguments; four threads), `runtime.library` (the
+  runtime's sessions give the library's bits).
+- **Batched generation:** `spingalett_session_generate()` continues several sequences of a session
+  together, the steps' rows computed at once, each sequence drawing as `spingalett_generate()` draws
+  (temperature, top-k, top-p, stop tokens; sequence b with seed + b): the same tokens as alone. Tests:
+  `gen`.
+- New functions `spingalett_session_new()`, `spingalett_session_free()`, `spingalett_session_feed()`,
+  `spingalett_session_rewind()`, `spingalett_session_copy()`, `spingalett_session_length()`,
+  `spingalett_session_vocabulary()` and `spingalett_session_generate_args()`
+  (`spingalett_session_generate()`), in the symbol version `SPINGALETT_1.3` of the library and the
+  runtime; new structs `SpingalettSessionOptions`, `SpingalettSessionFeed` and
+  `SpingalettSessionGenerateArgs`. In Python, `Model.session()` (`Session`: `feed()`, `feed_many()`,
+  `rewind()`, `copy()`, `length()`, `generate()`).
+
+### Changed
+- `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single
+  precision in a session (kept in the network until its parameters or layers change): the prompt fed
+  at once, then each token once; once the tokens fill the window, the window of the last tokens is fed
+  again from its first position, as the prediction over the window does, so the tokens are those of
+  1.2 (the logits equal the network's prediction to rounding, within 1e-6 relative in the tests). On an
+  Intel Core i7-12650H the CharGPT model (256 wide, 4 blocks, a window of 128) generates 3230 tokens a
+  second on one thread, 44 times 1.2's 72.7, and 3568 on six threads (121 in 1.2); a call generating
+  one token takes 1.8 ms instead of 11.7. Other networks and the GPU modes predict over the window as
+  before.
+
+### Fixed
+- Integer deployment models of language models (INT8, INT4, INT2; in the engine, batched and in the
+  runtime) quantized the input of each linear layer with one scale for the whole sequence, so that a
+  later token changed the logits of the earlier ones of a causal model. In a model whose first layer is
+  an embedding, integer convolutions of 1 x 1 windows, stride 1, no padding and one group now quantize
+  each token's channels with a scale of their own (`docs/ModelFormat.md`); their results differ from
+  1.2's within the quantization's error. Tests: `transformer` (later tokens leave earlier logits
+  unchanged, bit for bit, batched and in single runs).
+- **Tokenizers** of language models in C: `spingalett_tokenizer_load()` reads a Hugging Face
+  `tokenizer.json` (or a model directory, whose `tokenizer_config.json` names BOS and EOS),
+  `spingalett_tokenize()` encodes UTF-8 text and `spingalett_detokenize()` decodes ids, with
+  `spingalett_tokenizer_info()`, `spingalett_tokenizer_token()` and `spingalett_tokenizer_id()`
+  (`SpingalettTokenizer`, `SpingalettTokenizerInfo`, `SPINGALETT_NO_TOKEN`). Byte-level BPE (GPT-2,
+  SmolLM), tiktoken's encodings (LLaMA 3's cl100k, Qwen2's with single digits and NFC, o200k) and
+  SentencePiece's BPE with byte fallback (LLaMA 2, Mistral, Phi-3), as the `tokenizers` library runs
+  them: added tokens with their strip rules, special ones found only when asked (`.special`), the
+  normalizers, pre-tokenizers, decoders and templates those files use, merges by rank through a heap
+  (n log n in a piece's length; SentencePiece's texts merged word by word where the vocabulary allows
+  it). The pre-tokenizers' regular expressions are matched by hand with Oniguruma's semantics, over
+  Unicode tables written by `Src/make_unicode.py`. On the tokenizers of GPT-2, LLaMA 3.2, Qwen2.5,
+  SmolLM2, TinyLlama, Mistral 7B and Phi-3 the ids and texts equal those of `tokenizers` 0.23, and
+  encoding runs 3.6 to 8.3 times as fast (0.9 MB of prose and code on an i7-12650H, one thread). The
+  `tokenizer` test group checks six small tokenizers of these families
+  (`Tests/make_tokenizer_tests.py`) against the library's ids.
+- **Hugging Face checkpoints in C**: `spingalett_load_pretrained()` (`SpingalettPretrainedArgs`: `path`,
+  `context`) makes a network of a model directory, `config.json` and safetensors weights (one file, or
+  the shards of `model.safetensors.index.json`; F32, F16, BF16), of the model types `llama`, `mistral`,
+  `qwen2` and `gpt2`: the networks of the Python bindings' `llama_from_state_dict()` and
+  `gpt2_from_state_dict()`, which give the same logits bit for bit, with Qwen2's biases, explicit
+  `head_dim`, tied embeddings, GPT-2's Conv1D weights. The arrays are reserved at their final sizes and
+  each tensor is decoded once from the mapped file into its layer (SmolLM2-135M loads in 0.17 s on an
+  i7-12650H). Mistral's sliding window is not applied (exact within the window; a warning beyond it);
+  scaled rotary embeddings are refused. On SmolLM2-135M and Qwen2.5-0.5B-Instruct the logits agree with
+  `transformers` within 2.4e-4 and 4e-4 and the greedy continuations are the same. The `pretrained` test
+  group compares tiny LLaMA,
+  Qwen2, Mistral and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) with PyTorch.
+- **GGUF files**, llama.cpp's (versions 2 and 3), in `spingalett_load_pretrained()` and
+  `spingalett_tokenizer_load()` / `_from_memory()`: the network of `general.architecture` llama
+  (LLaMA, Mistral), qwen2 or gpt2 with the hyper-parameters of the metadata, its weights dequantized as
+  llama.cpp's `dequantize_row_*()` computes them (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K,
+  Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS; in IEEE order, the same weights on every platform), LLaMA's
+  queries and keys taken back from llama.cpp's order of their rows; the vocabulary of the `gpt2` model
+  as a byte-level BPE by the pre-tokenizer the file names, that of the `llama` model as SentencePiece's
+  BPE of its scores. On quantized SmolLM2-135M, TinyStories and Qwen2.5-0.5B-Instruct files the weights
+  equal the `gguf` package's dequantization bit for bit, and their vocabularies give the ids of the
+  `tokenizer.json` files they came from; the `pretrained` group checks GGUF files of the weights of
+  `hf_llama`, `hf_qwen2` and `hf_gpt2` (their directories' logits bit for bit), a model of fifteen
+  types (each matrix against a reference written
+  with llama.cpp's formulas and checked against `gguf`'s), a SentencePiece vocabulary against the
+  `sentencepiece` library's ids, and damaged files.
+- Tokenizers and pretrained models in every binding: Python's `sg.Tokenizer` (`encode()`, `decode()`,
+  `token()`, `id()`, `bos`, `eos`, ...) and `Network.from_pretrained(path, context)`, which give the
+  logits of the 1.2 loader `llama_from_state_dict()` bit for bit without PyTorch; C++'s
+  `spingalett::Tokenizer` and `Network::from_pretrained()`; Rust's, C#'s, Go's and Java's `Tokenizer`
+  and pretrained loading, each tested on the `tokenizer` group's expectations and on `hf_llama` in both of
+  its forms, their structures compared with the C layout. The functions of 1.3 are bound optionally in
+  Python and Java, so that the bindings still load a library of 1.2.
+- `Examples/Pretrained.c`: a Hugging Face or GGUF language model continuing a prompt, printing each
+  token as it comes.
+- An internal JSON reader (`Src/Spingalett.Json.c`) for the files of language models.
 
 ## [1.2.0] - 2026-10-11
 

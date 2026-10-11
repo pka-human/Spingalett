@@ -49,7 +49,9 @@ $tokens = $lm->generate([72, 101], 100, new Sampling(temperature: 0.8, topK: 40)
 Options go by name from PHP 8; PHP 7.4 gives them in order (`new TrainOptions(1500, 4, 0.05)`) or sets the
 properties. Samples are arrays of numbers, flat or one array a sample, copied into the library's floats once
 a call; outputs come back flat. `Network::save()`, `Network::load()`, `Model::load()` and
-`Network::toModel(Precision::INT8)` handle files and deployment models; `weights()`, `biases()` and
+`Network::toModel(Precision::INT8)` handle files and deployment models, and `Model::session()` a causal
+language model's session, fed a token at a time with the keys and values of earlier tokens kept
+(`feed()`, `rewind()`, `copy()`, `generate()` of several sequences at once); `weights()`, `biases()` and
 `setParameters()` the parameters. `Library::ffi()` gives the C functions themselves, and `raw()` the C
 object of a network or model, for what the classes leave out. Errors of the library throw
 `SpingalettException` (its code is the library's error code), wrong arguments `InvalidArgumentException`.

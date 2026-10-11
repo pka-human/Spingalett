@@ -1611,15 +1611,16 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
                      .tokens = ext && s->mask ? g->act[0].address : x,
                      .tokens_stride = ext && s->mask ? g->net->topology[0] : 0u};
     /* networks in bfloat16 on CUDA, heads of 32, 64 or 128: flash.cu on the matrix units (BQ 0 names it), a
-       block 64 rows (32 for heads of 128). A layer with padding or a sliding window runs on the kernels of single
-       precision (rattn.cu's units of EXT, which read activations kept as bfloat16 too): flash.cu does not read
-       them. */
+       block 64 rows of four warps (32 of two for heads of 128; FORWARD 128 rows of four warps for heads of up to
+       64). A layer with padding or a sliding window runs on the kernels of single precision (rattn.cu's units of
+       EXT, which read activations kept as bfloat16 too): flash.cu does not read them. */
     const bool mma = g->bf16 && spg_gpu_using() == SPG_BACKEND_CUDA && op != SPG_ATTN_PRE && !ext &&
                      (head == 32u || head == 64u || head == 128u);
     if (mma) {
         dmax = head;
         bq = head <= 64u ? 64u : 32u;
         threads = 2u * bq;
+        if (op == SPG_ATTN_FORWARD && head <= 64u) bq = 128u;
     }
     const uint32_t spec[4] = {op | (ext ? SPG_ATTN_EXT : 0u), mma ? 0u : bq, dmax, threads};
     if (g->geo[l].buffer) reads(a, whole(&g->geo[l]));

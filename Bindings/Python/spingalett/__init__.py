@@ -45,14 +45,14 @@ __all__ = [
     "AutoSave", "LogLevel", "ErrorCode", "Monitor", "TrainStatus", "Layer", "TrainConfig", "Network",
     "LayerType", "Input", "Conv2D", "MaxPool2D", "AvgPool2D", "BatchNorm", "LayerDescription",
     "ConvTranspose2D", "Upsample2D", "LayerNorm", "Upsample", "Linear", "Embedding", "Attention", "RMSNorm", "Multiply",
-    "Model", "LayerInfo", "DeviceData",
+    "Model", "LayerInfo", "DeviceData", "Session",
     "Metrics", "Progress", "TrainResult", "Trainer", "SpingalettError", "load_idx", "load_cifar", "load_csv",
     "DatasetEncoding", "save_dataset", "load_dataset", "dataset_info",
     "CosineDecay", "LinearWarmup", "StepDecay", "WarmupCosine", "LinearDecay", "WarmupLinear",
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
-    "gpt2_from_state_dict", "llama_from_state_dict",
+    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer",
 ]
 
 
@@ -554,6 +554,44 @@ class _Model(Structure):
 _ModelPtr = POINTER(_Model)
 
 
+class _SessionOptions(Structure):
+    _fields_ = [
+        ("max_length", c_uint32),
+        ("sequences", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _SessionFeed(Structure):
+    _fields_ = [
+        ("sequence", c_uint32),
+        ("tokens", POINTER(c_uint32)),
+        ("count", c_uint32),
+        ("logits", POINTER(c_float)),
+        ("all", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _SessionGenerateArgs(Structure):
+    _fields_ = [
+        ("session", c_void_p),
+        ("sequences", c_uint32),
+        ("prompts", POINTER(POINTER(c_uint32))),
+        ("prompt_lengths", POINTER(c_uint32)),
+        ("tokens", POINTER(c_uint32)),
+        ("made", POINTER(c_uint32)),
+        ("count", c_uint32),
+        ("temperature", c_float),
+        ("top_k", c_uint32),
+        ("top_p", c_float),
+        ("seed", c_uint64),
+        ("stop_tokens", POINTER(c_uint32)),
+        ("stop_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 class _LayerInfo(Structure):
     _fields_ = [
         ("type", c_int),
@@ -597,6 +635,51 @@ class _LRScheduleParams(Structure):
         ("step_size", c_size_t),
         ("gamma", c_float),
         ("min_lr", c_float),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _TokenizerInfo(Structure):
+    _fields_ = [
+        ("vocabulary", c_uint32),
+        ("added", c_uint32),
+        ("bos", c_uint32),
+        ("eos", c_uint32),
+        ("pad", c_uint32),
+        ("unk", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _TokenizeArgs(Structure):
+    _fields_ = [
+        ("tokenizer", c_void_p),
+        ("text", c_char_p),
+        ("length", c_size_t),
+        ("tokens", POINTER(c_uint32)),
+        ("capacity", c_size_t),
+        ("special", c_bool),
+        ("add_special", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _DetokenizeArgs(Structure):
+    _fields_ = [
+        ("tokenizer", c_void_p),
+        ("tokens", POINTER(c_uint32)),
+        ("count", c_size_t),
+        ("text", c_void_p),
+        ("capacity", c_size_t),
+        ("skip_special", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _PretrainedArgs(Structure):
+    _fields_ = [
+        ("path", c_char_p),
+        ("context", c_uint32),
         ("reserved", c_uint64 * _RESERVED),
     ]
 
@@ -736,6 +819,14 @@ _model_free = _bind("spingalett_model_free", None, [_ModelPtr])
 _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
 _model_predict = _bind("spingalett_model_predict", c_bool, [_ModelPtr, _FloatArray, c_uint32, _FloatArray])
 _model_evaluate = _bind("spingalett_model_evaluate", _EvalMetrics, [_ModelPtr, _FloatArray, _FloatArray, c_uint32])
+_session_new = _bind("spingalett_session_new", c_void_p, [_ModelPtr, POINTER(_SessionOptions)])
+_session_free = _bind("spingalett_session_free", None, [c_void_p])
+_session_vocabulary = _bind("spingalett_session_vocabulary", c_uint32, [c_void_p])
+_session_length = _bind("spingalett_session_length", c_uint32, [c_void_p, c_uint32])
+_session_feed = _bind("spingalett_session_feed", c_bool, [c_void_p, POINTER(_SessionFeed), c_uint32])
+_session_rewind = _bind("spingalett_session_rewind", c_bool, [c_void_p, c_uint32, c_uint32])
+_session_copy = _bind("spingalett_session_copy", c_bool, [c_void_p, c_uint32, c_uint32])
+_session_generate = _bind("spingalett_session_generate_args", c_uint32, [_SessionGenerateArgs])
 _load = _bind("spingalett_load", _NetPtr, [c_char_p])
 _import_onnx = _bind("spingalett_import_onnx", _NetPtr, [c_char_p])
 _import_onnx_from_memory = _bind("spingalett_import_onnx_from_memory", _NetPtr, [c_char_p, c_size_t])
@@ -762,6 +853,33 @@ _set_log_callback = _bind("spingalett_set_log_callback", None, [_LogCallbackFn])
 _set_log_level = _bind("spingalett_set_log_level", None, [c_int])
 _set_verbose = _bind("spingalett_set_verbose", None, [c_bool])
 _seed = _bind("spingalett_seed", None, [c_uint64])
+
+
+def _bind_optional(name, restype, argtypes):
+    """A function of a later library than the oldest these bindings accept: None when it is missing, so that the
+    rest of the bindings still work with an older library."""
+    try:
+        return _bind(name, restype, argtypes)
+    except AttributeError:
+        return None
+
+
+# 1.3: tokenizers and pretrained language models
+_tokenizer_load = _bind_optional("spingalett_tokenizer_load", c_void_p, [c_char_p])
+_tokenizer_from_memory = _bind_optional("spingalett_tokenizer_from_memory", c_void_p, [c_char_p, c_size_t])
+_tokenizer_free = _bind_optional("spingalett_tokenizer_free", None, [c_void_p])
+_tokenizer_info = _bind_optional("spingalett_tokenizer_info", _TokenizerInfo, [c_void_p])
+_tokenizer_token = _bind_optional("spingalett_tokenizer_token", c_char_p, [c_void_p, c_uint32])
+_tokenizer_id = _bind_optional("spingalett_tokenizer_id", c_uint32, [c_void_p, c_char_p])
+_tokenize = _bind_optional("spingalett_tokenize_args", ctypes.c_int64, [_TokenizeArgs])
+_detokenize = _bind_optional("spingalett_detokenize_args", ctypes.c_int64, [_DetokenizeArgs])
+_load_pretrained = _bind_optional("spingalett_load_pretrained_args", _NetPtr, [_PretrainedArgs])
+
+
+def _require(fn, what: str):
+    if fn is None:
+        raise SpingalettError(-1, f"{what} needs Spingalett 1.3 or later (the library is {_LIBRARY_VERSION})")
+    return fn
 
 
 def library_path() -> str:
@@ -1860,7 +1978,9 @@ class Network:
         whose outputs are the logits of every token of its vocabulary for each input token: the most likely
         token (``temperature`` 0), or a draw from the softmax of the logits over ``temperature`` among the
         ``top_k`` most likely and those whose probabilities add up to ``top_p``. ``seed`` (0: the library's
-        generator) makes draws repeatable; a token of ``stop`` ends the generation (it is returned last)."""
+        generator) makes draws repeatable; a token of ``stop`` ends the generation (it is returned last).
+        On the CPU a causal model runs as its deployment model of single precision in a :class:`Session`,
+        each token computed once."""
         p = np.ascontiguousarray(np.asarray(prompt, dtype=np.uint32).ravel())
         if p.size == 0:
             raise ValueError("generate needs a prompt of one token at least")
@@ -2046,6 +2166,20 @@ class Network:
         return cls._wrap(ptr)
 
     @classmethod
+    def from_pretrained(cls, path, context: int = 0) -> "Network":
+        """A language model as a network: a Hugging Face model directory (``config.json`` and safetensors weights,
+        sharded or not; ``model_type`` llama, mistral, qwen2 or gpt2) or a GGUF file (``general.architecture``
+        llama, qwen2 or gpt2, its weights dequantized from F32 to the k-quants), see spingalett_load_pretrained().
+        ``context`` is the network's window of tokens (0: the model's positions, LLaMA's at most 2048); the network
+        gives every position's logits and generates, trains and saves like any other. Its tokenizer:
+        :class:`Tokenizer` on the same path."""
+        args = _PretrainedArgs(path=_encode_path(path), context=int(context))
+        ptr = _call(_require(_load_pretrained, "Network.from_pretrained"), args)
+        if not ptr:
+            raise SpingalettError(-1, f"could not load {path!s}")
+        return cls._wrap(ptr)
+
+    @classmethod
     def from_torch(cls, module, example_input) -> "Network":
         """A network computing what a PyTorch module computes, through an ONNX export in memory
         (``torch.onnx.export``; ``example_input`` is a tensor of the module's input shape, NCHW for
@@ -2157,8 +2291,9 @@ class LayerInfo:
 
 class Model:
     """A read-only network for inference that computes in the precision its weights are stored in:
-    INT8, INT4 and INT2 layers quantize their input to 8 bits per sample and use integer kernels,
-    FLOAT32, FP16 and BFLOAT16 layers compute in float. Create one with :meth:`Network.to_model`,
+    INT8, INT4 and INT2 layers quantize their input to 8 bits per sample (per token in the linear layers
+    of language models) and use integer kernels, FLOAT32, FP16 and BFLOAT16 layers compute in float.
+    Create one with :meth:`Network.to_model`,
     :meth:`Model.load` or :meth:`Model.from_bytes`; :meth:`to_bytes` gives the .slett image, which
     the standalone C engine runs in place."""
 
@@ -2285,12 +2420,131 @@ class Model:
             raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
         return _metrics(_call(_model_evaluate, self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0]))
 
+    def session(self, max_length: int = 0, sequences: int = 1) -> "Session":
+        """A :class:`Session` of this causal language model: ``sequences`` sequences of at most
+        ``max_length`` tokens (0: the model's window) run a token at a time with a key-value cache."""
+        return Session(self, max_length, sequences)
+
     def __repr__(self) -> str:
         if not getattr(self, "_ptr", None):
             return "<spingalett.Model (closed)>"
         shape = [self.input_size] + [l.outputs for l in self.layers]
         precisions = sorted({l.precision.name for l in self.layers})
         return f"<spingalett.Model {shape} {'/'.join(precisions)} {self.size} bytes>"
+
+
+class Session:
+    """A causal language model (a :class:`Model` whose first layer embeds token ids and whose other layers
+    treat each position alone but for causal attention) run a token at a time: the keys and values of
+    every token fed are kept, so that a token costs one row through each layer and its attention over
+    the tokens before it. A session holds ``sequences`` sequences of at most ``max_length`` tokens;
+    the tokens of several sequences fed in one call (:meth:`feed_many`, :meth:`generate`) run through
+    the layers together. The logits are those :meth:`Model.predict` gives each position of the window,
+    bit for bit. A session is used from one thread at a time; several may share a model.
+
+    ::
+
+        with model.session() as s:
+            logits = s.feed(prompt)               # the next token's logits
+            logits = s.feed([int(logits.argmax())])
+    """
+
+    def __init__(self, model: Model, max_length: int = 0, sequences: int = 1):
+        model._model  # raise if closed
+        self._owner = model                       # keeps the model alive
+        options = _SessionOptions(int(max_length), int(sequences))
+        self._ptr = _call(_session_new, model._ptr, ctypes.byref(options))
+        if not self._ptr:
+            raise SpingalettError(-1, "could not create the session")
+        self.vocabulary = int(_session_vocabulary(self._ptr))
+        self.sequences = max(int(sequences), 1)
+
+    # ---- lifetime
+    def close(self) -> None:
+        ptr = getattr(self, "_ptr", None)
+        if ptr:
+            self._ptr = None
+            _session_free(ptr)
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _session(self):
+        if not getattr(self, "_ptr", None):
+            raise ValueError("session is closed")
+        return self._ptr
+
+    # ---- sequences
+    def length(self, sequence: int = 0) -> int:
+        """Tokens the sequence holds."""
+        return int(_session_length(self._session(), int(sequence)))
+
+    def rewind(self, length: int, sequence: int = 0) -> None:
+        """Truncate the sequence to its first ``length`` tokens (0 empties it)."""
+        _call(_session_rewind, self._session(), int(sequence), int(length))
+
+    def copy(self, source: int, target: int) -> None:
+        """Make sequence ``target`` a copy of sequence ``source``: a prompt fed once serves several
+        continuations."""
+        _call(_session_copy, self._session(), int(source), int(target))
+
+    def feed(self, tokens, sequence: int = 0, all: bool = False) -> np.ndarray:
+        """Append token ids to a sequence; returns the logits of the token after the last of them
+        (``vocabulary`` floats), or with ``all`` of the token after each (one row per token)."""
+        return self.feed_many([(sequence, tokens)], all=all)[0]
+
+    def feed_many(self, items, all: bool = False) -> List[np.ndarray]:
+        """Append tokens to several sequences in one pass: ``items`` holds (sequence, tokens) pairs, each
+        sequence named once; returns the logits of each as :meth:`feed` does."""
+        keep, outs = [], []
+        feeds = (_SessionFeed * max(len(items), 1))()
+        u32, f32 = POINTER(c_uint32), POINTER(c_float)
+        for k, (sequence, tokens) in enumerate(items):
+            t = np.ascontiguousarray(np.asarray(tokens, dtype=np.uint32).ravel())
+            out = np.empty((t.size, self.vocabulary) if all else self.vocabulary, dtype=np.float32)
+            keep.append(t)
+            outs.append(out)
+            feeds[k] = _SessionFeed(int(sequence), t.ctypes.data_as(u32), t.size,
+                                    out.ctypes.data_as(f32) if t.size else None, bool(all))
+        _call(_session_feed, self._session(), feeds, len(items))
+        return outs
+
+    def generate(self, prompts, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
+                 seed: int = 0, stop=()) -> List[List[int]]:
+        """Continue sequences 0 .. len(prompts) - 1 together, each first fed its prompt (token ids, at least
+        one), by up to ``count`` tokens each, drawn as :meth:`Network.generate` draws (sequence b with
+        seed ``seed + b``); a token of ``stop`` ends a sequence (it is returned last), and so does a full
+        sequence. Returns each sequence's tokens."""
+        ps = [np.ascontiguousarray(np.asarray(p, dtype=np.uint32).ravel()) for p in prompts]
+        if not ps or any(p.size == 0 for p in ps):
+            raise ValueError("generate needs a prompt of one token at least for each sequence")
+        u32 = POINTER(c_uint32)
+        pointers = (u32 * len(ps))(*[p.ctypes.data_as(u32) for p in ps])
+        lengths = (c_uint32 * len(ps))(*[p.size for p in ps])
+        count = max(int(count), 0)
+        out = np.zeros(len(ps) * max(count, 1), dtype=np.uint32)
+        made = (c_uint32 * len(ps))()
+        s = np.ascontiguousarray(np.asarray(list(stop), dtype=np.uint32))
+        args = _SessionGenerateArgs(self._session(), len(ps), pointers, lengths, out.ctypes.data_as(u32), made, count,
+                                    float(temperature), int(top_k), float(top_p), int(seed),
+                                    s.ctypes.data_as(u32) if s.size else None, s.size)
+        _call(_session_generate, args)
+        return [out[b * count:b * count + made[b]].tolist() for b in range(len(ps))]
+
+    def __repr__(self) -> str:
+        if not getattr(self, "_ptr", None):
+            return "<spingalett.Session (closed)>"
+        lengths = [self.length(b) for b in range(self.sequences)]
+        return f"<spingalett.Session {self.sequences} sequences {lengths} tokens, vocabulary {self.vocabulary}>"
 
 
 # --------------------------------------------------------------------------- low-level training
@@ -2383,6 +2637,149 @@ class Trainer:
 
 
 # --------------------------------------------------------------------------- data sets
+
+# --------------------------------------------------------------------------- tokenizers
+
+NO_TOKEN = 0xFFFFFFFF
+
+
+class Tokenizer:
+    """The tokenizer of a language model (spingalett_tokenizer_load()): a Hugging Face ``tokenizer.json`` file, a
+    model directory holding one (its ``tokenizer_config.json`` names BOS and EOS), a GGUF file, or the bytes of a
+    ``tokenizer.json`` or GGUF file. Byte-level BPE (GPT-2, SmolLM), tiktoken's encodings (LLaMA 3, Qwen2) and
+    SentencePiece's BPE (LLaMA 2, Mistral, Phi-3), encoding and decoding as Hugging Face's ``tokenizers`` does::
+
+        tok = sg.Tokenizer("models/SmolLM2-135M")
+        ids = tok.encode("<|im_start|>user\\nHi<|im_end|>", special=True)
+        text = tok.decode(ids)
+    """
+
+    def __init__(self, source):
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            ptr = _call(_require(_tokenizer_from_memory, "Tokenizer"), data, len(data))
+        else:
+            ptr = _call(_require(_tokenizer_load, "Tokenizer"), _encode_path(source))
+        if not ptr:
+            raise SpingalettError(-1, "could not load the tokenizer")
+        self._ptr = ptr
+
+    @classmethod
+    def load(cls, path) -> "Tokenizer":
+        return cls(os.fspath(path))
+
+    @classmethod
+    def from_bytes(cls, data) -> "Tokenizer":
+        return cls(bytes(data))
+
+    def close(self) -> None:
+        ptr = getattr(self, "_ptr", None)
+        if ptr:
+            self._ptr = None
+            _tokenizer_free(ptr)
+
+    def __enter__(self) -> "Tokenizer":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # interpreter shutdown may have torn down ctypes already
+            pass
+
+    @property
+    def _handle(self):
+        if not getattr(self, "_ptr", None):
+            raise ValueError("tokenizer is closed")
+        return self._ptr
+
+    def encode(self, text: str, special: bool = False, add_special: bool = False) -> List[int]:
+        """The ids of a text. ``special``: special tokens written in it (``<|im_start|>``) become their ids (by
+        default they are text, so that text from users cannot forge them); ``add_special``: the tokens the tokenizer
+        adds around a text (LLaMA's BOS), as ``tokenizers``' ``add_special_tokens=True``."""
+        data = text.encode("utf-8")
+        capacity = len(data) + 16
+        while True:
+            ids = (c_uint32 * capacity)()
+            args = _TokenizeArgs(tokenizer=self._handle, text=data if data else b"", length=len(data), tokens=ids,
+                                 capacity=capacity, special=special, add_special=add_special)
+            count = _call(_tokenize, args)
+            if count < 0:
+                raise SpingalettError(-1, "could not encode the text")
+            if count <= capacity:
+                return list(ids[:count])
+            capacity = int(count)
+
+    def decode(self, tokens, skip_special: bool = False) -> str:
+        """The text of ids (``skip_special``: without the special tokens); bytes that are no UTF-8, as a character
+        split between tokens, become U+FFFD."""
+        ids = np.ascontiguousarray(tokens, dtype=np.uint32).reshape(-1)
+        pointer = ids.ctypes.data_as(POINTER(c_uint32))
+        capacity = 4 * len(ids) + 64
+        while True:
+            buffer = ctypes.create_string_buffer(capacity)
+            args = _DetokenizeArgs(tokenizer=self._handle, tokens=pointer, count=len(ids),
+                                   text=ctypes.cast(buffer, c_void_p), capacity=capacity, skip_special=skip_special)
+            size = _call(_detokenize, args)
+            if size < 0:
+                raise SpingalettError(-1, "could not decode the tokens")
+            if size < capacity:
+                return buffer.raw[:size].decode("utf-8", errors="replace")
+            capacity = int(size) + 1
+
+    def token(self, id: int) -> Optional[str]:
+        """The token of an id as the vocabulary writes it ("Ġthe", "▁the", "<|im_start|>"), None for no token."""
+        s = _tokenizer_token(self._handle, int(id) & 0xFFFFFFFF)
+        return s.decode("utf-8", errors="replace") if s is not None else None
+
+    def id(self, token: str) -> Optional[int]:
+        """The id of a token as the vocabulary writes it (added tokens first), None when there is none."""
+        i = _tokenizer_id(self._handle, token.encode("utf-8"))
+        return None if i == NO_TOKEN else int(i)
+
+    def _info(self) -> _TokenizerInfo:
+        return _tokenizer_info(self._handle)
+
+    @property
+    def vocabulary(self) -> int:
+        """Token ids: the largest one + 1."""
+        return int(self._info().vocabulary)
+
+    def __len__(self) -> int:
+        return self.vocabulary
+
+    @property
+    def added(self) -> int:
+        return int(self._info().added)
+
+    @property
+    def bos(self) -> Optional[int]:
+        v = self._info().bos
+        return None if v == NO_TOKEN else int(v)
+
+    @property
+    def eos(self) -> Optional[int]:
+        v = self._info().eos
+        return None if v == NO_TOKEN else int(v)
+
+    @property
+    def pad(self) -> Optional[int]:
+        v = self._info().pad
+        return None if v == NO_TOKEN else int(v)
+
+    @property
+    def unk(self) -> Optional[int]:
+        v = self._info().unk
+        return None if v == NO_TOKEN else int(v)
+
+    def __repr__(self) -> str:
+        if not getattr(self, "_ptr", None):
+            return "Tokenizer(closed)"
+        return f"Tokenizer(vocabulary={self.vocabulary}, bos={self.bos}, eos={self.eos})"
+
 
 # --------------------------------------------------------------------------- language models from PyTorch
 

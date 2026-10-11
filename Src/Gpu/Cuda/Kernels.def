@@ -150,3 +150,15 @@ SPG_CUDA_MMA_GENERAL(0, 1, 2, 1)
 SPG_CUDA_MMA_GENERAL(0, 1, 2, 2)
 SPG_CUDA_MMA_GENERAL(0, 0, 2, 1)
 SPG_CUDA_MMA_GENERAL(0, 0, 2, 2)
+
+/* the large tiles on the matrix units (gemm_pipe.cu): BM x BN outputs over warps of 16 TM x 16 TN, steps of BK, STAGES
+   of them in shared memory, which is also the table of Spingalett.GpuKernels.c, for the dense modes of operands kept
+   as bfloat16, read eight values at once (A, B), and with GENERAL (_g) for those listed so: units
+   gemm_pipe_<BM>x<BN>x<BK>_<TM>x<TN>_s<STAGES>_a<A>b<B> */
+SPG_CUDA_PIPE_TILE(128, 128, 32, 4, 4, 3)
+
+SPG_CUDA_PIPE_MODES(0, 1)           /* forward */
+SPG_CUDA_PIPE_MODES(0, 0)           /* data gradient */
+SPG_CUDA_PIPE_MODES(1, 0)           /* weight gradient */
+SPG_CUDA_PIPE_GENERAL(0, 1)
+SPG_CUDA_PIPE_GENERAL(0, 0)

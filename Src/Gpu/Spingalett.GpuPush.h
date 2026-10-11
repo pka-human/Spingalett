@@ -191,3 +191,5 @@ enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
 #define SPG_CUDA_MMA_STAGES 2u
 #define SPG_CUDA_MMA_ROWS(x, bk) ((x) * ((bk) + 8u) > (bk) * ((x) + 8u) ? (x) * ((bk) + 8u) : (bk) * ((x) + 8u))
 #define SPG_CUDA_MMA_SHARED(bm, bn, bk) (SPG_CUDA_MMA_STAGES * (SPG_CUDA_MMA_ROWS(bm, bk) + SPG_CUDA_MMA_ROWS(bn, bk)) * 2u)
+/* gemm_pipe.cu: bytes of shared memory a tile takes (its stages of BM + BN rows of BK bfloat16, unpadded) */
+#define SPG_CUDA_PIPE_SHARED(bm, bn, bk, stages) ((stages) * ((bm) + (bn)) * (bk) * 2u)

@@ -27,7 +27,9 @@
  * Layers whose weights are stored as INT8, INT4 or INT2 run in integer arithmetic: the layer's input
  * is quantized to 8 bits with a scale chosen per sample (its largest magnitude maps to 127), the dot
  * products with the weights accumulate in 32-bit integers, and each output is rescaled by its weight
- * row's scale. FLOAT32, FP16 and BFLOAT16 layers run in float. Convolutions compute each output
+ * row's scale. In a language model (a model whose first layer is an embedding) the linear layers
+ * (convolutions of 1 x 1 windows, stride 1, no padding and one group) choose a scale per cell, a
+ * token's, so that a token's outputs depend on that token only. FLOAT32, FP16 and BFLOAT16 layers run in float. Convolutions compute each output
  * pixel as such dot products of the filters with the window it reads; pooling and batch
  * normalization run in float, and so do the layers that add or concatenate the outputs of others.
  */

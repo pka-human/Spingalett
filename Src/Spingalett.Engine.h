@@ -63,6 +63,9 @@ typedef struct {
     uint32_t mask;                                  /* version 9: an attention's embedding (a layer index) whose
                                                        tokens tell its padded keys, or 0 */
     uint32_t window;                                /* version 9: an attention's sliding window (0: none) */
+    bool cells;                                     /* an integer linear layer of a language model
+                                                       (slett_token_linear()): each cell's channels
+                                                       quantized with a scale of their own */
 } SlettLayer;
 
 typedef struct {
@@ -170,6 +173,21 @@ static inline bool slett_conv_depthwise(const SlettLayer *L) {
     return L->type == LAYER_CONV2D && L->groups > 1 && L->in_c == L->groups;
 }
 
+/* A 1 x 1 convolution with stride 1 and no padding: a linear map of each cell. */
+static inline bool slett_conv_pointwise(const SlettLayer *L) {
+    return L->type == LAYER_CONV2D && L->kernel_h == 1 && L->kernel_w == 1 && L->stride_h == 1 && L->stride_w == 1 &&
+           L->pad_h == 0 && L->pad_w == 0;
+}
+
+/* The linear layers of a language model (a model whose first layer is an embedding: its cells are
+   tokens), integer pointwise convolutions of one group, quantize each cell's channels with a scale of
+   their own (SlettLayer.cells), not the sample's: a token's outputs then depend on that token alone,
+   so that a causal model's earlier positions never see the later ones, and a sequence computed a token
+   at a time (spingalett_session_feed()) gives the integer sums of the whole sequence. */
+static inline bool slett_token_linear(const SlettLayer *L, bool language_model) {
+    return language_model && L->groups == 1 && spingalett_precision_is_int(L->precision) && slett_conv_pointwise(L);
+}
+
 /* Forward passes of the layers that combine others, on one sample, in the order the batched ones
    use: an addition's inputs in their order, a concatenation's side by side, the cells of a global
    pooling one after the other (y[c] = (sum of x[p][c]) * (1 / cells)). */
@@ -216,15 +234,28 @@ typedef struct {
    values (queries, keys, values), y of cells x heads x head values; each query's scores in the order of
    the keys, its softmax online (the running maximum and sum, the values' weighted sum rescaled when the
    maximum grows), causal: the keys up to its cell, with a window those less than window cells away, the keys
-   of padding left out (a query without a key gives zeros). With a table (the rotary embeddings) the queries and keys are rotated first, in scratch of
-   slett_attention_floats() floats. */
+   of padding left out (a query without a key gives zeros). With a table (the rotary embeddings) the queries and
+   keys are rotated first, in scratch of slett_attention_floats() floats. */
 void spingalett_engine_attention(const SlettAttention *a, const float *x, const float *table, float *y, float *scratch);
 /* The attention of layer L for one sample of the network's inputs `input` (whose tokens a layer ignoring padding
    reads). */
 void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, const float *input, SlettAttention *a);
+/* A head vector rotated by its position's angles (cosines and sines: the table's halves of its row). */
+void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, const float *cosines,
+                                   const float *sines);
+/* One query's attention over `count` keys and values (key j at keys + j key_stride, its value at values + j
+   value_stride) as spingalett_engine_attention() computes it, into o[head]: the scores in the order of the
+   keys, times scale, the softmax online; with tokens, key j left out when tokens[j] is negative (padding), and
+   zeros when no key is left. Sessions (spingalett_session_feed()) attend over the keys they keep with it, so
+   that their results are the engine's. */
+void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,
+                              size_t value_stride, uint32_t count, uint32_t head, float scale, const float *tokens,
+                              float *o);
 /* An embedding of one sample: a row of L's table (in its precision, as floats) for every input value, zeros
    for values outside it, plus the position's vector with positions. */
 void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);
+/* The same for one cell: token (an input value) at `position`. */
+void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float token, uint32_t position, float *y);
 static inline uint64_t slett_attention_floats(uint32_t cells, uint32_t kv, uint32_t head, bool rope) {
     return rope ? (uint64_t)cells * kv * head + (uint64_t)cells * head + head : 0u;
 }
@@ -284,6 +315,14 @@ void spingalett_gather_window(const void *x, const SlettLayer *L, uint32_t oh, u
    included. window: slett_conv_scratch() bytes, xq: the quantized input of integer precisions. */
 void spingalett_engine_conv_transpose(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq,
                                       void *window);
+
+/* Outputs j0 .. j0 + count - 1 of integer weight layer L (dense, or a pointwise convolution's for one cell)
+   before activation, from its input quantized in xq with x_scale (spingalett_quantize_activations()) and
+   permuted by spingalett_engine_permute(), which returns xsum (0 for INT8 rows): the engine's kernels for
+   one vector, which sessions run on few rows (not in the engine alone). */
+void spingalett_engine_int_rows(const uint8_t *image, const SlettLayer *L, uint32_t j0, uint32_t count, const int8_t *xq,
+                                float x_scale, int32_t xsum, float *y);
+int32_t spingalett_engine_permute(int8_t *xq, uint32_t n, PrecisionMode precision);
 
 /* y[j] = bias[j] + scale[j] * x_scale * acc[j], the output of an integer layer before activation. */
 static inline float spingalett_int_output(float bias, float row_scale, float x_scale, int32_t acc) {

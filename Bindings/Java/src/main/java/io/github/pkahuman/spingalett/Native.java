@@ -106,6 +106,13 @@ final class Native {
     static final StructLayout MODEL = struct(i("input_size"), i("output_size"), i("layer_count"), i("loss"),
             l("workspace_size"), a("image"), l("image_size"), i("max_width_"), i("max_int_inputs_"), l("conv_scratch_"),
             a("owner_"), l("activations_"), reserved(RESERVED));
+    static final StructLayout TOKENIZER_INFO = struct(i("vocabulary"), i("added"), i("bos"), i("eos"), i("pad"), i("unk"),
+            reserved(RESERVED));
+    static final StructLayout TOKENIZE_ARGS = struct(a("tokenizer"), a("text"), l("length"), a("tokens"), l("capacity"),
+            b("special"), b("add_special"), reserved(RESERVED));
+    static final StructLayout DETOKENIZE_ARGS = struct(a("tokenizer"), a("tokens"), l("count"), a("text"), l("capacity"),
+            b("skip_special"), reserved(RESERVED));
+    static final StructLayout PRETRAINED_ARGS = struct(a("path"), i("context"), reserved(RESERVED));
 
     private static final Map<String, VarHandle> HANDLES = new ConcurrentHashMap<>();
 
@@ -181,6 +188,24 @@ final class Native {
     static final MethodHandle MODEL_LOAD = fn("spingalett_model_load", ADDRESS, ADDRESS);
     static final MethodHandle MODEL_FREE = fn("spingalett_model_free", null, ADDRESS);
     static final MethodHandle MODEL_PREDICT = fn("spingalett_model_predict", JAVA_BOOLEAN, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
+
+    /**
+     * The functions of 1.3 (tokenizers, pretrained language models), resolved when first used, so that the rest of
+     * the bindings still runs on a library of 1.2.
+     */
+    static final class LanguageModels {
+        private LanguageModels() {}
+
+        static final MethodHandle TOKENIZER_LOAD = fn("spingalett_tokenizer_load", ADDRESS, ADDRESS);
+        static final MethodHandle TOKENIZER_FROM_MEMORY = fn("spingalett_tokenizer_from_memory", ADDRESS, ADDRESS, JAVA_LONG);
+        static final MethodHandle TOKENIZER_FREE = fn("spingalett_tokenizer_free", null, ADDRESS);
+        static final MethodHandle TOKENIZER_INFO_OF = fn("spingalett_tokenizer_info", TOKENIZER_INFO, ADDRESS);
+        static final MethodHandle TOKENIZER_TOKEN = fn("spingalett_tokenizer_token", ADDRESS, ADDRESS, JAVA_INT);
+        static final MethodHandle TOKENIZER_ID = fn("spingalett_tokenizer_id", JAVA_INT, ADDRESS, ADDRESS);
+        static final MethodHandle TOKENIZE = fn("spingalett_tokenize_args", JAVA_LONG, TOKENIZE_ARGS);
+        static final MethodHandle DETOKENIZE = fn("spingalett_detokenize_args", JAVA_LONG, DETOKENIZE_ARGS);
+        static final MethodHandle LOAD_PRETRAINED = fn("spingalett_load_pretrained_args", ADDRESS, PRETRAINED_ARGS);
+    }
 
     /** A C string's text, or null for a null pointer. */
     static String string(MemorySegment p) {

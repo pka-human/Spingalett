@@ -105,6 +105,10 @@ struct SpingalettNetwork {
        host_version counts every change of the arrays, the copies back from the GPU too (gpu_predict
        holds the parameters of one, spingalett_gpu_net_version()) */
     struct SpgGpuNet *gpu_trainer;
+    /* spingalett_generate() on the CPU: the network as a deployment model, made from the parameters of a
+       host_version (Spingalett.Generate.c); a call takes it and puts it back, so that concurrent calls make
+       their own */
+    _Atomic(struct SpingalettGenerateModel *) generate_model;
     atomic_bool gpu_newer;
     bool gpu_kept;
     atomic_bool gpu_busy;           /* the kept copy in use (a predict(), a copy back, its release) */

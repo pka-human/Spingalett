@@ -685,10 +685,20 @@ SPINGALETT_API void spingalett_free(void *ptr);
  * Dropout, Constant), as a network to train further, save or deploy. The network takes
  * channels-last samples: an input of shape [N, C, H, W] becomes an input layer of H x W x C, so
  * images in NCHW order must be transposed to H, W, C, and maps come out channels last too; a dense
- * layer after a flattened map gets its weight columns reordered to match. Its loss is cross-entropy
- * when the output layer is a softmax or sigmoid, else mean squared error. Errors name the operator
- * or node that cannot be imported. Weights in external data files are read when the model comes
- * from a path (the files in its folder), not from memory.
+ * layer after a flattened map gets its weight columns reordered to match. Transformers: an input of
+ * token ids [N, T] (integers) becomes an input layer of T values (the indices as floats), an input
+ * [N, T, C] a layer of 1 x T cells; Gather from a constant table becomes an embedding (a position
+ * table added to it, its positions), MatMul and Gemm by constant weights linear layers,
+ * LayerNormalization, RMSNormalization and their written-out forms normalizations of each token,
+ * element-wise expressions the activations they compute (GELU, SiLU), Mul of two layers a
+ * multiplication layer; attention written out (the queries' and keys' product scaled, masked
+ * causally, through a Softmax over the keys, times the values; grouped-query heads, rotary
+ * embeddings), opset 23's Attention and com.microsoft's Attention and MultiHeadAttention become an
+ * attention layer reading one linear layer of queries, keys and values. Nodes of constants are
+ * computed on import. Its loss is cross-entropy when the output layer is a softmax or sigmoid, sparse
+ * cross-entropy for a language model (token ids in, a sequence without activation out), else mean
+ * squared error. Errors name the operator or node that cannot be imported. Weights in external data
+ * files are read when the model comes from a path (the files in its folder), not from memory.
  */
 SPINGALETT_API SpingalettNetwork *spingalett_import_onnx(const char *path);
 SPINGALETT_API SpingalettNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
@@ -713,6 +723,114 @@ SPINGALETT_API bool spingalett_load_pytorch(SpingalettNetwork *net, const char *
                                             uint32_t module_count);
 SPINGALETT_API bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size,
                                                         const char *const *modules, uint32_t module_count);
+
+/*
+ * Tokenizers of language models: the byte-pair encodings of Hugging Face's tokenizer.json files (GPT-2's
+ * byte-level BPE and tiktoken's encodings as LLaMA 3, Qwen2 and SmolLM use them; SentencePiece's BPE with
+ * byte fallback as LLaMA 2, Mistral and Phi-3 use it) and of GGUF files' vocabularies (the BPE of merges
+ * of their "gpt2" model, by the pre-tokenizer they name; SentencePiece's BPE of scores of their "llama"
+ * model, as llama.cpp and sentencepiece encode). A text is encoded as Hugging Face's tokenizers
+ * library encodes it: the added tokens found in it, the rest normalized (NFC, prepended and replaced
+ * strings), cut into pieces by the pre-tokenizers (byte-level, the regular expressions of GPT-2, cl100k
+ * and o200k, digits, Metaspace, splits on strings) and each piece merged pair by pair in the order of the
+ * merges, in time n log n of the piece's length. Decoding reverses it (byte-level, byte fallback,
+ * Metaspace, replacements, stripping). Other models (WordPiece, Unigram) and patterns are refused, naming
+ * what is missing. A tokenizer is read-only once loaded: threads may share it.
+ */
+typedef struct SpingalettTokenizer SpingalettTokenizer;
+
+/* An id no token has. */
+#define SPINGALETT_NO_TOKEN UINT32_MAX
+
+typedef struct {
+    uint32_t vocabulary;            /* token ids: the largest one + 1 (the model's tokens and the added ones) */
+    uint32_t added;                 /* added tokens (special ones, such as "<|endoftext|>", and others) */
+    uint32_t bos, eos;              /* the tokens beginning and ending a text (SPINGALETT_NO_TOKEN when unknown):
+                                       tokenizer_config.json's bos_token and eos_token, a GGUF file's ids, else
+                                       the template's tokens or special tokens named so ("<s>", "</s>",
+                                       "<|endoftext|>") */
+    uint32_t pad, unk;              /* padding, and the token of what the vocabulary lacks */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettTokenizerInfo;
+
+/* Reads a tokenizer.json file, a model directory holding one (its tokenizer_config.json, when there is
+   one, names the BOS and EOS tokens) or a GGUF file's vocabulary. NULL on error. */
+SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
+/* The bytes of a tokenizer.json file, or of a GGUF file, in memory; they are not kept. */
+SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
+SPINGALETT_API void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
+SPINGALETT_API SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
+/* The token of an id as the vocabulary writes it ("Ġthe" in byte-level vocabularies, "▁the" in
+   SentencePiece's, "<|im_start|>"), valid while the tokenizer lives; NULL for an id of no token. */
+SPINGALETT_API const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
+/* The id of a token as the vocabulary writes it (added tokens first), SPINGALETT_NO_TOKEN when none. */
+SPINGALETT_API uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
+
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const char *text;               /* UTF-8 (other bytes are an error) */
+    size_t length;                  /* its bytes; 0: up to its NUL */
+    uint32_t *tokens;               /* [capacity] receives the ids, or NULL with capacity 0 to count them */
+    size_t capacity;
+    bool special;                   /* special tokens written in the text ("<|im_start|>") become their ids;
+                                       otherwise they are text like any other (the default, so that text
+                                       from users cannot forge them). Added tokens that are not special
+                                       are always found. */
+    bool add_special;               /* the tokens the tokenizer adds around a text (LLaMA's BOS), as Hugging
+                                       Face's encode(add_special_tokens=True) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettTokenizeArgs;
+
+/* Encodes a text. Returns its number of tokens, also when that exceeds capacity (the first capacity are
+   written: call again with room for all), -1 on error. */
+#define spingalett_tokenize(...) spingalett_tokenize_args((SpingalettTokenizeArgs){__VA_ARGS__})
+SPINGALETT_API int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
+
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const uint32_t *tokens;         /* [count] */
+    size_t count;
+    char *text;                     /* [capacity] receives the UTF-8 text and a NUL (NULL with capacity 0 to
+                                       measure it); bytes that are no UTF-8, as a lone byte of a character
+                                       split between tokens, become U+FFFD */
+    size_t capacity;
+    bool skip_special;              /* leaves special tokens out */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettDetokenizeArgs;
+
+/* Decodes tokens into text. Returns the text's bytes, also when they exceed capacity - 1 (the first
+   capacity - 1 are written, with a NUL), -1 on error (ids of no token among them). */
+#define spingalett_detokenize(...) spingalett_detokenize_args((SpingalettDetokenizeArgs){__VA_ARGS__})
+SPINGALETT_API int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+
+typedef struct {
+    const char *path;               /* a model directory of Hugging Face's form (config.json and model.safetensors,
+                                       or the shards model.safetensors.index.json names), or a GGUF file */
+    uint32_t context;               /* tokens a sample, the network's window: 0 = the model's positions (GPT-2's
+                                       all, LLaMA's at most 2048) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettPretrainedArgs;
+
+/*
+ * A language model as a network: the model_type of config.json llama, mistral, qwen2 or gpt2, its weights
+ * from safetensors files (F32, F16 or BF16; mapped, each tensor decoded once into its layer); or the
+ * general.architecture of a GGUF file (version 2 or 3) llama (LLaMA, Mistral), qwen2 or gpt2, its
+ * hyper-parameters from its metadata and its weights dequantized to floats as llama.cpp dequantizes them
+ * (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS), LLaMA's
+ * queries and keys taken back from llama.cpp's order of their rows. LLaMA, Mistral and Qwen2 become RMS
+ * normalizations, grouped-query attention with rotary embeddings (the queries', keys' and values'
+ * projections, with Qwen2's biases, in one linear layer), and a SwiGLU MLP (a SiLU layer times a linear
+ * one); GPT-2 layer normalizations, learned positions, a GELU MLP and its Conv1D weights transposed. The
+ * language model head is lm_head.weight (output.weight), or a copy of the embeddings (tied). The network
+ * takes a window of `context` token ids and gives every position's logits
+ * (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it generates (spingalett_generate()), trains and saves like any
+ * other. Mistral's sliding window is not applied: attention covers the whole context, which is exact for
+ * contexts within the window (a warning says when the context exceeds it). Scaled rotary embeddings (LLaMA
+ * 3.1's, YaRN) are refused. The tokenizer comes from spingalett_tokenizer_load() on the same path. NULL on
+ * error.
+ */
+#define spingalett_load_pretrained(...) spingalett_load_pretrained_args((SpingalettPretrainedArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args);
 
 /* Deployment: models loaded from files, prediction and evaluation in Spingalett.Runtime.h. */
 

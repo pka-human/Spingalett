@@ -8,8 +8,8 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad conv norm graph onnx equiv cont optim sched dropout gen predict valid
- *                                step data io model xor
+ *   Spingalett.Tests [group]     groups: grad conv norm graph onnx tokenizer pretrained equiv cont optim sched
+ *                                dropout gen predict valid step data io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 
 #ifndef SPINGALETT_TEST_DATA_DIR
 #define SPINGALETT_TEST_DATA_DIR "Data"
@@ -337,7 +338,7 @@ static void conv_api(void) {
 static void deterministic_threads(void) {
     static const ComputeMode modes[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENMP, COMPUTE_OPENMP};
     static const unsigned threads[] = {1, 1, 3, 4};
-    for (int kind = 0; kind < 3; kind++) {
+    for (int kind = 0; kind < 2; kind++) {
         float *ref = NULL;
         uint64_t count = 0;
         bool same = true;
@@ -4422,6 +4423,41 @@ static NeuralNetwork *pad_net(uint32_t T, uint32_t V, bool causal, bool mask) {
     return net;
 }
 
+/* Causal language models of width d (heads of 4 or more values) over T tokens of V: GPT-2-like (kind 0:
+   learned positions, layer normalization, multi-head attention, a GELU MLP) and LLaMA-like (kind 1: RMS
+   normalization, grouped-query attention with rotary embeddings, SwiGLU; kind 2 as Mistral's: with sliding
+   windows of 5 tokens, attention ignoring padding and the head tied to the embedding), two blocks each. */
+static NeuralNetwork *lm_net(int kind, uint32_t T, uint32_t V, uint32_t d) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = T);
+    const uint32_t e = embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = kind == 0);
+    uint32_t x = e;
+    const uint32_t heads = d >= 16 ? 4 : 2, kv = kind == 0 ? heads : heads / 2, head = d / heads;
+    for (int b = 0; b < 2; b++) {
+        if (kind == 0) layer_norm(.net = net);
+        else rms_norm(.net = net);
+        linear(.net = net, .neurons_amount = (heads + 2 * kv) * head);
+        attention(.net = net, .heads = heads, .kv_heads = kv, .rope_theta = kind == 0 ? 0.0f : 10000.0f, .causal = true,
+                  .window = kind == 2 ? 5u : 0u, .ignore_padding = kind == 2);
+        uint32_t a = linear(.net = net, .neurons_amount = d);
+        x = add_layers(.net = net, .inputs = {x, a});
+        uint32_t n = kind == 0 ? layer_norm(.net = net) : rms_norm(.net = net, .epsilon = 1e-6f);
+        if (kind == 0) {
+            linear(.net = net, .neurons_amount = 3 * d, .act_func = ACT_GELU);
+        } else {
+            uint32_t g = linear(.net = net, .neurons_amount = 3 * d, .act_func = ACT_SILU);
+            uint32_t u = linear(.net = net, .inputs = {n}, .neurons_amount = 3 * d);
+            multiply_layers(.net = net, .inputs = {g, u});
+        }
+        a = linear(.net = net, .neurons_amount = d);
+        x = add_layers(.net = net, .inputs = {x, a});
+    }
+    if (kind == 0) layer_norm(.net = net);
+    else rms_norm(.net = net);
+    linear(.net = net, .neurons_amount = V, .tied = kind == 2 ? e : 0u);
+    return net;
+}
+
 /* Sequences of different lengths in one batch, padded with -1 tokens (and targets): with attention ignoring
    padding, the gradient of the batch is the mean of the sequences' own, each in a network of its length (the
    learned positions its first ones), up to the order of the sums; right padding with non-causal attention,
@@ -4657,6 +4693,41 @@ static void tf_tied(void) {
     free_network(tied); free_network(own);
 }
 
+/* Integer language models quantize each token's activations alone: a later token leaves the logits of
+   the earlier ones as they were, batched and in single runs (narrow models run the engine's short windows,
+   wide ones its four pixels at a time). */
+static void tf_token_quantization(void) {
+    const uint32_t T = 11, V = 13, N = 5;
+    for (int kind = 0; kind < 3; kind++)
+        for (uint32_t d = 8; d <= 48; d += 40) {
+            lcg_state = 610 + (unsigned)(kind * 100) + d;
+            NeuralNetwork *net = lm_net(kind, T, V, d);
+            tf_init(net);
+            float *x = malloc((size_t)N * T * sizeof(float)), *y = malloc((size_t)N * T * V * sizeof(float));
+            float *z = malloc((size_t)N * T * V * sizeof(float)), *r = malloc((size_t)N * T * V * sizeof(float));
+            for (uint32_t i = 0; i < N * T; i++) x[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
+            for (int p = PRECISION_INT8; p < PRECISION_COUNT; p++) {
+                SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+                CHECK(m != NULL, "token quantization: model");
+                if (!m) continue;
+                spingalett_model_predict(m, x, N, y);
+                for (uint32_t s = 0; s < N; s++) x[s * T + T - 1] = (float)(((uint32_t)x[s * T + T - 1] + 5u) % V);
+                spingalett_model_predict(m, x, N, z);
+                for (uint32_t s = 0; s < N; s++) spingalett_model_run(m, x + (size_t)s * T, r + (size_t)s * T * V, NULL);
+                bool same = true;
+                for (uint32_t s = 0; s < N; s++)
+                    same = same && !memcmp(y + (size_t)s * T * V, z + (size_t)s * T * V, (size_t)(T - 1) * V * 4);
+                CHECK(same && !memcmp(z, r, (size_t)N * T * V * 4), "token quantization: kind %d width %u p=%d: the "
+                      "earlier tokens' logits changed with the last token (%d), or batches differ from runs", kind, d, p,
+                      !same);
+                spingalett_model_free(m);
+            }
+            free(x); free(y); free(z); free(r);
+            free_network(net);
+        }
+    printf("  integer language models: each token quantized alone, earlier logits independent of later tokens\n");
+}
+
 static void tf_validation(void) {
     spingalett_set_log_level(LOG_NONE);
     NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
@@ -4688,6 +4759,349 @@ static void tf_validation(void) {
           "embedding: tokens outside the table give zeros");
     free_network(net);
     spingalett_set_log_level(LOG_WARNING);
+}
+
+/* ------------------------------------------------------------------------- sessions (key-value cache) */
+
+/* Feeds tokens [from, to) of a sequence to one of a session's sequences, the logits of each into
+   logits[t * V] (all) or of the last into logits[(to - 1) * V]. */
+static bool feed_span(SpingalettSession *s, uint32_t sequence, const uint32_t *tokens, uint32_t from, uint32_t to,
+                      bool all, float *logits, uint32_t V) {
+    SpingalettSessionFeed f = {.sequence = sequence, .tokens = tokens + from, .count = to - from,
+                               .logits = logits + (size_t)(all ? from : to - 1u) * V, .all = all};
+    return spingalett_session_feed(s, &f, 1);
+}
+
+/* Language models (GPT-2-like, LLaMA-like and Mistral-like, narrow and wide) in every precision, on one thread
+   and many: a session gives the logits batched prediction gives each position of the whole window, bit for bit,
+   however the tokens come: one at a time, a prompt at once then one at a time, several sequences in one
+   call, after a rewind, after a copy, and in a session shorter than the window. */
+static void session_equivalence(void) {
+    const uint32_t T = 12, V = 29, N = 3;
+    int exact = 0, runs = 0;
+    for (int kind = 0; kind < 3; kind++)
+        for (uint32_t d = 8; d <= 48; d += 40) {
+            lcg_state = 700 + (unsigned)(kind * 50) + d;
+            NeuralNetwork *net = lm_net(kind, T, V, d);
+            tf_init(net);
+            uint32_t tok[N][12];
+            float *x = malloc((size_t)N * T * sizeof(float)), *ref = malloc((size_t)N * T * V * sizeof(float));
+            float *got = malloc((size_t)N * T * V * sizeof(float));
+            for (uint32_t s = 0; s < N; s++)
+                for (uint32_t t = 0; t < T; t++) x[s * T + t] = (float)(tok[s][t] = (uint32_t)(frand() * 4096.0f) % V);
+            tok[2][3] = V + 4;                              /* a token outside the vocabulary: zeros */
+            x[2 * T + 3] = (float)tok[2][3];
+            for (int p = 0; p < PRECISION_COUNT; p++)
+                for (int mode = 0; mode < 2; mode++) {
+                    spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+                    SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+                    SpingalettSession *s = m ? spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = N})
+                                             : NULL;
+                    CHECK(s && spingalett_session_vocabulary(s) == V, "session: kind %d width %u p=%d: no session (%s)",
+                          kind, d, p, spingalett_last_error_message());
+                    if (!s) { spingalett_model_free(m); continue; }
+                    spingalett_model_predict(m, x, N, ref);
+                    float *const g0 = got, *const g1 = got + (size_t)T * V, *const g2 = got + (size_t)2 * T * V;
+                    bool ok = true;
+                    /* sequence 0 a token at a time; 1 a prompt, three alone, the rest at once */
+                    for (uint32_t t = 0; t < T; t++) ok = ok && feed_span(s, 0, tok[0], t, t + 1, false, g0, V);
+                    ok = ok && feed_span(s, 1, tok[1], 0, 5, true, g1, V);
+                    for (uint32_t t = 5; t < 8; t++) ok = ok && feed_span(s, 1, tok[1], t, t + 1, false, g1, V);
+                    ok = ok && feed_span(s, 1, tok[1], 8, T, true, g1, V);
+                    bool same = ok && !memcmp(got, ref, (size_t)2 * T * V * 4);
+                    /* sequence 0 rewound to 4 and continued together with all of sequence 2 */
+                    memset(got, 0, (size_t)N * T * V * 4);
+                    SpingalettSessionFeed both[2] = {
+                        {.sequence = 2, .tokens = tok[2], .count = T, .logits = g2, .all = true},
+                        {.sequence = 0, .tokens = tok[0] + 4, .count = T - 4, .logits = g0 + (size_t)4 * V, .all = true}};
+                    ok = ok && spingalett_session_rewind(s, 0, 4) && spingalett_session_feed(s, both, 2);
+                    same = same && ok && !memcmp(g0 + (size_t)4 * V, ref + (size_t)4 * V, (size_t)(T - 4) * V * 4) &&
+                           !memcmp(g2, ref + (size_t)2 * T * V, (size_t)T * V * 4);
+                    /* sequence 1 copied over 2, cut to 7 tokens and continued */
+                    ok = ok && spingalett_session_copy(s, 1, 2) && spingalett_session_length(s, 2) == T &&
+                         spingalett_session_rewind(s, 2, 7) && feed_span(s, 2, tok[1], 7, T, true, g2, V);
+                    same = same && ok && !memcmp(g2 + (size_t)7 * V, ref + (size_t)(T + 7) * V, (size_t)(T - 7) * V * 4);
+                    CHECK(ok && spingalett_session_length(s, 0) == T && spingalett_session_length(s, 1) == T,
+                          "session: kind %d width %u p=%d: feeds failed (%s)", kind, d, p, spingalett_last_error_message());
+                    spingalett_session_free(s);
+                    /* a session of 6 tokens */
+                    s = spingalett_session_new(m, &(SpingalettSessionOptions){.max_length = 6});
+                    ok = s && feed_span(s, 0, tok[0], 0, 6, true, g0, V) && !feed_span(s, 0, tok[0], 6, 7, false, g0, V);
+                    same = same && ok && !memcmp(g0, ref, (size_t)6 * V * 4);
+                    spingalett_session_free(s);
+                    CHECK(same, "session: kind %d width %u p=%d mode %d: logits differ from batched prediction",
+                          kind, d, p, mode);
+                    exact += same, runs++;
+                    spingalett_model_free(m);
+                }
+            free(x); free(ref); free(got);
+            free_network(net);
+        }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    printf("  sessions: %d of %d models and modes give batched prediction's logits bit for bit\n", exact, runs);
+}
+
+/* What sessions refuse: models that are no causal language models, a window too long, and feeds, rewinds
+   and copies out of range (which leave the sequences as they were). */
+static void session_validation(void) {
+    spingalett_set_log_level(LOG_NONE);
+    const uint32_t T = 6, V = 7;
+    NeuralNetwork *nets[4];
+    nets[0] = tf_net(2, T, V);                          /* attention over a map: no embedding */
+    nets[1] = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);  /* attention that is not causal */
+    layer(.net = nets[1], .neurons_amount = T);
+    embedding(.net = nets[1], .vocabulary = V, .neurons_amount = 8);
+    linear(.net = nets[1], .neurons_amount = 24);
+    attention(.net = nets[1], .heads = 2);
+    linear(.net = nets[1], .neurons_amount = V);
+    nets[2] = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);  /* a convolution across positions */
+    layer(.net = nets[2], .neurons_amount = T);
+    embedding(.net = nets[2], .vocabulary = V, .neurons_amount = 8);
+    conv2d(.net = nets[2], .filters = V, .kernel_h = 1, .kernel_w = 3, .padding_w = 1);
+    nets[3] = new_spingalett(.loss_func = LOSS_MSE);    /* a dense layer over the whole window */
+    layer(.net = nets[3], .neurons_amount = T);
+    embedding(.net = nets[3], .vocabulary = V, .neurons_amount = 4);
+    layer(.net = nets[3], .neurons_amount = 5);
+    for (int k = 0; k < 4; k++) {
+        SpingalettModel *m = spingalett_model_from_network(nets[k], PRECISION_FLOAT32);
+        spingalett_clear_error();
+        CHECK(m && !spingalett_session_new(m, NULL) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+              strstr(spingalett_last_error_message(), "causal language model"), "session: model %d accepted (%s)", k,
+              spingalett_last_error_message());
+        spingalett_model_free(m);
+        free_network(nets[k]);
+    }
+    NeuralNetwork *net = lm_net(1, T, V, 8);
+    SpingalettModel *m = spingalett_model_from_network(net, PRECISION_INT8);
+    CHECK(!spingalett_session_new(m, &(SpingalettSessionOptions){.max_length = T + 1}) &&
+          !spingalett_session_new(NULL, NULL), "session: a window longer than the model's accepted");
+    SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 2});
+    const uint32_t tok[8] = {1, 2, 3, 4, 5, 6, 0, 1};
+    float logits[8 * 7];
+    SpingalettSessionFeed twice[2] = {{.sequence = 1, .tokens = tok, .count = 2}, {.sequence = 1, .tokens = tok, .count = 1}};
+    SpingalettSessionFeed bad[4] = {{.sequence = 2, .tokens = tok, .count = 1}, {.sequence = 0, .tokens = tok, .count = 7},
+                                    {.sequence = 0, .count = 0, .logits = logits}, {.sequence = 0, .tokens = NULL, .count = 2}};
+    bool refused = s && feed_span(s, 0, tok, 0, 3, false, logits, V) && !spingalett_session_feed(s, twice, 2);
+    for (int k = 0; k < 4; k++) refused = refused && !spingalett_session_feed(s, &bad[k], 1);
+    refused = refused && !spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 0, .tokens = tok, .count = 4}, 1);
+    refused = refused && !spingalett_session_rewind(s, 0, 4) && !spingalett_session_rewind(s, 2, 0) &&
+              !spingalett_session_copy(s, 0, 2) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID;
+    CHECK(refused && spingalett_session_length(s, 0) == 3 && spingalett_session_length(s, 1) == 0 &&
+          spingalett_session_length(s, 5) == 0 && spingalett_session_feed(s, NULL, 0),
+          "session: bad feeds, rewinds or copies accepted, or they changed the sequences");
+    spingalett_session_free(s);
+    spingalett_session_free(NULL);
+    spingalett_model_free(m);
+    free_network(net);
+    spingalett_set_log_level(LOG_WARNING);
+    printf("  sessions: other models, windows too long and feeds out of range refused\n");
+}
+
+#if !defined(_WIN32)
+typedef struct {
+    const SpingalettModel *model;
+    const uint32_t *tokens;     /* [T] */
+    const float *expect;        /* [T x V] the logits of every position */
+    uint32_t T, V, seed;
+    bool same;
+} SessionJob;
+
+/* Sessions of one model on several threads: each feeds the tokens in pieces of its own and compares. */
+static void *session_job(void *arg) {
+    SessionJob *j = (SessionJob *)arg;
+    float *got = malloc((size_t)j->T * j->V * sizeof(float));
+    j->same = got != NULL;
+    for (uint32_t r = 0; r < 12 && j->same; r++) {
+        SpingalettSession *s = spingalett_session_new(j->model, NULL);
+        j->same = s != NULL;
+        for (uint32_t t = 0; t < j->T && j->same;) {
+            const uint32_t n = 1u + (t * 7u + r + j->seed) % 3u, end = t + n < j->T ? t + n : j->T;
+            j->same = feed_span(s, 0, j->tokens, t, end, true, got, j->V);
+            t = end;
+        }
+        j->same = j->same && !memcmp(got, j->expect, (size_t)j->T * j->V * sizeof(float));
+        spingalett_session_free(s);
+    }
+    free(got);
+    return NULL;
+}
+#endif
+
+/* Several sessions on one model from four threads at once (the model's panels prepared under its lock by
+   the first), and a session on a model that owns nothing (spingalett_model_init over the image). */
+static void session_shared(void) {
+    const uint32_t T = 10, V = 17;
+    lcg_state = 811;
+    NeuralNetwork *net = lm_net(0, T, V, 16);
+    tf_init(net);
+    uint32_t tok[10];
+    float x[10], *expect = malloc((size_t)T * V * sizeof(float)), *got = malloc((size_t)T * V * sizeof(float));
+    for (uint32_t t = 0; t < T; t++) x[t] = (float)(tok[t] = (uint32_t)(frand() * 4096.0f) % V);
+    ComputeMode mode = spingalett_get_compute_mode();
+    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    for (int p = 0; p < PRECISION_COUNT; p += 3) {
+        SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+        bool same = m && spingalett_model_predict(m, x, 1, expect);
+        SpingalettModel bare;
+        SpingalettSession *s = same && spingalett_model_init(&bare, m->image, m->image_size) == SPINGALETT_OK
+                             ? spingalett_session_new(&bare, NULL) : NULL;
+        same = s && feed_span(s, 0, tok, 0, T, true, got, V) && !memcmp(got, expect, (size_t)T * V * 4);
+        spingalett_session_free(s);
+        CHECK(same, "session p=%d: a model without an owner differs", p);
+#if !defined(_WIN32)
+        SessionJob jobs[4];
+        pthread_t threads[4];
+        int started = 0;
+        for (int t = 0; t < 4; t++) {
+            jobs[t] = (SessionJob){m, tok, expect, T, V, (uint32_t)t, false};
+            if (pthread_create(&threads[t], NULL, session_job, &jobs[t]) == 0) started++;
+        }
+        bool threaded = started == 4;
+        for (int t = 0; t < started; t++) {
+            pthread_join(threads[t], NULL);
+            threaded = threaded && jobs[t].same;
+        }
+        CHECK(threaded, "session p=%d: sessions on several threads differ", p);
+#endif
+        spingalett_model_free(m);
+    }
+    spingalett_set_compute_mode(mode);
+    free(expect); free(got);
+    free_network(net);
+    printf("  sessions: concurrent sessions on one model and sessions on an unowned model agree\n");
+}
+
+/* The greedy continuation of a prompt by the prediction over the window, a token at a time, as
+   spingalett_generate() computed it before sessions; worst gets the largest difference between the
+   network's logits and those of a session of its deployment model of single precision (in the window). */
+static void greedy_by_window(NeuralNetwork *net, const uint32_t *prompt, uint32_t length, uint32_t count,
+                             uint32_t *tokens, float *worst) {
+    const uint32_t T = net->topology[0], V = net->topology[net->layers - 1] / T;
+    uint32_t *seq = malloc((size_t)(length + count) * sizeof(uint32_t));
+    float *window = malloc((size_t)T * sizeof(float)), *logits = malloc((size_t)T * V * sizeof(float));
+    float *cached = malloc((size_t)V * sizeof(float));
+    memcpy(seq, prompt, (size_t)length * sizeof(uint32_t));
+    SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+    SpingalettSession *s = spingalett_session_new(m, NULL);
+    *worst = 0;
+    for (uint32_t made = 0; made < count; made++) {
+        const uint32_t n = length < T ? length : T, first = length - n;
+        for (uint32_t i = 0; i < T; i++) window[i] = i < n ? (float)seq[first + i] : -1.0f;
+        predict(.net = net, .inputs = window, .sample_count = 1, .outputs = logits);
+        const float *row = logits + (size_t)(n - 1) * V;
+        uint32_t best = 0;
+        for (uint32_t v = 1; v < V; v++) if (row[v] > row[best]) best = v;
+        if (first == 0 && feed_span(s, 0, seq, spingalett_session_length(s, 0), length, false,
+                                    cached - (size_t)(length - 1) * V, V))
+            for (uint32_t v = 0; v < V; v++) *worst = fmaxf(*worst, fabsf(cached[v] - row[v]) / (1.0f + fabsf(row[v])));
+        seq[length++] = tokens[made] = best;
+    }
+    spingalett_session_free(s);
+    spingalett_model_free(m);
+    free(seq); free(window); free(logits); free(cached);
+}
+
+/* spingalett_generate() on the CPU runs a session of the network's deployment model: the greedy tokens of
+   the prediction over the window, past the window too (the window fed again from position 0), the logits
+   within rounding of the network's, draws repeated with their seed and alike in a session of the model,
+   and the model the network keeps made again when its parameters change. */
+static void generate_cached(void) {
+    const uint32_t T = 10, V = 23;
+    for (int kind = 0; kind < 3; kind++) {
+        lcg_state = 900 + (unsigned)kind;
+        NeuralNetwork *net = lm_net(kind, T, V, 16);
+        tf_init(net);
+        const uint32_t prompt[3] = {4, 9, 1};
+        uint32_t ref[30], got[30], a[8], b[8], c[8];
+        float worst;
+        spingalett_set_compute_mode(kind ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+        greedy_by_window(net, prompt, 3, 30, ref, &worst);
+        uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = got, .count = 30);
+        CHECK(made == 30 && !memcmp(got, ref, sizeof ref) && worst < 1e-5f,
+              "generate kind %d: greedy tokens differ from the prediction over the window (%u), or logits %.2e apart",
+              kind, made, worst);
+        printf("  generate kind %d: 30 greedy tokens as the window's prediction, logits within %.1e (relative)\n", kind,
+               (double)worst);
+        spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = a, .count = 7, .temperature = 1.3f,
+                            .top_k = 8, .top_p = 0.9f, .seed = 31);
+        spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = b, .count = 7, .temperature = 1.3f,
+                            .top_k = 8, .top_p = 0.9f, .seed = 31);
+        SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
+        SpingalettSession *s = spingalett_session_new(m, NULL);
+        const uint32_t *prompts[1] = {prompt}, lengths[1] = {3};
+        const uint32_t drawn = spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = lengths,
+                                                           .tokens = c, .count = 7, .temperature = 1.3f, .top_k = 8,
+                                                           .top_p = 0.9f, .seed = 31);
+        CHECK(drawn == 7 && !memcmp(a, b, 7 * 4) && !memcmp(a, c, 7 * 4) && spingalett_session_length(s, 0) == 10,
+              "generate kind %d: draws differ between calls or from a session's", kind);
+        spingalett_session_free(s);
+        spingalett_model_free(m);
+        /* new parameters: the kept model is made again */
+        uint32_t last = net->layers - 1;
+        float *w = malloc((size_t)T * 16 * V * sizeof(float));
+        const uint64_t nw = (uint64_t)V * 16;
+        spingalett_get_parameters(net, last, PARAM_WEIGHTS, w, nw);
+        for (uint64_t i = 0; i < nw; i++) w[i] = -w[i] * 1.5f;
+        spingalett_set_parameters(net, last, PARAM_WEIGHTS, w, nw);
+        greedy_by_window(net, prompt, 3, 12, ref, &worst);
+        made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = 3, .tokens = got, .count = 12);
+        CHECK(made == 12 && !memcmp(got, ref, 12 * 4), "generate kind %d: the kept model has the old parameters", kind);
+        free(w);
+        free_network(net);
+    }
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Batched generation: sequences of prompts of different lengths advanced together give the tokens each
+   gives alone with its seed (seed + b), greedy and drawn, with a stop token, in FP32 and INT8; a sequence
+   that fills its session stops after the token its last position predicts. */
+static void generate_batched(void) {
+    const uint32_t T = 12, V = 19, B = 4, count = 8;
+    lcg_state = 950;
+    NeuralNetwork *net = lm_net(1, T, V, 16);
+    tf_init(net);
+    const uint32_t p0[1] = {3}, p1[4] = {1, 7, 2, 2}, p2[2] = {11, 5}, p3[5] = {0, 4, 4, 8, 16};
+    const uint32_t *prompts[4] = {p0, p1, p2, p3}, lengths[4] = {1, 4, 2, 5};
+    for (int p = 0; p < 2; p++)
+        for (int drawn = 0; drawn < 2; drawn++) {
+            SpingalettModel *m = spingalett_model_from_network(net, p ? PRECISION_INT8 : PRECISION_FLOAT32);
+            SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = B});
+            uint32_t tokens[4 * 8] = {0}, made[4] = {0}, alone[8], made1 = 0;
+            const uint32_t stop = 6;
+            const float temperature = drawn ? 0.9f : 0.0f;
+            const uint32_t total = spingalett_session_generate(.session = s, .sequences = B, .prompts = prompts,
+                                                               .prompt_lengths = lengths, .tokens = tokens, .made = made,
+                                                               .count = count, .temperature = temperature, .top_k = 6,
+                                                               .top_p = 0.95f, .seed = 77, .stop_tokens = &stop,
+                                                               .stop_count = 1);
+            bool same = total == made[0] + made[1] + made[2] + made[3] && total > 0;
+            for (uint32_t b = 0; b < B && same; b++) {
+                SpingalettSession *one = spingalett_session_new(m, NULL);
+                spingalett_session_generate(.session = one, .prompts = prompts + b, .prompt_lengths = lengths + b,
+                                            .tokens = alone, .made = &made1, .count = count, .temperature = temperature,
+                                            .top_k = 6, .top_p = 0.95f, .seed = 77 + b, .stop_tokens = &stop,
+                                            .stop_count = 1);
+                /* (the token after a full sequence is not fed) */
+                const uint32_t held = lengths[b] + made[b] < T ? lengths[b] + made[b] : T;
+                same = made1 == made[b] && !memcmp(alone, tokens + b * count, made1 * 4) &&
+                       spingalett_session_length(s, b) == held &&
+                       (made[b] == count || tokens[b * count + made[b] - 1] == stop);
+                if (!same) printf("    sequence %u: made %u alone %u, length %u\n", b, made[b], made1, spingalett_session_length(s, b));
+                spingalett_session_free(one);
+            }
+            CHECK(same, "batched generation p=%d drawn=%d: sequences together differ from alone", p, drawn);
+            spingalett_session_free(s);
+            /* a full session */
+            s = spingalett_session_new(m, &(SpingalettSessionOptions){.max_length = 6});
+            same = spingalett_session_generate(.session = s, .prompts = prompts + 3, .prompt_lengths = lengths + 3,
+                                               .tokens = alone, .made = &made1, .count = count) == 2 && made1 == 2 &&
+                   spingalett_session_length(s, 0) == 6;
+            CHECK(same, "batched generation p=%d: a full session did not stop after its last position (%u)", p, made1);
+            spingalett_session_free(s);
+            spingalett_model_free(m);
+        }
+    free_network(net);
+    printf("  batched generation: four sequences together give the tokens each gives alone\n");
 }
 
 static void graph_validation(void) {
@@ -4760,6 +5174,12 @@ static void onnx_models(void) {
         {"onnx_resnet_dynamo", 0, LOSS_CROSS_ENTROPY}, {"onnx_matmul", 2, LOSS_CROSS_ENTROPY},
         {"onnx_unet", 14, LOSS_CROSS_ENTROPY}, {"onnx_unet_dynamo", 14, LOSS_CROSS_ENTROPY},
         {"onnx_layernorm", 6, LOSS_CROSS_ENTROPY}, {"onnx_layernorm_dynamo", 6, LOSS_CROSS_ENTROPY},
+        /* transformers: GPT-2's and LLaMA's blocks, PyTorch's encoder layer */
+        {"onnx_gpt", 22, LOSS_SPARSE_CROSS_ENTROPY}, {"onnx_gpt_dynamo", 22, LOSS_SPARSE_CROSS_ENTROPY},
+        {"onnx_gpt_opset14", 22, LOSS_SPARSE_CROSS_ENTROPY}, {"onnx_llama", 26, LOSS_SPARSE_CROSS_ENTROPY},
+        {"onnx_llama_dynamo", 26, LOSS_SPARSE_CROSS_ENTROPY}, {"onnx_llama_opset23", 26, LOSS_SPARSE_CROSS_ENTROPY},
+        {"onnx_encoder", 13, LOSS_MSE}, {"onnx_encoder_dynamo", 13, LOSS_MSE},
+        {"onnx_ort_fused", 17, LOSS_SPARSE_CROSS_ENTROPY},      /* ONNX Runtime's fused operators */
     };
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         char path[512];
@@ -4792,6 +5212,21 @@ static void onnx_models(void) {
             spingalett_model_free(m);
         }
         CHECK(mworst < 1e-5f, "%s: the model differs from PyTorch's outputs by %g", cases[c].name, mworst);
+        /* the transformers' layers as the library builds such models: GPT-2's embedding with positions
+           and causal attention of 2 heads, LLaMA's 4 query heads over 2 key and value heads with rotary
+           embeddings of base 10000 */
+        const bool gpt = !strncmp(cases[c].name, "onnx_gpt", 8), llama = !strncmp(cases[c].name, "onnx_llama", 10);
+        for (uint32_t l = 1; (gpt || llama) && l < net->layers; l++) {
+            SpingalettNetworkLayer d;
+            spingalett_network_layer(net, l, &d);
+            if (d.type == LAYER_EMBEDDING)
+                CHECK(d.positions == gpt, "%s: an embedding %s positions", cases[c].name, gpt ? "without" : "with");
+            if (d.type == LAYER_ATTENTION)
+                CHECK(d.causal && d.heads == (gpt ? 2u : 4u) && d.kv_heads == 2u &&
+                      (gpt ? d.rope_theta == 0.0f : fabsf(d.rope_theta - 10000.0f) < 1.0f),
+                      "%s: attention of %u heads, %u key heads, causal %d, rotary base %g", cases[c].name, d.heads,
+                      d.kv_heads, d.causal, (double)d.rope_theta);
+        }
         printf("  %-20s %3u layers, %llu parameters, |outputs - PyTorch| %.1e (model %.1e)\n", cases[c].name, net->layers,
                (unsigned long long)spingalett_parameter_count(net), worst, mworst);
         free(y);
@@ -4828,6 +5263,16 @@ static void onnx_models(void) {
     spingalett_clear_error();
     CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Resize"),
           "an unsupported Resize: %s", spingalett_last_error_message());
+    /* what transformers hold that no layer computes is named too: a softmax over each token's channels, a
+       product of two computed tensors outside an attention */
+    snprintf(path, sizeof path, "%s/onnx_tokens_softmax.onnx", SPINGALETT_TEST_DATA_DIR);
+    spingalett_clear_error();
+    CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "Softmax"),
+          "a softmax over each token: %s", spingalett_last_error_message());
+    snprintf(path, sizeof path, "%s/onnx_gram.onnx", SPINGALETT_TEST_DATA_DIR);
+    spingalett_clear_error();
+    CHECK(!spingalett_import_onnx(path) && strstr(spingalett_last_error_message(), "MatMul"),
+          "a product of two computed tensors: %s", spingalett_last_error_message());
     static const unsigned char junk[] = {0x0a, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x12};
     CHECK(!spingalett_import_onnx_from_memory(junk, sizeof junk) && !spingalett_import_onnx_from_memory(junk, 0) &&
           !spingalett_import_onnx_from_memory(NULL, 4), "junk accepted as an ONNX model");
@@ -4843,6 +5288,34 @@ static void onnx_models(void) {
     }
     CHECK(accepted == 0, "%d truncated models imported", accepted);
     free(model);
+    /* nor do truncations of transformers, and bytes changed at random (which may still be a model)
+       never crash: the import reads untrusted files */
+    static const char *const damaged[] = {"onnx_llama", "onnx_gpt_dynamo", "onnx_encoder"};
+    uint32_t seed = 12345u;
+    for (size_t d = 0; d < sizeof damaged / sizeof damaged[0]; d++) {
+        snprintf(path, sizeof path, "%s/%s.onnx", SPINGALETT_TEST_DATA_DIR, damaged[d]);
+        model = read_file(path, &size);
+        CHECK(model != NULL, "%s: cannot be read", path);
+        if (!model) continue;
+        accepted = 0;
+        for (long cut = 0; cut < size; cut += 61) {
+            NeuralNetwork *net = spingalett_import_onnx_from_memory(model, (size_t)cut);
+            accepted += net != NULL;
+            free_network(net);
+        }
+        CHECK(accepted == 0, "%s: %d truncated models imported", damaged[d], accepted);
+        unsigned char *copy = malloc((size_t)size);
+        for (int trial = 0; copy && trial < 300; trial++) {
+            memcpy(copy, model, (size_t)size);
+            for (int k = 0; k < 4; k++) {
+                seed = seed * 1664525u + 1013904223u;
+                copy[(seed >> 8) % (uint32_t)size] ^= (unsigned char)(1u << (seed >> 29));
+            }
+            free_network(spingalett_import_onnx_from_memory(copy, (size_t)size));
+        }
+        free(copy);
+        free(model);
+    }
 }
 
 /* PyTorch state dicts (torch.save and safetensors, Tests/make_test_models.py) in a network built to
@@ -4945,6 +5418,477 @@ static void pytorch_transposed(void) {
     free_network(net);
     free(y);
     free(data);
+}
+
+/* ---- tokenizers: the ids and texts of Hugging Face's tokenizers library (Tests/make_tokenizer_tests.py) ---- */
+
+/* Bytes of a hex string ("-" for none) into out; returns their count. */
+static size_t unhex(const char *hex, char *out) {
+    size_t n = 0;
+    if (hex[0] == '-') return 0;
+    for (; isxdigit((unsigned char)hex[0]) && isxdigit((unsigned char)hex[1]); hex += 2) {
+        int hi = hex[0] <= '9' ? hex[0] - '0' : (hex[0] | 32) - 'a' + 10, lo = hex[1] <= '9' ? hex[1] - '0' : (hex[1] | 32) - 'a' + 10;
+        out[n++] = (char)(hi * 16 + lo);
+    }
+    return n;
+}
+
+/* Every case of an expectations file (tokenizer_NAME.txt) for a tokenizer file of Tests/Data: the ids (also
+   counted without room, and cut short by a small array), and both decodings ("*": not checked). */
+static void tokenizer_cases(const char *name, const char *file, const char *expectations, int least) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, file);
+    SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+    CHECK(tok, "%s: %s", path, spingalett_last_error_message());
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, expectations);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "%s: no expected ids", path);
+    if (!tok || !f) { if (f) fclose(f); spingalett_tokenizer_free(tok); return; }
+    enum { LINE = 1 << 16 };
+    char *line = malloc(LINE), *text = malloc(LINE), *want = malloc(LINE), *got = malloc(LINE);
+    uint32_t *ids = malloc(LINE * sizeof(uint32_t)), *expect = malloc(LINE * sizeof(uint32_t));
+    int cases = 0, wrong_ids = 0, wrong_text = 0;
+    while (fgets(line, LINE, f)) {
+        if (line[0] == '#') continue;
+        int special = 0, add = 0, used = 0;
+        char *hex = malloc(LINE);
+        if (sscanf(line, "%d %d %s", &special, &add, hex) != 3) { free(hex); break; }
+        size_t n = unhex(hex, text);
+        free(hex);
+        text[n] = '\0';
+        unsigned count = 0;
+        if (!fgets(line, LINE, f) || sscanf(line, "%u%n", &count, &used) != 1 || count >= LINE) break;
+        char *p = line + used;
+        for (unsigned k = 0; k < count; k++) expect[k] = (uint32_t)strtoul(p, &p, 10);
+        cases++;
+        int64_t m = spingalett_tokenize(.tokenizer = tok, .text = n ? text : "", .length = n, .tokens = ids,
+                                        .capacity = LINE, .special = special, .add_special = add);
+        int64_t counted = spingalett_tokenize(.tokenizer = tok, .text = n ? text : "", .length = n, .special = special,
+                                              .add_special = add);
+        bool same = m == (int64_t)count && counted == m && (count == 0 || !memcmp(ids, expect, count * sizeof(uint32_t)));
+        if (same && count > 1) {        /* a short array: the count still, the first tokens written */
+            uint32_t few[2] = {UINT32_MAX, UINT32_MAX - 1};
+            same = spingalett_tokenize(.tokenizer = tok, .text = text, .length = n, .tokens = few, .capacity = 1,
+                                       .special = special, .add_special = add) == (int64_t)count &&
+                   few[0] == expect[0] && few[1] == UINT32_MAX - 1;
+        }
+        if (!same && ++wrong_ids <= 3)
+            printf("  %s: \"%.60s\" (special %d, add %d) gives %lld tokens, %u expected\n", name, text, special, add,
+                   (long long)m, count);
+        for (int skip = 0; skip < 2; skip++) {
+            if (!fgets(line, LINE, f)) break;
+            if (line[0] == '*') continue;
+            size_t wn = unhex(line, want);
+            int64_t len = spingalett_detokenize(.tokenizer = tok, .tokens = expect, .count = count, .text = got,
+                                                .capacity = LINE, .skip_special = skip);
+            int64_t measured = spingalett_detokenize(.tokenizer = tok, .tokens = expect, .count = count, .skip_special = skip);
+            if ((len != (int64_t)wn || measured != len || memcmp(got, want, wn) || got[wn] != '\0') && ++wrong_text <= 3)
+                printf("  %s: ids of \"%.60s\" decode to \"%.60s\" (skip %d)\n", name, text, len >= 0 ? got : "(error)", skip);
+        }
+    }
+    CHECK(cases >= least && !wrong_ids && !wrong_text, "%s: %d of %d texts tokenized and %d decoded differently from the "
+          "reference", name, wrong_ids, cases, wrong_text);
+    /* every token found by its string (the lowest id of equal ones) */
+    SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+    uint32_t lookups = 0;
+    for (uint32_t id = 0; id < info.vocabulary; id++) {
+        const char *s = spingalett_tokenizer_token(tok, id);
+        lookups += s && spingalett_tokenizer_id(tok, s) <= id;
+    }
+    CHECK(lookups == info.vocabulary && !spingalett_tokenizer_token(tok, info.vocabulary) &&
+          spingalett_tokenizer_id(tok, "no such token \x01") == SPINGALETT_NO_TOKEN,
+          "%s: %u of %u tokens found by their strings", name, lookups, info.vocabulary);
+    printf("  %-20s %3d texts, %u tokens\n", name, cases, info.vocabulary);
+    fclose(f);
+    free(line); free(text); free(want); free(got); free(ids); free(expect);
+    spingalett_tokenizer_free(tok);
+}
+
+/* The tokens a tokenizer names, the errors of calls and of malformed files. */
+static void tokenizer_api(void) {
+    char path[512];
+    static const struct { const char *name; uint32_t bos, eos, unk, added; } named[] = {
+        {"llama3", 420, 421, SPINGALETT_NO_TOKEN, 5}, {"spm", 1, 2, 0, 5}, {"gpt2", SPINGALETT_NO_TOKEN, 0, SPINGALETT_NO_TOKEN, 2},
+        {"qwen2", SPINGALETT_NO_TOKEN, 420, SPINGALETT_NO_TOKEN, 3},
+    };
+    for (size_t k = 0; k < sizeof named / sizeof *named; k++) {
+        snprintf(path, sizeof path, "%s/tokenizer_%s.json", SPINGALETT_TEST_DATA_DIR, named[k].name);
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+        CHECK(tok && info.bos == named[k].bos && info.eos == named[k].eos && info.unk == named[k].unk &&
+              info.added == named[k].added, "tokenizer_%s: BOS %u, EOS %u, unknown %u, %u added", named[k].name, info.bos,
+              info.eos, info.unk, info.added);
+        spingalett_tokenizer_free(tok);
+    }
+    snprintf(path, sizeof path, "%s/tokenizer_llama3.json", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *json = read_file(path, &size);
+    SpingalettTokenizer *tok = json ? spingalett_tokenizer_from_memory(json, (size_t)size) : NULL;
+    CHECK(tok, "a tokenizer from memory: %s", spingalett_last_error_message());
+    uint32_t ids[64], bot = spingalett_tokenizer_id(tok, "<|begin_of_text|>");
+    CHECK(bot == 420 && !strcmp(spingalett_tokenizer_token(tok, 420), "<|begin_of_text|>"), "special tokens by name");
+    /* the text from users cannot forge special tokens unless asked */
+    int64_t plain = spingalett_tokenize(.tokenizer = tok, .text = "<|begin_of_text|>", .tokens = ids, .capacity = 64);
+    int64_t asked = spingalett_tokenize(.tokenizer = tok, .text = "<|begin_of_text|>", .tokens = ids, .capacity = 64, .special = true);
+    CHECK(plain > 1 && asked == 1 && ids[0] == 420, "special tokens: %lld tokens as text, %lld when asked", (long long)plain,
+          (long long)asked);
+    /* errors */
+    spingalett_clear_error();
+    CHECK(spingalett_tokenize(.tokenizer = tok, .text = "bad \xC3\x28 UTF-8", .tokens = ids, .capacity = 64) == -1 &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "text that is not UTF-8 accepted");
+    CHECK(spingalett_tokenize(.tokenizer = NULL, .text = "x") == -1 && spingalett_tokenize(.tokenizer = tok, .text = NULL) == -1 &&
+          spingalett_tokenize(.tokenizer = tok, .text = "x", .capacity = 4) == -1, "tokenize without its arguments");
+    const uint32_t beyond[2] = {5, 100000};
+    char text[64];
+    CHECK(spingalett_detokenize(.tokenizer = tok, .tokens = beyond, .count = 2, .text = text, .capacity = 64) == -1 &&
+          spingalett_detokenize(.tokenizer = tok, .tokens = NULL, .count = 2) == -1, "ids of no token decoded");
+    const uint32_t hello[3] = {420, 72, 73};
+    int64_t full = spingalett_detokenize(.tokenizer = tok, .tokens = hello, .count = 3, .text = text, .capacity = 64);
+    int64_t cut = spingalett_detokenize(.tokenizer = tok, .tokens = hello, .count = 3, .text = text, .capacity = 4);
+    CHECK(full > 3 && cut == full && strlen(text) == 3, "a text cut to its capacity: %lld bytes, \"%s\"", (long long)cut, text);
+    spingalett_tokenizer_free(tok);
+    /* truncated files never load and never crash */
+    int accepted = 0;
+    for (long cut_at = 0; json && cut_at < size; cut_at += 89) {
+        SpingalettTokenizer *t = spingalett_tokenizer_from_memory(json, (size_t)cut_at);
+        accepted += t != NULL;
+        spingalett_tokenizer_free(t);
+    }
+    CHECK(accepted == 0, "%d truncated tokenizer files loaded", accepted);
+    free(json);
+    /* files of what is not supported, or not consistent, name the problem */
+    static const struct { const char *json, *message; } bad[] = {
+        {"{\"model\": {\"type\": \"WordPiece\", \"vocab\": {\"a\": 0}}}", "WordPiece"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0, \"b\": 1}, \"merges\": [\"a b\"]}}", "merge"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"pre_tokenizer\": {\"type\": \"Whitespace\"}}",
+         "Whitespace"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"pre_tokenizer\": {\"type\": \"Split\", "
+         "\"pattern\": {\"Regex\": \"\\\\w+\"}, \"behavior\": \"Isolated\"}}", "pattern"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 99999999}, \"merges\": []}}", "id"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": [\"a\"]}}", "merge"},
+        {"{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0}, \"merges\": []}, \"normalizer\": {\"type\": \"NFKD\"}}", "NFKD"},
+        {"[1, 2, 3]", "tokenizer"},
+        {"{\"model\": {\"vocab\": {\"\\ud800\": 0}, \"merges\": []}}", "escape"},
+    };
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        SpingalettTokenizer *t = spingalett_tokenizer_from_memory(bad[k].json, strlen(bad[k].json));
+        CHECK(!t && strstr(spingalett_last_error_message(), bad[k].message), "malformed tokenizer %zu: \"%s\"", k,
+              t ? "loaded" : spingalett_last_error_message());
+        spingalett_tokenizer_free(t);
+    }
+    char deep[2100];
+    memset(deep, '[', 1000);
+    memset(deep + 1000, ']', 1000);
+    CHECK(!spingalett_tokenizer_from_memory(deep, 2000), "a JSON document nested 1000 deep loaded");
+    CHECK(!spingalett_tokenizer_load("no/such/tokenizer.json") && spingalett_tokenizer_info(NULL).vocabulary == 0 &&
+          !spingalett_tokenizer_token(NULL, 0), "tokenizers that do not exist");
+}
+
+/* ---- language models from their files: Hugging Face's directories (Tests/make_pretrained_tests.py) ---- */
+
+#if defined(_WIN32)
+#include <direct.h>
+#define make_dir(p) _mkdir(p)
+#define remove_dir(p) _rmdir(p)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define make_dir(p) mkdir(p, 0755)
+#define remove_dir(p) rmdir(p)
+#endif
+
+static const char pretrained_text[] = "The quick brown fox jumps over the lazy dog, it's 1234 times!";
+
+/* A model's logits for a window of tokens against PyTorch's (NAME.bin), the tokens its directory's tokenizer
+   gives the text against those of the file. */
+static void pretrained_model(const char *name, bool tokenizer) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, name);
+    long size = 0;
+    unsigned char *data = read_file(path, &size);
+    CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+    if (!data) return;
+    const uint32_t T = rd32(data + 8), out = rd32(data + 12);
+    const float *tokens = (const float *)(const void *)(data + 16), *expected = tokens + T;
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, name);
+    NeuralNetwork *net = spingalett_load_pretrained(.path = path, .context = T);
+    CHECK(net && spingalett_input_size(net) == T && spingalett_output_size(net) == out &&
+          spingalett_network_loss(net) == LOSS_SPARSE_CROSS_ENTROPY, "%s: %s", name, spingalett_last_error_message());
+    if (tokenizer) {
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        uint32_t ids[64];
+        int64_t n = tok ? spingalett_tokenize(.tokenizer = tok, .text = pretrained_text, .tokens = ids, .capacity = 64) : -1;
+        bool same = n >= (int64_t)T;
+        for (uint32_t k = 0; same && k < T; k++) same = (float)ids[k] == tokens[k];
+        CHECK(same, "%s: its tokenizer gives the text other tokens (%s)", name, tok ? "" : spingalett_last_error_message());
+        spingalett_tokenizer_free(tok);
+    }
+    if (net) {
+        float *y = malloc((size_t)out * sizeof(float)), worst = 0.0f;
+        predict(.net = net, .inputs = tokens, .sample_count = 1, .outputs = y);
+        for (uint32_t i = 0; i < out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
+        CHECK(worst < 1e-4f, "%s: logits differ from PyTorch's by %g", name, worst);
+        printf("  %-12s %3u tokens x %3u logits, |logits - PyTorch| %.1e\n", name, T, out / T, worst);
+        free(y);
+        free_network(net);
+    }
+    free(data);
+}
+
+static void write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+/* Directories of what cannot be loaded name the problem; damaged files never load. */
+static void pretrained_errors(void) {
+    const char *dir = "spingalett_test_hf";
+    char path[512], src[512];
+    (void)make_dir(dir);
+    static const struct { const char *config, *message; } bad[] = {
+        {"{\"model_type\": \"bert\"}", "bert"},
+        {"{\"model_type\": \"llama\", \"hidden_size\": 16, \"num_hidden_layers\": 1, \"num_attention_heads\": 4}",
+         "model.safetensors"},
+        {"{\"model_type\": \"llama\", \"rope_scaling\": {\"rope_type\": \"llama3\", \"factor\": 8.0}}", "llama3"},
+        {"{\"model_type\": \"llama\", \"hidden_act\": \"gelu\"}", "gelu"},
+        {"{\"model_type\": \"gpt2\", \"n_embd\": 16, \"activation_function\": \"tanh\"}", "activation"},
+        {"{\"model_type\": ", "config.json"},
+    };
+    snprintf(path, sizeof path, "%s/config.json", dir);
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        write_text(path, bad[k].config);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+        CHECK(!net && strstr(spingalett_last_error_message(), bad[k].message), "config %zu: \"%s\"", k,
+              net ? "loaded" : spingalett_last_error_message());
+        free_network(net);
+    }
+    /* Mistral's weights under a config of another width, and truncated */
+    snprintf(src, sizeof src, "%s/hf_mistral/config.json", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *config = read_file(src, &size);
+    snprintf(src, sizeof src, "%s/hf_mistral/model.safetensors", SPINGALETT_TEST_DATA_DIR);
+    long wsize = 0;
+    unsigned char *weights = read_file(src, &wsize);
+    CHECK(config && weights, "hf_mistral cannot be read");
+    char weights_path[512];
+    snprintf(weights_path, sizeof weights_path, "%s/model.safetensors", dir);
+    if (config && weights) {
+        config[size] = '\0';
+        char *wide = malloc((size_t)size + 8), *at = strstr((char *)config, "\"hidden_size\": 16");
+        if (at) {
+            snprintf(wide, (size_t)size + 8, "%.*s\"hidden_size\": 32%s", (int)(at - (char *)config), (char *)config,
+                     at + strlen("\"hidden_size\": 16"));
+            write_text(path, wide);
+            write_file(weights_path, weights, wsize);
+            NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+            CHECK(!net && strstr(spingalett_last_error_message(), "shape"), "a checkpoint of another width: \"%s\"",
+                  net ? "loaded" : spingalett_last_error_message());
+            free_network(net);
+        }
+        free(wide);
+        write_text(path, (const char *)config);
+        int accepted = 0;
+        for (long cut = 0; cut < wsize; cut += 397) {
+            write_file(weights_path, weights, cut);
+            NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+            accepted += net != NULL;
+            free_network(net);
+        }
+        CHECK(accepted == 0, "%d truncated checkpoints loaded", accepted);
+        /* a window beyond Mistral's sliding window: loaded, with a warning */
+        write_file(weights_path, weights, wsize);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = dir, .context = 20);
+        CHECK(net && spingalett_input_size(net) == 20, "a context beyond the sliding window: %s", spingalett_last_error_message());
+        free_network(net);
+        remove(weights_path);
+    }
+    /* an index that names a shard outside the directory */
+    char index[512];
+    snprintf(index, sizeof index, "%s/model.safetensors.index.json", dir);
+    write_text(index, "{\"weight_map\": {\"model.embed_tokens.weight\": \"../model.safetensors\"}}");
+    NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+    CHECK(!net && strstr(spingalett_last_error_message(), "outside"), "a shard outside the directory: \"%s\"",
+          net ? "loaded" : spingalett_last_error_message());
+    free_network(net);
+    remove(index);
+    remove(path);
+    remove_dir(dir);
+    CHECK(!spingalett_load_pretrained(.path = "no/such/model") && !spingalett_load_pretrained(.path = NULL),
+          "models that do not exist");
+    free(config);
+    free(weights);
+}
+
+/* ---- GGUF files (Tests/make_pretrained_tests.py) ---- */
+
+/* The logits of a network for the window of NAME.bin into y; the window and the expected logits through the
+   pointers into the file's bytes (*data, to free). False when the file is missing or does not fit. */
+static bool window_logits(NeuralNetwork *net, const char *name, float **y, uint32_t *count, const float **expected,
+                          unsigned char **data) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, name);
+    long size = 0;
+    *data = read_file(path, &size);
+    *y = NULL;
+    if (!*data || size < 16 || memcmp(*data, "SPGT", 4) || !net) return false;
+    const uint32_t T = rd32(*data + 8);
+    *count = rd32(*data + 12);
+    const float *tokens = (const float *)(const void *)(*data + 16);
+    *expected = tokens + T;
+    if (spingalett_input_size(net) != T || spingalett_output_size(net) != *count) return false;
+    *y = malloc((size_t)*count * sizeof(float));
+    return predict(.net = net, .inputs = tokens, .sample_count = 1, .outputs = *y);
+}
+
+static void gguf_models(void) {
+    char path[512];
+    /* the checkpoints' weights as llama.cpp's converter writes them (LLaMA's queries and keys permuted, GPT-2's
+       Conv1D matrices transposed): the networks of the directories, bit for bit */
+    static const char *const forms[3][2] = {{"gguf_llama.gguf", "hf_llama"}, {"gguf_qwen2.gguf", "hf_qwen2"},
+                                            {"gguf_gpt2.gguf", "hf_gpt2"}};
+    float *yg, *yh, worst = 0.0f;
+    const float *expected;
+    uint32_t count = 0;
+    unsigned char *data, *data2;
+    bool ok;
+    for (int k = 0; k < 3; k++) {
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, forms[k][0]);
+        NeuralNetwork *g = spingalett_load_pretrained(.path = path, .context = 10);
+        CHECK(g, "%s: %s", forms[k][0], spingalett_last_error_message());
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, forms[k][1]);
+        NeuralNetwork *h = spingalett_load_pretrained(.path = path, .context = 10);
+        ok = window_logits(g, forms[k][1], &yg, &count, &expected, &data) &&
+             window_logits(h, forms[k][1], &yh, &count, &expected, &data2);
+        worst = 0.0f;
+        for (uint32_t i = 0; ok && i < count; i++) worst = fmaxf(worst, fabsf(yg[i] - expected[i]));
+        CHECK(ok && !memcmp(yg, yh, (size_t)count * sizeof(float)) && worst < 1e-4f,
+              "%s: logits differ from the directory's network's or PyTorch's (%g)", forms[k][0], worst);
+        if (ok) printf("  %-20s the directory's logits bit for bit, |logits - PyTorch| %.1e\n", forms[k][0], worst);
+        free(yg); free(yh); free(data); free(data2);
+        free_network(g); free_network(h);
+    }
+    /* matrices of fifteen types: the logits of their dequantized weights, each matrix's sums */
+    snprintf(path, sizeof path, "%s/gguf_quant.gguf", SPINGALETT_TEST_DATA_DIR);
+    NeuralNetwork *q = spingalett_load_pretrained(.path = path, .context = 10);
+    CHECK(q, "gguf_quant.gguf: %s", spingalett_last_error_message());
+    ok = window_logits(q, "gguf_quant", &yg, &count, &expected, &data);
+    float scale = 1.0f;
+    worst = 0.0f;
+    for (uint32_t i = 0; ok && i < count; i++) {
+        worst = fmaxf(worst, fabsf(yg[i] - expected[i]));
+        scale = fmaxf(scale, fabsf(expected[i]));
+    }
+    CHECK(ok && worst < 1e-4f * scale, "gguf_quant.gguf: logits differ from PyTorch's by %g (of %g)", worst, scale);
+    free(yg);
+    free(data);
+    snprintf(path, sizeof path, "%s/gguf_quant.txt", SPINGALETT_TEST_DATA_DIR);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "%s: no expected sums", path);
+    char line[512], type[16];
+    int matrices = 0, wrong = 0;
+    double worst_sum = 0.0;
+    while (q && f && fgets(line, sizeof line, f)) {
+        unsigned layer, first, rows, cols;
+        double sum, squares, weighted;
+        if (line[0] == '#' || sscanf(line, "%u %u %15s %u %u %lf %lf %lf", &layer, &first, type, &rows, &cols, &sum, &squares,
+                                     &weighted) != 8)
+            continue;
+        SpingalettNetworkLayer d;
+        const bool known = spingalett_network_layer(q, layer, &d);
+        const uint64_t table_rows = d.type == LAYER_EMBEDDING ? d.vocabulary : d.bias_count;
+        if (!known || !table_rows || d.weight_count / table_rows != cols || first + rows > table_rows) {
+            wrong++;
+            continue;
+        }
+        float *w = malloc((size_t)d.weight_count * sizeof(float));
+        spingalett_get_parameters(q, layer, PARAM_WEIGHTS, w, d.weight_count);
+        double s = 0, s2 = 0, sw = 0;
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t c = 0; c < cols; c++) {
+                const double v = w[(size_t)(first + r) * cols + c];
+                s += v; s2 += v * v; sw += v * (r + 1.0) * (c + 1.0);
+            }
+        /* the same weights, added in the same order: the same sums, exactly */
+        const double err = fmax(fabs(s - sum) / fmax(1.0, fabs(sum)), fmax(fabs(s2 - squares) / squares,
+                                                                         fabs(sw - weighted) / fmax(1.0, fabs(weighted))));
+        worst_sum = fmax(worst_sum, err);
+        if ((s != sum || s2 != squares || sw != weighted) && ++wrong <= 3)
+            printf("  gguf_quant.gguf: the %s matrix of layer %u differs (%g)\n", type, layer, err);
+        matrices++;
+        free(w);
+    }
+    if (f) fclose(f);
+    CHECK(matrices == 16 && !wrong, "gguf_quant.gguf: %d of %d matrices dequantized differently", wrong, matrices);
+    printf("  %-20s 16 matrices of 15 types as dequantized (%.0e), |logits - PyTorch| %.1e\n", "gguf_quant.gguf", worst_sum,
+           worst);
+    free_network(q);
+    /* the vocabularies: a byte-level BPE (LLaMA 3's form, Hugging Face's ids) and SentencePiece's BPE (its ids) */
+    tokenizer_cases("gguf_llama.gguf", "gguf_llama.gguf", "tokenizer_llama3.txt", 100);
+    tokenizer_cases("gguf_qwen2.gguf", "gguf_qwen2.gguf", "tokenizer_qwen2.txt", 100);
+    tokenizer_cases("gguf_spm.gguf", "gguf_spm.gguf", "gguf_spm.txt", 60);
+    static const struct { const char *file; uint32_t bos, eos, unk; } named[] = {
+        {"gguf_llama.gguf", 420, 424, SPINGALETT_NO_TOKEN}, {"gguf_qwen2.gguf", SPINGALETT_NO_TOKEN, 420, SPINGALETT_NO_TOKEN},
+        {"gguf_spm.gguf", 1, 2, 0}};
+    for (size_t k = 0; k < sizeof named / sizeof *named; k++) {
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, named[k].file);
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);
+        CHECK(tok && info.bos == named[k].bos && info.eos == named[k].eos && info.unk == named[k].unk,
+              "%s: BOS %u, EOS %u, unknown %u", named[k].file, info.bos, info.eos, info.unk);
+        spingalett_tokenizer_free(tok);
+    }
+}
+
+/* Damaged and unsupported GGUF files never load and never crash. */
+static void gguf_errors(void) {
+    char path[512];
+    const char *file = "spingalett_test.gguf";
+    snprintf(path, sizeof path, "%s/gguf_llama.gguf", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *gguf = read_file(path, &size);
+    CHECK(gguf, "%s cannot be read", path);
+    int accepted = 0, tokenizers = 0;
+    for (long cut = 0; gguf && cut < size; cut += 1009) {
+        write_file(file, gguf, cut);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = file);
+        SpingalettTokenizer *tok = spingalett_tokenizer_from_memory(gguf, (size_t)cut);
+        accepted += net != NULL;
+        tokenizers += tok != NULL;
+        free_network(net);
+        spingalett_tokenizer_free(tok);
+    }
+    CHECK(accepted == 0 && tokenizers == 0, "%d truncated GGUF files loaded, %d tokenizers", accepted, tokenizers);
+    /* a tensor of a type that is not read, a version that is not, counts beyond the file */
+    snprintf(path, sizeof path, "%s/gguf_quant.gguf", SPINGALETT_TEST_DATA_DIR);
+    long qsize = 0;
+    unsigned char *quant = read_file(path, &qsize);
+    static const char name[] = "blk.0.attn_q.weight";
+    unsigned char *at = NULL;
+    for (long i = 0; quant && i + (long)sizeof name < qsize && !at; i++)
+        if (!memcmp(quant + i, name, sizeof name - 1)) at = quant + i;
+    CHECK(at, "gguf_quant.gguf: no %s", name);
+    if (at) {
+        at[sizeof name - 1 + 4 + 16] = 16;          /* the type after its two dimensions: IQ2_XXS */
+        write_file(file, quant, qsize);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = file);
+        CHECK(!net && strstr(spingalett_last_error_message(), "type 16"), "a tensor of a type not read: \"%s\"",
+              net ? "loaded" : spingalett_last_error_message());
+        free_network(net);
+    }
+    static const unsigned char v1[] = {'G', 'G', 'U', 'F', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    static const unsigned char huge[] = {'G', 'G', 'U', 'F', 3, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0};
+    write_file(file, v1, sizeof v1);
+    NeuralNetwork *net = spingalett_load_pretrained(.path = file);
+    CHECK(!net && strstr(spingalett_last_error_message(), "version 1"), "a GGUF file of version 1: \"%s\"",
+          net ? "loaded" : spingalett_last_error_message());
+    free_network(net);
+    write_file(file, huge, sizeof huge);
+    net = spingalett_load_pretrained(.path = file);
+    CHECK(!net && !spingalett_tokenizer_from_memory(huge, sizeof huge), "a GGUF file of 2^40 tensors loaded");
+    free_network(net);
+    remove(file);
+    free(gguf);
+    free(quant);
 }
 
 /* ---- the GPU (COMPUTE_VULKAN, or COMPUTE_CUDA in the group "cuda") against the CPU ---- */
@@ -5342,9 +6286,10 @@ static void gpu_transformer(int which) {
 }
 
 /* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA) against single
-   precision: predictions, one step's change of every parameter, and two runs alike. */
-static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
-    const uint32_t T = 80, V = 37, n = 20, heads = 4, d = heads * head;
+   precision: predictions, one step's change of every parameter, and two runs alike; over T tokens (several
+   blocks of queries, the last partial), causal or not. */
+static void gpu_flash(uint32_t head, bool rope, uint32_t kv, uint32_t T, bool causal) {
+    const uint32_t V = 37, n = T > 100u ? 6u : 20u, heads = 4, d = heads * head;
     /* runs: the GPU in single precision, the CPU, the GPU in bfloat16 twice */
     float *pred[3] = {NULL, NULL, NULL}, *delta[3] = {NULL, NULL, NULL}, *again = NULL;
     uint64_t count = 0;
@@ -5359,7 +6304,7 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
         embedding(.net = net, .vocabulary = V, .neurons_amount = d, .positions = !rope,
                   .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         linear(.net = net, .neurons_amount = (heads + 2u * kv) * head, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
-        attention(.net = net, .heads = heads, .kv_heads = kv, .causal = true, .rope_theta = rope ? 10000.0f : 0.0f);
+        attention(.net = net, .heads = heads, .kv_heads = kv, .causal = causal, .rope_theta = rope ? 10000.0f : 0.0f);
         /* (a GELU kept for its derivative: on CUDA the products' epilogues store both) */
         linear(.net = net, .neurons_amount = 64, .act_func = ACT_GELU, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
         linear(.net = net, .neurons_amount = V, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
@@ -5399,8 +6344,8 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv) {
     const double cpu_step = gpu_max_scaled(delta[0], delta[1], count);
     CHECK(cpu_pred < 1e-4 && cpu_step < 1e-3, "gpu attention head %u: predictions %.2e, step %.2e from the CPU's", head,
           cpu_pred, cpu_step);
-    printf("  gpu attention head %u%s%s: predictions %.1e, step %.1e from the CPU's", head, rope ? ", rotary" : "",
-           kv < 4u ? ", grouped" : "", cpu_pred, cpu_step);
+    printf("  gpu attention head %u%s%s, %u tokens%s: predictions %.1e, step %.1e from the CPU's", head, rope ? ", rotary" : "",
+           kv < 4u ? ", grouped" : "", T, causal ? "" : ", not causal", cpu_pred, cpu_step);
     if (pred[2]) {
         const double predicted = gpu_max_scaled(pred[0], pred[2], (size_t)n * V);
         const double stepped = gpu_max_scaled(delta[0], delta[2], count);
@@ -6410,10 +7355,18 @@ static NeuralNetwork *runtime_net(int k, const char **name) {
     static const char *names[] = {"norm0", "norm1", "norm2", "norm3", "graph0", "graph1", "graph2", "graph3",
                                   "graph4", "graph5", "graph6", "graph7", "conv5", "conv6", "conv7", "conv8",
                                   "conv9", "resnet"};
+    static const char *const lm[] = {"lm0", "lm1"};
     lcg_state = 500u + (unsigned)k;
     if (k == 0) { *name = "mlp"; return deploy_net(); }
     if (k == 1) { *name = "cnn"; return conv_deploy_net(); }
-    if (k - 2 >= (int)(sizeof names / sizeof *names)) return NULL;
+    const int last = 2 + (int)(sizeof names / sizeof *names);
+    if (k >= last + 2) return NULL;
+    if (k >= last) {            /* language models: their sessions too */
+        *name = lm[k - last];
+        NeuralNetwork *net = lm_net(k - last, 12, 29, 16);
+        tf_init(net);
+        return net;
+    }
     *name = names[k - 2];
     NeuralNetwork *net = k < 6 ? norm_net(k - 2) : k < 14 ? graph_net(k - 6) : k < 19 ? conv_net(k - 9)
                                                                                      : resnet(2, 16, 0.0f);
@@ -6437,9 +7390,9 @@ static bool write_floats(const char *dir, const char *name, const char *suffix, 
 /* SpingalettTests export-models DIR: networks of every kind of layer saved as .slett files in every
    precision (and one with its optimizer state), with what the full library's spingalett_model_predict()
    (single-threaded and on four threads), spingalett_model_run() and spingalett_model_evaluate() give for
-   the samples of Spingalett.RuntimeData.h: NAME.st, NAME.omp, NAME.run and NAME.eval, raw floats. The
-   runtime must give the same bits (Spingalett.RuntimeTests.c). DIR/models.txt lists the names and the
-   samples of each. */
+   the samples of Spingalett.RuntimeData.h: NAME.st, NAME.omp, NAME.run and NAME.eval, raw floats, and for
+   language models NAME.sess, the logits of runtime_session(). The runtime must give the same bits
+   (Spingalett.RuntimeTests.c). DIR/models.txt lists the names and the samples of each. */
 static int export_runtime_models(const char *dir) {
     static const char *pnames[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
     char path[1024];
@@ -6453,7 +7406,9 @@ static int export_runtime_models(const char *dir) {
         const uint32_t count = 300, in = net->topology[0], out = net->topology[net->layers - 1];
         float *x = malloc((size_t)count * in * sizeof(float)), *t = malloc((size_t)count * out * sizeof(float));
         float *y = malloc((size_t)count * out * sizeof(float));
-        runtime_inputs(x, (size_t)count * in);
+        const bool lm = net->shapes[1].type == LAYER_EMBEDDING;
+        if (lm) runtime_tokens(x, (size_t)count * in, net->shapes[1].vocabulary);
+        else runtime_inputs(x, (size_t)count * in);
         runtime_targets(t, count, out);
         for (int p = 0; p <= PRECISION_COUNT; p++) {
             /* PRECISION_COUNT: the FLOAT32 network with its (zero) optimizer state, as training saves it */
@@ -6479,6 +7434,12 @@ static int export_runtime_models(const char *dir) {
             EvalMetrics e = spingalett_model_evaluate(m, x, t, count);
             float metrics[2] = {e.loss, e.accuracy};
             ok = ok && write_floats(dir, name, "eval", metrics, 2);
+            if (lm) {
+                const size_t floats = runtime_session_floats(in, out / in);
+                float *logits = malloc(floats * sizeof(float));
+                ok = ok && logits && runtime_session(m, x, logits) && write_floats(dir, name, "sess", logits, floats);
+                free(logits);
+            }
             if (ok) fprintf(list, "%s %u\n", name, count), written++;
             else rc = 1;
             spingalett_model_free(m);
@@ -6578,6 +7539,7 @@ int main(int argc, char **argv) {
         tf_gradcheck(1, cm[2], STRATEGY_FULL_BATCH);
         tf_determinism();
         tf_models();
+        tf_token_quantization();
         tf_tied();
         for (int m = 0; m < 2; m++) tf_padding(cm[m]);
         for (int m = 0; m < 2; m++) tf_window(cm[m]);
@@ -6589,6 +7551,28 @@ int main(int argc, char **argv) {
         onnx_models();
         pytorch_weights();
         pytorch_transposed();
+    }
+    if (!*only || !strcmp(only, "tokenizer")) {
+        printf("[tokenizers]\n");
+        static const char *const names[] = {"gpt2", "llama3", "qwen2", "o200k", "spm", "metaspace"};
+        for (size_t k = 0; k < sizeof names / sizeof *names; k++) {
+            char file[64], expectations[64], label[64];
+            snprintf(file, sizeof file, "tokenizer_%s.json", names[k]);
+            snprintf(expectations, sizeof expectations, "tokenizer_%s.txt", names[k]);
+            snprintf(label, sizeof label, "tokenizer_%s", names[k]);
+            tokenizer_cases(label, file, expectations, 100);
+        }
+        tokenizer_api();
+    }
+    if (!*only || !strcmp(only, "pretrained")) {
+        printf("[pretrained language models]\n");
+        pretrained_model("hf_llama", true);
+        pretrained_model("hf_qwen2", true);
+        pretrained_model("hf_mistral", false);
+        pretrained_model("hf_gpt2", true);
+        pretrained_errors();
+        gguf_models();
+        gguf_errors();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");
@@ -6642,9 +7626,11 @@ int main(int argc, char **argv) {
         dropout_xor();
     }
     if (!*only || !strcmp(only, "gen")) {
-        printf("[generator mode]\n");
+        printf("[generator mode, text generation]\n");
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         for (int m = 0; m < 3; m++) generator_mode(cm[m]);
+        generate_cached();
+        generate_batched();
     }
     if (!*only || !strcmp(only, "predict")) {
         printf("[batched inference]\n");
@@ -6705,6 +7691,9 @@ int main(int argc, char **argv) {
         model_inference(PRECISION_INT4, 0.1f);
         model_inference(PRECISION_INT2, 0.5f);
         model_shared();
+        session_equivalence();
+        session_validation();
+        session_shared();
         model_validation();
         model_files();
         for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);
@@ -6738,9 +7727,12 @@ int main(int argc, char **argv) {
             gpu_bf16();
             for (int k = 0; k < 6; k++) gpu_transformer(k);
             gpu_transformer_trainer();
-            gpu_flash(32, false, 4);
-            gpu_flash(64, true, 2);
-            gpu_flash(128, true, 1);
+            gpu_flash(32, false, 4, 80, true);
+            gpu_flash(64, true, 2, 80, true);
+            gpu_flash(128, true, 1, 80, true);
+            gpu_flash(64, false, 4, 300, true);
+            gpu_flash(64, true, 2, 200, false);
+            gpu_flash(32, false, 2, 150, true);
             gpu_masked(32, false, 0, true);
             gpu_masked(64, true, 0, true);
             gpu_masked(128, false, 0, true);

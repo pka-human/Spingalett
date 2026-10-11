@@ -166,6 +166,45 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
 SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs,
                                                 const float *targets, uint32_t count);
 
+typedef struct SpingalettSession SpingalettSession;
+typedef struct {
+    uint32_t max_length;
+    uint32_t sequences;
+    uint64_t reserved[8];
+} SpingalettSessionOptions;
+SpingalettSession *spingalett_session_new(const SpingalettModel *model, const SpingalettSessionOptions *options);
+void spingalett_session_free(SpingalettSession *session);
+uint32_t spingalett_session_vocabulary(const SpingalettSession *session);
+uint32_t spingalett_session_length(const SpingalettSession *session, uint32_t sequence);
+typedef struct {
+    uint32_t sequence;
+    const uint32_t *tokens;
+    uint32_t count;
+    float *logits;
+    bool all;
+    uint64_t reserved[8];
+} SpingalettSessionFeed;
+bool spingalett_session_feed(SpingalettSession *session, const SpingalettSessionFeed *feeds, uint32_t count);
+bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
+bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
+typedef struct {
+    SpingalettSession *session;
+    uint32_t sequences;
+    const uint32_t *const *prompts;
+    const uint32_t *prompt_lengths;
+    uint32_t *tokens;
+    uint32_t *made;
+    uint32_t count;
+    float temperature;
+    uint32_t top_k;
+    float top_p;
+    uint64_t seed;
+    const uint32_t *stop_tokens;
+    uint32_t stop_count;
+    uint64_t reserved[8];
+} SpingalettSessionGenerateArgs;
+uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
+
 /* Networks and training (Spingalett.h). */
 
 typedef enum {
@@ -544,6 +583,50 @@ bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const cha
                              uint32_t module_count);
 bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size,
                                          const char *const *modules, uint32_t module_count);
+
+/* Tokenizers and pretrained language models. */
+typedef struct SpingalettTokenizer SpingalettTokenizer;
+typedef struct {
+    uint32_t vocabulary;
+    uint32_t added;
+    uint32_t bos, eos;
+    uint32_t pad, unk;
+    uint64_t reserved[8];
+} SpingalettTokenizerInfo;
+SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
+SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
+void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
+SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
+const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
+uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const char *text;
+    size_t length;
+    uint32_t *tokens;
+    size_t capacity;
+    bool special;
+    bool add_special;
+    uint64_t reserved[8];
+} SpingalettTokenizeArgs;
+int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const uint32_t *tokens;
+    size_t count;
+    char *text;
+    size_t capacity;
+    bool skip_special;
+    uint64_t reserved[8];
+} SpingalettDetokenizeArgs;
+int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+typedef struct {
+    const char *path;
+    uint32_t context;
+    uint64_t reserved[8];
+} SpingalettPretrainedArgs;
+SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args);
+
 SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
 bool spingalett_export_c_header(const SpingalettNetwork *net, const char *path, const char *name,
                                 SpingalettPrecisionMode precision);

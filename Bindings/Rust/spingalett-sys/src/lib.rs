@@ -427,6 +427,60 @@ pub struct Model {
     pub reserved: [u64; RESERVED],
 }
 
+/// A language model's tokenizer (opaque).
+#[repr(C)]
+pub struct Tokenizer {
+    _private: [u8; 0],
+}
+
+/// An id no token has.
+pub const NO_TOKEN: u32 = u32::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokenizerInfo {
+    pub vocabulary: u32,
+    pub added: u32,
+    pub bos: u32,
+    pub eos: u32,
+    pub pad: u32,
+    pub unk: u32,
+    pub reserved: [u64; RESERVED],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TokenizeArgs {
+    pub tokenizer: *const Tokenizer,
+    pub text: *const c_char,
+    pub length: usize,
+    pub tokens: *mut u32,
+    pub capacity: usize,
+    pub special: bool,
+    pub add_special: bool,
+    pub reserved: [u64; RESERVED],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DetokenizeArgs {
+    pub tokenizer: *const Tokenizer,
+    pub tokens: *const u32,
+    pub count: usize,
+    pub text: *mut c_char,
+    pub capacity: usize,
+    pub skip_special: bool,
+    pub reserved: [u64; RESERVED],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PretrainedArgs {
+    pub path: *const c_char,
+    pub context: u32,
+    pub reserved: [u64; RESERVED],
+}
+
 extern "C" {
     pub fn spingalett_version() -> *const c_char;
     pub fn spingalett_last_error_code() -> c_int;
@@ -472,4 +526,15 @@ extern "C" {
     pub fn spingalett_model_predict(model: *const Model, inputs: *const f32, count: u32, outputs: *mut f32) -> bool;
     pub fn spingalett_model_evaluate(model: *const Model, inputs: *const f32, targets: *const f32, count: u32)
         -> EvalMetrics;
+
+    // 1.3: tokenizers and pretrained language models (Hugging Face's directories, GGUF files)
+    pub fn spingalett_tokenizer_load(path: *const c_char) -> *mut Tokenizer;
+    pub fn spingalett_tokenizer_from_memory(data: *const c_void, size: usize) -> *mut Tokenizer;
+    pub fn spingalett_tokenizer_free(tokenizer: *mut Tokenizer);
+    pub fn spingalett_tokenizer_info(tokenizer: *const Tokenizer) -> TokenizerInfo;
+    pub fn spingalett_tokenizer_token(tokenizer: *const Tokenizer, id: u32) -> *const c_char;
+    pub fn spingalett_tokenizer_id(tokenizer: *const Tokenizer, token: *const c_char) -> u32;
+    pub fn spingalett_tokenize_args(args: TokenizeArgs) -> i64;
+    pub fn spingalett_detokenize_args(args: DetokenizeArgs) -> i64;
+    pub fn spingalett_load_pretrained_args(args: PretrainedArgs) -> *mut Network;
 }

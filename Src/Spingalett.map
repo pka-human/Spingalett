@@ -124,6 +124,23 @@ SPINGALETT_1.2 {
 
 SPINGALETT_1.3 {
     global:
+        spingalett_detokenize_args;
+        spingalett_load_pretrained_args;
         spingalett_lr_linear_decay;
         spingalett_lr_warmup_linear;
+        spingalett_session_copy;
+        spingalett_session_feed;
+        spingalett_session_free;
+        spingalett_session_generate_args;
+        spingalett_session_length;
+        spingalett_session_new;
+        spingalett_session_rewind;
+        spingalett_session_vocabulary;
+        spingalett_tokenize_args;
+        spingalett_tokenizer_free;
+        spingalett_tokenizer_from_memory;
+        spingalett_tokenizer_id;
+        spingalett_tokenizer_info;
+        spingalett_tokenizer_load;
+        spingalett_tokenizer_token;
 } SPINGALETT_1.2;

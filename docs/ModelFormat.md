@@ -288,6 +288,10 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
 - INT8, INT4 and INT2 layers quantize their input `x` (`in` floats, the whole tensor) to bytes
   first: `s = max |x| / 127` and `xq = round(x / s)` to nearest even (all `xq` 0 when `x` is all 0),
   then `y[j] = b[j] + (scale[j] * s) * sum_k q[j][k] * xq[k]` with the sum in 32-bit integers.
+  In a language model (a model whose first layer is an embedding: its cells are tokens) a convolution
+  of 1 x 1 windows, stride 1, no padding and one group (a linear map of each cell) quantizes each
+  cell's channels alone instead, with an `s` of their own, so that a token's outputs depend on that
+  token only (engines before Spingalett 1.3 quantize the whole tensor there too).
 - A convolution computes, for each output pixel `(oh, ow)`, its `out_c` outputs as above with `x`
   the pixel's window: `kernel_h x kernel_w x in_c` values in the order of the filter rows, 0 where
   the window lies in the padding (for integer layers, the window of the quantized input); with

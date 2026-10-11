@@ -34,8 +34,10 @@
 #include <cstdint>
 #include <expected>
 #include <initializer_list>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -307,6 +309,101 @@ private:
     SpingalettModel *m_ = nullptr;
 };
 
+/* ---------------------------------------------------------------- tokenizers */
+
+/* The tokenizer of a language model (SpingalettTokenizer): a tokenizer.json file, a model directory holding
+   one, or a GGUF file; read-only, so threads may share it. */
+class Tokenizer {
+public:
+    Tokenizer(Tokenizer &&other) noexcept : t_(std::exchange(other.t_, nullptr)) {}
+    Tokenizer &operator=(Tokenizer &&other) noexcept {
+        if (this != &other) {
+            spingalett_tokenizer_free(t_);
+            t_ = std::exchange(other.t_, nullptr);
+        }
+        return *this;
+    }
+    Tokenizer(const Tokenizer &) = delete;
+    Tokenizer &operator=(const Tokenizer &) = delete;
+    ~Tokenizer() { spingalett_tokenizer_free(t_); }
+
+    static Result<Tokenizer> load(const std::string &path) {
+        spingalett_clear_error();
+        SpingalettTokenizer *t = spingalett_tokenizer_load(path.c_str());
+        if (!t) return failure("cannot load the tokenizer");
+        return Tokenizer(t);
+    }
+    static Result<Tokenizer> from_bytes(std::span<const std::byte> data) {
+        spingalett_clear_error();
+        SpingalettTokenizer *t = spingalett_tokenizer_from_memory(data.data(), data.size());
+        if (!t) return failure("invalid tokenizer");
+        return Tokenizer(t);
+    }
+
+    /* the ids of a UTF-8 text; special: special tokens written in it become their ids; add_special: the
+       tokens the tokenizer adds around a text (LLaMA's BOS) */
+    Result<std::vector<std::uint32_t>> encode(std::string_view text, bool special = false, bool add_special = false) const {
+        std::vector<std::uint32_t> ids(text.size() + 16);
+        for (;;) {
+            SpingalettTokenizeArgs a{};
+            a.tokenizer = t_;
+            a.text = text.empty() ? "" : text.data();
+            a.length = text.size();
+            a.tokens = ids.data();
+            a.capacity = ids.size();
+            a.special = special;
+            a.add_special = add_special;
+            spingalett_clear_error();
+            const std::int64_t n = spingalett_tokenize_args(a);
+            if (n < 0) return failure("cannot encode the text");
+            if (static_cast<std::uint64_t>(n) <= ids.size()) {
+                ids.resize(static_cast<std::size_t>(n));
+                return ids;
+            }
+            ids.resize(static_cast<std::size_t>(n));
+        }
+    }
+    /* the UTF-8 text of ids (skip_special: without the special tokens) */
+    Result<std::string> decode(std::span<const std::uint32_t> ids, bool skip_special = false) const {
+        std::string text(4 * ids.size() + 64, '\0');
+        for (;;) {
+            SpingalettDetokenizeArgs a{};
+            a.tokenizer = t_;
+            a.tokens = ids.data();
+            a.count = ids.size();
+            a.text = text.data();
+            a.capacity = text.size();
+            a.skip_special = skip_special;
+            spingalett_clear_error();
+            const std::int64_t n = spingalett_detokenize_args(a);
+            if (n < 0) return failure("cannot decode the tokens");
+            if (static_cast<std::uint64_t>(n) < text.size()) {
+                text.resize(static_cast<std::size_t>(n));
+                return text;
+            }
+            text.assign(static_cast<std::size_t>(n) + 1, '\0');
+        }
+    }
+    /* a token as the vocabulary writes it, and the id of one (nothing for none) */
+    std::optional<std::string> token(std::uint32_t id) const {
+        const char *s = spingalett_tokenizer_token(t_, id);
+        if (!s) return std::nullopt;
+        return std::string(s);
+    }
+    std::optional<std::uint32_t> id(const std::string &token) const {
+        const std::uint32_t i = spingalett_tokenizer_id(t_, token.c_str());
+        if (i == SPINGALETT_NO_TOKEN) return std::nullopt;
+        return i;
+    }
+    /* the vocabulary's size, BOS, EOS, padding and unknown tokens (SPINGALETT_NO_TOKEN for none) */
+    SpingalettTokenizerInfo info() const { return spingalett_tokenizer_info(t_); }
+    const SpingalettTokenizer *raw() const { return t_; }
+
+private:
+    explicit Tokenizer(SpingalettTokenizer *t) : t_(t) {}
+    SpingalettTokenizer *t_ = nullptr;
+};
+
 /* ---------------------------------------------------------------- networks */
 
 /* train()'s options as typed fields; raw carries every other field of SpingalettTrainArgs (its net,
@@ -532,6 +629,17 @@ public:
         spingalett_clear_error();
         SpingalettNetwork *n = spingalett_import_onnx(path.c_str());
         if (!n) return failure("cannot import the model");
+        return Network(n);
+    }
+    /* a language model: a Hugging Face model directory or a GGUF file, a window of context tokens (0: the
+       model's positions, LLaMA's at most 2048); see spingalett_load_pretrained() */
+    static Result<Network> from_pretrained(const std::string &path, std::uint32_t context = 0) {
+        SpingalettPretrainedArgs a{};
+        a.path = path.c_str();
+        a.context = context;
+        spingalett_clear_error();
+        SpingalettNetwork *n = spingalett_load_pretrained_args(a);
+        if (!n) return failure("cannot load the model");
         return Network(n);
     }
     /* takes ownership of a network the library made */

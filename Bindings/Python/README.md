@@ -103,6 +103,15 @@ net = sg.Network.from_torch(model, torch.rand(1, 3, 32, 32))     # takes (32, 32
 same = sg.Network(sg.Loss.MSE, [sg.Input(32, 32, 3), sg.Conv2D(8, 3, padding=1), sg.Layer(10, sg.Activation.NONE)])
 same.load_pytorch(model.state_dict())                              # or "model.pt", "model.safetensors"
 onnx = sg.Network.from_onnx("model.onnx")
+# transformers too (GPT-2, LLaMA, BERT-like, nn.TransformerEncoderLayer): token ids in, as rows of floats
+lm = sg.Network.from_torch(my_gpt, torch.randint(0, 50257, (1, 256)))   # attention, RMS norm, SwiGLU ... as layers
+logits = lm.forward(tokens.astype(np.float32))      # tokens: (samples, 256) ids; logits: (samples, 256 x 50257)
+
+# a pretrained language model and its tokenizer, from a Hugging Face directory or a GGUF file, read by the C library
+lm = sg.Network.from_pretrained("models/SmolLM2-135M", context=512)       # or "SmolLM2-135M.Q4_K_M.gguf"
+tok = sg.Tokenizer("models/SmolLM2-135M")
+prompt = tok.encode("<|im_start|>user\nWhat is a tokenizer?<|im_end|>\n<|im_start|>assistant\n", special=True)
+print(tok.decode(lm.generate(prompt, 64, temperature=0.7, top_p=0.9, stop=[tok.id("<|im_end|>")])))
 
 # a language model: GPT-2 from Hugging Face's weights (or nanoGPT's), trained further on a token file, sampled
 from transformers import GPT2LMHeadModel
@@ -121,6 +130,12 @@ g = lm.add_linear(1376, activation=sg.Activation.SILU).last
 lm.add_linear(1376, inputs=n).add_multiply([g, lm.last]).add_linear(512).add_add([x, lm.last])
 lm.add_rms_norm().add_linear(32000)
 
+# its deployment model a token at a time with a key-value cache: four continuations of one prompt together
+with lm.to_model(sg.Precision.INT8) as model, model.session(sequences=4) as s:
+    logits = s.feed([1, 450, 4996])                 # the prompt's tokens at once: the next token's logits
+    for b in range(1, 4): s.copy(0, b)
+    print(s.generate([[int(logits.argmax())]] * 4, 50, temperature=0.8, top_k=40, seed=1))
+
 with sg.Network.load("xor.slett") as net:
     print(net.topology, net.forward([1, 0]))
     # deployment: a read-only INT8 model with integer kernels, and a C header for firmware
@@ -138,9 +153,11 @@ with sg.Network.load("xor.slett") as net:
 | `add_linear(neurons, ..., tied=e)`, `Linear(..., tied=e)` | a linear layer computing with embedding `e`'s table (tied input and output embeddings); `layer(i).tied`, `model.layers[i].tied` name it |
 | `add_attention(..., ignore_padding=True)`, `Attention(..., ignore_padding=True)` | the keys of padding (tokens of -1 in the inputs, which an embedding reads as zeros and the sparse loss as no target) left out: sequences of different lengths in one batch |
 | `add_attention(..., window=w)`, `Attention(..., window=w)` | a sliding window (Mistral's): each cell attends to the keys less than `w` cells away, with `causal` the cell and the `w - 1` before it; `layer(i).window`, `model.layers[i].window` give it |
+| `Network.from_pretrained(path, context=0)` | a language model read by the C library: a Hugging Face model directory (`config.json`, safetensors weights, sharded or not; `llama`, `mistral`, `qwen2`, `gpt2`) or a GGUF file (`llama`, `qwen2`, `gpt2`; weights dequantized from F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K to Q6_K, IQ4_NL, IQ4_XS); the same networks as the two functions above, without PyTorch |
+| `Tokenizer(path or bytes)`: `encode(text, special=False, add_special=False)`, `decode(ids, skip_special=False)`, `token(id)`, `id(token)`, `vocabulary`, `bos`, `eos`, `pad`, `unk`, `added` | a language model's tokenizer in C (a `tokenizer.json`, a model directory or a GGUF file): byte-level BPE, tiktoken's encodings and SentencePiece's BPE, the ids and texts of Hugging Face's `tokenizers`; `special` turns special tokens written in the text into their ids, `add_special` adds the template's (LLaMA's BOS) |
 | `inputs=` on every `add_*`, `last`, `len(net)` | a layer reads the one before it, or the earlier layers `inputs` names (indices; negative ones count back from the new layer); `last` is the index of the layer added last |
 | `add_add(inputs, activation=NONE, dropout=0)`, `add_concat(inputs, ...)`, `add_global_avg_pool(dropout=0, inputs=None)` | the sum of layers of one shape (residual connections), layers side by side along the channels, the mean of each channel |
-| `Network.from_onnx(path or bytes)`, `Network.from_torch(module, example_input)` | ONNX models (and PyTorch modules, exported to ONNX in memory) as networks with channels-last inputs: transpose NCHW images with `x.transpose(0, 2, 3, 1)` |
+| `Network.from_onnx(path or bytes)`, `Network.from_torch(module, example_input)` | ONNX models (and PyTorch modules, exported to ONNX in memory) as networks with channels-last inputs: transpose NCHW images with `x.transpose(0, 2, 3, 1)`; transformers (an `example_input` of token ids `[1, T]`, or of vectors `[1, T, C]`) with their embeddings, normalizations, attention (grouped-query, causal, rotary) and gated MLPs as the library's layers, token ids given as floats |
 | `load_pytorch(state_dict, path or bytes, modules=None)` | PyTorch weights (`state_dict()`, `torch.save` or safetensors files) into a network of the same layers, reordered for channels-last data; the network is unchanged on error |
 | `add_input(h, w, c)`, `add_conv2d(filters, kernel, stride=1, padding=0, activation=RELU, init=HE, dropout=0, groups=1)`, `add_max_pool2d(kernel, stride=0, padding=0)`, `add_avg_pool2d(...)` | convolution (grouped or depthwise with `groups`) and pooling over channels-last tensors; pooling's stride defaults to the kernel size |
 | `add_batch_norm(activation=NONE, epsilon=1e-5, momentum=0.1, dropout=0)` | per-channel normalization of the previous layer: batch statistics while training, running averages otherwise; `get_running_statistics(i)` / `set_running_statistics(i, mean, var)` |
@@ -164,6 +181,7 @@ with sg.Network.load("xor.slett") as net:
 | `model.predict(x)` / `model(x)`, `model.evaluate(x, y)` | 1-D input -> vector, 2-D batch -> matrix; `Metrics(loss, accuracy)` |
 | `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding, groups, epsilon, input_layers)` per layer (normalizations after a dense or convolution layer are folded into it); image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
+| `model.session(max_length=0, sequences=1)` / `Session(model, ...)` | a causal language model run a token at a time with a key-value cache: `feed(tokens, sequence=0, all=False)` (the next token's logits, or every fed token's), `feed_many([(sequence, tokens), ...])` (several sequences in one pass), `rewind(length, sequence=0)`, `copy(source, target)`, `length(sequence=0)`, `vocabulary`, `generate(prompts, count, temperature=0, top_k=0, top_p=0, seed=0, stop=())` (sequences advanced together, sequence b drawing with seed + b); the logits are `predict()`'s for each position bit for bit; `Network.generate()` runs one on the CPU |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings; `ComputeMode.CUDA` (NVIDIA) and `ComputeMode.VULKAN` train and predict on the GPU |
 | `DeviceData(values)` | a data set in the GPU's memory (rows of float32, an array `(n, ...)` flattened to a row a sample), copied there once; `train()`, `validation_data`, `forward()` and `evaluate()` take it in place of an array (inputs, targets or both), and with the GPU modes gather, augment and smooth their batches on the device; `len(d)`, `d.shape`, `d.numpy(first=0, count=None)`, `close()` or a `with` block |
 | `set_gpu_precision(Precision.BFLOAT16)`, `get_gpu_precision()` | the GPU's matrix products in bfloat16 on its matrix units, or `FLOAT32` (the default); returns whether the GPU multiplies in that precision |
@@ -178,4 +196,4 @@ Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bind
 that the library can serve them (`library_version()`), because they mirror its struct layouts: the
 same major version and at least their own minor one (before 1.0, the same major.minor version). A
 `Network` is not thread-safe: use one per thread. A `Model` is read-only and can be shared between
-threads.
+threads; a `Session` is used by one thread at a time, and any number of them may share a model.

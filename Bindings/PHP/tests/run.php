@@ -257,6 +257,40 @@ test('a LLaMA-like model learns to count, then generates', function (): void {
     }), 'an empty prompt');
 });
 
+test('a session of the LLaMA-like model gives the window\'s logits, a token at a time', function (): void {
+    Library::seed(5);
+    $t = 16;
+    $v = 13;
+    $lm = language_model($t, $v);
+    foreach ([Precision::FLOAT32, Precision::INT8] as $precision) {
+        $model = $lm->toModel($precision);
+        $tokens = [3, 4, 5, 6, 7, 8, 9, 10];
+        $window = array_merge($tokens, array_fill(0, $t - count($tokens), 0));
+        $whole = $model->predict($window);
+        $session = $model->session(0, 2);
+        check($session->vocabulary() === $v, 'vocabulary');
+        $same = true;
+        foreach ($tokens as $i => $token) {
+            $same = $same && $session->feed([$token]) === array_slice($whole, $i * $v, $v);
+        }
+        check($same && $session->length() === count($tokens), "fed a token at a time ($precision)");
+        $all = $session->feed([1, 2], 1, true);
+        $two = $model->predict(array_merge([1, 2], array_fill(0, $t - 2, 0)));
+        check($all === array_slice($two, 0, 2 * $v), "a prompt at once ($precision)");
+        $session->rewind(1, 1);
+        $session->copy(0, 1);
+        check($session->length(1) === count($tokens), 'rewind and copy');
+        $session->rewind(0, 0);
+        $session->rewind(0, 1);
+        $batch = $session->generate([[3, 4, 5], [7]], 5);
+        $alone = $model->session()->generate([[3, 4, 5]], 5);
+        check(count($batch) === 2 && $batch[0] === $alone[0] && count($batch[1]) === 5, 'batched generation');
+    }
+    check(throws(SpingalettException::class, function (): void {
+        xor_network()->toModel()->session();
+    }), 'a model that is no language model');
+});
+
 test('training on a token file', function (): void {
     Library::seed(11);
     $v = 13;
