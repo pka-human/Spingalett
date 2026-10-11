@@ -741,6 +741,30 @@ typedef struct {
 #define spingalett_detokenize(...) spingalett_detokenize_args((SpingalettDetokenizeArgs){__VA_ARGS__})
 SPINGALETT_API int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
 
+typedef struct {
+    const char *path;               /* a model directory of Hugging Face's form: config.json and model.safetensors,
+                                       or the shards model.safetensors.index.json names */
+    uint32_t context;               /* tokens a sample, the network's window: 0 = the model's positions (GPT-2's
+                                       all, LLaMA's at most 2048) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettPretrainedArgs;
+
+/*
+ * A language model as a network: the model_type of config.json llama, mistral, qwen2 or gpt2, its weights
+ * from safetensors files (F32, F16 or BF16; mapped, each tensor decoded once into its layer). LLaMA, Mistral
+ * and Qwen2 become RMS normalizations, grouped-query attention with rotary embeddings (the queries', keys'
+ * and values' projections, with Qwen2's biases, in one linear layer), and a SwiGLU MLP (a SiLU layer times a
+ * linear one); GPT-2 layer normalizations, learned positions, a GELU MLP and its Conv1D weights transposed.
+ * The language model head is lm_head.weight, or a copy of the embeddings (tied). The network takes a window
+ * of `context` token ids and gives every position's logits (SPINGALETT_LOSS_SPARSE_CROSS_ENTROPY): it
+ * generates (spingalett_generate()), trains and saves like any other. Mistral's sliding window is not
+ * applied: attention covers the whole context, which is exact for contexts within the window (a warning
+ * says when the context exceeds it). Scaled rotary embeddings (LLaMA 3.1's, YaRN) are refused. The
+ * tokenizer comes from spingalett_tokenizer_load() on the same directory. NULL on error.
+ */
+#define spingalett_load_pretrained(...) spingalett_load_pretrained_args((SpingalettPretrainedArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args);
+
 /* Deployment: models loaded from files, prediction and evaluation in Spingalett.Runtime.h. */
 
 /* A network quantized (or converted) to precision for inference, as a model that owns its image

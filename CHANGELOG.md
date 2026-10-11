@@ -24,6 +24,17 @@ All notable changes to this project are documented in this file. The format foll
   encoding runs 3.6 to 8.3 times as fast (0.9 MB of prose and code on an i7-12650H, one thread). The
   `tokenizer` test group checks six small tokenizers of these families
   (`Tests/make_tokenizer_tests.py`) against the library's ids.
+- **Hugging Face checkpoints in C**: `spingalett_load_pretrained()` (`SpingalettPretrainedArgs`: `path`,
+  `context`) makes a network of a model directory, `config.json` and safetensors weights (one file, or
+  the shards of `model.safetensors.index.json`; F32, F16, BF16), of the model types `llama`, `mistral`,
+  `qwen2` and `gpt2`: the networks of the Python bindings' `llama_from_state_dict()` and
+  `gpt2_from_state_dict()`, which give the same logits bit for bit, with Qwen2's biases, explicit
+  `head_dim`, tied embeddings, GPT-2's Conv1D weights. The arrays are reserved at their final sizes and
+  each tensor is decoded once from the mapped file into its layer (SmolLM2-135M loads in 0.17 s on an
+  i7-12650H). Mistral's sliding window is not applied (exact within the window; a warning beyond it);
+  scaled rotary embeddings are refused. On SmolLM2-135M the logits agree with `transformers` within
+  2.4e-4 and the greedy continuation is the same. The `pretrained` test group compares tiny LLaMA,
+  Qwen2, Mistral and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) with PyTorch.
 - An internal JSON reader (`Src/Spingalett.Json.c`) for the files of language models.
 
 ## [1.2.0] - 2026-10-11

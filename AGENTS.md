@@ -33,6 +33,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Onnx.c`, `Src/Spingalett.Torch.c` | ONNX import (own protocol buffer reader, external data files); PyTorch state dicts (zip, a pickle interpreter that runs nothing) and safetensors |
 | `Src/Spingalett.Import.c` | What the importers share: files mapped into memory, tensors decoded and reordered to channels-last in one pass |
 | `Src/Spingalett.Tokenizer.c`, `Src/Spingalett.Json.c` | Tokenizers of `tokenizer.json` files (BPE; the pre-tokenizers' expressions matched by hand over `Spingalett.Unicode.h`, written by `Src/make_unicode.py`); the JSON reader they and the checkpoints' files share |
+| `Src/Spingalett.Pretrained.c`, `.h` | Language models from Hugging Face's directories (`config.json`, safetensors through `Torch.c`): the transformer built from hyper-parameters, its tensors read from a source each format provides |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
 | `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer, RMS) layers |
 | `Src/Spingalett.Transformer.c`, `Generate.c` | Embeddings and attention over batches on the CPU (blocked products a thread per sample and group of heads, the backward pass recomputing the probabilities); text generation |
@@ -50,8 +51,9 @@ assumed (see [Performance work](#performance-work)).
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
-Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx tokenizer equiv cont
-                                                    # optim sched dropout gen predict valid step data io model gpu cuda xor
+Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx tokenizer pretrained
+                                                    # equiv cont optim sched dropout gen predict valid step data io model
+                                                    # gpu cuda xor
 ```
 
 Executables go to `Bin/` and static libraries to `Lib/` in the source tree. Point extra build

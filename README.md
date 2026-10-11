@@ -55,7 +55,7 @@ Python (wheels with the library inside), C++, Rust, .NET, Go and Java are includ
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
-| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
@@ -586,6 +586,44 @@ spingalett_tokenizer_free(tok);
   code encode in 0.055 s with GPT-2's tokenizer (0.30 s in `tokenizers` 0.23), 0.030 s with LLaMA
   3's (0.25 s), 0.075 s with Qwen2.5's (0.27 s) and 0.067 s with TinyLlama's (0.31 s), medians of
   seven runs on one thread.
+
+### Pretrained language models
+
+`spingalett_load_pretrained()` makes a network of a Hugging Face model directory: `config.json` and
+the weights in `model.safetensors`, or in the shards `model.safetensors.index.json` lists. The model
+types are `llama`, `mistral`, `qwen2` and `gpt2`; the network takes a window of `.context` token ids
+and gives every position's logits, so it generates, trains further (fine-tuning), saves and deploys
+like any other:
+
+```c
+NeuralNetwork *net = spingalett_load_pretrained(.path = "models/SmolLM2-135M", .context = 512);
+SpingalettTokenizer *tok = spingalett_tokenizer_load("models/SmolLM2-135M");
+uint32_t prompt[512], tokens[64];
+int64_t n = spingalett_tokenize(.tokenizer = tok, .text = "The history of computing", .tokens = prompt, .capacity = 512);
+uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = (uint32_t)n, .tokens = tokens,
+                                    .count = 64, .temperature = 0.7f, .top_p = 0.9f,
+                                    .stop_tokens = &(uint32_t){spingalett_tokenizer_info(tok).eos}, .stop_count = 1);
+```
+
+- LLaMA, Mistral and Qwen2 become RMS normalizations, grouped-query attention with rotary
+  embeddings (the queries', keys' and values' projections in one linear layer, with Qwen2's biases;
+  a `head_dim` of its own), and SwiGLU as a SiLU layer times a linear one; GPT-2 layer
+  normalizations, learned positions, its GELU (`gelu_new`: the tanh form) and its Conv1D weights,
+  transposed. A missing `lm_head.weight` (tied embeddings) becomes a copy of the embeddings. These
+  are the networks of the Python bindings' `llama_from_state_dict()` and `gpt2_from_state_dict()`,
+  which give the same logits bit for bit.
+- Weights in F32, F16 or BF16 are decoded straight from the mapped files into the network, whose
+  arrays are reserved at their final sizes first, so a model is never copied: SmolLM2-135M (BF16)
+  loads in 0.17 s on an i7-12650H.
+- `.context` 0 takes the model's positions (GPT-2's all, LLaMA's up to 2048). Mistral's sliding
+  window is not applied: attention covers the whole window, which is exact while the context is
+  within the sliding window (a warning says when it is not). Scaled rotary embeddings (LLaMA 3.1's
+  `llama3`, YaRN) are refused, as is anything else the layers do not compute, with an error that
+  names it.
+- On SmolLM2-135M the logits are those of `transformers` within 2.4e-4 (of logits up to 42) and the
+  greedy continuation is the same; on Hugging Face's tiny random LLaMA and GPT-2 within 2e-7. The
+  `pretrained` test group checks tiny LLaMA (BF16, sharded), Qwen2 (F16, biases, tied), Mistral
+  and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) against PyTorch, within 2e-6.
 
 ### Importing models: ONNX and PyTorch
 

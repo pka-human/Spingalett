@@ -8,8 +8,8 @@
  * configuration; backends that are not compiled in fall back to single-threaded and the
  * cross-backend comparisons then pass trivially.
  *
- *   Spingalett.Tests [group]     groups: grad conv norm graph onnx tokenizer equiv cont optim sched dropout gen
- *                                predict valid step data io model xor
+ *   Spingalett.Tests [group]     groups: grad conv norm graph onnx tokenizer pretrained equiv cont optim sched
+ *                                dropout gen predict valid step data io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -4701,6 +4701,141 @@ static void tokenizer_api(void) {
           !spingalett_tokenizer_token(NULL, 0), "tokenizers that do not exist");
 }
 
+/* ---- language models from their files: Hugging Face's directories (Tests/make_pretrained_tests.py) ---- */
+
+#if defined(_WIN32)
+#include <direct.h>
+#define make_dir(p) _mkdir(p)
+#define remove_dir(p) _rmdir(p)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define make_dir(p) mkdir(p, 0755)
+#define remove_dir(p) rmdir(p)
+#endif
+
+static const char pretrained_text[] = "The quick brown fox jumps over the lazy dog, it's 1234 times!";
+
+/* A model's logits for a window of tokens against PyTorch's (NAME.bin), the tokens its directory's tokenizer
+   gives the text against those of the file. */
+static void pretrained_model(const char *name, bool tokenizer) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, name);
+    long size = 0;
+    unsigned char *data = read_file(path, &size);
+    CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+    if (!data) return;
+    const uint32_t T = rd32(data + 8), out = rd32(data + 12);
+    const float *tokens = (const float *)(const void *)(data + 16), *expected = tokens + T;
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, name);
+    NeuralNetwork *net = spingalett_load_pretrained(.path = path, .context = T);
+    CHECK(net && spingalett_input_size(net) == T && spingalett_output_size(net) == out &&
+          spingalett_network_loss(net) == LOSS_SPARSE_CROSS_ENTROPY, "%s: %s", name, spingalett_last_error_message());
+    if (tokenizer) {
+        SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+        uint32_t ids[64];
+        int64_t n = tok ? spingalett_tokenize(.tokenizer = tok, .text = pretrained_text, .tokens = ids, .capacity = 64) : -1;
+        bool same = n >= (int64_t)T;
+        for (uint32_t k = 0; same && k < T; k++) same = (float)ids[k] == tokens[k];
+        CHECK(same, "%s: its tokenizer gives the text other tokens (%s)", name, tok ? "" : spingalett_last_error_message());
+        spingalett_tokenizer_free(tok);
+    }
+    if (net) {
+        float *y = malloc((size_t)out * sizeof(float)), worst = 0.0f;
+        predict(.net = net, .inputs = tokens, .sample_count = 1, .outputs = y);
+        for (uint32_t i = 0; i < out; i++) worst = fmaxf(worst, fabsf(y[i] - expected[i]));
+        CHECK(worst < 1e-4f, "%s: logits differ from PyTorch's by %g", name, worst);
+        printf("  %-12s %3u tokens x %3u logits, |logits - PyTorch| %.1e\n", name, T, out / T, worst);
+        free(y);
+        free_network(net);
+    }
+    free(data);
+}
+
+static void write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+/* Directories of what cannot be loaded name the problem; damaged files never load. */
+static void pretrained_errors(void) {
+    const char *dir = "spingalett_test_hf";
+    char path[512], src[512];
+    (void)make_dir(dir);
+    static const struct { const char *config, *message; } bad[] = {
+        {"{\"model_type\": \"bert\"}", "bert"},
+        {"{\"model_type\": \"llama\", \"hidden_size\": 16, \"num_hidden_layers\": 1, \"num_attention_heads\": 4}",
+         "model.safetensors"},
+        {"{\"model_type\": \"llama\", \"rope_scaling\": {\"rope_type\": \"llama3\", \"factor\": 8.0}}", "llama3"},
+        {"{\"model_type\": \"llama\", \"hidden_act\": \"gelu\"}", "gelu"},
+        {"{\"model_type\": \"gpt2\", \"n_embd\": 16, \"activation_function\": \"tanh\"}", "activation"},
+        {"{\"model_type\": ", "config.json"},
+    };
+    snprintf(path, sizeof path, "%s/config.json", dir);
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        write_text(path, bad[k].config);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+        CHECK(!net && strstr(spingalett_last_error_message(), bad[k].message), "config %zu: \"%s\"", k,
+              net ? "loaded" : spingalett_last_error_message());
+        free_network(net);
+    }
+    /* Mistral's weights under a config of another width, and truncated */
+    snprintf(src, sizeof src, "%s/hf_mistral/config.json", SPINGALETT_TEST_DATA_DIR);
+    long size = 0;
+    unsigned char *config = read_file(src, &size);
+    snprintf(src, sizeof src, "%s/hf_mistral/model.safetensors", SPINGALETT_TEST_DATA_DIR);
+    long wsize = 0;
+    unsigned char *weights = read_file(src, &wsize);
+    CHECK(config && weights, "hf_mistral cannot be read");
+    char weights_path[512];
+    snprintf(weights_path, sizeof weights_path, "%s/model.safetensors", dir);
+    if (config && weights) {
+        config[size] = '\0';
+        char *wide = malloc((size_t)size + 8), *at = strstr((char *)config, "\"hidden_size\": 16");
+        if (at) {
+            snprintf(wide, (size_t)size + 8, "%.*s\"hidden_size\": 32%s", (int)(at - (char *)config), (char *)config,
+                     at + strlen("\"hidden_size\": 16"));
+            write_text(path, wide);
+            write_file(weights_path, weights, wsize);
+            NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+            CHECK(!net && strstr(spingalett_last_error_message(), "shape"), "a checkpoint of another width: \"%s\"",
+                  net ? "loaded" : spingalett_last_error_message());
+            free_network(net);
+        }
+        free(wide);
+        write_text(path, (const char *)config);
+        int accepted = 0;
+        for (long cut = 0; cut < wsize; cut += 397) {
+            write_file(weights_path, weights, cut);
+            NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+            accepted += net != NULL;
+            free_network(net);
+        }
+        CHECK(accepted == 0, "%d truncated checkpoints loaded", accepted);
+        /* a window beyond Mistral's sliding window: loaded, with a warning */
+        write_file(weights_path, weights, wsize);
+        NeuralNetwork *net = spingalett_load_pretrained(.path = dir, .context = 20);
+        CHECK(net && spingalett_input_size(net) == 20, "a context beyond the sliding window: %s", spingalett_last_error_message());
+        free_network(net);
+        remove(weights_path);
+    }
+    /* an index that names a shard outside the directory */
+    char index[512];
+    snprintf(index, sizeof index, "%s/model.safetensors.index.json", dir);
+    write_text(index, "{\"weight_map\": {\"model.embed_tokens.weight\": \"../model.safetensors\"}}");
+    NeuralNetwork *net = spingalett_load_pretrained(.path = dir);
+    CHECK(!net && strstr(spingalett_last_error_message(), "outside"), "a shard outside the directory: \"%s\"",
+          net ? "loaded" : spingalett_last_error_message());
+    free_network(net);
+    remove(index);
+    remove(path);
+    remove_dir(dir);
+    CHECK(!spingalett_load_pretrained(.path = "no/such/model") && !spingalett_load_pretrained(.path = NULL),
+          "models that do not exist");
+    free(config);
+    free(weights);
+}
+
 /* ---- the GPU (COMPUTE_VULKAN, or COMPUTE_CUDA in the group "cuda") against the CPU ---- */
 
 /* The compute mode of the GPU group's tests: gpu_mode, or COMPUTE_CUDA. */
@@ -6205,6 +6340,14 @@ int main(int argc, char **argv) {
         static const char *const names[] = {"gpt2", "llama3", "qwen2", "o200k", "spm", "metaspace"};
         for (size_t k = 0; k < sizeof names / sizeof *names; k++) tokenizer_cases(names[k]);
         tokenizer_api();
+    }
+    if (!*only || !strcmp(only, "pretrained")) {
+        printf("[pretrained language models]\n");
+        pretrained_model("hf_llama", true);
+        pretrained_model("hf_qwen2", true);
+        pretrained_model("hf_mistral", false);
+        pretrained_model("hf_gpt2", true);
+        pretrained_errors();
     }
     if (!*only || !strcmp(only, "equiv")) {
         printf("[backend equivalence]\n");

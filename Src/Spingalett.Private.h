@@ -405,6 +405,21 @@ size_t spingalett_dense_scratch(uint32_t out, uint32_t in, bool transposed);
 void spingalett_import_dense(float *dst, const uint8_t *src, int dtype, uint32_t out, uint32_t in, uint32_t C,
                              uint32_t HW, bool transposed, float alpha, float *scratch);
 
+/* A tensor of a safetensors file: its name (not NUL-terminated), element type, shape and bytes. */
+typedef struct {
+    const char *name;
+    size_t name_len;
+    int dtype;                      /* SPG_DTYPE_*, SPG_DTYPE_OTHER for types that do not convert to float */
+    int ndims;
+    int64_t dims[8];
+    const uint8_t *data;
+    uint64_t bytes;
+} SpgTensor;
+/* The tensors of a safetensors file in memory (Torch.c), in a malloc'ed array that points into data;
+   false with a message of at most error_size bytes in error. */
+bool spingalett_safetensors(const uint8_t *data, size_t size, SpgTensor **tensors, size_t *count, char *error,
+                            size_t error_size);
+
 /* count strings copied into one allocation (a NULL-terminated array of pointers; free() releases it). */
 char **spingalett_copy_names(const char *const *names, uint32_t count);
 /* load_spingalett_from_memory that also reports the precision of the first weight layer. */
