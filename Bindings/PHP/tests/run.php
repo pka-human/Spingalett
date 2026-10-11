@@ -28,6 +28,7 @@ use Spingalett\Precision;
 use Spingalett\Sampling;
 use Spingalett\SpingalettException;
 use Spingalett\Strategy;
+use Spingalett\Tokenizer;
 use Spingalett\TrainOptions;
 
 $failures = 0;
@@ -308,6 +309,81 @@ test('training on a token file', function (): void {
     check(throws(SpingalettException::class, function () use ($lm): void {
         $lm->trainTokens('/nonexistent/tokens.bin');
     }), 'a missing token file');
+});
+
+test('tokenizers give the ids and texts of Hugging Face\'s', function (): void {
+    $data = __DIR__ . '/../../../Tests/Data/';
+    if (!is_file($data . 'tokenizer_gpt2.json')) {
+        echo "  the test data are not here: tokenizers not checked\n";
+        return;
+    }
+    // Tests/make_tokenizer_tests.py: "special add text", the ids, the text decoded ("*": not checked) and
+    // without special tokens; texts in hexadecimal, "-" for none
+    $unhex = function (string $h): string {
+        return $h === '-' ? '' : (string)hex2bin($h);
+    };
+    $files = [];
+    foreach (['gpt2', 'llama3', 'qwen2', 'o200k', 'spm', 'metaspace'] as $n) {
+        $files["tokenizer_$n.json"] = "tokenizer_$n.txt";
+    }
+    $files['gguf_llama.gguf'] = 'tokenizer_llama3.txt';
+    $files['gguf_spm.gguf'] = 'gguf_spm.txt';
+    foreach ($files as $file => $expected) {
+        $tok = Tokenizer::load($data . $file);
+        $lines = array_values(array_filter(file($data . $expected, FILE_IGNORE_NEW_LINES), function (string $l): bool {
+            return $l !== '' && $l[0] !== '#';
+        }));
+        $wrong = 0;
+        for ($k = 0; $k + 3 < count($lines); $k += 4) {
+            [$special, $add, $text] = explode(' ', $lines[$k]);
+            $ids = array_map('intval', array_slice(explode(' ', $lines[$k + 1]), 1));
+            $got = $tok->encode($unhex($text), $special === '1', $add === '1');
+            $ok = $got === $ids && ($lines[$k + 2] === '*' || $tok->decode($ids) === $unhex($lines[$k + 2])) &&
+                  $tok->decode($ids, true) === $unhex($lines[$k + 3]);
+            $wrong += $ok ? 0 : 1;
+        }
+        check($wrong === 0 && $k > 0, "$file: $wrong of " . ($k / 4) . ' texts wrong');
+        // (texts come back as they were where the decoder inverts the pre-tokenizer: byte-level ones)
+        $long = str_repeat('Tokenizers cut text into pieces, ', 200);
+        if (strpos($file, 'o200k') === false && strpos($file, 'spm') === false && strpos($file, 'metaspace') === false) {
+            check($tok->decode($tok->encode($long)) === $long, "$file: a long text round trip");
+        }
+        $tok->close();
+    }
+    $tok = Tokenizer::fromBytes((string)file_get_contents($data . 'tokenizer_llama3.json'));
+    check($tok->encode('<|begin_of_text|>', true) === [420], 'special tokens when asked');
+    check(count($tok->encode('<|begin_of_text|>')) >= 2, 'special tokens as text');
+    check($tok->id($tok->token(300) ?? '') === 300 && $tok->token(1 << 30) === null, 'tokens and ids');
+    check(throws(SpingalettException::class, function () use ($data): void {
+        Tokenizer::load($data . 'no_such_tokenizer.json');
+    }), 'a missing tokenizer');
+});
+
+test('pretrained models give PyTorch\'s logits', function (): void {
+    $data = __DIR__ . '/../../../Tests/Data/';
+    if (!is_file($data . 'hf_llama.bin')) {
+        echo "  the test data are not here: pretrained models not checked\n";
+        return;
+    }
+    // hf_llama.bin (Tests/make_pretrained_tests.py): "SPGT", 1, T, T x vocabulary, then the tokens and logits as
+    // floats
+    $bin = (string)file_get_contents($data . 'hf_llama.bin');
+    [, $t, $n] = array_values(unpack('V3', $bin, 4));
+    $floats = array_values(unpack('g*', substr($bin, 16)));
+    $tokens = array_slice($floats, 0, $t);
+    $logits = array_slice($floats, $t, $n);
+    foreach (['hf_llama', 'gguf_llama.gguf'] as $path) {
+        $lm = Network::fromPretrained($data . $path, $t);
+        check(close($lm->predict($tokens), $logits, 1e-4), "$path: the logits of PyTorch");
+        $lm->close();
+    }
+    $tok = Tokenizer::load($data . 'hf_llama');
+    $ids = $tok->encode("The quick brown fox jumps over the lazy dog, it's 1234 times!");
+    check(array_slice($ids, 0, $t) === array_map('intval', $tokens), 'the directory\'s tokenizer');
+    check($tok->eos() === 424, 'the EOS of tokenizer_config.json');
+    check(throws(SpingalettException::class, function () use ($data): void {
+        Network::fromPretrained($data . 'no_such_model');
+    }), 'a missing model');
 });
 
 test('declarations against the C headers', function (): void {

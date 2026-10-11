@@ -51,7 +51,9 @@ properties. Samples are arrays of numbers, flat or one array a sample, copied in
 a call; outputs come back flat. `Network::save()`, `Network::load()`, `Model::load()` and
 `Network::toModel(Precision::INT8)` handle files and deployment models, and `Model::session()` a causal
 language model's session, fed a token at a time with the keys and values of earlier tokens kept
-(`feed()`, `rewind()`, `copy()`, `generate()` of several sequences at once); `weights()`, `biases()` and
+(`feed()`, `rewind()`, `copy()`, `generate()` of several sequences at once). `Network::fromPretrained()`
+loads a Hugging Face directory of LLaMA, Mistral, Qwen2 or GPT-2, or a GGUF file, and `Tokenizer` encodes and
+decodes text with a `tokenizer.json` file, a model directory's or a GGUF file's vocabulary; `weights()`, `biases()` and
 `setParameters()` the parameters. `Library::ffi()` gives the C functions themselves, and `raw()` the C
 object of a network or model, for what the classes leave out. Errors of the library throw
 `SpingalettException` (its code is the library's error code), wrong arguments `InvalidArgumentException`.

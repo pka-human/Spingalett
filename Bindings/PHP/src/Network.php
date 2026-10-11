@@ -53,6 +53,27 @@ final class Network
         return $network;
     }
 
+    /**
+     * A pretrained language model: a Hugging Face model directory (config.json and model.safetensors, or its
+     * shards) of LLaMA, Mistral, Qwen2 or GPT-2, or a GGUF file; $context tokens a sample (0: the model's
+     * positions).
+     */
+    public static function fromPretrained(string $path, int $context = 0): self
+    {
+        $ffi = Library::ffi();
+        $name = Native::cString($path);
+        $args = $ffi->new('SpingalettPretrainedArgs');
+        $args->path = Native::pointer($name, 'char');
+        $args->context = $context;
+        $net = $ffi->spingalett_load_pretrained_args($args);
+        if (Native::isNull($net)) {
+            throw SpingalettException::last('spingalett_load_pretrained failed');
+        }
+        $network = (new \ReflectionClass(self::class))->newInstanceWithoutConstructor();
+        $network->net = $net;
+        return $network;
+    }
+
     /** Releases the network (as its destruction does). */
     public function close(): void
     {
