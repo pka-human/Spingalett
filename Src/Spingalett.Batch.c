@@ -440,6 +440,29 @@ static void batch_layer(NeuralNetwork *net, BatchWorkspace *ws, uint32_t l, cons
     }
 }
 
+/* Values at .. at + len - 1 of sample s of layer l whose product or pass left its activation (and a dense layer's
+   bias) undone: from pre (the values before the activation, kept) or in place, the activation, then dropout. */
+static void activate_part(const NeuralNetwork *net, BatchWorkspace *ws, uint32_t l, const float *pre, bool masked,
+                          const DropoutContext *dropout, uint32_t position_offset, uint32_t s, uint32_t at,
+                          uint32_t len) {
+    const uint32_t size = net->topology[l];
+    const ActivationFunction act = net->act_func[l - 1];
+    float *row = ws->act[l] + (size_t)s * size + at;
+    float *mask = masked ? ws->dmask[l] + (size_t)s * size + at : NULL;
+    if (pre) {
+        /* the activation of the values kept; a dropout mask alone, the derivative from them */
+        memcpy(row, pre + (size_t)s * size + at, (size_t)len * sizeof(float));
+        apply_activation_batch(row, len, act);
+    } else {
+        if (net->shapes[l].type == LAYER_DENSE)
+            spingalett_vec_axpy(row, net->biases + net->bias_offsets[l - 1] + at, len, 1.0f);
+        apply_activation_batch(row, len, act);
+    }
+    if (masked)
+        spingalett_dropout_apply_at(row, mask, len, pre ? ACT_NONE : act, net->dropout_rates[l], dropout, l,
+                                    position_offset + s, at);
+}
+
 /* The forward pass of every layer, or (only, a segment's index) of the layers of that segment that a recomputing
    workspace does not keep. */
 static void forward_layers(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout,
@@ -532,27 +555,18 @@ static void forward_layers(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, c
         if (done)
             continue;
 
-        float *Y = ws->act[l];
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * curr_size))
-#endif
-        for (int64_t s = 0; s < (int64_t)N; s++) {
-            float *row = Y + (size_t)s * curr_size;
-            if (pre) {
-                /* the activation of the values kept; a dropout mask alone, the derivative from them */
-                memcpy(row, pre + (size_t)s * curr_size, (size_t)curr_size * sizeof(float));
-                apply_activation_batch(row, curr_size, act);
-                if (masked)
-                    spingalett_dropout_apply(row, ws->dmask[l] + (size_t)s * curr_size, curr_size, ACT_NONE,
-                                             net->dropout_rates[l], dropout, l, position_offset + (uint32_t)s);
-                continue;
-            }
-            if (type == LAYER_DENSE)
-                spingalett_vec_axpy(row, bias, curr_size, 1.0f);
-            apply_activation_batch(row, curr_size, act);
-            if (masked)
-                spingalett_dropout_apply(row, ws->dmask[l] + (size_t)s * curr_size, curr_size, act,
-                                         net->dropout_rates[l], dropout, l, position_offset + (uint32_t)s);
+        /* the activation and dropout in pieces of the samples (a softmax: over a sample's values, whole samples) */
+        const uint64_t total = (uint64_t)N * curr_size;
+        if (act == ACT_SOFTMAX) {
+            SPINGALETT_PARALLEL_FOR(spingalett_use_omp(mode, total) && N > 1,
+                for (int64_t s = 0; s < (int64_t)N; s++)
+                    activate_part(net, ws, l, pre, masked, dropout, position_offset, (uint32_t)s, 0, curr_size);
+            );
+        } else {
+            SPINGALETT_FOR_PIECES(spingalett_use_omp(mode, total), N, curr_size, s, at, len,
+                activate_part(net, ws, l, pre, masked, dropout, position_offset, (uint32_t)s, (uint32_t)at,
+                              (uint32_t)len);
+            );
         }
     }
 }

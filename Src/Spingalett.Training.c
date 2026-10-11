@@ -422,16 +422,12 @@ static void backprop_layers(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, 
                 !ws->dmask[l] && !pre)
                 continue;
 
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if(spingalett_use_omp(mode, (uint64_t)N * cur_sz))
-#endif
-            for (int64_t s = 0; s < (int64_t)N; s++) {
-                size_t off = (size_t)s * cur_sz;
-                if (ws->dmask[l])
-                    spingalett_vec_mul(ws->delta[l] + off, ws->dmask[l] + off, cur_sz);
-                if (!ws->dmask[l] || pre)
-                    apply_derivative_batch(ws->delta[l] + off, from + off, cur_sz, act);
-            }
+            float *const delta = ws->delta[l], *const dmask = ws->dmask[l];
+            SPINGALETT_FOR_PIECES(spingalett_use_omp(mode, (uint64_t)N * cur_sz), N, cur_sz, s, at, len,
+                const size_t off = (size_t)s * cur_sz + at;
+                if (dmask) spingalett_vec_mul(delta + off, dmask + off, len);
+                if (!dmask || pre) apply_derivative_batch(delta + off, from + off, len, act);
+            );
         }
     }
 }

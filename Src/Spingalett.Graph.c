@@ -114,56 +114,64 @@ uint64_t spingalett_plan_outputs(const NeuralNetwork *net, const uint32_t *uses,
 
 /* ------------------------------------------------------------------------- forward */
 
+/* The sum (multiply: the product) of the inputs' values at base .. base + len - 1, and the activation. */
+static void add_part(const float *const *x, uint32_t count, float *y, uint64_t base, uint64_t len,
+                     ActivationFunction act, bool multiply) {
+    float *restrict o = y + base;
+    if (multiply) {
+        const float *in[SPINGALETT_MAX_INPUTS];
+        for (uint32_t k = 0; k < count; k++) in[k] = x[k] + base;
+        spingalett_engine_multiply(in, count, o, (uint32_t)len);
+    } else if (count == 1) {
+        memcpy(o, x[0] + base, (size_t)len * sizeof(float));
+    } else {
+        const float *restrict a = x[0] + base, *restrict b = x[1] + base;
+        for (uint64_t i = 0; i < len; i++) o[i] = a[i] + b[i];
+        for (uint32_t k = 2; k < count; k++) {
+            const float *restrict c = x[k] + base;
+            for (uint64_t i = 0; i < len; i++) o[i] += c[i];
+        }
+    }
+    apply_activation_batch(o, (uint32_t)len, act);
+}
+
+/* Sums and products of layers in pieces of the samples (a softmax after them: over a sample's values, whole
+   samples). */
+static void combine_parts(const float *const *x, uint32_t count, float *y, uint32_t n, uint64_t size,
+                          ActivationFunction act, bool multiply, ComputeMode mode) {
+    if (act == ACT_SOFTMAX) {
+        SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * size * count),
+            for (int64_t s = 0; s < (int64_t)n; s++) add_part(x, count, y, (uint64_t)s * size, size, act, multiply);
+        );
+    } else {
+        SPINGALETT_FOR_PIECES(spingalett_use_omp(mode, (uint64_t)n * size * count), n, size, s, at, len,
+            add_part(x, count, y, s * size + at, len, act, multiply);
+        );
+    }
+    (void)mode;
+}
+
 void spingalett_add_forward(const float *const *x, uint32_t count, float *y, uint32_t n, uint64_t size,
                             ActivationFunction act, ComputeMode mode) {
-    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * size * count),
-        for (int64_t s = 0; s < (int64_t)n; s++) {
-            const uint64_t base = (uint64_t)s * size;
-            float *restrict o = y + base;
-            const float *restrict a = x[0] + base;
-            if (count == 1) {
-                memcpy(o, a, (size_t)size * sizeof(float));
-            } else {
-                const float *restrict b = x[1] + base;
-                for (uint64_t i = 0; i < size; i++) o[i] = a[i] + b[i];
-                for (uint32_t k = 2; k < count; k++) {
-                    const float *restrict c = x[k] + base;
-                    for (uint64_t i = 0; i < size; i++) o[i] += c[i];
-                }
-            }
-            apply_activation_batch(o, (uint32_t)size, act);
-        }
-    );
-    (void)mode;
+    combine_parts(x, count, y, n, size, act, false, mode);
 }
 
 void spingalett_multiply_forward(const float *const *x, uint32_t count, float *y, uint32_t n, uint64_t size,
                                  ActivationFunction act, ComputeMode mode) {
-    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * size * count),
-        for (int64_t s = 0; s < (int64_t)n; s++) {
-            const uint64_t base = (uint64_t)s * size;
-            const float *in[SPINGALETT_MAX_INPUTS];
-            for (uint32_t k = 0; k < count; k++) in[k] = x[k] + base;
-            spingalett_engine_multiply(in, count, y + base, (uint32_t)size);
-            apply_activation_batch(y + base, (uint32_t)size, act);
-        }
-    );
-    (void)mode;
+    combine_parts(x, count, y, n, size, act, true, mode);
 }
 
 void spingalett_multiply_backward(const float *const *x, uint32_t count, uint32_t k, const float *dy, float *dx,
                                   uint32_t n, uint64_t size, bool accumulate, ComputeMode mode) {
-    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * size * count),
-        for (int64_t s = 0; s < (int64_t)n; s++) {
-            const uint64_t base = (uint64_t)s * size;
-            float *restrict d = dx + base;
-            const float *restrict g = dy + base;
-            for (uint64_t i = 0; i < size; i++) {
-                float v = g[i];
-                for (uint32_t j = 0; j < count; j++)
-                    if (j != k) v *= x[j][base + i];
-                d[i] = accumulate ? d[i] + v : v;
-            }
+    SPINGALETT_FOR_PIECES(spingalett_use_omp(mode, (uint64_t)n * size * count), n, size, s, at, len,
+        const uint64_t base = s * size + at;
+        float *restrict d = dx + base;
+        const float *restrict g = dy + base;
+        for (uint64_t i = 0; i < len; i++) {
+            float v = g[i];
+            for (uint32_t j = 0; j < count; j++)
+                if (j != k) v *= x[j][base + i];
+            d[i] = accumulate ? d[i] + v : v;
         }
     );
     (void)mode;
@@ -258,17 +266,16 @@ void spingalett_global_pool_backward(const float *dy, float *dx, const float *x,
 
 void spingalett_gradient_sum(float *delta, const float *add, const float *y, const float *dmask, uint32_t n,
                              uint64_t size, ActivationFunction act, bool last, ComputeMode mode) {
-    SPINGALETT_PARALLEL_FOR(parallel(mode, n, (uint64_t)n * size),
-        for (int64_t s = 0; s < (int64_t)n; s++) {
-            const uint64_t base = (uint64_t)s * size;
-            float *restrict d = delta + base;
-            if (add) {
-                const float *restrict a = add + base;
-                for (uint64_t i = 0; i < size; i++) d[i] += a[i];
-            }
-            if (!last) continue;
-            if (dmask) spingalett_vec_mul(d, dmask + base, size);
-            else apply_derivative_batch(d, y + base, size, act);
+    SPINGALETT_FOR_PIECES(spingalett_use_omp(mode, (uint64_t)n * size), n, size, s, at, len,
+        const uint64_t base = s * size + at;
+        float *restrict d = delta + base;
+        if (add) {
+            const float *restrict a = add + base;
+            for (uint64_t i = 0; i < len; i++) d[i] += a[i];
+        }
+        if (last) {
+            if (dmask) spingalett_vec_mul(d, dmask + base, len);
+            else apply_derivative_batch(d, y + base, len, act);
         }
     );
     (void)mode;

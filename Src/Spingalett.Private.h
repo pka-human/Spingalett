@@ -57,6 +57,24 @@ static inline int spingalett_thread_num(void) { return omp_get_thread_num(); }
 static inline int spingalett_thread_num(void) { return 0; }
 #endif
 
+/* SPINGALETT_FOR_PIECES(cond, n, size, s, at, len, body): an element-wise pass over n samples of `size` values,
+   in items of at most SPINGALETT_PIECE values (sample s, its values at .. at + len - 1), on the threads when cond
+   holds. A training chunk often holds fewer samples than there are threads (a sequence of a language model is
+   millions of values): items keep every thread busy. A sample's items start at multiples of SPINGALETT_PIECE
+   from its start, so that vector loops (blocks of up to 256 values from where they start, scalar tails) split it
+   where they did when they took it whole: the same bits. */
+#define SPINGALETT_PIECE 8192u
+#define SPINGALETT_FOR_PIECES(cond, n, size, s, at, len, ...) do { \
+    const uint64_t spg_per_ = ((uint64_t)(size) + SPINGALETT_PIECE - 1u) / SPINGALETT_PIECE; \
+    const int64_t spg_items_ = (int64_t)((uint64_t)(n) * spg_per_); \
+    SPINGALETT_PARALLEL_FOR((cond) && spg_items_ > 1, \
+        for (int64_t spg_i_ = 0; spg_i_ < spg_items_; spg_i_++) { \
+            const uint64_t s = (uint64_t)spg_i_ / spg_per_, at = (uint64_t)spg_i_ % spg_per_ * SPINGALETT_PIECE; \
+            const uint64_t len = (uint64_t)(size) - at < SPINGALETT_PIECE ? (uint64_t)(size) - at : SPINGALETT_PIECE; \
+            __VA_ARGS__ \
+        }); \
+} while (0)
+
 #define SPINGALETT_NEURON(net, l, j)        ((net)->neurons[(net)->neuron_offsets[l] + (uint64_t)(j)])
 #define SPINGALETT_LAYER_PTR(net, l)        ((net)->neurons + (net)->neuron_offsets[l])
 
@@ -385,10 +403,14 @@ bool spingalett_has_dropout(const NeuralNetwork *net);
 /* dropout == NULL: inference. Otherwise hidden layers with a dropout rate are masked. */
 float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,
                                const DropoutContext *dropout);
-/* Masks n activations y (outputs of activation act) in place and stores mask * f'(a) in dmask. */
+/* Masks n activations y (outputs of activation act) in place and stores mask * f'(a) in dmask. The _at form masks
+   the values from `offset` on of a sample's (a multiple of 256: the masks and blocks of the whole sample's). */
 void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t n,
                               ActivationFunction act, float rate,
                               const DropoutContext *ctx, uint32_t layer, uint32_t position);
+void spingalett_dropout_apply_at(float *restrict y, float *restrict dmask, uint32_t n, ActivationFunction act,
+                                 float rate, const DropoutContext *ctx, uint32_t layer, uint32_t position,
+                                 uint32_t offset);
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
 /* +1: messages below warnings quiet on this thread until the matching -1 */

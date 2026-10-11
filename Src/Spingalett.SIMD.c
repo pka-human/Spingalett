@@ -386,6 +386,12 @@ static inline uint64_t mix64(uint64_t z) {
 void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t n,
                               ActivationFunction act, float rate,
                               const DropoutContext *ctx, uint32_t layer, uint32_t position) {
+    spingalett_dropout_apply_at(y, dmask, n, act, rate, ctx, layer, position, 0);
+}
+
+void spingalett_dropout_apply_at(float *restrict y, float *restrict dmask, uint32_t n, ActivationFunction act,
+                                 float rate, const DropoutContext *ctx, uint32_t layer, uint32_t position,
+                                 uint32_t offset) {
     /* Unit j is kept when hash(base + j * golden) >= rate * 2^32. */
     uint32_t base = (uint32_t)(mix64(ctx->seed ^ mix64(ctx->step * 0x9E3779B97F4A7C15ull +
                                      ((uint64_t)position << 20) + layer)) >> 32);
@@ -396,7 +402,7 @@ void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t
     for (uint32_t k0 = 0; k0 < n; k0 += 256u) {
         uint32_t len = (n - k0 < 256u) ? n - k0 : 256u;
         for (uint32_t j = 0; j < len; j++)
-            m[j] = hash32(base + (k0 + j) * 0x9E3779B9u) >= threshold ? scale : 0.0f;
+            m[j] = hash32(base + (offset + k0 + j) * 0x9E3779B9u) >= threshold ? scale : 0.0f;
         /* The derivative is taken from the unmasked activation, then both are masked. */
         memcpy(dmask + k0, m, len * sizeof(float));
         apply_derivative_batch(dmask + k0, y + k0, (uint64_t)len, act);
