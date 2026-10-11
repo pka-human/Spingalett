@@ -407,6 +407,15 @@ public:
         a.weight_initialization = static_cast<SpingalettWeightInitialization>(init);
         return add(a);
     }
+    /* a linear map whose matrix is the table of the embedding of index `embedding` (tied input and output
+       embeddings, the heads of GPT-2 and LLaMA): units its vocabulary */
+    Builder &tied_linear(std::uint32_t units, std::uint32_t embedding) {
+        SpingalettLayerArgs a = args(SPINGALETT_LAYER_CONV2D, Activation::None, 0);
+        a.filters = units;
+        a.kernel = 1;
+        a.tied = embedding;
+        return add(a);
+    }
     Builder &embedding(std::uint32_t vocabulary, std::uint32_t width, bool positions = false) {
         SpingalettLayerArgs a = args(SPINGALETT_LAYER_EMBEDDING, Activation::None, width);
         a.vocabulary = vocabulary;

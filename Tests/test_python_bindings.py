@@ -715,7 +715,7 @@ if torch is not None:
             x = x + lin(a, h + "self_attn.o_proj")
             y = rms(x, sd[h + "post_attention_layernorm.weight"])
             x = x + lin(tf.silu(lin(y, h + "mlp.gate_proj")) * lin(y, h + "mlp.up_proj"), h + "mlp.down_proj")
-        return rms(x, sd["model.norm.weight"]) @ sd["lm_head.weight"].T
+        return rms(x, sd["model.norm.weight"]) @ sd.get("lm_head.weight", sd["model.embed_tokens.weight"]).T
 
     torch.manual_seed(11)
     V, T, d, heads = 50, 12, 32, 4
@@ -738,6 +738,14 @@ if torch is not None:
         got = gpt.forward(tokens.numpy().astype(np.float32)).reshape(T, V)
         check(np.abs(got - want).max() < 2e-4, f"gpt2_from_state_dict ({'Conv1D' if conv1d else 'Linear'}): "
               f"{np.abs(got - want).max():.2e} from PyTorch")
+        # the head tied to the token embeddings: one table, trained by both, saved and loaded so
+        check(gpt.layer(-1).tied == 1 and gpt.layer(-1).weight_count == 0, f"gpt2 head tied: {gpt.layer(-1)}")
+        back = sg.Network.from_bytes(gpt.to_bytes())
+        check(back.layer(-1).tied == 1 and np.array_equal(back.forward(tokens.numpy().astype(np.float32)).reshape(T, V), got),
+              "tied gpt2 saved and loaded")
+        model = gpt.to_model(sg.Precision.FLOAT32)
+        check(model.layers[-1].tied == 1 and np.abs(model.predict(tokens.numpy().astype(np.float32)).reshape(T, V) - got).max() < 1e-4,
+              "tied gpt2 as a model")
     for qwen in (False, True):
         kv, ff, theta = 2, 48, 500000.0
         sd = {"model.embed_tokens.weight": r(V, d), "model.norm.weight": 1 + r(d), "lm_head.weight": r(V, d)}
@@ -751,9 +759,12 @@ if torch is not None:
             if qwen:
                 for n, m in (("q", d), ("k", kv * d // heads), ("v", kv * d // heads)):
                     sd[h + f"self_attn.{n}_proj.bias"] = r(m)
+        if qwen:
+            del sd["lm_head.weight"]        # (tie_word_embeddings: no head of its own)
         tokens = torch.randint(0, V, (T,))
         want = ref_llama(sd, tokens, heads, kv, theta, 1e-6).numpy()
         lm = sg.llama_from_state_dict(sd, heads, kv, context=T, rope_theta=theta)
+        check(lm.layer(-1).tied == (1 if qwen else 0), f"llama head tied {qwen}: {lm.layer(-1).tied}")
         got = lm.forward(tokens.numpy().astype(np.float32)).reshape(T, V)
         check(np.abs(got - want).max() < 2e-4, f"llama_from_state_dict ({'with' if qwen else 'no'} biases): "
               f"{np.abs(got - want).max():.2e} from PyTorch")

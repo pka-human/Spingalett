@@ -123,7 +123,9 @@ typedef struct {
     float rope_theta;               /* attention: base of the rotary position embeddings, 0 for none */
     bool causal;                    /* attention: each cell attends to itself and the cells before it */
     bool positions;                 /* embedding: a learned vector added a cell */
-    uint64_t reserved[SPINGALETT_RESERVED - 2];     /* (vocabulary took the padding before them) */
+    uint32_t tied;                  /* dense and linear layers: the embedding whose table they compute with
+                                       (weight_count 0: the table is the embedding's), or 0 */
+    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them) */
 } SpingalettNetworkLayer;
 ```
 
@@ -313,6 +315,11 @@ typedef struct {
                                        (language models) */
     bool positions;                 /* embedding: a learned vector added to each cell (absolute position
                                        embeddings, as GPT-2's) */
+    uint32_t tied;                  /* dense and linear layers: the index of an earlier embedding whose table
+                                       the layer takes as its weights, tied input and output embeddings (GPT-2,
+                                       LLaMA): its outputs the embedding's vocabulary, its inputs a row's values;
+                                       the layer keeps its biases, and the table's gradient is the sum of both
+                                       layers' (0: weights of its own) */
     uint64_t reserved[SPINGALETT_RESERVED - 3];
 } SpingalettLayerArgs;
 ```
@@ -663,7 +670,7 @@ Layer normalization over each cell's channels (a dense layer's outputs).
 
 ### `spingalett_linear()`
 
-A dense layer of .neurons_amount outputs applied to each cell alike: a 1 x 1 convolution, the linear layers of transformers over their tokens.
+A dense layer of .neurons_amount outputs applied to each cell alike: a 1 x 1 convolution, the linear layers of transformers over their tokens; with .tied, the product with an embedding's table (a language model's head tied to its token embeddings).
 
 ```c
 #define spingalett_linear(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_CONV2D, .kernel = 1, __VA_ARGS__})
@@ -1611,7 +1618,7 @@ The inference engine: models over .slett images, without heap or I/O.
 
 Spingalett inference engine.
 
-Runs a network stored as a .slett image (format version 3; 4 for networks with convolution and pooling layers; 5 for networks with batch normalization or grouped convolutions; 6 for networks whose layers read other layers than the one before them, such as residual connections; 7 for transposed convolutions, upsampling and layer normalization; 8 for the layers and activations of transformers: embeddings, attention, RMS normalization, products of layers, GELU and SiLU) in place, in the precision its parameters were saved in. The image can be a file read into memory, a const array compiled into the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing, does no I/O and keeps no global state: apart from the image it only needs a workspace from the caller, so it runs on microcontrollers as well as on desktops, and any number of threads can share one model.
+Runs a network stored as a .slett image (format version 3; 4 for networks with convolution and pooling layers; 5 for networks with batch normalization or grouped convolutions; 6 for networks whose layers read other layers than the one before them, such as residual connections; 7 for transposed convolutions, upsampling and layer normalization; 8 for the layers and activations of transformers: embeddings, attention, RMS normalization, products of layers, GELU and SiLU; 9 for the training features of language models: output layers tied to an embedding's table) in place, in the precision its parameters were saved in. The image can be a file read into memory, a const array compiled into the program (see spingalett_export_c_header) or a region of flash. The engine allocates nothing, does no I/O and keeps no global state: apart from the image it only needs a workspace from the caller, so it runs on microcontrollers as well as on desktops, and any number of threads can share one model.
 
 This header and Src/Spingalett.Inference.c are self-contained. Compiled together with -DSPINGALETT_INFERENCE_ONLY (and Include/ on the include path) they give inference without the rest of the library: no training code, no file I/O, no OpenMP, no heap. The full library includes this header from Spingalett.h and adds loading, quantization and batched inference on top of it.
 
@@ -1619,10 +1626,10 @@ Layers whose weights are stored as INT8, INT4 or INT2 run in integer arithmetic:
 
 ### `SPINGALETT_FORMAT_VERSION`
 
-Newest version of the .slett model format. spingalett_save() writes the oldest version that holds the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one before them, add or concatenate several, or pool globally), 7 with transposed convolutions, upsampling or layer normalization, 8 with embeddings, attention, RMS normalization, products of layers, the GELU and SiLU activations or the sparse cross-entropy loss, so that engines of earlier releases still run what they can; versions 1 and 2 still load.
+Newest version of the .slett model format. spingalett_save() writes the oldest version that holds the network: 3 for dense layers only, 4 with convolution or pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs (layers that read other layers than the one before them, add or concatenate several, or pool globally), 7 with transposed convolutions, upsampling or layer normalization, 8 with embeddings, attention, RMS normalization, products of layers, the GELU and SiLU activations or the sparse cross-entropy loss, 9 with the training features of language models (output layers tied to an embedding's table), so that engines of earlier releases still run what they can; versions 1 and 2 still load.
 
 ```c
-#define SPINGALETT_FORMAT_VERSION 8
+#define SPINGALETT_FORMAT_VERSION 9
 ```
 
 ### `SPINGALETT_MAX_INPUTS`
@@ -1854,13 +1861,15 @@ typedef struct {
     float rope_theta;               /* attention: base of the rotary position embeddings, 0 for none */
     bool causal;                    /* attention: each cell attends to itself and the cells before it */
     bool positions;                 /* embedding: a learned vector added a cell */
-    uint64_t reserved[SPINGALETT_RESERVED - 2];     /* (vocabulary took the padding before them) */
+    uint32_t tied;                  /* dense and linear layers: the network's layer (an embedding) whose table
+                                       are their weights, or 0 */
+    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them) */
 } SpingalettLayerInfo;
 ```
 
 ### `spingalett_model_init()`
 
-Checks a .slett image (format version 3 to 8: header, layer table, shapes, bounds and CRC-32 checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region). Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format versions, which the full library's spingalett_model_load converts).
+Checks a .slett image (format version 3 to 9: header, layer table, shapes, bounds and CRC-32 checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region). Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format versions, which the full library's spingalett_model_load converts).
 
 ```c
 int spingalett_model_init(SpingalettModel *model, const void *image, size_t size);

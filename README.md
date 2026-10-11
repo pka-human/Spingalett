@@ -467,8 +467,8 @@ cross-entropy compares with the next token. A GPT-2 small, and the changes that 
 ```c
 NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
 layer(.net = net, .neurons_amount = 1024);                          /* a window of 1024 tokens */
-uint32_t x = embedding(.net = net, .vocabulary = 50257, .neurons_amount = 768,
-                       .positions = true);                          /* learned positions, as GPT-2's */
+uint32_t e = embedding(.net = net, .vocabulary = 50257, .neurons_amount = 768,
+                       .positions = true), x = e;                   /* learned positions, as GPT-2's */
 for (int b = 0; b < 12; b++) {
     layer_norm(.net = net);
     linear(.net = net, .neurons_amount = 3 * 768);                  /* queries, keys and values */
@@ -481,7 +481,8 @@ for (int b = 0; b < 12; b++) {
     x = add_layers(.net = net, .inputs = {x, a});
 }
 layer_norm(.net = net);
-linear(.net = net, .neurons_amount = 50257);                        /* each position's logits */
+linear(.net = net, .neurons_amount = 50257, .tied = e);             /* each position's logits, with the
+                                                                       embedding's table (tied, as GPT-2's) */
 
 /* LLaMA: RMS normalization, grouped-query attention with rotary embeddings, a SwiGLU MLP */
 uint32_t n = rms_norm(.net = net, .epsilon = 1e-5f);
@@ -513,7 +514,7 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 | Builder or call | Arguments | What it does |
 |---|---|---|
 | `spingalett_embedding()` | `vocabulary`, `neurons_amount` (the width), `positions` | Each token id's vector (ids outside the vocabulary give zeros); with `positions`, a learned vector per position added (the layer's biases) |
-| `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs` | Each position's channels times a matrix, plus biases |
+| `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs`, `tied` | Each position's channels times a matrix, plus biases; with `tied`, an embedding's index, that embedding's table is the matrix (tied input and output embeddings: one table, its gradient the sum of both layers') |
 | `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled; outputs the heads' vectors side by side |
 | `spingalett_rms_norm()` | `epsilon` (1e-5) | Each position's channels over their root mean square, times a gain (no biases) |
 | `spingalett_multiply_layers()` | `inputs` | The element-wise product of layers of one shape |
@@ -529,11 +530,13 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
   pass recomputes the probabilities from each query's log-sum-exp. On the GPU it runs in tiles
   (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16 on
   CUDA), deterministic like everything else.
-- Networks of these layers save to `.slett` files (format 8), become deployment models in every
-  precision (the linear maps in INT8 down to INT2) and run on the runtime and the engine.
+- Networks of these layers save to `.slett` files (format 8; 9 with a tied head, its table stored once),
+  become deployment models in every precision (the linear maps in INT8 down to INT2) and run on the
+  runtime and the engine.
 - `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every
   epoch. In Python, `gpt2_from_state_dict()` and `llama_from_state_dict()` make networks of GPT-2
-  checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2).
+  checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2), the head tied
+  to the embedding when the checkpoint ties them.
 
 ### Importing models: ONNX and PyTorch
 
@@ -1697,7 +1700,7 @@ what 1.0 gave, and only 2.0 may take anything away.
   per release that adds some), so that the loader refuses a library older than the program needs.
   The test `api.abi` compares every release with the one before.
 - **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7;
-  1.2 adds format 8 for transformers)
+  1.2 adds format 8 for transformers, 1.3 format 9 for the training features of language models)
   and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
   later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
   that uses only what it knows.

@@ -177,6 +177,7 @@ pub struct LayerArgs {
     pub rope_theta: f32,
     pub causal: bool,
     pub positions: bool,
+    pub tied: u32,
     pub reserved: [u64; RESERVED - 3],
 }
 
@@ -218,7 +219,8 @@ pub struct NetworkLayer {
     pub rope_theta: f32,
     pub causal: bool,
     pub positions: bool,
-    pub reserved: [u64; RESERVED - 2],
+    pub tied: u32,
+    pub reserved: [u64; RESERVED - 3],
 }
 
 impl Default for NetworkLayer {

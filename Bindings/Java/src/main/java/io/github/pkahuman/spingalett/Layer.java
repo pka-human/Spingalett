@@ -9,7 +9,7 @@ import java.lang.foreign.ValueLayout;
 /** A layer to add to a network: made by a kind's method, then options (each returns the layer). */
 public final class Layer {
     int type, neurons, act, init, height, width, channels, filters, kernel, stride, padding, groups, upsample;
-    int outputPadding, vocabulary, heads, kvHeads;
+    int outputPadding, vocabulary, heads, kvHeads, tied;
     float dropout, epsilon, ropeTheta;
     boolean causal, positions;
     int[] inputs = new int[0];
@@ -90,6 +90,8 @@ public final class Layer {
     public Layer causal(boolean c) { causal = c; return this; }
     public Layer ropeTheta(float t) { ropeTheta = t; return this; }
     public Layer positions(boolean p) { positions = p; return this; }
+    /** A linear layer computing with the table of the embedding of index e (tied input and output embeddings). */
+    public Layer tied(int e) { tied = e; return this; }
     /** The layers it reads (indices that Network.add returned; 0 the input layer); none: the last one. */
     public Layer inputs(int... names) {
         if (names.length > Native.MAX_INPUTS) throw new IllegalArgumentException("a layer reads at most 16 layers");
@@ -123,6 +125,7 @@ public final class Layer {
         Native.set(s, L, "rope_theta", ropeTheta);
         Native.set(s, L, "causal", (byte) (causal ? 1 : 0));
         Native.set(s, L, "positions", (byte) (positions ? 1 : 0));
+        Native.set(s, L, "tied", tied);
         long at = L.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("inputs"));
         for (int k = 0; k < inputs.length; k++) s.set(ValueLayout.JAVA_INT, at + 4L * k, inputs[k]);
         Native.set(s, L, "input_count", inputs.length);

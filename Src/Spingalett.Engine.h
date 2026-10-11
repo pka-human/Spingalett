@@ -58,10 +58,12 @@ typedef struct {
     uint32_t heads, kv_heads;                       /* version 8: attention */
     float theta;                                    /* version 8: attention: rotary embeddings' base */
     bool causal, positions;                         /* version 8: attention, embedding */
+    uint32_t tied;                                  /* version 9: a dense or convolution layer's embedding (a layer
+                                                       index), whose table are its weights (and scales), or 0 */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3 to 8 */
+    uint32_t version;           /* 3 to 9 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;

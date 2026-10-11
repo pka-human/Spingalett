@@ -30,6 +30,9 @@ static void compute_offsets(NeuralNetwork *net) {
     net->total_neurons = n;
     net->total_weights = w;
     net->total_biases = b;
+    /* a layer tied to an embedding computes with its table */
+    for (uint32_t l = 1; l < net->layers; l++)
+        if (net->shapes[l].tied) net->weight_offsets[l - 1] = net->weight_offsets[net->shapes[l].tied - 1];
 }
 
 NeuralNetwork *spingalett_network_new_args(NeuralNetworkArgs args) {
@@ -81,14 +84,35 @@ static bool layer_inputs(const NeuralNetwork *net, const LayerArgs *args, uint32
     return true;
 }
 
+/* A dense or convolution layer's tie to an embedding (args->tied), of shape `shape` reading `in`: an earlier
+   embedding of a table of `outputs` rows of the input's channels (a dense layer's inputs), a pointwise
+   convolution; false (error set) otherwise. */
+static bool layer_tie(const NeuralNetwork *net, const LayerArgs *args, const LayerShape *in, uint32_t in_units,
+                      const LayerShape *shape) {
+    const uint32_t e = args->tied;
+    if (e == 0 || e >= net->layers || net->shapes[e].type != LAYER_EMBEDDING)
+        return layer_error("tied must name an earlier embedding layer");
+    const LayerShape *table = &net->shapes[e];
+    const bool pointwise = shape->type == LAYER_DENSE ||
+                           (shape->kernel_h == 1 && shape->kernel_w == 1 && shape->stride_h == 1 && shape->stride_w == 1 &&
+                            shape->pad_h == 0 && shape->pad_w == 0 && shape->groups == 1);
+    const uint32_t reads = shape->type == LAYER_DENSE ? in_units : in->channels;
+    if (!pointwise || table->vocabulary != shape->channels || table->channels != reads)
+        return layer_error("A layer tied to an embedding is dense or a linear layer (a 1 x 1 convolution) of an output a "
+                           "token of its table and an input a value of a token's row");
+    return true;
+}
+
 /* The shape of a new layer from its arguments and its inputs; false (error set) when they do not
    fit together. */
 static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const uint32_t *inputs, uint32_t count,
                         LayerShape *shape, uint32_t *outputs) {
     *shape = (LayerShape){.type = args->type, .height = 1, .width = 1};
     uint64_t units;
+    if (args->tied && args->type != LAYER_DENSE && args->type != LAYER_CONV2D)
+        return layer_error("Only dense and linear layers are tied to an embedding");
     if (net->layers == 0) {
-        if (args->type != LAYER_DENSE)
+        if (args->type != LAYER_DENSE || args->tied)
             return layer_error("The first layer is the input layer; give it a size or a shape, not a type");
         if (args->height || args->width || args->channels) {
             shape->height = args->height ? args->height : 1;
@@ -104,6 +128,8 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
     } else if (args->type == LAYER_DENSE) {
         units = args->neurons_amount;
         shape->channels = args->neurons_amount;
+        if (args->tied && !layer_tie(net, args, &net->shapes[inputs[0]], net->topology[inputs[0]], shape)) return false;
+        shape->tied = args->tied;
     } else if (args->type == LAYER_ADD || args->type == LAYER_CONCAT || args->type == LAYER_MULTIPLY) {
         /* adding and multiplying: one shape for all; concatenating: one height and width, the channels
            summed */
@@ -277,6 +303,8 @@ static bool layer_shape(const NeuralNetwork *net, const LayerArgs *args, const u
         units = (uint64_t)shape->height * shape->width * shape->channels;
         if (conv && (uint64_t)kh * kw * (in->channels / groups) > UINT32_MAX)
             return layer_error("Convolution windows are limited to 2^32 - 1 inputs");
+        if (args->tied && !layer_tie(net, args, in, net->topology[inputs[0]], shape)) return false;
+        shape->tied = args->tied;
     }
     if (units == 0)
         return layer_error("A layer needs at least one output (neurons_amount, filters or shape)");
@@ -459,6 +487,7 @@ bool spingalett_add_layer(LayerArgs args) {
     }
     if (nl > 1 && spingalett_normalization(shape.type)) { rows = shape.channels; row_len = 1; }
     if (nl > 1 && shape.type == LAYER_EMBEDDING) { rows = shape.vocabulary; row_len = shape.channels; }
+    if (shape.tied) row_len = 0;                /* (the embedding's table: its biases alone) */
     uint64_t add_w = (uint64_t)rows * row_len;
     uint64_t add_b = shape.type == LAYER_RMS_NORM ? 0u
                    : shape.type == LAYER_EMBEDDING ? (shape.positions ? (uint64_t)neurons_amount : 0u) : rows;
@@ -671,6 +700,7 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l) {
     a.act_func = net->act_func[l - 1];
     a.input_count = spingalett_input_count(net, l);
     memcpy(a.inputs, spingalett_inputs(net, l), a.input_count * sizeof(uint32_t));
+    a.tied = s->tied;
     switch (s->type) {
         case LAYER_DENSE:
             a.neurons_amount = net->topology[l];
@@ -752,6 +782,7 @@ bool spingalett_network_layer(const NeuralNetwork *net, uint32_t index, Spingale
     layer->rope_theta = s->theta;
     layer->causal = s->causal;
     layer->positions = s->positions;
+    layer->tied = s->tied;
     if (index > 0) {
         layer->bias_count = spingalett_bias_count(net, index - 1);
         layer->weight_count = spingalett_weight_count(net, index - 1);

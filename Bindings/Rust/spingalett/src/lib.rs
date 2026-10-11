@@ -348,6 +348,12 @@ impl Layer {
         self.args.positions = positions;
         self
     }
+    /// A linear layer computing with the table of the embedding of this index (tied input and output
+    /// embeddings); its outputs the embedding's vocabulary.
+    pub fn tied(mut self, embedding: u32) -> Self {
+        self.args.tied = embedding;
+        self
+    }
 }
 
 /// Options of Network::train() (the defaults: 10 epochs of mini-batches of 32, Adam at 0.001).

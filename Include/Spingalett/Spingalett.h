@@ -91,7 +91,9 @@ typedef struct {
     float rope_theta;               /* attention: base of the rotary position embeddings, 0 for none */
     bool causal;                    /* attention: each cell attends to itself and the cells before it */
     bool positions;                 /* embedding: a learned vector added a cell */
-    uint64_t reserved[SPINGALETT_RESERVED - 2];     /* (vocabulary took the padding before them) */
+    uint32_t tied;                  /* dense and linear layers: the embedding whose table they compute with
+                                       (weight_count 0: the table is the embedding's), or 0 */
+    uint64_t reserved[SPINGALETT_RESERVED - 3];     /* (vocabulary took the padding before them) */
 } SpingalettNetworkLayer;
 
 /* Which parameters spingalett_get_parameters() and spingalett_set_parameters() copy. */
@@ -243,6 +245,11 @@ typedef struct {
                                        (language models) */
     bool positions;                 /* embedding: a learned vector added to each cell (absolute position
                                        embeddings, as GPT-2's) */
+    uint32_t tied;                  /* dense and linear layers: the index of an earlier embedding whose table
+                                       the layer takes as its weights, tied input and output embeddings (GPT-2,
+                                       LLaMA): its outputs the embedding's vocabulary, its inputs a row's values;
+                                       the layer keeps its biases, and the table's gradient is the sum of both
+                                       layers' (0: weights of its own) */
     uint64_t reserved[SPINGALETT_RESERVED - 3];
 } SpingalettLayerArgs;
 
@@ -480,7 +487,8 @@ SPINGALETT_API SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkA
 /* The layers of transformers. A sequence of n tokens is a layer of 1 x n cells, each of its channels
    (the input layer: n values, the tokens' indices as floats). */
 /* A dense layer of .neurons_amount outputs applied to each cell alike: a 1 x 1 convolution, the linear
-   layers of transformers over their tokens. */
+   layers of transformers over their tokens; with .tied, the product with an embedding's table (a language
+   model's head tied to its token embeddings). */
 #define spingalett_linear(...) spingalett_append_layer((SpingalettLayerArgs){.type = SPINGALETT_LAYER_CONV2D, .kernel = 1, __VA_ARGS__})
 /* Token embeddings: each input value the index of a row of .vocabulary rows of .neurons_amount values;
    .positions adds a learned vector a cell. */

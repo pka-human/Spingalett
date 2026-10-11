@@ -241,6 +241,13 @@ final class Layer
         return $this;
     }
 
+    /** Linear: computes with the table of the embedding of index $embedding (tied input and output embeddings). */
+    public function tied(int $embedding): self
+    {
+        $this->fields['tied'] = $embedding;
+        return $this;
+    }
+
     /** The layers it reads (indices Network::add() returned; 0 the input layer); none: the one before. */
     public function inputs(int ...$inputs): self
     {

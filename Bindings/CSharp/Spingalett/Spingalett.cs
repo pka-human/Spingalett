@@ -96,6 +96,8 @@ public sealed unsafe class Layer
     public Layer Causal(bool causal = true) { Args.causal = (byte)(causal ? 1 : 0); return this; }
     public Layer RopeTheta(float theta) { Args.rope_theta = theta; return this; }
     public Layer Positions(bool positions = true) { Args.positions = (byte)(positions ? 1 : 0); return this; }
+    /// <summary>A linear layer computing with the table of the embedding of this index (tied embeddings).</summary>
+    public Layer Tied(uint embedding) { Args.tied = embedding; return this; }
     /// <summary>The layers it reads (indices that Network.Add returned); none: the last one.</summary>
     public Layer Inputs(params uint[] inputs)
     {

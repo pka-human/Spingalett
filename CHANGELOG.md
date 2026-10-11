@@ -8,6 +8,16 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Tied input and output embeddings** (`SpingalettLayerArgs.tied`, `.tied = e` on a linear or dense layer):
+  a language model's head computing with embedding `e`'s table, as GPT-2's and LLaMA's tied heads do, on
+  the CPU, both GPU backends, the engine, deployment models and the runtime. The table is stored once and
+  stepped by the sum of both layers' gradients, added in a fixed order (on the CPU the embedding's first,
+  on the GPU the head's); the head keeps its biases. `.slett` format 9 records the tie (offset 104 of the
+  head's entry, its weights and scales those of the embedding's section), which the writer picks only
+  for networks with a tie; `SpingalettNetworkLayer.tied` and `SpingalettLayerInfo.tied` name it. In Python
+  `add_linear(..., tied=e)`, and `gpt2_from_state_dict()` and `llama_from_state_dict()` tie the head when
+  the checkpoint does (no `lm_head.weight`, or the embeddings' values) instead of copying the table; the
+  C++ builder's `tied_linear()` and the other bindings' `tied` options.
 - **Gradient accumulation** in `spingalett_train()` (`SpingalettTrainArgs.accumulation_steps`, on the CPU
   and both GPU backends): an optimizer step after every `accumulation_steps` mini-batches of
   `batch_size` samples (with a generator, calls of it), with the mean gradient of the step's samples

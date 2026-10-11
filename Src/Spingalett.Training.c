@@ -432,7 +432,9 @@ static void batch_backprop_hidden(NeuralNetwork *net, BatchWorkspace *ws, uint32
 
 /* grad = scale * (sum over the chunk) + beta * grad, so chunks of one step accumulate. With an
    optimizer step `o`, each layer is updated as soon as its gradient is complete, while the
-   gradient is still in cache (the gradient must then be the whole step's, unclipped). */
+   gradient is still in cache (the gradient must then be the whole step's, unclipped). A layer tied to an
+   embedding adds its weight gradient to the table's, which the embedding (an earlier layer) has written,
+   and the table is updated after it. */
 static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                                        float scale, float beta, ComputeMode mode, const OptimizerStep *o) {
     for (uint32_t l = 0; l + 1 < net->layers; l++) {
@@ -440,12 +442,13 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
         uint32_t in_sz  = net->topology[src];
         uint32_t out_sz = net->topology[l + 1];
         LayerType type = net->shapes[l + 1].type;
+        const uint32_t tied = net->shapes[l + 1].tied;
 
         if (type == LAYER_DENSE) {
             /* gW[out x in] = delta^T[out x N] * act[N x in] */
             spingalett_gemm(ws->gemm, mode, true, false, out_sz, in_sz, N, scale,
                             ws->delta[l + 1], out_sz, ws->act[src], in_sz,
-                            beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
+                            tied ? 1.0f : beta, SPINGALETT_GRAD_W_MTX_PTR(net, l), in_sz);
 
             float *gB = net->grad_biases + net->bias_offsets[l];
             if (beta == 0.0f)
@@ -453,8 +456,11 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
             for (uint32_t s = 0; s < N; s++)
                 spingalett_vec_axpy(gB, ws->delta[l + 1] + (size_t)s * out_sz, out_sz, scale);
         } else if (type == LAYER_CONV2D) {
-            spingalett_conv_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
-                                             ws->gemm, mode);
+            /* tied: the weight gradient added to the table's, the biases' started at zero */
+            if (tied && beta == 0.0f)
+                memset(net->grad_biases + net->bias_offsets[l], 0, spingalett_bias_count(net, l) * sizeof(float));
+            spingalett_conv_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, tied ? 1.0f : beta,
+                                             ws->conv, ws->gemm, mode);
         } else if (type == LAYER_CONV_TRANSPOSE2D) {
             spingalett_conv_transpose_backward_weights(net, l, ws->act[src], ws->delta[l + 1], N, scale, beta, ws->conv,
                                                        ws->gemm, mode);
@@ -481,10 +487,13 @@ static void batch_accumulate_gradients(NeuralNetwork *net, BatchWorkspace *ws, u
         }
 
         if (o) {
+            /* a tied table's step after the tied layer's gradient, as the embedding's weights */
+            const uint32_t owner = tied ? tied - 1u : l;
             uint64_t w = net->weight_offsets[l], b = net->bias_offsets[l];
-            optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
-                                   net->grad_weights + w, spingalett_weight_count(net, l),
-                                   layer_decay(net, l, o->decay), mode);
+            if (tied || type != LAYER_EMBEDDING || !spingalett_table_tied(net, l + 1))
+                optimizer_update_array(o, net->weights + w, net->opt_m_weights + w, net->opt_v_weights + w,
+                                       net->grad_weights + w, spingalett_weight_count(net, owner),
+                                       layer_decay(net, owner, o->decay), mode);
             optimizer_update_array(o, net->biases + b, net->opt_m_biases + b, net->opt_v_biases + b,
                                    net->grad_biases + b, spingalett_bias_count(net, l), 0.0f, mode);
         }

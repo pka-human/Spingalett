@@ -289,6 +289,9 @@ func (l Layer) Causal(c bool) Layer          { l.args.causal = C.bool(c); return
 func (l Layer) RopeTheta(t float32) Layer    { l.args.rope_theta = C.float(t); return l }
 func (l Layer) Positions(p bool) Layer       { l.args.positions = C.bool(p); return l }
 
+// Tied makes a linear layer compute with the table of the embedding of index e (tied input and output embeddings).
+func (l Layer) Tied(e uint32) Layer { l.args.tied = C.uint32_t(e); return l }
+
 // Inputs names the layers it reads (indices Add returned; 0 the input layer); none: the last one.
 func (l Layer) Inputs(inputs ...uint32) Layer {
 	for k, i := range inputs {

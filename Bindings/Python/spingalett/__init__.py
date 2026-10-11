@@ -235,7 +235,8 @@ class _NetworkLayer(Structure):
         ("rope_theta", c_float),
         ("causal", c_bool),
         ("positions", c_bool),
-        ("reserved", c_uint64 * (_RESERVED - 2)),
+        ("tied", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 3)),
     ]
 
 
@@ -320,6 +321,7 @@ class _LayerArgs(Structure):
         ("rope_theta", c_float),
         ("causal", c_bool),
         ("positions", c_bool),
+        ("tied", c_uint32),
         ("reserved", c_uint64 * (_RESERVED - 3)),
     ]
 
@@ -578,7 +580,8 @@ class _LayerInfo(Structure):
         ("rope_theta", c_float),
         ("causal", c_bool),
         ("positions", c_bool),
-        ("reserved", c_uint64 * (_RESERVED - 2)),
+        ("tied", c_uint32),
+        ("reserved", c_uint64 * (_RESERVED - 3)),
     ]
 
 
@@ -1081,12 +1084,14 @@ class LayerNorm:
 @dataclasses.dataclass(frozen=True)
 class Linear:
     """A dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution): the linear
-    layers of transformers over their tokens."""
+    layers of transformers over their tokens; with ``tied`` (an embedding's index), the transposed product
+    with that embedding's table (tied input and output embeddings)."""
     neurons: int
     activation: Activation = Activation.NONE
     init: Init = Init.LECUN
     dropout: float = 0.0
     inputs: _Inputs = None
+    tied: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1157,6 +1162,7 @@ class LayerDescription:
     rope_theta: float = 0.0         # attention: base of the rotary position embeddings (0: none)
     causal: bool = False            # attention: each cell attends to the cells up to itself
     positions: bool = False         # embedding: a learned vector a cell
+    tied: int = 0                   # dense and linear layers: the embedding whose table are their weights
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1363,7 +1369,8 @@ class Network:
             elif isinstance(spec, LayerNorm):
                 self.add_layer_norm(spec.activation, spec.epsilon, spec.dropout, inputs=spec.inputs)
             elif isinstance(spec, Linear):
-                self.add_linear(spec.neurons, spec.activation, spec.init, spec.dropout, inputs=spec.inputs)
+                self.add_linear(spec.neurons, spec.activation, spec.init, spec.dropout, inputs=spec.inputs,
+                                tied=spec.tied)
             elif isinstance(spec, Embedding):
                 self.add_embedding(spec.vocabulary, spec.size, spec.positions, spec.activation, spec.init, spec.dropout,
                                    inputs=spec.inputs)
@@ -1525,11 +1532,14 @@ class Network:
                          dropout_rate=float(dropout))
 
     def add_linear(self, neurons: int, activation: Activation = Activation.NONE, init: Init = Init.LECUN,
-                   dropout: float = 0.0, inputs: _Inputs = None) -> "Network":
+                   dropout: float = 0.0, inputs: _Inputs = None, tied: int = 0) -> "Network":
         """Append a dense layer of ``neurons`` outputs applied to each cell alike (a 1 x 1 convolution),
-        the linear layers of transformers over their tokens."""
+        the linear layers of transformers over their tokens. ``tied``, an earlier embedding's index, makes it
+        compute with that embedding's table (``neurons`` its vocabulary, its inputs a row's values): tied input
+        and output embeddings, the table trained by both layers' gradients; the layer keeps its biases."""
         return self._add(inputs, type=int(LayerType.CONV2D), filters=int(neurons), kernel=1,
-                         act_func=int(activation), weight_initialization=int(init), dropout_rate=float(dropout))
+                         act_func=int(activation), weight_initialization=int(init), dropout_rate=float(dropout),
+                         tied=int(tied))
 
     def add_embedding(self, vocabulary: int, size: int, positions: bool = False,
                       activation: Activation = Activation.NONE, init: Init = Init.LECUN, dropout: float = 0.0,
@@ -1576,7 +1586,7 @@ class Network:
                                 int(info.weight_count), int(info.bias_count), int(info.groups), float(info.epsilon),
                                 float(info.momentum), tuple(int(info.inputs[k]) for k in range(info.input_count)),
                                 int(info.vocabulary), int(info.heads), int(info.kv_heads), float(info.rope_theta),
-                                bool(info.causal), bool(info.positions))
+                                bool(info.causal), bool(info.positions), int(info.tied))
 
     @property
     def layers(self) -> List[LayerDescription]:
@@ -2122,6 +2132,7 @@ class LayerInfo:
     rope_theta: float = 0.0             # attention: base of the rotary position embeddings (0: none)
     causal: bool = False                # attention: each cell attends to the cells up to itself
     positions: bool = False             # embedding: a learned vector a cell
+    tied: int = 0                       # dense and linear layers: the embedding (network layer) whose table
 
 
 class Model:
@@ -2219,7 +2230,7 @@ class Model:
                                  input_layers=tuple(int(info.input_layers[k]) for k in range(info.input_count)),
                                  vocabulary=int(info.vocabulary), heads=int(info.heads), kv_heads=int(info.kv_heads),
                                  rope_theta=float(info.rope_theta), causal=bool(info.causal),
-                                 positions=bool(info.positions)))
+                                 positions=bool(info.positions), tied=int(info.tied)))
         return out
 
     def to_bytes(self) -> bytes:
@@ -2375,9 +2386,10 @@ def gpt2_from_state_dict(state, heads: int, context: Optional[int] = None,
     values' weights. ``heads`` is the model's attention heads (12 for GPT-2 small); ``context`` the window of
     the network (tokens a sample; at most the model's positions, all of them when None); ``activation`` the
     MLP's GELU (default: Hugging Face's tanh approximation, nanoGPT's erf). The language model head is
-    ``lm_head.weight`` when the state dict has one, else tied to the token embeddings, as GPT-2's is. The
-    network's input is a window of token ids, its outputs each position's logits; it trains on, generates
-    with and saves like any other (the weights are copied, the head no longer tied)."""
+    ``lm_head.weight`` when the state dict has one that differs from the token embeddings, else a linear layer
+    tied to the embedding's table (``tied=1``), as GPT-2's is: the table is stored once and trained by the
+    gradients of both. The network's input is a window of token ids, its outputs each position's logits; it
+    trains on, generates with and saves like any other (the weights are copied)."""
     p = _prefix(state, "wte.weight")
     wte, wpe = _tensor(state[p + "wte.weight"]), _tensor(state[p + "wpe.weight"])
     vocabulary, width = wte.shape
@@ -2423,13 +2435,24 @@ def gpt2_from_state_dict(state, heads: int, context: Optional[int] = None,
         x = net.last
     net.add_layer_norm()
     sets.append((net.last - 1, _tensor(state[p + "ln_f.weight"]), bias(p + "ln_f.bias", width)))
-    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else wte
-    net.add_linear(vocabulary)
-    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    _head(net, state, wte, vocabulary, sets)
     for index, w, b in sets:
-        net.set_weights(index, w)
+        if w is not None:
+            net.set_weights(index, w)
         net.set_biases(index, b)
     return net
+
+
+def _head(net: "Network", state, table: np.ndarray, vocabulary: int, sets) -> None:
+    """The language model head: lm_head.weight, or (when the state dict has none, or the token embeddings'
+    values: the checkpoint ties them) a linear layer tied to the embedding, layer 1."""
+    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else None
+    if head is None or np.array_equal(head, table):
+        net.add_linear(vocabulary, tied=1)
+        sets.append((net.last - 1, None, np.zeros(vocabulary, dtype=np.float32)))
+    else:
+        net.add_linear(vocabulary)
+        sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
 
 
 def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, context: int = 2048,
@@ -2439,7 +2462,8 @@ def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, con
     attention with rotary embeddings (rotate_half, as Hugging Face stores the weights), a SwiGLU MLP. ``heads``
     and ``kv_heads`` are the config's num_attention_heads and num_key_value_heads (None: as many), ``rope_theta``
     and ``epsilon`` its rope_theta and rms_norm_eps; ``context`` the network's window of tokens. The language
-    model head is lm_head.weight, else tied to the token embeddings."""
+    model head is lm_head.weight when it differs from the token embeddings, else (tie_word_embeddings) a linear
+    layer tied to the embedding's table."""
     p = _prefix(state, "embed_tokens.weight")
     embed = _tensor(state[p + "embed_tokens.weight"])
     vocabulary, width = embed.shape
@@ -2486,11 +2510,10 @@ def llama_from_state_dict(state, heads: int, kv_heads: Optional[int] = None, con
         x = net.last
     net.add_rms_norm(epsilon=epsilon)
     sets.append((net.last - 1, _tensor(state[p + "norm.weight"]), None))
-    head = _tensor(state["lm_head.weight"]) if "lm_head.weight" in state else embed
-    net.add_linear(vocabulary)
-    sets.append((net.last - 1, head, np.zeros(vocabulary, dtype=np.float32)))
+    _head(net, state, embed, vocabulary, sets)
     for index, w, b in sets:
-        net.set_weights(index, w)
+        if w is not None:
+            net.set_weights(index, w)
         if b is not None:
             net.set_biases(index, b)
     if head_size * heads != width:

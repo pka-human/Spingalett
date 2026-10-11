@@ -107,7 +107,8 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
-    uint64_t reserved[8 - 2];
+    uint32_t tied;
+    uint64_t reserved[8 - 3];
 } SpingalettLayerInfo;
 
 int spingalett_model_init(SpingalettModel *model, const void *image, size_t size);
@@ -228,7 +229,8 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
-    uint64_t reserved[8 - 2];
+    uint32_t tied;
+    uint64_t reserved[8 - 3];
 } SpingalettNetworkLayer;
 
 typedef enum {
@@ -333,6 +335,7 @@ typedef struct {
     float rope_theta;
     bool causal;
     bool positions;
+    uint32_t tied;
     uint64_t reserved[8 - 3];
 } SpingalettLayerArgs;
 

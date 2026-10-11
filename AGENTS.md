@@ -95,10 +95,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   produce the same 32-bit sums; tests compare with `== 0`, not with a tolerance.
 - **IEEE order in inference.** `Inference.c` and `Model.c` are compiled without reassociation or
   contraction; epilogues use `spingalett_int_output()` so every path rounds alike.
-- **Formats.** `.slett` versions 3 to 8 stay loadable; the writer picks the lowest version that
+- **Formats.** `.slett` versions 3 to 9 stay loadable; the writer picks the lowest version that
   can hold the network (chains 3 to 5, graphs 6, transposed convolutions, upsampling and layer
   normalization 7, embeddings, attention, RMS normalization, products of layers, GELU and SiLU, the
-  sparse cross-entropy 8). Any change to the format updates `docs/ModelFormat.md` and adds a version.
+  sparse cross-entropy 8, layers tied to an embedding 9). Any change to the format updates `docs/ModelFormat.md` and adds a version.
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.

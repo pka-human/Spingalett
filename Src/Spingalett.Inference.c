@@ -1336,6 +1336,8 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         layer->positions = (layer->mode & 1u) != 0;
         layer->mode = 0;
     }
+    if (version >= 9u && (layer->type == LAYER_DENSE || layer->type == LAYER_CONV2D))
+        layer->tied = slett_get32(e + 104);     /* the embedding whose table are its weights */
     uint64_t in_cells = (uint64_t)layer->in_h * layer->in_w, out_cells = (uint64_t)layer->out_h * layer->out_w;
     layer->in_c = in_cells ? (uint32_t)(layer->inputs / in_cells) : 0u;
     layer->out_c = out_cells ? (uint32_t)(layer->outputs / out_cells) : 0u;
@@ -1508,9 +1510,9 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
     if (!spingalett_host_is_little_endian())
         return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: the .slett format needs a little-endian host");
     if (size < 8 || memcmp(p, SLETT_MAGIC, 6) != 0)
-        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3 to 8 image");
+        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3 to 9 image");
     uint16_t version = slett_get16(p + 6);
-    if (version < 3 || version > 8)
+    if (version < 3 || version > 9)
         return ENGINE_FAIL(SPINGALETT_ERR_FORMAT_VERSION, "model: unsupported format version");
     if (size < SLETT_HEADER_SIZE)
         return ENGINE_FAIL(SPINGALETT_ERR_FILE_IO, "model: image is truncated");
@@ -1553,6 +1555,18 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
             (unsigned)L.activation >= ACT_COUNT || (unsigned)L.precision >= PRECISION_COUNT ||
             !(L.dropout >= 0.0f && L.dropout < 1.0f) || (version >= 4 && !shape_ok(&L, version)))
             return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
+        if (L.tied) {
+            /* version 9: a dense layer or a pointwise convolution whose weights (and scales) are the table of an
+               embedding before it, of a row a token of its outputs and a value of its inputs */
+            SlettLayer E;
+            bool tie = L.tied <= i;
+            if (tie) spingalett_slett_layer(p, L.tied - 1u, &E);
+            tie = tie && E.type == LAYER_EMBEDDING && E.rows == L.rows && E.row_len == L.row_len &&
+                  E.precision == L.precision && E.weights == L.weights && E.scales == L.scales &&
+                  (L.type == LAYER_DENSE || (L.kernel_h == 1 && L.kernel_w == 1 && L.stride_h == 1 && L.stride_w == 1 &&
+                                             L.pad_h == 0 && L.pad_w == 0 && L.groups == 1));
+            if (!tie) return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
+        }
         bool norm = L.type == LAYER_BATCH_NORM, layer_norm = L.type == LAYER_LAYER_NORM || L.type == LAYER_RMS_NORM;
         bool embedding = L.type == LAYER_EMBEDDING;
         bool weighted = L.type == LAYER_DENSE || L.type == LAYER_CONV2D || L.type == LAYER_CONV_TRANSPOSE2D || norm ||
@@ -1575,7 +1589,7 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
                       (!norm || section_ok(L.scales, (uint64_t)L.rows * 8u, file_size, 4)) &&
                       (!layer_norm || L.scales == 0) && (!embedding || is_int || L.scales == 0);
             if (ok && (info->flags & SLETT_FLAG_OPTIMIZER)) {
-                uint64_t weights = (uint64_t)L.rows * L.row_len;
+                uint64_t weights = L.tied ? 0u : (uint64_t)L.rows * L.row_len;      /* (a tied table's: the embedding's) */
                 ok = weights <= file_size / 8u &&
                      section_ok(L.optimizer, (2u * weights + 2u * biases) * 4u, file_size, 4);
             }
@@ -1657,6 +1671,7 @@ bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, Spinga
     info->rope_theta = L.theta;
     info->causal = L.causal;
     info->positions = L.positions;
+    info->tied = L.tied;
     info->input_count = L.input_count;
     for (uint32_t k = 0; k < L.input_count; k++)
         info->input_layers[k] = spingalett_slett_input((const uint8_t *)model->image, &L, k);

@@ -2715,7 +2715,7 @@ static void model_validation(void) {
     }
 
     memcpy(buf, img, size);
-    buf[6] = 9;                                                  /* a future format version */
+    buf[6] = SPINGALETT_FORMAT_VERSION + 1;                       /* a future format version */
     reseal(buf, size);
     CHECK(spingalett_model_init(&m, buf, size) == SPINGALETT_ERR_FORMAT_VERSION, "validation: future version");
     CHECK(spingalett_model_init(NULL, img, size) == SPINGALETT_ERR_INVALID && spingalett_model_init(&m, NULL, size) == SPINGALETT_ERR_INVALID,
@@ -4136,6 +4136,18 @@ static NeuralNetwork *tf_net(int which, uint32_t T, uint32_t V) {
             attention(.net = net, .heads = 2, .kv_heads = 1, .act_func = ACT_GELU_TANH);
             layer(.net = net, .neurons_amount = 3, .act_func = ACT_TANH);
             return net;
+        case 4:     /* tied input and output embeddings (GPT-2's head): the output layer computes with the table */
+            net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+            layer(.net = net, .neurons_amount = T);
+            x = embedding(.net = net, .vocabulary = V, .neurons_amount = 8, .positions = true);
+            layer_norm(.net = net);
+            linear(.net = net, .neurons_amount = 24);
+            attention(.net = net, .heads = 2, .causal = true);
+            a = linear(.net = net, .neurons_amount = 8);
+            add_layers(.net = net, .inputs = {x, a});
+            layer_norm(.net = net, .act_func = ACT_GELU);
+            linear(.net = net, .neurons_amount = V, .tied = x);
+            return net;
         default:    /* products of three layers and of a layer with itself, SiLU and GELU outputs read twice */
             net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
             layer(.net = net, .neurons_amount = T);
@@ -4308,10 +4320,11 @@ static void tf_learns(ComputeMode mode) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
-/* Deployment models and files of transformers: format 8, every precision, the engine and batches. */
+/* Deployment models and files of transformers: format 8 (9 with a tied head), every precision, the engine and
+   batches. */
 static void tf_models(void) {
     const uint32_t T = 9, V = 10, N = 37;
-    for (int which = 0; which < 4; which++) {
+    for (int which = 0; which < 5; which++) {
         lcg_state = 4242 + which;
         NeuralNetwork *net = tf_net(which, T, V);
         tf_init(net);
@@ -4325,7 +4338,8 @@ static void tf_models(void) {
         /* the file: version 8, the same network back */
         size_t size = 0;
         void *img = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &size);
-        CHECK(img && ((const uint8_t *)img)[6] == 8, "transformer models net %d: format 8", which);
+        const uint8_t format = which == 4 ? 9 : 8;
+        CHECK(img && ((const uint8_t *)img)[6] == format, "transformer models net %d: format %u", which, format);
         NeuralNetwork *back = img ? spingalett_load_from_memory(img, size) : NULL;
         CHECK(back && back->total_weights == net->total_weights && back->total_biases == net->total_biases &&
               !memcmp(back->weights, net->weights, net->total_weights * 4) &&
@@ -4371,10 +4385,90 @@ static void tf_models(void) {
             }
             spingalett_model_free(m);
         }
-        printf("  transformer models net %d: format 8 round trip, the engine and batches in every precision\n", which);
+        printf("  transformer models net %d: format %u round trip, the engine and batches in every precision\n", which,
+               format);
         free(ref); free(got); free(one); free(x); free(y);
         free_network(net);
     }
+}
+
+/* Tied input and output embeddings: the head computes with the table, as an untied head holding a copy of it
+   does, and the table's step is the sum of the embedding's and the head's; the layers' other parameters step
+   alike; ties that do not fit are refused. */
+static void tf_tied(void) {
+    const uint32_t T = 6, V = 9, N = 16;
+    NeuralNetwork *nets[2];
+    for (int k = 0; k < 2; k++) {
+        lcg_state = 606;
+        if (k == 0) {
+            nets[k] = tf_net(4, T, V);
+        } else {                            /* the same layers, the head with weights of its own */
+            NeuralNetwork *net = nets[k] = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+            layer(.net = net, .neurons_amount = T);
+            uint32_t x = embedding(.net = net, .vocabulary = V, .neurons_amount = 8, .positions = true);
+            layer_norm(.net = net);
+            linear(.net = net, .neurons_amount = 24);
+            attention(.net = net, .heads = 2, .causal = true);
+            uint32_t a = linear(.net = net, .neurons_amount = 8);
+            add_layers(.net = net, .inputs = {x, a});
+            layer_norm(.net = net, .act_func = ACT_GELU);
+            linear(.net = net, .neurons_amount = V);
+        }
+    }
+    NeuralNetwork *tied = nets[0], *own = nets[1];
+    lcg_state = 607;
+    tf_init(tied);
+    const uint64_t table = (uint64_t)V * 8, nw = tied->total_weights, nb = tied->total_biases;
+    const uint32_t head = tied->layers - 1;
+    CHECK(own->total_weights == nw + table && own->total_biases == nb && tied->weight_offsets[head - 1] == 0,
+          "tied head: %llu weights against %llu", (unsigned long long)nw, (unsigned long long)own->total_weights);
+    memcpy(own->weights, tied->weights, nw * 4);
+    memcpy(own->weights + nw, tied->weights, table * 4);       /* (the table is the embedding's, at 0) */
+    memcpy(own->biases, tied->biases, nb * 4);
+    float *x, *y;
+    lcg_state = 608;
+    tf_data(tied, N, V, &x, &y);
+    float *pt = malloc((size_t)N * T * V * 4), *po = malloc((size_t)N * T * V * 4);
+    predict(.net = tied, .inputs = x, .sample_count = N, .outputs = pt);
+    predict(.net = own, .inputs = x, .sample_count = N, .outputs = po);
+    const bool same = !memcmp(pt, po, (size_t)N * T * V * 4);
+    float *w0 = malloc((nw + table) * 4);
+    memcpy(w0, own->weights, (nw + table) * 4);
+    for (int k = 0; k < 2; k++)
+        train(.net = nets[k], .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 1.0f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_FULL_BATCH);
+    /* the table moves by both gradients; everything else as the untied network moves */
+    double worst = 0.0, top = 0.0;
+    for (uint64_t i = 0; i < table; i++) {
+        const double both = ((double)w0[i] - own->weights[i]) + ((double)w0[nw + i] - own->weights[nw + i]);
+        worst = fmax(worst, fabs(((double)w0[i] - tied->weights[i]) - both));
+        top = fmax(top, fabs(both));
+    }
+    const bool rest = !memcmp(tied->weights + table, own->weights + table, (nw - table) * 4) &&
+                      !memcmp(tied->biases, own->biases, nb * 4);
+    printf("  tied embeddings: outputs alike %s, table steps by both gradients %.1e (of %.1e), the rest alike %s\n",
+           same ? "yes" : "no", worst, top, rest ? "yes" : "no");
+    CHECK(same && rest && worst <= 1e-6 * top && top > 0.0, "tied embeddings: outputs %d, table %.3e of %.3e, rest %d",
+          same, worst, top, rest);
+
+    /* ties that do not fit */
+    spingalett_set_log_level(LOG_NONE);
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = T);
+    uint32_t e = embedding(.net = net, .vocabulary = V, .neurons_amount = 8);
+    uint32_t l = linear(.net = net, .neurons_amount = 8);
+    CHECK(linear(.net = net, .neurons_amount = V, .tied = l) == SPINGALETT_NO_LAYER, "a tie to a linear layer accepted");
+    CHECK(linear(.net = net, .neurons_amount = V + 1, .tied = e) == SPINGALETT_NO_LAYER, "a tie of other outputs accepted");
+    CHECK(conv2d(.net = net, .filters = V, .kernel = 3, .padding = 1, .tied = e) == SPINGALETT_NO_LAYER,
+          "a tied convolution of a window accepted");
+    CHECK(attention(.net = net, .heads = 2, .tied = e) == SPINGALETT_NO_LAYER, "a tied attention accepted");
+    CHECK(layer(.net = net, .neurons_amount = V, .tied = e) == SPINGALETT_NO_LAYER,
+          "a dense layer of the flattened cells tied accepted");
+    CHECK(linear(.net = net, .neurons_amount = V, .tied = e) != SPINGALETT_NO_LAYER, "a fitting tie refused");
+    free_network(net);
+    spingalett_set_log_level(LOG_WARNING);
+    free(pt); free(po); free(w0); free(x); free(y);
+    free_network(tied); free_network(own);
 }
 
 static void tf_validation(void) {
@@ -6223,10 +6317,11 @@ int main(int argc, char **argv) {
         ComputeMode cm[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENBLAS};
         TrainingStrategy strats[] = {STRATEGY_FULL_BATCH, STRATEGY_SMALL_BATCH};
         for (int m = 0; m < 2; m++) for (int s = 0; s < 2; s++)
-            for (int k = 0; k < 4; k++) tf_gradcheck(k, cm[m], strats[s]);
+            for (int k = 0; k < 5; k++) tf_gradcheck(k, cm[m], strats[s]);
         tf_gradcheck(1, cm[2], STRATEGY_FULL_BATCH);
         tf_determinism();
         tf_models();
+        tf_tied();
         tf_validation();
         tf_learns(COMPUTE_OPENMP);
     }
@@ -6382,7 +6477,7 @@ int main(int argc, char **argv) {
             gpu_device_data();
             gpu_device_data_threads();
             gpu_bf16();
-            for (int k = 0; k < 4; k++) gpu_transformer(k);
+            for (int k = 0; k < 5; k++) gpu_transformer(k);
             gpu_transformer_trainer();
             gpu_flash(32, false, 4);
             gpu_flash(64, true, 2);
