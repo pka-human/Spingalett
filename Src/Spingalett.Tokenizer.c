@@ -30,8 +30,12 @@
  * asked) and runs the decoders over the list (ByteLevel, ByteFallback, Replace, Fuse, Strip, Metaspace),
  * bytes that are no UTF-8 becoming U+FFFD as Rust's from_utf8_lossy makes them.
  *
- * Every text is UTF-8: input that is not is refused, and strings of the files are checked as they are
- * read (the JSON reader checks its strings; a GGUF file's are checked here).
+ * A GGUF file's vocabulary becomes the same structures (spingalett_tokenizer_build()): byte-level BPE
+ * from its merges, or SentencePiece's BPE from its scores, whose merges are derived from them.
+ *
+ * Every text given to encode is UTF-8 (other input is refused), as are the strings of tokenizer.json
+ * files (the JSON reader checks them); a GGUF file's tokens are kept as they are, and every reader of
+ * code points here takes a malformed sequence as U+FFFD of one byte.
  */
 
 #include "Spingalett.Private.h"
