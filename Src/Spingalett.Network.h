@@ -76,6 +76,27 @@ struct SpingalettNetwork {
     uint64_t time_step;
     LossFunction loss_func;
 
+    /* The state of the run that trained this network, what a checkpoint holds beside its parameters
+       (spingalett_save_checkpoint): the seeds the run drew for dropout and augmentation, which the
+       masks and the augmentations of every epoch hash from; the bias corrections its optimizer
+       reached, which a resumed run multiplies on instead of counting them from the step number
+       again; the epochs it ran, which the learning-rate schedule counts with; and the library's
+       generator as it stood where the run's epochs begin to shuffle. run_valid marks
+       them set by a run; run_resume, that they come from a checkpoint and that the next train()
+       carries the run on from them: it restores the generator and draws the shuffles of the epochs
+       already run again, keeps the seeds and the corrections, and counts its epochs after run_epochs.
+       A network made or loaded as a model has neither. */
+    bool run_valid, run_resume;
+    uint64_t run_dropout_seed, run_augment_seed, run_epochs;
+    uint32_t run_generator[4];
+    float run_beta1_pow, run_beta2_pow;
+    /* Best-epoch, early stopping and reduce-on-plateau state: the best monitored value, how many
+       epochs have passed without improvement, how many since the plateau's last reduction, the scale
+       those reductions reached, and the run's epoch that was the best. A run begun here starts them
+       afresh; a resumed one carries on what the checkpoint holds. */
+    float run_best, run_lr_scale;
+    uint64_t run_no_improvement, run_stale, run_best_epoch;
+
     float *dropout_rates;           /* per layer, applied to its outputs while training */
 
     /* batch normalization layers: the statistics inference uses, laid out like the biases (zeros

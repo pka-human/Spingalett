@@ -50,7 +50,7 @@ cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
 Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx equiv cont
-                                                    # optim sched dropout gen predict valid step data io model gpu cuda xor
+                                                    # optim sched dropout gen predict valid step data resume io model gpu cuda xor
 ```
 
 Executables go to `Bin/` and static libraries to `Lib/` in the source tree. Point extra build

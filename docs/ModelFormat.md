@@ -10,7 +10,9 @@ concatenates several, or pools globally (0.10 on), version 7 for networks with t
 convolutions, upsampling or layer normalization (0.13 on), version 8 for the layers of transformers
 (embeddings, attention, RMS normalization, products of layers), the GELU and SiLU activations and the
 sparse cross-entropy loss (1.2 on). `spingalett_load()` and `spingalett_load_from_memory()` read
-versions 1 to 8.
+versions 1 to 8. A checkpoint of a training run (`spingalett_save_checkpoint()`) is one of these
+images with a record of the run after it, which every reader of the image ignores (**Checkpoint
+record**).
 
 Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
 (`spingalett_model_init()` in `Spingalett.Inference.h`) checks the image and computes directly from
@@ -254,6 +256,55 @@ layers whose shapes do not
 fit, when `in` differs from the units of its first input, or when an output (other than the last
 one) does not lie within the activations, is misaligned or overlaps the output of an input of its
 own layer.
+
+## Checkpoint record
+
+`spingalett_save_checkpoint()` writes a model image (FLOAT32, always with the optimizer state) and,
+directly after it, a record of the run the image does not describe: what the parameters do not say,
+and what a run cannot carry on without. `spingalett_load_checkpoint()` reads both and gives the
+network back with the run's state, so the next `spingalett_train()` continues that run.
+
+The image is untouched: the record begins at its own size, which the header holds at byte 24, and
+its bytes are covered by no checksum of the image. An engine that reads the model stops at the
+image's end, so a checkpoint is also a model (`spingalett_load()`, `spingalett_model_load()` and the
+runtime all run one).
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 6 | Magic `SLETTX` |
+| 6 | 2 | Record version, 1 |
+| 8 | 4 | Reader positions that follow, at offset 112 |
+| 12 | 4 | Flags. Bit 0: the record holds a run's state (the fields at 16 to 95). A checkpoint of a network that has not trained holds none, and the fields are 0 |
+| 16 | 8 | Epochs the run has completed |
+| 24 | 8 | The seed its dropout masks hash from |
+| 32 | 8 | The seed its augmentations hash from |
+| 40 | 16 | The library's generator, four words, where the run's epochs begin to shuffle |
+| 56 | 4 | The optimizer's `beta1` correction, as its steps reached it (float) |
+| 60 | 4 | The optimizer's `beta2` correction (float) |
+| 64 | 4 | The best monitored value so far (float; the infinite value of a run that has seen no finite one) |
+| 68 | 4 | The learning rate's scale that reduce-on-plateau reached (float, 1 before the first reduction) |
+| 72 | 8 | Epochs without improvement of the monitored value |
+| 80 | 8 | Epochs since the plateau's last reduction |
+| 88 | 8 | The run's epoch that was the best (0 before the first) |
+| 96 | 16 | Reserved, 0 |
+| 112 | 24 each | One entry per reader: its seed (8), the pass it reached (8) and its position within that pass (8) |
+| — | 4 | CRC-32 of every byte of the record before it |
+
+Each reader's entry is the `SpingalettDatasetPosition` of `spingalett_dataset_get_position()` as of the
+moment the checkpoint is written, and `spingalett_load_checkpoint()` moves the readers it is given, in
+the order they were saved in, to those places (their own options must match the run's); the counts of
+the file and of the call must agree. The record describes the run at an *epoch's end*: the epochs it
+holds are those completed, and a checkpoint written between the steps of an epoch resumes with the
+parameters as they stand but restarts that epoch, so its samples come in the order of a new pass over
+the readers rather than the order they were read in.
+
+A reader rejects the record when the version is not 1, when its length is not `112 + 24 x readers + 4`
+bytes, or when its checksum does not match. A file with no bytes after its image is a plain model and
+loads with no run's state; bytes after the image that form no complete record are an error.
+
+The record holds what the run needs at an *epoch's end*. Not in it: the parameters of the best epoch,
+which `.restore_best_weights` keeps in memory (a resumed run restores the best of the epochs it runs
+itself), and the GPU's copy of the network, which the resumed run makes again.
 
 ## How the inference engine computes
 

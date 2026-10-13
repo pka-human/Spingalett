@@ -5,6 +5,7 @@
 
 #include "Spingalett.Private.h"
 #include <math.h>
+#include <string.h>
 #include <time.h>
 #include <stdbool.h>
 
@@ -62,6 +63,20 @@ uint64_t rng_next64(void) {
 
 void spingalett_seed(uint64_t seed) {
     rng_seed(seed);
+}
+
+/* The calling thread's generator as four words, and putting them back: a run restored from a
+   checkpoint draws what the run it continues would have drawn next. Getting the state does not seed
+   an unseeded generator (a state taken before any draw is all zeros, which nothing resumes from);
+   setting it marks the generator seeded, so a fresh thread resumes without mixing time or addresses
+   into the run. */
+void rng_state_get(uint32_t *out) {
+    memcpy(out, rng_state, sizeof rng_state);
+}
+
+void rng_state_set(const uint32_t *state) {
+    memcpy(rng_state, state, sizeof rng_state);
+    rng_initialized = true;
 }
 
 float rng_next_float(void) {

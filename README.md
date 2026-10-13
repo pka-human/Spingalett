@@ -67,6 +67,7 @@ Python (wheels with the library inside), C++, Rust, .NET, Go and Java are includ
 | Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
+| Checkpoints | `spingalett_save_checkpoint()` and `spingalett_load_checkpoint()`: the network, its optimizer state and the state of the run that produced it (its seeds, the bias corrections its optimizer reached, its epochs, the counters of validation and early stopping, the place of every data set reader) in one file; a run stopped at an epoch's end and carried on trains the same bits as one that never stopped. Readers' positions: `spingalett_dataset_get_position()` and `spingalett_dataset_set_position()` |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
 | Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API) |
@@ -908,6 +909,25 @@ saved in version 4 (`SPINGALETT_FORMAT_VERSION`), which adds the layers' kinds a
 of dense layers only are still saved in version 3, so that the engines of earlier releases run them.
 Files of versions 1 and 2 remain loadable. `spingalett_load()` returns `NULL` for missing, truncated
 or corrupt files and for files with an invalid header.
+
+A checkpoint holds a training run as well as the network:
+
+```c
+spingalett_save_checkpoint(net, "run.ckpt", NULL, 0);            /* at an epoch's end */
+NeuralNetwork *back = spingalett_load_checkpoint("run.ckpt", NULL, 0);
+train(.net = back, .epochs = 30 /* the run's total, not what is left */, ...);
+```
+
+The file is a `.slett` image (FLOAT32, with the optimizer state) with a record of the run after it:
+the seeds its dropout masks and augmentations hash from, the bias corrections its optimizer reached
+by multiplying beta step after step, the epochs it ran, the counters of best-epoch tracking, early
+stopping and reduce-on-plateau, the place of the library's generator where its epochs begin to
+shuffle, and the place of each data set reader it trained on (given back to the readers the call
+lists, whose count must match). The next `spingalett_train()` continues the run: it states the run's
+total epochs in `.epochs` and runs what the run has left of them, its schedule counts the epochs of
+the run, and the bits it trains are those of a run that never stopped. `.reset_optimizer` begins a
+fresh run instead. Because the record sits after the image, `spingalett_load()`,
+`spingalett_model_load()` and the runtime read a checkpoint as a model (docs/ModelFormat.md).
 
 ### Backends and threading
 

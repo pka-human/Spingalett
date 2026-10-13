@@ -729,6 +729,10 @@ static void trainer_begin_step(Trainer *t) {
     t->net->time_step++;
     t->beta1_pow *= t->opt.beta1;
     t->beta2_pow *= t->opt.beta2;
+    /* the run's state, for a checkpoint saved between steps: the values a resumed run multiplies
+       on from here, which are not what powf() of the step number gives */
+    t->net->run_beta1_pow = t->beta1_pow;
+    t->net->run_beta2_pow = t->beta2_pow;
     t->opt.m_factor = 1.0f / (1.0f - t->beta1_pow);
     t->opt.v_factor = 1.0f / (1.0f - t->beta2_pow);
 }
@@ -1095,6 +1099,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             memset(net->opt_v_biases,  0, net->total_biases  * sizeof(float));
         }
         net->time_step = 0;
+        net->run_resume = false;        /* the run begins afresh: new seeds, its epochs counted from 0 */
         spingalett_log(LOG_INFO, "Optimizer state reset");
     }
 
@@ -1151,10 +1156,31 @@ TrainReport spingalett_train_args(TrainArgs args) {
         .type = args.optimizer_type, .lr = args.learning_rate, .decay = args.weight_decay,
         .momentum = args.momentum, .beta1 = args.beta1, .beta2 = args.beta2, .epsilon = args.epsilon,
     };
-    // Adam bias correction must continue from the persisted step count; restarting it at 1
-    // on every train() call (or after loading a checkpoint) inflates the first updates ~10x.
-    t.beta1_pow = powf(args.beta1, (float)net->time_step);
-    t.beta2_pow = powf(args.beta2, (float)net->time_step);
+    /* Adam's bias correction continues from the step count the network holds: restarting it at 1
+       would inflate the first updates ~10x. A resumed run takes the values its steps reached, which
+       powf() of the step number does not give, and with them the generator its epochs began their
+       shuffles from, whose draws it runs again to reach the order the run stopped on. Its .epochs
+       counts the epochs the run already ran, so this call runs what is left of them and its schedule
+       sees the epochs of the run. */
+    size_t run_done = 0;
+    if (net->run_resume) {
+        run_done = (size_t)net->run_epochs;
+        if (run_done >= epochs) {
+            char message[160];
+            snprintf(message, sizeof message,
+                     "a resumed run's epochs are those of the run: it ran %zu, %zu given (give %zu or more)",
+                     run_done, epochs, run_done + 1);
+            return train_failed(message);
+        }
+        epochs -= run_done;
+        rng_state_set(net->run_generator);
+        t.beta1_pow = net->run_beta1_pow;
+        t.beta2_pow = net->run_beta2_pow;
+    } else {
+        t.beta1_pow = powf(args.beta1, (float)net->time_step);
+        t.beta2_pow = powf(args.beta2, (float)net->time_step);
+        net->run_epochs = 0;                    /* a run begun here counts its epochs from 0 */
+    }
 
     switch (training_strategy) {
         case STRATEGY_SAMPLE:      t.batch_size = 1; break;
@@ -1174,12 +1200,25 @@ TrainReport spingalett_train_args(TrainArgs args) {
     if (net->dropout_rates[net->layers - 1] > 0.0f)
         spingalett_log(LOG_WARNING, "Dropout is not applied to the output layer; ignoring rate %g",
                        (double)net->dropout_rates[net->layers - 1]);
+    /* The seeds the masks and the augmentations hash from: one draw of the library's generator each,
+       at the start of the run. A resumed run keeps the ones it drew then, as the run that carried on
+       without stopping would. */
     t.use_dropout = spingalett_has_dropout(net);
-    if (t.use_dropout)
-        t.dropout.seed = rng_next64();
     t.augment = args.augment_shift > 0 || args.augment_flip;
+    if (t.use_dropout)
+        t.dropout.seed = net->run_resume ? net->run_dropout_seed : rng_next64();
     if (t.augment)
-        t.augment_seed = rng_next64();
+        t.augment_seed = net->run_resume ? net->run_augment_seed : rng_next64();
+    net->run_valid = true;
+    net->run_dropout_seed = t.dropout.seed;
+    net->run_augment_seed = t.augment_seed;
+    net->run_beta1_pow = t.beta1_pow;
+    net->run_beta2_pow = t.beta2_pow;
+    /* Where the library's generator stands when the run's epochs begin to shuffle, which a checkpoint
+       holds. A run that does not shuffle — in file order, or on a generator — draws nothing between its
+       seeds and its epochs, so this is also where it leaves the generator. */
+    if (!net->run_resume)
+        rng_state_get(net->run_generator);
 
     if (use_gpu) {
         SpgGpuTraining cfg = {
@@ -1221,6 +1260,14 @@ TrainReport spingalett_train_args(TrainArgs args) {
         spingalett_log(LOG_ERROR, "Failed to allocate training buffers");
         return (TrainReport){.status = TRAIN_FAILED};
     }
+
+    /* An epoch shuffles the order the epoch before it left, so a resumed run reaches the order its last
+       epoch stopped on by drawing the shuffles of the epochs already run again, from the place of the
+       generator the checkpoint holds. Its next epoch then shuffles what the run of the same epochs
+       would have. */
+    if (net->run_resume && t.order)
+        for (size_t k = 0; k < run_done; k++)
+            spingalett_shuffle_indices(t.order, sample_count);
 
     /* Data sets on the GPU: gathered there when the network trains there, on that backend (augmentation
        shifts of up to 2^23 cells, rows.comp's), copied to the host otherwise; the validation's targets
@@ -1316,22 +1363,39 @@ TrainReport spingalett_train_args(TrainArgs args) {
         .status = TRAIN_COMPLETED, .train_loss = NAN, .has_validation = has_validation,
         .validation = {NAN, NAN}, .monitor = monitor, .best_value = NAN,
     };
-    float best = higher_is_better ? -INFINITY : INFINITY;
-    size_t epochs_without_improvement = 0, stale = 0;
+    /* The best epoch, the patience counters and the plateau's scale: a resumed run carries on what
+       the checkpoint holds, so that its early stopping and its reductions continue where they were;
+       a run begun here starts them afresh. `total` is the epochs of the run, `epochs` those this call
+       runs, and `run_epoch` the epoch of the run the loop is in. */
+    const size_t total = args.epochs;
+    float best = net->run_resume ? net->run_best : (higher_is_better ? -INFINITY : INFINITY);
+    size_t epochs_without_improvement = net->run_resume ? (size_t)net->run_no_improvement : 0;
+    size_t stale = net->run_resume ? (size_t)net->run_stale : 0;
     bool lr_warned = false;
-    float lr_scale = 1.0f, base_lr = args.learning_rate;   /* reduce on plateau: the scale it reached */
+    float lr_scale = net->run_resume ? net->run_lr_scale : 1.0f, base_lr = args.learning_rate;
+    if (net->run_resume) {
+        report.best_epoch = net->run_best_epoch;
+        if (isfinite(best)) report.best_value = best;
+    } else {
+        net->run_best = best;
+        net->run_lr_scale = 1.0f;
+        net->run_no_improvement = net->run_stale = 0;
+        net->run_best_epoch = 0;
+    }
 
     for (size_t epoch = 1; epoch <= epochs; epoch++) {
+        const size_t run_epoch = run_done + epoch;
         float total_error = 0.0f;
 
         if (args.lr_scheduler) {
-            float lr = args.lr_scheduler(epoch - 1, epochs, args.learning_rate, args.lr_scheduler_data);
+            /* the epoch of the run, not of this call: a resumed run's schedule continues */
+            float lr = args.lr_scheduler(run_epoch - 1, total, args.learning_rate, args.lr_scheduler_data);
             if (lr >= 0.0f && isfinite(lr)) {
                 base_lr = lr;
             } else if (!lr_warned) {
                 lr_warned = true;
                 spingalett_log(LOG_WARNING, "LR scheduler returned %g at epoch %zu; keeping lr=%g",
-                               (double)lr, epoch, (double)base_lr);
+                               (double)lr, run_epoch, (double)base_lr);
             }
         }
         /* reductions on plateau scale the base rate, down to lr_plateau_min_lr (never above the base) */
@@ -1365,7 +1429,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             }
             if (failed) { report.status = TRAIN_FAILED; break; }
             if (epoch_samples == 0) {
-                spingalett_log(LOG_WARNING, "Generator produced no samples in epoch %zu; stopping training", epoch);
+                spingalett_log(LOG_WARNING, "Generator produced no samples in epoch %zu; stopping training", run_epoch);
                 report.status = TRAIN_NO_DATA;
                 break;
             }
@@ -1378,7 +1442,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
                 uint32_t count = (sample_count - start < step_size) ? sample_count - start : step_size;
                 /* full batches in order: the next epoch starts with the same chunk, filled ahead (not with
                    validation, which runs on the GPU's chunks in between) */
-                t.gpu_ahead = t.gpu && steps_per_epoch == 1 && !t.order && !has_validation && epoch < epochs;
+                t.gpu_ahead = t.gpu && steps_per_epoch == 1 && !t.order && !has_validation && run_epoch < total;
                 total_error += trainer_step(&t, args.inputs, args.targets, t.order, start, count);
             }
             epoch_samples = sample_count;
@@ -1389,7 +1453,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             atomic_store(&net->gpu_newer, true);
             if (lost) {
                 set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
-                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", run_epoch);
                 report.status = TRAIN_FAILED;
                 break;
             }
@@ -1397,11 +1461,12 @@ TrainReport spingalett_train_args(TrainArgs args) {
 
         report.epochs_run = epoch;
         report.train_loss = total_error / (float)epoch_samples;
+        net->run_epochs++;                /* a checkpoint saved from here on holds this epoch too */
 
         const bool check_nan = args.nan_check_interval > 0 && epoch % args.nan_check_interval == 0;
         if (check_nan) spingalett_network_sync(net);
         if (check_nan && check_nan_inf(net)) {
-            spingalett_log(LOG_ERROR, "NaN/Inf detected in weights at epoch %zu, stopping training", epoch);
+            spingalett_log(LOG_ERROR, "NaN/Inf detected in weights at epoch %zu, stopping training", run_epoch);
             report.status = TRAIN_DIVERGED;
             break;
         }
@@ -1413,7 +1478,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
                 if (!spingalett_gpu_evaluate(t.gpu, net, args.val_inputs, args.device_val_inputs, args.val_targets,
                                              args.val_count, &loss, &correct)) {
                     set_error(SPINGALETT_ERR_INVALID, "The GPU failed during validation");
-                    spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                    spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", run_epoch);
                     report.status = TRAIN_FAILED;
                     break;
                 }
@@ -1435,7 +1500,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
                 improved = true;    /* the first finite value is the first best, whatever min_delta */
             if (improved) {
                 best = value;
-                report.best_epoch = epoch;
+                report.best_epoch = run_epoch;
                 report.best_value = value;
                 epochs_without_improvement = 0;
                 if (t.best_params) {
@@ -1452,30 +1517,36 @@ TrainReport spingalett_train_args(TrainArgs args) {
                 spingalett_log(LOG_INFO, "No improvement for %zu epochs: learning rate scaled to %g of the schedule's",
                                args.lr_plateau_patience, (double)lr_scale);
             }
+            /* the run's state as of this epoch, for a checkpoint saved from a callback */
+            net->run_best = best;
+            net->run_lr_scale = lr_scale;
+            net->run_no_improvement = epochs_without_improvement;
+            net->run_stale = stale;
+            net->run_best_epoch = report.best_epoch;
         }
 
-        if (should_report(epoch, epochs, args.report_interval)) {
+        if (should_report(run_epoch, total, args.report_interval)) {
             char lr_text[32] = "", val_text[64] = "";
             if (args.lr_scheduler || lr_scale < 1.0f)
                 snprintf(lr_text, sizeof lr_text, ", LR: %g", (double)t.opt.lr);
             if (has_validation)
                 snprintf(val_text, sizeof val_text, ", Val loss: %f, Val accuracy: %.2f%%",
                          (double)report.validation.loss, 100.0 * (double)report.validation.accuracy);
-            spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f%s%s%s", epoch, epochs, (double)report.train_loss,
+            spingalett_log(LOG_INFO, "Epoch: %zu/%zu, Error: %f%s%s%s", run_epoch, total, (double)report.train_loss,
                            val_text, lr_text, improved && monitoring ? " (best)" : "");
         }
 
-        if (should_report(epoch, epochs, args.autosave_interval))
-            handle_autosave(net, &args, epoch);
+        if (should_report(run_epoch, total, args.autosave_interval))
+            handle_autosave(net, &args, run_epoch);
 
-        if (args.callback && should_report(epoch, epochs, args.callback_interval)) {
+        if (args.callback && should_report(run_epoch, total, args.callback_interval)) {
             TrainProgress progress = {
-                .epoch = epoch, .epochs = epochs, .train_loss = report.train_loss, .learning_rate = t.opt.lr,
+                .epoch = run_epoch, .epochs = total, .train_loss = report.train_loss, .learning_rate = t.opt.lr,
                 .has_validation = has_validation, .validation = report.validation, .monitor = monitor,
                 .best_epoch = report.best_epoch, .best_value = report.best_value, .improved = improved,
             };
             if (args.callback(net, &progress, args.callback_data)) {
-                spingalett_log(LOG_INFO, "Training interrupted by callback at epoch %zu", epoch);
+                spingalett_log(LOG_INFO, "Training interrupted by callback at epoch %zu", run_epoch);
                 report.status = TRAIN_INTERRUPTED;
                 break;
             }
@@ -1486,7 +1557,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             seen_version = net->param_version;
             if (!spingalett_gpu_upload(t.gpu)) {
                 set_error(SPINGALETT_ERR_INVALID, "The GPU failed during training");
-                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", epoch);
+                spingalett_log(LOG_ERROR, "The GPU failed in epoch %zu; stopping training", run_epoch);
                 report.status = TRAIN_FAILED;
                 break;
             }
@@ -1494,7 +1565,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
 
         if (args.early_stopping_patience > 0 && epochs_without_improvement >= args.early_stopping_patience) {
             spingalett_log(LOG_INFO, "Early stopping at epoch %zu: no improvement since epoch %zu",
-                           epoch, report.best_epoch);
+                           run_epoch, report.best_epoch);
             report.status = TRAIN_EARLY_STOPPED;
             break;
         }
@@ -1513,7 +1584,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             atomic_store(&net->gpu_newer, false);
         }
     }
-    if (t.best_params && report.best_epoch > 0 && report.best_epoch != report.epochs_run) {
+    if (t.best_params && report.best_epoch > 0 && report.best_epoch != run_done + report.epochs_run) {
         spingalett_network_sync(net);
         restore_params(net, t.best_params);
         report.restored_best = true;

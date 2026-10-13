@@ -9,7 +9,7 @@
  * cross-backend comparisons then pass trivially.
  *
  *   Spingalett.Tests [group]     groups: grad conv norm graph onnx equiv cont optim sched dropout gen predict valid
- *                                step data io model xor
+ *                                step data resume io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -2253,6 +2253,767 @@ static void dataset_files_v2(void) {
     remove(path);
     spingalett_dataset_free(&ph);
     (void)back;
+}
+
+/* ---------------- the place a reader stands in: stopping a run and carrying it on */
+
+/* Readers of one stream: the same file, the same options, so that a position taken from one belongs
+   to the others, and all of them draw the same seed (the library's generator reseeded before each
+   open). kind 0 is a file of tokens, 1 a streaming .slettd reader, 2 an in-memory one. */
+typedef struct {
+    int kind;
+    const char *path;
+    SpingalettTokenReaderOptions tokens;
+    DatasetReaderOptions reader;
+} PositionSource;
+
+static SpingalettDatasetReader *open_positions(const PositionSource *src, uint64_t seed) {
+    spingalett_seed(seed);
+    return src->kind == 0 ? spingalett_dataset_open_tokens(src->path, &src->tokens)
+                          : spingalett_dataset_open_ex(src->path, &src->reader);
+}
+
+static bool same_position(const SpingalettDatasetPosition *a, const SpingalettDatasetPosition *b) {
+    return a->seed == b->seed && a->pass == b->pass && a->position == b->position;
+}
+
+/* Writes want samples into x and y, in reads of at most batch. A read of 0 ends a pass and the next
+   one starts the pass after it; two of them in a row is a reader that stops short of the run. */
+static bool read_samples(SpingalettDatasetReader *r, uint64_t want, uint32_t in, uint32_t out, float *x, float *y,
+                         uint32_t batch) {
+    uint64_t done = 0;
+    uint32_t zeros = 0;
+    while (done < want) {
+        uint32_t ask = (uint32_t)(want - done < batch ? want - done : batch);
+        uint32_t got = spingalett_dataset_read(r, x + (size_t)done * in, y + (size_t)done * out, ask);
+        if (got == 0) {
+            if (++zeros > 1) return false;
+            continue;
+        }
+        zeros = 0;
+        done += got;
+    }
+    return true;
+}
+
+/* The samples after a position, read as the stream continues, then read again after the same reader
+   is moved back to it and after a freshly opened one is moved there; both compared with the run of
+   a reader that never left the stream, so that a resumed run that lost or repeated samples shows.
+   *pos holds the position (and *info the reader's shape) either way, for callers that compare the
+   positions of readers that differ only in how their chunks get decoded. */
+static bool position_round_trip(const PositionSource *src, uint64_t seed, uint64_t before, uint64_t after,
+                                uint32_t batch, SpingalettDatasetPosition *pos, SpingalettDatasetInfo *info) {
+    bool ok = false;
+    memset(pos, 0, sizeof *pos);
+    SpingalettDatasetReader *r = open_positions(src, seed), *ref = open_positions(src, seed), *fresh = NULL;
+    *info = spingalett_dataset_info(r);
+    const uint32_t in = info->input_size, tg = info->target_size;
+    const size_t span = (size_t)(before + after);
+    float *rx = malloc(span * in * sizeof(float)), *ry = malloc(span * tg * sizeof(float));
+    float *ax = malloc(span * in * sizeof(float)), *ay = malloc(span * tg * sizeof(float));
+    float *bx = malloc((size_t)after * in * sizeof(float)), *by = malloc((size_t)after * tg * sizeof(float));
+    ok = r && ref && in && tg && rx && ry && ax && ay && bx && by;
+    if (ok) ok = read_samples(ref, span, in, tg, rx, ry, batch);
+    /* the run before the position, and the run that follows it, of the reader itself */
+    if (ok) ok = read_samples(r, before, in, tg, ax, ay, batch) &&
+                 spingalett_dataset_get_position(r, pos) && pos->position <= info->count &&
+                 read_samples(r, after, in, tg, ax + (size_t)before * in, ay + (size_t)before * tg, batch);
+    if (ok) {
+        ok = !memcmp(ax, rx, span * in * sizeof(float)) && !memcmp(ay, ry, span * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: the stream itself differs from the reference\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+
+    /* the same reader, moved back to where it stood */
+    if (ok) {
+        memset(bx, 0, (size_t)after * in * sizeof(float));
+        memset(by, 0, (size_t)after * tg * sizeof(float));
+        SpingalettDatasetPosition here = {0};
+        ok = spingalett_dataset_set_position(r, pos);
+        if (ok) ok = spingalett_dataset_get_position(r, &here) && same_position(pos, &here);
+        if (ok) ok = read_samples(r, after, in, tg, bx, by, batch) &&
+                     !memcmp(bx, ax + (size_t)before * in, (size_t)after * in * sizeof(float)) &&
+                     !memcmp(by, ay + (size_t)before * tg, (size_t)after * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: resuming the reader itself differs\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+
+    /* a reader of the same file and options, opened now and moved to that position */
+    if (ok) {
+        fresh = open_positions(src, seed + 1234);     /* its own draw, until the position sets it */
+        memset(bx, 0, (size_t)after * in * sizeof(float));
+        memset(by, 0, (size_t)after * tg * sizeof(float));
+        ok = spingalett_dataset_set_position(fresh, pos) &&
+             read_samples(fresh, after, in, tg, bx, by, batch) &&
+             !memcmp(bx, ax + (size_t)before * in, (size_t)after * in * sizeof(float)) &&
+             !memcmp(by, ay + (size_t)before * tg, (size_t)after * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: a freshly opened reader differs\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+    spingalett_dataset_close(fresh);
+    spingalett_dataset_close(ref);
+    spingalett_dataset_close(r);
+    free(rx); free(ry); free(ax); free(ay); free(bx); free(by);
+    return ok;
+}
+
+/* The place of a stream after before samples: a pass whose every sample the caller holds is still
+   that pass, with its end not yet reported by a read of 0. */
+static void expect_position(uint64_t before, uint32_t count, uint64_t *pass, uint64_t *position) {
+    if (!count) {
+        *pass = *position = 0;
+        return;
+    }
+    *pass = before / count;
+    *position = before % count;
+    if (*position == 0 && before > 0) {
+        (*pass)--;
+        *position = count;
+    }
+}
+
+static void dataset_positions(void) {
+    ComputeMode mode = spingalett_get_compute_mode();
+
+    /* ---- positions of the reader itself, and of NULL: refused, and the reader untouched */
+    {
+        const char *path = "spingalett_test_pos_null.slettd";
+        SpingalettDataset d = {0};
+        make_ds(&d, 8, 240, 16);
+        for (uint32_t i = 0; i < d.count; i++)
+            for (uint32_t k = 0; k < 240; k++) d.inputs[(size_t)i * 240 + k] = (float)(i * 240 + k) / 7.0f;
+        DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32, .target_encoding = DATASET_ENCODING_FLOAT32,
+                                 .no_compression = true};
+        CHECK(spingalett_save_dataset(&d, path, &so), "positions: the file of the NULL checks");
+        spingalett_dataset_free(&d);
+        SpingalettDatasetReader *r = spingalett_dataset_open(path, true);
+        SpingalettDatasetPosition p = {0};
+        CHECK(!spingalett_dataset_get_position(NULL, &p) && !spingalett_dataset_get_position(r, NULL) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "positions: get of NULL");
+        CHECK(spingalett_dataset_get_position(r, &p) && p.pass == 0 && p.position == 0, "positions: a reader just opened");
+        CHECK(!spingalett_dataset_set_position(NULL, &p) && !spingalett_dataset_set_position(r, NULL) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "positions: set of NULL");
+        float x[240], y[16];
+        uint64_t bad = p.position;
+        p.position = UINT64_MAX;
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a sample beyond the pass accepted");
+        p.position = UINT32_MAX;                     /* the count is well under it here */
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a sample of 2^32 accepted");
+        p.position = bad;
+        p.pass = UINT64_MAX;
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a pass that overflows the chunk queue accepted");
+        p.pass = 0;
+        CHECK(spingalett_dataset_read(r, x, y, 1) == 1, "positions: a reader of refused positions still serves");
+        spingalett_dataset_close(r);
+        remove(path);
+    }
+
+    /* ---- files of tokens: windows of uint16 (nanoGPT) and of uint32 behind a header (llm.c) */
+    const char *tpaths[] = {"spingalett_test_pos_tokens.bin", "spingalett_test_pos_tokens_llmc.bin"};
+    const uint32_t ntok = 400, tctx = 8, tstride = 3;
+    for (int file = 0; file < 2; file++) {
+        FILE *f = fopen(tpaths[file], "wb");
+        if (!f) { CHECK(false, "positions: cannot write %s", tpaths[file]); return; }
+        if (file) {
+            uint32_t header[256] = {20240520u, 2u, ntok};
+            fwrite(header, sizeof header, 1, f);
+        }
+        for (uint32_t i = 0; i < ntok; i++) {
+            const uint32_t t = (i * 6151u + 11u) % 65000u;
+            const uint8_t b[4] = {(uint8_t)t, (uint8_t)(t >> 8), (uint8_t)(t >> 16), (uint8_t)(t >> 24)};
+            fwrite(b, 1, file ? 4 : 2, f);
+        }
+        fclose(f);
+    }
+    const uint32_t tcount = (ntok - tctx - 1) / tstride + 1;
+    const uint64_t tcases[][2] = {
+        {0, 17}, {1, 23}, {tcount / 2, 9}, {tcount - 5, 9}, {tcount, 12},
+        {tcount + 1, 30}, {2 * tcount, 7}, {2 * tcount + tcount / 3, 25},
+    };
+    for (int file = 0; file < 2; file++)
+        for (int shuffled = 1; shuffled >= 0; shuffled--)
+            for (size_t k = 0; k < sizeof tcases / sizeof *tcases; k++) {
+                PositionSource src = {.kind = 0, .path = tpaths[file],
+                                      .tokens = {.context = tctx, .stride = tstride, .shuffle = shuffled}};
+                SpingalettDatasetPosition pos = {0};
+                SpingalettDatasetInfo info = {0};
+                bool ok = position_round_trip(&src, 21 + 5 * (uint64_t)k, tcases[k][0], tcases[k][1], 5, &pos, &info);
+                CHECK(ok, "positions: tokens %d shuffle %d at %llu samples (pass %llu, position %llu of %u)", file, shuffled,
+                      (unsigned long long)tcases[k][0], (unsigned long long)pos.pass, (unsigned long long)pos.position,
+                      info.count);
+            }
+
+    /* ---- streaming readers: several chunks, of which one thread decodes ahead, none decodes ahead,
+           and the caller's OpenMP threads decode together */
+    const char *spath = "spingalett_test_pos.slettd";
+    {
+        SpingalettDataset d = {0};
+        make_ds(&d, 3072, 240, 16);
+        lcg_state = 9;
+        for (uint32_t i = 0; i < d.count; i++) {
+            for (uint32_t k = 0; k < 240; k++) d.inputs[(size_t)i * 240 + k] = frand();
+            for (uint32_t k = 0; k < 16; k++) d.targets[(size_t)i * 16 + k] = (float)((i + k) % 16) / 16.0f;
+            d.targets[(size_t)i * 16 + i % 16] = 1.0f;
+        }
+        DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32, .target_encoding = DATASET_ENCODING_FLOAT32,
+                                 .no_compression = true};
+        CHECK(spingalett_save_dataset(&d, spath, &so), "positions: saving the streaming file");
+        spingalett_dataset_free(&d);
+    }
+    SpingalettDatasetReader *probe = spingalett_dataset_open(spath, false);
+    SpingalettDatasetInfo sinfo = spingalett_dataset_info(probe);
+    spingalett_dataset_close(probe);
+    const uint32_t chunks = sinfo.chunk_count, ccount = sinfo.count;
+    CHECK(chunks > 1 && ccount % chunks == 0, "positions: the streaming file holds %u chunks of %u samples", chunks,
+          ccount / chunks);
+    const uint32_t crows = ccount / chunks;
+    /* the same stream through the library's in-memory path (every sample held, not read by chunks) */
+    const uint64_t memcases[] = {1300, ccount, 2 * (uint64_t)ccount + crows};
+    for (size_t k = 0; k < sizeof memcases / sizeof *memcases; k++) {
+        PositionSource src = {.kind = 2, .path = spath, .reader = {.shuffle = true, .in_memory = true}};
+        SpingalettDatasetPosition pos = {0};
+        SpingalettDatasetInfo info = {0};
+        bool ok = position_round_trip(&src, 33, memcases[k], 400, 60, &pos, &info);
+        uint64_t pass, position;
+        expect_position(memcases[k], info.count, &pass, &position);
+        ok = ok && pos.pass == pass && pos.position == position;
+        CHECK(ok, "positions: the in-memory reader at %llu samples (pass %llu, position %llu of %u, want %llu/%llu)",
+              (unsigned long long)memcases[k], (unsigned long long)pos.pass, (unsigned long long)pos.position, info.count,
+              (unsigned long long)pass, (unsigned long long)position);
+    }
+    struct { uint64_t before; uint64_t after; } cases[] = {
+        {0, 25}, {1, 40}, {crows - 3, 60}, {crows, 60}, {crows + 1, 30}, {2 * crows, 200},
+        {ccount - 4, 30}, {ccount, 150}, {ccount + 1, 60}, {ccount + crows, 20}, {ccount / 2, 1030},
+        {2 * ccount, 44}, {2 * ccount - 2, 500}, {2 * ccount + 1, 80},
+    };
+    /* a position of one decoding scheme resumes the same samples of another: the same seed, the same
+       stream, chunks decoded by a thread, by none, or by all of the caller's threads together */
+    static const ComputeMode open_modes[3] = {COMPUTE_SINGLE_THREADED, COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP};
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        SpingalettDatasetPosition first = {0};
+        uint64_t pass, position;
+        expect_position(cases[k].before, ccount, &pass, &position);
+        for (int v = 0; v < 3; v++) {
+            spingalett_set_compute_mode(open_modes[v]);
+            PositionSource src = {.kind = 1, .path = spath, .reader = {.shuffle = true, .no_prefetch = v == 1}};
+            SpingalettDatasetPosition pos = {0};
+            SpingalettDatasetInfo info = {0};
+            bool ok = position_round_trip(&src, 51 + 7 * (uint64_t)k, cases[k].before, cases[k].after, 64, &pos, &info);
+            ok = ok && pos.pass == pass && pos.position == position;
+            if (v == 0) first = pos;
+            else ok = ok && same_position(&pos, &first);
+            spingalett_set_compute_mode(mode);
+            CHECK(ok, "positions: streaming %d at %llu samples (pass %llu position %llu of %u, want %llu/%llu, %u chunks)",
+                  v, (unsigned long long)cases[k].before, (unsigned long long)pos.pass,
+                  (unsigned long long)pos.position, info.count, (unsigned long long)pass,
+                  (unsigned long long)position, info.chunk_count);
+        }
+    }
+    /* a pass in file order, resumed at places that are its own since nothing shuffles it */
+    static const uint64_t passes[] = {0, 1, 2, 1};
+    for (size_t k = 0; k < 4; k++) {
+        const uint64_t before = passes[k] * (uint64_t)ccount + 1 + 97 * (uint64_t)k;
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        PositionSource src = {.kind = 1, .path = spath, .reader = {.shuffle = false}};
+        SpingalettDatasetPosition pos = {0};
+        SpingalettDatasetInfo info = {0};
+        bool ok = position_round_trip(&src, 5 + 3 * (uint64_t)k, before, 130 + 11 * (uint64_t)k, 97, &pos, &info);
+        uint64_t pass, position;
+        expect_position(before, info.count, &pass, &position);
+        ok = ok && pos.pass == pass && pos.position == position;
+        spingalett_set_compute_mode(mode);
+        CHECK(ok, "positions: in order at %llu samples (pass %llu, position %llu, want %llu/%llu)",
+              (unsigned long long)before, (unsigned long long)pos.pass, (unsigned long long)pos.position,
+              (unsigned long long)pass, (unsigned long long)position);
+    }
+    remove(spath);
+    for (int file = 0; file < 2; file++) remove(tpaths[file]);
+    printf("  positions: %u token windows and %u samples of %u chunks resume where they stood\n", tcount, ccount, chunks);
+}
+
+/* ---------------- checkpoints: a run stopped at an epoch's end and carried on */
+
+/* What a run's callback logs: every epoch's loss, and the epoch of the run with the epochs of the
+   run — what a learning-rate schedule is given, so that a resumed call that counted only its own
+   epochs or its own total shows at once. stop_at interrupts the run after that many epochs, which is
+   where its checkpoint is written. */
+typedef struct {
+    float loss[64];
+    size_t epoch[64], total[64];
+    uint32_t count, stop_at;
+} RunLog;
+
+static bool log_run_epoch(NeuralNetwork *net, const TrainProgress *p, void *data) {
+    (void)net;
+    RunLog *l = (RunLog *)data;
+    if (l->count < sizeof l->loss / sizeof l->loss[0]) {
+        l->loss[l->count] = p->train_loss;
+        l->epoch[l->count] = p->epoch;
+        l->total[l->count] = p->epochs;
+    }
+    l->count++;
+    return l->stop_at != 0 && l->count == l->stop_at;
+}
+
+/* The entries of two runs' logs that differ in any bit, plus a count that differs. */
+static uint32_t log_diff(const RunLog *a, const RunLog *b) {
+    uint32_t d = a->count != b->count ? 1u : 0u;
+    for (uint32_t i = 0; i < a->count && i < b->count; i++) {
+        if (memcmp(&a->loss[i], &b->loss[i], sizeof(float))) d++;
+        if (a->epoch[i] != b->epoch[i] || a->total[i] != b->total[i]) d++;
+    }
+    return d;
+}
+
+/* Floats that differ in any bit. */
+static uint64_t bit_diff(const float *a, const float *b, uint64_t n) {
+    uint64_t d = 0;
+    for (uint64_t i = 0; i < n; i++) if (memcmp(a + i, b + i, sizeof(float))) d++;
+    return d;
+}
+
+/* As bit_diff, for the arrays a run makes when it needs them: one side without the other is a
+   difference, and neither side's absence one of none. */
+static uint64_t array_diff(const float *a, const float *b, uint64_t n) {
+    if (!a || !b) return a == b ? 0u : 1u;
+    return bit_diff(a, b, n);
+}
+
+static NeuralNetwork *resume_dense_net(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = 6);
+    layer(.net = net, .neurons_amount = 12, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE,
+          .dropout_rate = 0.3f);
+    layer(.net = net, .neurons_amount = 8, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+    return net;
+}
+
+static NeuralNetwork *resume_conv_net(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 6, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE, .dropout_rate = 0.25f);
+    max_pool2d(.net = net, .kernel = 2);
+    conv2d(.net = net, .filters = 5, .kernel = 3, .padding = 1, .act_func = ACT_SIGMOID);
+    batch_norm(.net = net, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+    return net;
+}
+
+/* A small language model over cells of token indices, what the windows of a token file train. */
+static NeuralNetwork *resume_lm_net(uint32_t cells, uint32_t vocab) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = cells);
+    embedding(.net = net, .vocabulary = vocab, .neurons_amount = 8, .positions = true,
+              .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    linear(.net = net, .neurons_amount = 24, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    attention(.net = net, .heads = 2, .kv_heads = 2, .causal = true);
+    linear(.net = net, .neurons_amount = vocab, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    return net;
+}
+
+static NeuralNetwork *resume_net(int which, uint32_t cells, uint32_t vocab) {
+    return which == 0 ? resume_dense_net() : which == 1 ? resume_conv_net() : resume_lm_net(cells, vocab);
+}
+
+/* A schedule of the whole run's epochs, so that a resumed run must know how many the run holds. */
+static float resume_lr(size_t epoch, size_t total_epochs, float initial_lr, void *data) {
+    (void)data;
+    return initial_lr * (float)(1.0 - 0.5 * (double)epoch / (double)(total_epochs ? total_epochs : 1));
+}
+
+static void resume_compute(uint32_t threads) {
+    spingalett_set_compute_mode(threads > 1 ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+    spingalett_set_num_threads(threads);
+}
+
+/* n tokens of a file of nanoGPT's shape (uint16, little-endian), each below vocab. */
+static bool write_token_file(const char *path, uint32_t n, uint32_t vocab) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = true;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t t = (i * 37u + 5u) % vocab;
+        const uint8_t b[2] = {(uint8_t)t, (uint8_t)(t >> 8)};
+        ok = ok && fwrite(b, 1, 2, f) == 2;
+    }
+    fclose(f);
+    return ok;
+}
+
+/* A reader of the case's stream, drawn from the library's generator as the run's first one was;
+   NULL for a case that trains on arrays. */
+static SpingalettDatasetReader *resume_open(int source, const char *dspath, const char *tokpath, uint32_t cells) {
+    if (source == 3) {
+        const SpingalettTokenReaderOptions o = {.context = cells, .stride = 1, .shuffle = true};
+        return spingalett_dataset_open_tokens(tokpath, &o);
+    }
+    if (source == 0) return NULL;
+    const DatasetReaderOptions o = {.shuffle = true, .in_memory = source == 2};
+    return spingalett_dataset_open_ex(dspath, &o);
+}
+
+struct ResumeCase {
+    const char *name;
+    int net;            /* 0 dense, 1 convolutional, 2 a language model */
+    int source;         /* 0 arrays, 1 a streamed .slettd, 2 a .slettd kept in memory, 3 a token file */
+    bool augment, scheduler, validate, plateau, early_stop;
+    OptimizerType opt;
+    uint32_t samples, batch, first, rest;
+    uint32_t threads[3];    /* the long run, the run before the checkpoint, the one after it */
+};
+
+/* Trains the case's network for first + rest epochs without stopping, and the same run interrupted
+   after `first` epochs, written to a checkpoint, and carried on in a network loaded from it with the
+   process's generator reseeded otherwise and on the case's third thread count. The parameters, the
+   optimizer's moments, the running statistics, the last step's gradients, the step count and every
+   epoch's loss and epoch number must come out the same bits. */
+static void resume_case(const struct ResumeCase *c) {
+    const char *dspath = "spingalett_test_resume.slettd", *ckpath = "spingalett_test_resume.ckpt",
+               *tokpath = "spingalett_test_resume_tok.bin";
+    const uint32_t cells = 6, vocab = 64, ntok = 400;
+    const uint32_t in = c->net == 0 ? 6 : c->net == 1 ? 8u * 8u * 3u : cells;
+    const uint32_t out = c->net == 2 ? vocab : 3;
+    const size_t total = c->first + c->rest;
+    bool ok = true;
+
+    lcg_state = 90210;
+    float *x = NULL, *y = NULL, *vx = NULL, *vy = NULL;
+    if (c->source != 3) make_data(c->samples, in, out, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    if (c->validate) {
+        lcg_state = 4242;
+        make_data(24, in, out, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &vx, &vy);
+    }
+    if (c->source == 1 || c->source == 2) {           /* the same samples in a .slettd file */
+        SpingalettDataset d = {0};
+        make_ds(&d, c->samples, in, out);
+        memcpy(d.inputs, x, (size_t)c->samples * in * sizeof(float));
+        memcpy(d.targets, y, (size_t)c->samples * out * sizeof(float));
+        const DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32,
+                                       .target_encoding = DATASET_ENCODING_FLOAT32, .no_compression = true};
+        ok = ok && spingalett_save_dataset(&d, dspath, &so);
+        spingalett_dataset_free(&d);
+    }
+    if (c->source == 3) ok = ok && write_token_file(tokpath, ntok, vocab);
+    CHECK(ok, "resume: the data of %s", c->name);
+    if (!ok) return;
+
+    TrainArgs args = {0};
+    args.epochs = total;
+    args.learning_rate = 0.05f;
+    args.optimizer_type = c->opt;
+    args.training_strategy = STRATEGY_SMALL_BATCH;
+    args.batch_size = c->batch;
+    args.augment_shift = c->augment ? 1u : 0u;
+    args.augment_flip = c->augment;
+    args.callback = log_run_epoch;
+    args.callback_interval = 1;
+    args.early_stopping_min_delta = 1000.0f;      /* only the first epoch's value counts as an improvement */
+    if (c->scheduler) args.lr_scheduler = resume_lr;
+    if (c->validate) {
+        args.val_inputs = vx;
+        args.val_targets = vy;
+        args.val_count = 24;
+    }
+    if (c->plateau) { args.lr_plateau_patience = 1; args.lr_plateau_factor = 0.5f; args.lr_plateau_min_lr = 0.001f; }
+    if (c->early_stop) args.early_stopping_patience = 2;
+    if (c->source) {
+        args.training_mode = MODE_GENERATOR_FUNCTION;
+        args.generator = spingalett_dataset_generator;
+    } else {
+        args.inputs = x;
+        args.targets = y;
+        args.sample_count = c->samples;
+    }
+
+    /* the run that never stops */
+    RunLog cont = {0}, stop = {0};
+    resume_compute(c->threads[0]);
+    spingalett_seed(777);
+    SpingalettDatasetReader *rc = resume_open(c->source, dspath, tokpath, cells);
+    if (rc) args.sample_count = spingalett_dataset_info(rc).count;
+    NeuralNetwork *a = resume_net(c->net, cells, vocab);
+    args.net = a;
+    args.callback_data = &cont;
+    args.generator_data = rc;
+    TrainReport ra = train_struct_arguments(args);
+    CHECK(ra.status == (c->early_stop ? TRAIN_EARLY_STOPPED : TRAIN_COMPLETED), "resume: the continuous run (%s)",
+          c->name);
+
+    /* the same run, stopped at the checkpoint and carried on by another process's state */
+    args.net = NULL;
+    resume_compute(c->threads[1]);
+    spingalett_seed(777);
+    SpingalettDatasetReader *r1 = resume_open(c->source, dspath, tokpath, cells);
+    if (r1) args.sample_count = spingalett_dataset_info(r1).count;
+    NeuralNetwork *net = resume_net(c->net, cells, vocab);
+    args.net = net;
+    args.callback_data = &stop;
+    args.generator_data = r1;
+    stop.stop_at = c->first;
+    TrainReport rb = train_struct_arguments(args);
+    CHECK(rb.status == TRAIN_INTERRUPTED && rb.epochs_run == c->first, "resume: the run before the checkpoint (%s)",
+          c->name);
+    const SpingalettDatasetReader *saved[1] = { r1 };
+    ok = spingalett_save_checkpoint(net, ckpath, r1 ? saved : NULL, r1 ? 1u : 0u);
+    CHECK(ok, "resume: the checkpoint of %s", c->name);
+    spingalett_network_free(net);           /* as if the process ended here */
+    if (r1) spingalett_dataset_close(r1);
+    if (!ok) goto done;
+
+    resume_compute(c->threads[2]);
+    spingalett_seed(4242);                  /* a fresh process draws otherwise: the checkpoint decides */
+    SpingalettDatasetReader *r2 = resume_open(c->source, dspath, tokpath, cells);
+    if (r2) args.sample_count = spingalett_dataset_info(r2).count;
+    SpingalettDatasetReader *given[1] = { r2 };
+    NeuralNetwork *back = spingalett_load_checkpoint(ckpath, r2 ? given : NULL, r2 ? 1u : 0u);
+    CHECK(back != NULL, "resume: loading the checkpoint of %s", c->name);
+    if (!back) goto done;
+    args.net = back;
+    args.epochs = total;                    /* a resumed run states the epochs of the run */
+    stop.stop_at = 0;                       /* and runs them to the end */
+    args.callback_data = &stop;
+    args.generator_data = r2;
+    TrainReport rd = train_struct_arguments(args);
+    CHECK(rd.status == (c->early_stop ? TRAIN_EARLY_STOPPED : TRAIN_COMPLETED) &&
+          rd.epochs_run == cont.count - c->first, "resume: the run after it (%s: status %d, %zu epochs, %u logged)",
+          c->name, rd.status, rd.epochs_run, cont.count);
+
+    uint64_t d = log_diff(&cont, &stop);
+    const uint64_t w = back->total_weights, b = back->total_biases;
+    for (uint32_t i = 0; d && i < cont.count && i < stop.count; i++)
+        if (memcmp(&cont.loss[i], &stop.loss[i], sizeof(float)) || cont.epoch[i] != stop.epoch[i] ||
+            cont.total[i] != stop.total[i])
+            printf("    loss %u: epoch %zu of %zu %.9g against epoch %zu of %zu %.9g\n", i, cont.epoch[i],
+                   cont.total[i], (double)cont.loss[i], stop.epoch[i], stop.total[i], (double)stop.loss[i]);
+    d += array_diff(a->weights, back->weights, w);
+    d += array_diff(a->biases, back->biases, b);
+    d += array_diff(a->opt_m_weights, back->opt_m_weights, w);
+    d += array_diff(a->opt_v_weights, back->opt_v_weights, w);
+    d += array_diff(a->opt_m_biases, back->opt_m_biases, b);
+    d += array_diff(a->opt_v_biases, back->opt_v_biases, b);
+    d += array_diff(a->running_mean, back->running_mean, b);
+    d += array_diff(a->running_var, back->running_var, b);
+    d += array_diff(a->grad_weights, back->grad_weights, w);
+    d += array_diff(a->grad_biases, back->grad_biases, b);
+    if (a->time_step != back->time_step) d++;
+    if (a->run_epochs != back->run_epochs || !back->run_valid) d++;
+    printf("  resume %-26s: %u+%u epochs on %u/%u/%u threads, %u losses, %llu of %llu weights, %llu moments: "
+           "%llu differ\n", c->name, c->first, c->rest, c->threads[0], c->threads[1], c->threads[2], cont.count,
+           (unsigned long long)(w - bit_diff(a->weights, back->weights, w)), (unsigned long long)w,
+           (unsigned long long)(2u * (w + b)), (unsigned long long)d);
+    CHECK(d == 0, "resume: %s differs from the run that never stopped in %llu places", c->name, (unsigned long long)d);
+
+    spingalett_network_free(back);
+    if (r2) spingalett_dataset_close(r2);
+done:
+    spingalett_network_free(a);
+    if (rc) spingalett_dataset_close(rc);
+    free(x); free(y); free(vx); free(vy);
+    remove(ckpath);
+    if (c->source == 1 || c->source == 2) remove(dspath);
+    if (c->source == 3) remove(tokpath);
+}
+
+/* What a checkpoint refuses, and what a model file gives back. */
+static void checkpoint_errors(void) {
+    const char *ckpath = "spingalett_test_ck_errors.ckpt", *mpath = "spingalett_test_ck_model.slett",
+               *dspath = "spingalett_test_ck_data.slettd";
+    const uint32_t N = 32;
+    lcg_state = 21;
+    float *x = NULL, *y = NULL;
+    make_data(N, 6, 3, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    SpingalettDataset d = {0};
+    make_ds(&d, 16, 6, 3);
+    for (uint32_t i = 0; i < d.count; i++)
+        for (uint32_t k = 0; k < 6; k++) d.inputs[(size_t)i * 6 + k] = (float)(i * 6 + k) / 3.0f;
+    const DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32,
+                                   .target_encoding = DATASET_ENCODING_FLOAT32, .no_compression = true};
+    CHECK(spingalett_save_dataset(&d, dspath, &so), "checkpoints: the file of the error checks");
+    spingalett_dataset_free(&d);
+
+    resume_compute(1);
+    spingalett_seed(5);
+    NeuralNetwork *net = resume_dense_net();
+    train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 2, .learning_rate = 0.05f,
+          .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8);
+
+    CHECK(!spingalett_save_checkpoint(NULL, ckpath, NULL, 0) &&
+          !spingalett_save_checkpoint(net, NULL, NULL, 0) &&
+          !spingalett_save_checkpoint(net, ckpath, NULL, 1) &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: a save of NULL arguments");
+    CHECK(!spingalett_load_checkpoint(NULL, NULL, 0) &&
+          !spingalett_load_checkpoint("spingalett_test_missing.ckpt", NULL, 0) &&
+          spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO, "checkpoints: a load of a missing file");
+    CHECK(spingalett_save_checkpoint(net, ckpath, NULL, 0), "checkpoints: the save of a run without readers");
+    free_network(net);
+
+    /* the reader counts of the file and of the call must agree */
+    SpingalettDatasetReader *one = spingalett_dataset_open(dspath, true);
+    SpingalettDatasetReader *given1[1] = { one }, *given2[2] = { one, one };
+    CHECK(spingalett_load_checkpoint(ckpath, given1, 1) == NULL &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: a reader given for a file of none");
+    CHECK(spingalett_load_checkpoint(ckpath, given2, 2) == NULL, "checkpoints: two readers for a file of none");
+    NeuralNetwork *held = spingalett_load_checkpoint(ckpath, NULL, 0);
+    CHECK(held != NULL && held->run_valid && held->run_resume && held->run_epochs == 2,
+          "checkpoints: a run without readers loaded without any");
+    /* the resumed run states the epochs of the run: 2 have run, so 2 is nothing to do and 3 is one */
+    train_struct_arguments((TrainArgs){.net = held, .inputs = x, .targets = y, .sample_count = N, .epochs = 2,
+                                       .learning_rate = 0.05f, .optimizer_type = OPTIMIZER_ADAM,
+                                       .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8});
+    CHECK(spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: a resumed run past its total accepted");
+    TrainReport rr = train_struct_arguments((TrainArgs){.net = held, .inputs = x, .targets = y, .sample_count = N,
+                                                         .epochs = 3, .learning_rate = 0.05f,
+                                                         .optimizer_type = OPTIMIZER_ADAM,
+                                                         .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8});
+    CHECK(rr.status == TRAIN_COMPLETED && rr.epochs_run == 1, "checkpoints: a resumed run ran %zu epochs",
+          rr.epochs_run);
+    /* .reset_optimizer begins the run afresh: the epochs of the call are its own again */
+    TrainReport rs = train_struct_arguments((TrainArgs){.net = held, .inputs = x, .targets = y, .sample_count = N,
+                                                        .epochs = 2, .learning_rate = 0.05f, .reset_optimizer = true,
+                                                        .optimizer_type = OPTIMIZER_ADAM,
+                                                        .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8});
+    CHECK(rs.status == TRAIN_COMPLETED && rs.epochs_run == 2 && held->run_epochs == 2 && !held->run_resume,
+          "checkpoints: reset_optimizer ran %zu epochs of a run of %llu", rs.epochs_run,
+          (unsigned long long)held->run_epochs);
+    free_network(held);
+    if (one) spingalett_dataset_close(one);
+
+    /* a checkpoint of a run with a reader, and its counts */
+    SpingalettDatasetReader *ra = spingalett_dataset_open(dspath, true), *rb = spingalett_dataset_open(dspath, true);
+    spingalett_seed(9);
+    NeuralNetwork *with = resume_dense_net();
+    train(.net = with, .inputs = x, .targets = y, .sample_count = N, .epochs = 2, .learning_rate = 0.05f,
+          .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8);
+    const SpingalettDatasetReader *saved[1] = { ra };
+    SpingalettDatasetReader *one_ra[1] = { ra }, *two[2] = { ra, rb };
+    CHECK(spingalett_save_checkpoint(with, ckpath, saved, 1), "checkpoints: the save with a reader");
+    CHECK(spingalett_load_checkpoint(ckpath, NULL, 0) == NULL &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: no reader for a file of one");
+    CHECK(spingalett_load_checkpoint(ckpath, two, 2) == NULL, "checkpoints: two readers for a file of one");
+    NeuralNetwork *moved = spingalett_load_checkpoint(ckpath, one_ra, 1);
+    CHECK(moved != NULL, "checkpoints: the reader of a checkpoint loaded");
+    free_network(moved);
+    free_network(with);
+    spingalett_dataset_close(rb);
+    spingalett_dataset_close(ra);
+
+    /* a plain .slett model loads with no run's state, and its first run draws its seeds afresh */
+    spingalett_seed(11);
+    NeuralNetwork *model = resume_dense_net();
+    CHECK(save_spingalett(.net = model, .filename = mpath), "checkpoints: the save of a model");
+    NeuralNetwork *m1 = spingalett_load_checkpoint(mpath, NULL, 0), *m2 = spingalett_load_checkpoint(mpath, NULL, 0);
+    CHECK(m1 && m2 && !m1->run_valid && !m1->run_resume && !m2->run_valid, "checkpoints: a model without run state");
+    SpingalettDatasetReader *rd1 = spingalett_dataset_open(dspath, true);
+    SpingalettDatasetReader *given_m[1] = { rd1 };
+    CHECK(spingalett_load_checkpoint(mpath, given_m, 1) == NULL &&
+          spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: readers for a model of none");
+    if (rd1) spingalett_dataset_close(rd1);
+    if (m1 && m2) {
+        spingalett_seed(31);
+        train(.net = m1, .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 0.05f,
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8);
+        spingalett_seed(31);
+        train(.net = m2, .inputs = x, .targets = y, .sample_count = N, .epochs = 1, .learning_rate = 0.05f,
+              .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8);
+        CHECK(bit_diff(m1->weights, m2->weights, m1->total_weights) == 0, "checkpoints: a model's fresh run differs");
+    }
+    free_network(m1); free_network(m2);
+
+    /* a checkpoint reads as a model, with the same parameters, and as a deployment model */
+    spingalett_seed(5);
+    NeuralNetwork *again = resume_dense_net();
+    train(.net = again, .inputs = x, .targets = y, .sample_count = N, .epochs = 2, .learning_rate = 0.05f,
+          .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 8);
+    CHECK(spingalett_save_checkpoint(again, ckpath, NULL, 0), "checkpoints: the save of a second run");
+    NeuralNetwork *as_model = spingalett_load(ckpath);
+    CHECK(as_model && bit_diff(as_model->weights, again->weights, again->total_weights) == 0 &&
+          as_model->time_step == again->time_step, "checkpoints: a checkpoint read as a model");
+    SpingalettModel *dm = spingalett_model_load(ckpath);
+    CHECK(dm != NULL, "checkpoints: a checkpoint read as a deployment model");
+    if (dm) spingalett_model_free(dm);
+    free_network(as_model);
+
+    /* a record whose bytes do not add up, and one cut short */
+    size_t size = 0;
+    uint8_t *bytes = NULL;
+    FILE *f = fopen(ckpath, "rb");
+    bool read_ok = f != NULL;
+    if (read_ok) {
+        fseek(f, 0, SEEK_END);
+        size = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        bytes = (uint8_t *)malloc(size);
+        read_ok = bytes && fread(bytes, 1, size, f) == size;
+        fclose(f);
+    }
+    const uint64_t image = read_ok ? (uint64_t)bytes[24] | ((uint64_t)bytes[25] << 8) | ((uint64_t)bytes[26] << 16) |
+                                    ((uint64_t)bytes[27] << 24) : 0;
+    bool whole = read_ok && image >= 64 && image < size;
+    CHECK(whole, "checkpoints: the image size of the file (%llu of %zu)", (unsigned long long)image, size);
+    if (whole) {
+        bytes[image + 40] ^= 0x80u;                 /* a bit of the generator's state */
+        f = fopen(ckpath, "wb");
+        if (f) { fwrite(bytes, 1, size, f); fclose(f); }
+        CHECK(spingalett_load_checkpoint(ckpath, NULL, 0) == NULL &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: a corrupt record accepted");
+        f = fopen(ckpath, "rb");
+        read_ok = f != NULL;
+        if (read_ok) { read_ok = fread(bytes, 1, size, f) == size; fclose(f); }
+        f = fopen(ckpath, "wb");
+        if (f) { fwrite(bytes, 1, size - 8, f); fclose(f); }
+        CHECK(spingalett_load_checkpoint(ckpath, NULL, 0) == NULL &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: a truncated record accepted");
+    }
+    free(bytes);
+    remove(ckpath); remove(mpath); remove(dspath);
+    free_network(again);
+    free_network(model);
+    free(x); free(y);
+}
+
+static void resume_runs(void) {
+    static const struct ResumeCase cases[] = {
+        {"dense adam dropout",         0, 0, false, false, false, false, false, OPTIMIZER_ADAM,
+            64, 16, 3, 5, {4, 4, 4}},
+        {"dense sgd-momentum",         0, 0, false, false, false, false, false, OPTIMIZER_MOMENTUM,
+            64, 16, 2, 4, {4, 4, 4}},
+        {"dense adam, 1 thread",       0, 0, false, false, false, false, false, OPTIMIZER_ADAM,
+            64, 16, 2, 3, {1, 1, 1}},
+        {"dense adam, threads change", 0, 0, false, false, false, false, false, OPTIMIZER_ADAM,
+            64, 16, 2, 4, {4, 4, 1}},
+        {"dense adam, schedule of run",0, 0, false, true,  false, false, false, OPTIMIZER_ADAM,
+            64, 16, 3, 4, {4, 4, 4}},
+        {"dense adam, plateau",        0, 0, false, true,  true,  true,  false, OPTIMIZER_ADAM,
+            64, 16, 2, 4, {4, 4, 4}},
+        {"dense adam, early stop",     0, 0, false, false, false, false, true,  OPTIMIZER_ADAM,
+            64, 16, 1, 5, {4, 4, 4}},
+        {"conv adam dropout",          1, 0, false, false, false, false, false, OPTIMIZER_ADAM,
+            64, 16, 3, 3, {4, 4, 4}},
+        {"conv adam, augmented",       1, 0, true,  false, false, false, false, OPTIMIZER_ADAM,
+            64, 16, 2, 4, {4, 4, 4}},
+        {"conv sgd-momentum",          1, 0, false, false, false, false, false, OPTIMIZER_MOMENTUM,
+            64, 16, 2, 2, {4, 4, 4}},
+        {"conv reader, streamed",      1, 1, false, false, false, false, false, OPTIMIZER_ADAM,
+            1024, 128, 2, 2, {4, 4, 4}},
+        {"conv reader, augmented",     1, 1, true,  false, false, false, false, OPTIMIZER_ADAM,
+            1024, 128, 2, 3, {4, 4, 1}},
+        {"conv reader, in memory",     1, 2, false, false, false, false, false, OPTIMIZER_ADAMW,
+            1024, 128, 3, 2, {4, 1, 4}},
+        {"language model, tokens",     2, 3, false, false, false, false, false, OPTIMIZER_ADAM,
+            0, 32, 2, 3, {4, 4, 4}},
+        {"language model, schedule",   2, 3, false, true,  false, false, false, OPTIMIZER_SGD,
+            0, 32, 3, 3, {4, 4, 4}},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) resume_case(&cases[i]);
+    checkpoint_errors();
+    resume_compute(4);
+    printf("  checkpoints: %u runs of two parts trained the bits of one that never stopped\n",
+           (unsigned)(sizeof cases / sizeof *cases));
 }
 
 
@@ -6130,6 +6891,11 @@ int main(int argc, char **argv) {
         dataset_files();
         dataset_files_v2();
         token_files();
+        dataset_positions();
+    }
+    if (!*only || !strcmp(only, "resume")) {
+        printf("[checkpoints]\n");
+        resume_runs();
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");

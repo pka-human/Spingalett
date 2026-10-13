@@ -7,6 +7,28 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- **Checkpoints**: `spingalett_save_checkpoint()` and `spingalett_load_checkpoint()` keep a network,
+  its optimizer state and the state of the run that produced it in one file — a `.slett` FLOAT32 image
+  with the optimizer, and after it a record of what the parameters do not say: the seeds its dropout
+  masks and augmentations hash from, the bias corrections its optimizer reached by multiplying beta
+  step after step (not what the step number raised to beta gives), the epochs it ran, the counters of
+  best-epoch tracking, early stopping and reduce-on-plateau, the place of the library's generator
+  where its epochs begin to shuffle, and the place of every data set reader it trained on. The next
+  `spingalett_train()` continues that run: it states the run's total in `.epochs` and runs what the
+  run has left of them, its learning-rate schedule counts the epochs of the run rather than of the
+  call, and a run of T epochs stopped at N, a checkpoint and a call of the same T train the same bits
+  as the run of T (the new `resume` test group). `.reset_optimizer` begins a fresh run. The record
+  sits after the image, whose own size says where it begins, so `spingalett_load()`,
+  `spingalett_model_load()` and the runtime read a checkpoint as a model (docs/ModelFormat.md,
+  **Checkpoint record**).
+- **The position of a data set reader**: `spingalett_dataset_get_position()` and
+  `spingalett_dataset_set_position()` with `SpingalettDatasetPosition` (the reader's seed, the pass it
+  reached and its position within that pass). A reader moved to a position serves the samples it would
+  have served then, bit for bit, on any number of threads and with or without its decoding thread;
+  chunks decoded ahead are dropped and decoded again when they come. What a checkpoint holds of a run
+  that trained on readers.
+
 ## [1.2.0] - 2026-10-11
 
 "Transformers": the networks of today's language models in every part of the library at once,

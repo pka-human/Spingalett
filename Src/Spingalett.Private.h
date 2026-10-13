@@ -462,6 +462,10 @@ void     rng_seed(uint64_t seed);
 uint32_t rng_next(void);
 uint64_t rng_next64(void);
 float    rng_next_float(void);
+/* The calling thread's generator as four words, and putting them back (a checkpoint carries a run's
+   draws on where they stopped; spingalett_save_checkpoint). Reading does not seed an unseeded thread. */
+void rng_state_get(uint32_t *state);
+void rng_state_set(const uint32_t *state);
 
 float random_uniform_weight(void);
 float random_normal_weight(void);

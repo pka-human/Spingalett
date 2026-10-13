@@ -877,3 +877,207 @@ NeuralNetwork *spingalett_load(const char *filename) {
         precision_names[precision]);
     return net;
 }
+
+/* ------------------------------------------------------------------------- checkpoints */
+
+/*
+ * A checkpoint is a .slett image of the network with its optimizer state, and after it a record of
+ * the run the image does not describe (docs/ModelFormat.md): the seeds of its dropout masks and of
+ * its augmentations, the optimizer's bias corrections, the epochs it ran, the counters that watch a
+ * validation set (best value, patience, the reduce-on-plateau scale), the library's generator as its
+ * thread left it, and the place of every reader it trained on. The record begins at the image's own
+ * size, which the header holds at byte 24, so an engine that reads the image ignores the record and a
+ * checkpoint serves as a model.
+ *
+ *   offset size field
+ *      0    6   magic "SLETTX"
+ *      6    2   record version, 1
+ *      8    4   number of reader positions
+ *     12    4   flags, bit 0: the record holds a run's state
+ *     16    8   epochs the run ran
+ *     24    8   the dropout seeds' draw
+ *     32    8   the augmentation seed's draw
+ *     40   16   the generator's four words
+ *     56    4   beta1 to the steps taken (its bit pattern)
+ *     60    4   beta2 to the steps taken
+ *     64    4   the best monitored value (its bit pattern)
+ *     68    4   the learning rate's plateau scale (1.0 before the first reduction)
+ *     72    8   epochs without improvement
+ *     80    8   epochs since the plateau's last reduction
+ *     88    8   the run's best epoch (0: none)
+ *     96   16   reserved, 0
+ *    112  24n one entry per reader: its seed, its pass, the samples of it served
+ *  112+24n  4   CRC-32 of the bytes before it
+ */
+#define SLETT_CK_MAGIC    "SLETTX"
+#define SLETT_CK_VERSION  1u
+#define SLETT_CK_HEADER   112u
+#define SLETT_CK_READER   24u
+#define SLETT_CK_STATE    1u
+
+static void slett_put_float(uint8_t *p, float v) { uint32_t bits; memcpy(&bits, &v, 4); slett_put32(p, bits); }
+static float slett_get_float(const uint8_t *p) { uint32_t bits = slett_get32(p); float v; memcpy(&v, &bits, 4); return v; }
+
+bool spingalett_save_checkpoint(NeuralNetwork *net, const char *path,
+                                const SpingalettDatasetReader *const *readers, uint32_t reader_count) {
+    if (!net || !path) {
+        set_error(SPINGALETT_ERR_INVALID, "checkpoint: net or path is NULL");
+        return false;
+    }
+    if (reader_count && !readers) {
+        set_error(SPINGALETT_ERR_INVALID, "checkpoint: readers is NULL with a count above 0");
+        return false;
+    }
+    size_t image_size = 0;
+    void *image = spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &image_size);
+    if (!image) return false;
+    const size_t record = SLETT_CK_HEADER + (size_t)reader_count * SLETT_CK_READER + 4u;
+    uint8_t *ck = (uint8_t *)calloc(1, record);
+    if (!ck) {
+        set_error(SPINGALETT_ERR_ALLOC, "checkpoint: allocation failed");
+        spingalett_free(image);
+        return false;
+    }
+    memcpy(ck, SLETT_CK_MAGIC, 6);
+    slett_put16(ck + 6, SLETT_CK_VERSION);
+    slett_put32(ck + 8, reader_count);
+    slett_put32(ck + 12, net->run_valid ? SLETT_CK_STATE : 0u);
+    slett_put64(ck + 16, net->run_epochs);
+    slett_put64(ck + 24, net->run_dropout_seed);
+    slett_put64(ck + 32, net->run_augment_seed);
+    for (int k = 0; k < 4; k++) slett_put32(ck + 40 + 4 * k, net->run_generator[k]);
+    slett_put_float(ck + 56, net->run_beta1_pow);
+    slett_put_float(ck + 60, net->run_beta2_pow);
+    slett_put_float(ck + 64, net->run_best);
+    slett_put_float(ck + 68, net->run_lr_scale);
+    slett_put64(ck + 72, net->run_no_improvement);
+    slett_put64(ck + 80, net->run_stale);
+    slett_put64(ck + 88, net->run_best_epoch);
+    for (uint32_t r = 0; r < reader_count; r++) {
+        SpingalettDatasetPosition pos;
+        if (!spingalett_dataset_get_position(readers[r], &pos)) {
+            free(ck);
+            spingalett_free(image);
+            return false;
+        }
+        uint8_t *e = ck + SLETT_CK_HEADER + (size_t)r * SLETT_CK_READER;
+        slett_put64(e, pos.seed);
+        slett_put64(e + 8, pos.pass);
+        slett_put64(e + 16, pos.position);
+    }
+    slett_put32(ck + record - 4u, spingalett_crc32(0, ck, record - 4u));
+
+    bool ok = false;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) set_error(SPINGALETT_ERR_FILE_IO, "checkpoint: cannot open file for writing");
+    else {
+        ok = fwrite(image, 1, image_size, fp) == image_size && fwrite(ck, 1, record, fp) == record;
+        if (fclose(fp) != 0) ok = false;
+        if (!ok) set_error(SPINGALETT_ERR_FILE_IO, "checkpoint: write error (disk full?)");
+    }
+    free(ck);
+    spingalett_free(image);
+    if (ok)
+        spingalett_log(LOG_INFO, "Checkpoint saved to %s: image=%zu bytes, run state=%s, readers=%u",
+                       path, image_size, net->run_valid ? "yes" : "no", reader_count);
+    else
+        spingalett_log(LOG_ERROR, "Write error saving a checkpoint to %s", path);
+    return ok;
+}
+
+SpingalettNetwork *spingalett_load_checkpoint(const char *path, SpingalettDatasetReader *const *readers,
+                                              uint32_t reader_count) {
+    if (!path) {
+        set_error(SPINGALETT_ERR_INVALID, "checkpoint: path is NULL");
+        return NULL;
+    }
+    if (reader_count && !readers) {
+        set_error(SPINGALETT_ERR_INVALID, "checkpoint: readers is NULL with a count above 0");
+        return NULL;
+    }
+    size_t size = 0;
+    uint8_t *data = (uint8_t *)spingalett_read_file(path, &size);
+    if (!data) return NULL;
+
+    /* the record, when the file has one: it begins where the image ends */
+    const uint64_t image_size = size >= SLETT_HEADER_SIZE && memcmp(data, SLETT_MAGIC, 6) == 0 &&
+                                slett_get16(data + 6) >= 3u ? slett_get64(data + 24) : 0u;
+    const bool has_record = image_size >= SLETT_HEADER_SIZE && image_size <= size &&
+                            size - image_size >= SLETT_CK_HEADER + 4u &&
+                            memcmp(data + image_size, SLETT_CK_MAGIC, 6) == 0;
+    const uint8_t *ck = has_record ? data + image_size : NULL;
+    if (has_record) {
+        const size_t record = size - image_size;
+        const uint32_t held = slett_get32(ck + 8);
+        if (slett_get16(ck + 6) != SLETT_CK_VERSION || record != SLETT_CK_HEADER + (size_t)held * SLETT_CK_READER + 4u ||
+            slett_get32(ck + record - 4u) != spingalett_crc32(0, ck, record - 4u)) {
+            set_error(SPINGALETT_ERR_INVALID, "checkpoint: the run state is corrupt");
+            spingalett_aligned_free(data);
+            return NULL;
+        }
+        if (held != reader_count) {
+            char msg[128];
+            snprintf(msg, sizeof msg, "checkpoint: the file holds positions of %u reader(s), %u given",
+                     (unsigned)held, (unsigned)reader_count);
+            set_error(SPINGALETT_ERR_INVALID, msg);
+            spingalett_aligned_free(data);
+            return NULL;
+        }
+    } else if (image_size && image_size != size) {
+        char msg[128];
+        snprintf(msg, sizeof msg, "checkpoint: %zu bytes after the model's image are no run record",
+                 (size_t)(size - image_size));
+        set_error(SPINGALETT_ERR_INVALID, msg);
+        spingalett_aligned_free(data);
+        return NULL;
+    } else if (reader_count) {
+        char msg[128];
+        snprintf(msg, sizeof msg, "checkpoint: the file holds no reader positions, %u given", (unsigned)reader_count);
+        set_error(SPINGALETT_ERR_INVALID, msg);
+        spingalett_aligned_free(data);
+        return NULL;
+    }
+
+    /* The image, and with it the record that follows it, are read here: the file's buffer stays until
+       every field of the record moved into the network and its readers. */
+    PrecisionMode precision = PRECISION_FLOAT32;
+    NeuralNetwork *net = spingalett_load_from_memory_ex(data, size, &precision);
+    if (!net) {
+        spingalett_aligned_free(data);
+        spingalett_log(LOG_ERROR, "Could not load %s: %s", path, spingalett_last_error_message());
+        return NULL;
+    }
+    if (!ck) {
+        spingalett_aligned_free(data);
+        spingalett_log(LOG_INFO, "Checkpoint loaded from %s without a run's state", path);
+        return net;
+    }
+    if (slett_get32(ck + 12) & SLETT_CK_STATE) {
+        net->run_valid = net->run_resume = true;
+        net->run_epochs = slett_get64(ck + 16);
+        net->run_dropout_seed = slett_get64(ck + 24);
+        net->run_augment_seed = slett_get64(ck + 32);
+        for (int k = 0; k < 4; k++) net->run_generator[k] = slett_get32(ck + 40 + 4 * k);
+        net->run_beta1_pow = slett_get_float(ck + 56);
+        net->run_beta2_pow = slett_get_float(ck + 60);
+        net->run_best = slett_get_float(ck + 64);
+        net->run_lr_scale = slett_get_float(ck + 68);
+        net->run_no_improvement = slett_get64(ck + 72);
+        net->run_stale = slett_get64(ck + 80);
+        net->run_best_epoch = slett_get64(ck + 88);
+    }
+    for (uint32_t r = 0; r < reader_count; r++) {
+        const uint8_t *e = ck + SLETT_CK_HEADER + (size_t)r * SLETT_CK_READER;
+        SpingalettDatasetPosition pos = { .seed = slett_get64(e), .pass = slett_get64(e + 8),
+                                          .position = slett_get64(e + 16) };
+        if (!spingalett_dataset_set_position(readers[r], &pos)) {
+            spingalett_aligned_free(data);
+            free_network(net);
+            return NULL;
+        }
+    }
+    spingalett_aligned_free(data);
+    spingalett_log(LOG_INFO, "Checkpoint loaded from %s: epochs=%llu, steps=%llu, readers=%u", path,
+                   (unsigned long long)net->run_epochs, (unsigned long long)net->time_step, reader_count);
+    return net;
+}

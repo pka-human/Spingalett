@@ -116,7 +116,8 @@ typedef enum {
 
 /* State of a spingalett_train() call, passed to the epoch callback. */
 typedef struct {
-    size_t epoch;                   /* epochs completed in this call (1-based) */
+    size_t epoch;                   /* the epoch of the run (1-based): a run resumed from a checkpoint
+                                       counts the epochs it already ran, as one never stopped would */
     size_t epochs;                  /* SpingalettTrainArgs.epochs */
     float train_loss;               /* mean training loss of this epoch */
     float learning_rate;            /* learning rate used in this epoch */
@@ -166,8 +167,9 @@ typedef struct {
 typedef uint32_t (*SpingalettDataGeneratorFn)(float *inputs, float *targets, uint32_t requested, void *user_data);
 
 /*
- * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
- * completed in this spingalett_train() call (0 for the first), `initial_lr` is SpingalettTrainArgs.learning_rate.
+ * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs the run has
+ * completed (0 for the first; a run resumed from a checkpoint counts those it already ran),
+ * `initial_lr` is SpingalettTrainArgs.learning_rate.
  * Returns the learning rate for the coming epoch; negative or NaN results are ignored.
  */
 typedef float (*SpingalettLRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
@@ -266,7 +268,8 @@ typedef struct {
                                        (0 = until the generator returns 0; required for full batch) */
     uint32_t batch_size;
     bool do_not_shuffle;            /* keep sample order (per-sample and mini-batch training) */
-    size_t epochs;
+    size_t epochs;                  /* epochs the run trains; a run resumed from a checkpoint counts
+                                       the epochs it already ran among them (spingalett_save_checkpoint) */
 
     float learning_rate;
     float weight_decay;
@@ -840,8 +843,82 @@ SPINGALETT_API SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDat
    error, which is sticky); the next call starts a new pass. */
 SPINGALETT_API uint32_t spingalett_dataset_read(SpingalettDatasetReader *reader, float *inputs, float *targets,
                                                 uint32_t max_samples);
+/* Where a reader stands in its passes: enough to carry a stopped run on where it left off. The order
+   of a pass is a function of the seed and of the pass number, so these three words describe the
+   stream of samples exactly. A position belongs to the reader that wrote it, and to readers of the
+   same file opened with the same options: another stride, context, set of targets or way of cutting
+   the file into chunks orders other samples, and the numbers would then name another stream. */
+typedef struct {
+    uint64_t seed;                /* the reader's draw of the library's generator */
+    uint64_t pass;                /* the pass the position lies in (0: the first one) */
+    uint64_t position;            /* samples of that pass the caller holds. One equal to what the
+                                       pass holds in all means the pass is read out and its end has
+                                       still to be reported by a read of 0; a reader that streams a
+                                       file then resumes inside the chunk the sample lies in, which
+                                       it reads and decodes again. */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettDatasetPosition;
+/* Writes the reader's place into *position (false, with an error, when an argument is NULL). The
+   place of a reader that failed is its own: the message of what went wrong stays where it was. */
+SPINGALETT_API bool spingalett_dataset_get_position(const SpingalettDatasetReader *reader,
+                                                    SpingalettDatasetPosition *position);
+/* Moves a reader to a position of its own: the samples it serves next are those it would have
+   served then, bit for bit, on any number of threads and with or without a decoding thread. Its seed
+   becomes the position's; chunks decoded ahead are dropped and decoded again when they come. A
+   position beyond what this reader holds is refused; one taken from another file or other options
+   that this reader still holds is not noticed (see SpingalettDatasetPosition). */
+SPINGALETT_API bool spingalett_dataset_set_position(SpingalettDatasetReader *reader,
+                                                    const SpingalettDatasetPosition *position);
 /* A SpingalettDataGeneratorFn over a reader, for .generator = spingalett_dataset_generator, .generator_data = reader. */
 SPINGALETT_API uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader);
+
+/*
+ * A checkpoint: the network, its optimizer state and the state of the run that produced it, in one
+ * file. The model image (FLOAT32, always with the optimizer: its moments and step count) holds the
+ * parameters, the running statistics and how many steps were taken; the record after it holds what
+ * the parameters do not say, and what a run cannot carry on without: the seeds its dropout masks and
+ * its augmentations hash from, the bias corrections its optimizer reached by multiplying beta step
+ * after step (not what the step number raised to beta gives), the epochs it ran, which a
+ * learning-rate schedule counts with, the counters of best-epoch tracking, early stopping and
+ * reduce-on-plateau (the best monitored value, the epochs without improvement, the learning rate's
+ * scale), the place of the library's generator where the run's epochs begin to shuffle and which a
+ * resumed run draws again over the epochs already run, and the place of every reader it trained on.
+ *
+ * spingalett_load_checkpoint() gives the network back with that state, and the next spingalett_train()
+ * continues the run from it instead of beginning a new one: it restores the generator and draws the
+ * epochs' shuffles again to reach the order the run stopped on, keeps the seeds, the corrections and
+ * the counters, and counts its epochs after those already run. A resumed
+ * train() states the epochs of the run in .epochs and runs what the run has left of them, so the
+ * epochs of an interrupted run and of one that never stopped are alike: a run of T epochs stopped at
+ * N (its callback returning true, or the process ending), a checkpoint, and a train() that gives the
+ * same T, trains the same bits as the run of T. Every call of such a run gives its total, and so does
+ * the call that begins it; a train() of a network that holds no run state (made, or loaded as a model
+ * with spingalett_load()) runs .epochs epochs and draws new seeds, as it has always done.
+ *
+ * Checkpoint a run at an epoch's end: within one, the samples read but not stepped on are not held by
+ * the reader's position alone. The best epoch's parameters, kept in memory by
+ * .restore_best_weights, are not in the checkpoint: a resumed run restores the best of the epochs it
+ * runs itself, and so does the call that is interrupted, which resets the parameters to the best so
+ * far. The GPU's copy of the network is not in it either: the resumed run makes its own.
+ * .reset_optimizer begins a fresh run: new seeds, and the schedule, the epochs and the counters from
+ * the start. A checkpoint is a .slett file with a record after it, so spingalett_load() and the
+ * runtime read one as a model, the record being bytes they never look at (docs/ModelFormat.md).
+ */
+/* Writes net's checkpoint to path (nothing is appended to the name), with the place of each of the
+   reader_count readers in *readers, in order; readers NULL means none (reader_count must then be 0).
+   The network must have been trained by spingalett_train() to hold a run's state; a checkpoint of one
+   that has not loads as a model and begins its run afresh. False on error. */
+SPINGALETT_API bool spingalett_save_checkpoint(SpingalettNetwork *net, const char *path,
+                                               const SpingalettDatasetReader *const *readers, uint32_t reader_count);
+/* Reads a checkpoint written by spingalett_save_checkpoint(): the network with its parameters, its
+   optimizer state and its run's state, and moves the reader_count readers given, in the order they
+   were saved in, to the places the checkpoint holds (their own options must match the run's). The
+   counts must agree, or the load fails. A file without a record—a plain .slett model—loads with no
+   run state, so its first spingalett_train() draws new seeds; bytes after the image that form no
+   complete record are an error. NULL on error. */
+SPINGALETT_API SpingalettNetwork *spingalett_load_checkpoint(const char *path,
+                                                             SpingalettDatasetReader *const *readers,
+                                                             uint32_t reader_count);
 
 SPINGALETT_API void spingalett_print_network(const SpingalettNetwork *net);
 SPINGALETT_API void spingalett_network_free(SpingalettNetwork *net);
