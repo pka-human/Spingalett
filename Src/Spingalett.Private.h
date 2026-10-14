@@ -599,6 +599,10 @@ typedef struct {
     const SpingalettGemmSource *a, *b;
     void (*epilogue)(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols, float *c, size_t ldc);
     const void *epilogue_ctx;
+    /* a product whose k runs far longer than M and N (a linear layer's weight gradient over a chunk's tokens), from
+       memory and without an epilogue: k in slots fixed by the shape, each summed by one thread (GEMM.c's
+       gemm_tall()) */
+    bool tall;
 } SpingalettGemmHooks;
 
 SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads);

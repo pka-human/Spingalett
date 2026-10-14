@@ -4319,6 +4319,51 @@ static void tf_determinism(void) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
+/* Linear layers wide enough for the weight gradient on the dense products, over chunks long enough for its slots of
+   tokens (GEMM.c's tall products: 64 cells of 368 channels, 64 sequences a step, two slots), train to the same bits
+   on one thread, on three and on four, and single-threaded. */
+static void tf_wide_threads(void) {
+    static const ComputeMode modes[] = {COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP, COMPUTE_OPENMP, COMPUTE_OPENMP};
+    static const unsigned threads[] = {1, 1, 3, 4};
+    const uint32_t cells = 64, C = 368, n = 64;
+    float *ref = NULL;
+    bool same = true;
+    uint64_t nw = 0;
+    for (int v = 0; v < 4; v++) {
+        spingalett_set_num_threads(threads[v]);
+        spingalett_set_compute_mode(modes[v]);
+        lcg_state = 41;
+        spingalett_seed(3);
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = net, .height = 1, .width = cells, .channels = C);
+        linear(.net = net, .neurons_amount = C, .act_func = ACT_GELU);
+        linear(.net = net, .neurons_amount = C);
+        linear(.net = net, .neurons_amount = 8);
+        float *x = malloc((size_t)n * cells * C * sizeof(float)), *y = malloc((size_t)n * cells * 8 * sizeof(float));
+        for (size_t i = 0; i < (size_t)n * cells * C; i++) x[i] = frand() * 2 - 1;
+        for (size_t i = 0; i < (size_t)n * cells * 8; i++) y[i] = frand();
+        /* (SGD: the weights move with the gradients' bits, where Adam's first steps take their signs) */
+        train(.net = net, .inputs = x, .targets = y, .sample_count = n, .epochs = 2, .learning_rate = 1e-2f,
+              .optimizer_type = OPTIMIZER_SGD, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = n);
+        nw = net->total_weights + net->total_biases;
+        float *w = malloc(nw * sizeof(float));
+        memcpy(w, net->weights, net->total_weights * sizeof(float));
+        memcpy(w + net->total_weights, net->biases, net->total_biases * sizeof(float));
+        if (!ref) ref = w;
+        else {
+            same = same && !memcmp(ref, w, nw * sizeof(float));
+            free(w);
+        }
+        free(x); free(y); free_network(net);
+    }
+    CHECK(same, "wide linear layers: training differs between thread counts or compute modes");
+    printf("  wide linear layers: %llu parameters alike on 1, 3 and 4 threads and single-threaded%s\n",
+           (unsigned long long)nw, same ? "" : " -- NO");
+    free(ref);
+    spingalett_set_num_threads(4);
+    spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
 /* A causal model learns to predict the next token of sequences counting up modulo V by one or two. */
 static void tf_learns(ComputeMode mode) {
     const uint32_t T = 16, V = 13, N = 256;
@@ -8196,6 +8241,7 @@ int main(int argc, char **argv) {
             for (int k = 0; k < 7; k++) tf_gradcheck(k, cm[m], strats[s]);
         tf_gradcheck(1, cm[2], STRATEGY_FULL_BATCH);
         tf_determinism();
+        tf_wide_threads();
         tf_models();
         tf_token_quantization();
         tf_tied();

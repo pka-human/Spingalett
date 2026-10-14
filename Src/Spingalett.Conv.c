@@ -419,6 +419,7 @@ static void multiply_derivative(const void *ctx, uint32_t row, uint32_t rows, ui
 
 /* Rows per product when nothing is gathered (pointwise convolutions): the GEMM counts in 32 bits. */
 #define POINTWISE_ROWS (1u << 30)
+#define DENSE_WGRAD_WEIGHTS (1u << 17)  /* weights of a pointwise convolution whose gradient takes the dense products */
 
 /* A 1 x 1 convolution with stride 1 and no padding reads each input pixel as its window. */
 static bool pointwise(const LayerShape *out) {
@@ -866,7 +867,11 @@ static void conv_backward_weights_shapes(const LayerShape *in, const LayerShape 
         return;
     }
     const uint32_t G = groups_of(out);
-    const bool direct = spingalett_conv_direct_wgrad(in, out, mode);
+    /* a pointwise convolution of many weights (a linear layer of a transformer) as dy^T x on the dense products,
+       whose tiles of the weights' gradient keep the threads busy; few weights (a convolutional network's
+       pointwise layers) split better into the indirect kernel's slots of pixels */
+    const bool dense = G == 1 && pointwise(out) && (uint64_t)OC * K >= DENSE_WGRAD_WEIGHTS;
+    const bool direct = !dense && spingalett_conv_direct_wgrad(in, out, mode);
     if (direct) {
         const uint64_t work = total * K * OC / G;
         for (uint32_t g = 0; g < G; g++)
@@ -944,10 +949,12 @@ static void conv_backward_weights_shapes(const LayerShape *in, const LayerShape 
             for (size_t k = 0; k < K; k++)
                 gW[(size_t)oc * K + k] = scale * T[k * OC + oc] + (beta == 0.0f ? 0.0f : beta * gW[(size_t)oc * K + k]);
     } else if (pointwise(out)) {
+        /* (a linear layer's: k the chunk's tokens, in slots, spingalett_gemm_ex()'s tall products) */
+        const SpingalettGemmHooks tall = {.tall = dense};
         for (uint64_t p0 = 0; p0 < total; p0 += POINTWISE_ROWS) {
             uint64_t rows = total - p0 < POINTWISE_ROWS ? total - p0 : POINTWISE_ROWS;
-            spingalett_gemm(gemm, mode, true, false, OC, (uint32_t)K, (uint32_t)rows, scale, dy + p0 * OC, OC,
-                            x + p0 * K, K, p0 == 0 ? beta : 1.0f, gW, K);
+            spingalett_gemm_ex(gemm, mode, true, false, OC, (uint32_t)K, (uint32_t)rows, scale, dy + p0 * OC, OC,
+                               x + p0 * K, K, p0 == 0 ? beta : 1.0f, gW, K, &tall);
         }
     } else if (implicit(mode)) {
         for (uint64_t p0 = 0; p0 < total; p0 += POINTWISE_ROWS) {
