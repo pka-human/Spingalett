@@ -853,7 +853,7 @@ rng = np.random.default_rng(3)
 src = rng.integers(0, V, (256, S)).astype(np.float32)
 xs = np.concatenate([src, np.zeros((256, Q), np.float32)], axis=1)
 xs[:, S + 1:] = src[:, :Q - 1]                      # the target's tokens so far: the source's, shifted
-r = seq.train(xs, src[:, :Q], epochs=60, batch_size=32, strategy=sg.Strategy.MINI_BATCH, learning_rate=1e-2,
+r = seq.train(xs, src[:, :Q], epochs=100, batch_size=32, strategy=sg.Strategy.MINI_BATCH, learning_rate=1e-2,
               optimizer=sg.Optimizer.ADAM)
 m = seq.evaluate(xs, src[:, :Q])
 check(r.status == sg.TrainStatus.COMPLETED and m.accuracy > 0.9, f"an encoder-decoder learns to copy ({m.accuracy:.3f})")
