@@ -62,10 +62,14 @@ typedef struct {
     _Atomic(PredictWorkspace *) spare;
 #if !defined(SPINGALETT_RUNTIME)
     /* the full library on a GPU: the model as a network there (models of float weights), made under the lock by
-       the first call that needs it (gpu_state 1; -1: the GPU cannot run it), its calls one at a time (gpu_lock) */
+       the first call that needs it (gpu_state 1; -1: the GPU cannot run it); a model of integer weights as the CPU
+       computes it, on each backend (Vulkan, CUDA) the first call there makes it (gpu_exact_state); their calls one at
+       a time (gpu_lock) */
     struct SpingalettNetwork *gpu_net;
+    struct SpgGpuModel *gpu_exact[2];
     SpgSignal *gpu_lock;
     _Atomic int gpu_state;
+    _Atomic int gpu_exact_state[2];
 #endif
 } ModelOwner;
 

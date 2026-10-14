@@ -1,0 +1,116 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Products of a few rows of activations (decoding: a token of each sequence) with a linear layer's weights kept on
+ * the device as an integer model's codes (INT8, INT4, INT2: BITS) and a scale a row of weights, the codes widened to
+ * floats in registers as they are read, so that a pass reads each weight's BITS once for up to ROWS rows of x:
+ * y[r][n] = act(bias[n] + scale[n] sum_k x[r][k] code[n][k]) for the rows r0 .. r0 + rows - 1. A workgroup 32 rows of
+ * weights, 32 invocations NR of them, an invocation 16 bytes of each of its rows' codes in turn (a value of x read
+ * once for the NR rows): its sums in the order of k, then the 32 invocations' added by a tree in shared memory, a
+ * fixed order on any subgroup size (the same bits on every run, a row's whatever rows are computed with it).
+ *
+ * HALF: words x 0, y 1 kept as bfloat16 (half.glsl).
+ */
+
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+
+layout(constant_id = 0) const uint BITS = 8;
+layout(constant_id = 1) const uint ROWS = 1;
+layout(constant_id = 2) const uint ACT = ACT_NONE;
+layout(constant_id = 3) const uint HALF = 0;
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 { uvec4 v[]; };
+
+layout(push_constant) uniform Push {
+    F32 x, y;
+    U32x4 codes;
+    F32 scale, bias;
+    uint rows, N, K, stride, r0, pad;
+} p;
+
+#include "half.glsl"
+
+const uint PER = 32u / BITS;                /* codes a word */
+const uint CODES = 4u * PER;                /* codes in 16 bytes */
+const uint MAXR = 8u;                       /* SPG_WQ_ROWS */
+const uint NR = ROWS >= 8u ? 2u : 4u;      /* rows of weights an invocation (SPG_WQ_NR) */
+
+shared float red[256 * MAXR];
+
+/* code j of a word of codes as a float: the code with its top bit flipped (code + half its range, unsigned) in the
+   significand of 2^23, less 2^23 + half the range (exact; no conversion from integers, which runs at a quarter of
+   the rate of additions) */
+const uint MASK = (1u << BITS) - 1u, MID = 1u << (BITS - 1u);
+float code_of(uint w, uint j) {
+    return uintBitsToFloat(0x4B000000u | (((w >> (BITS * j)) & MASK) ^ MID)) - (8388608.0 + float(MID));
+}
+
+void main() {
+    const uint t = gl_LocalInvocationID.x, lane = t & 31u, n0 = (gl_WorkGroupID.x * 8u + (t >> 5)) * NR;
+    float acc[NR][MAXR];
+    [[unroll]] for (uint i = 0; i < NR; i++)
+        [[unroll]] for (uint r = 0; r < MAXR; r++) acc[i][r] = 0.0;
+    const uint live = n0 < p.N ? min(p.N - n0, NR) : 0u;   /* (rows of weights past N: none) */
+    if (live > 0u) {
+        const uint chunks = (p.K + CODES - 1u) / CODES, rowq = p.stride >> 4;
+        const bool fours = (p.K & 3u) == 0u;
+        for (uint c = lane; c < chunks; c += 32u) {
+            uvec4 q[NR];
+            [[unroll]] for (uint i = 0; i < NR; i++) q[i] = i < live ? p.codes.v[(n0 + i) * rowq + c] : uvec4(0u);
+            const uint k0 = c * CODES;
+            if (fours && k0 + CODES <= p.K) {
+                [[unroll]] for (uint wi = 0; wi < 4u; wi++)
+                    [[unroll]] for (uint j = 0; j < PER; j += 4u) {
+                        const uint k = k0 + wi * PER + j;
+                        vec4 x[MAXR];
+                        [[unroll]] for (uint r = 0; r < MAXR; r++)
+                            x[r] = r < ROWS && r < p.rows ? ld4(p.x, (p.r0 + r) * p.K + k, 0u) : vec4(0.0);
+                        [[unroll]] for (uint i = 0; i < NR; i++) {
+                            const vec4 code = vec4(code_of(q[i][wi], j), code_of(q[i][wi], j + 1u), code_of(q[i][wi], j + 2u),
+                                                   code_of(q[i][wi], j + 3u));
+                            [[unroll]] for (uint r = 0; r < MAXR; r++)
+                                if (r < ROWS) acc[i][r] += dot(x[r], code);
+                        }
+                    }
+            } else {
+                /* (the last chunk, or rows not in fours: a value at a time, every index a constant) */
+                [[unroll]] for (uint wi = 0; wi < 4u; wi++)
+                    [[unroll]] for (uint j = 0; j < PER; j++) {
+                        const uint k = k0 + wi * PER + j;
+                        if (k >= p.K) continue;
+                        [[unroll]] for (uint r = 0; r < MAXR; r++) {
+                            if (r >= ROWS || r >= p.rows) continue;
+                            const float x = ld(p.x, (p.r0 + r) * p.K + k, 0u);
+                            [[unroll]] for (uint i = 0; i < NR; i++) acc[i][r] += x * code_of(q[i][wi], j);
+                        }
+                    }
+            }
+        }
+    }
+    /* each row of weights in turn: the 32 invocations' sums by a tree, then invocation r writes x's row r's output */
+    [[unroll]] for (uint i = 0; i < NR; i++) {
+        [[unroll]] for (uint r = 0; r < MAXR; r++)
+            if (r < ROWS) red[t * MAXR + r] = acc[i][r];
+        barrier();
+        for (uint h = 16u; h > 0u; h >>= 1) {
+            if (lane < h)
+                [[unroll]] for (uint r = 0; r < MAXR; r++)
+                    if (r < ROWS) red[t * MAXR + r] += red[(t + h) * MAXR + r];
+            barrier();
+        }
+        if (i < live && lane < ROWS && lane < p.rows) {
+            const float s = red[(t - lane) * MAXR + lane];
+            st(p.y, (p.r0 + lane) * p.N + n0 + i, 1u, activate(p.bias.v[n0 + i] + p.scale.v[n0 + i] * s, ACT));
+        }
+        barrier();                          /* (red is written again for the next row) */
+    }
+}

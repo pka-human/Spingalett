@@ -106,9 +106,16 @@ typedef struct {
 /* Samples per batch-path chunk: bounds workspace memory (full-batch training over a large dataset
    runs in chunks whose gradients are accumulated) while keeping the GEMMs large. Networks with more
    than SPINGALETT_BATCH_FLOATS / SPINGALETT_BATCH_CHUNK activations per sample (convolutions) take
-   fewer samples per chunk, so that one chunk's activations stay near SPINGALETT_BATCH_FLOATS. */
+   fewer samples per chunk, so that one chunk's activations stay near SPINGALETT_BATCH_FLOATS. A
+   network's products then take a chunk's samples times their cells as rows: a sample of few cells but
+   many values (a sequence of a language model, millions of values over 256 cells) left chunks of one or
+   two, products over 256 or 512 rows that kept six threads busy half the time; such chunks take more
+   samples, up to SPINGALETT_BATCH_ROWS rows or SPINGALETT_NETWORK_FLOATS values (GPT on the CPU trained 1.5
+   times as fast). Deployment models size their chunks by SPINGALETT_BATCH_FLOATS alone. */
 #define SPINGALETT_BATCH_CHUNK 2048u
 #define SPINGALETT_BATCH_FLOATS (1u << 24)
+#define SPINGALETT_BATCH_ROWS 2048u
+#define SPINGALETT_NETWORK_FLOATS (1u << 26)
 
 typedef struct SpingalettGemmScratch SpingalettGemmScratch;
 
@@ -180,8 +187,9 @@ BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint
 BatchWorkspace *spingalett_batch_workspace_recompute(const NeuralNetwork *net, uint32_t capacity, bool gather,
                                                      ComputeMode mode);
 void spingalett_batch_workspace_free(BatchWorkspace *ws);
-/* Samples per chunk for `count` samples: at most count, SPINGALETT_BATCH_CHUNK and what fits
-   SPINGALETT_BATCH_FLOATS activations, at least 1. */
+/* Samples per chunk for `count` samples: at most count and SPINGALETT_BATCH_CHUNK, what fits
+   SPINGALETT_BATCH_FLOATS activations, or more for products of fewer than SPINGALETT_BATCH_ROWS rows (up to
+   SPINGALETT_NETWORK_FLOATS activations), at least 1. */
 uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
 /* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
    layers; samples are numbered position_offset + s for the dropout hash. */
@@ -517,6 +525,18 @@ void apply_softmax(float *layer, uint32_t size);
 void apply_activation_batch(float *data, uint32_t size, ActivationFunction act);
 void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act);
 void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total, ActivationFunction act);
+/* The activation of training's forward pass, from the values before it that training keeps (GELU, SiLU):
+   GELU, its tanh form and SiLU in vectors (erf as the GPU computes it, the vector exp), as their derivatives in
+   apply_derivative_batch(); inference (spingalett_engine_activate_one(), the engine's) keeps libm's erff and
+   expf, which the engine on its own, its WebAssembly build and sessions agree on. Other activations as
+   apply_activation_bulk(). */
+void spingalett_activate_training(float *data, uint64_t total, ActivationFunction act);
+/* row[i] = exp(row[i] - shift) for i < n, the vector exp in blocks of 8 from the start (expf for the rest), and
+   their sum (eight lanes, then across them, then the rest in order): attention's softmax in training and
+   predict(); deployment models attend through spingalett_engine_attend(). */
+float spingalett_vec_exp_shifted(float *row, uint32_t n, float shift);
+/* The sum of n values in spingalett_vec_exp_shifted()'s order. */
+float spingalett_vec_sum_lanes(const float *row, uint32_t n);
 
 void     rng_seed(uint64_t seed);
 uint32_t rng_next(void);

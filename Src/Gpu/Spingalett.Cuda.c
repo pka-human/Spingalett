@@ -290,6 +290,7 @@ static bool grid_stride(SpgKernel kernel) {
         case SPG_KERNEL_eltwise: case SPG_KERNEL_eltwise_h: case SPG_KERNEL_combine: case SPG_KERNEL_combine_h:
         case SPG_KERNEL_pool: case SPG_KERNEL_pool_h: case SPG_KERNEL_upsample: case SPG_KERNEL_upsample_h:
         case SPG_KERNEL_wtrans: case SPG_KERNEL_optim: case SPG_KERNEL_optim_h: case SPG_KERNEL_rows: case SPG_KERNEL_rows_h:
+        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h:
             return true;
         default:
             return false;
@@ -351,6 +352,9 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], op);
         else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u%s", spec[2], op, op == SPG_ATTN_PRE ? "" : ext);
         else snprintf(name, sizeof name, "attn_d%u%s", spec[2], ext);
+    } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
+        if (count < 2) return -1;
+        snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];

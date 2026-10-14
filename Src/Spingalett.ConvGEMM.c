@@ -361,13 +361,24 @@ static void row_taps(const Taps *g, uint64_t row, uint32_t rows, const float **p
     }
 }
 
-/* Packs B[k][j] = src[j * ldj + k * ldk] for k < K, j < cols into NR-wide panels (zero-padded). */
-static void pack_panels(float *dst, const float *src, size_t ldj, size_t ldk, uint32_t K, uint32_t cols) {
-    for (uint32_t j0 = 0; j0 < cols; j0 += NR) {
-        uint32_t width = cols - j0 < NR ? cols - j0 : NR;
-        for (uint32_t k = 0; k < K; k++, dst += NR) {
-            for (uint32_t j = 0; j < width; j++) dst[j] = src[(size_t)(j0 + j) * ldj + (size_t)k * ldk];
-            for (uint32_t j = width; j < NR; j++) dst[j] = 0.0f;
+/* Whether packing `floats` weights pays for the threads (every chunk of a training step packs its layers again). */
+static inline bool pack_parallel(bool parallel, uint64_t floats) { return parallel && floats >= (1u << 15); }
+
+/* Packs B[k][j] = src[j * ldj + k * ldk] for k < K, j < cols into NR-wide panels (zero-padded), a panel a thread
+   when parallel. */
+static void pack_panels(float *dst, const float *src, size_t ldj, size_t ldk, uint32_t K, uint32_t cols, bool parallel,
+                        int threads) {
+    const int64_t panels = (int64_t)((cols + NR - 1) / NR);
+    (void)threads; (void)parallel;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(pack_parallel(parallel, (uint64_t)K * cols) && panels > 1)
+#endif
+    for (int64_t pn = 0; pn < panels; pn++) {
+        const uint32_t j0 = (uint32_t)pn * NR, width = cols - j0 < NR ? cols - j0 : NR;
+        float *d = dst + (size_t)j0 * K;
+        for (uint32_t k = 0; k < K; k++, d += NR) {
+            for (uint32_t j = 0; j < width; j++) d[j] = src[(size_t)(j0 + j) * ldj + (size_t)k * ldk];
+            for (uint32_t j = width; j < NR; j++) d[j] = 0.0f;
         }
     }
 }
@@ -400,7 +411,7 @@ void CONV_NAME(spingalett_conv_direct_forward)(const LayerShape *in, const Layer
     const uint32_t taps = out->kernel_h * out->kernel_w, K = taps * CG;
     float *packed = scratch, *zeros = scratch + spingalett_conv_direct_packed_floats(OG, K);
     memset(zeros, 0, ((size_t)(CG > OG ? CG : OG) + 32u) * sizeof(float));
-    pack_panels(packed, W + (size_t)g * OG * K, K, 1, K, OG);
+    pack_panels(packed, W + (size_t)g * OG * K, K, 1, K, OG, parallel, threads);
     Taps tp = {taps, CG, out->kernel_w, out->stride_h, out->stride_w, out->pad_h, out->pad_w, out->height, out->width,
                in->height, in->width, C, g * CG, false, x, zeros, {0}};
     taps_init(&tp);
@@ -491,10 +502,14 @@ void CONV_NAME(spingalett_conv_direct_backward_data)(const LayerShape *in, const
         strided_backward_data(in, out, g, W, dy, dx, n, packed, zeros, epilogue, parallel, threads);
         return;
     }
-    /* B[t * OG + oc][j] = W[g OG + oc][t CG + j] */
+    /* B[t * OG + oc][j] = W[g OG + oc][t CG + j], a panel a thread when parallel */
     const float *Wg = W + (size_t)g * OG * K;
-    for (uint32_t j0 = 0; j0 < CG; j0 += NR) {
-        uint32_t width = CG - j0 < NR ? CG - j0 : NR;
+    const int64_t panels = (int64_t)((CG + NR - 1) / NR);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(pack_parallel(parallel, (uint64_t)KR * CG) && panels > 1)
+#endif
+    for (int64_t pn = 0; pn < panels; pn++) {
+        const uint32_t j0 = (uint32_t)pn * NR, width = CG - j0 < NR ? CG - j0 : NR;
         float *dst = packed + (size_t)j0 * KR;
         for (uint32_t t = 0; t < taps; t++)
             for (uint32_t oc = 0; oc < OG; oc++, dst += NR) {
@@ -599,7 +614,7 @@ void CONV_NAME(spingalett_conv_direct_backward_weights)(const LayerShape *in, co
 /* ------------------------------------------------------------------------- rows of a linear layer */
 
 void CONV_NAME(spingalett_conv_pack)(const float *W, uint32_t K, uint32_t N, float *packed) {
-    pack_panels(packed, W, K, 1, K, N);
+    pack_panels(packed, W, K, 1, K, N, false, 1);
 }
 
 /* Rows are taken MR at a time by ikernel, the rest four, two or one at a time; a work item is a block of

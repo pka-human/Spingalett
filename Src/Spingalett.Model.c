@@ -52,6 +52,8 @@ static SpingalettModel *adopt_image(void *image, size_t size) {
     atomic_init(&owner->spare, NULL);
 #if !defined(SPINGALETT_RUNTIME)
     atomic_init(&owner->gpu_state, 0);
+    atomic_init(&owner->gpu_exact_state[0], 0);
+    atomic_init(&owner->gpu_exact_state[1], 0);
 #endif
     model->owner_ = owner;
     return model;
@@ -162,6 +164,8 @@ static void owner_free(ModelOwner *owner, uint32_t layers) {
     if (!owner) return;
 #if !defined(SPINGALETT_RUNTIME)
     if (owner->gpu_net) spingalett_network_free(owner->gpu_net);
+    spingalett_gpu_model_free(owner->gpu_exact[0]);
+    spingalett_gpu_model_free(owner->gpu_exact[1]);
     spg_signal_free(owner->gpu_lock);
 #endif
     prepared_free(owner->layers, layers);
@@ -839,7 +843,7 @@ void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const P
 #if !defined(SPINGALETT_RUNTIME)
 /* The model as a network on the GPU of the compute mode (the full library): an owned model whose weights are floats
    (FP32, FP16, BF16), made from its image by the first call that needs it, under the lock; NULL for integer
-   models (their sums in integers, on the CPU), models the GPU cannot run, and models that own nothing. */
+   models (model_gpu_exact()), models the GPU cannot run, and models that own nothing. */
 static NeuralNetwork *model_gpu_network(const SpingalettModel *model) {
     ModelOwner *owner = (ModelOwner *)model->owner_;
     if (!owner) return NULL;
@@ -862,8 +866,8 @@ static NeuralNetwork *model_gpu_network(const SpingalettModel *model) {
                 net = spingalett_load_from_memory(model->image, model->image_size);
                 spingalett_log_quiet(-1);
             }
-            owner->gpu_lock = net && spingalett_gpu_supports(net, &why) ? spg_signal_create() : NULL;
-            if (owner->gpu_lock) {
+            if (net && spingalett_gpu_supports(net, &why) && !owner->gpu_lock) owner->gpu_lock = spg_signal_create();
+            if (net && !why && owner->gpu_lock) {
                 owner->gpu_net = net;
                 state = 1;
             } else {
@@ -876,6 +880,37 @@ static NeuralNetwork *model_gpu_network(const SpingalettModel *model) {
     }
     return state == 1 ? owner->gpu_net : NULL;
 }
+
+/* The model on the GPU of the compute mode as the CPU computes it (models of integer weights whose every layer the
+   GPU computes so: spingalett_gpu_model_new()), made under the lock by the first call on each backend; NULL for
+   other models and models that own nothing. */
+static SpgGpuModel *model_gpu_exact(const SpingalettModel *model) {
+    ModelOwner *owner = (ModelOwner *)model->owner_;
+    if (!owner) return NULL;
+    const int b = spingalett_get_compute_mode() == COMPUTE_CUDA ? 1 : 0;
+    int state = atomic_load(&owner->gpu_exact_state[b]);
+    if (state == 0) {
+        spg_lock(owner->lock);
+        state = atomic_load(&owner->gpu_exact_state[b]);
+        if (state == 0) {
+            const char *why = NULL;
+            SpgGpuModel *g = spingalett_gpu_model_new(model, &why);
+            if (g && !owner->gpu_lock) owner->gpu_lock = spg_signal_create();
+            if (g && owner->gpu_lock) {
+                owner->gpu_exact[b] = g;
+                state = 1;
+            } else {
+                spingalett_gpu_model_free(g);
+                spingalett_log(LOG_DEBUG, "model predict: on the CPU (the GPU cannot compute the model as the CPU does%s%s)",
+                               why ? ": " : "", why ? why : "");
+                state = -1;
+            }
+            atomic_store(&owner->gpu_exact_state[b], state);
+        }
+        spg_unlock(owner->lock);
+    }
+    return state == 1 ? owner->gpu_exact[b] : NULL;
+}
 #endif
 
 bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs) {
@@ -885,15 +920,26 @@ bool spingalett_model_predict(const SpingalettModel *model, const float *inputs,
     }
     if (count == 0) return true;
 #if !defined(SPINGALETT_RUNTIME)
-    /* on a GPU: models of float weights there, one call at a time (the device's own order of work) */
-    NeuralNetwork *gpu = spingalett_use_gpu() ? model_gpu_network(model) : NULL;
-    if (gpu) {
+    /* on a GPU: models of float weights there, and those of integer weights the GPU computes as the CPU does (the
+       CPU's bits; the CPU computes them again if the GPU fails), one call at a time (the device's own order of work) */
+    if (spingalett_use_gpu()) {
         ModelOwner *owner = (ModelOwner *)model->owner_;
-        spg_lock(owner->gpu_lock);
-        const bool done = spingalett_predict_args((SpingalettPredictArgs){.net = gpu, .inputs = inputs,
-                                                                          .sample_count = count, .outputs = outputs});
-        spg_unlock(owner->gpu_lock);
-        return done;
+        NeuralNetwork *gpu = model_gpu_network(model);
+        if (gpu) {
+            spg_lock(owner->gpu_lock);
+            const bool done = spingalett_predict_args((SpingalettPredictArgs){.net = gpu, .inputs = inputs,
+                                                                              .sample_count = count, .outputs = outputs});
+            spg_unlock(owner->gpu_lock);
+            return done;
+        }
+        SpgGpuModel *exact = model_gpu_exact(model);
+        if (exact) {
+            spg_lock(owner->gpu_lock);
+            const bool done = spingalett_gpu_model_predict(exact, inputs, count, outputs);
+            spg_unlock(owner->gpu_lock);
+            if (done) return true;
+            spingalett_log(LOG_DEBUG, "model predict: on the CPU (the GPU failed)");
+        }
     }
 #endif
 

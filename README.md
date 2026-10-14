@@ -535,6 +535,14 @@ parameters change), with the tokens it gave before: the CharGPT model (256 wide,
 128) generates 3230 tokens a second on one thread of an Intel Core i7-12650H where predicting the
 window for every token gave 72.7, and 3568 on six threads where it gave 121.
 
+In the GPU modes a session runs on the GPU, its model a network there and the keys and values in the GPU's
+memory. An integer model's linear layers then multiply its codes, kept on the GPU with their scales and
+widened to floats as they are read (weight-only: 8, 4 or 2 bits read a weight a token; the activations in
+the GPU's precision): the logits are those of the model's weights as floats to rounding, near the CPU's
+integer session's but not its bits. A model of GPT-2 small's size (12 blocks of 768, a vocabulary of
+50,257) generates 684 tokens a second in INT8 and 854 in INT4 on CUDA on an RTX 4050 Laptop GPU, where
+the same model in BF16 gives 368 (four sequences together: 1,953 and 2,053).
+
 ```c
 SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);   /* or spingalett_model_load() */
 SpingalettSession *s = spingalett_session_new(model, &(SpingalettSessionOptions){.sequences = 4});
@@ -1397,6 +1405,28 @@ also runs in sessions, a token at a time with a key-value cache (see
 [Transformers and language models](#transformers-and-language-models)): the first session packs the
 float linear layers' filters once more for its kernels of few rows (the float size of those layers
 again), which the model keeps for every session.
+
+In the full library's GPU modes (`SPINGALETT_COMPUTE_CUDA`, `SPINGALETT_COMPUTE_VULKAN`) a model that owns
+its image predicts on the GPU, which the first call prepares and later calls reuse. A model of float
+weights runs as a network there, its outputs the CPU's to rounding. An integer model (INT8, INT4, INT2)
+runs as the CPU computes it, its outputs those of `spingalett_model_run()` bit for bit: each layer's
+inputs are quantized on the GPU as the CPU quantizes them (the divisions rounded as IEEE's, the values
+to the nearest even integer), its codes multiply them on the matrix kernels as floats or bfloat16, which
+hold such integers exactly, in sums of at most 1,040 products of INT8 codes (16,512 of INT4), which stay
+below 2^24 where floats are exact integers (longer sums run in slices added as integers), and the outputs
+are rescaled in the CPU's order of operations; pooling, additions, products and concatenations of
+layers, batch normalization and upsampling follow the CPU's order too. The activations inside the
+network must be none, ReLU or leaky ReLU (the last layer's, softmax or sigmoid among them, runs on the
+CPU); a model with others, layer normalization or attention keeps the CPU. On an RTX 4050 Laptop GPU,
+against all 16 threads of the Intel Core i7-12650H next to it (samples per second, INT8, medians):
+
+| Model (`Examples/Benchmark.c`) | CPU | CUDA | Vulkan |
+|---|---:|---:|---:|
+| 784-512-1000-10 MLP, 20,000 samples | 658,000 | 2,490,000 | 2,010,000 |
+| CNN of MNIST, 10,000 samples | 86,400 | 567,000 | 367,000 |
+| ResNet-20, 4,096 images of 32 x 32 | 10,300 | 69,900 | 56,900 |
+| MobileNet-style network, 4,096 images | 15,400 | 89,400 | 76,400 |
+| U-Net, 1,024 images of 64 x 64 | 3,130 | 15,200 | 14,100 |
 
 Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
 (`spingalett_model_evaluate()`):
