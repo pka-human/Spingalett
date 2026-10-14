@@ -1,0 +1,313 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * The passes of integer models on the GPU (Spingalett.GpuModel.c) besides their products, each value computed in the
+ * order of operations of the CPU's (Spingalett.Model.c, Spingalett.Inference.c), to the bit; then the layer's
+ * activation ACT (none, ReLU or leaky ReLU). A grid-stride loop over `total` outputs, four at a time with VEC4 (EPI,
+ * ADD, MUL, BN, SLICE: the outputs, channels and addresses in fours).
+ *
+ *   EPI      an integer layer's outputs from its integer sums: y[m][j] = bias[j] + (scale[j] * xs[sample]) * acc,
+ *            spingalett_int_output(), acc the sum of the product's slices as integers. x: the sums (floats that are
+ *            integers, exact), as [m][out_c] (slices 1), or `slices` partial products of each of `groups` groups,
+ *            [group][slice][m][out_c / groups]; n rows a sample; w: xs; e0: biases; e1: the rows' scales
+ *   DIRECT   a convolution's integer sums window by window (depthwise convolutions, transposed ones with
+ *            TRANSPOSED), then EPI's outputs: x the quantized input (bfloat16 with HALF bit 0), w the filters' codes
+ *            transposed, [kh][kw][in_c / groups][out_c] (bfloat16 with HALF bit 1), e0 biases, e1 scales, e2 xs;
+ *            the sums in floats with FLOATS (exact: short windows), else in integers; four filters a thread with
+ *            DW4 (a depthwise convolution's, of a channel each: four channels of the input) or OG4 (four of a
+ *            group: a value of the input times four codes)
+ *   POOL     max (MAX) or average pooling, the window's cells in the engine's order, times 1 / cells
+ *   GAP      global average pooling: the cells' sum in their order, times inv
+ *   ADD MUL  y = x op e0 (FIRST), else y = y op x; the activation after the last (LAST)
+ *   SLICE    y[cell][c0 + c] = x[cell][c] over in_c channels of out_c
+ *   BN       batch normalization: y = x * e0[c] + e1[c] (the coefficients the CPU computes)
+ *   UP       upsampling: the nearest, or BILINEAR from the table at e0 (rows then columns: the lower and upper
+ *            source and the weights of both)
+ */
+
+#version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+#include "int.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint ACT = ACT_NONE;
+layout(constant_id = 2) const uint HALF = 0;      /* DIRECT: bit 0 x, bit 1 w kept as bfloat16 */
+layout(local_size_x = 256) in;
+
+#define EPI    0u
+#define DIRECT 1u
+#define POOL   2u
+#define GAP    3u
+#define ADD    4u
+#define MUL    5u
+#define SLICE  6u
+#define BN     7u
+#define UP     8u
+
+#define FLAG_FIRST 1u
+#define FLAG_LAST  2u
+#define FLAG_MAX   1u
+#define FLAG_TRANSPOSED 1u
+#define FLAG_BILINEAR   1u
+#define FLAG_FLOATS 2u
+#define FLAG_VEC4  4u
+#define FLAG_DW4   8u
+#define FLAG_OG4   16u
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
+
+layout(push_constant) uniform Push {
+    F32 x, y, w, e0, e1, e2;
+    uint total, n;
+    uint in_h, in_w, in_c, out_h, out_w, out_c;
+    uint kh, kw, sh, sw, ph, pw;
+    uint groups, slices, c0, flags;
+    float inv;
+    uint pad;
+} p;
+
+float ld_x(uint i) {
+#ifdef SPG_HALF
+    if ((HALF & 1u) != 0u) return from_bf16(uint(BF16(p.x).v[i]));
+#endif
+    return p.x.v[i];
+}
+
+float ld_w(uint i) {
+#ifdef SPG_HALF
+    if ((HALF & 2u) != 0u) return from_bf16(uint(BF16(p.w).v[i]));
+#endif
+    return p.w.v[i];
+}
+
+/* four values from i on (a multiple of four, 16 bytes or 8 of bfloat16 apart) of x and of w */
+vec4 ld4_x(uint i) {
+#ifdef SPG_HALF
+    if ((HALF & 1u) != 0u) {
+        const uvec2 u = U32x2(p.x).v[i >> 2];
+        return vec4(uintBitsToFloat(u.x << 16), uintBitsToFloat(u.x & 0xFFFF0000u), uintBitsToFloat(u.y << 16),
+                    uintBitsToFloat(u.y & 0xFFFF0000u));
+    }
+#endif
+    return F32x4(p.x).v[i >> 2];
+}
+
+vec4 ld4_w(uint i) {
+#ifdef SPG_HALF
+    if ((HALF & 2u) != 0u) {
+        const uvec2 u = U32x2(p.w).v[i >> 2];
+        return vec4(uintBitsToFloat(u.x << 16), uintBitsToFloat(u.x & 0xFFFF0000u), uintBitsToFloat(u.y << 16),
+                    uintBitsToFloat(u.y & 0xFFFF0000u));
+    }
+#endif
+    return F32x4(p.w).v[i >> 2];
+}
+
+/* spingalett_int_output() */
+float int_output(float bias, float scale, float xs, int acc) {
+    precise float v = bias + (scale * xs) * float(acc);
+    return v;
+}
+
+vec4 int_act4(vec4 v) { return vec4(int_act(v.x, ACT), int_act(v.y, ACT), int_act(v.z, ACT), int_act(v.w, ACT)); }
+
+/* a convolution's sums window by window at output (s, oh, ow) of filter j (DIRECT) */
+float direct(uint s, uint oh, uint ow, uint j) {
+    const uint C = p.out_c, CG = p.in_c / p.groups, g = j / (C / p.groups);
+    const bool transposed = (p.flags & FLAG_TRANSPOSED) != 0u, floats = (p.flags & FLAG_FLOATS) != 0u;
+    int acc = 0;
+    float sum = 0.0;
+    for (uint th = 0u; th < p.kh; th++) {
+        int ih;
+        if (transposed) {
+            const int nh = int(oh + p.ph) - int(th);
+            if (nh < 0 || nh % int(p.sh) != 0) continue;
+            ih = nh / int(p.sh);
+        } else {
+            ih = int(oh * p.sh) - int(p.ph) + int(th);
+        }
+        if (ih < 0 || ih >= int(p.in_h)) continue;
+        for (uint tw = 0u; tw < p.kw; tw++) {
+            int iw;
+            if (transposed) {
+                const int nw = int(ow + p.pw) - int(tw);
+                if (nw < 0 || nw % int(p.sw) != 0) continue;
+                iw = nw / int(p.sw);
+            } else {
+                iw = int(ow * p.sw) - int(p.pw) + int(tw);
+            }
+            if (iw < 0 || iw >= int(p.in_w)) continue;
+            const uint cell = ((s * p.in_h + uint(ih)) * p.in_w + uint(iw)) * p.in_c + g * CG;
+            const uint tap = (th * p.kw + tw) * CG;
+            if (floats)
+                for (uint c = 0u; c < CG; c++) sum = fma(ld_x(cell + c), ld_w((tap + c) * C + j), sum);
+            else
+                for (uint c = 0u; c < CG; c++) acc += int(ld_x(cell + c)) * int(ld_w((tap + c) * C + j));
+        }
+    }
+    return floats ? sum : float(acc);
+}
+
+/* the sums of filters j .. j + 3 at output (s, oh, ow), in floats (DIRECT with DW4 or OG4) */
+vec4 direct4(uint s, uint oh, uint ow, uint j) {
+    const uint C = p.out_c, CG = p.in_c / p.groups, g = j / (C / p.groups);
+    const bool transposed = (p.flags & FLAG_TRANSPOSED) != 0u, dw = (p.flags & FLAG_DW4) != 0u;
+    vec4 sum = vec4(0.0);
+    for (uint th = 0u; th < p.kh; th++) {
+        int ih;
+        if (transposed) {
+            const int nh = int(oh + p.ph) - int(th);
+            if (nh < 0 || nh % int(p.sh) != 0) continue;
+            ih = nh / int(p.sh);
+        } else {
+            ih = int(oh * p.sh) - int(p.ph) + int(th);
+        }
+        if (ih < 0 || ih >= int(p.in_h)) continue;
+        for (uint tw = 0u; tw < p.kw; tw++) {
+            int iw;
+            if (transposed) {
+                const int nw = int(ow + p.pw) - int(tw);
+                if (nw < 0 || nw % int(p.sw) != 0) continue;
+                iw = nw / int(p.sw);
+            } else {
+                iw = int(ow * p.sw) - int(p.pw) + int(tw);
+            }
+            if (iw < 0 || iw >= int(p.in_w)) continue;
+            const uint cell = ((s * p.in_h + uint(ih)) * p.in_w + uint(iw)) * p.in_c + g * CG;
+            const uint tap = (th * p.kw + tw) * CG;
+            if (dw) sum = fma(ld4_x(cell), ld4_w(tap * C + j), sum);        /* (channels j .. j + 3: groups too) */
+            else for (uint c = 0u; c < CG; c++) sum = fma(vec4(ld_x(cell + c)), ld4_w((tap + c) * C + j), sum);
+        }
+    }
+    return sum;
+}
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    if (OP == DIRECT && (p.flags & (FLAG_DW4 | FLAG_OG4)) != 0u) {
+        for (uint t = gl_GlobalInvocationID.x; t < p.total / 4u; t += stride) {
+            const uint i = 4u * t, C = p.out_c, j = i % C, q = i / C, ow = q % p.out_w, oh = (q / p.out_w) % p.out_h;
+            const uint s = q / (p.out_w * p.out_h);
+            const vec4 sum = direct4(s, oh, ow, j), bias = F32x4(p.e0).v[j >> 2], scale = F32x4(p.e1).v[j >> 2];
+            const float xs = p.e2.v[s];
+            F32x4(p.y).v[t] = int_act4(vec4(int_output(bias.x, scale.x, xs, int(sum.x)), int_output(bias.y, scale.y, xs, int(sum.y)),
+                                            int_output(bias.z, scale.z, xs, int(sum.z)), int_output(bias.w, scale.w, xs, int(sum.w))));
+        }
+        return;
+    }
+    if ((p.flags & FLAG_VEC4) != 0u && (OP == EPI || OP == ADD || OP == MUL || OP == BN || OP == SLICE)) {
+        for (uint t = gl_GlobalInvocationID.x; t < p.total / 4u; t += stride) {
+            const uint i = 4u * t;
+            vec4 v;
+            if (OP == SLICE) {
+                const uint c = i % p.in_c, q = i / p.in_c;
+                F32x4(p.y).v[(q * p.out_c + p.c0 + c) >> 2] = int_act4(F32x4(p.x).v[t]);
+                continue;
+            }
+            if (OP == EPI) {
+                const uint C = p.out_c, m = i / C, j = i % C;
+                const vec4 sums = F32x4(p.x).v[t], bias = F32x4(p.e0).v[j >> 2], scale = F32x4(p.e1).v[j >> 2];
+                const float xs = p.w.v[m / p.n];
+                v = vec4(int_output(bias.x, scale.x, xs, int(sums.x)), int_output(bias.y, scale.y, xs, int(sums.y)),
+                         int_output(bias.z, scale.z, xs, int(sums.z)), int_output(bias.w, scale.w, xs, int(sums.w)));
+                v = int_act4(v);
+            } else if (OP == BN) {
+                const uint c = i % p.out_c;
+                precise vec4 r = F32x4(p.x).v[t] * F32x4(p.e0).v[c >> 2] + F32x4(p.e1).v[c >> 2];
+                v = int_act4(r);
+            } else {
+                const bool first = (p.flags & FLAG_FIRST) != 0u;
+                const vec4 a = first ? F32x4(p.x).v[t] : F32x4(p.y).v[t], b = first ? F32x4(p.e0).v[t] : F32x4(p.x).v[t];
+                precise vec4 r = OP == ADD ? a + b : a * b;
+                v = (p.flags & FLAG_LAST) != 0u ? int_act4(r) : r;
+            }
+            F32x4(p.y).v[t] = v;
+        }
+        return;
+    }
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        float v;
+        if (OP == EPI) {
+            const uint C = p.out_c, m = i / C, j = i % C;
+            int acc = 0;
+            if (p.slices == 1u) {
+                acc = int(p.x.v[i]);
+            } else {
+                const uint OG = C / p.groups, g = j / OG, rows = p.total / C;
+                for (uint s = 0u; s < p.slices; s++) acc += int(p.x.v[((g * p.slices + s) * rows + m) * OG + j % OG]);
+            }
+            v = int_output(p.e0.v[j], p.e1.v[j], p.w.v[m / p.n], acc);
+        } else if (OP == DIRECT) {
+            const uint C = p.out_c, j = i % C, q = i / C, ow = q % p.out_w, oh = (q / p.out_w) % p.out_h;
+            const uint s = q / (p.out_w * p.out_h);
+            v = int_output(p.e0.v[j], p.e1.v[j], p.e2.v[s], int(direct(s, oh, ow, j)));
+        } else if (OP == POOL) {
+            /* the engine's pool_forward(): the window clipped to the input, its first cell, then the others in order */
+            const uint C = p.out_c, c = i % C, q = i / C, ow = q % p.out_w, oh = (q / p.out_w) % p.out_h;
+            const uint s = q / (p.out_w * p.out_h);
+            const int hs = int(oh * p.sh) - int(p.ph), ws = int(ow * p.sw) - int(p.pw);
+            const uint h0 = uint(max(hs, 0)), h1 = uint(min(hs + int(p.kh), int(p.in_h)));
+            const uint w0 = uint(max(ws, 0)), w1 = uint(min(ws + int(p.kw), int(p.in_w)));
+            const bool most = (p.flags & FLAG_MAX) != 0u;
+            const uint base = s * p.in_h * p.in_w;
+            precise float acc = p.x.v[((base + h0 * p.in_w) + w0) * C + c];
+            for (uint h = h0; h < h1; h++)
+                for (uint w = h == h0 ? w0 + 1u : w0; w < w1; w++) {
+                    const float x = p.x.v[((base + h * p.in_w) + w) * C + c];
+                    if (most) {
+                        if (x > acc) acc = x;
+                    } else {
+                        acc += x;
+                    }
+                }
+            const float inv = most ? 1.0 : div_rn(1.0, float((h1 - h0) * (w1 - w0)));
+            precise float r = acc * inv;
+            v = r;
+        } else if (OP == GAP) {
+            const uint C = p.in_c, c = i % C, s = i / C, cells = p.in_h * p.in_w, base = s * cells * C + c;
+            precise float acc = p.x.v[base];
+            for (uint q = 1u; q < cells; q++) acc += p.x.v[base + q * C];
+            precise float r = acc * p.inv;
+            v = r;
+        } else if (OP == ADD || OP == MUL) {
+            const bool first = (p.flags & FLAG_FIRST) != 0u;
+            const float a = first ? p.x.v[i] : p.y.v[i], b = first ? p.e0.v[i] : p.x.v[i];
+            precise float r = OP == ADD ? a + b : a * b;
+            v = (p.flags & FLAG_LAST) != 0u ? int_act(r, ACT) : r;
+            p.y.v[i] = v;
+            continue;
+        } else if (OP == SLICE) {
+            const uint c = i % p.in_c, q = i / p.in_c;
+            p.y.v[q * p.out_c + p.c0 + c] = int_act(p.x.v[i], ACT);
+            continue;
+        } else if (OP == BN) {
+            const uint c = i % p.out_c;
+            precise float r = p.x.v[i] * p.e0.v[c] + p.e1.v[c];
+            v = r;
+        } else {                            /* UP */
+            const uint C = p.out_c, c = i % C, q = i / C, ox = q % p.out_w, oy = (q / p.out_w) % p.out_h;
+            const uint s = q / (p.out_w * p.out_h), base = s * p.in_h * p.in_w;
+            if ((p.flags & FLAG_BILINEAR) == 0u) {
+                v = p.x.v[(base + (oy / p.sh) * p.in_w + ox / p.sw) * C + c];
+            } else {
+                /* spingalett_engine_upsample(): rows y0, y1 weighted hy, ly; columns x0, x1 weighted hx, lx */
+                const uint r = 4u * oy, k = 4u * (p.out_h + ox);
+                const uint y0 = floatBitsToUint(p.e0.v[r]), y1 = floatBitsToUint(p.e0.v[r + 1u]);
+                const uint x0 = floatBitsToUint(p.e0.v[k]), x1 = floatBitsToUint(p.e0.v[k + 1u]);
+                const float ly = p.e0.v[r + 2u], hy = p.e0.v[r + 3u], lx = p.e0.v[k + 2u], hx = p.e0.v[k + 3u];
+                const float a = p.x.v[(base + y0 * p.in_w + x0) * C + c], b = p.x.v[(base + y0 * p.in_w + x1) * C + c];
+                const float d0 = p.x.v[(base + y1 * p.in_w + x0) * C + c], d1 = p.x.v[(base + y1 * p.in_w + x1) * C + c];
+                precise float top = hx * a + lx * b, bottom = hx * d0 + lx * d1;
+                precise float r2 = hy * top + ly * bottom;
+                v = r2;
+            }
+        }
+        p.y.v[i] = int_act(v, ACT);
+    }
+}

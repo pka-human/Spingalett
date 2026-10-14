@@ -20,6 +20,7 @@
 
 #include "Spingalett.Gpu.h"
 #include "Spingalett.GpuKernels.h"
+#include "Spingalett.Recorder.h"
 #include "Spingalett.Thread.h"
 #include <math.h>
 #include <stdlib.h>
@@ -1045,66 +1046,9 @@ fail:
 
 /* ------------------------------------------------------------------------- recording */
 
-/*
- * Commands are recorded through a Recorder, which keeps the memory read and written since the last
- * barrier: every dispatch states what it reads and writes, and a barrier is recorded before it only
- * when it reads what an earlier one wrote or writes what an earlier one read or wrote. Independent
- * dispatches, such as a layer's weight gradient and its data gradient, then run side by side.
- * Consecutive dispatches of one nonzero `group` access the same ranges and write disjoint parts of
- * them (the phases of a data gradient): they do not wait for each other. A group belongs to one layer
- * and purpose (group_of()), so that the next layer's dispatches, which read what these wrote, wait.
- */
-typedef struct { uint64_t lo, hi; } Range;
-
-#define TRACKED 96u
-typedef struct {
-    SpgGpuCommands *c;
-    const SpgGpuNet *g;
-    Range reads[TRACKED], writes[TRACKED];
-    uint32_t nr, nw, group;
-} Recorder;
-
-typedef struct {
-    Range read[8], write[4];
-    uint32_t nr, nw, group;
-} Access;
-
+/* (the Recorder: Spingalett.Recorder.h) */
 enum { GROUP_SLICES = 1, GROUP_PHASES = 2, GROUP_OPTIMIZER = 3 };
 static uint32_t group_of(uint32_t layer, uint32_t purpose) { return 4u * layer + purpose; }
-
-static Range whole(const SpgGpuBuffer *b) { return (Range){b->address, b->address + b->size}; }
-static Range span(uint64_t address, uint64_t floats) { return (Range){address, address + 4u * floats}; }
-
-static void reads(Access *a, Range r) { if (r.hi > r.lo) a->read[a->nr++] = r; }
-static void writes(Access *a, Range r) { if (r.hi > r.lo) a->write[a->nw++] = r; }
-
-static bool hits(const Range *list, uint32_t n, Range r) {
-    for (uint32_t k = 0; k < n; k++)
-        if (r.lo < list[k].hi && list[k].lo < r.hi) return true;
-    return false;
-}
-
-static void barrier(Recorder *r) {
-    spg_gpu_barrier(r->c);
-    r->nr = r->nw = 0;
-    r->group = 0;
-}
-
-/* A barrier if the access conflicts with what was recorded since the last one; then it is noted. */
-static void need(Recorder *r, const Access *a) {
-    bool wait = r->nr + a->nr > TRACKED || r->nw + a->nw > TRACKED;
-    if (!(a->group != 0 && a->group == r->group)) {
-        for (uint32_t k = 0; k < a->nr && !wait; k++) wait = hits(r->writes, r->nw, a->read[k]);
-        for (uint32_t k = 0; k < a->nw && !wait; k++)
-            wait = hits(r->writes, r->nw, a->write[k]) || hits(r->reads, r->nr, a->write[k]);
-    }
-    if (wait) barrier(r);
-    memcpy(r->reads + r->nr, a->read, a->nr * sizeof(Range));
-    memcpy(r->writes + r->nw, a->write, a->nw * sizeof(Range));
-    r->nr += a->nr;
-    r->nw += a->nw;
-    r->group = a->group;
-}
 
 /* Whether address is in the output (or the gradient) of a layer kept as bfloat16. */
 static bool in_half(const SpgGpuNet *g, uint64_t address) {

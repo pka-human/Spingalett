@@ -1,0 +1,123 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * The inputs of an integer layer quantized as spingalett_quantize_activations() quantizes them (integer models on the
+ * GPU, Spingalett.GpuModel.c): each sample's len values x (stride floats apart) to q = x * (127 / amax) rounded to
+ * the nearest (ties to even) within -127 .. 127, amax the largest magnitude, and its scale amax / 127 to xs; zeros
+ * and scale 0 when all are 0, zeros and scale NaN when one is NaN or infinite. The largest magnitude is the largest
+ * of the values' bits without their signs, whatever the order it is found in, and the divisions round as IEEE's.
+ * A sample is `slices` slices of slice_len values, a workgroup each (and every further one their number on):
+ *
+ *   WHOLE  a slice a sample: its largest magnitude, then its values quantized
+ *   MAX    each slice's largest magnitude (the bits) to part[sample][slice]
+ *   QUANT  each slice's values quantized, amax the largest of its sample's slices' (part)
+ *
+ * The quantized values are integers, which floats and bfloat16 (HALF: words 1, q) hold exactly: the products of
+ * integer layers run on the matrix kernels (gemm.comp, gemm_mma.comp), whose sums of them are exact. Four values at a
+ * time with VEC4 (sizes and addresses in fours).
+ */
+
+#version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+#include "int.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint HALF = 0;      /* words: q 1 */
+layout(local_size_x = 256) in;
+
+#define WHOLE 0u
+#define MAX   1u
+#define QUANT 2u
+#define FLAG_VEC4 1u
+
+layout(push_constant) uniform Push {
+    F32 x, q, xs;
+    U32 part;
+    uint n, len, stride, qstride, slices, slice_len, flags, pad;
+} p;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2 { uvec2 v[]; };
+
+shared uint top[256];
+
+/* the largest of the 256 invocations' m (every invocation gets it) */
+uint largest(uint m) {
+    const uint t = gl_LocalInvocationID.x;
+    top[t] = m;
+    barrier();
+    for (uint h = 128u; h > 0u; h >>= 1) {
+        if (t < h) top[t] = max(top[t], top[t + h]);
+        barrier();
+    }
+    m = top[0];
+    barrier();                              /* (top is written again by the next slice) */
+    return m;
+}
+
+float quantized(float x, float inv, bool none) {
+    if (none) return 0.0;
+    precise float y = x * inv;
+    return clamp(roundEven(y), -127.0, 127.0);
+}
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    const bool vec4s = (p.flags & FLAG_VEC4) != 0u;
+    for (uint w = gl_WorkGroupID.x; w < p.n * p.slices; w += gl_NumWorkGroups.x) {
+        const uint s = w / p.slices, slice = w % p.slices, base = s * p.stride, dst = s * p.qstride;
+        const uint first = slice * p.slice_len, end = min(p.len, first + p.slice_len);
+        uint m = 0u;
+        if (OP != QUANT) {
+            if (vec4s) {
+                for (uint i = first + 4u * t; i < end; i += 1024u) {
+                    const uvec4 b = floatBitsToUint(F32x4(p.x).v[(base + i) >> 2]) & 0x7FFFFFFFu;
+                    m = max(m, max(max(b.x, b.y), max(b.z, b.w)));
+                }
+            } else {
+                for (uint i = first + t; i < end; i += 256u) m = max(m, floatBitsToUint(p.x.v[base + i]) & 0x7FFFFFFFu);
+            }
+            m = largest(m);
+            if (OP == MAX) {
+                if (t == 0u) p.part.v[w] = m;
+                continue;
+            }
+        } else {
+            for (uint k = 0u; k < p.slices; k++) m = max(m, p.part.v[s * p.slices + k]);
+        }
+        const bool bad = m >= 0x7F800000u, zero = m == 0u;
+        const float amax = uintBitsToFloat(m), inv = bad || zero ? 0.0 : div_rn(127.0, amax);
+        if (t == 0u && slice == 0u) p.xs.v[s] = bad ? uintBitsToFloat(0x7FC00000u) : zero ? 0.0 : div_rn(amax, 127.0);
+        if (vec4s) {
+            for (uint i = first + 4u * t; i < end; i += 1024u) {
+                const vec4 x = F32x4(p.x).v[(base + i) >> 2];
+                const vec4 v = vec4(quantized(x.x, inv, bad || zero), quantized(x.y, inv, bad || zero),
+                                    quantized(x.z, inv, bad || zero), quantized(x.w, inv, bad || zero));
+#ifdef SPG_HALF
+                if ((HALF & 2u) != 0u) {            /* (integers of 8 bits: exact) */
+                    const uvec4 b = floatBitsToUint(v) >> 16;
+                    U32x2(p.q).v[(dst + i) >> 2] = uvec2(b.x | b.y << 16, b.z | b.w << 16);
+                    continue;
+                }
+#endif
+                F32x4(p.q).v[(dst + i) >> 2] = v;
+            }
+        } else {
+            for (uint i = first + t; i < end; i += 256u) {
+                const float v = quantized(p.x.v[base + i], inv, bad || zero);
+#ifdef SPG_HALF
+                if ((HALF & 2u) != 0u) {
+                    BF16(p.q).v[dst + i] = uint16_t(floatBitsToUint(v) >> 16);
+                    continue;
+                }
+#endif
+                p.q.v[dst + i] = v;
+            }
+        }
+    }
+}

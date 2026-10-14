@@ -1398,6 +1398,28 @@ also runs in sessions, a token at a time with a key-value cache (see
 float linear layers' filters once more for its kernels of few rows (the float size of those layers
 again), which the model keeps for every session.
 
+In the full library's GPU modes (`SPINGALETT_COMPUTE_CUDA`, `SPINGALETT_COMPUTE_VULKAN`) a model that owns
+its image predicts on the GPU, which the first call prepares and later calls reuse. A model of float
+weights runs as a network there, its outputs the CPU's to rounding. An integer model (INT8, INT4, INT2)
+runs as the CPU computes it, its outputs those of `spingalett_model_run()` bit for bit: each layer's
+inputs are quantized on the GPU as the CPU quantizes them (the divisions rounded as IEEE's, the values
+to the nearest even integer), its codes multiply them on the matrix kernels as floats or bfloat16, which
+hold such integers exactly, in sums of at most 1,040 products of INT8 codes (16,512 of INT4), which stay
+below 2^24 where floats are exact integers (longer sums run in slices added as integers), and the outputs
+are rescaled in the CPU's order of operations; pooling, additions, products and concatenations of
+layers, batch normalization and upsampling follow the CPU's order too. The activations inside the
+network must be none, ReLU or leaky ReLU (the last layer's, softmax or sigmoid among them, runs on the
+CPU); a model with others, layer normalization or attention keeps the CPU. On an RTX 4050 Laptop GPU,
+against all 16 threads of the Intel Core i7-12650H next to it (samples per second, INT8, medians):
+
+| Model (`Examples/Benchmark.c`) | CPU | CUDA | Vulkan |
+|---|---:|---:|---:|
+| 784-512-1000-10 MLP, 20,000 samples | 658,000 | 2,490,000 | 2,010,000 |
+| CNN of MNIST, 10,000 samples | 86,400 | 567,000 | 367,000 |
+| ResNet-20, 4,096 images of 32 x 32 | 10,300 | 69,900 | 56,900 |
+| MobileNet-style network, 4,096 images | 15,400 | 89,400 | 76,400 |
+| U-Net, 1,024 images of 64 x 64 | 3,130 | 15,200 | 14,100 |
+
 Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
 (`spingalett_model_evaluate()`):
 

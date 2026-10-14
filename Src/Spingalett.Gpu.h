@@ -25,6 +25,7 @@
 
 typedef struct SpgGpuNet SpgGpuNet;
 typedef struct SpgGpuDecoder SpgGpuDecoder;
+typedef struct SpgGpuModel SpgGpuModel;
 
 /* Fixed for a training run. */
 typedef struct {
@@ -115,6 +116,15 @@ bool spingalett_gpu_decoder_step(SpgGpuDecoder *d, uint32_t rows, const uint32_t
 /* Copies the first `length` positions' keys and values of sequence `from` to sequence `to`. */
 bool spingalett_gpu_decoder_copy(SpgGpuDecoder *d, uint32_t from, uint32_t to, uint32_t length);
 bool spingalett_gpu_download(SpgGpuNet *g);
+
+/* Deployment models of integer weights on the GPU (Spingalett.GpuModel.c): batched prediction that gives the bits
+   of spingalett_model_run(), for models whose every layer the GPU computes as the CPU does (integer products, the
+   activations that need no libm but the last layer's, pooling, additions and concatenations, batch normalization);
+   NULL with *why for other models, or when memory runs out. Made on the calling thread's backend. */
+SpgGpuModel *spingalett_gpu_model_new(const SpingalettModel *model, const char **why);
+void spingalett_gpu_model_free(SpgGpuModel *m);
+/* outputs [count x output_size] for inputs [count x input_size], in chunks; waits */
+bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t count, float *outputs);
 
 /* Where the next chunk's inputs and targets go (rows of the input and output layers), once the
    device is done with the chunk that used that memory before. */
@@ -236,6 +246,16 @@ static inline bool spingalett_gpu_decoder_copy(SpgGpuDecoder *d, uint32_t from, 
     return false;
 }
 static inline bool spingalett_gpu_download(SpgGpuNet *g) { (void)g; return false; }
+static inline SpgGpuModel *spingalett_gpu_model_new(const SpingalettModel *model, const char **why) {
+    (void)model;
+    if (why) *why = "no GPU backend";
+    return NULL;
+}
+static inline void spingalett_gpu_model_free(SpgGpuModel *m) { (void)m; }
+static inline bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t count, float *outputs) {
+    (void)m; (void)inputs; (void)count; (void)outputs;
+    return false;
+}
 static inline uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
     (void)g; (void)targets;
     return NULL;

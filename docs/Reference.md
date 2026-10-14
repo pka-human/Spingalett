@@ -1638,7 +1638,7 @@ typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *mess
 
 ### `SpingalettComputeMode`
 
-Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU: on all its threads with SPINGALETT_COMPUTE_OPENMP, on one otherwise; in the full library's GPU modes those of float weights (FP32, FP16, BF16) and sessions run on the GPU, integer ones (their sums in integers) on all the CPU's threads. The runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with a warning, as in a full library built without it; nor a GPU.
+Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU: on all its threads with SPINGALETT_COMPUTE_OPENMP, on one otherwise; in the full library's GPU modes those of float weights (FP32, FP16, BF16) and sessions run on the GPU, and so do integer ones whose every layer the GPU computes as the CPU does (their outputs the CPU's to the bit), the others on all the CPU's threads. The runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with a warning, as in a full library built without it; nor a GPU.
 
 ```c
 typedef enum {
@@ -1786,7 +1786,7 @@ void spingalett_model_free(SpingalettModel *model);
 
 ### `spingalett_model_predict()`
 
-Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all threads in SPINGALETT_COMPUTE_OPENMP mode; in the full library's GPU modes, a model of float weights that owns its image (spingalett_model_load(), _from_memory(), _from_network()) as a network on the GPU, made by the first call and kept, its calls one at a time, the outputs the CPU's to rounding. Returns false on error.
+Batched inference: inputs [count x input_size] give outputs [count x output_size]. Uses all threads in SPINGALETT_COMPUTE_OPENMP mode; in the full library's GPU modes, a model that owns its image (spingalett_model_load(), _from_memory(), _from_network()) runs on the GPU, made there by the first call and kept, its calls one at a time: one of float weights as a network, the outputs the CPU's to rounding; one of integer weights (INT8, INT4, INT2) as the CPU computes it, the outputs spingalett_model_run()'s bit for bit, where the GPU computes every layer so (integer products, convolutions of every kind, pooling, additions, products and concatenations of layers, batch normalization, upsampling, the activations none, ReLU and leaky ReLU inside the network and any after its last layer, which the CPU applies); a model with others (GELU, SiLU, sigmoid or tanh inside the network, normalizations of layers, attention) runs on the CPU, the GPU's memory too small or the device lost as well. Returns false on error.
 
 ```c
 bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs);

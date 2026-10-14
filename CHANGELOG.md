@@ -170,6 +170,30 @@ All notable changes to this project are documented in this file. The format foll
   runtime; new structs `SpingalettSessionOptions`, `SpingalettSessionFeed` and
   `SpingalettSessionGenerateArgs`. In Python, `Model.session()` (`Session`: `feed()`, `feed_many()`,
   `rewind()`, `copy()`, `length()`, `generate()`).
+- **Integer deployment models on the GPU, the CPU's bits:** in the full library's GPU modes
+  `spingalett_model_predict()` of an INT8, INT4 or INT2 model that owns its image runs on the GPU
+  (CUDA and Vulkan) and gives the bits of `spingalett_model_run()`, for every model whose layers the GPU
+  computes as the CPU does: each integer layer's inputs quantized per sample as
+  `spingalett_quantize_activations()` quantizes them (`iquant.comp`: the largest magnitude from the
+  values' bits, the divisions rounded as IEEE's, on Vulkan by long division of the significands; a sample
+  in slices of 4,096 values over several workgroups), the codes (INT4 and INT2 unpacked) multiplying them
+  on the matrix kernels as floats or bfloat16, which hold them exactly, in sums of at most 1,040 products
+  of INT8 codes (16,512 of INT4, 66,048 of INT2) that stay below 2^24, longer sums in slices added as
+  integers; depthwise and transposed convolutions window by window (`ipass.comp`); the outputs
+  `spingalett_int_output()`'s, pooling, global pooling, additions, products and concatenations of layers,
+  batch normalization and upsampling in the CPU's order of operations, the multiplies and additions
+  rounded alone (`precise`, CUDA's `mul.rn` and `add.rn`); the activations none, ReLU and leaky ReLU inside
+  the network, the last layer's others (softmax, sigmoid, ...) on the CPU. Models with other layers or
+  activations inside (GELU, SiLU, sigmoid, tanh, normalizations of layers, attention, embeddings) stay on
+  the CPU, decided once per model and backend. Chunks of up to 4,096 samples whose activations keep to
+  32 MB, two of them in flight (the next one's inputs copied in while one runs). On an RTX 4050 Laptop GPU
+  against the 16 threads of an Intel Core i7-12650H (samples/s, INT8, medians of three interleaved
+  rounds): the benchmark's MLP over 20,000 samples 658,000 on the CPU, 2,490,000 on CUDA, 2,010,000 on
+  Vulkan; the CNN of MNIST 86,400, 567,000, 367,000; ResNet-20 10,300, 69,900, 56,900; the MobileNet-style
+  network 15,400, 89,400, 76,400; the U-Net 3,130, 15,200, 14,100 (INT4 alike: the MLP 647,000, 2,500,000,
+  2,010,000). Tests (gpu and cuda groups): an MLP, a chain of convolutions and a graph of every such layer
+  in INT8, INT4 and INT2 the bits of `spingalett_model_run()` and of the CPU's batched prediction (9,000
+  samples in chunks, products in slices, inputs quantized in slices), a model with GELU inside on the CPU.
 
 ### Changed
 - `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single

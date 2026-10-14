@@ -168,6 +168,40 @@ typedef struct {
 enum { SPG_CACHE_APPEND, SPG_CACHE_ATTEND };
 #define SPG_CACHE_THREADS 64u       /* Vulkan's workgroups of ATTEND (a row and head); CUDA's: a warp a row and head */
 
+/* iquant.comp: the activations of integer models quantized as spingalett_quantize_activations() quantizes them, the
+   len values of each of n samples (stride floats apart) to q (qstride values apart: floats, or bfloat16 with HALF)
+   and the sample's scale to xs, a sample in slices of slice_len values (the slices' largest magnitudes in part) */
+typedef struct {
+    uint64_t x, q, xs, part;
+    uint32_t n, len, stride, qstride, slices, slice_len, flags, pad;
+} SpgIquantPush;
+enum { SPG_IQ_WHOLE, SPG_IQ_MAX, SPG_IQ_QUANT };
+#define SPG_IQ_VEC4  1u             /* four values at a time (sizes and addresses in fours) */
+#define SPG_IQ_SLICE 4096u          /* values a slice */
+
+/* ipass.comp: the passes of integer models other than their products, every value computed as the CPU computes it
+   (Spingalett.Model.c, Spingalett.Inference.c): spec OP, ACT (none, ReLU or leaky ReLU), HALF */
+typedef struct {
+    uint64_t x, y, w, e0, e1, e2;
+    uint32_t total, n;
+    uint32_t in_h, in_w, in_c, out_h, out_w, out_c;
+    uint32_t kh, kw, sh, sw, ph, pw;
+    uint32_t groups, slices, c0, flags;
+    float inv;
+    uint32_t pad;
+} SpgIpassPush;
+enum { SPG_IP_EPI, SPG_IP_DIRECT, SPG_IP_POOL, SPG_IP_GAP, SPG_IP_ADD, SPG_IP_MUL, SPG_IP_SLICE, SPG_IP_BN, SPG_IP_UP };
+#define SPG_IP_FIRST      1u        /* ADD, MUL: y = x op e0, else y = y op x */
+#define SPG_IP_LAST       2u        /* ADD, MUL: the activation after it */
+#define SPG_IP_MAX        1u        /* POOL: max pooling, else average pooling */
+#define SPG_IP_TRANSPOSED 1u        /* DIRECT: a transposed convolution's windows */
+#define SPG_IP_BILINEAR   1u        /* UP: bilinear (its table at e0), else the nearest */
+#define SPG_IP_FLOATS     2u        /* DIRECT: the sums in floats (exact: few enough of them) */
+#define SPG_IP_VEC4       4u        /* EPI, ADD, MUL, BN, SLICE: four values at a time (outputs, channels, addresses in
+                                       fours) */
+#define SPG_IP_DW4        8u        /* DIRECT with FLOATS: a depthwise convolution's four channels at a time */
+#define SPG_IP_OG4        16u       /* DIRECT with FLOATS: four filters of a group at a time */
+
 /* rows.comp */
 typedef struct {
     uint64_t index, dst, header;
