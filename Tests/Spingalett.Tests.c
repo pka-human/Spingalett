@@ -6099,6 +6099,17 @@ static void gguf_errors(void) {
 /* The compute mode of the GPU group's tests: gpu_mode, or COMPUTE_CUDA. */
 static ComputeMode gpu_mode = COMPUTE_VULKAN;
 
+/* Bfloat16 on the GPU under test: whether it multiplies in it; single precision set again when it does not (the setting
+   is kept either way, spingalett_set_gpu_precision()). */
+static bool bf16_on_gpu(void) {
+    const ComputeMode mode = spingalett_get_compute_mode();
+    spingalett_set_compute_mode(gpu_mode);
+    const bool on = spingalett_set_gpu_precision(PRECISION_BFLOAT16);
+    if (!on) spingalett_set_gpu_precision(PRECISION_FLOAT32);
+    spingalett_set_compute_mode(mode);
+    return on;
+}
+
 /* Networks covering every kind of layer the GPU runs: dense layers, convolutions (strided, grouped,
    depthwise), pooling, batch normalization (of convolutions and of dense layers), residual additions,
    concatenations, global pooling, dropout, layers feeding several others, transposed convolutions,
@@ -6470,7 +6481,7 @@ static void gpu_transformer(int which) {
     float *b1 = NULL, *b2 = NULL, *pb = (float *)malloc((size_t)n * out * sizeof(float));
     bool bf16_same = true;
     double bf16 = 0.0;
-    if (spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+    if (bf16_on_gpu()) {
         TrainReport r1, r2;
         float *o1 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &b1, &count, &r1);
         float *o2 = gpu_tf_trained(which, gpu_mode, x, t, n, T, V, mini, false, &b2, &count, &r2);
@@ -6542,7 +6553,7 @@ static void gpu_session(bool llama) {
     bool same[2] = {false, false};
     for (int bf16 = 0; bf16 < 2 && ok; bf16++) {
         spingalett_set_compute_mode(gpu_mode);
-        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {     /* (a device without bfloat16) */
+        if (bf16 && !bf16_on_gpu()) {     /* (a device without bfloat16) */
             same[1] = true;
             break;
         }
@@ -6642,7 +6653,7 @@ static void gpu_session_int(int which) {
         spingalett_session_free(s);
         for (int bf16 = 0; bf16 < 2 && ok; bf16++) {
             spingalett_set_compute_mode(gpu_mode);
-            if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
+            if (bf16 && !bf16_on_gpu()) break;
             spingalett_set_verbose(true);
             spingalett_set_log_level(LOG_DEBUG);
             spingalett_set_log_callback(count_coded_sessions);
@@ -6865,7 +6876,7 @@ static void gpu_flash(uint32_t head, bool rope, uint32_t kv, uint32_t T, bool ca
         lcg_state = 77;
         for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
         spingalett_set_compute_mode(run == 1 ? COMPUTE_OPENMP : gpu_mode);
-        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+        if (bf16 && !bf16_on_gpu()) {
             free_network(net);
             break;
         }
@@ -6947,7 +6958,7 @@ static void gpu_masked(uint32_t head, bool causal, uint32_t window, bool padding
         lcg_state = 91;
         for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
         spingalett_set_compute_mode(run == 0 ? COMPUTE_OPENMP : gpu_mode);
-        if (run == 3 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+        if (run == 3 && !bf16_on_gpu()) {
             free_network(net);
             break;
         }
@@ -7016,7 +7027,7 @@ static void gpu_cross(uint32_t head, uint32_t kv, bool padding) {
         lcg_state = 92;
         for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
         spingalett_set_compute_mode(run == 0 ? COMPUTE_OPENMP : gpu_mode);
-        if (run == 3 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) {
+        if (run == 3 && !bf16_on_gpu()) {
             free_network(net);
             break;
         }
@@ -7433,7 +7444,7 @@ static void gpu_kept_threads(void) {
    set's bfloat16 copy, under its lock): the outputs of one call from the host's array, bit for bit. */
 static void gpu_device_data_threads(void) {
 #if !defined(_WIN32)
-    if (!spingalett_set_gpu_precision(PRECISION_BFLOAT16)) return;
+    if (!bf16_on_gpu()) return;
     spingalett_set_compute_mode(gpu_mode);
     NeuralNetwork *net = gpu_net(2);
     const uint32_t n = 300, in = net->topology[0], out = net->topology[net->layers - 1];
@@ -7755,7 +7766,7 @@ static void gpu_kept(void) {
     for (size_t jp = 0; jp < 2 * (sizeof nets / sizeof nets[0]); jp++) {
         const size_t j = jp % (sizeof nets / sizeof nets[0]);
         const bool bf16 = jp >= sizeof nets / sizeof nets[0];
-        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
+        if (bf16 && !bf16_on_gpu()) break;
         const int which = nets[j];
         float *w[5] = {NULL};
         size_t count = 0;
@@ -7854,7 +7865,7 @@ static void gpu_device_data(void) {
     for (size_t jp = 0; jp < 2 * (sizeof nets / sizeof nets[0]); jp++) {
         const size_t j = jp % (sizeof nets / sizeof nets[0]);
         const bool bf16 = jp >= sizeof nets / sizeof nets[0];
-        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
+        if (bf16 && !bf16_on_gpu()) break;
         const int which = nets[j];
         NeuralNetwork *probe = gpu_net(which);
         const uint32_t n = 150, nv = 50, in = probe->topology[0], out = probe->topology[probe->layers - 1];
@@ -7864,6 +7875,7 @@ static void gpu_device_data(void) {
         for (size_t i = 0; i < (size_t)(n + nv) * in; i++) x[i] = frand() * 2.0f - 1.0f;
         for (uint32_t i = 0; i < n + nv; i++) t[i * out + (uint32_t)(frand() * out) % out] = 1.0f;
         const float *vx = x + (size_t)n * in, *vt = t + (size_t)n * out;
+        spingalett_set_compute_mode(gpu_mode);              /* (the sets in the memory of the backend under test) */
         SpingalettDeviceData *dx = spingalett_device_data_new(x, n, in), *dt = spingalett_device_data_new(t, n, out);
         SpingalettDeviceData *dvx = spingalett_device_data_new(vx, nv, in), *dvt = spingalett_device_data_new(vt, nv, out);
         CHECK(dx && dt && dvx && dvt, "gpu device data: sets not made");

@@ -599,8 +599,13 @@ SpingalettDeviceData *spingalett_device_data_new(const float *values, uint32_t c
         set_error(SPINGALETT_ERR_INVALID, "spingalett_device_data_new: values is NULL, or count or size is 0");
         return NULL;
     }
-    /* in the memory of the compute mode's GPU: CUDA's for COMPUTE_CUDA, else Vulkan's */
-    if (!spingalett_gpu_select(spingalett_get_compute_mode() == COMPUTE_CUDA ? COMPUTE_CUDA : COMPUTE_VULKAN)) {
+    /* in the memory of the compute mode's GPU: CUDA's for COMPUTE_CUDA, else Vulkan's, or CUDA's in the CPU's modes
+       without a Vulkan device (or a library built without Vulkan) */
+    const ComputeMode mode = spingalett_get_compute_mode();
+    const bool selected = mode == COMPUTE_CUDA ? spingalett_gpu_select(COMPUTE_CUDA)
+                          : spingalett_gpu_select(COMPUTE_VULKAN) ||
+                                (mode != COMPUTE_VULKAN && spingalett_gpu_select(COMPUTE_CUDA));
+    if (!selected) {
         set_error(SPINGALETT_ERR_INVALID, "spingalett_device_data_new: no usable GPU");
         return NULL;
     }

@@ -619,7 +619,8 @@ SPINGALETT_API uint32_t spingalett_generate_args(SpingalettGenerateArgs args);
 /*
  * Data sets in the GPU's memory: count rows of size floats copied to the device once, for the
  * device_* fields of spingalett_train(), spingalett_predict() and spingalett_evaluate(). A set is made in
- * the memory of the compute mode's GPU (SPINGALETT_COMPUTE_CUDA's, else SPINGALETT_COMPUTE_VULKAN's).
+ * the memory of the compute mode's GPU (SPINGALETT_COMPUTE_CUDA's, else SPINGALETT_COMPUTE_VULKAN's; in the
+ * CPU's modes CUDA's where there is no Vulkan device).
  * On that backend those calls read their chunks on the device, where spingalett_train() gathers,
  * augments and smooths them, instead of copying samples from the host for every pass; on the CPU, or
  * the other backend, they copy the rows through the host first. With SPINGALETT_PRECISION_BFLOAT16 a set

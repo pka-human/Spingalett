@@ -243,6 +243,11 @@ All notable changes to this project are documented in this file. The format foll
   before.
 
 ### Fixed
+- `spingalett_device_data_new()` in the CPU's compute modes made sets only in Vulkan's memory, so that a
+  library built without Vulkan, or a machine without a Vulkan device, made none; it now takes CUDA's
+  there. The `cuda` group's tests asked the compute mode's GPU, not CUDA, whether it multiplies in
+  bfloat16, and when told no left that precision set: in a build without Vulkan the later tests ran in
+  bfloat16 and failed (20 checks).
 - Integer deployment models of language models (INT8, INT4, INT2; in the engine, batched and in the
   runtime) quantized the input of each linear layer with one scale for the whole sequence, so that a
   later token changed the logits of the earlier ones of a causal model. In a model whose first layer is
