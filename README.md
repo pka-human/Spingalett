@@ -535,6 +535,14 @@ parameters change), with the tokens it gave before: the CharGPT model (256 wide,
 128) generates 3230 tokens a second on one thread of an Intel Core i7-12650H where predicting the
 window for every token gave 72.7, and 3568 on six threads where it gave 121.
 
+In the GPU modes a session runs on the GPU, its model a network there and the keys and values in the GPU's
+memory. An integer model's linear layers then multiply its codes, kept on the GPU with their scales and
+widened to floats as they are read (weight-only: 8, 4 or 2 bits read a weight a token; the activations in
+the GPU's precision): the logits are those of the model's weights as floats to rounding, near the CPU's
+integer session's but not its bits. A model of GPT-2 small's size (12 blocks of 768, a vocabulary of
+50,257) generates 684 tokens a second in INT8 and 854 in INT4 on CUDA on an RTX 4050 Laptop GPU, where
+the same model in BF16 gives 368 (four sequences together: 1,953 and 2,053).
+
 ```c
 SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);   /* or spingalett_model_load() */
 SpingalettSession *s = spingalett_session_new(model, &(SpingalettSessionOptions){.sequences = 4});

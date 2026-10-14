@@ -3099,6 +3099,14 @@ struct SpgGpuDecoder {
     uint32_t kept_rows[DECODE_KEPT];
     SpgGpuCommands *kept[DECODE_KEPT];
     uint32_t next;                      /* the kept commands replaced next */
+    /* an integer model's linear layers kept as their codes (spingalett_gpu_decoder_quantize()): per layer the bits
+       of its codes (0: it multiplies the network's weights), the bytes of a row of them, where they are in `codes`,
+       and where its scales then biases are in `qparams` (floats) */
+    uint8_t *bits;
+    uint32_t *qstride;
+    uint64_t *qcodes, *qprm;
+    SpgGpuArena *qarena;
+    SpgGpuBuffer codes, qparams;
 };
 
 /* Whether a decoder can run layer l: what decoding computes token by token, or causal attention. */
@@ -3132,6 +3140,34 @@ static bool decodes(const NeuralNetwork *net, uint32_t l, uint32_t cells, const 
     }
 }
 
+/* The product of linear layer l kept as an integer model's codes on `rows` rows: y = act(bias + scale (x codes)),
+   in passes of up to SPG_WQ_ROWS rows of wqmv.comp, which widens the codes in registers (a pass reads the layer's
+   codes once: a byte, half or a quarter of one a weight). A row's sums run in an order of their own, whatever rows
+   are computed with it. */
+static void decode_codes(SpgGpuDecoder *d, Recorder *r, uint32_t l, uint32_t rows) {
+    SpgGpuNet *g = d->g;
+    const NeuralNetwork *net = g->net;
+    const uint32_t src = spingalett_source(net, l), N = net->shapes[l].channels, K = net->shapes[src].channels;
+    const uint64_t x = g->act[src].address, y = g->act[l].address, codes = d->codes.address + d->qcodes[l];
+    const uint64_t scales = d->qparams.address + 4u * d->qprm[l], biases = scales + 4ull * N;
+    const uint32_t half = (in_half(g, x) ? 1u : 0u) | (in_half(g, y) ? 2u : 0u);
+    for (uint32_t r0 = 0; r0 < rows; r0 += SPG_WQ_ROWS) {
+        const uint32_t n = rows - r0 < SPG_WQ_ROWS ? rows - r0 : SPG_WQ_ROWS;
+        const uint32_t R = n <= 1u ? 1u : n <= 2u ? 2u : n <= 4u ? 4u : 8u;
+        SpgWqPush p = {x, y, codes, scales, biases, n, N, K, d->qstride[l], r0, 0};
+        uint32_t spec[4] = {d->bits[l], R, net->act_func[l - 1], half};
+        Access a = {0};
+        reads(&a, whole(&g->act[src]));
+        reads(&a, (Range){codes, codes + (uint64_t)N * d->qstride[l]});
+        reads(&a, span(scales, 2ull * N));
+        writes(&a, whole(&g->act[l]));
+        a.group = group_of(l, GROUP_PHASES);            /* (the passes write rows apart) */
+        need(r, &a);
+        spg_gpu_dispatch(r->c, half ? SPG_KERNEL_wqmv_h : SPG_KERNEL_wqmv, spec, 4, &p, sizeof p,
+                         (N + 8u * SPG_WQ_NR(R) - 1u) / (8u * SPG_WQ_NR(R)), 1, 1);
+    }
+}
+
 /* Records the step of `rows` rows: every layer's pass on them. */
 static void record_decode(SpgGpuDecoder *d, Recorder *r, uint32_t rows) {
     SpgGpuNet *g = d->g;
@@ -3156,6 +3192,8 @@ static void record_decode(SpgGpuDecoder *d, Recorder *r, uint32_t rows) {
             writes(&a, whole(&g->act[l]));
             kernel(r, &a, SPG_KERNEL_embed, spec, 1, &p, sizeof p, groups(total / (C % 4u ? 1u : 4u), 256u), 1, 1);
             later = act;
+        } else if ((s->type == LAYER_DENSE || s->type == LAYER_CONV2D) && d->bits && d->bits[l]) {
+            decode_codes(d, r, l, rows);
         } else if (s->type == LAYER_DENSE || s->type == LAYER_CONV2D) {
             /* a pointwise layer's product on the rows: [rows x in] times its weights [out x in] */
             const uint32_t K = net->shapes[src].channels;
@@ -3261,8 +3299,13 @@ static void spingalett_gpu_decoder_free_here(SpgGpuDecoder *d) {
     for (uint32_t k = 0; k < DECODE_KEPT; k++) spg_gpu_commands_free(d->kept[k]);
     spg_gpu_buffer_free(&d->staging);
     spg_gpu_arena_free(d->arena);
+    spg_gpu_arena_free(d->qarena);
     free(d->keys);
     free(d->half);
+    free(d->bits);
+    free(d->qstride);
+    free(d->qcodes);
+    free(d->qprm);
     free(d);
 }
 
@@ -3343,6 +3386,97 @@ SpgGpuDecoder *spingalett_gpu_decoder_new(SpgGpuNet *g, uint32_t sequences, uint
 }
 
 uint32_t spingalett_gpu_decoder_rows(const SpgGpuDecoder *d) { return d ? d->most : 0; }
+
+/* The integer model's image whose network the decoder runs: its linear layers' codes, scales and biases copied to the
+   device, the codes in the image's order, each row padded with zero codes to a multiple of 16 bytes. */
+static int spingalett_gpu_decoder_quantize_here(SpgGpuDecoder *d, const uint8_t *image) {
+    const NeuralNetwork *net = d->g->net;
+    const uint32_t layers = net->layers;
+    int count = 0;
+    for (uint32_t l = 0; d->bits && l < layers; l++) count += d->bits[l] != 0;
+    if (d->bits) return count;
+    uint8_t *bits = (uint8_t *)calloc(layers, 1);
+    uint32_t *stride = (uint32_t *)calloc(layers, sizeof *stride);
+    uint64_t *at = (uint64_t *)calloc(layers, sizeof *at), *prm = (uint64_t *)calloc(layers, sizeof *prm);
+    uint64_t bytes = 0, floats = 0;
+    bool ok = bits && stride && at && prm;
+    for (uint32_t l = 2; ok && l < layers; l++) {
+        const LayerShape *s = &net->shapes[l];
+        if (s->type != LAYER_DENSE && s->type != LAYER_CONV2D) continue;
+        SlettLayer L;
+        spingalett_slett_layer(image, l - 1u, &L);
+        if (!spingalett_precision_is_int(L.precision)) continue;
+        const uint32_t K = net->shapes[spingalett_source(net, l)].channels;
+        if (L.rows != s->channels || L.row_len != K) continue;      /* (the network's layer: always) */
+        bits[l] = L.precision == PRECISION_INT8 ? 8u : L.precision == PRECISION_INT4 ? 4u : 2u;
+        count++;
+        stride[l] = (uint32_t)((((uint64_t)K * bits[l] + 7u) / 8u + 15u) & ~15ull);
+        at[l] = bytes;
+        prm[l] = floats;
+        bytes += (uint64_t)L.rows * stride[l];
+        floats += (2ull * L.rows + 3u) & ~3ull;
+    }
+    if (!ok || !bytes) {
+        free(bits); free(stride); free(at); free(prm);
+        return ok ? 0 : -1;
+    }
+    SpgGpuArena *arena = spg_gpu_arena_create();
+    SpgGpuBuffer staging = {0};
+    if (arena) {
+        spg_gpu_arena_add(arena, &d->codes, bytes, SPG_MEMORY_DEVICE);
+        spg_gpu_arena_add(arena, &d->qparams, 4u * floats, SPG_MEMORY_DEVICE);
+    }
+    ok = arena && spg_gpu_arena_commit(arena) && spg_gpu_buffer_create(&staging, bytes + 4u * floats, true);
+    if (ok) {
+        uint8_t *host = (uint8_t *)staging.mapped;
+        float *params = (float *)(void *)(host + bytes);
+        memset(host, 0, bytes);
+        for (uint32_t l = 2; l < layers; l++) {
+            if (!bits[l]) continue;
+            SlettLayer L;
+            spingalett_slett_layer(image, l - 1u, &L);
+            const size_t row = (size_t)spingalett_slett_row_bytes(L.precision, L.row_len);
+            for (uint32_t j = 0; j < L.rows; j++) memcpy(host + at[l] + (size_t)j * stride[l], image + L.weights + j * row, row);
+            memcpy(params + prm[l], image + L.scales, 4u * (size_t)L.rows);
+            memcpy(params + prm[l] + L.rows, image + L.biases, 4u * (size_t)L.rows);
+        }
+        SpgGpuCommands *c = spg_gpu_commands_create();
+        ok = c && spg_gpu_record_begin(c);
+        if (ok) {
+            spg_gpu_copy(c, &staging, 0, &d->codes, 0, bytes);
+            spg_gpu_copy(c, &staging, bytes, &d->qparams, 0, 4u * floats);
+            spg_gpu_barrier(c);
+            ok = spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
+        }
+        spg_gpu_commands_free(c);
+    }
+    spg_gpu_buffer_free(&staging);
+    if (!ok) {
+        spg_gpu_arena_free(arena);
+        free(bits); free(stride); free(at); free(prm);
+        return -1;
+    }
+    /* (steps recorded before multiplied the network's weights) */
+    for (uint32_t k = 0; k < DECODE_KEPT; k++) {
+        spg_gpu_commands_free(d->kept[k]);
+        d->kept[k] = NULL;
+    }
+    d->qarena = arena;
+    d->bits = bits;
+    d->qstride = stride;
+    d->qcodes = at;
+    d->qprm = prm;
+    return count;
+}
+
+int spingalett_gpu_decoder_quantize(SpgGpuDecoder *d, const uint8_t *image) {
+    if (!d || !image) return -1;
+    const SpgBackend saved = spg_gpu_using();
+    spg_gpu_use(d->g->backend);
+    const int count = spingalett_gpu_decoder_quantize_here(d, image);
+    spg_gpu_use(saved);
+    return count;
+}
 
 /* The commands of a step of `rows` rows: kept ones, or recorded now in place of the oldest. */
 static SpgGpuCommands *decode_commands(SpgGpuDecoder *d, uint32_t rows) {

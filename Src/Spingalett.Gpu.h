@@ -113,6 +113,11 @@ uint32_t spingalett_gpu_decoder_rows(const SpgGpuDecoder *d);
    fed already); writes every row's logits ([rows x outputs]) when logits is not NULL, and waits. */
 bool spingalett_gpu_decoder_step(SpgGpuDecoder *d, uint32_t rows, const uint32_t *tokens, const uint32_t *sequence,
                                  const uint32_t *position, float *logits);
+/* An integer model's image whose network the decoder runs (spingalett_load_from_memory() of it): its linear layers then
+   multiply the model's codes, kept on the device with their scales and widened in registers (weight-only: the
+   activations as the network keeps them, the sums in single precision), rather than the network's weights. The
+   number of such layers (0: a model of float weights), -1 when memory runs out (the network's weights stay in use). */
+int spingalett_gpu_decoder_quantize(SpgGpuDecoder *d, const uint8_t *image);
 /* Copies the first `length` positions' keys and values of sequence `from` to sequence `to`. */
 bool spingalett_gpu_decoder_copy(SpgGpuDecoder *d, uint32_t from, uint32_t to, uint32_t length);
 bool spingalett_gpu_download(SpgGpuNet *g);
@@ -235,6 +240,10 @@ static inline SpgGpuDecoder *spingalett_gpu_decoder_new(SpgGpuNet *g, uint32_t s
     return NULL;
 }
 static inline void spingalett_gpu_decoder_free(SpgGpuDecoder *d) { (void)d; }
+static inline int spingalett_gpu_decoder_quantize(SpgGpuDecoder *d, const uint8_t *image) {
+    (void)d; (void)image;
+    return -1;
+}
 static inline uint32_t spingalett_gpu_decoder_rows(const SpgGpuDecoder *d) { (void)d; return 0; }
 static inline bool spingalett_gpu_decoder_step(SpgGpuDecoder *d, uint32_t rows, const uint32_t *tokens,
                                                const uint32_t *sequence, const uint32_t *position, float *logits) {

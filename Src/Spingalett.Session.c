@@ -208,7 +208,8 @@ static bool session_workspace(SpingalettSession *s, ComputeMode mode) {
 
 #if !defined(SPINGALETT_RUNTIME)
 /* The session on the GPU of the compute mode: the model's image made a network there (its weights as floats,
-   the products in the GPU's precision), a decoder with the caches of every sequence; false (and the session on the
+   the products in the GPU's precision), a decoder with the caches of every sequence, which multiplies an integer
+   model's codes in its linear layers (weight-only: spingalett_gpu_decoder_quantize()); false (and the session on the
    CPU) when the GPU cannot run it. */
 static bool session_gpu(SpingalettSession *s) {
     if (!spingalett_use_gpu()) return false;
@@ -221,6 +222,9 @@ static bool session_gpu(SpingalettSession *s) {
     if (!s->gpu || !spingalett_gpu_upload(s->gpu)) goto fail;
     s->decoder = spingalett_gpu_decoder_new(s->gpu, s->sequences, s->max_length, &why);
     if (!s->decoder) goto fail;
+    const int coded = spingalett_gpu_decoder_quantize(s->decoder, (const uint8_t *)s->model->image);
+    if (coded > 0) spingalett_log(LOG_DEBUG, "session: on the GPU, %d linear layers multiply the model's codes", coded);
+    else if (coded < 0) spingalett_log(LOG_DEBUG, "session: on the GPU, the model's weights as floats (no memory for its codes)");
     const uint32_t rows = spingalett_gpu_decoder_rows(s->decoder);
     s->gpu_logits = (float *)malloc((size_t)rows * s->vocabulary * sizeof(float));
     s->row_token_id = (uint32_t *)malloc((size_t)rows * sizeof(uint32_t));

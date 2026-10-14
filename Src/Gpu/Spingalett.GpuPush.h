@@ -202,6 +202,18 @@ enum { SPG_IP_EPI, SPG_IP_DIRECT, SPG_IP_POOL, SPG_IP_GAP, SPG_IP_ADD, SPG_IP_MU
 #define SPG_IP_DW4        8u        /* DIRECT with FLOATS: a depthwise convolution's four channels at a time */
 #define SPG_IP_OG4        16u       /* DIRECT with FLOATS: four filters of a group at a time */
 
+/* wqmv.comp: products of rows of activations with a linear layer's weights kept as integer codes (INT8, INT4, INT2:
+   BITS) and a scale a row of weights, the codes widened in registers: y[r][n] = act(bias[n] + scale[n] sum_k
+   x[r][k] code[n][k]) for the `rows` rows from r0 on (SPG_WQ_ROWS at most). A row of codes takes `stride` bytes (a
+   multiple of 16), its codes in the image's order. */
+typedef struct {
+    uint64_t x, y, codes, scale, bias;
+    uint32_t rows, N, K, stride, r0, pad;
+} SpgWqPush;
+#define SPG_WQ_ROWS 8u
+/* rows of weights 32 invocations take in a pass of `rows` rows of x (a workgroup of 256: eight times that) */
+#define SPG_WQ_NR(rows) ((rows) >= 8u ? 2u : 4u)
+
 /* rows.comp */
 typedef struct {
     uint64_t index, dst, header;

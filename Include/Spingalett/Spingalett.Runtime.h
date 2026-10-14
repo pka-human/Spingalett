@@ -150,7 +150,11 @@ SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettM
  * a network there, its products in the GPU's precision, the keys and values in its memory: the logits the
  * CPU's to rounding, still the same bits however the tokens were fed), and is used from one thread at a
  * time; any number of sessions may run on one model at once, from any threads. The model must outlive its
- * sessions.
+ * sessions. On the GPU the linear layers of an integer model (INT8, INT4, INT2) multiply its codes, kept in
+ * the GPU's memory with their scales and widened as they are read (each weight's 8, 4 or 2 bits read once a
+ * step), the activations in the GPU's precision and quantized nowhere: the logits those of the model's weights
+ * as floats to rounding, near the CPU's integer session's but not its bits (which quantizes each token's
+ * activations, and attention's exponentials are libm's).
  */
 typedef struct SpingalettSession SpingalettSession;
 

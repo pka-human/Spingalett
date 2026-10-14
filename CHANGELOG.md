@@ -194,6 +194,26 @@ All notable changes to this project are documented in this file. The format foll
   2,010,000). Tests (gpu and cuda groups): an MLP, a chain of convolutions and a graph of every such layer
   in INT8, INT4 and INT2 the bits of `spingalett_model_run()` and of the CPU's batched prediction (9,000
   samples in chunks, products in slices, inputs quantized in slices), a model with GELU inside on the CPU.
+- **Sessions of integer language models on the GPU multiply their codes** (weight-only): the decoder of a
+  session of an INT8, INT4 or INT2 model keeps its linear layers' codes on the device as the image stores
+  them (each row padded to 16 bytes), with their scales, and multiplies them by the activations in the
+  GPU's precision, widening the codes to floats in registers as it reads them (`wqmv.comp`: 32 rows of
+  weights a workgroup, four (two) a group of 32 invocations, each reading a value of the activations once
+  for them; passes of up to eight rows of activations, each reading the codes once; a row's sums in the
+  order of k, then the invocations' by a tree in shared memory, or a warp's shuffles: the same bits on
+  every run, and a row's whatever rows run with it), where they multiplied the weights widened to floats
+  or bfloat16 on the matrix kernels. The logits are those of the model's weights as floats to rounding
+  (4e-7 of the CPU's session of the network the image makes, 5e-3 in bfloat16), near the CPU's integer
+  session's (which quantizes each token's activations: 9e-3 in the tests), not its bits. Greedy decoding
+  after a prompt of 16, tokens/s on an RTX 4050 Laptop GPU, medians of three interleaved rounds, before
+  and after: the GPT of `Examples/Benchmark.c` (6 blocks of 384) in INT8 on CUDA 1,025 -> 3,386 in single
+  precision, 2,223 -> 3,406 in bfloat16, on Vulkan 804 -> 2,248 and 1,270 -> 2,304 (INT4 3,214, 3,236, 2,194,
+  2,180); a model of GPT-2 small's size (12 blocks of 768, a vocabulary of 50,257, a window of 512) in INT8
+  on CUDA 186 -> 680 and 368 -> 684, on Vulkan 142 -> 443 and 256 -> 431 (INT4 838, 854, 553, 553; the same
+  model in BF16 186, 368, 144, 253), four sequences together in bfloat16 1,250 -> 1,953 on CUDA (INT4
+  2,053) and 932 -> 1,365 on Vulkan (INT4 1,326). Tests (gpu and cuda groups): GPT- and LLaMA-like models
+  and one of 66 channels in INT8, INT4 and INT2 against their weights as floats and the CPU's integer
+  session, a prompt the bits of its tokens one at a time and of two sequences fed together.
 
 ### Changed
 - `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single

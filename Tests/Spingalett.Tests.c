@@ -6589,6 +6589,103 @@ static void gpu_session(bool llama) {
     free(cpu); free(one); free(all); free(x); free(t);
 }
 
+/* The messages of sessions whose linear layers multiply an integer model's codes on the GPU. */
+static _Atomic int coded_sessions;
+static void count_coded_sessions(LogLevel level, const char *message) {
+    (void)level;
+    if (strstr(message, "multiply the model's codes")) atomic_fetch_add(&coded_sessions, 1);
+}
+
+/* Sessions of integer models on the GPU: the linear layers multiply the model's codes there (weight-only, wqmv.comp:
+   INT8, INT4, INT2), so that the logits are those of the model's weights as floats (the CPU's session of the network
+   the model's image makes) to single precision's rounding, and within bfloat16's error; a prompt fed at once the bits
+   of its tokens fed one at a time, and of several sequences fed together; the CPU's integer session, which quantizes
+   the activations too, near. GPT- and LLaMA-like models, and one of 66 channels (rows of codes not in fours). */
+static void gpu_session_int(int which) {
+    const uint32_t T = 48, V = 40, P = 40;
+    const bool llama = which == 1;
+    NeuralNetwork *net;
+    if (which < 2) {
+        net = session_lm(llama, T, V);
+    } else {
+        net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+        layer(.net = net, .neurons_amount = T);
+        const uint32_t x = embedding(.net = net, .vocabulary = V, .neurons_amount = 66, .positions = true);
+        layer_norm(.net = net);
+        linear(.net = net, .neurons_amount = 3 * 66);
+        attention(.net = net, .heads = 3, .causal = true);
+        const uint32_t a = linear(.net = net, .neurons_amount = 66, .act_func = ACT_GELU);
+        add_layers(.net = net, .inputs = {x, a});
+        linear(.net = net, .neurons_amount = V);
+    }
+    lcg_state = 191u + (unsigned)which;
+    for (uint64_t i = 0; i < net->total_weights; i++) net->weights[i] = (frand() * 2 - 1) * 0.15f;
+    uint32_t tok[40];
+    for (uint32_t i = 0; i < P; i++) tok[i] = (i * 7 + 3) % V;
+    const size_t bytes = (size_t)P * V * sizeof(float);
+    float *ref = (float *)malloc(bytes), *cpu = (float *)malloc(bytes), *one = (float *)malloc(bytes);
+    float *all = (float *)malloc(bytes), *mixed = (float *)malloc(bytes);
+    static const PrecisionMode precisions[3] = {PRECISION_INT8, PRECISION_INT4, PRECISION_INT2};
+    double worst[2] = {0, 0}, integer = 0;
+    bool ok = true, same = true;
+    int coded = 0, sessions = 0;
+    for (int k = 0; k < 3 && ok; k++) {
+        SpingalettModel *m = spingalett_model_from_network(net, precisions[k]);
+        NeuralNetwork *floats = m ? spingalett_load_from_memory(m->image, m->image_size) : NULL;
+        SpingalettModel *mf = floats ? spingalett_model_from_network(floats, PRECISION_FLOAT32) : NULL;
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        SpingalettSession *s = mf ? spingalett_session_new(mf, NULL) : NULL;
+        ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = ref, .all = true}, 1);
+        spingalett_session_free(s);
+        s = ok ? spingalett_session_new(m, NULL) : NULL;
+        ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = cpu, .all = true}, 1);
+        spingalett_session_free(s);
+        for (int bf16 = 0; bf16 < 2 && ok; bf16++) {
+            spingalett_set_compute_mode(gpu_mode);
+            if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) break;
+            spingalett_set_verbose(true);
+            spingalett_set_log_level(LOG_DEBUG);
+            spingalett_set_log_callback(count_coded_sessions);
+            atomic_store(&coded_sessions, 0);
+            s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 3});
+            spingalett_set_log_callback(NULL);
+            spingalett_set_log_level(LOG_INFO);
+            spingalett_set_verbose(false);
+            coded += atomic_load(&coded_sessions);
+            sessions++;
+            ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = all, .all = true}, 1);
+            for (uint32_t i = 0; ok && i < P; i++)
+                ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 1, .tokens = tok + i, .count = 1,
+                                                                         .logits = one + (size_t)i * V}, 1);
+            /* sequence 2 rewound, then fed with sequence 0's continuation a token at a time: rows of two sequences a step */
+            ok = ok && spingalett_session_rewind(s, 0, 0) && spingalett_session_rewind(s, 2, 0);
+            for (uint32_t i = 0; ok && i < P; i++) {
+                const SpingalettSessionFeed feeds[2] = {
+                    {.sequence = 0, .tokens = tok + i, .count = 1, .logits = mixed + (size_t)i * V},
+                    {.sequence = 2, .tokens = tok + (P - 1 - i), .count = 1}};
+                ok = spingalett_session_feed(s, feeds, 2);
+            }
+            same = same && ok && !memcmp(all, one, bytes) && !memcmp(all, mixed, bytes);
+            if (ok) worst[bf16] = fmax(worst[bf16], gpu_max_scaled(all, ref, (size_t)P * V));
+            if (ok && !bf16) integer = fmax(integer, gpu_max_scaled(all, cpu, (size_t)P * V));
+            spingalett_session_free(s);
+            spingalett_set_gpu_precision(PRECISION_FLOAT32);
+        }
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        spingalett_model_free(mf);
+        if (floats) free_network(floats);
+        spingalett_model_free(m);
+    }
+    CHECK(ok && same && coded == sessions && sessions >= 3 && worst[0] < 1e-4 && worst[1] < 3e-2 && integer < 0.1,
+          "gpu session int %s: single precision %.2e, bf16 %.2e from the float weights', %.2e from the integer session; "
+          "alike %d, coded %d", which == 2 ? "odd" : llama ? "llama" : "gpt", worst[0], worst[1], integer, same, coded);
+    printf("  gpu session int %s: INT8, INT4, INT2 logits %.1e (bf16 %.1e) from their weights as floats, %.1e from the "
+           "CPU's integer session, a prompt the bits of its tokens %s\n",
+           which == 2 ? "66 channels" : llama ? "LLaMA-like" : "GPT-like", worst[0], worst[1], integer, same ? "yes" : "no");
+    free(ref); free(cpu); free(one); free(all); free(mixed);
+    free_network(net);
+}
+
 /* Deployment models in a GPU's compute modes: those of float weights (FP32, FP16, BF16) predict on the GPU, within
    single precision's rounding of the CPU's; integer ones on the CPU, the CPU's bits. A CNN and a GPT-like model. */
 static void gpu_model_predict(void) {
@@ -8303,6 +8400,7 @@ int main(int argc, char **argv) {
             gpu_session(true);
             gpu_model_predict();
             gpu_model_exact();
+            for (int k = 0; k < 3; k++) gpu_session_int(k);
         }
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }

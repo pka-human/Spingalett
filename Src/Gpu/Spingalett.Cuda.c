@@ -350,6 +350,9 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], op);
         else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u%s", spec[2], op, op == SPG_ATTN_PRE ? "" : ext);
         else snprintf(name, sizeof name, "attn_d%u%s", spec[2], ext);
+    } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
+        if (count < 2) return -1;
+        snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];

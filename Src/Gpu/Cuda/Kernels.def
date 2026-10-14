@@ -32,6 +32,20 @@ SPG_CUDA_UNIT(embed, embed, "")
 SPG_CUDA_UNIT(attn_cache, attn_cache, "")   /* attention over a cache of keys and values (decoding) */
 SPG_CUDA_UNIT(iquant, iquant, "")           /* integer models: their activations quantized, */
 SPG_CUDA_UNIT(ipass, ipass, "")             /* their other passes */
+/* integer models' linear layers in sessions: products of a few rows with their codes widened in registers, a unit of
+   BITS and ROWS each (wqmv_b<BITS>_r<ROWS>) */
+SPG_CUDA_UNIT(wqmv_b8_r1, wqmv, "-DBITS=8u -DROWS=1u")
+SPG_CUDA_UNIT(wqmv_b8_r2, wqmv, "-DBITS=8u -DROWS=2u")
+SPG_CUDA_UNIT(wqmv_b8_r4, wqmv, "-DBITS=8u -DROWS=4u")
+SPG_CUDA_UNIT(wqmv_b8_r8, wqmv, "-DBITS=8u -DROWS=8u")
+SPG_CUDA_UNIT(wqmv_b4_r1, wqmv, "-DBITS=4u -DROWS=1u")
+SPG_CUDA_UNIT(wqmv_b4_r2, wqmv, "-DBITS=4u -DROWS=2u")
+SPG_CUDA_UNIT(wqmv_b4_r4, wqmv, "-DBITS=4u -DROWS=4u")
+SPG_CUDA_UNIT(wqmv_b4_r8, wqmv, "-DBITS=4u -DROWS=8u")
+SPG_CUDA_UNIT(wqmv_b2_r1, wqmv, "-DBITS=2u -DROWS=1u")
+SPG_CUDA_UNIT(wqmv_b2_r2, wqmv, "-DBITS=2u -DROWS=2u")
+SPG_CUDA_UNIT(wqmv_b2_r4, wqmv, "-DBITS=2u -DROWS=4u")
+SPG_CUDA_UNIT(wqmv_b2_r8, wqmv, "-DBITS=2u -DROWS=8u")
 SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")     /* attention in single precision: heads of up to 256, */
 SPG_CUDA_UNIT(rattn_d32_o0, rattn, "-DD=32u -DOPC=0u")   /* of up to 32, 64, 128 a unit per pass */
 SPG_CUDA_UNIT(rattn_d32_o1, rattn, "-DD=32u -DOPC=1u")
