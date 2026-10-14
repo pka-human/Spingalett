@@ -579,8 +579,8 @@ spingalett_session_free(s);
   and left padding need the option. Batch normalization takes its statistics over padded cells too.
 - Attention never stores the scores: the CPU computes a block of queries at a time, the backward
   pass recomputes the probabilities from each query's log-sum-exp. On the GPU it runs in tiles
-  (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16 on
-  CUDA), deterministic like everything else.
+  (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16, on
+  CUDA and Vulkan alike), deterministic like everything else.
 - A sliding window costs what it reads: the CPU and the GPU's kernels of single precision skip the blocks of
   keys outside every query's window (in bfloat16 on CUDA such layers run on those kernels, not on flash
   attention).

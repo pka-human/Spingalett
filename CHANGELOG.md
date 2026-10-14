@@ -217,6 +217,15 @@ All notable changes to this project are documented in this file. The format foll
   session, a prompt the bits of its tokens one at a time and of two sequences fed together.
 
 ### Changed
+- **Attention in single precision on Vulkan in register tiles** (`rattn.comp`, as CUDA's `rattn.cu` computes it):
+  a workgroup of 64 queries (keys in the keys' gradient pass), each invocation four of them and a share of a tile
+  of keys, the scores and sums in registers, a row's maximum and sum combined over its eight lanes by subgroup
+  shuffles in a fixed pattern (the same bits on every run), the next tile loaded while one is used; for heads of
+  up to 128 values where the device has subgroups of 8 lanes or more and up to 48 KB of shared memory (the
+  others, and layers with padding, windows or cross-attention, run on `attn.comp` as before). On an RTX 4050
+  Laptop GPU the GPT of `Examples/Benchmark.c` in single precision on Vulkan trains 70,967 tokens a second
+  instead of 40,085 and infers 226,062 instead of 143,567 (CUDA: 74,821 and 235,811), medians of three runs
+  from a GPU at 60 C.
 - **Flash attention on Vulkan**: networks in bfloat16 run attention's forward pass and its gradients on the
   matrix units (`flash.comp`: cooperative matrices of bfloat16, `VK_KHR_cooperative_matrix`, as CUDA's
   `flash.cu` does with `mma.sync`) for heads of 32, 64 and 128, causal or not, rotary, grouped: a subgroup

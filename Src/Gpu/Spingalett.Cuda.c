@@ -260,8 +260,8 @@ static uint32_t cub_max_workgroups(uint32_t axis) { return axis == 0 ? 0x7FFFFFF
 static bool cub_mma_bf16(void) { return cub_open(); }          /* (Ampere and later: mma.sync of bfloat16) */
 static bool cub_bf16_storage(void) { return cub_open(); }
 static bool cub_host_writes(void) { return false; }
-/* (flash.comp is Vulkan's: flash attention runs on attn's units of flash.cu here) */
-static bool cub_kernel_built(SpgKernel kernel) { return kernel != SPG_KERNEL_flash; }
+/* (flash.comp and rattn.comp are Vulkan's: attention runs on attn's units of flash.cu and rattn.cu here) */
+static bool cub_kernel_built(SpgKernel kernel) { return kernel != SPG_KERNEL_flash && kernel != SPG_KERNEL_rattn; }
 
 /* ------------------------------------------------------------------------- kernels */
 

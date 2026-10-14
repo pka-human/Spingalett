@@ -1,0 +1,408 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * rattn: attn.comp's passes FORWARD, DQ and DKV in single precision for heads of up to 128 values (as CUDA's
+ * rattn.cu computes them), with the scores and sums of every invocation in registers. A workgroup takes R rows
+ * (queries; keys in DKV), every invocation RM = 4 of them and a share of the other side's tile of B rows: the TX
+ * invocations of a row's group (consecutive lanes of a subgroup) hold its scores at columns tx, tx + TX, ... and its
+ * sums at chunks of four values tx, tx + TX, ... of the head. Tiles sit in shared memory as rows of D + 4 floats; a
+ * row group passes its probabilities through shared memory to itself (a subgroup barrier), its maximum and sum
+ * combined over its lanes by xor 1, 2, 4 (a fixed pattern). Heads of exactly D values are loaded four values at a
+ * time, the next tile into registers while the workgroup computes on the current one.
+ *
+ *   FORWARD  S = Q K^T over tiles of keys, the softmax online, O += P V; y = O / sum, the log sum with STATS.
+ *   DQ       S, P = exp(S - lse), dP = dO V^T, dS = P (dP - rowsum(dO o)), dQ += dS K.
+ *   DKV      per workgroup of keys, over the group's query heads and tiles of queries in order: S^T = K Q^T, P^T,
+ *            dP^T = V dO^T, dV += P^T dO, dS^T, dK += dS^T Q.
+ *
+ * Queries come scaled (and queries and keys rotated, ROPE) as they are loaded; a product adds its terms in the order
+ * of the head's values, a sum over keys in their order: the same bits on every run. The head d may be smaller than D
+ * (zeros past it). Layers with padding, a sliding window or cross-attention, PRE and buffers kept as bfloat16 run on
+ * attn.comp. Spec: OP, D, THREADS (SPG_RATTN_THREADS), the rows those of SPG_RATTN_ROWS. Needs subgroups of 8 lanes
+ * or more whose lanes follow the invocations' order (REQUIRE_FULL_SUBGROUPS), and up to 48 KB of shared memory.
+ */
+
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "common.glsl"
+
+/* (the defaults are the tiles of the most shared memory: some drivers size it before specialization) */
+layout(constant_id = 0) const uint OP = 3;
+layout(constant_id = 1) const uint D = 64;
+layout(constant_id = 2) const uint THREADS = 128;
+layout(local_size_x_id = 2) in;
+
+#define FORWARD 0u
+#define DQ      2u
+#define DKV     3u
+#define FLAG_CAUSAL 1u
+#define FLAG_ROPE   2u
+#define FLAG_STATS  4u
+
+layout(push_constant) uniform Push {
+    F32 x, y, dy, dx, stats, table;
+    uint n, cells, heads, kv, d, flags;
+    float scale;
+    uint window;
+    F32 tokens;
+    uint tokens_stride, tokens_at;
+    F32 kvx;
+    uint kcells, pad_;
+} p;
+
+const uint R = D <= 64u || OP == FORWARD ? 64u : 32u;                       /* rows of a workgroup */
+const uint B = OP == FORWARD ? (D <= 32u ? 64u : D <= 64u ? 32u : 16u)     /* rows of the other side's tiles */
+                             : (D <= 32u ? 32u : D <= 64u ? 16u : 8u);
+const bool KVS = OP == FORWARD && D > 64u;                                  /* keys and values in turn in one tile */
+const uint RM = 4u;                     /* rows an invocation */
+const uint TY = R / RM;                 /* row groups */
+const uint TX = THREADS / TY;           /* invocations a row group */
+const uint CN = B / TX;                 /* scores of a row an invocation */
+const uint CH = D / TX / 4u;            /* chunks of four of a row of the head an invocation */
+const uint SQ = (D + 4u) / 4u;          /* vec4 a row of the tiles of D */
+const uint SP = B + 4u;                 /* floats a row of probabilities */
+const uint LC = B * D / 4u / THREADS;   /* chunks of four of a tile of B rows an invocation loads */
+
+/* rows of R (A0, A1) and of B (B0, B1): FORWARD the queries, the keys (or keys and values in turn) and the values;
+   DQ the queries, the outputs' gradient, keys and values; DKV the keys, values, queries and outputs' gradient */
+shared vec4 A0[R * SQ];
+shared vec4 A1[OP == FORWARD ? 1u : R * SQ];
+shared vec4 B0[B * SQ];
+shared vec4 B1[KVS ? 1u : B * SQ];
+shared vec4 P[R * SP / 4u];             /* a row group's probabilities (or dS^T) */
+shared float L[OP == DKV ? B : 1u], DL[OP == DKV ? B : 1u];
+
+/* Where a tile's rows come from: float `head` on of each cell's `stride` floats of base, rotated with rotate
+   (ROPE), times mul. */
+struct Rows {
+    F32 base;
+    uint head, stride;
+    bool rotate;
+    float mul;
+};
+
+/* Value c of row pos of sample s (zero past the cells or the head's d values) */
+float value(uint s, uint pos, uint c, Rows r) {
+    const uint d = p.d, hd = d / 2u;
+    if (pos >= p.cells || c >= d) return 0.0;
+    const uint at = (s * p.cells + pos) * r.stride + r.head;
+    float v = r.base.v[at + c];
+    if (r.rotate && (p.flags & FLAG_ROPE) != 0u) {
+        const uint i = c < hd ? c : c - hd;
+        const float cs = p.table.v[pos * hd + i], sn = p.table.v[p.cells * hd + pos * hd + i];
+        v = c < hd ? v * cs - r.base.v[at + c + hd] * sn : v * cs + r.base.v[at + c - hd] * sn;
+    }
+    return v * r.mul;
+}
+
+/* Values c .. c + 3 of row pos, a head of exactly D values: as value() computes them, four at a time */
+vec4 chunk(uint s, uint pos, uint c, Rows r) {
+    if (pos >= p.cells) return vec4(0.0);
+    const uint at = (s * p.cells + pos) * r.stride + r.head;
+    vec4 v = F32x4(r.base).v[(at + c) >> 2];
+    if (r.rotate && (p.flags & FLAG_ROPE) != 0u) {
+        const uint hd = D / 2u, i = c < hd ? c : c - hd;
+        const vec4 w = F32x4(r.base).v[(at + (c < hd ? c + hd : c - hd)) >> 2];
+        const vec4 cs = F32x4(p.table).v[(pos * hd + i) >> 2];
+        const vec4 sn = F32x4(p.table).v[(p.cells * hd + pos * hd + i) >> 2];
+        v = c < hd ? v * cs - w * sn : v * cs + w * sn;
+    }
+    return v * r.mul;
+}
+
+/* Rows r0 .. r0 + count - 1 into tile T ([count][SQ]); `chunk` of row and chunk e (exactly D values) or value()s */
+#define LOAD_ROWS(T, s, r0, count, r)                                                                          \
+    if (p.d == D) {                                                                                            \
+        for (uint e = tid; e < (count) * (D / 4u); e += THREADS)                                               \
+            T[(e / (D / 4u)) * SQ + e % (D / 4u)] = chunk(s, (r0) + e / (D / 4u), 4u * (e % (D / 4u)), r);    \
+    } else {                                                                                                   \
+        for (uint e = tid; e < (count) * D; e += THREADS)                                                      \
+            T[(e / D) * SQ + (e % D) / 4u][e % 4u] = value(s, (r0) + e / D, e % D, r);                        \
+    }
+
+/* A tile of B rows from r0 into this invocation's registers (heads of exactly D values) */
+void fetch(uint tid, uint s, uint r0, Rows r, out vec4 v[LC]) {
+    [[unroll]] for (uint k = 0u; k < LC; k++) {
+        const uint e = tid + THREADS * k;
+        v[k] = chunk(s, r0 + e / (D / 4u), 4u * (e % (D / 4u)), r);
+    }
+}
+/* The tile of B rows from r0 into tile T: from the registers fetch() filled, or loaded now */
+#define PLACE(T, s, r0, r, v)                                                                                  \
+    if (p.d == D) {                                                                                            \
+        [[unroll]] for (uint k = 0u; k < LC; k++) {                                                            \
+            const uint e = tid + THREADS * k;                                                                  \
+            T[(e / (D / 4u)) * SQ + e % (D / 4u)] = v[k];                                                      \
+        }                                                                                                      \
+    } else {                                                                                                   \
+        LOAD_ROWS(T, s, r0, B, r)                                                                              \
+    }
+
+/* s[m][n] += A's row (ry RM + m) . B's row (tx + TX n), the head's values four at a time, in order: A0 and B0, or
+   (second) A1 and B1 */
+void scores(bool second, uint ry, uint tx, inout float sc[RM][CN]) {
+    for (uint c = 0u; c < D / 4u; c++) {
+        vec4 x[RM], y[CN];
+        [[unroll]] for (uint m = 0u; m < RM; m++) x[m] = second ? A1[(ry * RM + m) * SQ + c] : A0[(ry * RM + m) * SQ + c];
+        [[unroll]] for (uint n = 0u; n < CN; n++) y[n] = second ? B1[(tx + TX * n) * SQ + c] : B0[(tx + TX * n) * SQ + c];
+        [[unroll]] for (uint m = 0u; m < RM; m++)
+            [[unroll]] for (uint n = 0u; n < CN; n++) {
+                sc[m][n] = fma(x[m].x, y[n].x, sc[m][n]);
+                sc[m][n] = fma(x[m].y, y[n].y, sc[m][n]);
+                sc[m][n] = fma(x[m].z, y[n].z, sc[m][n]);
+                sc[m][n] = fma(x[m].w, y[n].w, sc[m][n]);
+            }
+    }
+}
+
+/* acc[m][k] += the row group's probabilities P[ry RM + m][j] times B0's (second: B1's) row j at chunk tx + TX k,
+   over the tile's B rows j in order */
+void accumulate(bool second, uint ry, uint tx, inout vec4 acc[RM][CH]) {
+    [[dont_unroll]] for (uint j = 0u; j < B; j += 4u) {
+        vec4 w[RM];
+        [[unroll]] for (uint m = 0u; m < RM; m++) w[m] = P[((ry * RM + m) * SP + j) / 4u];
+        [[unroll]] for (uint jj = 0u; jj < 4u; jj++)
+            [[unroll]] for (uint k = 0u; k < CH; k++) {
+                const vec4 y = second ? B1[(j + jj) * SQ + tx + TX * k] : B0[(j + jj) * SQ + tx + TX * k];
+                [[unroll]] for (uint m = 0u; m < RM; m++) acc[m][k] = fma(vec4(w[m][jj]), y, acc[m][k]);
+            }
+    }
+}
+
+/* the maximum (sum) of a row's values over its group's lanes */
+float group_max(float v) {
+    [[unroll]] for (uint m = 1u; m < TX; m <<= 1) v = max(v, subgroupShuffleXor(v, m));
+    return v;
+}
+float group_sum(float v) {
+    [[unroll]] for (uint m = 1u; m < TX; m <<= 1) v += subgroupShuffleXor(v, m);
+    return v;
+}
+/* the row group's writes of P visible to its lanes */
+void group_sync() {
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
+
+/* The gradient of the vector before the rotation: value c of row `row` of A0 (A1: second), at position pos */
+float unrotated(bool second, uint row, uint pos, uint c) {
+    const float v = second ? A1[row * SQ + c / 4u][c % 4u] : A0[row * SQ + c / 4u][c % 4u];
+    if ((p.flags & FLAG_ROPE) == 0u) return v;
+    const uint hd = p.d / 2u, i = c < hd ? c : c - hd, o = c < hd ? c + hd : c - hd;
+    const float cs = p.table.v[pos * hd + i], sn = p.table.v[p.cells * hd + pos * hd + i];
+    const float w = second ? A1[row * SQ + o / 4u][o % 4u] : A0[row * SQ + o / 4u][o % 4u];
+    return c < hd ? v * cs + w * sn : v * cs - w * sn;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, tx = tid % TX, ry = tid / TX, s = gl_WorkGroupID.z;
+    const uint d = p.d, out_c = p.heads * d, rows = p.n * p.heads * p.cells;
+    const uint C = (p.heads + 2u * p.kv) * d, group = p.heads / p.kv;
+    const bool causal = (p.flags & FLAG_CAUSAL) != 0u, vec = d == D;
+    const float NEG = -3.402823466e38;
+    vec4 ra[LC], rb[LC];            /* the next tile's rows, as fetch() loads them */
+    if (OP == FORWARD || OP == DQ) {
+        const uint h = gl_WorkGroupID.y, kh = h / group, i0 = gl_WorkGroupID.x * R, sa = (s * p.heads + h) * p.cells;
+        Rows keys_of = Rows(p.x, (p.heads + kh) * d, C, true, 1.0);
+        Rows values_of = Rows(p.x, (p.heads + p.kv + kh) * d, C, false, 1.0);
+        LOAD_ROWS(A0, s, i0, R, Rows(p.x, h * d, C, true, p.scale))
+        float mx[RM], sum[RM], lse[RM], del[RM];
+        if (OP == DQ) {
+            LOAD_ROWS(A1, s, i0, R, Rows(p.dy, h * d, out_c, false, 1.0))
+        }
+        [[unroll]] for (uint m = 0u; m < RM; m++) {
+            const uint i = i0 + ry * RM + m;
+            mx[m] = NEG;
+            sum[m] = 0.0;
+            lse[m] = OP == DQ && i < p.cells ? p.stats.v[sa + i] : 0.0;
+            del[m] = OP == DQ && i < p.cells ? p.stats.v[rows + sa + i] : 0.0;
+        }
+        vec4 acc[RM][CH];
+        [[unroll]] for (uint m = 0u; m < RM; m++)
+            [[unroll]] for (uint k = 0u; k < CH; k++) acc[m][k] = vec4(0.0);
+        const uint keys = causal ? min(p.cells, i0 + R) : p.cells;
+        if (vec) {
+            fetch(tid, s, 0u, keys_of, ra);
+            fetch(tid, s, 0u, values_of, rb);
+        }
+        for (uint j0 = 0u; j0 < keys; j0 += B) {
+            const bool next = vec && j0 + B < keys;
+            float sc[RM][CN];
+            [[unroll]] for (uint m = 0u; m < RM; m++)
+                [[unroll]] for (uint n = 0u; n < CN; n++) sc[m][n] = 0.0;
+            barrier();                  /* the last tile's rows are no longer read */
+            if (KVS) {
+                PLACE(B0, s, j0, keys_of, ra)
+                barrier();
+                if (next) fetch(tid, s, j0 + B, keys_of, ra);
+                scores(false, ry, tx, sc);
+                barrier();
+                PLACE(B0, s, j0, values_of, rb)
+                barrier();
+                if (next) fetch(tid, s, j0 + B, values_of, rb);
+            } else {
+                PLACE(B0, s, j0, keys_of, ra)
+                PLACE(B1, s, j0, values_of, rb)
+                barrier();
+                if (next) {
+                    fetch(tid, s, j0 + B, keys_of, ra);
+                    fetch(tid, s, j0 + B, values_of, rb);
+                }
+                scores(false, ry, tx, sc);
+            }
+            if (OP == FORWARD) {
+                [[unroll]] for (uint m = 0u; m < RM; m++) {
+                    const uint i = i0 + ry * RM + m;
+                    float top = NEG;
+                    [[unroll]] for (uint n = 0u; n < CN; n++) {
+                        const uint j = j0 + tx + TX * n;
+                        if (!(i < p.cells && j < p.cells && (!causal || j <= i))) sc[m][n] = NEG;
+                        top = max(top, sc[m][n]);
+                    }
+                    const float mn = max(mx[m], group_max(top)), alpha = mn == NEG ? 1.0 : exp(mx[m] - mn);
+                    float part = 0.0;
+                    [[unroll]] for (uint n = 0u; n < CN; n++) {
+                        const float pv = sc[m][n] == NEG ? 0.0 : exp(sc[m][n] - mn);
+                        const uint at = (ry * RM + m) * SP + tx + TX * n;
+                        P[at / 4u][at % 4u] = pv;
+                        part += pv;
+                    }
+                    sum[m] = sum[m] * alpha + group_sum(part);
+                    mx[m] = mn;
+                    [[unroll]] for (uint k = 0u; k < CH; k++) acc[m][k] *= alpha;
+                }
+                group_sync();
+                accumulate(!KVS, ry, tx, acc);
+            } else {
+                float dp[RM][CN];
+                [[unroll]] for (uint m = 0u; m < RM; m++)
+                    [[unroll]] for (uint n = 0u; n < CN; n++) dp[m][n] = 0.0;
+                scores(true, ry, tx, dp);
+                [[unroll]] for (uint m = 0u; m < RM; m++) {
+                    const uint i = i0 + ry * RM + m;
+                    [[unroll]] for (uint n = 0u; n < CN; n++) {
+                        const uint j = j0 + tx + TX * n, at = (ry * RM + m) * SP + tx + TX * n;
+                        const bool valid = i < p.cells && j < p.cells && (!causal || j <= i);
+                        P[at / 4u][at % 4u] = valid ? exp(sc[m][n] - lse[m]) * (dp[m][n] - del[m]) : 0.0;
+                    }
+                }
+                group_sync();
+                accumulate(false, ry, tx, acc);
+            }
+        }
+        if (OP == FORWARD) {
+            [[unroll]] for (uint m = 0u; m < RM; m++) {
+                const uint i = i0 + ry * RM + m;
+                if (i >= p.cells) continue;
+                const float inv = 1.0 / sum[m];
+                const uint at = (s * p.cells + i) * out_c + h * d;
+                [[unroll]] for (uint k = 0u; k < CH; k++) {
+                    const uint c = 4u * (tx + TX * k);
+                    const vec4 o = acc[m][k] * inv;
+                    if (vec) {
+                        F32x4(p.y).v[(at + c) >> 2] = o;
+                    } else {
+                        [[unroll]] for (uint e = 0u; e < 4u; e++)
+                            if (c + e < d) p.y.v[at + c + e] = o[e];
+                    }
+                }
+                if ((p.flags & FLAG_STATS) != 0u && tx == 0u) p.stats.v[sa + i] = mx[m] + log(sum[m]);
+            }
+        } else {
+            /* dQ times the scale, rotated back through shared memory */
+            barrier();
+            [[unroll]] for (uint m = 0u; m < RM; m++)
+                [[unroll]] for (uint k = 0u; k < CH; k++) A0[(ry * RM + m) * SQ + tx + TX * k] = acc[m][k] * p.scale;
+            barrier();
+            for (uint e = tid; e < R * D; e += THREADS) {
+                const uint row = e / D, c = e % D, i = i0 + row;
+                if (i < p.cells && c < d) p.dx.v[(s * p.cells + i) * C + h * d + c] = unrotated(false, row, i, c);
+            }
+        }
+    } else {
+        /* the workgroup's keys and values of head kh; the queries of the group's heads */
+        const uint kh = gl_WorkGroupID.y, j0 = gl_WorkGroupID.x * R;
+        LOAD_ROWS(A0, s, j0, R, Rows(p.x, (p.heads + kh) * d, C, true, 1.0))
+        LOAD_ROWS(A1, s, j0, R, Rows(p.x, (p.heads + p.kv + kh) * d, C, false, 1.0))
+        vec4 dk[RM][CH], dv[RM][CH];
+        [[unroll]] for (uint m = 0u; m < RM; m++)
+            [[unroll]] for (uint k = 0u; k < CH; k++) {
+                dk[m][k] = vec4(0.0);
+                dv[m][k] = vec4(0.0);
+            }
+        const uint first = causal ? (j0 / B) * B : 0u;
+        for (uint h = kh * group; h < (kh + 1u) * group; h++) {
+            const uint sa = (s * p.heads + h) * p.cells;
+            Rows queries_of = Rows(p.x, h * d, C, true, p.scale);
+            Rows grads_of = Rows(p.dy, h * d, out_c, false, 1.0);
+            if (vec) {
+                fetch(tid, s, first, queries_of, ra);
+                fetch(tid, s, first, grads_of, rb);
+            }
+            for (uint q0 = first; q0 < p.cells; q0 += B) {
+                barrier();
+                PLACE(B0, s, q0, queries_of, ra)
+                PLACE(B1, s, q0, grads_of, rb)
+                for (uint e = tid; e < B; e += THREADS) {
+                    const bool live = q0 + e < p.cells;
+                    L[e] = live ? p.stats.v[sa + q0 + e] : 0.0;
+                    DL[e] = live ? p.stats.v[rows + sa + q0 + e] : 0.0;
+                }
+                barrier();
+                if (vec && q0 + B < p.cells) {
+                    fetch(tid, s, q0 + B, queries_of, ra);
+                    fetch(tid, s, q0 + B, grads_of, rb);
+                }
+                float st[RM][CN], dpt[RM][CN];
+                [[unroll]] for (uint m = 0u; m < RM; m++)
+                    [[unroll]] for (uint n = 0u; n < CN; n++) {
+                        st[m][n] = 0.0;
+                        dpt[m][n] = 0.0;
+                    }
+                scores(false, ry, tx, st);
+                scores(true, ry, tx, dpt);
+                /* P^T = exp(S^T - lse[query]) into the row group's probabilities; dS^T = P^T (dP^T - delta[query]) */
+                [[unroll]] for (uint m = 0u; m < RM; m++) {
+                    const uint key = j0 + ry * RM + m;
+                    [[unroll]] for (uint n = 0u; n < CN; n++) {
+                        const uint qc = tx + TX * n, query = q0 + qc, at = (ry * RM + m) * SP + qc;
+                        const bool valid = query < p.cells && key < p.cells && (!causal || key <= query);
+                        const float pv = valid ? exp(st[m][n] - L[qc]) : 0.0;
+                        P[at / 4u][at % 4u] = pv;
+                        st[m][n] = pv * (dpt[m][n] - DL[qc]);
+                    }
+                }
+                group_sync();
+                accumulate(true, ry, tx, dv);
+                group_sync();
+                [[unroll]] for (uint m = 0u; m < RM; m++)
+                    [[unroll]] for (uint n = 0u; n < CN; n++) {
+                        const uint at = (ry * RM + m) * SP + tx + TX * n;
+                        P[at / 4u][at % 4u] = st[m][n];
+                    }
+                group_sync();
+                accumulate(false, ry, tx, dk);
+            }
+        }
+        /* dV as it is; dK (of scaled queries) rotated back through shared memory */
+        barrier();
+        [[unroll]] for (uint m = 0u; m < RM; m++)
+            [[unroll]] for (uint k = 0u; k < CH; k++) {
+                A0[(ry * RM + m) * SQ + tx + TX * k] = dk[m][k];
+                A1[(ry * RM + m) * SQ + tx + TX * k] = dv[m][k];
+            }
+        barrier();
+        for (uint e = tid; e < R * D; e += THREADS) {
+            const uint row = e / D, c = e % D, j = j0 + row;
+            if (j >= p.cells || c >= d) continue;
+            const uint at = (s * p.cells + j) * C;
+            p.dx.v[at + (p.heads + kh) * d + c] = unrotated(false, row, j, c);
+            p.dx.v[at + (p.heads + p.kv + kh) * d + c] = A1[row * SQ + c / 4u][c % 4u];
+        }
+    }
+}

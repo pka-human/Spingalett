@@ -476,7 +476,7 @@ static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t coun
     VkComputePipelineCreateInfo cci = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL,
-                  (kernel == SPG_KERNEL_gemm_mma || kernel == SPG_KERNEL_flash) && gpu.full_subgroups
+                  (kernel == SPG_KERNEL_gemm_mma || kernel == SPG_KERNEL_flash || kernel == SPG_KERNEL_rattn) && gpu.full_subgroups
                       ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT : 0u,
                   VK_SHADER_STAGE_COMPUTE_BIT, module, "main", count ? &si : NULL},
         .layout = gpu.layout,

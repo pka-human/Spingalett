@@ -1584,6 +1584,22 @@ static void attn_tiles(uint32_t head, uint32_t op, uint32_t *dmax, uint32_t *bq,
     *threads = *dmax == 32u ? 128u : *dmax == 256u ? 16u : 64u;
 }
 
+/* Whether Vulkan's rattn.comp runs pass op for heads of `head` values: subgroups of 8 lanes or more (its row groups'
+   lanes), the shared memory of its tiles (rows of D + 4 floats: R of the workgroup's side twice, B of the other's
+   twice, R rows of B + 4 probabilities; as rattn.comp declares them). */
+static bool rattn_fits(uint32_t head, uint32_t op) {
+    const uint32_t sg = spg_gpu_subgroup_size();
+    if (spg_gpu_using() != SPG_BACKEND_VULKAN || head > 128u || sg < 8u || (sg & (sg - 1u)) ||
+        !spg_gpu_kernel_built(SPG_KERNEL_rattn))
+        return false;
+    const uint32_t D = head <= 32u ? 32u : head <= 64u ? 64u : 128u, R = SPG_RATTN_ROWS(D, op);
+    const uint32_t B = op == SPG_ATTN_FORWARD ? (D <= 32u ? 64u : D <= 64u ? 32u : 16u) : (D <= 32u ? 32u : D <= 64u ? 16u : 8u);
+    const bool kvs = op == SPG_ATTN_FORWARD && D > 64u;
+    const uint32_t floats = R * (D + 4u) + (op == SPG_ATTN_FORWARD ? 4u : R * (D + 4u)) + B * (D + 4u) +
+                            (kvs ? 4u : B * (D + 4u)) + R * (B + 4u) + (op == SPG_ATTN_DKV ? 2u * B : 2u);
+    return 4u * floats <= spg_gpu_shared_memory();
+}
+
 /* The sliding window of attention layer s, 0 when it holds every key (a window of the cells or more). */
 static uint32_t attn_window(const LayerShape *s) {
     return s->window < s->height * s->width ? s->window : 0u;
@@ -1647,6 +1663,16 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
         const uint32_t fspec[7] = {op, head, warps, bt, sg, mask, warps * sg};
         need(r, a);
         spg_gpu_dispatch(r->c, SPG_KERNEL_flash, fspec, 7, &p, sizeof p, (cells + 16u * warps - 1u) / (16u * warps),
+                         op == SPG_ATTN_DKV ? s->kv_heads : s->heads, n);
+        return;
+    }
+    /* networks in single precision on Vulkan, heads of up to 128: rattn.comp's register tiles where the device has
+       subgroups of 8 or more and room for them (attn.comp otherwise, and for PRE, padding, windows, cross-attention) */
+    if (!g->bf16 && !ext && op != SPG_ATTN_PRE && rattn_fits(head, op)) {
+        const uint32_t D = head <= 32u ? 32u : head <= 64u ? 64u : 128u, rows = SPG_RATTN_ROWS(D, op);
+        const uint32_t rspec[3] = {op, D, SPG_RATTN_THREADS(D, op)};
+        need(r, a);
+        spg_gpu_dispatch(r->c, SPG_KERNEL_rattn, rspec, 3, &p, sizeof p, (cells + rows - 1u) / rows,
                          op == SPG_ATTN_DKV ? s->kv_heads : s->heads, n);
         return;
     }
