@@ -76,7 +76,9 @@ KERNEL(attn_cache, SpgCachePush) {
     const uint32_t per = (d + 31u) / 32u;   /* channels a lane: c = lane + 32 j < d (heads of up to 128) */
     float m = -3.402823466e38f, l = 0.0f, o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const uint64_t base = (uint64_t)seq * p.length * p.kv * d;
-    for (uint32_t t0 = 32u * w; t0 <= pos; t0 += 32u * WARPS) {
+    /* (with a sliding window, its last positions only) */
+    const uint32_t first = p.window != 0u && pos + 1u > p.window ? pos + 1u - p.window : 0u;
+    for (uint32_t t0 = first + 32u * w; t0 <= pos; t0 += 32u * WARPS) {
         const uint32_t t = t0 + lane;
         float s = -3.402823466e38f;
         if (t <= pos) {

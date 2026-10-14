@@ -43,7 +43,7 @@ layout(push_constant) uniform Push {
     F32 table;
     uint n, heads, kv, d, span, sequences, flags, cells;
     float scale;
-    uint pad;
+    uint window;
 } p;
 
 #include "half.glsl"
@@ -105,7 +105,9 @@ void main() {
     float m = -3.402823466e38, l = 0.0;
     float o[DMAX / 64u];                    /* channels tid, tid + THREADS, ... (THREADS >= 64) */
     for (uint j = 0u; j < DMAX / 64u; j++) o[j] = 0.0;
-    for (uint t0 = 0u; t0 <= pos; t0 += TILE) {
+    /* (with a sliding window, its last positions only) */
+    const uint first = p.window != 0u && pos + 1u > p.window ? pos + 1u - p.window : 0u;
+    for (uint t0 = first; t0 <= pos; t0 += TILE) {
         const uint count = min(TILE, pos + 1u - t0);
         float best = -3.402823466e38;
         for (uint t = tid; t < count; t += THREADS) {

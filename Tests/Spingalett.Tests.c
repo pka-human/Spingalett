@@ -7110,8 +7110,9 @@ static void gpu_cross(uint32_t head, uint32_t kv, bool padding) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
 }
 
-/* A session of a model with sliding windows under a GPU's compute mode runs on the CPU (the GPU's decoder attends
-   over every key it keeps): the logits of the CPU's session bit for bit. */
+/* A session of a model with sliding windows on the GPU attends over the last keys of its cache as the CPU's does:
+   the CPU's logits to single precision's rounding (not its bits: the GPU ran), and the same bits fed a token at a
+   time as fed at once. */
 static void gpu_session_window(void) {
     const uint32_t T = 12, V = 29;
     lcg_state = 4321;
@@ -7120,18 +7121,27 @@ static void gpu_session_window(void) {
     SpingalettModel *m = spingalett_model_from_network(net, PRECISION_FLOAT32);
     uint32_t tok[12];
     for (uint32_t i = 0; i < T; i++) tok[i] = (i * 5u + 2u) % V;
-    float logits[2][12 * 29];
+    float logits[3][12 * 29];
     bool ok = m != NULL;
-    for (int k = 0; k < 2 && ok; k++) {
+    for (int k = 0; k < 3 && ok; k++) {
         spingalett_set_compute_mode(k ? gpu_mode : COMPUTE_SINGLE_THREADED);
         SpingalettSession *s = spingalett_session_new(m, NULL);
-        ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = T, .logits = logits[k],
-                                                                      .all = true}, 1);
+        if (k < 2) {
+            ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = T,
+                                                                          .logits = logits[k], .all = true}, 1);
+        } else {
+            for (uint32_t i = 0; i < T && ok; i++)
+                ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + i, .count = 1,
+                                                                              .logits = logits[2] + i * V}, 1);
+        }
         spingalett_session_free(s);
     }
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
-    CHECK(ok && !memcmp(logits[0], logits[1], sizeof logits[0]), "gpu session of sliding windows: other logits");
-    printf("  gpu session of sliding windows: the CPU's logits\n");
+    const double worst = ok ? gpu_max_scaled(logits[0], logits[1], (size_t)T * V) : 1.0;
+    CHECK(ok && worst > 0.0 && worst < 1e-5, "gpu session of sliding windows: %.2e from the CPU's logits", worst);
+    CHECK(ok && !memcmp(logits[1], logits[2], sizeof logits[1]), "gpu session of sliding windows: fed a token at a time, "
+          "other bits");
+    printf("  gpu session of sliding windows: %.1e from the CPU's logits, a token at a time the same bits\n", worst);
     spingalett_model_free(m);
     free_network(net);
 }

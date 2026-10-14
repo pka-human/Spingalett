@@ -38,7 +38,8 @@ All notable changes to this project are documented in this file. The format foll
   the keys less than `window` cells away, with `.causal` the cell and the `window - 1` before it, without
   the `window - 1` on either side, on the CPU, both GPU backends, the engine and deployment models. The CPU
   and the GPU's kernels of single precision skip the blocks of keys outside every query's window (in
-  bfloat16 on CUDA such layers run on those kernels, not `flash.cu`); `.slett` format 9 stores the window in
+  bfloat16 on CUDA such layers run on those kernels, not `flash.cu`), and sessions on the GPU attend over
+  the last `window` keys of their cache (`attn_cache`); `.slett` format 9 stores the window in
   the attention's momentum field. `SpingalettNetworkLayer.window`, `SpingalettLayerInfo.window`; Python
   `add_attention(..., window=w)`, the C++ builder's and the other bindings' options.
 - **Sequences of different lengths in one batch** (`SpingalettLayerArgs.ignore_padding` on attention): the

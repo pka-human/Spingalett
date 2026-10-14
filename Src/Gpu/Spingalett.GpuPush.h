@@ -161,12 +161,13 @@ enum { SPG_ATTN_FORWARD, SPG_ATTN_PRE, SPG_ATTN_DQ, SPG_ATTN_DKV };
     ((op) == SPG_ATTN_PRE ? 256u : (d) > 64u && (op) != SPG_ATTN_FORWARD ? 64u : 128u)
 
 /* attn_cache.comp: attention of rows (tokens of sequences at positions: rows[2r], rows[2r + 1]) over a cache of
-   keys then values ([sequences][length][kv][d] each) */
+   keys then values ([sequences][length][kv][d] each); with a sliding window, over the last `window` positions up to
+   a row's own (0: all of them) */
 typedef struct {
     uint64_t x, y, cache, rows, table;
     uint32_t n, heads, kv, d, length, sequences, flags, cells;
     float scale;
-    uint32_t pad;
+    uint32_t window;
 } SpgCachePush;
 enum { SPG_CACHE_APPEND, SPG_CACHE_ATTEND };
 #define SPG_CACHE_THREADS 64u       /* Vulkan's workgroups of ATTEND (a row and head); CUDA's: a warp a row and head */

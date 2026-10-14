@@ -3095,7 +3095,8 @@ bool spingalett_gpu_pass_step(SpgGpuNet *g, const SpgGpuTraining *cfg, const Spg
  * (at the rows' positions), then layers that treat each token alone — products of pointwise layers, layer and
  * RMS normalizations, additions, products and concatenations of layers — and causal attention, which appends
  * the rows' keys (rotated) and values to its cache of every sequence's positions and attends over the
- * positions up to each row's (attn_cache.comp). The commands of a number of rows are recorded once and kept.
+ * positions up to each row's, with a sliding window the last of them (attn_cache.comp). The commands of a number of
+ * rows are recorded once and kept.
  */
 #define DECODE_KEPT 8u
 
@@ -3145,7 +3146,6 @@ static bool decodes(const NeuralNetwork *net, uint32_t l, uint32_t cells, const 
             return true;
         case LAYER_ATTENTION:
             if (!s->causal) return *why = "attention that is not causal", false;
-            if (s->window && s->window < cells) return *why = "attention of a sliding window", false;
             if (s->channels / s->heads > (spg_gpu_using() == SPG_BACKEND_CUDA ? 128u : 256u) ||
                 (s->channels / s->heads) % 2u)
                 return *why = "attention heads of over 128 values (Vulkan: 256), or of an odd number", false;
@@ -3275,7 +3275,8 @@ static void record_decode(SpgGpuDecoder *d, Recorder *r, uint32_t rows) {
                               .table = g->geo[l].buffer ? g->geo[l].address : g->act[src].address, .n = rows,
                               .heads = s->heads, .kv = s->kv_heads, .d = head, .length = d->length,
                               .sequences = d->sequences, .flags = g->geo[l].buffer ? SPG_ATTN_ROPE : 0u,
-                              .cells = s->height * s->width, .scale = 1.0f / sqrtf((float)head)};
+                              .cells = s->height * s->width, .scale = 1.0f / sqrtf((float)head),
+                              .window = attn_window(s)};
             const uint32_t half = (in_half(g, p.x) ? 1u : 0u) | (in_half(g, p.y) ? 2u : 0u) | (d->half[l] ? 4u : 0u);
             const SpgKernel k = half ? SPG_KERNEL_attn_cache_h : SPG_KERNEL_attn_cache;
             Access a = {0};
