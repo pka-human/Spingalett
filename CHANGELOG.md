@@ -215,56 +215,6 @@ All notable changes to this project are documented in this file. The format foll
   2,053) and 932 -> 1,365 on Vulkan (INT4 1,326). Tests (gpu and cuda groups): GPT- and LLaMA-like models
   and one of 66 channels in INT8, INT4 and INT2 against their weights as floats and the CPU's integer
   session, a prompt the bits of its tokens one at a time and of two sequences fed together.
-
-### Changed
-- **Attention in single precision on Vulkan in register tiles** (`rattn.comp`, as CUDA's `rattn.cu` computes it):
-  a workgroup of 64 queries (keys in the keys' gradient pass), each invocation four of them and a share of a tile
-  of keys, the scores and sums in registers, a row's maximum and sum combined over its eight lanes by subgroup
-  shuffles in a fixed pattern (the same bits on every run), the next tile loaded while one is used; for heads of
-  up to 128 values where the device has subgroups of 8 lanes or more and up to 48 KB of shared memory (the
-  others, and layers with padding, windows or cross-attention, run on `attn.comp` as before). On an RTX 4050
-  Laptop GPU the GPT of `Examples/Benchmark.c` in single precision on Vulkan trains 70,967 tokens a second
-  instead of 40,085 and infers 226,062 instead of 143,567 (CUDA: 74,821 and 235,811), medians of three runs
-  from a GPU at 60 C.
-- **Flash attention on Vulkan**: networks in bfloat16 run attention's forward pass and its gradients on the
-  matrix units (`flash.comp`: cooperative matrices of bfloat16, `VK_KHR_cooperative_matrix`, as CUDA's
-  `flash.cu` does with `mma.sync`) for heads of 32, 64 and 128, causal or not, rotary, grouped: a subgroup
-  takes 16 queries (keys for the keys' and values' gradients), the scores pass through shared memory for the
-  softmax, whose row maxima and sums each row's invocations combine in a fixed pattern (the same bits on
-  every run). Devices without bfloat16 cooperative matrices or the room in shared memory, and builds whose
-  glslc lacks `GL_EXT_bfloat16`, run `attn.comp` as before. On an RTX 4050 Laptop GPU the passes of
-  `Examples/Benchmark.c`'s GPT (chunks of 16 sequences of 256 tokens, 6 heads of 64) take 0.11, 0.13 and
-  0.18 ms instead of 2.2, 3.9 and 3.9 ms (CUDA's `flash.cu`: 0.11, 0.12, 0.18), and the GPT in bfloat16 on
-  Vulkan trains 179,000 tokens a second instead of 53,800 (3.3 times) and infers 572,000 instead of 225,000
-  (2.5 times). `SpingalettGpuTests` compares the two ways on the same inputs (`bench attn` times them).
-- Training on Vulkan applies GELU and SiLU in the products' epilogues, which store the values before the
-  activation for its derivative too (`SPG_GEMM_PRE`, as CUDA's products do, in pipelines of their own so
-  that the other products' code stays as it was), rather than the product writing those and an
-  element-wise pass the activation: the GPT of `Examples/Benchmark.c` trains 1.01 times as fast on an RTX
-  4050 Laptop GPU, in bfloat16 and in single precision.
-- `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single
-  precision in a session (kept in the network until its parameters or layers change): the prompt fed
-  at once, then each token once; once the tokens fill the window, the window of the last tokens is fed
-  again from its first position, as the prediction over the window does, so the tokens are those of
-  1.2 (the logits equal the network's prediction to rounding, within 1e-6 relative in the tests). On an
-  Intel Core i7-12650H the CharGPT model (256 wide, 4 blocks, a window of 128) generates 3230 tokens a
-  second on one thread, 44 times 1.2's 72.7, and 3568 on six threads (121 in 1.2); a call generating
-  one token takes 1.8 ms instead of 11.7. Other networks and the GPU modes predict over the window as
-  before.
-
-### Fixed
-- `spingalett_device_data_new()` in the CPU's compute modes made sets only in Vulkan's memory, so that a
-  library built without Vulkan, or a machine without a Vulkan device, made none; it now takes CUDA's
-  there. The `cuda` group's tests asked the compute mode's GPU, not CUDA, whether it multiplies in
-  bfloat16, and when told no left that precision set: in a build without Vulkan the later tests ran in
-  bfloat16 and failed (20 checks).
-- Integer deployment models of language models (INT8, INT4, INT2; in the engine, batched and in the
-  runtime) quantized the input of each linear layer with one scale for the whole sequence, so that a
-  later token changed the logits of the earlier ones of a causal model. In a model whose first layer is
-  an embedding, integer convolutions of 1 x 1 windows, stride 1, no padding and one group now quantize
-  each token's channels with a scale of their own (`docs/ModelFormat.md`); their results differ from
-  1.2's within the quantization's error. Tests: `transformer` (later tokens leave earlier logits
-  unchanged, bit for bit, batched and in single runs).
 - **Tokenizers** of language models in C: `spingalett_tokenizer_load()` reads a Hugging Face
   `tokenizer.json` (or a model directory, whose `tokenizer_config.json` names BOS and EOS),
   `spingalett_tokenize()` encodes UTF-8 text and `spingalett_detokenize()` decodes ids, with
@@ -317,6 +267,76 @@ All notable changes to this project are documented in this file. The format foll
 - `Examples/Pretrained.c`: a Hugging Face or GGUF language model continuing a prompt, printing each
   token as it comes.
 - An internal JSON reader (`Src/Spingalett.Json.c`) for the files of language models.
+
+### Changed
+- **The GPT in bfloat16 on CUDA ahead of `torch.compile`**: products of dense layers whose operands are kept
+  as bfloat16 on tiles of 128 x 128 outputs over four warps of 64 x 64 (`gemm_pipe.cu`: three steps of k in
+  shared memory copied two steps ahead, chunks of 16 bytes XOR-swizzled within their rows, fragments a step
+  ahead, the epilogue from the registers, eight consecutive outputs a thread stored in 16 bytes; each
+  epilogue a loop of its own), adding in the order of k over the same steps as the other tiles, so that every
+  tile still gives the same bits; flash attention's forward pass with two tiles of queries a warp, its rows
+  loaded and stored 16 bytes at a time; GELU's erf through the approximate reciprocal; training and inference
+  chunks whose largest layer keeps to the GPU's cache (2^24 values: the GPT in chunks of 16 sequences in
+  training, 32 in inference). On an RTX 4050 Laptop GPU the GPT of `Examples/Benchmark.c` in bfloat16 trains
+  200,800 tokens a second instead of 1.2's 180,900 and infers 675,900 instead of 583,800, against
+  `torch.compile` with `max-autotune`'s 192,600 and 654,300 (medians of three runs from a GPU at 60 C).
+- **Transformers' training on the CPU** (the roadmap's step 2 of 1.3): element-wise passes over a chunk in
+  pieces of 8,192 values rather than a sample at a time, GELU, its tanh form and SiLU in vectors while training
+  (erf as the GPU computes it; inference keeps libm's), the indirect products' weights packed on the threads,
+  network chunks of sequences grown to products of 2,048 rows, attention's softmax exponentials in vectors,
+  linear layers' weight gradients on the dense products in slots of 2,048 tokens summed in their order
+  (`SpingalettGemmHooks.tall`), and large tiles of the indirect products handed out one at a time; every
+  change keeps the bits the same on any number of threads. On an Intel Core i7-12650H the GPT of
+  `Examples/Benchmark.c` trains 1,602 tokens a second on one thread (1.2: 1,120) and 6,675 on six (1.2:
+  about 2,550), against PyTorch 2.14.1's 1,541 and 6,000 in interleaved runs; inference on six threads 18,100.
+- **Attention in single precision on Vulkan in register tiles** (`rattn.comp`, as CUDA's `rattn.cu` computes it):
+  a workgroup of 64 queries (keys in the keys' gradient pass), each invocation four of them and a share of a tile
+  of keys, the scores and sums in registers, a row's maximum and sum combined over its eight lanes by subgroup
+  shuffles in a fixed pattern (the same bits on every run), the next tile loaded while one is used; for heads of
+  up to 128 values where the device has subgroups of 8 lanes or more and up to 48 KB of shared memory (the
+  others, and layers with padding, windows or cross-attention, run on `attn.comp` as before). On an RTX 4050
+  Laptop GPU the GPT of `Examples/Benchmark.c` in single precision on Vulkan trains 70,967 tokens a second
+  instead of 40,085 and infers 226,062 instead of 143,567 (CUDA: 74,821 and 235,811), medians of three runs
+  from a GPU at 60 C.
+- **Flash attention on Vulkan**: networks in bfloat16 run attention's forward pass and its gradients on the
+  matrix units (`flash.comp`: cooperative matrices of bfloat16, `VK_KHR_cooperative_matrix`, as CUDA's
+  `flash.cu` does with `mma.sync`) for heads of 32, 64 and 128, causal or not, rotary, grouped: a subgroup
+  takes 16 queries (keys for the keys' and values' gradients), the scores pass through shared memory for the
+  softmax, whose row maxima and sums each row's invocations combine in a fixed pattern (the same bits on
+  every run). Devices without bfloat16 cooperative matrices or the room in shared memory, and builds whose
+  glslc lacks `GL_EXT_bfloat16`, run `attn.comp` as before. On an RTX 4050 Laptop GPU the passes of
+  `Examples/Benchmark.c`'s GPT (chunks of 16 sequences of 256 tokens, 6 heads of 64) take 0.11, 0.13 and
+  0.18 ms instead of 2.2, 3.9 and 3.9 ms (CUDA's `flash.cu`: 0.11, 0.12, 0.18), and the GPT in bfloat16 on
+  Vulkan trains 179,000 tokens a second instead of 53,800 (3.3 times) and infers 572,000 instead of 225,000
+  (2.5 times). `SpingalettGpuTests` compares the two ways on the same inputs (`bench attn` times them).
+- Training on Vulkan applies GELU and SiLU in the products' epilogues, which store the values before the
+  activation for its derivative too (`SPG_GEMM_PRE`, as CUDA's products do, in pipelines of their own so
+  that the other products' code stays as it was), rather than the product writing those and an
+  element-wise pass the activation: the GPT of `Examples/Benchmark.c` trains 1.01 times as fast on an RTX
+  4050 Laptop GPU, in bfloat16 and in single precision.
+- `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single
+  precision in a session (kept in the network until its parameters or layers change): the prompt fed
+  at once, then each token once; once the tokens fill the window, the window of the last tokens is fed
+  again from its first position, as the prediction over the window does, so the tokens are those of
+  1.2 (the logits equal the network's prediction to rounding, within 1e-6 relative in the tests). On an
+  Intel Core i7-12650H the CharGPT model (256 wide, 4 blocks, a window of 128) generates 3230 tokens a
+  second on one thread, 44 times 1.2's 72.7, and 3568 on six threads (121 in 1.2); a call generating
+  one token takes 1.8 ms instead of 11.7. Other networks and the GPU modes predict over the window as
+  before.
+
+### Fixed
+- `spingalett_device_data_new()` in the CPU's compute modes made sets only in Vulkan's memory, so that a
+  library built without Vulkan, or a machine without a Vulkan device, made none; it now takes CUDA's
+  there. The `cuda` group's tests asked the compute mode's GPU, not CUDA, whether it multiplies in
+  bfloat16, and when told no left that precision set: in a build without Vulkan the later tests ran in
+  bfloat16 and failed (20 checks).
+- Integer deployment models of language models (INT8, INT4, INT2; in the engine, batched and in the
+  runtime) quantized the input of each linear layer with one scale for the whole sequence, so that a
+  later token changed the logits of the earlier ones of a causal model. In a model whose first layer is
+  an embedding, integer convolutions of 1 x 1 windows, stride 1, no padding and one group now quantize
+  each token's channels with a scale of their own (`docs/ModelFormat.md`); their results differ from
+  1.2's within the quantization's error. Tests: `transformer` (later tokens leave earlier logits
+  unchanged, bit for bit, batched and in single runs).
 
 ## [1.2.0] - 2026-10-11
 

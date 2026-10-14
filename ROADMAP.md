@@ -24,103 +24,7 @@ against PyTorch on the same machine.
 | 1.0 | "Stability": the API, ABI and formats of 0.14 kept by semantic versioning (symbol versions, the `api.abi` test against the last release), the names of 0.x only on request, pkg-config, Conan and vcpkg recipes |
 | 1.1 | "CUDA": a backend for NVIDIA GPUs on the library's own kernels (PTX compiled by Clang, no CUDA toolkit, cuBLAS or cuDNN), ahead of PyTorch with cuDNN by 1.2 to 7.7 times in every workload and of the Vulkan backend; batch normalizations in their product's epilogue at inference on both backends; the runtime library for programs that only run models. Why not cuDNN and cuBLAS: half a gigabyte to a gigabyte of libraries for each CUDA version, backward algorithms that add through atomics (runs would no longer repeat their bits), and the library measures its own kernels rather than wrapping others'; they remain what the backend is measured against |
 | 1.2 | "Transformers": embeddings, multi-head attention (grouped-query, causal, rotary), RMS normalization, products of layers, GELU and SiLU, the sparse cross-entropy, `.slett` format 8, in training on the CPU and both GPU backends, the engine, deployment models and the runtime; token files, text generation, GPT-2 and LLaMA checkpoints in Python, a character-level GPT example; on CUDA flash attention on the tensor cores, register-tiled attention in single precision, GELU and SiLU in the products' epilogues, the weights' bfloat16 copy for sequences and images, block order kept in L2: ahead of PyTorch at its fastest (`torch.compile` with `max-autotune`) in every workload but the GPT in bfloat16 (0.91 times in training); bindings for Rust, .NET, Go and Java; Debian and RPM packages, AUR, Homebrew, Scoop, Nix, a container image, conda |
-
-## 1.3: language models in production
-
-What a model needs after training: running it fast for many tokens, from the formats people have
-weights in.
-
-- **Inference with a key-value cache:** generation that computes each new token once (the keys and
-  values of the tokens before kept per layer), on the CPU (deployment models: `spingalett_model_*`
-  gains a session for a sequence) and on the GPU; batched generation of several sequences.
-- **Deployment models on the GPU**: `spingalett_model_predict()` with FP16, BF16 and INT8 weights
-  (exact against the CPU where the sums are integers), and weight-only INT4 and INT8 matrix kernels
-  for language models (the weights read once per token, dequantized in registers).
-- **Tokenizers**: byte-level BPE (GPT-2, tiktoken's encodings) and SentencePiece-style models from
-  `tokenizer.json`, encoding and decoding in C, with the special tokens of chat formats.
-- **Weights from the formats they come in**: Hugging Face checkpoints of LLaMA, Mistral, Qwen and
-  GPT-2 by their names (safetensors, sharded) in C and the other bindings (1.2 has them in Python),
-  and GGUF files.
-- **Ahead of PyTorch where 1.2 is not** (below): the GPT in bfloat16 on CUDA, transformers'
-  training on the CPU, and transformers on the Vulkan backend.
-- **Training features of language models**: tied input and output embeddings, activation
-  recomputation (checkpointing) to fit longer contexts, gradient accumulation and learning-rate
-  schedules by step in `spingalett_train()`, sequences of different lengths in one batch, sliding
-  window attention, cross-attention (encoder-decoder models), and FP16 products with loss scaling.
-- **ONNX import of transformers**: products of two activations, softmax over an axis, Gather,
-  layer normalization over sequences, attention patterns folded into the attention layer.
-- **A WebAssembly build of the engine** and a JavaScript package around it (npm), for models that
-  run in browsers.
-- **Bindings for PHP** (`Bindings/PHP`): PHP's FFI extension (PHP 8.0 and later) over the shared
-  library, as the bindings of 1.2 are: the C declarations of the `*_args` functions and structures
-  in a header FFI loads (`FFI::load()`, no macros), classes for networks, layers, training on arrays
-  and token files, prediction, evaluation, generation, parameters, files and deployment models, PHP
-  arrays copied into the library's floats once per call; a Composer package; tests of XOR, a
-  LLaMA-like model's generation and every structure's layout against `SpingalettLayout`, run by CI's
-  `bindings` job against the installed library.
-
-### Where PyTorch is faster (measured with 1.2)
-
-On the laptop of the README (i7-12650H, RTX 4050 Laptop GPU), against PyTorch 2.14.1, Spingalett 1.2
-is ahead of PyTorch at its fastest in every workload on CUDA but the GPT in bfloat16, and behind in
-two other places. What the profiles show, why, and what 1.3 does about it:
-
-1. **The GPT in bfloat16 on CUDA**: training at 0.91 times `torch.compile` with `max-autotune`,
-   inference at 0.88 times (1.06 times as fast as PyTorch without compilation, both). Of a
-   training run's GPU time (`SPINGALETT_GPU_PROFILE=1`), the matrix products take 62%, flash
-   attention 17%, and element-wise passes 19% (layer normalization, residual additions, the column
-   sums of bias gradients, the optimizer).
-   - *Products*: 15 to 17 TFLOPS in the forward pass and data gradients where cuBLAS reaches 22 to
-     23. The tuner picks tiles of 64 x 64 for every large product of the GPT, because 1.2's larger
-     tiles (128 x 128, 128 x 256: no spills) do not outrun them: two stages of asynchronous copies,
-     operands padded in shared memory rather than swizzled (three and four stages, 64 x 64 warp tiles
-     and k of 64 all measured slower in that layout), and results going through shared memory to the
-     stores.
-     Fix: a new `gemm_mma.cu` with tiles of 128 x 128 and 128 x 256 over 64 x 64 warp tiles, three or
-     four stages in XOR-swizzled shared memory, `ldmatrix` fragments loaded a step ahead, results
-     stored from registers; the products still add in the order of k, so tiles stay bit-identical.
-   - *Attention*: about 8 TFLOPS. A warp of `flash.cu` takes 16 queries, so each fragment of keys
-     and values it reads from shared memory serves one tile of the matrix units (FlashAttention-2
-     gives a warp 32); the tiles of keys and values reach shared memory through registers rather
-     than by asynchronous copies; and the backward pass computes dQ and dK, dV in two passes that
-     both compute the scores again (deterministic, without atomics). Fix: 32 queries a warp,
-     asynchronous copies of the next tile, and dQ summed per tile of keys into fixed slots and added
-     in their order, so that one backward pass computes the scores once.
-   - *Element-wise passes* that `torch.compile` fuses: the residual addition in the epilogue of the
-     projection before it, the addition and the layer normalization after it in one pass, bias
-     gradients summed in the data gradient's epilogue, one launch for every tensor's optimizer step.
-   Target: training and inference ahead of `torch.compile`.
-2. **Transformers' training on the CPU**: the GPT trains at 0.79 times PyTorch's speed on one thread
-   (1,229 tokens per second against 1,559, epochs after the first) and at 0.36 times on six threads
-   (2,548 against 7,152): Spingalett's training scales 1.44 times on two threads and 2.07 times on
-   six, PyTorch's 4.6 times, and eight threads (with efficiency cores) run slower than six for both.
-   Its inference, the forward pass alone, scales 3.2 times on six threads and is 5.5 to 6.3 times as
-   fast as PyTorch's. Of the CPU time (`gprofng`, eight threads), the products take 78%: the forward
-   pass and data gradients 48% in the convolutions' indirect kernel, the weight gradients 30% in
-   their own kernel; GELU's `erff` from libm 5%.
-   - *Linear layers are 1 x 1 convolutions* and go through the convolution kernels (a pointer per
-     tap, weight gradients summed over slots of pixels), not the packed kernels of dense layers. Fix:
-     linear layers on the dense products, the weight gradient as dY^T X over the batch's tokens in
-     chunks fixed by the shape.
-   - *About two fifths of a step do not run in parallel* (by the speed-up on two threads), mostly
-     in the backward pass and the optimizer's step (the forward pass alone scales 3.2 times). Fix:
-     time a step by phase and spread what runs on one thread over chunks fixed by the shape, summed
-     in a fixed order (the same bits on any number of threads).
-   - *Static schedules* give efficiency cores the share of performance cores. Fix: chunks fixed by
-     the shape handed out dynamically (results unchanged), so that eight threads beat six.
-   - *GELU through scalar `erff`*. Fix: a vector erf (the GPU's polynomial) in the kernels'
-     epilogues.
-   Target: ahead of PyTorch at every thread count, as the convolutional networks are.
-3. **Transformers on the Vulkan backend**: on the same GPU against PyTorch with CUDA, the GPT trains
-   at 0.54 times and infers at 0.63 times in single precision, 0.29 and 0.34 times in bfloat16; and
-   ResNet-20 and the U-Net train in bfloat16 at 0.89 and 0.87 times `torch.compile` (on CUDA 1.1 and
-   1.02 times). Vulkan's attention runs in single-precision tiles without the matrix units (flash
-   attention is CUDA's), GELU and SiLU take a pass of their own after the products, and its products
-   on cooperative matrices are slower than CUDA's (ResNet-20's bfloat16 training 18,400 samples per
-   second against 22,700). Fix: flash attention on `VK_KHR_cooperative_matrix` in bfloat16, GELU and
-   SiLU in `gemm.comp`'s epilogue, the bands of blocks and the new tiles of step 1 in `gemm.comp`.
-   Target: Vulkan within 10% of CUDA on NVIDIA GPUs, and measured against PyTorch on AMD and Intel
-   GPUs, where it has no CUDA.
+| 1.3 | "Language models in production": sessions with a key-value cache on the CPU and both GPU backends (batched generation, sliding windows), deployment models predicting on the GPU (integer ones to the CPU's bits) and weight-only INT8, INT4 and INT2 decoding, tokenizers and Hugging Face and GGUF checkpoints in C and every binding, tied embeddings, activation recomputation, gradient accumulation, schedules by step, padding, sliding windows and cross-attention in training, ONNX import of transformers, the engine in WebAssembly (npm), PHP bindings; ahead of PyTorch where 1.2 was not: the GPT in bfloat16 on CUDA ahead of `torch.compile` (1.04 times in training, 1.03 in inference), transformers' training on the CPU (linear layers' weight gradients on the dense products in slots of tokens, GELU and SiLU in vectors, element-wise passes in pieces), and on Vulkan flash attention on cooperative matrices and register-tiled attention in single precision (the GPT 3.1 times as fast in bfloat16, 1.8 times in single precision, there within 5% of CUDA) |
 
 ## 1.4: scale
 
@@ -138,6 +42,12 @@ Models that do not fit one GPU's memory or time.
 - **Mixture of experts**: a layer of expert networks with a learned router (top-k gating, the
   experts' products batched by expert, the load-balancing loss), for the sparse models that reach
   large parameter counts at a dense model's cost per token.
+- **FP16 products with loss scaling** (planned for 1.3, moved): products on the matrix units with FP16
+  operands for GPUs whose matrix units take FP16 but not bfloat16 (NVIDIA's Turing generation, Vulkan
+  devices with FP16 cooperative matrices only), the loss scaled and the scale lowered on steps whose
+  gradients overflow, deterministically. 1.3 left it for the multi-GPU work: bfloat16 runs on every
+  GPU the CUDA backend takes (Ampere and later) and needs no scaling, and the kernels' variants would
+  double the matrix units' units.
 
 ## 1.5: Arm, Apple and the edge
 
@@ -234,12 +144,20 @@ coefficients computed once until the parameters change, and three chunks in flig
 kernel of its own for a first layer's few channels (part of 3). Done in 1.2 (CUDA): the weights'
 bfloat16 copy wherever products take 256 rows of a layer (sequences and images, not only batches of
 256 samples: ResNet-20 and the U-Net infer 1.1 to 1.14 times as fast in bfloat16), blocks of a
-product in bands that keep their rows of A in L2, GELU's and SiLU's epilogues in the products. The
-next steps, each measured against the release before and against PyTorch:
+product in bands that keep their rows of A in L2, GELU's and SiLU's epilogues in the products. Done in
+1.3: on CUDA the matrix units' products in tiles of 128 x 128 over three stages of asynchronous copies
+(`gemm_pipe.cu`) and flash attention's forward pass of 32 queries a warp; on Vulkan flash attention on
+cooperative matrices, attention in register tiles in single precision and GELU and SiLU in the products'
+epilogues. The next steps, each measured against the release before and against PyTorch:
 
-1. **The matrix units' kernel:** 1.3's (above, *Where PyTorch is faster*, step 1), and split sums
-   of weight gradients chosen by the tile the timing picked rather than by a single-precision
-   estimate; target: cuBLAS's 22 to 23 TFLOPS on a GPT's products.
+1. **The matrix units' kernels:** on Vulkan, the GPT in bfloat16 trains at 0.89 times and infers at 0.85 times
+   the CUDA backend's speed (1.3), its products on cooperative matrices behind CUDA's three-stage 128 x 128
+   tiles. Measured in 1.3 and left out: two steps of the sum in shared memory and larger tiles (training 0.5%
+   slower), blocks in bands with results stored eight at a time (the GPT's inference 4% faster, the MLP's and the
+   CNN's bfloat16 runs from host arrays 2 to 5% slower; branch `vk-tiles-clean`). On both backends, split sums of
+   weight gradients chosen by the tile the timing picked rather than by a single-precision estimate, and attention
+   of layers with padding, windows or cross-attention on the matrix units (they run on the register tiles of
+   single precision).
 2. **The single-precision kernel for convolutions of few channels.** ResNet-20's and the U-Net's
    convolutions (16 to 64 filters, k = 144 to 576 values of the window) reach 3.3 to 4.5 TFLOPS, the
    MLP's products 5.6 to 6.4, and they take 70% of those networks' training time in single

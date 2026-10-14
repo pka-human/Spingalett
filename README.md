@@ -147,7 +147,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 and `Spingalett::runtime` for the runtime, which carry the include paths:
 
 ```cmake
-find_package(Spingalett 1.2 REQUIRED)         # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 1.3 REQUIRED)         # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)    # or Spingalett::runtime
 ```
 
@@ -163,8 +163,8 @@ pip install spingalett                    # Python: wheels with the library insi
 brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
 scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
 nix build github:pka-human/Spingalett     # the flake's package; nix develop: a shell to build it in
-sudo apt install ./spingalett_1.2.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
-docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.2.0     # the library, tools and Python, CUDA and Vulkan
+sudo apt install ./spingalett_1.3.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.3.0     # the library, tools and Python, CUDA and Vulkan
 ```
 
 The `.deb` and `.rpm` packages are assets of each [release](https://github.com/pka-human/Spingalett/releases),
@@ -1988,8 +1988,8 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.2.0. Its API (prefixed names, structs that can grow, zero as every
-field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 8, `.slettd` 2)
+Spingalett is at version 1.3.0. Its API (prefixed names, structs that can grow, zero as every
+field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 9, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and
 remain loadable.
@@ -2001,11 +2001,14 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 - 1.2 (released): transformers and language models (embeddings, attention, RMS normalization,
   GELU, SiLU, the sparse cross-entropy, token files, generation, GPT-2 and LLaMA checkpoints),
   flash attention on CUDA, bindings for Rust, .NET, Go and Java, packages for the usual managers
-- 1.3: a KV cache and batched generation, mixed precision with loss scaling, gradient
-  checkpointing, deployment models on the GPU, ahead of PyTorch where 1.2 is not (the GPT in
-  bfloat16 on CUDA, transformers' training on the CPU and on Vulkan), bindings for PHP
-- 1.4 to 2.0: training across several GPUs, mixture-of-experts layers, Arm and Apple GPUs, sequence
-  models beyond attention
+- 1.3 (released): sessions with a key-value cache and batched generation on the CPU and both GPU
+  backends, deployment models on the GPU (integer ones to the CPU's bits, weight-only decoding),
+  tokenizers and Hugging Face and GGUF checkpoints in C, the training features of language models
+  (tied embeddings, recomputation, accumulation, padding, sliding windows, cross-attention), ONNX
+  import of transformers, the engine in WebAssembly, bindings for PHP; ahead of PyTorch where 1.2 was
+  not (the GPT in bfloat16 on CUDA, transformers' training on the CPU)
+- 1.4 to 2.0: training across several GPUs, FP16 products with loss scaling, mixture-of-experts
+  layers, Arm and Apple GPUs, sequence models beyond attention
 
 ## Contributing
 
