@@ -182,7 +182,8 @@ static bool aligned(uint64_t address, uint32_t group, uint32_t width) {
 static bool vector_c(const SpgGemmPush *p, const SpgGemmMode *m) {
     if (m->epi == SPG_EPI_PARTIAL) return p->c % 16u == 0 && p->N % 4u == 0;
     if (!aligned(p->c, p->c_group, 4u) || p->ldc % 4u != 0) return false;
-    if (m->epi == SPG_EPI_BIAS_ACT && (p->flags & SPG_GEMM_BIAS)) return p->e0 % 16u == 0;
+    if (m->epi == SPG_EPI_BIAS_PRE && p->e1 % 16u != 0) return false;
+    if ((m->epi == SPG_EPI_BIAS_ACT || m->epi == SPG_EPI_BIAS_PRE) && (p->flags & SPG_GEMM_BIAS)) return p->e0 % 16u == 0;
     if (m->epi == SPG_EPI_SCALE_ACT) return p->e0 % 16u == 0 && p->e1 % 16u == 0;
     if (m->epi == SPG_EPI_DERIV) return p->e0 % 16u == 0;
     return true;
@@ -431,6 +432,11 @@ void spg_gemm(SpgGpuCommands *c, SpgGemmPush *p, const SpgGemmMode *mode) {
     const bool mma = mode->bf16 && spg_gpu_mma_bf16();
     SpgGemmMode m = *mode;
     if (!mma) m.half = 0;
+    /* (Vulkan: the values before the activation stored by pipelines of their own, the others' code unchanged: a
+       test of the flag in every product's epilogue cost the MLP of Examples/Benchmark.c 6% of its training in
+       single precision and 14% of its inference) */
+    if (spg_gpu_using() == SPG_BACKEND_VULKAN && m.epi == SPG_EPI_BIAS_ACT && (p->flags & SPG_GEMM_PRE))
+        m.epi = SPG_EPI_BIAS_PRE;
     /* vectors of four floats, four bfloat16 or (wide) eight bfloat16 of the operands kept as such */
     const bool wide_a = m.vec_a && (m.half & 1u) && m.wide_a && vectors(p, &m, true, 8u),
                wide_b = m.vec_b && (m.half & 2u) && m.wide_b && vectors(p, &m, false, 8u);
@@ -444,6 +450,30 @@ void spg_gemm(SpgGpuCommands *c, SpgGemmPush *p, const SpgGemmMode *mode) {
              tile_serves(&tab.list[mode->tile - 1], mode, vec) ? tab.list[mode->tile - 1]
            : tuned >= 0 ? tab.list[tuned] : choose_tile(p->M, p->N, mode->groups * p->slices, mma, mode, vec);
     dispatch_tile(c, p, mode, vec, &t, mma);
+}
+
+/* ------------------------------------------------------------------------- flash attention */
+
+/* Bytes of shared memory flash.comp takes for a head size, pass, subgroups a workgroup and tile of the other side
+   (its header counts them). */
+static uint32_t flash_shared(uint32_t d, uint32_t op, uint32_t warps, uint32_t bt) {
+    const uint32_t sd = d + 8u, ps = (bt > d ? bt : d) + 8u, np = op == SPG_ATTN_DKV ? 2u : 1u;
+    const uint32_t fs = op == SPG_ATTN_FORWARD && 16u * (bt + 4u) > 640u ? 16u * (bt + 4u) : 640u;
+    return 4u * bt * sd + 2u * warps * np * 16u * ps + 4u * warps * fs + (op == SPG_ATTN_FORWARD ? 64u * warps : 4u) +
+           (op == SPG_ATTN_DKV ? 8u * bt : 8u);
+}
+
+bool spg_flash_tiles(uint32_t head, uint32_t op, uint32_t *warps, uint32_t *bt) {
+    const uint32_t sg = spg_gpu_subgroup_size();
+    if (spg_gpu_using() != SPG_BACKEND_VULKAN || op == SPG_ATTN_PRE || (head != 32u && head != 64u && head != 128u) ||
+        (sg != 16u && sg != 32u && sg != 64u) || !spg_gpu_mma_bf16() || !spg_gpu_kernel_built(SPG_KERNEL_flash))
+        return false;
+    *bt = head <= 64u ? 64u : 32u;
+    for (*warps = 4u; *warps >= 2u; *warps /= 2u)
+        if (flash_shared(head, op, *warps, *bt) <= spg_gpu_shared_memory() && *warps * sg <= 1024u &&
+            (*bt * head / 8u) % (2u * *warps * sg) == 0)
+            return true;
+    return false;
 }
 
 /* ------------------------------------------------------------------------- convolution geometry */

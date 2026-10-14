@@ -26,6 +26,8 @@
 #define EPI_SCALE_ACT   2u      /* C = act(AB * scale[column] + shift[column]) */
 #define EPI_PARTIAL     3u      /* partial[z] = AB */
 #define EPI_DERIV       4u      /* C = (alpha AB + beta C) * act'(e0), e0 laid out like C */
+#define EPI_BIAS_PRE    5u      /* EPI_BIAS_ACT, and e1 = AB + bias[column], laid out and kept like C (the values
+                                   before the activation, for its derivative: SPG_GEMM_PRE) */
 
 #define FLAG_BIAS       1u
 
@@ -254,8 +256,9 @@ void store_c(uint z, uint coff, uint m, uint row, uint n, precise float v) {
     if (EPI == EPI_STORE) {
         v *= p.alpha;
         if (p.beta != 0.0) v += p.beta * get(p.c, at, HC);
-    } else if (EPI == EPI_BIAS_ACT) {
+    } else if (EPI == EPI_BIAS_ACT || EPI == EPI_BIAS_PRE) {
         if ((p.flags & FLAG_BIAS) != 0u) v += p.e0.v[coff + n];
+        if (EPI == EPI_BIAS_PRE) put(p.e1, at, HC, v);
         v = activate(v, ACT);
     } else if (EPI == EPI_SCALE_ACT) {
         v = activate(v * p.e0.v[coff + n] + p.e1.v[coff + n], ACT);

@@ -161,15 +161,18 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   floats, or its bfloat16 copy (`data_half()`), never floats in place of bfloat16.
 - **Values before the activation.** GELU's and SiLU's derivatives take the layer's values before
   its activation, which training keeps in `pre[]` (`keeps_pre()`; with dropout the mask then holds
-  the mask alone). On CUDA the product of a dense or convolution layer stores them itself
-  (`pre_out`, `SPG_GEMM_PRE`, honoured by the units built with `GENERAL` and by `epi.cu`); elsewhere
-  the layer writes `pre[]` and an element-wise pass the activation.
+  the mask alone). The product of a dense or convolution layer stores them itself (`pre_out`,
+  `SPG_GEMM_PRE`, honoured by gemm.comp's and gemm_mma.comp's epilogues, and on CUDA by the units
+  built with `GENERAL` and by `epi.cu`); other layers write `pre[]` and an element-wise pass the
+  activation.
 - **Activations as bfloat16.** With `PRECISION_BFLOAT16` the executor keeps layers' outputs and
   gradients as bfloat16 (`kept_half()`): products find which operands are such by address
   (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push
   constants' bfloat16 buffers. A kernel that reads or writes activations through anything but
   `ld()`/`st()` (`half.glsl`) or the products' loads reads garbage in bfloat16: every new kernel
-  that touches activations needs a variant and an entry in `half_words[]`.
+  that touches activations needs a variant and an entry in `half_words[]`. The kernels of the matrix
+  units, which exist only with 16-bit storage (`gemm_mma.comp`, and `flash.comp`, Vulkan's flash
+  attention), have no variant: their HALF is a constant their caller computes (`product()`, `attn_pass()`).
 - **Normalizations applied by their readers.** On the GPU a batch normalization read only by an
   addition (`fold[]`) or by a depthwise convolution (`pro[]`, dwconv.comp's PRO) has no outputs: its
   reader applies it to the normalization's input as it reads. Code that reads a layer's outputs goes

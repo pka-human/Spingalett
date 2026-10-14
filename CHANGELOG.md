@@ -216,6 +216,22 @@ All notable changes to this project are documented in this file. The format foll
   session, a prompt the bits of its tokens one at a time and of two sequences fed together.
 
 ### Changed
+- **Flash attention on Vulkan**: networks in bfloat16 run attention's forward pass and its gradients on the
+  matrix units (`flash.comp`: cooperative matrices of bfloat16, `VK_KHR_cooperative_matrix`, as CUDA's
+  `flash.cu` does with `mma.sync`) for heads of 32, 64 and 128, causal or not, rotary, grouped: a subgroup
+  takes 16 queries (keys for the keys' and values' gradients), the scores pass through shared memory for the
+  softmax, whose row maxima and sums each row's invocations combine in a fixed pattern (the same bits on
+  every run). Devices without bfloat16 cooperative matrices or the room in shared memory, and builds whose
+  glslc lacks `GL_EXT_bfloat16`, run `attn.comp` as before. On an RTX 4050 Laptop GPU the passes of
+  `Examples/Benchmark.c`'s GPT (chunks of 16 sequences of 256 tokens, 6 heads of 64) take 0.11, 0.13 and
+  0.18 ms instead of 2.2, 3.9 and 3.9 ms (CUDA's `flash.cu`: 0.11, 0.12, 0.18), and the GPT in bfloat16 on
+  Vulkan trains 179,000 tokens a second instead of 53,800 (3.3 times) and infers 572,000 instead of 225,000
+  (2.5 times). `SpingalettGpuTests` compares the two ways on the same inputs (`bench attn` times them).
+- Training on Vulkan applies GELU and SiLU in the products' epilogues, which store the values before the
+  activation for its derivative too (`SPG_GEMM_PRE`, as CUDA's products do, in pipelines of their own so
+  that the other products' code stays as it was), rather than the product writing those and an
+  element-wise pass the activation: the GPT of `Examples/Benchmark.c` trains 1.01 times as fast on an RTX
+  4050 Laptop GPU, in bfloat16 and in single precision.
 - `spingalett_generate()` on the CPU runs a causal language model as its deployment model of single
   precision in a session (kept in the network until its parameters or layers change): the prompt fed
   at once, then each token once; once the tokens fill the window, the window of the last tokens is fed

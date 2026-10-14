@@ -95,6 +95,9 @@ bool spg_gpu_bf16_storage(void);
 /* Whether the host can write into all of the device's memory (resizable BAR, unified memory), for
    SPG_MEMORY_HOST_WRITES: the largest device-local heap's memory is host-visible too. */
 bool spg_gpu_host_writes(void);
+/* Whether the backend holds the kernel: Vulkan's kernels of the matrix units are missing from builds whose glslc
+   could not compile them, and flash.comp is Vulkan's (CUDA's flash attention is attn's units of flash.cu). */
+bool spg_gpu_kernel_built(SpgKernel kernel);
 
 bool spg_gpu_buffer_create(SpgGpuBuffer *buffer, size_t bytes, bool host_visible);
 void spg_gpu_buffer_free(SpgGpuBuffer *buffer);
@@ -153,6 +156,7 @@ typedef struct {
     bool (*mma_bf16)(void);
     bool (*bf16_storage)(void);
     bool (*host_writes)(void);
+    bool (*kernel_built)(SpgKernel kernel);
     bool (*buffer_create)(SpgGpuBuffer *buffer, size_t bytes, bool host_visible);
     void (*buffer_free)(SpgGpuBuffer *buffer);
     void *(*arena_create)(void);

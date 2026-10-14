@@ -6839,8 +6839,8 @@ static void gpu_model_exact(void) {
     }
 }
 
-/* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA) against single
-   precision: predictions, one step's change of every parameter, and two runs alike; over T tokens (several
+/* Attention on the matrix units (heads of 32, 64 and 128 in bfloat16: flash.cu on CUDA, flash.comp on Vulkan) against
+   single precision: predictions, one step's change of every parameter, and two runs alike; over T tokens (several
    blocks of queries, the last partial), causal or not. */
 static void gpu_flash(uint32_t head, bool rope, uint32_t kv, uint32_t T, bool causal) {
     const uint32_t V = 37, n = T > 100u ? 6u : 20u, heads = 4, d = heads * head;
@@ -8381,6 +8381,7 @@ int main(int argc, char **argv) {
             gpu_flash(64, false, 4, 300, true);
             gpu_flash(64, true, 2, 200, false);
             gpu_flash(32, false, 2, 150, true);
+            gpu_flash(128, false, 4, 150, false);
             gpu_masked(32, false, 0, true);
             gpu_masked(64, true, 0, true);
             gpu_masked(128, false, 0, true);

@@ -107,8 +107,8 @@ struct SpgGpuNet {
        or an attention's backward pass its outputs (an attention with an activation): pre[l], laid out
        and kept (as bfloat16 or not) like act[l] */
     SpgGpuBuffer *pre;
-    /* while a training forward pass is recorded on CUDA: where the product of the layer being recorded stores its
-       values before the activation (SPG_GEMM_PRE: gemm_mma.cu's epilogue or epi.cu's), else NULL */
+    /* while a training forward pass is recorded: where the product of the layer being recorded stores its values
+       before the activation (SPG_GEMM_PRE: the products' epilogues, or on CUDA epi.cu's), else NULL */
     const SpgGpuBuffer *pre_out;
     /* training with embeddings: the stable sort of a chunk's tokens (four arrays of capacity x the
        widest embedding's tokens: keys and positions, read from and written to) */
@@ -1633,8 +1633,24 @@ static void attn_pass(SpgGpuNet *g, Recorder *r, Access *a, uint32_t l, uint32_t
         threads = 2u * bq;
         if (op == SPG_ATTN_FORWARD && head <= 64u) bq = 128u;
     }
-    const uint32_t spec[4] = {op | (ext ? SPG_ATTN_EXT : 0u), mma ? 0u : bq, dmax, threads};
     if (g->geo[l].buffer) reads(a, whole(&g->geo[l]));
+    /* networks in bfloat16 on Vulkan: flash.comp where the device has its cooperative matrices and room for its
+       tiles, told which of x, y, dy and dx are kept as bfloat16 (HALF); layers with padding, a window or
+       cross-attention run on attn.comp, as on CUDA */
+    uint32_t warps, bt;
+    if (g->bf16 && !ext && (x | y | dy | dx) % 16u == 0 && spg_flash_tiles(head, op, &warps, &bt)) {
+        const uint64_t words[4] = {x, y, dy, dx};
+        uint32_t mask = 0;
+        for (uint32_t w = 0; w < 4u; w++)
+            if (in_half(g, words[w])) mask |= 1u << w;
+        const uint32_t sg = spg_gpu_subgroup_size();
+        const uint32_t fspec[7] = {op, head, warps, bt, sg, mask, warps * sg};
+        need(r, a);
+        spg_gpu_dispatch(r->c, SPG_KERNEL_flash, fspec, 7, &p, sizeof p, (cells + 16u * warps - 1u) / (16u * warps),
+                         op == SPG_ATTN_DKV ? s->kv_heads : s->heads, n);
+        return;
+    }
+    const uint32_t spec[4] = {op | (ext ? SPG_ATTN_EXT : 0u), mma ? 0u : bq, dmax, threads};
     if (ext && s->mask) reads(a, whole(&g->act[0]));
     const uint32_t tiles = ((op == SPG_ATTN_DKV ? kcells : cells) + bq - 1u) / bq;
     if (op == SPG_ATTN_PRE)
@@ -1695,11 +1711,10 @@ static void output_kernel(Recorder *r, const Access *a, uint32_t spec[4], const 
 }
 
 /* Whether layer l's forward pass is a product that can store its values before the activation as well
-   (SPG_GEMM_PRE: CUDA's dense layers and convolutions but depthwise ones). */
+   (SPG_GEMM_PRE: dense layers and convolutions but depthwise ones), with the activation in its epilogue. */
 static bool products_keep_pre(const SpgGpuNet *g, uint32_t l) {
     const LayerType type = g->net->shapes[l].type;
-    return spg_gpu_using() == SPG_BACKEND_CUDA &&
-           (type == LAYER_DENSE || (type == LAYER_CONV2D && !depthwise(g->net, l)));
+    return type == LAYER_DENSE || (type == LAYER_CONV2D && !depthwise(g->net, l));
 }
 
 static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
@@ -1710,8 +1725,8 @@ static void record_forward(SpgGpuNet *g, Recorder *r, uint32_t n, bool train) {
         const bool masked = train && g->dmask[l].buffer;
         const uint64_t total = (uint64_t)n * net->topology[l];
         /* softmax runs over whole rows after the layer; every other activation in its kernel, but with
-           values kept before it (pre[], training) the layer writes those, an element-wise pass act[l]; on CUDA
-           a dense or convolution layer's product stores both (pre_out) */
+           values kept before it (pre[], training) the layer writes those, an element-wise pass act[l]; a dense
+           or convolution layer's product stores both (pre_out) */
         const bool kept = train && g->pre[l].buffer, both = kept && products_keep_pre(g, l), pre = kept && !both;
         const uint32_t fused = act == ACT_SOFTMAX || pre ? ACT_NONE : act;
         if (!train && g->into[l]) continue;     /* its product runs with the normalization it applies */

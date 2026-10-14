@@ -78,8 +78,9 @@ void store_c4(uint z, uint coff, uint m, uint row, uint n, precise vec4 v) {
     if (EPI == EPI_STORE) {
         v *= p.alpha;
         if (p.beta != 0.0) v += p.beta * F32x4(p.c).v[at >> 2];
-    } else if (EPI == EPI_BIAS_ACT) {
+    } else if (EPI == EPI_BIAS_ACT || EPI == EPI_BIAS_PRE) {
         if ((p.flags & FLAG_BIAS) != 0u) v += F32x4(p.e0).v[(coff + n) >> 2];
+        if (EPI == EPI_BIAS_PRE) F32x4(p.e1).v[at >> 2] = v;
         v = activate4(v);
     } else if (EPI == EPI_SCALE_ACT) {
         v = activate4(v * F32x4(p.e0).v[(coff + n) >> 2] + F32x4(p.e1).v[(coff + n) >> 2]);

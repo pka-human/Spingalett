@@ -6,7 +6,8 @@
 /* The GPU kernels: SPG_KERNEL(name) is Shaders/name.comp, compiled to SPIR-V and embedded by
    cmake/Vulkan.cmake. SPG_KERNEL_H(name) is compiled twice: as name, and with SPG_HALF defined as
    name_h, the variant that may keep activations as bfloat16 (16-bit storage, which only devices with
-   bfloat16 matrix units are asked for). */
+   bfloat16 matrix units are asked for). gemm_mma and flash run on the matrix units (cooperative matrices of
+   bfloat16): a glslc without GL_EXT_bfloat16 leaves them empty, and the library runs without them. */
 
 SPG_KERNEL(gemm)
 SPG_KERNEL(gemm_mma)
@@ -27,6 +28,7 @@ SPG_KERNEL_H(dwconv)
 SPG_KERNEL_H(embed)
 SPG_KERNEL_H(attn)
 SPG_KERNEL_H(attn_cache)
+SPG_KERNEL(flash)
 SPG_KERNEL_H(iquant)
 SPG_KERNEL_H(ipass)
 SPG_KERNEL_H(wqmv)
