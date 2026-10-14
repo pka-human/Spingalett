@@ -388,9 +388,13 @@ static void indirect_product(const Taps *g, uint64_t rows_total, const float *pa
                              const SpingalettGemmHooks *hooks, bool parallel, int threads) {
     const uint32_t K = g->taps * g->run;
     const int64_t tiles = (int64_t)((rows_total + MR - 1) / MR);
-    (void)threads; (void)parallel;
+    /* tiles handed out eight at a time when small (a convolutional network's: a microsecond or two each), one at a
+       time when large (a transformer's linear layers: 20 to 70 us each, where eight left threads waiting at the end
+       of each product for a tenth of it) */
+    const int chunk = (uint64_t)MR * cols * K >= (1u << 19) ? 1 : 8;
+    (void)threads; (void)parallel; (void)chunk;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(dynamic, 8) num_threads(threads) if(parallel && tiles > 1)
+#pragma omp parallel for schedule(dynamic, chunk) num_threads(threads) if(parallel && tiles > 1)
 #endif
     for (int64_t t = 0; t < tiles; t++) {
         const float *p[MR * SPINGALETT_CONV_DIRECT_TAPS];
