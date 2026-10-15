@@ -495,6 +495,7 @@ bool spingalett_add_layer(LayerArgs args) {
     spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));
     spingalett_generate_release(net);
     spingalett_network_release_gpu(net);                    /* its parameters back first */
+    spingalett_run_reset(net);                              /* a run of other layers */
     bool pooling = shape.type == LAYER_MAX_POOL2D || shape.type == LAYER_AVG_POOL2D ||
                    shape.type == LAYER_GLOBAL_AVG_POOL || shape.type == LAYER_UPSAMPLE;
     if (pooling) act_func = ACT_NONE;
@@ -1048,6 +1049,7 @@ void spingalett_network_free(NeuralNetwork *net) {
     spingalett_gpu_net_free(atomic_exchange(&net->gpu_predict, NULL));
     spingalett_generate_release(net);
     if (net->gpu_kept) spingalett_gpu_net_free(net->gpu_trainer);
+    spingalett_run_reset(net);
     spingalett_aligned_free(net->neurons);
     spingalett_aligned_free(net->weights);
     spingalett_aligned_free(net->biases);

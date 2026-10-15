@@ -880,10 +880,14 @@ _tokenize = _bind_optional("spingalett_tokenize_args", ctypes.c_int64, [_Tokeniz
 _detokenize = _bind_optional("spingalett_detokenize_args", ctypes.c_int64, [_DetokenizeArgs])
 _load_pretrained = _bind_optional("spingalett_load_pretrained_args", _NetPtr, [_PretrainedArgs])
 
+# 1.4: checkpoints of training runs
+_save_checkpoint = _bind_optional("spingalett_save_checkpoint", c_bool, [_NetPtr, c_char_p])
+_load_checkpoint = _bind_optional("spingalett_load_checkpoint", _NetPtr, [c_char_p])
 
-def _require(fn, what: str):
+
+def _require(fn, what: str, version: str = "1.3"):
     if fn is None:
-        raise SpingalettError(-1, f"{what} needs Spingalett 1.3 or later (the library is {_LIBRARY_VERSION})")
+        raise SpingalettError(-1, f"{what} needs Spingalett {version} or later (the library is {_LIBRARY_VERSION})")
     return fn
 
 
@@ -1538,6 +1542,20 @@ class Network:
             raise SpingalettError(-1, f"could not load {path!s}")
         return cls._wrap(ptr)
 
+    @classmethod
+    def load_checkpoint(cls, path) -> "Network":
+        """Load a checkpoint written by :meth:`save_checkpoint` or by an autosave in FLOAT32 with the optimizer
+        state: the network, its optimizer state and the state of the training run, which the next
+        :meth:`train` (or ``train_from_file``, ``train_from_tokens``, ``train_from_generator``) carries on when
+        given the run's arguments again, ``epochs`` counting all the run's epochs. A run stopped at an epoch's
+        end and carried on so trains the same bits as one that never stopped; the reader of
+        ``train_from_file`` or ``train_from_tokens`` resumes where the run's stood. A .slett model loads
+        without a run's state."""
+        ptr = _call(_require(_load_checkpoint, "Network.load_checkpoint", "1.4"), _encode_path(path))
+        if not ptr:
+            raise SpingalettError(-1, f"could not load {path!s}")
+        return cls._wrap(ptr)
+
     # ---- lifetime
     def close(self) -> None:
         ptr = getattr(self, "_ptr", None)
@@ -2147,6 +2165,12 @@ class Network:
     def save(self, path, precision: Precision = Precision.FLOAT32, save_optimizer: bool = True) -> None:
         """Save to ``path`` (".slett" is appended when there is no extension)."""
         _call(_save, _SaveArgs(self._ptr, _encode_path(path), not save_optimizer, int(precision)))
+
+    def save_checkpoint(self, path) -> None:
+        """Save a checkpoint to ``path``, as given: the network, its optimizer state and the state of the
+        training run as its last epoch left it (see :meth:`load_checkpoint`). Call it from the training
+        callback, or after training."""
+        _call(_require(_save_checkpoint, "Network.save_checkpoint", "1.4"), self._net, _encode_path(path))
 
     def to_bytes(self, precision: Precision = Precision.FLOAT32, save_optimizer: bool = False) -> bytes:
         """The .slett file :meth:`save` would write, as bytes."""

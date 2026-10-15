@@ -564,7 +564,7 @@ static void handle_autosave(NeuralNetwork *net, const TrainArgs *args, size_t ep
 
     if (args->autosave_mode == AUTOSAVE_OVERWRITE) {
         save_args.filename = args->autosave_path;
-        save_spingalett_struct_arguments(save_args);
+        spingalett_autosave(&save_args);
     } else if (args->autosave_mode == AUTOSAVE_NEW_FILES) {
         const char *path = args->autosave_path;
         size_t path_len = strlen(path);
@@ -592,7 +592,7 @@ static void handle_autosave(NeuralNetwork *net, const TrainArgs *args, size_t ep
         }
 
         save_args.filename = buf;
-        save_spingalett_struct_arguments(save_args);
+        spingalett_autosave(&save_args);
         free(buf);
     }
 }
@@ -686,6 +686,7 @@ typedef struct {
     BatchWorkspace *val_ws;     /* validation: inference workspace and output rows */
     float *val_out;
     float *best_params;         /* restore_best_weights: weights then biases of the best epoch */
+    bool best_held;             /* best_params holds the best epoch's parameters */
 
     SpgGpuNet *gpu;             /* COMPUTE_VULKAN: the network on the GPU (no CPU workspaces then) */
     bool gpu_rows_in, gpu_rows_out;     /* the GPU gathers the inputs, the targets from data sets there */
@@ -1079,6 +1080,43 @@ static void restore_params(NeuralNetwork *net, const float *src) {
     memcpy(net->running_var, src + w + 2u * b, b * sizeof(float));
 }
 
+void spingalett_run_reset(NeuralNetwork *net) {
+    free(net->run.saved_best);
+    memset(&net->run, 0, sizeof net->run);
+}
+
+/* Records the state of the run as of the end of `epoch`, what a checkpoint written from here holds and
+   a train() resumed from it takes up: the run's seeds, the optimizer's corrections, its steps, its
+   schedule and plateau, its best epoch with the trainer's copy of its parameters, and the place of the
+   reader spingalett_dataset_generator() read. */
+static void run_capture(const Trainer *t, size_t epoch, const TrainReport *report, float best,
+                        size_t no_improvement, size_t stale) {
+    NeuralNetwork *net = t->net;
+    net->run.valid = true;
+    net->run.time_step = net->time_step;
+    net->run.epochs = epoch;
+    net->run.steps = t->steps;
+    net->run.total_steps = t->total_steps;
+    net->run.dropout_seed = t->dropout.seed;
+    net->run.augment_seed = t->augment_seed;
+    net->run.order_seed = t->order_seed;
+    net->run.beta1_pow = t->beta1_pow;
+    net->run.beta2_pow = t->beta2_pow;
+    net->run.base_lr = t->base_lr;
+    net->run.lr_scale = t->lr_scale;
+    net->run.best = best;
+    net->run.best_epoch = report->best_epoch;
+    net->run.no_improvement = no_improvement;
+    net->run.stale = stale;
+    net->run.best_params = t->best_held ? t->best_params : NULL;
+    net->run.has_reader = false;
+    if (t->use_generator) {
+        const GeneratorWatch seen = spingalett_generator_watched();
+        if (seen.reader && !seen.several)
+            net->run.has_reader = spingalett_dataset_get_position(seen.reader, &net->run.reader);
+    }
+}
+
 TrainReport spingalett_train_args(TrainArgs args) {
     NeuralNetwork *net = args.net;
     TrainingMode training_mode = args.training_mode;
@@ -1195,7 +1233,25 @@ TrainReport spingalett_train_args(TrainArgs args) {
             memset(net->opt_v_biases,  0, net->total_biases  * sizeof(float));
         }
         net->time_step = 0;
+        spingalett_run_reset(net);              /* a new run, not the checkpoint's */
         spingalett_log(LOG_INFO, "Optimizer state reset");
+    }
+
+    /* A network loaded from a checkpoint carries its run on, once (the train() after that begins a
+       run of its own): .epochs counts the run's epochs, and the run's seeds, corrections, schedule
+       and counters are taken up where its last epoch left them. A network that stepped since (the
+       step API) no longer stands at that epoch's end. */
+    bool resume = net->run.resume;
+    if (resume && (!net->run.valid || net->run.time_step != net->time_step)) {
+        spingalett_log(LOG_WARNING, "The network has taken steps since its checkpoint; training begins a new run");
+        resume = false;
+    }
+    const size_t run_done = resume ? (size_t)net->run.epochs : 0;
+    if (run_done > epochs) {
+        char message[200];
+        snprintf(message, sizeof message, "A resumed run's .epochs counts all the run's epochs: %zu have run, %zu "
+                 "given", run_done, epochs);
+        return train_failed(message);
     }
 
 #if defined(_OPENMP)
@@ -1251,10 +1307,11 @@ TrainReport spingalett_train_args(TrainArgs args) {
         .type = args.optimizer_type, .lr = args.learning_rate, .decay = args.weight_decay,
         .momentum = args.momentum, .beta1 = args.beta1, .beta2 = args.beta2, .epsilon = args.epsilon,
     };
-    // Adam bias correction must continue from the persisted step count; restarting it at 1
-    // on every train() call (or after loading a checkpoint) inflates the first updates ~10x.
-    t.beta1_pow = powf(args.beta1, (float)net->time_step);
-    t.beta2_pow = powf(args.beta2, (float)net->time_step);
+    /* Adam's bias correction continues from the step count the network holds: restarting it at 1 on
+       every train() call (or after loading a model) inflates the first updates ~10x. A resumed run
+       takes the values its steps multiplied, which powf() of the step count does not give. */
+    t.beta1_pow = resume ? net->run.beta1_pow : powf(args.beta1, (float)net->time_step);
+    t.beta2_pow = resume ? net->run.beta2_pow : powf(args.beta2, (float)net->time_step);
 
     switch (training_strategy) {
         case STRATEGY_SAMPLE:      t.batch_size = 1; break;
@@ -1280,12 +1337,13 @@ TrainReport spingalett_train_args(TrainArgs args) {
     if (net->dropout_rates[net->layers - 1] > 0.0f)
         spingalett_log(LOG_WARNING, "Dropout is not applied to the output layer; ignoring rate %g",
                        (double)net->dropout_rates[net->layers - 1]);
+    /* the seeds the masks and the augmentations hash from: a run's draws, or a resumed run's */
     t.use_dropout = spingalett_has_dropout(net);
     if (t.use_dropout)
-        t.dropout.seed = rng_next64();
+        t.dropout.seed = resume ? net->run.dropout_seed : rng_next64();
     t.augment = args.augment_shift > 0 || args.augment_flip;
     if (t.augment)
-        t.augment_seed = rng_next64();
+        t.augment_seed = resume ? net->run.augment_seed : rng_next64();
 
     if (use_gpu) {
         SpgGpuTraining cfg = {
@@ -1328,7 +1386,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
         return (TrainReport){.status = TRAIN_FAILED};
     }
     /* the seed of the epochs' orders: a draw of the library's generator, as for dropout and augmentation */
-    if (t.order) t.order_seed = rng_next64();
+    if (t.order) t.order_seed = resume ? net->run.order_seed : rng_next64();
 
     /* Data sets on the GPU: gathered there when the network trains there, on that backend (augmentation
        shifts of up to 2^23 cells, rows.comp's), copied to the host otherwise; the validation's targets
@@ -1405,6 +1463,13 @@ TrainReport spingalett_train_args(TrainArgs args) {
                                : sample_count && t.batch_size ? (sample_count + (uint64_t)t.batch_size - 1u) / t.batch_size
                                                               : 0u;
     t.total_steps = epoch_steps * epochs;
+    if (resume) {
+        /* (a generator's steps without sample_count: those its run counted after its first epoch) */
+        t.steps = net->run.steps;
+        if (net->run.total_steps) t.total_steps = net->run.total_steps;
+        t.lr_scale = net->run.lr_scale;
+        if (args.lr_scheduler) t.base_lr = net->run.base_lr;
+    }
     /* the inputs' rows on the GPU read where they are when the chunks of an epoch are the same every
        epoch and few enough for their commands, recorded for their rows, to stay recorded */
     if (t.gpu_rows_in && !t.order && !t.augment) {
@@ -1432,8 +1497,46 @@ TrainReport spingalett_train_args(TrainArgs args) {
     };
     float best = higher_is_better ? -INFINITY : INFINITY;
     size_t epochs_without_improvement = 0, stale = 0;
+    /* A resumed run: its epochs after those its checkpoint ran (a run that ran them all, or stopped
+       early, has none left), its best epoch, patience and plateau where they were, and the best epoch's
+       parameters from the checkpoint, or the network's own when the last epoch was the best. */
+    size_t first = 1;
+    if (resume) {
+        first = run_done + 1;
+        best = net->run.best;
+        epochs_without_improvement = (size_t)net->run.no_improvement;
+        stale = (size_t)net->run.stale;
+        report.best_epoch = (size_t)net->run.best_epoch;
+        if (report.best_epoch) report.best_value = best;
+        if (args.early_stopping_patience > 0 && epochs_without_improvement >= args.early_stopping_patience) {
+            report.status = TRAIN_EARLY_STOPPED;
+            first = epochs + 1;
+        }
+        if (t.best_params && report.best_epoch) {
+            if (net->run.saved_best) {
+                memcpy(t.best_params, net->run.saved_best,
+                       (size_t)(net->total_weights + 3u * net->total_biases) * sizeof(float));
+                t.best_held = true;
+            } else if (report.best_epoch == run_done) {
+                save_params(t.best_params, net);
+                t.best_held = true;
+            } else {
+                spingalett_log(LOG_WARNING, "The checkpoint holds no parameters of epoch %zu, the best so far: "
+                               "restore_best_weights restores a later epoch's only", report.best_epoch);
+            }
+        }
+        if (net->run.has_reader && !use_generator)
+            spingalett_log(LOG_WARNING, "The run read a data set reader, and this call reads none: its samples "
+                           "are not the run's");
+        spingalett_log(LOG_INFO, "Resuming a run after epoch %zu of %zu", run_done, epochs);
+    }
+    free(net->run.saved_best);
+    net->run.saved_best = NULL;
+    net->run.resume = false;
+    /* the reader spingalett_dataset_generator() reads: moved to the run's place first when resuming */
+    if (use_generator) spingalett_generator_watch(resume && net->run.has_reader ? &net->run.reader : NULL);
 
-    for (size_t epoch = 1; epoch <= epochs; epoch++) {
+    for (size_t epoch = first; epoch <= epochs; epoch++) {
         float total_error = 0.0f;
 
         /* the epoch's learning rate (lr_per_step: each step's, set before it) */
@@ -1457,6 +1560,12 @@ TrainReport spingalett_train_args(TrainArgs args) {
                     }
                     float *gx = t.gen_inputs + (size_t)step_got * in_sz, *gt = t.gen_targets + (size_t)step_got * tg_sz;
                     uint32_t got = args.generator(gx, gt, want, args.generator_data);
+                    if (got == 0 && spingalett_generator_watched().failed) {
+                        spingalett_log(LOG_ERROR, "The reader could not be moved to the checkpoint's place: %s",
+                                       spingalett_last_error_message());
+                        failed = true;
+                        break;
+                    }
                     /* A generator that ends its passes with a 0 (such as spingalett_dataset_generator) answers
                        0 first when the previous epoch, cut by sample_count, never asked past its last sample. */
                     if (got == 0 && epoch_samples + step_got == 0)
@@ -1509,7 +1618,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
             }
         }
 
-        report.epochs_run = epoch;
+        report.epochs_run = epoch - run_done;
         report.train_loss = total_error / (float)epoch_samples;
         /* (a generator's steps, without sample_count: known now) */
         if (t.total_steps == 0) t.total_steps = (t.steps - steps_before) * epochs;
@@ -1557,6 +1666,7 @@ TrainReport spingalett_train_args(TrainArgs args) {
                 if (t.best_params) {
                     spingalett_network_sync(net);
                     save_params(t.best_params, net);
+                    t.best_held = true;
                 }
             } else {
                 epochs_without_improvement++;
@@ -1569,6 +1679,11 @@ TrainReport spingalett_train_args(TrainArgs args) {
                                args.lr_plateau_patience, (double)t.lr_scale);
             }
         }
+
+        run_capture(&t, epoch, &report, best, epochs_without_improvement, stale);
+        if (epoch == first && spingalett_generator_watched().pending)
+            spingalett_log(LOG_WARNING, "The run read a data set reader through spingalett_dataset_generator, and this "
+                           "call does not: its samples are not the run's");
 
         if (should_report(epoch, epochs, args.report_interval)) {
             char lr_text[32] = "", val_text[64] = "";
@@ -1629,12 +1744,18 @@ TrainReport spingalett_train_args(TrainArgs args) {
             atomic_store(&net->gpu_newer, false);
         }
     }
-    if (t.best_params && report.best_epoch > 0 && report.best_epoch != report.epochs_run) {
+    if (t.best_held && report.best_epoch != run_done + report.epochs_run) {
         spingalett_network_sync(net);
         restore_params(net, t.best_params);
         report.restored_best = true;
         spingalett_log(LOG_INFO, "Restored the weights of epoch %zu", report.best_epoch);
     }
+    /* The run's state outlives the call, but not the trainer's copy of the best parameters; nor does a
+       run cut short whose parameters went back to its best epoch: it no longer stands where it stopped. */
+    net->run.best_params = NULL;
+    if (report.restored_best && report.status != TRAIN_COMPLETED && report.status != TRAIN_EARLY_STOPPED)
+        net->run.valid = false;
+    if (use_generator) spingalett_generator_watch(NULL);
 
 #if defined(SPINGALETT_OPENBLAS_THREAD_CONTROL)
     if (saved_blas_threads > 0)

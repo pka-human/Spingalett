@@ -2310,6 +2310,37 @@ bool spingalett_dataset_set_position(SpingalettDatasetReader *r, const Spingalet
     return ok;
 }
 
+/* What spingalett_dataset_generator() read on this thread since a training run began to watch, and the
+   place it moves the next reader it reads to (spingalett_generator_watch()). */
+static _Thread_local struct {
+    GeneratorWatch seen;
+    SpingalettDatasetPosition at;
+} watch;
+
+void spingalett_generator_watch(const SpingalettDatasetPosition *at) {
+    memset(&watch, 0, sizeof watch);
+    if (at) {
+        watch.seen.pending = true;
+        watch.at = *at;
+    }
+}
+
+GeneratorWatch spingalett_generator_watched(void) {
+    return watch.seen;
+}
+
 uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader) {
-    return spingalett_dataset_read((SpingalettDatasetReader *)reader, inputs, targets, requested);
+    SpingalettDatasetReader *r = (SpingalettDatasetReader *)reader;
+    if (r && watch.seen.pending) {
+        watch.seen.pending = false;
+        if (!spingalett_dataset_set_position(r, &watch.at)) {
+            watch.seen.failed = true;
+            return 0;
+        }
+    }
+    if (r && r != watch.seen.reader) {
+        watch.seen.several |= watch.seen.reader != NULL;
+        watch.seen.reader = r;
+    }
+    return spingalett_dataset_read(r, inputs, targets, requested);
 }

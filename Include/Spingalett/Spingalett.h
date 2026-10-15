@@ -122,7 +122,8 @@ typedef enum {
 
 /* State of a spingalett_train() call, passed to the epoch callback. */
 typedef struct {
-    size_t epoch;                   /* epochs completed in this call (1-based) */
+    size_t epoch;                   /* the epoch just completed, of the run (1-based): a run resumed from a
+                                       checkpoint counts on from the checkpoint's epochs */
     size_t epochs;                  /* SpingalettTrainArgs.epochs */
     float train_loss;               /* mean training loss of this epoch */
     float learning_rate;            /* learning rate used in this epoch */
@@ -150,7 +151,7 @@ typedef enum {
 /* Result of spingalett_train(). */
 typedef struct {
     SpingalettTrainStatus status;
-    size_t epochs_run;
+    size_t epochs_run;              /* epochs this call ran (a resumed run: those after its checkpoint's) */
     float train_loss;               /* mean training loss of the last epoch */
     bool has_validation;
     SpingalettEvalMetrics validation;         /* validation metrics of the last epoch */
@@ -172,11 +173,11 @@ typedef struct {
 typedef uint32_t (*SpingalettDataGeneratorFn)(float *inputs, float *targets, uint32_t requested, void *user_data);
 
 /*
- * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs already
- * completed in this spingalett_train() call (0 for the first), `initial_lr` is SpingalettTrainArgs.learning_rate.
- * Returns the learning rate for the coming epoch; negative or NaN results are ignored. With
- * SpingalettTrainArgs.lr_per_step it is called before every optimizer step instead, with the steps
- * taken in this call (0 for the first) and the steps the call takes in all in place of the epochs.
+ * Learning-rate schedule, called before every epoch. `epoch` is the number of epochs of the run already
+ * completed (0 for the first; a run resumed from a checkpoint counts its checkpoint's), `initial_lr` is
+ * SpingalettTrainArgs.learning_rate. Returns the learning rate for the coming epoch; negative or NaN results
+ * are ignored. With SpingalettTrainArgs.lr_per_step it is called before every optimizer step instead, with the
+ * steps the run has taken (0 for the first) and the steps it takes in all in place of the epochs.
  */
 typedef float (*SpingalettLRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_lr, void *user_data);
 
@@ -295,7 +296,8 @@ typedef struct {
                                        (0 = until the generator returns 0; required for full batch) */
     uint32_t batch_size;
     bool do_not_shuffle;            /* keep sample order (per-sample and mini-batch training) */
-    size_t epochs;
+    size_t epochs;                  /* epochs of the run, which for the train() after
+                                       spingalett_load_checkpoint() include those the checkpoint ran */
 
     float learning_rate;
     float weight_decay;
@@ -305,11 +307,14 @@ typedef struct {
     float epsilon;
     float max_grad_norm;            /* clip the global L2 norm of each step's gradient; 0 = off */
 
-    bool reset_optimizer;
+    bool reset_optimizer;           /* zero the moments and the step count; a run from a checkpoint
+                                       begins anew */
     size_t nan_check_interval;
 
     size_t report_interval;
 
+    /* Saves every autosave_interval epochs; one in SPINGALETT_PRECISION_FLOAT32 with the optimizer
+       state (the defaults) is a checkpoint, as spingalett_save_checkpoint() writes. */
     SpingalettAutoSaveMode autosave_mode;
     size_t autosave_interval;
     const char *autosave_path;
@@ -692,6 +697,33 @@ SPINGALETT_API void *spingalett_save_to_memory(const SpingalettNetwork *net, Spi
 SPINGALETT_API SpingalettNetwork *spingalett_load_from_memory(const void *data, size_t size);
 /* Releases memory the library returned (spingalett_save_to_memory). */
 SPINGALETT_API void spingalett_free(void *ptr);
+
+/*
+ * Checkpoints: a network with its optimizer state and the state of the spingalett_train() run that trained
+ * it, as its last epoch left it, so that a run stopped there and carried on trains the bits of one that never
+ * stopped, on any number of threads. The run's state: the seeds of its dropout masks, of its augmentations and
+ * of its epochs' orders, the optimizer's bias corrections as its steps multiplied them, its epochs and steps,
+ * its schedule's rate and reduce-on-plateau's scale, its best epoch and patience, and, with
+ * restore_best_weights, the best epoch's parameters, and the place of the reader it read through
+ * spingalett_dataset_generator(). A checkpoint is a FLOAT32 .slett image with a record of the run after it:
+ * spingalett_load() and the runtime read it as a model (docs/ModelFormat.md).
+ *
+ * The train() after spingalett_load_checkpoint() carries the run on, with .epochs the run's epochs in all
+ * (those the checkpoint ran included: the call that started the run, given again, finishes it) and the rest
+ * of its arguments the run's: it runs the epochs left, moves the reader of spingalett_dataset_generator() to
+ * the run's place, and its schedule, callback and best epoch count the run's epochs. A run whose epochs
+ * all ran, or that stopped early, has none left. The train() after that one, or one with .reset_optimizer,
+ * begins a run of its own, as every train() of a network made or loaded as a model does.
+ *
+ * Write checkpoints between epochs: from the callback, or after train() returns. A call that stops early
+ * and restores the best epoch's parameters leaves no run to carry on (what it stopped at is gone).
+ */
+/* Writes net's checkpoint to path, as given. A network that has not trained, or has taken steps since its
+   run's last epoch (the step API), is written without a run's state. False on error. */
+SPINGALETT_API bool spingalett_save_checkpoint(SpingalettNetwork *net, const char *path);
+/* Reads a checkpoint, or a .slett model, which loads without a run's state. NULL on error, also for bytes
+   after a model's image that are no sound record of a run. */
+SPINGALETT_API SpingalettNetwork *spingalett_load_checkpoint(const char *path);
 
 /*
  * ONNX import: a model of the operators Spingalett has (Conv and ConvTranspose with groups, Gemm,

@@ -9,7 +9,7 @@
  * cross-backend comparisons then pass trivially.
  *
  *   Spingalett.Tests [group]     groups: grad conv norm graph onnx tokenizer pretrained equiv cont optim sched
- *                                dropout gen predict valid step data io model xor
+ *                                dropout gen predict valid step data resume io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -2664,6 +2664,546 @@ static void dataset_positions(void) {
     remove(spath);
     for (int file = 0; file < 2; file++) remove(tpaths[file]);
     printf("  positions: %u token windows and %u samples of %u chunks resume where they stood\n", tcount, ccount, chunks);
+}
+
+/* ---------------- checkpoints: a run stopped at an epoch's end and carried on */
+
+/* What a run's callback logs: every epoch's loss, and the epoch of the run with the epochs of the
+   run — what a learning-rate schedule is given, so that a resumed call that counted only its own
+   epochs or its own total shows at once. stop_at interrupts the run after that many epochs, which is
+   where its checkpoint is written. */
+typedef struct {
+    float loss[64];
+    size_t epoch[64], total[64];
+    uint32_t count, stop_at;
+    bool draw;                  /* the callback draws from the library's generator, as building a network does */
+    const char *checkpoint;     /* written by the callback at stop_at */
+} RunLog;
+
+static bool log_run_epoch(NeuralNetwork *net, const TrainProgress *p, void *data) {
+    RunLog *l = (RunLog *)data;
+    if (l->draw) {
+        NeuralNetwork *other = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = other, .neurons_amount = 5);
+        layer(.net = other, .neurons_amount = 7, .act_func = ACT_TANH);
+        free_network(other);
+    }
+    if (l->count < sizeof l->loss / sizeof l->loss[0]) {
+        l->loss[l->count] = p->train_loss;
+        l->epoch[l->count] = p->epoch;
+        l->total[l->count] = p->epochs;
+    }
+    l->count++;
+    const bool stop = l->stop_at != 0 && l->count == l->stop_at;
+    if (stop && l->checkpoint && !spingalett_save_checkpoint(net, l->checkpoint)) l->count += 1000;
+    return stop;
+}
+
+/* The entries of two runs' logs that differ in any bit, plus a count that differs. */
+static uint32_t log_diff(const RunLog *a, const RunLog *b) {
+    uint32_t d = a->count != b->count ? 1u : 0u;
+    for (uint32_t i = 0; i < a->count && i < b->count; i++) {
+        if (memcmp(&a->loss[i], &b->loss[i], sizeof(float))) d++;
+        if (a->epoch[i] != b->epoch[i] || a->total[i] != b->total[i]) d++;
+    }
+    return d;
+}
+
+/* Floats that differ in any bit. */
+static uint64_t bit_diff(const float *a, const float *b, uint64_t n) {
+    uint64_t d = 0;
+    for (uint64_t i = 0; i < n; i++) if (memcmp(a + i, b + i, sizeof(float))) d++;
+    return d;
+}
+
+/* As bit_diff, for the arrays a run makes when it needs them: one side without the other is a
+   difference, and neither side's absence one of none. */
+static uint64_t array_diff(const float *a, const float *b, uint64_t n) {
+    if (!a || !b) return a == b ? 0u : 1u;
+    return bit_diff(a, b, n);
+}
+
+static NeuralNetwork *resume_dense_net(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = 6);
+    layer(.net = net, .neurons_amount = 12, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE,
+          .dropout_rate = 0.3f);
+    layer(.net = net, .neurons_amount = 8, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+    return net;
+}
+
+static NeuralNetwork *resume_conv_net(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 6, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE, .dropout_rate = 0.25f);
+    max_pool2d(.net = net, .kernel = 2);
+    conv2d(.net = net, .filters = 5, .kernel = 3, .padding = 1, .act_func = ACT_SIGMOID);
+    batch_norm(.net = net, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+    return net;
+}
+
+/* A small language model over cells of token indices, what the windows of a token file train. */
+static NeuralNetwork *resume_lm_net(uint32_t cells, uint32_t vocab) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = cells);
+    embedding(.net = net, .vocabulary = vocab, .neurons_amount = 8, .positions = true,
+              .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    linear(.net = net, .neurons_amount = 24, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    attention(.net = net, .heads = 2, .kv_heads = 2, .causal = true);
+    linear(.net = net, .neurons_amount = vocab, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    return net;
+}
+
+static NeuralNetwork *resume_net(int which, uint32_t cells, uint32_t vocab) {
+    return which == 0 ? resume_dense_net() : which == 1 ? resume_conv_net() : resume_lm_net(cells, vocab);
+}
+
+/* A schedule of the whole run's epochs, so that a resumed run must know how many the run holds. */
+static float resume_lr(size_t epoch, size_t total_epochs, float initial_lr, void *data) {
+    (void)data;
+    return initial_lr * (float)(1.0 - 0.5 * (double)epoch / (double)(total_epochs ? total_epochs : 1));
+}
+
+/* The GPU's mode for the runs of resume_case() (COMPUTE_SINGLE_THREADED: the CPU, by thread count). */
+static ComputeMode resume_gpu = COMPUTE_SINGLE_THREADED;
+
+static void resume_compute(uint32_t threads) {
+    if (resume_gpu != COMPUTE_SINGLE_THREADED) {
+        spingalett_set_compute_mode(resume_gpu);
+        return;
+    }
+    spingalett_set_compute_mode(threads > 1 ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+    spingalett_set_num_threads(threads);
+}
+
+/* n tokens of a file of nanoGPT's shape (uint16, little-endian), each below vocab. */
+static bool write_token_file(const char *path, uint32_t n, uint32_t vocab) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = true;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t t = (i * 37u + 5u) % vocab;
+        const uint8_t b[2] = {(uint8_t)t, (uint8_t)(t >> 8)};
+        ok = ok && fwrite(b, 1, 2, f) == 2;
+    }
+    fclose(f);
+    return ok;
+}
+
+/* A reader of the case's stream, drawn from the library's generator as the run's first one was;
+   NULL for a case that trains on arrays. */
+static SpingalettDatasetReader *resume_open(int source, const char *dspath, const char *tokpath, uint32_t cells) {
+    if (source == 3) {
+        const SpingalettTokenReaderOptions o = {.context = cells, .stride = 1, .shuffle = true};
+        return spingalett_dataset_open_tokens(tokpath, &o);
+    }
+    if (source == 0) return NULL;
+    const DatasetReaderOptions o = {.shuffle = true, .in_memory = source == 2};
+    return spingalett_dataset_open_ex(dspath, &o);
+}
+
+struct ResumeCase {
+    const char *name;
+    int net;            /* 0 dense, 1 convolutional, 2 a language model */
+    int source;         /* 0 arrays, 1 a streamed .slettd, 2 a .slettd kept in memory, 3 a token file */
+    bool augment, scheduler, validate, plateau, early_stop, restore_best, per_step, draw, autosave;
+    uint32_t accumulate;
+    OptimizerType opt;
+    uint32_t samples, batch, first, rest;
+    uint32_t threads[3];    /* the run that never stops, the run before the checkpoint, the one after it */
+};
+
+/* Trains the case's network for first + rest epochs without stopping, and the same run stopped after
+   `first` epochs, its checkpoint written (by the callback, or by the autosave), and carried on by the
+   train() after spingalett_load_checkpoint(), with the process's generator reseeded otherwise, its
+   reader opened afresh, on the case's third thread count. The parameters, the optimizer's moments, the
+   running statistics, the last step's gradients, the step count and every epoch's loss, epoch number
+   and total must come out the same bits, and so must the reports. */
+static void resume_case(const struct ResumeCase *c) {
+    const char *dspath = "spingalett_test_resume.slettd", *ckpath = "spingalett_test_resume.ckpt",
+               *tokpath = "spingalett_test_resume_tok.bin";
+    const uint32_t cells = 6, vocab = 64, ntok = 400;
+    const uint32_t in = c->net == 0 ? 6 : c->net == 1 ? 8u * 8u * 3u : cells;
+    const uint32_t out = c->net == 2 ? vocab : 3;
+    const size_t total = c->first + c->rest;
+    bool ok = true;
+
+    lcg_state = 90210;
+    float *x = NULL, *y = NULL, *vx = NULL, *vy = NULL;
+    if (c->source != 3) make_data(c->samples, in, out, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    if (c->validate) {
+        lcg_state = 4242;
+        make_data(24, in, out, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &vx, &vy);
+    }
+    if (c->source == 1 || c->source == 2) {           /* the same samples in a .slettd file */
+        SpingalettDataset d = {0};
+        make_ds(&d, c->samples, in, out);
+        memcpy(d.inputs, x, (size_t)c->samples * in * sizeof(float));
+        memcpy(d.targets, y, (size_t)c->samples * out * sizeof(float));
+        const DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32,
+                                       .target_encoding = DATASET_ENCODING_FLOAT32, .no_compression = true};
+        ok = ok && spingalett_save_dataset(&d, dspath, &so);
+        spingalett_dataset_free(&d);
+    }
+    if (c->source == 3) ok = ok && write_token_file(tokpath, ntok, vocab);
+    CHECK(ok, "resume: the data of %s", c->name);
+    if (!ok) return;
+
+    TrainArgs args = {0};
+    args.epochs = total;
+    args.learning_rate = 0.05f;
+    args.optimizer_type = c->opt;
+    args.training_strategy = STRATEGY_SMALL_BATCH;
+    args.batch_size = c->batch;
+    args.accumulation_steps = c->accumulate;
+    args.augment_shift = c->augment ? 1u : 0u;
+    args.augment_flip = c->augment;
+    args.callback = log_run_epoch;
+    args.callback_interval = 1;
+    args.early_stopping_min_delta = 1000.0f;      /* only the first epoch's value counts as an improvement */
+    args.restore_best_weights = c->restore_best;
+    SpingalettLRScheduleParams warmup = {.warmup_epochs = 5};
+    if (c->scheduler) args.lr_scheduler = resume_lr;
+    if (c->per_step) {
+        args.lr_scheduler = spingalett_lr_warmup_cosine;
+        args.lr_scheduler_data = &warmup;
+        args.lr_per_step = true;
+    }
+    if (c->validate) {
+        args.val_inputs = vx;
+        args.val_targets = vy;
+        args.val_count = 24;
+    }
+    if (c->plateau) { args.lr_plateau_patience = 1; args.lr_plateau_factor = 0.5f; args.lr_plateau_min_lr = 0.001f; }
+    if (c->early_stop) args.early_stopping_patience = 2;
+    if (c->source) {
+        args.training_mode = MODE_GENERATOR_FUNCTION;
+        args.generator = spingalett_dataset_generator;
+    } else {
+        args.inputs = x;
+        args.targets = y;
+        args.sample_count = c->samples;
+    }
+
+    /* the run that never stops */
+    RunLog cont = {.draw = c->draw}, stop = {.draw = c->draw};
+    resume_compute(c->threads[0]);
+    spingalett_seed(777);
+    SpingalettDatasetReader *rc = resume_open(c->source, dspath, tokpath, cells);
+    if (rc) args.sample_count = spingalett_dataset_info(rc).count;
+    NeuralNetwork *a = resume_net(c->net, cells, vocab);
+    args.net = a;
+    args.callback_data = &cont;
+    args.generator_data = rc;
+    TrainReport ra = train_struct_arguments(args);
+    const TrainStatus want = c->early_stop ? TRAIN_EARLY_STOPPED : TRAIN_COMPLETED;
+    CHECK(ra.status == want, "resume: the continuous run (%s): status %d", c->name, ra.status);
+
+    /* the same run, stopped at the checkpoint, as if the process ended there */
+    resume_compute(c->threads[1]);
+    spingalett_seed(777);
+    SpingalettDatasetReader *r1 = resume_open(c->source, dspath, tokpath, cells);
+    if (r1) args.sample_count = spingalett_dataset_info(r1).count;
+    NeuralNetwork *net = resume_net(c->net, cells, vocab);
+    args.net = net;
+    args.callback_data = &stop;
+    args.generator_data = r1;
+    stop.stop_at = c->first;
+    if (c->autosave) {
+        args.autosave_mode = AUTOSAVE_OVERWRITE;
+        args.autosave_interval = 1;
+        args.autosave_path = ckpath;
+    } else {
+        stop.checkpoint = ckpath;
+    }
+    TrainReport rb = train_struct_arguments(args);
+    args.autosave_mode = AUTOSAVE_OFF;
+    ok = rb.status == TRAIN_INTERRUPTED && rb.epochs_run == c->first && stop.count == c->first;
+    CHECK(ok, "resume: the run before the checkpoint (%s): status %d, %zu epochs", c->name, rb.status, rb.epochs_run);
+    free_network(net);
+    if (r1) spingalett_dataset_close(r1);
+    if (!ok) goto done;
+
+    resume_compute(c->threads[2]);
+    spingalett_seed(4242);                  /* a fresh process draws otherwise: the checkpoint decides */
+    SpingalettDatasetReader *r2 = resume_open(c->source, dspath, tokpath, cells);
+    if (r2) args.sample_count = spingalett_dataset_info(r2).count;
+    NeuralNetwork *back = spingalett_load_checkpoint(ckpath);
+    CHECK(back != NULL && back->run.resume, "resume: loading the checkpoint of %s", c->name);
+    if (!back) goto done;
+    args.net = back;
+    stop.stop_at = 0;                       /* the call given again runs the run to its end */
+    stop.checkpoint = NULL;
+    args.callback_data = &stop;
+    args.generator_data = r2;
+    TrainReport rd = train_struct_arguments(args);
+    CHECK(rd.status == ra.status && rd.epochs_run == cont.count - c->first && rd.best_epoch == ra.best_epoch &&
+          rd.restored_best == ra.restored_best && !memcmp(&rd.best_value, &ra.best_value, sizeof(float)) &&
+          (rd.epochs_run == 0 || !memcmp(&rd.train_loss, &ra.train_loss, sizeof(float))),
+          "resume: the run after it (%s: status %d, %zu epochs, %u logged, best %zu against %zu)", c->name, rd.status,
+          rd.epochs_run, cont.count, rd.best_epoch, ra.best_epoch);
+
+    /* the files of the two (which bring a GPU's parameters and moments back first) */
+    size_t sa = 0, sb = 0;
+    void *ia = spingalett_save_to_memory(a, PRECISION_FLOAT32, true, &sa);
+    void *ib = spingalett_save_to_memory(back, PRECISION_FLOAT32, true, &sb);
+    uint64_t d = log_diff(&cont, &stop) + (!ia || !ib || sa != sb || memcmp(ia, ib, sa) ? 1u : 0u);
+    spingalett_free(ia);
+    spingalett_free(ib);
+    const uint64_t w = back->total_weights, b = back->total_biases;
+    for (uint32_t i = 0; d && i < cont.count && i < stop.count; i++)
+        if (memcmp(&cont.loss[i], &stop.loss[i], sizeof(float)) || cont.epoch[i] != stop.epoch[i] ||
+            cont.total[i] != stop.total[i])
+            printf("    loss %u: epoch %zu of %zu %.9g against epoch %zu of %zu %.9g\n", i, cont.epoch[i],
+                   cont.total[i], (double)cont.loss[i], stop.epoch[i], stop.total[i], (double)stop.loss[i]);
+    d += array_diff(a->weights, back->weights, w);
+    d += array_diff(a->biases, back->biases, b);
+    d += array_diff(a->opt_m_weights, back->opt_m_weights, w);
+    d += array_diff(a->opt_v_weights, back->opt_v_weights, w);
+    d += array_diff(a->opt_m_biases, back->opt_m_biases, b);
+    d += array_diff(a->opt_v_biases, back->opt_v_biases, b);
+    d += array_diff(a->running_mean, back->running_mean, b);
+    d += array_diff(a->running_var, back->running_var, b);
+    if (rd.epochs_run && resume_gpu == COMPUTE_SINGLE_THREADED) {     /* (no gradients in a checkpoint, nor
+                                                                         brought back from a GPU) */
+        d += array_diff(a->grad_weights, back->grad_weights, w);
+        d += array_diff(a->grad_biases, back->grad_biases, b);
+    }
+    if (a->time_step != back->time_step || a->run.epochs != back->run.epochs || a->run.valid != back->run.valid) d++;
+    char where[48];
+    if (resume_gpu != COMPUTE_SINGLE_THREADED) snprintf(where, sizeof where, "the GPU");
+    else snprintf(where, sizeof where, "%u/%u/%u threads", c->threads[0], c->threads[1], c->threads[2]);
+    printf("  resume %-30s: %u+%u epochs on %s, %u losses, %llu weights: %llu differ\n", c->name, c->first, c->rest,
+           where, cont.count, (unsigned long long)w, (unsigned long long)d);
+    CHECK(d == 0, "resume: %s differs from the run that never stopped in %llu places", c->name, (unsigned long long)d);
+
+    free_network(back);
+    if (r2) spingalett_dataset_close(r2);
+done:
+    free_network(a);
+    if (rc) spingalett_dataset_close(rc);
+    free(x); free(y); free(vx); free(vy);
+    remove(ckpath);
+    if (c->source == 1 || c->source == 2) remove(dspath);
+    if (c->source == 3) remove(tokpath);
+}
+
+/* Reads a whole file; NULL when it cannot. */
+static uint8_t *read_all(const char *path, size_t *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    *size = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *bytes = (uint8_t *)malloc(*size ? *size : 1);
+    if (bytes && fread(bytes, 1, *size, f) != *size) { free(bytes); bytes = NULL; }
+    fclose(f);
+    return bytes;
+}
+
+static bool write_all(const char *path, const uint8_t *bytes, size_t size) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(bytes, 1, size, f) == size;
+    return fclose(f) == 0 && ok;
+}
+
+/* What checkpoints refuse, what a model file gives back, and the runs that follow a resumed one. */
+static void checkpoint_cases(void) {
+    const char *ckpath = "spingalett_test_ck.ckpt", *mpath = "spingalett_test_ck_model.slett";
+    const uint32_t N = 32;
+    lcg_state = 21;
+    float *x = NULL, *y = NULL;
+    make_data(N, 6, 3, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    const TrainArgs base = {.inputs = x, .targets = y, .sample_count = N, .epochs = 2, .learning_rate = 0.05f,
+                            .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH,
+                            .batch_size = 8};
+    resume_compute(1);
+
+    CHECK(!spingalett_save_checkpoint(NULL, ckpath) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "checkpoints: a save of no network");
+    CHECK(!spingalett_load_checkpoint(NULL) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+          !spingalett_load_checkpoint("spingalett_test_missing.ckpt") &&
+          spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO, "checkpoints: a load of no file");
+
+    /* a run of 2 epochs: given again it has none left; a call of 3 runs one; the call after that is a run
+       of its own, which a network made the same way and trained by two calls also gives */
+    spingalett_seed(5);
+    NeuralNetwork *net = resume_dense_net();
+    TrainArgs args = base;
+    args.net = net;
+    train_struct_arguments(args);
+    CHECK(spingalett_save_checkpoint(net, ckpath), "checkpoints: the save of a run");
+    NeuralNetwork *held = spingalett_load_checkpoint(ckpath);
+    CHECK(held && held->run.resume && held->run.epochs == 2, "checkpoints: the run's state loaded");
+    if (held) {
+        args.net = held;
+        args.epochs = 1;
+        TrainReport r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_FAILED && held->run.resume, "checkpoints: a resumed run of fewer epochs than it ran");
+        args.epochs = 2;
+        r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_COMPLETED && r.epochs_run == 0 && held->time_step == net->time_step &&
+              !bit_diff(held->weights, net->weights, net->total_weights), "checkpoints: a run with no epochs left");
+        free_network(held);
+    }
+    held = spingalett_load_checkpoint(ckpath);
+    if (held) {
+        args.net = held;
+        args.epochs = 3;
+        TrainReport r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_COMPLETED && r.epochs_run == 1 && held->run.epochs == 3 && !held->run.resume,
+              "checkpoints: a resumed run ran %zu epochs", r.epochs_run);
+        /* the call after it trains as on the same network saved as a model: a run of its own */
+        CHECK(save_spingalett(.net = held, .filename = mpath), "checkpoints: the resumed network as a model");
+        NeuralNetwork *twin = spingalett_load(mpath);
+        if (twin) {
+            args.epochs = 2;
+            spingalett_seed(9);
+            TrainReport rh = train_struct_arguments(args);
+            args.net = twin;
+            spingalett_seed(9);
+            r = train_struct_arguments(args);
+            CHECK(rh.status == TRAIN_COMPLETED && rh.epochs_run == 2 && r.epochs_run == 2 && held->run.epochs == 2 &&
+                  held->time_step == twin->time_step && !bit_diff(held->weights, twin->weights, twin->total_weights),
+                  "checkpoints: the run after a resumed one is a run of its own");
+        }
+        free_network(twin);
+        free_network(held);
+    }
+
+    /* .reset_optimizer: a new run, not the checkpoint's */
+    held = spingalett_load_checkpoint(ckpath);
+    if (held) {
+        args = base;
+        args.net = held;
+        args.reset_optimizer = true;
+        TrainReport r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_COMPLETED && r.epochs_run == 2 && held->time_step == net->time_step &&
+              !held->run.resume, "checkpoints: reset_optimizer ran %zu epochs", r.epochs_run);
+        free_network(held);
+    }
+
+    /* a network that stepped since its run's last epoch (the step API) is written without the run */
+    SpingalettTrainer *tr = spingalett_trainer_new(net, 8);
+    const SpingalettOptimizerArgs adam = {.type = OPTIMIZER_ADAM, .learning_rate = 0.01f};
+    if (tr) spingalett_train_on_batch(tr, x, y, 8, &adam);
+    spingalett_trainer_free(tr);
+    CHECK(spingalett_save_checkpoint(net, ckpath), "checkpoints: the save of a network that stepped");
+    held = spingalett_load_checkpoint(ckpath);
+    CHECK(held && !held->run.resume && !held->run.valid && held->time_step == net->time_step,
+          "checkpoints: a network that stepped since its run");
+    free_network(held);
+
+    /* a model file is a checkpoint without a run; a checkpoint is a model, also to the runtime */
+    CHECK(save_spingalett(.net = net, .filename = mpath), "checkpoints: the save of a model");
+    held = spingalett_load_checkpoint(mpath);
+    CHECK(held && !held->run.valid && !held->run.resume, "checkpoints: a model loads without a run");
+    free_network(held);
+    args = base;
+    args.net = net;
+    train_struct_arguments(args);
+    CHECK(spingalett_save_checkpoint(net, ckpath), "checkpoints: the save of a second run");
+    NeuralNetwork *as_model = spingalett_load(ckpath);
+    CHECK(as_model && !bit_diff(as_model->weights, net->weights, net->total_weights) &&
+          as_model->time_step == net->time_step && !as_model->run.valid, "checkpoints: a checkpoint read as a model");
+    free_network(as_model);
+    SpingalettModel *dm = spingalett_model_load(ckpath);
+    CHECK(dm != NULL, "checkpoints: a checkpoint read as a deployment model");
+    spingalett_model_free(dm);
+
+    /* a record with a bit changed, one cut short, one with a byte more */
+    size_t size = 0;
+    uint8_t *bytes = read_all(ckpath, &size);
+    uint64_t image = 0;
+    if (bytes && size >= 32) memcpy(&image, bytes + 24, 8);
+    const bool whole = bytes && image >= 64 && image + 156 <= size;
+    CHECK(whole, "checkpoints: the image of the file (%llu of %zu bytes)", (unsigned long long)image, size);
+    if (whole) {
+        bytes[image + 48] ^= 0x10u;                  /* the dropout seed */
+        CHECK(write_all(ckpath, bytes, size) && !spingalett_load_checkpoint(ckpath) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: a corrupt record accepted");
+        bytes[image + 48] ^= 0x10u;
+        CHECK(write_all(ckpath, bytes, size - 4) && !spingalett_load_checkpoint(ckpath),
+              "checkpoints: a record cut short accepted");
+        uint8_t *more = (uint8_t *)malloc(size + 1);
+        if (more) {
+            memcpy(more, bytes, size);
+            more[size] = 0;
+            CHECK(write_all(ckpath, more, size + 1) && !spingalett_load_checkpoint(ckpath),
+                  "checkpoints: a record with a byte more accepted");
+            free(more);
+        }
+        CHECK(write_all(ckpath, bytes, (size_t)image + 3) && !spingalett_load_checkpoint(ckpath),
+              "checkpoints: 3 bytes after a model accepted");
+        CHECK(write_all(ckpath, bytes, size) && (held = spingalett_load_checkpoint(ckpath)) && held->run.resume,
+              "checkpoints: the file put back");
+        free_network(held);
+    }
+    free(bytes);
+    remove(ckpath);
+    remove(mpath);
+    free_network(net);
+    free(x); free(y);
+}
+
+static void resume_runs(void) {
+    static const struct ResumeCase cases[] = {
+        {"dense adam dropout", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 5,
+         .threads = {4, 4, 4}},
+        {"dense sgd-momentum", 0, 0, .opt = OPTIMIZER_MOMENTUM, .samples = 64, .batch = 16, .first = 2, .rest = 4,
+         .threads = {4, 4, 4}},
+        {"dense adam, 1 thread", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 2, .rest = 3,
+         .threads = {1, 1, 1}},
+        {"dense adam, threads change", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 2,
+         .rest = 4, .threads = {4, 4, 1}},
+        {"dense adam, schedule of run", 0, 0, .scheduler = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 3, .rest = 4, .threads = {4, 4, 4}},
+        {"dense adam, schedule by step", 0, 0, .per_step = true, .opt = OPTIMIZER_ADAM, .samples = 60, .batch = 16,
+         .first = 2, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, accumulation", 0, 0, .accumulate = 2, .opt = OPTIMIZER_ADAM, .samples = 72, .batch = 8,
+         .first = 2, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, plateau", 0, 0, .scheduler = true, .validate = true, .plateau = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 2, .rest = 4, .threads = {4, 4, 4}},
+        {"dense adam, early stop", 0, 0, .early_stop = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 1, .rest = 5, .threads = {4, 4, 4}},
+        {"dense adam, stopped at the end", 0, 0, .early_stop = true, .restore_best = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 3, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, best before", 0, 0, .validate = true, .restore_best = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 3, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, best at the stop", 0, 0, .validate = true, .restore_best = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 1, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, callback draws", 0, 0, .draw = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 2, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, autosaved", 0, 0, .validate = true, .restore_best = true, .autosave = true,
+         .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 2, .threads = {4, 4, 4}},
+        {"conv adam dropout", 1, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 3,
+         .threads = {4, 4, 4}},
+        {"conv adam, augmented", 1, 0, .augment = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 2, .rest = 4, .threads = {4, 4, 4}},
+        {"conv sgd-momentum", 1, 0, .opt = OPTIMIZER_MOMENTUM, .samples = 64, .batch = 16, .first = 2, .rest = 2,
+         .threads = {4, 4, 4}},
+        {"conv reader, streamed", 1, 1, .opt = OPTIMIZER_ADAM, .samples = 1024, .batch = 128, .first = 2,
+         .rest = 2, .threads = {4, 4, 4}},
+        {"conv reader, augmented", 1, 1, .augment = true, .opt = OPTIMIZER_ADAM, .samples = 1024, .batch = 128,
+         .first = 2, .rest = 3, .threads = {4, 4, 1}},
+        {"conv reader, autosaved", 1, 1, .autosave = true, .opt = OPTIMIZER_ADAM, .samples = 1024, .batch = 128,
+         .first = 1, .rest = 2, .threads = {4, 4, 4}},
+        {"conv reader, in memory", 1, 2, .opt = OPTIMIZER_ADAMW, .samples = 1024, .batch = 128, .first = 3,
+         .rest = 2, .threads = {4, 1, 4}},
+        {"language model, tokens", 2, 3, .opt = OPTIMIZER_ADAM, .batch = 32, .first = 2, .rest = 3,
+         .threads = {4, 4, 4}},
+        {"language model, schedule", 2, 3, .scheduler = true, .opt = OPTIMIZER_SGD, .batch = 32, .first = 3,
+         .rest = 3, .threads = {4, 4, 4}},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) resume_case(&cases[i]);
+    checkpoint_cases();
+    resume_compute(4);
+    printf("  checkpoints: %u runs of two parts trained the bits of one that never stopped\n",
+           (unsigned)(sizeof cases / sizeof *cases));
 }
 
 /* ---------------------------------------------------------------- deployment models (format 3) */
@@ -6420,6 +6960,8 @@ static void gguf_errors(void) {
 
 /* ---- the GPU (COMPUTE_VULKAN, or COMPUTE_CUDA in the group "cuda") against the CPU ---- */
 
+static void gpu_resume(void);
+
 /* The compute mode of the GPU group's tests: gpu_mode, or COMPUTE_CUDA. */
 static ComputeMode gpu_mode = COMPUTE_VULKAN;
 
@@ -7387,6 +7929,26 @@ static void gpu_cross(uint32_t head, uint32_t kv, bool padding) {
     for (int r = 0; r < 4; r++) { free(pred[r]); free(step[r]); }
     free(x); free(t);
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Checkpoints of runs on the GPU: stopped, written, loaded and carried on there, to the bits of the run
+   that never stopped (its moments and parameters brought back for the checkpoint and sent again). */
+static void gpu_resume(void) {
+    static const struct ResumeCase cases[] = {
+        {"GPU dense adam dropout", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 2, .rest = 3},
+        {"GPU dense adam, best before", 0, 0, .validate = true, .restore_best = true, .scheduler = true,
+         .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 2},
+        {"GPU conv adam, augmented", 1, 0, .augment = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 2, .rest = 2},
+        {"GPU conv reader, streamed", 1, 1, .opt = OPTIMIZER_ADAMW, .samples = 1024, .batch = 128, .first = 1,
+         .rest = 2},
+        {"GPU language model, tokens", 2, 3, .opt = OPTIMIZER_ADAM, .batch = 32, .first = 2, .rest = 2},
+    };
+    const ComputeMode mode = spingalett_get_compute_mode();
+    resume_gpu = gpu_mode;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) resume_case(&cases[i]);
+    resume_gpu = COMPUTE_SINGLE_THREADED;
+    spingalett_set_compute_mode(mode);
 }
 
 /* A session of a model with sliding windows on the GPU attends over the last keys of its cache as the CPU's does:
@@ -8668,6 +9230,10 @@ int main(int argc, char **argv) {
         token_files();
         dataset_positions();
     }
+    if (!*only || !strcmp(only, "resume")) {
+        printf("[checkpoints]\n");
+        resume_runs();
+    }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");
         roundtrip(PRECISION_FLOAT32, 0.0f);
@@ -8745,6 +9311,7 @@ int main(int argc, char **argv) {
             gpu_cross(256, 2, true);
             tf_cross(gpu_mode);
             gpu_session_window();
+            gpu_resume();
             gpu_session(false);
             gpu_session(true);
             gpu_model_predict();

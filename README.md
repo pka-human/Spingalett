@@ -67,7 +67,7 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()`, sessions of language models (`spingalett_session_feed()`) |
 | Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
-| Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
+| Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format; checkpoints of training runs, which a stopped run carries on from to the bits of one that never stopped |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`) of CNNs, MLPs and transformers, PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
 | Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension); JavaScript and TypeScript for the inference engine in WebAssembly |
@@ -847,7 +847,7 @@ below.
 | `lr_scheduler`, `lr_scheduler_data` | none | Learning-rate schedule, see below |
 | `lr_per_step` | false | Evaluate the schedule before every optimizer step instead of every epoch |
 | `recompute` | false | Activation recomputation on the CPU: less memory for about one more forward pass, the same results (see below) |
-| `reset_optimizer` | false | Clear moment estimates and the step counter before training |
+| `reset_optimizer` | false | Clear moment estimates and the step counter before training (and begin a new run in place of a checkpoint's) |
 | `nan_check_interval` | 0 (off) | Stop when weights become NaN/Inf, checked every N epochs |
 | `report_interval` | 0 (off) | Log the training loss every N epochs |
 | `callback`, `callback_interval`, `callback_data` | none, 1, NULL | `bool cb(SpingalettNetwork *, const SpingalettTrainProgress *, void *callback_data)`; return `true` to stop |
@@ -855,8 +855,8 @@ below.
 | `monitor` | `SPINGALETT_MONITOR_AUTO` | Quantity that selects the best epoch: validation loss if there is validation data, else training loss; or `SPINGALETT_MONITOR_TRAIN_LOSS`, `SPINGALETT_MONITOR_VAL_LOSS`, `SPINGALETT_MONITOR_VAL_ACCURACY` |
 | `early_stopping_patience`, `early_stopping_min_delta` | 0 (off), 0 | Stop after this many epochs without an improvement larger than `min_delta` |
 | `restore_best_weights` | false | End with the weights and biases of the best epoch, kept in memory |
-| `autosave_mode`, `autosave_interval`, `autosave_path` | off | Periodic checkpoints (`SPINGALETT_AUTOSAVE_OVERWRITE` or `SPINGALETT_AUTOSAVE_NEW_FILES`, which appends `_epoch_N`) |
-| `autosave_precision`, `autosave_do_not_save_optimizer` | FP32, false | Checkpoint format |
+| `autosave_mode`, `autosave_interval`, `autosave_path` | off | Periodic saves (`SPINGALETT_AUTOSAVE_OVERWRITE` or `SPINGALETT_AUTOSAVE_NEW_FILES`, which appends `_epoch_N`): [checkpoints](#checkpoints) in FP32 with the optimizer state |
+| `autosave_precision`, `autosave_do_not_save_optimizer` | FP32, false | The saves' format: another precision, or no optimizer state, saves a model |
 | `blas_num_threads` | 0 (auto) | OpenBLAS threads during training, see [Backends](#backends-and-threading) |
 | `augment_shift`, `augment_flip` | 0, false | Image augmentation (the input layer has a height and width): each training sample is shifted by up to `augment_shift` cells along each axis, zeros shifted in, and with `augment_flip` mirrored left to right half of the time; drawn anew for every sample of every step, the same on any number of threads |
 
@@ -1171,6 +1171,38 @@ saved in version 4 (`SPINGALETT_FORMAT_VERSION`), which adds the layers' kinds a
 of dense layers only are still saved in version 3, so that the engines of earlier releases run them.
 Files of versions 1 and 2 remain loadable. `spingalett_load()` returns `NULL` for missing, truncated
 or corrupt files and for files with an invalid header.
+
+### Checkpoints
+
+A checkpoint holds a network with its optimizer state and the state of the `spingalett_train()` run
+that trained it, as its last epoch left it, so that a run stopped there (by its callback, by a crash
+after an autosave) and carried on trains the same bits as one that never stopped, on any number of
+threads:
+
+```c
+NeuralNetwork *net = spingalett_load_checkpoint("run.ckpt");   /* NULL: none yet */
+if (!net) net = build_network();
+SpingalettDatasetReader *r = spingalett_dataset_open("train.slettd", true);
+train(.net = net, .epochs = 30,                                /* the run's epochs, not those left */
+      .training_mode = MODE_GENERATOR_FUNCTION, .generator = spingalett_dataset_generator,
+      .generator_data = r, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 128,
+      .autosave_mode = AUTOSAVE_OVERWRITE, .autosave_interval = 1, .autosave_path = "run.ckpt");
+```
+
+The run's state is what its parameters and moments do not say: the seeds of its dropout masks, of its
+augmentations and of its epochs' orders (each epoch's order is drawn from the run's seed and the
+epoch's number), Adam's bias corrections as the steps multiplied them, its epochs and steps (which
+schedules count), reduce-on-plateau's scale, the best epoch and the patience of early stopping, with
+`restore_best_weights` the best epoch's parameters, and the place of the reader it read through
+`spingalett_dataset_generator()`, to which the resumed run moves its own reader. The `spingalett_train()`
+after `spingalett_load_checkpoint()` is given the run's arguments again, its `.epochs` all the run's
+epochs: it runs those left (none for a run that ran them all or stopped early), and its callback,
+schedule and best epoch count the run's epochs. The call after it, as every call on a network made or
+loaded with `spingalett_load()`, begins a run of its own; so does one with `.reset_optimizer`.
+`spingalett_save_checkpoint(net, path)` writes one from a callback or after training; an autosave in
+FP32 with the optimizer state is one. A checkpoint is a FLOAT32 image with a record of the run after
+it, so `spingalett_load()`, the engine and the runtime read it as a model
+([docs/ModelFormat.md](docs/ModelFormat.md#checkpoints)).
 
 ### Backends and threading
 

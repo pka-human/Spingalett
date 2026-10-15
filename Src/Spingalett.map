@@ -149,4 +149,6 @@ SPINGALETT_1.4 {
     global:
         spingalett_dataset_get_position;
         spingalett_dataset_set_position;
+        spingalett_load_checkpoint;
+        spingalett_save_checkpoint;
 } SPINGALETT_1.3;

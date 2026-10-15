@@ -8,6 +8,25 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Checkpoints of training runs**: `spingalett_save_checkpoint()` and `spingalett_load_checkpoint()` (in
+  Python `Network.save_checkpoint()` and `Network.load_checkpoint()`) keep a network, its optimizer state
+  and the state of the `spingalett_train()` run that trained it, as its last epoch left it: the seeds of
+  its dropout masks, augmentations and epochs' orders, Adam's bias corrections as its steps multiplied
+  them (which `powf()` of the step count does not give), its epochs and steps (which schedules by epoch
+  and by step count), reduce-on-plateau's scale, the best epoch and early stopping's patience, with
+  `restore_best_weights` the best epoch's parameters, and the place of the reader it read through
+  `spingalett_dataset_generator()`. The `spingalett_train()` after `spingalett_load_checkpoint()`, given
+  the run's arguments again with `.epochs` all the run's epochs, runs the epochs left, its reader moved to
+  the run's place, and a run stopped at an epoch's end and carried on so trains the same bits as one that
+  never stopped, on any number of threads (the new `resume` group: 23 runs of two parts, dense,
+  convolutional and language models, arrays, streamed and in-memory `.slettd` readers and token files,
+  schedules by epoch and by step, gradient accumulation, plateaus, early stopping, best weights restored
+  from before the checkpoint, callbacks that draw from the generator, checkpoints written by autosaves).
+  Autosaves in FLOAT32 with the optimizer state, the defaults, are checkpoints. A checkpoint is a FLOAT32
+  `.slett` image with a record of the run after it, so `spingalett_load()`, the engine and the runtime read
+  it as a model (docs/ModelFormat.md, **Checkpoints**). From pull request 11 by Nazar Ponomarenko, whose
+  record held the library's generator and replayed the shuffles of the epochs already run, kept a resumed
+  network resuming in every later call, and restored best weights it did not hold.
 - **Positions of data set readers**: `spingalett_dataset_get_position()` and
   `spingalett_dataset_set_position()` with `SpingalettDatasetPosition`: the reader's seed, the pass it
   stands in and the samples of that pass already read, which name the samples to come exactly, since a

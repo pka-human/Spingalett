@@ -483,6 +483,11 @@ void  spingalett_aligned_free(void *ptr);
 /* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
    spingalett_aligned_free). NULL on error, with the error set. */
 void *spingalett_read_file(const char *path, size_t *size);
+#if !defined(SPINGALETT_RUNTIME)
+/* An autosave of spingalett_train(): a checkpoint in FLOAT32 with the optimizer state, a model otherwise,
+   under the name spingalett_save() would give it. */
+bool spingalett_autosave(const SpingalettSaveArgs *args);
+#endif
 
 /* One value through an activation (softmax, which needs the whole vector, leaves it as it is):
    spingalett_activate(), inline for the kernels' tails. */
@@ -570,6 +575,22 @@ float spingalett_dot_product(const float *restrict a, const float *restrict b, u
    shuffle over splitmix64): epoch e of a training run takes the run's seed and e, so that the order of
    any epoch is known without the epochs before it (a run resumed from a checkpoint). */
 void spingalett_permutation(uint32_t *order, uint32_t n, uint64_t seed, uint64_t index);
+
+/* Forgets the state of the run that trained a network (net->run): a change of its layers, or its end. */
+void spingalett_run_reset(NeuralNetwork *net);
+/* The reader spingalett_dataset_generator() reads on the calling thread, as a training run sees it
+   (Training.c): a run cannot tell the function by its address, of which a program may be given
+   another than the library sees (a non-PIE executable linked to a library built by Clang).
+   spingalett_generator_watch() begins to watch, and moves the next reader read to *at first (NULL:
+   none); spingalett_generator_watched() tells what was read since. */
+typedef struct {
+    SpingalettDatasetReader *reader;    /* the reader read (NULL: none) */
+    bool several;                       /* more than one reader was read */
+    bool pending;                       /* the move to *at is still to come */
+    bool failed;                        /* the move failed, with the error set */
+} GeneratorWatch;
+void spingalett_generator_watch(const SpingalettDatasetPosition *at);
+GeneratorWatch spingalett_generator_watched(void);
 
 void spingalett_sgd_update(float *restrict W, const float *restrict gW, uint64_t n, float lr, float decay);
 void spingalett_momentum_update(float *restrict W, float *restrict mW, const float *restrict gW, uint64_t n,

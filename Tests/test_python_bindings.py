@@ -241,6 +241,44 @@ with tempfile.TemporaryDirectory() as d:
         sg.Network.load(os.path.join(d, "missing.slett")); check(False, "missing file loaded")
     except sg.SpingalettError as e:
         check("cannot open" in str(e) and e.code == sg.ErrorCode.FILE_IO, f"error: {e} code {e.code!r}")
+# checkpoints: a run stopped by its callback, or by the end of the process after an autosave, and carried on
+# trains the bits of one that never stopped; train_from_file's reader resumes where the run's stood
+with tempfile.TemporaryDirectory() as d:
+    ck = os.path.join(d, "run.ckpt")
+    def drop_net():
+        sg.seed(13)
+        return sg.Network(sg.Loss.CROSS_ENTROPY, [3, sg.Layer(8, sg.Activation.RELU, sg.Init.HE, dropout=0.2),
+                                                  sg.Layer(2, sg.Activation.SOFTMAX, sg.Init.XAVIER)])
+    cfg = dict(epochs=5, strategy=sg.Strategy.MINI_BATCH, batch_size=8, optimizer=sg.Optimizer.ADAM, learning_rate=0.02)
+    def stop_at(epoch, path=None):
+        def cb(n, p):
+            if p.epoch == epoch and path:
+                n.save_checkpoint(path)
+            return p.epoch == epoch
+        return cb
+    data = os.path.join(d, "t.slettd")
+    sg.save_dataset(data, vx, ty)
+    for name, run in (("arrays", lambda n, **k: n.train(vx, ty, **k)), ("file", lambda n, **k: n.train_from_file(data, **k))):
+        with drop_net() as a:
+            a.train(vx, ty, **cfg) if name == "arrays" else a.train_from_file(data, **cfg)
+            want, steps = a.get_weights(0), a.time_step
+        with drop_net() as b:
+            if name == "arrays":
+                r = run(b, callback=stop_at(2, ck), **cfg)
+            else:
+                r = run(b, callback=stop_at(3), autosave_mode=sg.AutoSave.OVERWRITE, autosave_interval=1,
+                        autosave_path=ck, **cfg)
+            check(r.status == sg.TrainStatus.INTERRUPTED, f"checkpoint: the stopped run ({name}) {r}")
+        sg.seed(99)
+        with sg.Network.load_checkpoint(ck) as c:
+            r = run(c, **cfg)
+            check(r.epochs_run == (3 if name == "arrays" else 2) and c.time_step == steps and
+                  np.array_equal(c.get_weights(0), want), f"checkpoint: resumed ({name}) == never stopped {r}")
+    with sg.Network.load_checkpoint(ck) as c:
+        check(c.train(vx, ty, **cfg).epochs_run == 2, "checkpoint: a resumed run of the epochs left")
+        check(c.train(vx, ty, **cfg).epochs_run == 5, "checkpoint: the call after it is a run of its own")
+    with sg.Network.load(ck) as m:
+        check(m.time_step > 0 and m.get_weights(0).shape == (8, 3), "checkpoint: read as a model")
 check(sg.library_version() == sg.__version__, f"library {sg.library_version()} vs bindings {sg.__version__}")
 check(sg.cpu_kernels() in ("AVX-512", "AVX2", "AVX", "SSE2", "NEON", "C"), f"cpu kernels {sg.cpu_kernels()!r}")
 check(sg.gpu_device() is None or isinstance(sg.gpu_device(), str), f"gpu device {sg.gpu_device()!r}")

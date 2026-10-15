@@ -12,6 +12,8 @@ convolutions, upsampling or layer normalization (0.13 on), version 8 for the lay
 sparse cross-entropy loss (1.2 on), version 9 for the training features of language models: dense and
 linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window,
 cross-attention and embeddings of part of their input (1.3 on). `spingalett_load()` and `spingalett_load_from_memory()` read versions 1 to 9.
+A checkpoint (`spingalett_save_checkpoint()`, 1.4 on) is an image of one of these versions with a
+record of a training run after it, which readers of the image ignore (**Checkpoints**).
 
 Versions 3 to 5 are laid out so that a file image can be used as it is: the inference engine
 (`spingalett_model_init()` in `Spingalett.Inference.h`) checks the image and computes directly from
@@ -279,6 +281,45 @@ layers whose shapes do not
 fit, when `in` differs from the units of its first input, or when an output (other than the last
 one) does not lie within the activations, is misaligned or overlaps the output of an input of its
 own layer.
+
+## Checkpoints
+
+`spingalett_save_checkpoint()` writes the network's image in FLOAT32 with the optimizer state and,
+from the file size the header holds (offset 24) on, a record of the training run that trained it, as
+its last epoch left it. Readers of the image stop at its file size, so `spingalett_load()`, the engine
+and the runtime read a checkpoint as a model; `spingalett_load_checkpoint()` reads the record too, and
+the `spingalett_train()` after it carries the run on. The record (integers little-endian, floats IEEE
+single precision):
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 6 | magic `SLETTR` |
+| 6 | 2 | record version, 1 |
+| 8 | 4 | flags: bit 0 the run's state (offsets 16 to 151), bit 1 a reader's place (offsets 120 to 143), bit 2 the best epoch's parameters (from offset 152); other bits 0. Without bit 0 the fields to offset 151 are 0 |
+| 12 | 4 | reserved, 0 |
+| 16 | 8 | the network's optimizer steps at the end of the run's last epoch (the header's step count, offset 16) |
+| 24 | 8 | epochs of the run completed |
+| 32 | 8 | optimizer steps of the run |
+| 40 | 8 | optimizer steps of all the run's epochs, which schedules by step are given (0: not yet known, for a generator without a sample count before its first epoch) |
+| 48 | 8 | the seed of the dropout masks |
+| 56 | 8 | the seed of the augmentations |
+| 64 | 8 | the seed of the epochs' orders (epoch e's order is the permutation of this seed and e) |
+| 72 | 4 | Adam's `beta1` raised to the steps, as the steps multiplied it |
+| 76 | 4 | `beta2` likewise |
+| 80 | 4 | the last learning rate of the schedule |
+| 84 | 4 | the scale reduce-on-plateau reached (1 before a reduction) |
+| 88 | 4 | the best monitored value (an infinity before the first) |
+| 92 | 4 | reserved, 0 |
+| 96 | 8 | the run's best epoch (0: none) |
+| 104 | 8 | epochs without improvement |
+| 112 | 8 | epochs since the plateau's last reduction |
+| 120 | 24 | the place of the reader the run read through `spingalett_dataset_generator()`: its seed, pass and position (`SpingalettDatasetPosition`) |
+| 144 | 8 | `n`: floats of the best epoch's parameters, 0 without bit 2 |
+| 152 | 4 `n` | the best epoch's parameters, held for `restore_best_weights` when that epoch is not the last: the weights, the biases, then the running means and the running variances, laid out as in the network (`n` = weights + 3 x biases) |
+| 152 + 4 `n` | 4 | CRC-32 of the record's bytes before it |
+
+A file with bytes after its image that are not a record of this length, version and checksum does not
+load as a checkpoint.
 
 ## How the inference engine computes
 

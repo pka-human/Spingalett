@@ -55,7 +55,7 @@ cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
 Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx tokenizer pretrained
-                                                    # equiv cont optim sched dropout gen predict valid step data io model
+                                                    # equiv cont optim sched dropout gen predict valid step data resume io model
                                                     # gpu cuda xor
 ```
 
@@ -198,6 +198,14 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   the module to `test/references`, the native engine's outputs (integer models bit for bit), and to the
   same code built natively (every model bit for bit); a change of the engine's results makes the
   references again (`node test/make_references.mjs`, on x86-64 Linux with glibc 2.41 or later).
+- **Checkpoints resume exactly.** A run stopped at an epoch's end, written by `spingalett_save_checkpoint()`
+  and carried on by the `spingalett_train()` after `spingalett_load_checkpoint()` trains the bits of one that
+  never stopped (`resume` compares parameters, moments, gradients, losses and reports): whatever a run's
+  epochs depend on beyond the parameters and moments is in the network's `run` state, set at every epoch's
+  end (`run_capture()`), written in the record after the image (docs/ModelFormat.md) and taken up by the
+  resumed call. A training feature that keeps state across epochs or steps (a counter, a seed, a schedule's
+  memory) joins it, or resumed runs drift. An epoch's order and a reader's pass are functions of a seed and
+  their number, never of the epochs before: nothing replays the past.
 - **Sessions give batched prediction's bits.** A session's row equals what `spingalett_model_predict()`
   gives its position in the whole window, whatever rows it is computed with (`model`, `gen` and
   `runtime.library` compare with `memcmp`): the float linear layers sum on `spingalett_conv_rows()` in

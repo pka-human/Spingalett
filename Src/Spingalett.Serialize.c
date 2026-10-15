@@ -482,6 +482,24 @@ static const char *find_last_separator(const char *path) {
     return slash ? slash : backslash;
 }
 
+/* The name a model is saved under: SPINGALETT_MODEL_EXTENSION appended to one without an extension
+   (in *allocated, which the caller frees). NULL when out of memory. */
+static const char *model_filename(const char *name, char **allocated) {
+    *allocated = NULL;
+    const char *dot = strrchr(name, '.');
+    const char *last_sep = find_last_separator(name);
+    if (dot && (!last_sep || dot > last_sep)) return name;
+    size_t len = strlen(name);
+    *allocated = (char *)malloc(len + sizeof SPINGALETT_MODEL_EXTENSION);
+    if (!*allocated) {
+        set_error(SPINGALETT_ERR_ALLOC, "save: filename allocation failed");
+        return NULL;
+    }
+    memcpy(*allocated, name, len);
+    memcpy(*allocated + len, SPINGALETT_MODEL_EXTENSION, sizeof SPINGALETT_MODEL_EXTENSION);
+    return *allocated;
+}
+
 bool spingalett_save_args(SaveArgs args) {
     if (!args.net || !args.filename) {
         set_error(SPINGALETT_ERR_INVALID, "save: net or filename is NULL");
@@ -489,20 +507,8 @@ bool spingalett_save_args(SaveArgs args) {
     }
 
     char *allocated_filename = NULL;
-    const char *target_filename = args.filename;
-    const char *dot = strrchr(target_filename, '.');
-    const char *last_sep = find_last_separator(target_filename);
-    if (!(dot && (!last_sep || dot > last_sep))) {
-        size_t len = strlen(target_filename);
-        allocated_filename = (char *)malloc(len + sizeof SPINGALETT_MODEL_EXTENSION);
-        if (!allocated_filename) {
-            set_error(SPINGALETT_ERR_ALLOC, "save: filename allocation failed");
-            return false;
-        }
-        memcpy(allocated_filename, target_filename, len);
-        memcpy(allocated_filename + len, SPINGALETT_MODEL_EXTENSION, sizeof SPINGALETT_MODEL_EXTENSION);
-        target_filename = allocated_filename;
-    }
+    const char *target_filename = model_filename(args.filename, &allocated_filename);
+    if (!target_filename) return false;
 
     size_t size = 0;
     void *img = spingalett_save_to_memory(args.net, args.precision, !args.do_not_save_optimizer, &size);
@@ -905,4 +911,202 @@ NeuralNetwork *spingalett_load(const char *filename) {
         net->layers, (unsigned long long)net->total_weights, (unsigned long long)net->total_biases,
         precision_names[precision]);
     return net;
+}
+
+/* ------------------------------------------------------------------------- checkpoints */
+
+/*
+ * A checkpoint is the network's FLOAT32 image with its optimizer state and, after the image's last byte
+ * (the size its header holds), a record of the run that trained it (docs/ModelFormat.md, Checkpoints):
+ *
+ *   offset size
+ *      0    6   magic "SLETTR"
+ *      6    2   record version, 1
+ *      8    4   flags: bit 0 the run's state (offsets 16 to 143), bit 1 a reader's place (120),
+ *               bit 2 the best epoch's parameters (after offset 152)
+ *     12    4   reserved, 0
+ *     16    8   the network's optimizer steps at the end of the run's last epoch
+ *     24    8   the run's epochs completed          32  8  its optimizer steps
+ *     40    8   the steps of all its epochs (0: not yet known)
+ *     48    8   the dropout seed                    56  8  the augmentation seed
+ *     64    8   the seed of the epochs' orders
+ *     72    4   beta1 to the steps, as multiplied   76  4  beta2 likewise
+ *     80    4   the schedule's last learning rate   84  4  the plateau's scale
+ *     88    4   the best monitored value            92  4  reserved, 0
+ *     96    8   the best epoch (0: none)           104  8  epochs without improvement
+ *    112    8   epochs since the plateau's last reduction
+ *    120   24   the reader's seed, pass and position (SpingalettDatasetPosition)
+ *    144    8   n, floats of the best epoch's parameters (weights, biases, running means and variances)
+ *    152   4n   those parameters
+ *  152+4n   4   CRC-32 of the record's bytes before it
+ */
+#define RUN_MAGIC     "SLETTR"
+#define RUN_VERSION   1u
+#define RUN_HEADER    152u
+#define RUN_STATE     1u
+#define RUN_READER    2u
+#define RUN_BEST      4u
+
+static void put_float(uint8_t *p, float v) { uint32_t u; memcpy(&u, &v, 4); slett_put32(p, u); }
+static float get_float(const uint8_t *p) { uint32_t u = slett_get32(p); float v; memcpy(&v, &u, 4); return v; }
+
+bool spingalett_save_checkpoint(NeuralNetwork *net, const char *path) {
+    if (!net || !path) {
+        set_error(SPINGALETT_ERR_INVALID, "checkpoint: net or path is NULL");
+        return false;
+    }
+    /* a run's state while the network stands where the run's last epoch left it */
+    const bool state = net->run.valid && net->run.time_step == net->time_step;
+    if (net->run.valid && !state)
+        spingalett_log(LOG_WARNING, "Checkpoint: the network has taken steps since its run's last epoch, whose "
+                       "state is left out");
+    const float *best = !state || !net->run.best_epoch || net->run.best_epoch == net->run.epochs ? NULL
+                      : net->run.best_params ? net->run.best_params : net->run.saved_best;
+    const uint64_t n = best ? net->total_weights + 3u * net->total_biases : 0u;
+    size_t image_size = 0;
+    uint8_t *image = (uint8_t *)spingalett_save_to_memory(net, PRECISION_FLOAT32, true, &image_size);
+    if (!image) return false;
+    const size_t record = RUN_HEADER + (size_t)n * sizeof(float) + 4u;
+    uint8_t *r = (uint8_t *)calloc(1, record);
+    if (!r) {
+        spingalett_free(image);
+        set_error(SPINGALETT_ERR_ALLOC, "checkpoint: out of memory");
+        return false;
+    }
+    memcpy(r, RUN_MAGIC, 6);
+    slett_put16(r + 6, RUN_VERSION);
+    if (state) {
+        const bool reader = net->run.has_reader;
+        slett_put32(r + 8, RUN_STATE | (reader ? RUN_READER : 0u) | (best ? RUN_BEST : 0u));
+        slett_put64(r + 16, net->run.time_step);
+        slett_put64(r + 24, net->run.epochs);
+        slett_put64(r + 32, net->run.steps);
+        slett_put64(r + 40, net->run.total_steps);
+        slett_put64(r + 48, net->run.dropout_seed);
+        slett_put64(r + 56, net->run.augment_seed);
+        slett_put64(r + 64, net->run.order_seed);
+        put_float(r + 72, net->run.beta1_pow);
+        put_float(r + 76, net->run.beta2_pow);
+        put_float(r + 80, net->run.base_lr);
+        put_float(r + 84, net->run.lr_scale);
+        put_float(r + 88, net->run.best);
+        slett_put64(r + 96, net->run.best_epoch);
+        slett_put64(r + 104, net->run.no_improvement);
+        slett_put64(r + 112, net->run.stale);
+        if (reader) {
+            slett_put64(r + 120, net->run.reader.seed);
+            slett_put64(r + 128, net->run.reader.pass);
+            slett_put64(r + 136, net->run.reader.position);
+        }
+        slett_put64(r + 144, n);
+        if (best) memcpy(r + RUN_HEADER, best, (size_t)n * sizeof(float));
+    }
+    slett_put32(r + record - 4u, spingalett_crc32(0, r, record - 4u));
+
+    bool ok = false;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        set_error(SPINGALETT_ERR_FILE_IO, "checkpoint: cannot open the file for writing");
+    } else {
+        ok = fwrite(image, 1, image_size, fp) == image_size && fwrite(r, 1, record, fp) == record;
+        if (fclose(fp) != 0) ok = false;
+        if (!ok) set_error(SPINGALETT_ERR_FILE_IO, "checkpoint: write error (disk full?)");
+    }
+    free(r);
+    spingalett_free(image);
+    if (ok)
+        spingalett_log(LOG_INFO, "Checkpoint saved to %s: %zu bytes of model, %s", path, image_size,
+                       state ? "the run's state after its epoch" : "no run's state");
+    else
+        spingalett_log(LOG_ERROR, "Write error saving a checkpoint to %s", path);
+    return ok;
+}
+
+NeuralNetwork *spingalett_load_checkpoint(const char *path) {
+    if (!path) {
+        set_error(SPINGALETT_ERR_INVALID, "checkpoint: path is NULL");
+        return NULL;
+    }
+    size_t size = 0;
+    uint8_t *data = (uint8_t *)spingalett_read_file(path, &size);
+    if (!data) return NULL;
+    /* the record, after the image's last byte; a file that ends there is a model */
+    uint64_t image = size >= SLETT_HEADER_SIZE && !memcmp(data, SLETT_MAGIC, 6) && slett_get16(data + 6) >= 3u
+                   ? slett_get64(data + 24) : size;
+    if (image > size) image = size;                 /* a file cut short: the loader says so */
+    const uint8_t *r = image < size ? data + image : NULL;
+    const size_t record = r ? size - (size_t)image : 0u;
+    uint32_t flags = 0;
+    uint64_t n = 0;
+    if (r) {
+        bool sound = record >= RUN_HEADER + 4u && !memcmp(r, RUN_MAGIC, 6);
+        if (sound) {
+            flags = slett_get32(r + 8);
+            n = slett_get64(r + 144);
+            sound = slett_get16(r + 6) == RUN_VERSION && n <= (record - RUN_HEADER - 4u) / sizeof(float) &&
+                    record == RUN_HEADER + n * sizeof(float) + 4u && ((flags & RUN_BEST) != 0) == (n > 0) &&
+                    slett_get32(r + record - 4u) == spingalett_crc32(0, r, record - 4u);
+        }
+        if (!sound) {
+            spingalett_aligned_free(data);
+            set_error(SPINGALETT_ERR_INVALID, "checkpoint: the bytes after the model are no sound record of a run");
+            spingalett_log(LOG_ERROR, "Could not load %s: %s", path, spingalett_last_error_message());
+            return NULL;
+        }
+    }
+    NeuralNetwork *net = spingalett_load_from_memory_ex(data, (size_t)image, NULL);
+    if (net && (flags & RUN_STATE)) {
+        if (n && n != net->total_weights + 3u * net->total_biases) {
+            set_error(SPINGALETT_ERR_INVALID, "checkpoint: the best epoch's parameters are not the network's");
+            free_network(net);
+            net = NULL;
+        } else if (n && !(net->run.saved_best = (float *)malloc((size_t)n * sizeof(float)))) {
+            set_error(SPINGALETT_ERR_ALLOC, "checkpoint: out of memory");
+            free_network(net);
+            net = NULL;
+        }
+    }
+    if (net && (flags & RUN_STATE)) {
+        if (n) memcpy(net->run.saved_best, r + RUN_HEADER, (size_t)n * sizeof(float));
+        net->run.valid = net->run.resume = true;
+        net->run.has_reader = (flags & RUN_READER) != 0;
+        net->run.time_step = slett_get64(r + 16);
+        net->run.epochs = slett_get64(r + 24);
+        net->run.steps = slett_get64(r + 32);
+        net->run.total_steps = slett_get64(r + 40);
+        net->run.dropout_seed = slett_get64(r + 48);
+        net->run.augment_seed = slett_get64(r + 56);
+        net->run.order_seed = slett_get64(r + 64);
+        net->run.beta1_pow = get_float(r + 72);
+        net->run.beta2_pow = get_float(r + 76);
+        net->run.base_lr = get_float(r + 80);
+        net->run.lr_scale = get_float(r + 84);
+        net->run.best = get_float(r + 88);
+        net->run.best_epoch = slett_get64(r + 96);
+        net->run.no_improvement = slett_get64(r + 104);
+        net->run.stale = slett_get64(r + 112);
+        net->run.reader = (SpingalettDatasetPosition){
+            .seed = slett_get64(r + 120), .pass = slett_get64(r + 128), .position = slett_get64(r + 136)};
+    }
+    spingalett_aligned_free(data);
+    if (!net) {
+        spingalett_log(LOG_ERROR, "Could not load %s: %s", path, spingalett_last_error_message());
+        return NULL;
+    }
+    if (net->run.resume)
+        spingalett_log(LOG_INFO, "Checkpoint loaded from %s: a run after its epoch %llu, %llu steps", path,
+                       (unsigned long long)net->run.epochs, (unsigned long long)net->time_step);
+    else
+        spingalett_log(LOG_INFO, "Checkpoint loaded from %s without a run's state", path);
+    return net;
+}
+
+bool spingalett_autosave(const SaveArgs *args) {
+    if (args->precision != PRECISION_FLOAT32 || args->do_not_save_optimizer)
+        return spingalett_save_args(*args);
+    char *allocated = NULL;
+    const char *name = model_filename(args->filename, &allocated);
+    bool ok = name && spingalett_save_checkpoint(args->net, name);
+    free(allocated);
+    return ok;
 }
