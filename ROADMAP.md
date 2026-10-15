@@ -114,9 +114,41 @@ Dense models of the current families, from GGUF files computed as they are store
   their own attention) and audio frames, inputs of several kinds in one network.
 - **ALiBi positions** and block-sparse masks in the flash kernels, for the models that use them.
 
-## 1.7: Arm, Apple and the edge
+## 1.7: beyond neural networks: trees and the classical toolbox
 
-The CPU and GPU paths that 1.0 to 1.6 tuned on x86 and NVIDIA, brought to the other hardware the
+Most of the machine learning in production still runs on tables, and there gradient-boosted trees
+(XGBoost, LightGBM, CatBoost) beat neural networks; they are also the models most often run on
+microcontrollers. Spingalett's promises carry over: the same bits on any number of threads and on the
+GPU, kernels measured against the best libraries, models run by the engine without a heap.
+
+- **Gradient-boosted decision trees**: features binned once into at most 256 bins (quantiles,
+  categorical values, a bin for missing values), histograms of gradients and hessians summed over fixed
+  blocks of rows in a fixed order (the same trees on 1 thread or 16, and on the GPU, whose histograms
+  sum in shared memory without atomics), trees grown by depth or by leaf, L1 and L2 regularization,
+  minimum hessians and gains, rows and columns sampled from a seed, missing values sent the learned way,
+  categorical splits, monotone constraints; the library's losses (squared error, logistic, softmax over
+  classes) and Poisson, quantile and ranking (LambdaMART) objectives; validation, early stopping,
+  callbacks and checkpoints as `spingalett_train()` has them. **Random forests** and extremely
+  randomized trees on the same machinery.
+- **Trees in deployment**: ensembles in a `.slett` section of their own, predicted in batches by
+  branch-free traversal (QuickScorer's bit vectors, SIMD over samples), on the GPU, by the engine
+  (thresholds on bins as integers: no floats needed on a microcontroller) and the runtime, exported as C
+  headers; models imported from XGBoost (JSON), LightGBM (text) and scikit-learn through ONNX-ML's tree
+  ensembles.
+- **The classical toolbox** on the existing matrix kernels: linear and logistic regression with L1 and
+  L2 penalties (coordinate descent, L-BFGS), k-means (k-means++ seeding, mini-batches, on the GPU), PCA
+  (randomized SVD), exact k-nearest neighbours; standardization and one-hot encoding saved with a model
+  as its first steps; metrics (ROC AUC, F1, confusion matrices) and cross-validation splits.
+- **In Python**, estimators with scikit-learn's interface (`fit`, `predict`, `predict_proba`), so that
+  they drop into existing pipelines.
+
+Measured against XGBoost, LightGBM and CatBoost (time to the same validation loss and prediction
+throughput on Higgs, Covertype and Epsilon, on the CPU and the GPU) and against Treelite's compiled
+trees.
+
+## 1.8: Arm, Apple and the edge
+
+The CPU and GPU paths that 1.0 to 1.7 tuned on x86 and NVIDIA, brought to the other hardware the
 library runs on.
 
 - **NEON kernels for training** (and SVE where available), so that Apple silicon and AArch64
@@ -130,7 +162,7 @@ library runs on.
   RISC-V vector, transformers' layers within a microcontroller's memory, and models larger than RAM
   run layer by layer from flash.
 
-## 1.8: scale
+## 1.9: scale
 
 Models that do not fit one GPU's memory or time (planned for 1.4 until the language models came first).
 

@@ -2055,7 +2055,10 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 - 1.5: mixture of experts (Mixtral, Qwen3 MoE, gpt-oss), experts kept on the host, speculative decoding
 - 1.6: hybrid models with linear attention and state spaces (Qwen3.5, Qwen3-Next, Mamba-2), vision
   encoders
-- 1.7 to 2.0: Arm and Apple (NEON training, Metal), training across several GPUs, multi-head latent
+- 1.7: beyond neural networks: gradient-boosted trees and random forests (deterministic histogram
+  training on the CPU and GPU, trees in the engine and the runtime, imports from XGBoost, LightGBM and
+  scikit-learn), linear models, k-means, PCA, scikit-learn-style estimators in Python
+- 1.8 to 2.0: Arm and Apple (NEON training, Metal), training across several GPUs, multi-head latent
   attention, FP16 products with loss scaling
 
 ## Contributing
