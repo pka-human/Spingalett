@@ -1063,7 +1063,11 @@ Loading decodes the chunks in parallel with OpenMP. Readers convert values to fl
 time. A streaming reader decodes the next chunks on a background thread when a processor is free
 for it, and otherwise decodes several chunks at a time on the OpenMP threads when it needs them,
 since a thread competing with the OpenMP threads for the processors would stall them; the samples
-come in the same order either way. With `spingalett_dataset_open_u8()`, 8-bit data already in
+come in the same order either way: a pass's order is a function of the reader's seed and the pass
+number. `spingalett_dataset_get_position()` gives where a reader stands (its seed, its pass and the
+samples of the pass already read), and `spingalett_dataset_set_position()` moves a reader of the same
+file and options there, after which it reads what the first would have read, bit for bit. With
+`spingalett_dataset_open_u8()`, 8-bit data already in
 memory trains through a reader without a float copy. One epoch of a small CNN on CIFAR-10 (two
 convolutions, 4 threads, Xeon @ 2.1 GHz, 4 vCPUs, medians):
 

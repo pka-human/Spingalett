@@ -1025,6 +1025,27 @@ SPINGALETT_API SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDat
    error, which is sticky); the next call starts a new pass. */
 SPINGALETT_API uint32_t spingalett_dataset_read(SpingalettDatasetReader *reader, float *inputs, float *targets,
                                                 uint32_t max_samples);
+/* Where a reader stands in its stream of samples. A pass's order is a function of the reader's seed
+   and of the pass number, so these three numbers name the samples to come exactly, for the reader
+   that gave them and for readers of the same file opened with the same options (another stride,
+   context, set of targets or division into chunks orders other samples). */
+typedef struct {
+    uint64_t seed;                  /* the reader's draw of the library's generator */
+    uint64_t pass;                  /* the pass it stands in (0: the first) */
+    uint64_t position;              /* samples of that pass already read. All of them: the pass is read
+                                       out and the read of 0 that ends it is still to come */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettDatasetPosition;
+/* Writes where the reader stands into *position. False, with an error, when an argument is NULL. */
+SPINGALETT_API bool spingalett_dataset_get_position(const SpingalettDatasetReader *reader,
+                                                    SpingalettDatasetPosition *position);
+/* Moves a reader to a position: it then reads the samples it would have read from there, bit for bit,
+   on any number of threads, with or without its decoding thread. Its seed becomes the position's;
+   chunks decoded ahead are dropped and decoded again, and a chunk the position lies inside is read and
+   decoded at once. A position beyond the reader's samples is refused (false, with an error); one of
+   another file or other options is not detected. */
+SPINGALETT_API bool spingalett_dataset_set_position(SpingalettDatasetReader *reader,
+                                                    const SpingalettDatasetPosition *position);
 /* A SpingalettDataGeneratorFn over a reader, for .generator = spingalett_dataset_generator, .generator_data = reader. */
 SPINGALETT_API uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader);
 

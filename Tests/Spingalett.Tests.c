@@ -2387,6 +2387,285 @@ static void dataset_files_v2(void) {
 }
 
 
+/* ---------------- the place a reader stands in: stopping a run and carrying it on */
+
+/* Readers of one stream: the same file, the same options, so that a position taken from one belongs
+   to the others, and all of them draw the same seed (the library's generator reseeded before each
+   open). kind 0 is a file of tokens, 1 a streaming .slettd reader, 2 an in-memory one. */
+typedef struct {
+    int kind;
+    const char *path;
+    SpingalettTokenReaderOptions tokens;
+    DatasetReaderOptions reader;
+} PositionSource;
+
+static SpingalettDatasetReader *open_positions(const PositionSource *src, uint64_t seed) {
+    spingalett_seed(seed);
+    return src->kind == 0 ? spingalett_dataset_open_tokens(src->path, &src->tokens)
+                          : spingalett_dataset_open_ex(src->path, &src->reader);
+}
+
+static bool same_position(const SpingalettDatasetPosition *a, const SpingalettDatasetPosition *b) {
+    return a->seed == b->seed && a->pass == b->pass && a->position == b->position;
+}
+
+/* Writes want samples into x and y, in reads of at most batch. A read of 0 ends a pass and the next
+   one starts the pass after it; two of them in a row is a reader that stops short of the run. */
+static bool read_samples(SpingalettDatasetReader *r, uint64_t want, uint32_t in, uint32_t out, float *x, float *y,
+                         uint32_t batch) {
+    uint64_t done = 0;
+    uint32_t zeros = 0;
+    while (done < want) {
+        uint32_t ask = (uint32_t)(want - done < batch ? want - done : batch);
+        uint32_t got = spingalett_dataset_read(r, x + (size_t)done * in, y + (size_t)done * out, ask);
+        if (got == 0) {
+            if (++zeros > 1) return false;
+            continue;
+        }
+        zeros = 0;
+        done += got;
+    }
+    return true;
+}
+
+/* The samples after a position, read as the stream continues, then read again after the same reader
+   is moved back to it and after a freshly opened one is moved there; both compared with the run of
+   a reader that never left the stream, so that a resumed run that lost or repeated samples shows.
+   *pos holds the position (and *info the reader's shape) either way, for callers that compare the
+   positions of readers that differ only in how their chunks get decoded. */
+static bool position_round_trip(const PositionSource *src, uint64_t seed, uint64_t before, uint64_t after,
+                                uint32_t batch, SpingalettDatasetPosition *pos, SpingalettDatasetInfo *info) {
+    bool ok = false;
+    memset(pos, 0, sizeof *pos);
+    SpingalettDatasetReader *r = open_positions(src, seed), *ref = open_positions(src, seed), *fresh = NULL;
+    *info = spingalett_dataset_info(r);
+    const uint32_t in = info->input_size, tg = info->target_size;
+    const size_t span = (size_t)(before + after);
+    float *rx = malloc(span * in * sizeof(float)), *ry = malloc(span * tg * sizeof(float));
+    float *ax = malloc(span * in * sizeof(float)), *ay = malloc(span * tg * sizeof(float));
+    float *bx = malloc((size_t)after * in * sizeof(float)), *by = malloc((size_t)after * tg * sizeof(float));
+    ok = r && ref && in && tg && rx && ry && ax && ay && bx && by;
+    if (ok) ok = read_samples(ref, span, in, tg, rx, ry, batch);
+    /* the run before the position, and the run that follows it, of the reader itself */
+    if (ok) ok = read_samples(r, before, in, tg, ax, ay, batch) &&
+                 spingalett_dataset_get_position(r, pos) && pos->position <= info->count &&
+                 read_samples(r, after, in, tg, ax + (size_t)before * in, ay + (size_t)before * tg, batch);
+    if (ok) {
+        ok = !memcmp(ax, rx, span * in * sizeof(float)) && !memcmp(ay, ry, span * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: the stream itself differs from the reference\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+
+    /* the same reader, moved back to where it stood */
+    if (ok) {
+        memset(bx, 0, (size_t)after * in * sizeof(float));
+        memset(by, 0, (size_t)after * tg * sizeof(float));
+        SpingalettDatasetPosition here = {0};
+        ok = spingalett_dataset_set_position(r, pos);
+        if (ok) ok = spingalett_dataset_get_position(r, &here) && same_position(pos, &here);
+        if (ok) ok = read_samples(r, after, in, tg, bx, by, batch) &&
+                     !memcmp(bx, ax + (size_t)before * in, (size_t)after * in * sizeof(float)) &&
+                     !memcmp(by, ay + (size_t)before * tg, (size_t)after * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: resuming the reader itself differs\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+
+    /* a reader of the same file and options, opened now and moved to that position */
+    if (ok) {
+        fresh = open_positions(src, seed + 1234);     /* its own draw, until the position sets it */
+        memset(bx, 0, (size_t)after * in * sizeof(float));
+        memset(by, 0, (size_t)after * tg * sizeof(float));
+        ok = spingalett_dataset_set_position(fresh, pos) &&
+             read_samples(fresh, after, in, tg, bx, by, batch) &&
+             !memcmp(bx, ax + (size_t)before * in, (size_t)after * in * sizeof(float)) &&
+             !memcmp(by, ay + (size_t)before * tg, (size_t)after * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: a freshly opened reader differs\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+    spingalett_dataset_close(fresh);
+    spingalett_dataset_close(ref);
+    spingalett_dataset_close(r);
+    free(rx); free(ry); free(ax); free(ay); free(bx); free(by);
+    return ok;
+}
+
+/* The place of a stream after before samples: a pass whose every sample the caller holds is still
+   that pass, with its end not yet reported by a read of 0. */
+static void expect_position(uint64_t before, uint32_t count, uint64_t *pass, uint64_t *position) {
+    if (!count) {
+        *pass = *position = 0;
+        return;
+    }
+    *pass = before / count;
+    *position = before % count;
+    if (*position == 0 && before > 0) {
+        (*pass)--;
+        *position = count;
+    }
+}
+
+static void dataset_positions(void) {
+    ComputeMode mode = spingalett_get_compute_mode();
+
+    /* ---- positions of the reader itself, and of NULL: refused, and the reader untouched */
+    {
+        const char *path = "spingalett_test_pos_null.slettd";
+        SpingalettDataset d = {0};
+        make_ds(&d, 8, 240, 16);
+        for (uint32_t i = 0; i < d.count; i++)
+            for (uint32_t k = 0; k < 240; k++) d.inputs[(size_t)i * 240 + k] = (float)(i * 240 + k) / 7.0f;
+        DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32, .target_encoding = DATASET_ENCODING_FLOAT32,
+                                 .no_compression = true};
+        CHECK(spingalett_save_dataset(&d, path, &so), "positions: the file of the NULL checks");
+        spingalett_dataset_free(&d);
+        SpingalettDatasetReader *r = spingalett_dataset_open(path, true);
+        SpingalettDatasetPosition p = {0};
+        CHECK(!spingalett_dataset_get_position(NULL, &p) && !spingalett_dataset_get_position(r, NULL) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "positions: get of NULL");
+        CHECK(spingalett_dataset_get_position(r, &p) && p.pass == 0 && p.position == 0, "positions: a reader just opened");
+        CHECK(!spingalett_dataset_set_position(NULL, &p) && !spingalett_dataset_set_position(r, NULL) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "positions: set of NULL");
+        float x[240], y[16];
+        uint64_t bad = p.position;
+        p.position = UINT64_MAX;
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a sample beyond the pass accepted");
+        p.position = UINT32_MAX;                     /* the count is well under it here */
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a sample of 2^32 accepted");
+        p.position = bad;
+        p.pass = UINT64_MAX;
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a pass that overflows the chunk queue accepted");
+        p.pass = 0;
+        CHECK(spingalett_dataset_read(r, x, y, 1) == 1, "positions: a reader of refused positions still serves");
+        spingalett_dataset_close(r);
+        remove(path);
+    }
+
+    /* ---- files of tokens: windows of uint16 (nanoGPT) and of uint32 behind a header (llm.c) */
+    const char *tpaths[] = {"spingalett_test_pos_tokens.bin", "spingalett_test_pos_tokens_llmc.bin"};
+    const uint32_t ntok = 400, tctx = 8, tstride = 3;
+    for (int file = 0; file < 2; file++) {
+        FILE *f = fopen(tpaths[file], "wb");
+        if (!f) { CHECK(false, "positions: cannot write %s", tpaths[file]); return; }
+        if (file) {
+            uint32_t header[256] = {20240520u, 2u, ntok};
+            fwrite(header, sizeof header, 1, f);
+        }
+        for (uint32_t i = 0; i < ntok; i++) {
+            const uint32_t t = (i * 6151u + 11u) % 65000u;
+            const uint8_t b[4] = {(uint8_t)t, (uint8_t)(t >> 8), (uint8_t)(t >> 16), (uint8_t)(t >> 24)};
+            fwrite(b, 1, file ? 4 : 2, f);
+        }
+        fclose(f);
+    }
+    const uint32_t tcount = (ntok - tctx - 1) / tstride + 1;
+    const uint64_t tcases[][2] = {
+        {0, 17}, {1, 23}, {tcount / 2, 9}, {tcount - 5, 9}, {tcount, 12},
+        {tcount + 1, 30}, {2 * tcount, 7}, {2 * tcount + tcount / 3, 25},
+    };
+    for (int file = 0; file < 2; file++)
+        for (int shuffled = 1; shuffled >= 0; shuffled--)
+            for (size_t k = 0; k < sizeof tcases / sizeof *tcases; k++) {
+                PositionSource src = {.kind = 0, .path = tpaths[file],
+                                      .tokens = {.context = tctx, .stride = tstride, .shuffle = shuffled}};
+                SpingalettDatasetPosition pos = {0};
+                SpingalettDatasetInfo info = {0};
+                bool ok = position_round_trip(&src, 21 + 5 * (uint64_t)k, tcases[k][0], tcases[k][1], 5, &pos, &info);
+                CHECK(ok, "positions: tokens %d shuffle %d at %llu samples (pass %llu, position %llu of %u)", file, shuffled,
+                      (unsigned long long)tcases[k][0], (unsigned long long)pos.pass, (unsigned long long)pos.position,
+                      info.count);
+            }
+
+    /* ---- streaming readers: several chunks, of which one thread decodes ahead, none decodes ahead,
+           and the caller's OpenMP threads decode together */
+    const char *spath = "spingalett_test_pos.slettd";
+    {
+        SpingalettDataset d = {0};
+        make_ds(&d, 3072, 240, 16);
+        lcg_state = 9;
+        for (uint32_t i = 0; i < d.count; i++) {
+            for (uint32_t k = 0; k < 240; k++) d.inputs[(size_t)i * 240 + k] = frand();
+            for (uint32_t k = 0; k < 16; k++) d.targets[(size_t)i * 16 + k] = (float)((i + k) % 16) / 16.0f;
+            d.targets[(size_t)i * 16 + i % 16] = 1.0f;
+        }
+        DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32, .target_encoding = DATASET_ENCODING_FLOAT32,
+                                 .no_compression = true};
+        CHECK(spingalett_save_dataset(&d, spath, &so), "positions: saving the streaming file");
+        spingalett_dataset_free(&d);
+    }
+    SpingalettDatasetReader *probe = spingalett_dataset_open(spath, false);
+    SpingalettDatasetInfo sinfo = spingalett_dataset_info(probe);
+    spingalett_dataset_close(probe);
+    const uint32_t chunks = sinfo.chunk_count, ccount = sinfo.count;
+    CHECK(chunks > 1 && ccount % chunks == 0, "positions: the streaming file holds %u chunks of %u samples", chunks,
+          ccount / chunks);
+    const uint32_t crows = ccount / chunks;
+    /* the same stream through the library's in-memory path (every sample held, not read by chunks) */
+    const uint64_t memcases[] = {1300, ccount, 2 * (uint64_t)ccount + crows};
+    for (size_t k = 0; k < sizeof memcases / sizeof *memcases; k++) {
+        PositionSource src = {.kind = 2, .path = spath, .reader = {.shuffle = true, .in_memory = true}};
+        SpingalettDatasetPosition pos = {0};
+        SpingalettDatasetInfo info = {0};
+        bool ok = position_round_trip(&src, 33, memcases[k], 400, 60, &pos, &info);
+        uint64_t pass, position;
+        expect_position(memcases[k], info.count, &pass, &position);
+        ok = ok && pos.pass == pass && pos.position == position;
+        CHECK(ok, "positions: the in-memory reader at %llu samples (pass %llu, position %llu of %u, want %llu/%llu)",
+              (unsigned long long)memcases[k], (unsigned long long)pos.pass, (unsigned long long)pos.position, info.count,
+              (unsigned long long)pass, (unsigned long long)position);
+    }
+    struct { uint64_t before; uint64_t after; } cases[] = {
+        {0, 25}, {1, 40}, {crows - 3, 60}, {crows, 60}, {crows + 1, 30}, {2 * crows, 200},
+        {ccount - 4, 30}, {ccount, 150}, {ccount + 1, 60}, {ccount + crows, 20}, {ccount / 2, 1030},
+        {2 * ccount, 44}, {2 * ccount - 2, 500}, {2 * ccount + 1, 80},
+    };
+    /* a position of one decoding scheme resumes the same samples of another: the same seed, the same
+       stream, chunks decoded by a thread, by none, or by all of the caller's threads together */
+    static const ComputeMode open_modes[3] = {COMPUTE_SINGLE_THREADED, COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP};
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        SpingalettDatasetPosition first = {0};
+        uint64_t pass, position;
+        expect_position(cases[k].before, ccount, &pass, &position);
+        for (int v = 0; v < 3; v++) {
+            spingalett_set_compute_mode(open_modes[v]);
+            PositionSource src = {.kind = 1, .path = spath, .reader = {.shuffle = true, .no_prefetch = v == 1}};
+            SpingalettDatasetPosition pos = {0};
+            SpingalettDatasetInfo info = {0};
+            bool ok = position_round_trip(&src, 51 + 7 * (uint64_t)k, cases[k].before, cases[k].after, 64, &pos, &info);
+            ok = ok && pos.pass == pass && pos.position == position;
+            if (v == 0) first = pos;
+            else ok = ok && same_position(&pos, &first);
+            spingalett_set_compute_mode(mode);
+            CHECK(ok, "positions: streaming %d at %llu samples (pass %llu position %llu of %u, want %llu/%llu, %u chunks)",
+                  v, (unsigned long long)cases[k].before, (unsigned long long)pos.pass,
+                  (unsigned long long)pos.position, info.count, (unsigned long long)pass,
+                  (unsigned long long)position, info.chunk_count);
+        }
+    }
+    /* a pass in file order, resumed at places that are its own since nothing shuffles it */
+    static const uint64_t passes[] = {0, 1, 2, 1};
+    for (size_t k = 0; k < 4; k++) {
+        const uint64_t before = passes[k] * (uint64_t)ccount + 1 + 97 * (uint64_t)k;
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        PositionSource src = {.kind = 1, .path = spath, .reader = {.shuffle = false}};
+        SpingalettDatasetPosition pos = {0};
+        SpingalettDatasetInfo info = {0};
+        bool ok = position_round_trip(&src, 5 + 3 * (uint64_t)k, before, 130 + 11 * (uint64_t)k, 97, &pos, &info);
+        uint64_t pass, position;
+        expect_position(before, info.count, &pass, &position);
+        ok = ok && pos.pass == pass && pos.position == position;
+        spingalett_set_compute_mode(mode);
+        CHECK(ok, "positions: in order at %llu samples (pass %llu, position %llu, want %llu/%llu)",
+              (unsigned long long)before, (unsigned long long)pos.pass, (unsigned long long)pos.position,
+              (unsigned long long)pass, (unsigned long long)position);
+    }
+    remove(spath);
+    for (int file = 0; file < 2; file++) remove(tpaths[file]);
+    printf("  positions: %u token windows and %u samples of %u chunks resume where they stood\n", tcount, ccount, chunks);
+}
+
 /* ---------------------------------------------------------------- deployment models (format 3) */
 
 /* Fields of a .slett format 3 image, read as docs/ModelFormat.md describes them. */
@@ -8387,6 +8666,7 @@ int main(int argc, char **argv) {
         dataset_files();
         dataset_files_v2();
         token_files();
+        dataset_positions();
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");

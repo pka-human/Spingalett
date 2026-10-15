@@ -7,6 +7,16 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- **Positions of data set readers**: `spingalett_dataset_get_position()` and
+  `spingalett_dataset_set_position()` with `SpingalettDatasetPosition`: the reader's seed, the pass it
+  stands in and the samples of that pass already read, which name the samples to come exactly, since a
+  pass's order is a function of the seed and the pass number. A reader moved to a position reads what
+  it would have read from there, bit for bit, on any number of threads, with or without its decoding
+  thread (chunks decoded ahead are dropped; a chunk the position lies inside is decoded at once), for
+  `.slettd` files streamed or kept in memory and for token files. Contributed by Nazar Ponomarenko
+  (pull request 11).
+
 ## [1.3.0] - 2026-10-15
 
 "Language models in production": language models served where 1.2 trained them, on the CPU and both GPU

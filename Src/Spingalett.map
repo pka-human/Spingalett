@@ -144,3 +144,9 @@ SPINGALETT_1.3 {
         spingalett_tokenizer_load;
         spingalett_tokenizer_token;
 } SPINGALETT_1.2;
+
+SPINGALETT_1.4 {
+    global:
+        spingalett_dataset_get_position;
+        spingalett_dataset_set_position;
+} SPINGALETT_1.3;
