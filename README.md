@@ -1734,15 +1734,16 @@ position of half of them, in tokens per second. `Examples/benchmark_pytorch.py` 
 workloads in PyTorch. Run them with `Bin/Benchmark [threads]` and `python
 Examples/benchmark_pytorch.py [threads]`.
 
-Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 efficiency cores, AVX2
-and AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16
-and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel
-MKL and oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13
-to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was;
-0.11 to 0.13 leave all of them as they were on the CPU (within 4% of the release before, either
-way, in interleaved runs), and 1.2 leaves them as 1.1 did (within 3% either way, in interleaved
-runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style network, new in 0.14, with
-0.14, the GPT, new in 1.2, with 1.2 (the means of two runs):
+Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 efficiency cores, AVX2 and
+AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16 and
+uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel MKL and
+oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13 to 19%
+faster and runs them 15 to 27% faster, and leaves the fully connected network as it was; 0.11 to 0.13
+leave all of them as they were on the CPU (within 4% of the release before, either way, in
+interleaved runs), and 1.2 and 1.3 leave them as the release before did (within 3% either way, in
+interleaved runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style network, new in
+0.14, with 0.14, the GPT, whose training 1.3 made 1.4 times as fast on one thread and 3.2 times on
+eight, with 1.3:
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
@@ -1786,24 +1787,22 @@ runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style networ
 
 | GPT, tokens/s | Threads | Training | Inference |
 |---|---:|---:|---:|
-| Spingalett | 1 | 1,120 | 3,595 |
-| PyTorch | 1 | 1,435 | 568 |
-| Spingalett (OpenMP) | 8 | 2,088 | 9,226 |
-| PyTorch | 8 | 4,284 | 1,690 |
+| Spingalett | 1 | 1,616 | 3,893 |
+| PyTorch | 1 | 1,534 | 591 |
+| Spingalett (OpenMP) | 8 | 7,065 | 19,043 |
+| PyTorch | 8 | 4,314 | 1,679 |
 
 Spingalett trains the convolutional network 1.4 to 2.3 times as fast as PyTorch and runs it 2.6 to
 3.9 times as fast; with batch normalization 1.5 to 2.4 times and 3.4 to 5.5 times, since the
 normalization runs in the convolution's epilogue at inference. ResNet-20 trains 1.1 to 1.8 times as
 fast and runs 1.5 to 2.8 times as fast, the U-Net 1.1 to 1.6 times and 1.7 to 3.3 times, the
-MobileNet-style network 1.35 to 2 times and 2.3 to 4.2 times. The GPT infers 5.5 to 6.3 times as
-fast as in PyTorch, and trains at 0.78 times PyTorch's speed on one thread and 0.49 times on eight,
-which [ROADMAP.md](ROADMAP.md) plans to improve. For the
-fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast, full batches 1.1 to
-1.6 times and infers 1.1 to 1.7 times as fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: built without them
-(`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
-and 4,798.
+MobileNet-style network 1.35 to 2 times and 2.3 to 4.2 times, the GPT 1.05 to 1.64 times and 6.6 to
+11.3 times. For the fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast,
+full batches 1.1 to 1.6 times and infers 1.1 to 1.7 times as fast. The indirect convolution kernels
+of 0.10 account for the gains over 0.9: built without them (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20
+trains at 234 and 986 samples per second and infers at 958 and 4,798.
 
-On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 1.2 runs
+On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 1.3 runs
 the same workloads with `SPINGALETT_COMPUTE_CUDA` and `SPINGALETT_COMPUTE_VULKAN` (`Bin/Benchmark
 gpu`), in single precision and in bfloat16 (`spingalett_set_gpu_precision()`), against PyTorch 2.14.1
 with CUDA 13.0, cuBLAS and cuDNN 9.24, as it runs by default (`python Examples/benchmark_pytorch.py
@@ -1812,67 +1811,70 @@ bfloat16) and at its fastest (`--max`: `torch.compile` with `max-autotune` and C
 `cudnn.benchmark`, channels-last tensors, fused optimizers). The figures are medians of three rounds.
 The laptop's GPU slows down by up to 12% as it warms, so each block of runs (Spingalett on CUDA,
 PyTorch by default, PyTorch at its fastest, Spingalett on Vulkan) starts with the GPU at 60 °C, and
-the blocks' order changes from round to round. The first four columns keep the data in GPU memory
-from the start: Spingalett's data sets (`spingalett_device_data_new()`), PyTorch's tensors. The last
-two take it from host memory: Spingalett's arrays, each chunk copied over while the GPU works on the
-ones before, and PyTorch's pinned tensors, each batch copied as it is used and the outputs of
-inference copied back (`--host-data`). Inference is timed after a first call (Spingalett) or a
-warm-up step (PyTorch):
+the blocks' order changes from round to round. The GPT, which comes last in a block, is measured on
+its own (`Bin/Benchmark gpu cuda bf16 gpt`, `benchmark_pytorch.py --cuda-bf16 --max --gpt`), each run
+from the GPU at 60 °C: a precision of a backend a run, PyTorch a configuration a run. The fully
+connected network's mini-batches vary by up to 8% from run to run, in 1.2 as in 1.3. The first four
+columns keep the data in GPU memory from the start: Spingalett's data sets
+(`spingalett_device_data_new()`), PyTorch's tensors. The last two take it from host memory:
+Spingalett's arrays, each chunk copied over while the GPU works on the ones before, and PyTorch's
+pinned tensors, each batch copied as it is used and the outputs of inference copied back
+(`--host-data`). Inference is timed after a first call (Spingalett) or a warm-up step (PyTorch):
 
 | On the GPU, samples/s | CUDA, data on GPU (FP32 / bf16) | Vulkan, data on GPU (FP32 / bf16) | PyTorch, data on GPU (TF32 / FP32 / bf16) | PyTorch `--max`, data on GPU (TF32 / FP32 / bf16) | CUDA, host data (FP32 / bf16) | PyTorch, host data (TF32 / bf16) |
 |---|---:|---:|---:|---:|---:|---:|
-| ResNet-20, training | 11,740 / 22,680 | 10,680 / 18,360 | 8,521 / 7,573 / 12,270 | 9,779 / 8,744 / 20,700 | 11,770 / 22,700 | 8,401 / 12,040 |
-| ResNet-20, inference | 42,590 / 89,400 | 38,410 / 73,400 | 19,840 / 19,670 / 31,580 | 33,650 / 23,120 / 72,720 | 43,020 / 89,710 | 19,410 / 30,460 |
-| Convolutional network, training | 117,200 / 217,400 | 109,300 / 169,200 | 61,970 / 61,240 / 102,500 | 90,840 / 86,060 / 115,500 | 117,800 / 220,800 | 58,050 / 104,500 |
-| Convolutional network, inference | 390,300 / 982,800 | 345,600 / 507,600 | 132,900 / 144,100 / 237,800 | 214,400 / 179,900 / 423,500 | 386,500 / 974,700 | 128,000 / 226,300 |
-| With batch normalization, training | 80,760 / 153,300 | 76,050 / 121,900 | 48,330 / 48,780 / 83,100 | 66,650 / 63,720 / 103,600 | 80,970 / 154,200 | 47,960 / 82,560 |
-| With batch normalization, inference | 374,100 / 939,200 | 316,700 / 481,300 | 107,400 / 114,300 / 198,100 | 216,800 / 181,100 / 429,500 | 377,700 / 942,600 | 104,100 / 187,700 |
-| Fully connected network, mini-batch 64 | 371,000 / 529,900 | 322,800 / 444,200 | 82,480 / 80,670 / 70,960 | 109,800 / 113,900 / 123,500 | 375,700 / 551,600 | 75,080 / 53,900 |
-| Fully connected network, full batch | 1,339,000 / 3,263,000 | 1,273,000 / 2,897,000 | 1,055,000 / 1,057,000 / 2,542,000 | 1,019,000 / 1,005,000 / 2,386,000 | 1,215,000 / 3,016,000 | 845,600 / 1,574,000 |
-| Fully connected network, inference | 3,776,000 / 9,925,000 | 3,684,000 / 8,091,000 | 2,950,000 / 2,956,000 / 6,274,000 | 2,629,000 / 2,595,000 / 5,198,000 | 2,977,000 / 6,627,000 | 1,708,000 / 2,473,000 |
-| U-Net, training | 4,538 / 8,204 | 4,056 / 7,032 | 3,359 / 3,108 / 5,010 | 4,054 / 3,428 / 8,064 | 4,503 / 8,218 | 3,247 / 4,457 |
-| U-Net, inference | 15,320 / 31,880 | 14,850 / 25,650 | 6,464 / 6,694 / 11,950 | 11,220 / 7,796 / 26,770 | 15,280 / 31,460 | 5,961 / 11,060 |
-| MobileNet-style network, training | 15,140 / 33,600 | 14,700 / 31,760 | 9,917 / 8,701 / 22,830 | 9,160 / 8,255 / 21,750 | 14,910 / 33,400 | 9,784 / 22,230 |
-| MobileNet-style network, inference | 119,600 / 186,100 | 115,700 / 149,700 | 19,580 / 17,880 / 38,830 | 40,700 / 40,600 / 77,140 | 119,400 / 183,200 | 19,180 / 37,360 |
-| GPT, training (tokens/s) | 64,130 / 167,200 | 34,310 / 52,180 | 63,500 / 60,220 / 156,500 | 63,200 / 58,400 / 182,900 | 66,780 / 169,200 | 57,980 / 152,800 |
-| GPT, inference (tokens/s) | 209,100 / 535,100 | 129,100 / 209,000 | 204,100 / 196,000 / 507,700 | 192,100 / 181,900 / 610,600 | 218,500 / 547,600 | 177,900 / 471,400 |
+| ResNet-20, training | 11,840 / 22,640 | 10,830 / 18,690 | 8,528 / 7,713 / 12,320 | 9,808 / 8,917 / 20,410 | 11,790 / 22,620 | 8,457 / 12,160 |
+| ResNet-20, inference | 43,330 / 89,300 | 40,200 / 75,680 | 19,860 / 19,790 / 31,630 | 33,820 / 23,250 / 73,570 | 43,030 / 89,160 | 19,470 / 30,690 |
+| Convolutional network, training | 117,400 / 219,400 | 110,000 / 169,600 | 62,050 / 61,210 / 102,500 | 92,160 / 88,530 / 117,000 | 117,900 / 222,000 | 57,390 / 99,220 |
+| Convolutional network, inference | 389,500 / 995,400 | 345,300 / 506,900 | 132,700 / 144,200 / 238,200 | 214,600 / 180,000 / 427,400 | 385,900 / 982,500 | 128,300 / 223,900 |
+| With batch normalization, training | 80,970 / 153,600 | 75,880 / 122,400 | 48,480 / 48,860 / 83,470 | 66,210 / 63,840 / 107,400 | 80,720 / 154,700 | 48,160 / 57,900 |
+| With batch normalization, inference | 376,100 / 938,000 | 318,400 / 478,700 | 107,400 / 114,400 / 198,200 | 214,000 / 180,100 / 427,100 | 379,500 / 947,800 | 104,300 / 188,000 |
+| Fully connected network, mini-batch 64 | 349,700 / 531,800 | 322,500 / 443,400 | 88,040 / 79,800 / 70,040 | 87,730 / 113,400 / 129,400 | 383,000 / 557,800 | 91,530 / 73,800 |
+| Fully connected network, full batch | 1,313,000 / 3,270,000 | 1,285,000 / 2,903,000 | 1,049,000 / 1,055,000 / 2,546,000 | 1,016,000 / 1,021,000 / 2,393,000 | 1,228,000 / 3,023,000 | 844,600 / 1,573,000 |
+| Fully connected network, inference | 3,806,000 / 10,174,000 | 3,621,000 / 8,085,000 | 2,958,000 / 2,958,000 / 6,281,000 | 2,616,000 / 2,626,000 / 5,243,000 | 2,990,000 / 6,472,000 | 1,709,000 / 2,465,000 |
+| U-Net, training | 4,546 / 8,230 | 4,193 / 7,092 | 3,339 / 3,113 / 5,014 | 4,092 / 3,599 / 8,028 | 4,492 / 8,254 | 3,257 / 4,586 |
+| U-Net, inference | 15,340 / 31,820 | 15,220 / 25,760 | 6,467 / 6,711 / 12,000 | 11,200 / 7,813 / 26,780 | 15,310 / 31,620 | 6,113 / 11,070 |
+| MobileNet-style network, training | 15,170 / 33,430 | 14,700 / 31,850 | 9,895 / 8,692 / 22,910 | 9,116 / 8,232 / 21,980 | 14,960 / 33,350 | 9,773 / 22,280 |
+| MobileNet-style network, inference | 120,000 / 183,800 | 116,700 / 163,500 | 19,590 / 17,900 / 38,920 | 40,700 / 40,740 / 78,000 | 118,800 / 182,200 | 19,210 / 37,430 |
+| GPT, training (tokens/s) | 69,230 / 197,600 | 68,330 / 181,300 | 64,030 / 64,090 / 156,800 | 66,460 / 66,410 / 193,000 | 73,560 / 198,700 | 64,060 / 156,800 |
+| GPT, inference (tokens/s) | 224,200 / 684,800 | 217,600 / 583,100 | 208,100 / 208,400 / 517,800 | 207,400 / 207,200 / 655,000 | 231,800 / 687,300 | 203,200 / 497,400 |
 
-On CUDA Spingalett is ahead of PyTorch at its fastest in every workload but the GPT in bfloat16.
-With the data in GPU memory, in single precision, against the fastest of PyTorch's runs in single
-precision or with TF32 convolutions, it trains ResNet-20 1.2 times as fast and runs it 1.27 times as
-fast, the convolutional networks 1.2 to 1.3 and 1.7 to 1.8 times, the U-Net 1.12 and 1.37 times, the
-MobileNet-style network 1.5 and 2.9 times, and the fully connected network 1.27 times as fast in
-full batches and 3.3 times in mini-batches, and infers 1.28 times as fast; the GPT trains 1.01 times
-as fast and infers 1.02 times as fast. In bfloat16, against PyTorch's fastest run in bfloat16:
-ResNet-20 1.1 and 1.23 times, the convolutional networks 1.5 to 1.9 and 2.2 to 2.3 times, the U-Net
-1.02 and 1.19 times, the MobileNet-style network 1.47 and 2.4 times, the fully connected network
-1.28 times in full batches, 4.3 times in mini-batches and 1.6 times in inference. The GPT in
-bfloat16 trains at 0.91 times and infers at 0.88 times the speed of PyTorch compiled, and 1.06 times
-as fast as PyTorch by default, both: the products of its forward pass and data gradients run at 15
-to 17 TFLOPS on the matrix units where cuBLAS reaches 22 to 23, which 1.3 plans to close
-([ROADMAP.md](ROADMAP.md)). Against PyTorch by default the margins are wider: in single precision
-ResNet-20 trains 1.38 times as fast as PyTorch with TF32 (1.55 times as fast as in single precision)
-and infers 2.15 times as fast, and the MobileNet-style network infers 6.1 times as fast; in bfloat16
-ResNet-20 trains 1.85 times as fast and infers 2.8 times as fast, and the fully connected network
-trains mini-batches 7.5 times as fast. From host arrays the margins are as wide or wider (PyTorch
-copies each batch as it uses it; Spingalett copies a chunk while the GPU works on the ones before):
-the fully connected network, whose inference the bus binds, infers 1.74 times as fast in single
-precision and 2.7 times in bfloat16.
+On CUDA Spingalett is ahead of PyTorch at its fastest in every workload. With the data in GPU memory,
+in single precision, against the fastest of PyTorch's runs in single precision or with TF32
+convolutions, it trains ResNet-20 1.21 times as fast and runs it 1.28 times as fast, the
+convolutional networks 1.2 to 1.3 and 1.8 times, the U-Net 1.11 and 1.37 times, the MobileNet-style
+network 1.5 and 2.9 times, the GPT 1.04 and 1.08 times, and the fully connected network 1.24 times as
+fast in full batches and 3.1 times in mini-batches, and infers 1.29 times as fast. In bfloat16,
+against PyTorch's fastest run in bfloat16: ResNet-20 1.11 and 1.21 times, the convolutional networks
+1.4 to 1.9 and 2.2 to 2.3 times, the U-Net 1.03 and 1.19 times, the MobileNet-style network 1.46 and
+2.4 times, the GPT 1.02 and 1.05 times (where 1.2.0, measured the same way, trained at 0.94 times and
+inferred at 0.89 times the speed of PyTorch compiled), the fully connected network 1.28 times in full
+batches, 4.1 times in mini-batches and 1.6 times in inference. Against PyTorch by default the margins
+are wider: in single precision ResNet-20 trains 1.39 times as fast as PyTorch with TF32 (1.53 times
+as fast as in single precision) and infers 2.18 times as fast, and the MobileNet-style network infers
+6.1 times as fast; in bfloat16 ResNet-20 trains 1.84 times as fast and infers 2.8 times as fast, the
+GPT trains 1.26 times as fast and infers 1.32 times as fast, and the fully connected network trains
+mini-batches 7.6 times as fast. From host arrays the margins are as wide or wider (PyTorch copies
+each batch as it uses it; Spingalett copies a chunk while the GPU works on the ones before): the
+fully connected network, whose inference the bus binds, infers 1.75 times as fast in single precision
+and 2.6 times in bfloat16.
 
 The CUDA backend is the faster on this GPU: against the Vulkan backend (the same executor) it trains
-the networks of 1.1 1.03 to 1.15 times as fast in single precision and 1.06 to 1.28 times in
-bfloat16, and infers them 1.02 to 1.18 times as fast in single precision and 1.22 to 1.95 times in
-bfloat16, where its products of the tensor cores, its kernel for a network's first convolution
-(`dconv.cu`) and its depthwise convolutions pull ahead. It trains the GPT 1.9 times as fast in
-single precision and 3.2 times in bfloat16, and infers it 1.6 and 2.6 times as fast: its attention
-runs in register tiles and on the tensor cores, Vulkan's without the matrix units. Against 1.1.0,
-measured in the same way (both built alike), 1.2 infers the networks of 1.1 in bfloat16 as fast (the
-convolutional network) to 1.21 times as fast (ResNet-20 1.14 times, the U-Net 1.09, the
-MobileNet-style network 1.14, the convolutional network with batch normalization 1.21, the fully
-connected network 1.1), trains them in bfloat16 up to 1.03 times as fast, and runs the rest within
-1.5% of 1.1 either way (the fully connected network's inference from host arrays in single precision
-1.04 times as fast). In single precision Spingalett trains ResNet-20 on the GPU 7.4 times as fast as
-on the eight threads of the CPU.
+the other networks 1.02 to 1.09 times as fast in single precision and 1.05 to 1.29 times in bfloat16,
+and infers them 1.01 to 1.18 times as fast in single precision and 1.12 to 1.96 times in bfloat16,
+where its products of the tensor cores, its kernel for a network's first convolution (`dconv.cu`) and
+its depthwise convolutions pull ahead. The GPT, whose attention runs on the matrix units in bfloat16
+and in register tiles in single precision on both backends since 1.3, trains 1.01 times as fast on
+CUDA in single precision and 1.09 times in bfloat16, and infers 1.03 and 1.17 times as fast: CUDA's
+products of 128 x 128 outputs over three stages (`gemm_pipe.cu`) are ahead of Vulkan's on cooperative
+matrices. Against 1.2.0, measured in the same way (both built alike, in interleaved runs of every
+workload), 1.3 trains the GPT on Vulkan 3.1 to 3.2 times as fast in bfloat16 and 1.9 times in single
+precision and infers it 2.6 to 2.7 and 1.6 times as fast, on CUDA 1.10 and 1.04 times as fast and
+infers it 1.12 to 1.14 and 1.03 to 1.05 times as fast, and runs the other workloads as 1.2 did:
+within 3% either way, but for a few rows that moved by up to 6% either way in those runs as the GPU
+warmed, of which the slower ran within 2.5% of 1.2 in runs of their workloads alone. In single
+precision Spingalett trains ResNet-20 on the GPU 7.4 times as fast as on the eight threads of the
+CPU.
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the

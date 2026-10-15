@@ -7,6 +7,20 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-15
+
+"Language models in production": language models served where 1.2 trained them, on the CPU and both GPU
+backends: sessions with a key-value cache (batched generation, sliding windows), deployment models
+predicting on the GPU (integer ones to the CPU's bits) and decoding with weights in INT8, INT4 and INT2,
+tokenizers and Hugging Face and GGUF checkpoints in C and every binding; in training tied embeddings,
+activation recomputation, gradient accumulation, padding, sliding windows and cross-attention; ONNX
+import of transformers, the engine in WebAssembly for JavaScript, bindings for PHP. And the GPT of
+`Examples/Benchmark.c` is ahead of PyTorch where 1.2 was behind it: in bfloat16 on CUDA ahead of
+`torch.compile` with `max-autotune`, on the CPU 1.05 times as fast as PyTorch in training on one thread
+and 1.64 times on eight (1.2: 0.78 and 0.49 times), and on Vulkan 3.1 times as fast as 1.2 in bfloat16
+and 1.9 times in single precision (README, **Performance**). Programs of 1.2 build and run unchanged;
+files of 1.2 load unchanged.
+
 ### Added
 - **Activation recomputation** (`SpingalettTrainArgs.recompute`, checkpointing) on the CPU: the training
   workspace keeps the outputs of the layers several layers read (a transformer's residual stream, one a
@@ -277,9 +291,10 @@ All notable changes to this project are documented in this file. The format foll
   tile still gives the same bits; flash attention's forward pass with two tiles of queries a warp, its rows
   loaded and stored 16 bytes at a time; GELU's erf through the approximate reciprocal; training and inference
   chunks whose largest layer keeps to the GPU's cache (2^24 values: the GPT in chunks of 16 sequences in
-  training, 32 in inference). On an RTX 4050 Laptop GPU the GPT of `Examples/Benchmark.c` in bfloat16 trains
-  200,800 tokens a second instead of 1.2's 180,900 and infers 675,900 instead of 583,800, against
-  `torch.compile` with `max-autotune`'s 192,600 and 654,300 (medians of three runs from a GPU at 60 C).
+  training, 32 in inference). On an RTX 4050 Laptop GPU the GPT of `Examples/Benchmark.c` in bfloat16, its
+  data in GPU memory, trains 197,600 tokens a second and infers 684,800, against `torch.compile` with
+  `max-autotune`'s 193,000 and 655,000 (medians of three runs of the GPT alone, each from a GPU at 60 C;
+  1.2.0, measured the same way: 180,900 and 583,800).
 - **Transformers' training on the CPU** (the roadmap's step 2 of 1.3): element-wise passes over a chunk in
   pieces of 8,192 values rather than a sample at a time, GELU, its tanh form and SiLU in vectors while training
   (erf as the GPU computes it; inference keeps libm's), the indirect products' weights packed on the threads,
@@ -287,8 +302,9 @@ All notable changes to this project are documented in this file. The format foll
   linear layers' weight gradients on the dense products in slots of 2,048 tokens summed in their order
   (`SpingalettGemmHooks.tall`), and large tiles of the indirect products handed out one at a time; every
   change keeps the bits the same on any number of threads. On an Intel Core i7-12650H the GPT of
-  `Examples/Benchmark.c` trains 1,602 tokens a second on one thread (1.2: 1,120) and 6,675 on six (1.2:
-  about 2,550), against PyTorch 2.14.1's 1,541 and 6,000 in interleaved runs; inference on six threads 18,100.
+  `Examples/Benchmark.c` trains 1,616 tokens a second on one thread (1.2.0: 1,150) and 7,065 on eight (1.2.0:
+  2,190), against PyTorch 2.14.1's 1,534 and 4,314, and infers 3,893 and 19,043 (1.2.0: 3,655 and 9,656),
+  medians of three interleaved runs.
 - **Attention in single precision on Vulkan in register tiles** (`rattn.comp`, as CUDA's `rattn.cu` computes it):
   a workgroup of 64 queries (keys in the keys' gradient pass), each invocation four of them and a share of a tile
   of keys, the scores and sums in registers, a row's maximum and sum combined over its eight lanes by subgroup
@@ -1516,7 +1532,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/pka-human/Spingalett/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/pka-human/Spingalett/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/pka-human/Spingalett/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/pka-human/Spingalett/compare/v0.14.0...v1.0.0
