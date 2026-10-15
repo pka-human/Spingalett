@@ -2058,9 +2058,12 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 - 1.7: beyond neural networks: gradient-boosted trees and random forests (deterministic histogram
   training on the CPU and GPU, trees in the engine and the runtime, imports from XGBoost, LightGBM and
   scikit-learn), linear models, k-means, PCA, scikit-learn-style estimators in Python
-- 1.8: learning from rewards: reinforcement learning (PPO, SAC, DQN; environments stepped by the
-  program or a game's frame loop, rewards in named terms, behaviour cloning) and evolution (genetic
-  algorithms with crossover and mutation, evolution strategies, evolved topologies), seeded throughout
+- 1.8: learning from rewards: reinforcement learning for games, robots, control and decisions (PPO,
+  SAC, DQN, several agents and self-play, tree search; environments stepped by the program or its own
+  loop, rewards in named terms), bandits, learning from logs, language models tuned by GRPO and DPO with
+  low-rank adapters, and evolution (genetic algorithms with crossover and mutation over any genome,
+  several objectives, evolution strategies, evolved topologies, population-based training), seeded
+  throughout
 - 1.9 to 2.0: Arm and Apple (NEON training, Metal), training across several GPUs, multi-head latent
   attention, FP16 products with loss scaling
 

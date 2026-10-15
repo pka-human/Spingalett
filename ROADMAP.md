@@ -148,40 +148,69 @@ trees.
 
 ## 1.8: learning from rewards: reinforcement learning and evolution
 
-Networks trained by what they do rather than by labelled examples: a character in a 3D game that learns
-to walk, rewarded for distance covered and penalized for falling or for movements it should not make; a
-robot's controller; a game's opponent. The library is a C library with a runtime and an engine without
-dependencies, which is what a game engine or a robot can link, and its training repeats its bits, which
-reinforcement learning, known for runs that cannot be reproduced, rarely does.
+Networks trained by the consequences of what they do rather than by labelled examples, wherever a
+program can score an outcome: characters and opponents in games (a character that learns to walk,
+rewarded for distance covered and penalized for falling), the controllers of robots and drones trained
+in simulation, the control of machines, buildings' heating and data centres' cooling, traffic signals,
+bidding and trading, recommendations and prices chosen as bandits choose, decisions inside compilers and
+databases (as LLVM's inlining policy), scheduling and routing, and language models tuned by rewards and
+preferences. Evolution takes what has no gradient at all: a design's dimensions, a strategy's rules, a
+game's balance, a network's own shape and hyper-parameters. The library is a C library with a runtime and
+an engine without dependencies, which is what a game, a robot, a compiler or a server can link, and its
+training repeats its bits, which reinforcement learning, known for runs that cannot be reproduced, rarely
+does.
 
 - **Environments as the program has them**: the program steps its world (a physics engine, a game's
-  frame loop) and the library acts and learns, in either direction of control: the library calls the
-  program's `reset` and `step` (observations, a reward, whether the episode ended or was cut short), or the
-  game's loop calls the agent (`act` for each character's observation, `reward` and `end` as they come),
-  for one character or thousands stepped side by side on the program's threads. Rewards may be given as
-  named terms (forward speed, falling, energy spent, a joint's limit), logged one by one, since shaping
-  them is most of the work of teaching a gait.
+  frame loop, a simulator of a plant or a market, logs replayed) and the library acts and learns, in
+  either direction of control: the library calls the program's `reset` and `step` (observations, a
+  reward, whether the episode ended or was cut short), or the program's loop calls the agent (`act` for
+  each agent's observation, `reward` and `end` as they come), for one agent or thousands stepped side by
+  side on the program's threads. Observations and actions of any shape: vectors, images, discrete
+  choices, continuous ones, several at once. Rewards may be given as named terms (forward speed, a fall,
+  energy spent, a constraint broken), logged one by one, since shaping them is most of the work.
 - **Algorithms**: PPO (discrete actions and continuous ones from Gaussian policies, generalized
   advantage estimation, clipping, an entropy bonus), SAC for continuous control from a replay buffer,
   DQN with its double and dueling variants for discrete actions; observations and rewards normalized by
-  running statistics saved with the policy; recurrent policies on 1.6's layers; behaviour cloning from
-  recorded play (a person's demonstrations) to start from before rewards take over. Every draw from a
-  seed, the environments' too: a run repeats its bits on any number of threads, and resumes from a
-  checkpoint as supervised training does.
+  running statistics saved with the policy; recurrent policies on 1.6's layers. Several agents in one
+  environment, each with a policy of its own or one shared, and self-play against a league of their past
+  versions; tree search guided by a network's policy and value (AlphaZero's) for board games and for
+  planning where the program can simulate a move. Every draw from a seed, the environments' too: a run
+  repeats its bits on any number of threads, and resumes from a checkpoint as supervised training does.
+- **Bandits** for decisions whose reward comes at once (which item to recommend, which price or variant
+  to show): epsilon-greedy, LinUCB and Thompson sampling over 1.7's linear models or over networks, and
+  a new policy evaluated on logged decisions before it serves (inverse propensity and doubly robust
+  estimates).
+- **Learning from logs** where exploring is costly or unsafe: behaviour cloning from recorded play or
+  operation (a person's demonstrations, a running system's decisions) to start from before rewards take
+  over, and offline reinforcement learning (implicit and conservative Q-learning) on recorded
+  transitions, read as `.slettd` data sets.
+- **Language models from rewards and preferences**: the transformers of 1.4 to 1.6 tuned by GRPO (groups
+  of completions sampled by the sessions' batched generation, scored by the program's function: tests
+  passed, an answer checked, a format kept) and by DPO from pairs of preferred and rejected answers;
+  low-rank adapters (LoRA), which train a small share of the parameters, serve supervised fine-tuning as
+  well, and are merged into the model or kept beside it for the runtime to apply.
 - **The policy deployed** as any network: a `.slett` file the game's runtime evaluates each frame in
-  microseconds, the engine on a robot's microcontroller.
+  microseconds, a server per request, the engine on a robot's or a drone's microcontroller.
 - **Evolution**, for problems without gradients and for policies that rewards alone train badly: genetic
-  algorithms over a network's parameters or any vector of genes (populations, tournament selection and
-  elitism, crossover by gene, by layer or at points, Gaussian and reset mutations at rates that may decay),
-  fitness from the program's callback (the distance a character walked) evaluated in parallel; evolution
-  strategies (OpenAI's, CMA-ES for small genomes) whose perturbations are rebuilt from seeds rather than
-  stored; topologies evolved as graphs of layers (neurons and layers added or removed by mutation, as
-  NEAT does). Seeded throughout: a population evolves the same way on any number of threads.
-- **In Python**, Gymnasium's environments wrap directly (`sg.rl.PPO(env)`), and examples train a
-  walker in a physics simulation and a character in a Godot scene through the C API.
+  algorithms over a network's parameters or any genome (real numbers, integers, bits, or permutations
+  such as orders of jobs and routes, with the operators each needs), with populations, tournament
+  selection and elitism, crossover by gene, by layer, at points or by order, and Gaussian, reset and
+  swap mutations at rates that may decay; several objectives at once with their Pareto front (NSGA-II);
+  fitness from the program's callback (the distance a character walked, a design's simulated strength, a
+  schedule's length) evaluated in parallel. Evolution strategies (OpenAI's, CMA-ES for small genomes)
+  whose perturbations are rebuilt from seeds rather than stored; topologies evolved as graphs of layers
+  (neurons and layers added or removed by mutation, as NEAT does); population-based training, which
+  trains networks side by side and evolves their hyper-parameters (learning rates, dropout, reward
+  weights) by copying the best and perturbing them. Seeded throughout: a population evolves the same way
+  on any number of threads.
+- **In Python**, Gymnasium's environments wrap directly (`sg.rl.PPO(env)`), PettingZoo's for several
+  agents; examples train a walker in a physics simulation, a character in a Godot scene through the C
+  API, a bandit on logged clicks, a schedule by evolution and a small language model on arithmetic by
+  GRPO.
 
-Measured against Stable-Baselines3 and CleanRL (wall time to the same returns on Hopper, Walker2d, HalfCheetah
-and Humanoid in MuJoCo, on the CPU and the GPU) and against evosax and EvoTorch.
+Measured against Stable-Baselines3 and CleanRL (wall time to the same returns on Hopper, Walker2d,
+HalfCheetah and Humanoid in MuJoCo and on Atari games, on the CPU and the GPU), Vowpal Wabbit for bandits,
+TRL for GRPO and DPO, and evosax, EvoTorch, DEAP and pymoo for evolution.
 
 ## 1.9: Arm, Apple and the edge
 
