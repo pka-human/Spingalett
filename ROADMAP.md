@@ -146,9 +146,46 @@ Measured against XGBoost, LightGBM and CatBoost (time to the same validation los
 throughput on Higgs, Covertype and Epsilon, on the CPU and the GPU) and against Treelite's compiled
 trees.
 
-## 1.8: Arm, Apple and the edge
+## 1.8: learning from rewards: reinforcement learning and evolution
 
-The CPU and GPU paths that 1.0 to 1.7 tuned on x86 and NVIDIA, brought to the other hardware the
+Networks trained by what they do rather than by labelled examples: a character in a 3D game that learns
+to walk, rewarded for distance covered and penalized for falling or for movements it should not make; a
+robot's controller; a game's opponent. The library is a C library with a runtime and an engine without
+dependencies, which is what a game engine or a robot can link, and its training repeats its bits, which
+reinforcement learning, known for runs that cannot be reproduced, rarely does.
+
+- **Environments as the program has them**: the program steps its world (a physics engine, a game's
+  frame loop) and the library acts and learns, in either direction of control: the library calls the
+  program's `reset` and `step` (observations, a reward, whether the episode ended or was cut short), or the
+  game's loop calls the agent (`act` for each character's observation, `reward` and `end` as they come),
+  for one character or thousands stepped side by side on the program's threads. Rewards may be given as
+  named terms (forward speed, falling, energy spent, a joint's limit), logged one by one, since shaping
+  them is most of the work of teaching a gait.
+- **Algorithms**: PPO (discrete actions and continuous ones from Gaussian policies, generalized
+  advantage estimation, clipping, an entropy bonus), SAC for continuous control from a replay buffer,
+  DQN with its double and dueling variants for discrete actions; observations and rewards normalized by
+  running statistics saved with the policy; recurrent policies on 1.6's layers; behaviour cloning from
+  recorded play (a person's demonstrations) to start from before rewards take over. Every draw from a
+  seed, the environments' too: a run repeats its bits on any number of threads, and resumes from a
+  checkpoint as supervised training does.
+- **The policy deployed** as any network: a `.slett` file the game's runtime evaluates each frame in
+  microseconds, the engine on a robot's microcontroller.
+- **Evolution**, for problems without gradients and for policies that rewards alone train badly: genetic
+  algorithms over a network's parameters or any vector of genes (populations, tournament selection and
+  elitism, crossover by gene, by layer or at points, Gaussian and reset mutations at rates that may decay),
+  fitness from the program's callback (the distance a character walked) evaluated in parallel; evolution
+  strategies (OpenAI's, CMA-ES for small genomes) whose perturbations are rebuilt from seeds rather than
+  stored; topologies evolved as graphs of layers (neurons and layers added or removed by mutation, as
+  NEAT does). Seeded throughout: a population evolves the same way on any number of threads.
+- **In Python**, Gymnasium's environments wrap directly (`sg.rl.PPO(env)`), and examples train a
+  walker in a physics simulation and a character in a Godot scene through the C API.
+
+Measured against Stable-Baselines3 and CleanRL (wall time to the same returns on Hopper, Walker2d, HalfCheetah
+and Humanoid in MuJoCo, on the CPU and the GPU) and against evosax and EvoTorch.
+
+## 1.9: Arm, Apple and the edge
+
+The CPU and GPU paths that 1.0 to 1.8 tuned on x86 and NVIDIA, brought to the other hardware the
 library runs on.
 
 - **NEON kernels for training** (and SVE where available), so that Apple silicon and AArch64
@@ -162,7 +199,7 @@ library runs on.
   RISC-V vector, transformers' layers within a microcontroller's memory, and models larger than RAM
   run layer by layer from flash.
 
-## 1.9: scale
+## 1.10: scale
 
 Models that do not fit one GPU's memory or time (planned for 1.4 until the language models came first).
 
