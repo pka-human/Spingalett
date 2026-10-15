@@ -17,6 +17,16 @@ All notable changes to this project are documented in this file. The format foll
   `.slettd` files streamed or kept in memory and for token files. Contributed by Nazar Ponomarenko
   (pull request 11).
 
+### Changed
+- **The order of an epoch** in `spingalett_train()` on arrays is drawn from a seed the run draws once
+  and the epoch's number, as data set readers draw their passes, instead of shuffling the previous
+  epoch's order with the library's generator: any epoch's order is known without the epochs before it,
+  and a callback that draws from the generator no longer changes the orders that follow. A run
+  therefore orders its samples otherwise than 1.3 did from the same `spingalett_seed()`, and draws one
+  value of the generator for its orders instead of one for each sample of each epoch. The speed is the
+  same (the MLP of `Examples/Benchmark.c`, mini-batches of 64: 21,060 and 21,174 samples/s on one
+  thread, 51,844 and 51,540 on eight, medians of six runs each on an i7-12650H).
+
 ## [1.3.0] - 2026-10-15
 
 "Language models in production": language models served where 1.2 trained them, on the CPU and both GPU

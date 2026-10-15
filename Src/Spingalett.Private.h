@@ -566,7 +566,10 @@ float random_normal_weight(void);
 
 float spingalett_dot_product(const float *restrict a, const float *restrict b, uint64_t n);
 
-void spingalett_shuffle_indices(uint32_t *indices, uint32_t n);
+/* Writes a permutation of 0 to n - 1 into order, drawn from seed and index alone (Fisher and Yates'
+   shuffle over splitmix64): epoch e of a training run takes the run's seed and e, so that the order of
+   any epoch is known without the epochs before it (a run resumed from a checkpoint). */
+void spingalett_permutation(uint32_t *order, uint32_t n, uint64_t seed, uint64_t index);
 
 void spingalett_sgd_update(float *restrict W, const float *restrict gW, uint64_t n, float lr, float decay);
 void spingalett_momentum_update(float *restrict W, float *restrict mW, const float *restrict gW, uint64_t n,

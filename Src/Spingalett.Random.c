@@ -79,12 +79,18 @@ float random_normal_weight(void) {
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
 }
 
-void spingalett_shuffle_indices(uint32_t *indices, uint32_t n) {
-    rng_ensure_seeded();
-    for (uint32_t i = n - 1; i > 0; i--) {
-        uint32_t j = (uint32_t)(((uint64_t)rng_next() * (uint64_t)(i + 1)) >> 32);
-        uint32_t tmp = indices[i];
-        indices[i] = indices[j];
-        indices[j] = tmp;
+static inline uint64_t mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+void spingalett_permutation(uint32_t *order, uint32_t n, uint64_t seed, uint64_t index) {
+    for (uint32_t i = 0; i < n; i++) order[i] = i;
+    uint64_t state = mix64(seed ^ mix64(index + 0x9E3779B97F4A7C15ull));
+    for (uint32_t i = n; i > 1; i--) {
+        uint32_t j = (uint32_t)(((mix64(state += 0x9E3779B97F4A7C15ull) >> 32) * i) >> 32), t = order[i - 1];
+        order[i - 1] = order[j];
+        order[j] = t;
     }
 }

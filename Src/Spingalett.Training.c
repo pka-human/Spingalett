@@ -657,7 +657,8 @@ typedef struct {
     uint32_t chunk_size;        /* samples per chunk of a step, at most: a mini-batch's (with gradient
                                    accumulation, batch_size / accumulation_steps), else the step's */
     uint32_t accumulation;      /* generator mode: calls of the generator a step */
-    uint32_t *order;            /* sample order, reshuffled every epoch (NULL = in order) */
+    uint32_t *order;            /* sample order, drawn every epoch from order_seed (NULL = in order) */
+    uint64_t order_seed;        /* drawn once per run */
 
     bool use_generator;
     uint32_t gen_capacity;      /* samples requested per generator call */
@@ -721,8 +722,6 @@ static bool trainer_alloc(Trainer *t) {
         !t->use_generator && !t->args->do_not_shuffle) {
         t->order = (uint32_t *)malloc((size_t)sample_count * sizeof(uint32_t));
         if (!t->order) return false;
-        for (uint32_t i = 0; i < sample_count; i++)
-            t->order[i] = i;
     }
 
     if (t->args->val_count > 0 && !t->gpu) {
@@ -1328,6 +1327,8 @@ TrainReport spingalett_train_args(TrainArgs args) {
         spingalett_log(LOG_ERROR, "Failed to allocate training buffers");
         return (TrainReport){.status = TRAIN_FAILED};
     }
+    /* the seed of the epochs' orders: a draw of the library's generator, as for dropout and augmentation */
+    if (t.order) t.order_seed = rng_next64();
 
     /* Data sets on the GPU: gathered there when the network trains there, on that backend (augmentation
        shifts of up to 2^23 cells, rows.comp's), copied to the host otherwise; the validation's targets
@@ -1482,8 +1483,9 @@ TrainReport spingalett_train_args(TrainArgs args) {
                 break;
             }
         } else {
+            /* the epoch's order, from the run's seed and the epoch alone */
             if (t.order)
-                spingalett_shuffle_indices(t.order, sample_count);
+                spingalett_permutation(t.order, sample_count, t.order_seed, epoch - 1);
 
             for (uint32_t bi = 0; bi < steps_per_epoch; bi++) {
                 uint32_t start = bi * step_size;
