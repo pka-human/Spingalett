@@ -111,6 +111,10 @@ int main(void) {
     FIELD(SpingalettDatasetInfo, channels); FIELD(SpingalettDatasetInfo, target_set_count);
     FIELD(SpingalettDatasetInfo, target_set);
 
+    SIZE(SpingalettDatasetPosition); FIELD(SpingalettDatasetPosition, reserved);
+    FIELD(SpingalettDatasetPosition, seed); FIELD(SpingalettDatasetPosition, pass);
+    FIELD(SpingalettDatasetPosition, position);
+
     SIZE(DatasetReaderOptions); FIELD(DatasetReaderOptions, reserved);
     FIELD(DatasetReaderOptions, shuffle); FIELD(DatasetReaderOptions, in_memory); FIELD(DatasetReaderOptions, no_prefetch);
     FIELD(DatasetReaderOptions, target_set);

@@ -15,7 +15,7 @@ MIRRORS = {
     "EvalMetrics": sg._EvalMetrics, "TrainProgress": sg._TrainProgress, "TrainReport": sg._TrainReport,
     "EvaluateArgs": sg._EvaluateArgs, "OptimizerArgs": sg._OptimizerArgs, "SpingalettDataset": sg._Dataset,
     "DatasetSaveOptions": sg._DatasetSaveOptions, "SpingalettDatasetInfo": sg._DatasetInfo,
-    "SpingalettTargetSet": sg._TargetSet, "DatasetReaderOptions": sg._DatasetReaderOptions,
+    "SpingalettTargetSet": sg._TargetSet, "DatasetReaderOptions": sg._DatasetReaderOptions, "SpingalettDatasetPosition": sg._DatasetPosition,
     "SpingalettModel": sg._Model, "SpingalettLayerInfo": sg._LayerInfo,
     "SpingalettTokenReaderOptions": sg._TokenReaderOptions, "SpingalettGenerateArgs": sg._GenerateArgs,
     "SpingalettSessionOptions": sg._SessionOptions, "SpingalettSessionFeed": sg._SessionFeed,

@@ -499,6 +499,12 @@ class _DatasetReaderOptions(Structure):
     _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32), ("reserved", c_uint64 * _RESERVED)]
 
 
+class _DatasetPosition(Structure):
+    """SpingalettDatasetPosition (1.4): where a reader stands; the readers of train_from_file() and
+    train_from_tokens() live inside the call, and checkpoints hold their positions."""
+    _fields_ = [("seed", c_uint64), ("pass", c_uint64), ("position", c_uint64), ("reserved", c_uint64 * _RESERVED)]
+
+
 class _TokenReaderOptions(Structure):
     _fields_ = [
         ("context", c_uint32),
