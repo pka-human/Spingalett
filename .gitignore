@@ -8,6 +8,7 @@ Lib/
 *.nn
 *.slett
 !Tests/Data/runtime/*.slett
+!Bindings/JavaScript/test/models/*.slett
 *.slettd
 
 # Python bindings
@@ -27,3 +28,7 @@ Bindings/Rust/Cargo.lock
 Bindings/CSharp/**/bin/
 Bindings/CSharp/**/obj/
 Bindings/Java/target/
+Bindings/JavaScript/spingalett.wasm
+Bindings/JavaScript/LICENSE
+Bindings/JavaScript/*.tgz
+Bindings/JavaScript/node_modules/

@@ -9,7 +9,7 @@ documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; 
 Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch,
 layer and RMS normalization, adding, concatenating and multiplying layers, embeddings and attention
 for transformers, as chains or graphs), deployment models in FP32 down to INT2, the runtime (a library of the deployment models alone), a standalone inference engine for
-microcontrollers (one C file, no heap), ONNX and PyTorch import, GPU backends through CUDA (its own
+microcontrollers (one C file, no heap) and its WebAssembly build for JavaScript, ONNX and PyTorch import, GPU backends through CUDA (its own
 kernels) and Vulkan compute, language-model tooling (token files, generation), bindings for Python
 (ctypes, wheels with the library inside), C++, Rust, .NET, Go and Java, packages for the usual
 managers, and the DigitPad demo app.
@@ -25,6 +25,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Engine.h` | Internals shared by the engine and the desktop library (layer table, kernels, scratch rules) |
 | `Src/Spingalett.Inference.c` | The standalone engine: `.slett` parsing, per-sample kernels for every precision. Must stay free of heap, stdio, files and OpenMP (`model.engine_symbols` checks) and compile as C99 |
 | `Src/Spingalett.Model.c` | Batched deployment models (`spingalett_model_predict`): weights prepared once per owned model, a workspace kept between calls |
+| `Src/Spingalett.Session.c`, `Src/Spingalett.Model.h` | Sessions of deployment models (`spingalett_session_feed`): a causal language model a token at a time with a key-value cache, batched generation; `Model.h` is what they share with `Model.c` (prepared layers, workspaces, the passes of single layers) |
 | `cmake/Runtime.cmake`, `Src/Spingalett.Runtime.map` | The runtime library: the sources that load and run models, compiled with the library's flags (`spingalett_build`) and `SPINGALETT_RUNTIME`, its exports and their symbol versions |
 | `Src/Spingalett.Int8Tiles.c` | Batched INT8 tile kernels (AVX-512 VNNI, AVX-VNNI, Arm dot product) |
 | `Src/Spingalett.GEMM.c` | Float matrix kernels, including implicit im2col and epilogues |
@@ -32,13 +33,17 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Graph.c` | Adding, concatenating and global pooling layers, upsampling; the plan by which inference outputs share memory |
 | `Src/Spingalett.Onnx.c`, `Src/Spingalett.Torch.c` | ONNX import (own protocol buffer reader, external data files); PyTorch state dicts (zip, a pickle interpreter that runs nothing) and safetensors |
 | `Src/Spingalett.Import.c` | What the importers share: files mapped into memory, tensors decoded and reordered to channels-last in one pass |
+| `Src/Spingalett.Tokenizer.c`, `Src/Spingalett.Json.c` | Tokenizers of `tokenizer.json` files (BPE; the pre-tokenizers' expressions matched by hand over `Spingalett.Unicode.h`, written by `Src/make_unicode.py`); the JSON reader they and the checkpoints' files share |
+| `Src/Spingalett.Pretrained.c`, `.h` | Language models from Hugging Face's directories (`config.json`, safetensors through `Torch.c`): the transformer built from hyper-parameters, its tensors read from a source each format provides |
+| `Src/Spingalett.Gguf.c` | GGUF files: metadata, llama.cpp's dequantization (compiled in IEEE order, like `Inference.c`), the queries' and keys' rows put back in Hugging Face's order, vocabularies for `Tokenizer.c` |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
 | `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer, RMS) layers |
 | `Src/Spingalett.Transformer.c`, `Generate.c` | Embeddings and attention over batches on the CPU (blocked products a thread per sample and group of heads, the backward pass recomputing the probabilities); text generation |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
-| `Src/Gpu/` | The GPU backends under one executor: `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as commands), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use, a table a backend; convolution geometries), `Spingalett.Device.h`/`.c` (the device interface: `SpgGpuOps` a backend, the calling thread's backend), `Spingalett.Vulkan.c` (the loader opened at run time; `Shaders/*.comp`, GLSL listed in `Spingalett.Kernels.def`, `SPG_KERNEL_H` ones built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`), `Spingalett.Cuda.c` (the driver opened at run time; commands captured as CUDA graphs; `Cuda/*.cu` compiled to PTX by Clang, units listed in `Cuda/Kernels.def`, gzip-compressed into the library and expanded by `Spingalett.Gunzip.c`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
+| `Src/Gpu/` | The GPU backends under one executor: `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as commands; the decoder of sessions), `Spingalett.GpuModel.c` (integer deployment models with the CPU's bits), `Spingalett.Recorder.h` (the barriers a dispatch's reads and writes need), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use, a table a backend; convolution geometries), `Spingalett.Device.h`/`.c` (the device interface: `SpgGpuOps` a backend, the calling thread's backend), `Spingalett.Vulkan.c` (the loader opened at run time; `Shaders/*.comp`, GLSL listed in `Spingalett.Kernels.def`, `SPG_KERNEL_H` ones built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`), `Spingalett.Cuda.c` (the driver opened at run time; commands captured as CUDA graphs; `Cuda/*.cu` compiled to PTX by Clang, units listed in `Cuda/Kernels.def`, gzip-compressed into the library and expanded by `Spingalett.Gunzip.c`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
 | `Bindings/Rust`, `CSharp`, `Go`, `Java` | Bindings over the shared library; their tests compare their structures with `Bin/SpingalettLayout` through `SPINGALETT_LAYOUT` (CI job `bindings`) |
+| `Bindings/JavaScript` | The engine in WebAssembly and its npm package: `build.sh` (Clang for wasm32, no C library), `wasm/` (the exports, `Spingalett.Libm.c` with the mathematical functions the engine calls, the parts of `<math.h>` and `<string.h>` it includes), `index.js` and `index.d.ts`; `test/` compares the module with the native engine (CI job `javascript`) |
 | `packaging/`, `Formula/`, `bucket/`, `flake.nix` | Conan, vcpkg, AUR, conda, the container image; Homebrew, Scoop, Nix; CPack (DEB, RPM) in `CMakeLists.txt` |
 | `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), `RuntimeTests.c` (the runtime alone, C99), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
 | `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools (`Examples/Runtime/`: programs of the runtime), the demo app, the bindings (a package; `setup.py` builds wheels) |
@@ -49,8 +54,9 @@ assumed (see [Performance work](#performance-work)).
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
-Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx equiv cont
-                                                    # optim sched dropout gen predict valid step data io model gpu cuda xor
+Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx tokenizer pretrained
+                                                    # equiv cont optim sched dropout gen predict valid step data io model
+                                                    # gpu cuda xor
 ```
 
 Executables go to `Bin/` and static libraries to `Lib/` in the source tree. Point extra build
@@ -68,6 +74,8 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - the engine alone: `cc -std=c99 -Wall -Wextra -Wpedantic -Werror -DSPINGALETT_INFERENCE_ONLY -IInclude -ISrc -c Src/Spingalett.Inference.c`;
 - the runtime alone (`-DSPINGALETT_RUNTIME_ONLY=ON`) for changes to the files it is built from
   (`cmake/Runtime.cmake`) or to its header;
+- for changes to the engine, the engine in WebAssembly: `sh Bindings/JavaScript/build.sh` and `npm test` in
+  `Bindings/JavaScript` (Clang with the wasm32 target and `wasm-ld`, Node 18 or later);
 - for SIMD changes, every instruction set the code has a path for. AArch64 cross builds run under
   `qemu-aarch64` (`QEMU_CPU=cortex-a53` for no dot product, `max` for all features); MinGW builds
   run under Wine; `Examples/Embedded/run-qemu.sh` runs the engine on a Cortex-M4. AVX-512 paths on
@@ -90,12 +98,16 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - **Integer inference is exact.** Batched prediction of integer models equals single runs
   (`spingalett_model_run`) bit for bit, on every backend and platform. A new integer kernel must
   produce the same 32-bit sums; tests compare with `== 0`, not with a tolerance.
-- **IEEE order in inference.** `Inference.c` and `Model.c` are compiled without reassociation or
-  contraction; epilogues use `spingalett_int_output()` so every path rounds alike.
-- **Formats.** `.slett` versions 3 to 8 stay loadable; the writer picks the lowest version that
+- **IEEE order in inference.** `Inference.c`, `Model.c`, `Session.c` and `Gpu/Spingalett.GpuModel.c` (whose host
+  part computes what the CPU's integer models compute) are compiled without reassociation or contraction
+  (Clang contracts `a * b + c` by default where GCC's ISO C mode does not: a source that must give the CPU's bits
+  joins `SPINGALETT_STRICT_FP` in `CMakeLists.txt`); epilogues use `spingalett_int_output()` so every path rounds
+  alike. On the GPU integer models compute in the CPU's order (`iquant`, `ipass`, `precise`, CUDA's `mul.rn` and
+  `add.rn`): `spingalett_model_predict()` gives `spingalett_model_run()`'s bits there too.
+- **Formats.** `.slett` versions 3 to 9 stay loadable; the writer picks the lowest version that
   can hold the network (chains 3 to 5, graphs 6, transposed convolutions, upsampling and layer
   normalization 7, embeddings, attention, RMS normalization, products of layers, GELU and SiLU, the
-  sparse cross-entropy 8). Any change to the format updates `docs/ModelFormat.md` and adds a version.
+  sparse cross-entropy 8, layers tied to an embedding 9). Any change to the format updates `docs/ModelFormat.md` and adds a version.
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.
@@ -153,15 +165,18 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   floats, or its bfloat16 copy (`data_half()`), never floats in place of bfloat16.
 - **Values before the activation.** GELU's and SiLU's derivatives take the layer's values before
   its activation, which training keeps in `pre[]` (`keeps_pre()`; with dropout the mask then holds
-  the mask alone). On CUDA the product of a dense or convolution layer stores them itself
-  (`pre_out`, `SPG_GEMM_PRE`, honoured by the units built with `GENERAL` and by `epi.cu`); elsewhere
-  the layer writes `pre[]` and an element-wise pass the activation.
+  the mask alone). The product of a dense or convolution layer stores them itself (`pre_out`,
+  `SPG_GEMM_PRE`, honoured by gemm.comp's and gemm_mma.comp's epilogues, and on CUDA by the units
+  built with `GENERAL` and by `epi.cu`); other layers write `pre[]` and an element-wise pass the
+  activation.
 - **Activations as bfloat16.** With `PRECISION_BFLOAT16` the executor keeps layers' outputs and
   gradients as bfloat16 (`kept_half()`): products find which operands are such by address
   (`product()`), and kernels with variants (`kernel()`, `half_words[]`) get a mask of their push
   constants' bfloat16 buffers. A kernel that reads or writes activations through anything but
   `ld()`/`st()` (`half.glsl`) or the products' loads reads garbage in bfloat16: every new kernel
-  that touches activations needs a variant and an entry in `half_words[]`.
+  that touches activations needs a variant and an entry in `half_words[]`. The kernels of the matrix
+  units, which exist only with 16-bit storage (`gemm_mma.comp`, and `flash.comp`, Vulkan's flash
+  attention), have no variant: their HALF is a constant their caller computes (`product()`, `attn_pass()`).
 - **Normalizations applied by their readers.** On the GPU a batch normalization read only by an
   addition (`fold[]`) or by a depthwise convolution (`pro[]`, dwconv.comp's PRO) has no outputs: its
   reader applies it to the normalization's input as it reads. Code that reads a layer's outputs goes
@@ -175,10 +190,27 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   trained on the CPU, made a trainer, or had its GPU copy's parameters brought back
   (`spingalett_training_state()`, which `spingalett_gpu_download()` calls); code that reads them
   before (saving optimizer state, `spingalett_get_parameters()` of a gradient) treats them as zero.
+- **The engine in WebAssembly.** `Bindings/JavaScript` builds `Inference.c` for wasm32 without a C
+  library: what the engine takes from `<math.h>` and `<string.h>` is in `wasm/include` and
+  `wasm/Spingalett.Libm.c`, whose `expf` is glibc's algorithm and whose `tanhf` and `erff` are correctly
+  rounded, so that integer models give the native engine's bits. A function the engine starts calling
+  needs a definition there of the same accuracy (checked against glibc over every float). The tests hold
+  the module to `test/references`, the native engine's outputs (integer models bit for bit), and to the
+  same code built natively (every model bit for bit); a change of the engine's results makes the
+  references again (`node test/make_references.mjs`, on x86-64 Linux with glibc 2.41 or later).
+- **Sessions give batched prediction's bits.** A session's row equals what `spingalett_model_predict()`
+  gives its position in the whole window, whatever rows it is computed with (`model`, `gen` and
+  `runtime.library` compare with `memcmp`): the float linear layers sum on `spingalett_conv_rows()` in
+  the order of `spingalett_conv_direct_forward()`'s kernel for a pointwise convolution (a change to one is
+  a change to the other), the integer ones of a language model quantize each token alone
+  (`SlettLayer.cells`, in the engine and in `Model.c` alike), attention goes through
+  `spingalett_engine_attend()`, and sigmoid and tanh take the vector or scalar path of the row's place in
+  a whole sample (`activate_rows()`). A layer that mixes positions in a new way keeps sessions from
+  running the model (`session_model()`), or needs its own pass.
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
   `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
-  read afterwards (`model_shared` in the `model` group runs four threads; run it under
-  ThreadSanitizer when changing that code).
+  read afterwards (`model_shared` in the `model` group runs four threads, `session_shared` four sessions
+  of one model; run them under ThreadSanitizer when changing that code).
 
 ## Performance work
 
@@ -259,11 +291,13 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 ## Releases
 
 The version lives in `CMakeLists.txt` (`project(... VERSION ...)`), `Bindings/Python/pyproject.toml`,
-`Bindings/Python/spingalett/__init__.py` and `packaging/vcpkg/spingalett/vcpkg.json`. A release records
+`Bindings/Python/spingalett/__init__.py`, `Bindings/JavaScript/package.json` and
+`packaging/vcpkg/spingalett/vcpkg.json`. A release records
 its ABI (`python Tests/check_abi.py update Bin/SpingalettAbi Tests/Data/abi.txt`), and one that adds
 functions gives them a new node in `Src/Spingalett.map` (and `Src/Spingalett.Runtime.map`, for the
 runtime's). `.github/workflows/release.yml` builds packages for Linux
 (x86-64, x86-64-v3, AArch64), Windows and macOS (universal, with OpenMP), each also as a runtime
 archive (`SPINGALETT_RUNTIME_ONLY`), trains the DigitPad model
-(2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip. The
-maintainer merges pull requests and pushes tags.
+(2 epochs on pull requests, 30 for releases) and attaches the AppImage and the Windows zip, and the
+JavaScript package (`npm pack`) with its WebAssembly module; publishing it on npm takes the maintainer's
+account. The maintainer merges pull requests and pushes tags.

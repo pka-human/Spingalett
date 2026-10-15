@@ -14,6 +14,7 @@ public static class Const
     public const int Reserved = 8;
     public const int MaxInputs = 16;
     public const uint NoLayer = uint.MaxValue;
+    public const uint NoToken = uint.MaxValue;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -62,7 +63,12 @@ public unsafe struct LayerArgs
     public float rope_theta;
     public byte causal;
     public byte positions;
-    public fixed ulong reserved[Const.Reserved - 3];
+    public byte ignore_padding;
+    public uint tied;
+    public uint window;
+    public uint token_offset;
+    public uint token_count;
+    public fixed ulong reserved[Const.Reserved - 5];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -89,7 +95,11 @@ public unsafe struct NetworkLayer
     public float rope_theta;
     public byte causal;
     public byte positions;
-    public fixed ulong reserved[Const.Reserved - 2];
+    public byte ignore_padding;
+    public uint tied;
+    public uint window;
+    public uint token_offset;
+    public fixed ulong reserved[Const.Reserved - 4];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -145,7 +155,10 @@ public unsafe struct TrainArgs
     public float lr_plateau_factor;
     public nuint lr_plateau_patience;
     public float lr_plateau_min_lr;
-    public fixed ulong reserved[Const.Reserved];
+    public uint accumulation_steps;
+    public byte lr_per_step;
+    public byte recompute;
+    public fixed ulong reserved[Const.Reserved - 1];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -238,6 +251,49 @@ public unsafe struct DatasetInfo
     public fixed ulong reserved[Const.Reserved];
 }
 
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct TokenizerInfo
+{
+    public uint vocabulary;
+    public uint added;
+    public uint bos, eos;
+    public uint pad, unk;
+    public fixed ulong reserved[Const.Reserved];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct TokenizeArgs
+{
+    public nint tokenizer;
+    public nint text;
+    public nuint length;
+    public nint tokens;
+    public nuint capacity;
+    public byte special;
+    public byte add_special;
+    public fixed ulong reserved[Const.Reserved];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct DetokenizeArgs
+{
+    public nint tokenizer;
+    public nint tokens;
+    public nuint count;
+    public nint text;
+    public nuint capacity;
+    public byte skip_special;
+    public fixed ulong reserved[Const.Reserved];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct PretrainedArgs
+{
+    public nint path;
+    public uint context;
+    public fixed ulong reserved[Const.Reserved];
+}
+
 /// <summary>A deployment model's public fields (the rest is the library's).</summary>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct Model
@@ -299,6 +355,17 @@ public static unsafe partial class Lib
     [LibraryImport(Name, StringMarshalling = StringMarshalling.Utf8)] public static partial nint spingalett_model_load(string path);
     [LibraryImport(Name)] public static partial void spingalett_model_free(nint model);
     [LibraryImport(Name)] [return: MarshalAs(UnmanagedType.U1)] public static partial bool spingalett_model_predict(nint model, float* inputs, uint count, float* outputs);
+
+    // 1.3: tokenizers and pretrained language models
+    [LibraryImport(Name, StringMarshalling = StringMarshalling.Utf8)] public static partial nint spingalett_tokenizer_load(string path);
+    [LibraryImport(Name)] public static partial nint spingalett_tokenizer_from_memory(byte* data, nuint size);
+    [LibraryImport(Name)] public static partial void spingalett_tokenizer_free(nint tokenizer);
+    [LibraryImport(Name)] public static partial TokenizerInfo spingalett_tokenizer_info(nint tokenizer);
+    [LibraryImport(Name)] public static partial nint spingalett_tokenizer_token(nint tokenizer, uint id);
+    [LibraryImport(Name, StringMarshalling = StringMarshalling.Utf8)] public static partial uint spingalett_tokenizer_id(nint tokenizer, string token);
+    [LibraryImport(Name)] public static partial long spingalett_tokenize_args(TokenizeArgs args);
+    [LibraryImport(Name)] public static partial long spingalett_detokenize_args(DetokenizeArgs args);
+    [LibraryImport(Name)] public static partial nint spingalett_load_pretrained_args(PretrainedArgs args);
 
     /// <summary>spingalett_dataset_generator's address, for TrainArgs.generator.</summary>
     public static nint DatasetGenerator =>

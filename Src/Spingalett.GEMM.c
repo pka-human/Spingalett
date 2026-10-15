@@ -467,6 +467,97 @@ static void gemm_split(SpingalettGemmScratch *scratch, int threads, uint32_t slo
     }
 }
 
+/* Products whose k runs far longer than M and N (SpingalettGemmHooks.tall: a linear layer's weight gradient, dy^T x over
+   a chunk's tokens). The tiles of C alone give few pieces of work (a 384 x 384 product: a dozen, each packing its
+   operands again for every block of k), so k is cut into slots of TALL_SLOT_K and the columns into parts of at most
+   TALL_PART_N: each (slot, part) is multiplied by one thread into the slot's partial product, as many pieces as the
+   shape gives whatever the threads, handed out as threads come free (efficiency cores take fewer); the slots are
+   then summed in their order. A slot's sums run in blocks of k fixed by its length: the same bits on any number
+   of threads. */
+#define TALL_SLOT_K 2048u
+#define TALL_PART_N 256u
+#define TALL_PARTIAL_FLOATS (1u << 23)      /* partial products of at most 32 MB */
+
+static inline uint32_t tall_slots(uint32_t M, uint32_t N, uint32_t K) {
+    if (K < 2 * TALL_SLOT_K) return 1;
+    const uint64_t fit = TALL_PARTIAL_FLOATS / ((uint64_t)M * N);
+    uint32_t slots = K / TALL_SLOT_K;
+    if (slots > fit) slots = (uint32_t)fit;
+    return slots < 2 ? 1 : slots;
+}
+
+/* The columns of a part: whole panels, the parts as even as panels allow. */
+static inline uint32_t tall_width(uint32_t N) {
+    const uint32_t parts = (N + TALL_PART_N - 1) / TALL_PART_N;
+    return ((N + parts - 1) / parts + NR - 1) / NR * NR;
+}
+
+static bool tall_reserve(SpingalettGemmScratch *s, uint32_t M, uint32_t N, uint32_t slots, int threads) {
+    const size_t need = split_partial_floats(M, N, slots) + (size_t)threads * KC * tall_width(N);
+    if (s->split_floats >= need) return true;
+    spingalett_aligned_free(s->split);
+    s->split = (float *)spingalett_aligned_alloc(need * sizeof(float));
+    s->split_floats = s->split ? need : 0;
+    return s->split != NULL;
+}
+
+static void gemm_tall(SpingalettGemmScratch *scratch, int threads, uint32_t slots, bool trans_a, bool trans_b,
+                      uint32_t M, uint32_t N, uint32_t K, float alpha, const float *A, size_t lda,
+                      const float *B, size_t ldb, float beta, float *C, size_t ldc) {
+    const uint32_t per = (K + slots - 1) / slots, width = tall_width(N), parts = (N + width - 1) / width;
+    const size_t mn = (size_t)M * N;
+    float *partial = scratch->split, *b_area = partial + split_partial_floats(M, N, slots);
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads) if(threads > 1)
+#endif
+    for (int64_t w = 0; w < (int64_t)slots * parts; w++) {
+        int tid = 0;
+#if defined(_OPENMP)
+        tid = omp_get_thread_num();
+#endif
+        const uint32_t s = (uint32_t)(w / parts), c0 = (uint32_t)(w % parts) * width;
+        const uint32_t nc = N - c0 < width ? N - c0 : width, panels = (nc + NR - 1) / NR;
+        float *a_pack = scratch->a_pack + (size_t)tid * MC_MAX * KC, *b_pack = b_area + (size_t)tid * KC * width;
+        float *P = partial + (size_t)s * mn + c0;
+        const uint32_t k_begin = s * per, k_end = K - k_begin < per ? K : k_begin + per;
+        const uint32_t len = k_end - k_begin, blocks = (len + KC - 1) / KC, step = (len + blocks - 1) / blocks;
+        for (uint32_t k0 = k_begin; k0 < k_end; k0 += step) {
+            const uint32_t kc = k_end - k0 < step ? k_end - k0 : step;
+            for (uint32_t q = 0; q < panels; q++) {
+                const uint32_t j = q * NR;
+                pack_b_panel(b_pack + (size_t)j * kc, B, ldb, trans_b, NULL, k0, kc, c0 + j, nc - j < NR ? nc - j : NR);
+            }
+            for (uint32_t i0 = 0; i0 < M; i0 += MC) {
+                const uint32_t mc = M - i0 < MC ? M - i0 : MC;
+                for (uint32_t p = 0; p < mc; p += MR)
+                    pack_a_panel(a_pack + (size_t)p * kc, A, lda, trans_a, NULL, i0 + p, mc - p < MR ? mc - p : MR, k0, kc);
+                multiply_block(a_pack, b_pack, mc, nc, 0, panels, kc, P + (size_t)i0 * N, N, 1.0f,
+                               k0 == k_begin ? 0.0f : 1.0f);
+            }
+        }
+    }
+
+    /* C = alpha * (the slots' sum, in their order) + beta * C, rows in parallel */
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(threads > 1)
+#endif
+    for (int64_t i = 0; i < (int64_t)M; i++) {
+        float *c = C + (size_t)i * ldc;
+        for (uint32_t j0 = 0; j0 < N; j0 += SPLIT_N_MAX) {
+            const uint32_t n = N - j0 < SPLIT_N_MAX ? N - j0 : SPLIT_N_MAX;
+            float sum[SPLIT_N_MAX];
+            memcpy(sum, partial + (size_t)i * N + j0, n * sizeof(float));
+            for (uint32_t s = 1; s < slots; s++) {
+                const float *P = partial + (size_t)s * mn + (size_t)i * N + j0;
+                for (uint32_t j = 0; j < n; j++) sum[j] += P[j];
+            }
+            if (beta == 0.0f) for (uint32_t j = 0; j < n; j++) c[j0 + j] = alpha * sum[j];
+            else              for (uint32_t j = 0; j < n; j++) c[j0 + j] = alpha * sum[j] + beta * c[j0 + j];
+        }
+    }
+}
+
 /* Products with at most SMALL_N columns from two row-major operands (op(A) = A, op(B) = B^T: a
    dense layer's outputs with few units) leave most of an NR-wide panel idle; each element is
    instead a dot product of a row of A with a row of B, four rows of B per pass over A's row. The
@@ -695,6 +786,13 @@ static void spingalett_gemm_baseline(SpingalettGemmScratch *scratch, bool trans_
     }
     int threads = parallel && work >= SPINGALETT_GEMM_PARALLEL_WORK ? scratch->threads : 1;
 
+    if (hooks && hooks->tall && !a_src && !b_src && !epilogue) {
+        const uint32_t slots = tall_slots(M, N, K);
+        if (slots > 1 && tall_reserve(scratch, M, N, slots, threads)) {
+            gemm_tall(scratch, threads, slots, trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+            return;
+        }
+    }
     uint32_t slots = split_slots(M, N, K);
     if (slots > 1 && split_reserve(scratch, M, N, slots, threads)) {
         gemm_split(scratch, threads, slots, trans_a, trans_b, M, N, K, alpha, A, lda, a_src, B, ldb, b_src,

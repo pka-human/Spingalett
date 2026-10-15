@@ -156,9 +156,14 @@ DEVICE float tanh_(float x) {
     return x < 0.0f ? -t : t;
 }
 
+/* 1 / x for x of 1 and more, through the approximate reciprocal (within an ulp; an IEEE division is ten
+   instructions). The intrinsic rather than inline assembly, which the compiler costs high: the unrolled
+   epilogue of gemm.cu's 128 x 128 tile with GELU stayed a loop over arrays in local memory. */
+DEVICE float rcp_(float x) { return __nvvm_rcp_approx_ftz_f(x); }
+
 /* erf as common.glsl's: Abramowitz and Stegun 7.1.26, within 1.5e-7 of it */
 DEVICE float erf_(float x) {
-    float a = abs_(x), t = 1.0f / fma_(0.3275911f, a, 1.0f);
+    float a = abs_(x), t = rcp_(fma_(0.3275911f, a, 1.0f));
     float q = fma_(fma_(fma_(fma_(1.061405429f, t, -1.453152027f), t, 1.421413741f), t, -0.284496736f), t, 0.254829592f);
     float r = 1.0f - q * t * exp_(-a * a);
     return x < 0.0f ? -r : r;

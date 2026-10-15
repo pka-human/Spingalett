@@ -9,65 +9,126 @@
  * them hold no token (-1, which an embedding reads as zeros), which a causal model's earlier positions
  * never see. The next token is the most likely one, or a draw from the softmax of the logits divided by
  * the temperature, among the top_k most likely and the most likely whose probabilities add up to
- * top_p. Draws come from a splitmix64 generator seeded once, in an order fixed by the logits: the same
- * tokens for the same logits.
+ * top_p (spingalett_next_token()). Draws come from a splitmix64 generator seeded once, in an order fixed
+ * by the logits: the same tokens for the same logits.
+ *
+ * A causal model runs as its deployment model of single precision, which the network keeps until its
+ * parameters change, with a session (spingalett_session_feed(); on the GPU in its compute modes): the prompt
+ * fed at once, then each token fed once, attending over the keys and values kept of the tokens before it.
+ * Once the tokens fill the window, every step feeds the window of the last context tokens again from its
+ * first position on, as the prediction over the window does. The logits are those of the deployment model,
+ * which equal the network's prediction to rounding. Other networks predict on the whole window for every
+ * token.
  */
 
 #include "Spingalett.Private.h"
-#include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    float p;
-    uint32_t token;
-} Candidate;
+/* The network as a deployment model, and the parameters it was made from (the network's host_version); the
+   session of the last call, kept when it ran on a GPU (whose making takes the model to the device) for the next
+   call of the same compute mode, precision and window. */
+struct SpingalettGenerateModel {
+    SpingalettModel *model;
+    uint64_t version;
+    SpingalettSession *session;
+    ComputeMode mode;
+    PrecisionMode precision;
+    uint32_t window;
+};
 
-/* by probability, the larger first; equals by token */
-static int by_probability(const void *a, const void *b) {
-    const Candidate *x = (const Candidate *)a, *y = (const Candidate *)b;
-    if (x->p != y->p) return x->p > y->p ? -1 : 1;
-    return x->token < y->token ? -1 : x->token > y->token;
+static void model_free(struct SpingalettGenerateModel *g) {
+    if (!g) return;
+    spingalett_session_free(g->session);
+    spingalett_model_free(g->model);
+    free(g);
 }
 
-static uint64_t splitmix64(uint64_t *state) {
-    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
+void spingalett_generate_release(NeuralNetwork *net) {
+    model_free(atomic_exchange(&net->generate_model, NULL));
 }
 
-/* The next token from a row of V logits. */
-static uint32_t next_token(const float *logits, uint32_t V, const SpingalettGenerateArgs *a, Candidate *c,
-                           uint64_t *state) {
-    uint32_t best = 0;
-    for (uint32_t v = 1; v < V; v++)
-        if (logits[v] > logits[best]) best = v;
-    if (!(a->temperature > 0.0f)) return best;
-    const double inv = 1.0 / a->temperature, top = logits[best];
-    for (uint32_t v = 0; v < V; v++) c[v] = (Candidate){(float)exp(((double)logits[v] - top) * inv), v};
-    qsort(c, V, sizeof *c, by_probability);
-    uint32_t kept = a->top_k && a->top_k < V ? a->top_k : V;
-    double total = 0.0;
-    for (uint32_t k = 0; k < kept; k++) total += c[k].p;
-    if (a->top_p > 0.0f && a->top_p < 1.0f) {
-        double sum = 0.0;
-        for (uint32_t k = 0; k < kept; k++) {
-            sum += c[k].p;
-            if (sum >= a->top_p * total) {
-                kept = k + 1u;
-                total = sum;
-                break;
-            }
+static bool is_stop(const SpingalettGenerateArgs *a, uint32_t token) {
+    for (uint32_t k = 0; k < a->stop_count; k++)
+        if (a->stop_tokens[k] == token) return true;
+    return false;
+}
+
+/* With a session of the network's deployment model: false (*made untouched) when the model is no causal
+   language model, which the prediction over the window then runs. seq: [prompt_length + count]. */
+static bool generate_cached(NeuralNetwork *net, SpingalettGenerateArgs *a, uint32_t T, uint32_t V, uint32_t *seq,
+                            SpingalettCandidate *c, uint64_t *state, bool *ok, uint32_t *made) {
+    /* the model the network keeps when it was made from these parameters (the call takes it, so that
+       concurrent calls make their own), else a new one */
+    spingalett_network_sync(net);
+    const uint64_t version = atomic_load(&net->host_version);
+    struct SpingalettGenerateModel *g = atomic_exchange(&net->generate_model, NULL);
+    if (g && g->version != version) {
+        spingalett_model_free(g->model);
+        free(g);
+        g = NULL;
+    }
+    if (!g) {
+        g = (struct SpingalettGenerateModel *)calloc(1, sizeof *g);
+        SpingalettModel *model = g ? spingalett_model_from_network(net, PRECISION_FLOAT32) : NULL;
+        if (!model) {
+            free(g);
+            return false;           /* (the prediction over the window reports what fails) */
         }
+        g->model = model;
+        g->version = version;
     }
-    const double u = (double)(splitmix64(state) >> 11) * (1.0 / 9007199254740992.0) * total;
-    double sum = 0.0;
-    for (uint32_t k = 0; k < kept; k++) {
-        sum += c[k].p;
-        if (u < sum) return c[k].token;
+    /* the kept session where it fits this call, else a new one (a model no session runs leaves the error as it
+       was) */
+    const ComputeMode mode = resolve_compute_mode();
+    const PrecisionMode precision = spingalett_get_gpu_precision();
+    SpingalettSession *session = g->session;
+    g->session = NULL;
+    if (session && (g->mode != mode || g->precision != precision || g->window != T)) {
+        spingalett_session_free(session);
+        session = NULL;
     }
-    return c[kept - 1u].token;
+    if (!session) {
+        SpingalettSessionOptions options = {.max_length = T};
+        session = spingalett_session_runs(g->model) ? spingalett_session_new(g->model, &options) : NULL;
+    }
+    if (!session) {
+        model_free(atomic_exchange(&net->generate_model, g));
+        return false;
+    }
+    float *logits = (float *)malloc((size_t)V * sizeof(float));
+    *ok = logits != NULL;
+    if (!*ok) set_error(SPINGALETT_ERR_ALLOC, "spingalett_generate: out of memory");
+    uint32_t length = a->prompt_length, fed = 0;
+    while (*ok && *made < a->count) {
+        /* the window of the last T tokens: those after the ones fed, or all of it again once it is full */
+        const uint32_t n = length < T ? length : T, first = length - n;
+        if (first > 0) fed = 0;
+        if (!spingalett_session_rewind(session, 0, fed) ||
+            !spingalett_session_feed(session, &(SpingalettSessionFeed){.tokens = seq + first + fed, .count = n - fed,
+                                                                       .logits = logits}, 1)) {
+            *ok = false;
+            break;
+        }
+        fed = n;
+        const uint32_t token = spingalett_next_token(logits, V, a->temperature, a->top_k, a->top_p, c, state);
+        seq[length++] = token;
+        a->tokens[(*made)++] = token;
+        if (is_stop(a, token)) break;
+    }
+    free(logits);
+    /* (kept on a GPU, whose session costs its model's way to the device; on the CPU made again) */
+    if (spingalett_use_gpu() && *ok && spingalett_session_rewind(session, 0, 0)) {
+        g->session = session;
+        g->mode = mode;
+        g->precision = precision;
+        g->window = T;
+    } else {
+        spingalett_session_free(session);
+    }
+    model_free(atomic_exchange(&net->generate_model, g));
+    return true;
 }
 
 uint32_t spingalett_generate_args(SpingalettGenerateArgs args) {
@@ -84,31 +145,37 @@ uint32_t spingalett_generate_args(SpingalettGenerateArgs args) {
         return 0;
     }
     const uint32_t total = args.prompt_length + args.count;
-    float *window = (float *)malloc((size_t)T * sizeof(float)), *logits = (float *)malloc((size_t)out * sizeof(float));
     uint32_t *seq = (uint32_t *)malloc((size_t)total * sizeof(uint32_t));
-    Candidate *c = (Candidate *)malloc((size_t)V * sizeof(Candidate));
-    if (!window || !logits || !seq || !c) {
-        free(window); free(logits); free(seq); free(c);
+    SpingalettCandidate *c = (SpingalettCandidate *)malloc((size_t)V * sizeof(SpingalettCandidate));
+    if (!seq || !c) {
+        free(seq); free(c);
         set_error(SPINGALETT_ERR_ALLOC, "spingalett_generate: out of memory");
         return 0;
     }
     memcpy(seq, args.prompt, (size_t)args.prompt_length * sizeof(uint32_t));
     uint64_t state = args.seed ? args.seed : rng_next64();
-    uint32_t length = args.prompt_length, made = 0;
+    uint32_t made = 0;
     bool ok = true;
-    while (made < args.count) {
-        const uint32_t n = length < T ? length : T, first = length - n;
-        for (uint32_t i = 0; i < T; i++) window[i] = i < n ? (float)seq[first + i] : -1.0f;
-        if (!(ok = spingalett_predict_args((SpingalettPredictArgs){.net = net, .inputs = window, .sample_count = 1,
-                                                                   .outputs = logits})))
-            break;
-        const uint32_t token = next_token(logits + (size_t)(n - 1u) * V, V, &args, c, &state);
-        seq[length++] = token;
-        args.tokens[made++] = token;
-        bool stop = false;
-        for (uint32_t k = 0; k < args.stop_count && !stop; k++) stop = args.stop_tokens[k] == token;
-        if (stop) break;
+    /* through a session (on the GPU in its compute modes); when no session runs the network, over the window */
+    if (!generate_cached(net, &args, T, V, seq, c, &state, &ok, &made)) {
+        float *window = (float *)malloc((size_t)T * sizeof(float)), *logits = (float *)malloc((size_t)out * sizeof(float));
+        ok = window && logits;
+        if (!ok) set_error(SPINGALETT_ERR_ALLOC, "spingalett_generate: out of memory");
+        uint32_t length = args.prompt_length;
+        while (ok && made < args.count) {
+            const uint32_t n = length < T ? length : T, first = length - n;
+            for (uint32_t i = 0; i < T; i++) window[i] = i < n ? (float)seq[first + i] : -1.0f;
+            if (!(ok = spingalett_predict_args((SpingalettPredictArgs){.net = net, .inputs = window, .sample_count = 1,
+                                                                       .outputs = logits})))
+                break;
+            const uint32_t token = spingalett_next_token(logits + (size_t)(n - 1u) * V, V, args.temperature, args.top_k,
+                                                         args.top_p, c, &state);
+            seq[length++] = token;
+            args.tokens[made++] = token;
+            if (is_stop(&args, token)) break;
+        }
+        free(window); free(logits);
     }
-    free(window); free(logits); free(seq); free(c);
+    free(seq); free(c);
     return ok ? made : 0;
 }

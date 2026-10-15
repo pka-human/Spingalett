@@ -289,6 +289,22 @@ func (l Layer) Causal(c bool) Layer          { l.args.causal = C.bool(c); return
 func (l Layer) RopeTheta(t float32) Layer    { l.args.rope_theta = C.float(t); return l }
 func (l Layer) Positions(p bool) Layer       { l.args.positions = C.bool(p); return l }
 
+// Tied makes a linear layer compute with the table of the embedding of index e (tied input and output embeddings).
+func (l Layer) Tied(e uint32) Layer { l.args.tied = C.uint32_t(e); return l }
+
+// IgnorePadding leaves the keys of padding (tokens of -1) out of attention (sequences of different lengths in one batch).
+func (l Layer) IgnorePadding(i bool) Layer { l.args.ignore_padding = C.bool(i); return l }
+
+// Window gives attention a sliding window: keys less than w cells away (with causal the cell and the w - 1 before it).
+func (l Layer) Window(w uint32) Layer { l.args.window = C.uint32_t(w); return l }
+
+// Tokens makes an embedding read part of its input: count tokens (0: the rest) from value offset on.
+func (l Layer) Tokens(offset, count uint32) Layer {
+	l.args.token_offset = C.uint32_t(offset)
+	l.args.token_count = C.uint32_t(count)
+	return l
+}
+
 // Inputs names the layers it reads (indices Add returned; 0 the input layer); none: the last one.
 func (l Layer) Inputs(inputs ...uint32) Layer {
 	for k, i := range inputs {
@@ -313,6 +329,10 @@ type TrainOptions struct {
 	MaxGradNorm    float32
 	LabelSmoothing float32
 	NoShuffle      bool
+	// AccumulationSteps: an optimizer step after every this many mini-batches (0 or 1: every one).
+	AccumulationSteps uint32
+	// Recompute: activation recomputation on the CPU (less memory, a forward pass more, the same results).
+	Recompute bool
 }
 
 // TrainResult says how a training run ended.
@@ -423,6 +443,8 @@ func (n *Network) trainArgs(o TrainOptions) C.SpingalettTrainArgs {
 	a.beta1, a.beta2 = C.float(o.Beta1), C.float(o.Beta2)
 	a.max_grad_norm = C.float(o.MaxGradNorm)
 	a.label_smoothing = C.float(o.LabelSmoothing)
+	a.accumulation_steps = C.uint32_t(o.AccumulationSteps)
+	a.recompute = C.bool(o.Recompute)
 	return a
 }
 
@@ -669,3 +691,162 @@ func (m *Model) Predict(inputs []float32) ([]float32, error) {
 	}
 	return outputs, nil
 }
+
+// LoadPretrained makes a network of a language model: a Hugging Face model directory (config.json and safetensors
+// weights, sharded or not; model types llama, mistral, qwen2, gpt2) or a GGUF file (architectures llama, qwen2,
+// gpt2; quantized weights dequantized to floats). context is the network's window of tokens (0: the model's
+// positions, LLaMA's at most 2048); the network gives every position's logits. Its tokenizer: LoadTokenizer on the
+// same path.
+func LoadPretrained(path string, context uint32) (*Network, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var a C.SpingalettPretrainedArgs
+	a.path = cpath
+	a.context = C.uint32_t(context)
+	C.spingalett_clear_error()
+	p := C.spingalett_load_pretrained_args(a)
+	if p == nil {
+		return nil, lastError("load_pretrained failed")
+	}
+	n := &Network{p: p}
+	runtime.SetFinalizer(n, (*Network).Close)
+	return n, nil
+}
+
+// NoToken is the id of no token.
+const NoToken = uint32(C.SPINGALETT_NO_TOKEN)
+
+// Tokenizer is the tokenizer of a language model: byte-level BPE (GPT-2, SmolLM), tiktoken's encodings (LLaMA 3,
+// Qwen2) and SentencePiece's BPE (LLaMA 2, Mistral), encoding and decoding as Hugging Face's tokenizers library
+// does; goroutines may share one.
+type Tokenizer struct {
+	p *C.SpingalettTokenizer
+}
+
+func newTokenizer(p *C.SpingalettTokenizer, what string) (*Tokenizer, error) {
+	if p == nil {
+		return nil, lastError(what)
+	}
+	t := &Tokenizer{p: p}
+	runtime.SetFinalizer(t, (*Tokenizer).Close)
+	return t, nil
+}
+
+// LoadTokenizer reads a tokenizer.json file, a model directory holding one (its tokenizer_config.json names BOS and
+// EOS) or a GGUF file's vocabulary.
+func LoadTokenizer(path string) (*Tokenizer, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	C.spingalett_clear_error()
+	return newTokenizer(C.spingalett_tokenizer_load(cpath), "tokenizer_load failed")
+}
+
+// TokenizerFromBytes reads the bytes of a tokenizer.json file or of a GGUF file.
+func TokenizerFromBytes(data []byte) (*Tokenizer, error) {
+	if len(data) == 0 {
+		return nil, errors.New("TokenizerFromBytes: no bytes")
+	}
+	c := C.CBytes(data)
+	defer C.free(c)
+	C.spingalett_clear_error()
+	return newTokenizer(C.spingalett_tokenizer_from_memory(c, C.size_t(len(data))), "tokenizer_from_memory failed")
+}
+
+// Close releases the tokenizer.
+func (t *Tokenizer) Close() {
+	if t.p != nil {
+		C.spingalett_tokenizer_free(t.p)
+		t.p = nil
+	}
+}
+
+// Encode gives the ids of a UTF-8 text. special: special tokens written in it ("<|im_start|>") become their ids
+// (otherwise they are text, so that text from users cannot forge them); addSpecial: the tokens the tokenizer adds
+// around a text (LLaMA's BOS).
+func (t *Tokenizer) Encode(text string, special, addSpecial bool) ([]uint32, error) {
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
+	capacity := len(text) + 16
+	for {
+		ids := make([]uint32, capacity)
+		var pin runtime.Pinner
+		pin.Pin(&ids[0])
+		var a C.SpingalettTokenizeArgs
+		a.tokenizer = t.p
+		a.text = ctext
+		a.length = C.size_t(len(text))
+		a.tokens = (*C.uint32_t)(unsafe.Pointer(&ids[0]))
+		a.capacity = C.size_t(capacity)
+		a.special = C.bool(special)
+		a.add_special = C.bool(addSpecial)
+		C.spingalett_clear_error()
+		count := int64(C.spingalett_tokenize_args(a))
+		pin.Unpin()
+		if count < 0 {
+			return nil, lastError("tokenize failed")
+		}
+		if count <= int64(capacity) {
+			return ids[:count], nil
+		}
+		capacity = int(count)
+	}
+}
+
+// Decode gives the UTF-8 text of ids (skipSpecial: without the special tokens); bytes that are no UTF-8, as a
+// character split between tokens, become U+FFFD.
+func (t *Tokenizer) Decode(ids []uint32, skipSpecial bool) (string, error) {
+	capacity := 4*len(ids) + 64
+	for {
+		text := make([]byte, capacity)
+		var pin runtime.Pinner
+		pin.Pin(&text[0])
+		var a C.SpingalettDetokenizeArgs
+		a.tokenizer = t.p
+		if len(ids) > 0 {
+			pin.Pin(&ids[0])
+			a.tokens = (*C.uint32_t)(unsafe.Pointer(&ids[0]))
+		}
+		a.count = C.size_t(len(ids))
+		a.text = (*C.char)(unsafe.Pointer(&text[0]))
+		a.capacity = C.size_t(capacity)
+		a.skip_special = C.bool(skipSpecial)
+		C.spingalett_clear_error()
+		size := int64(C.spingalett_detokenize_args(a))
+		pin.Unpin()
+		if size < 0 {
+			return "", lastError("detokenize failed")
+		}
+		if size < int64(capacity) {
+			return string(text[:size]), nil
+		}
+		capacity = int(size) + 1
+	}
+}
+
+// Token gives the token of an id as the vocabulary writes it ("Ġthe", "▁the", "<|im_start|>"); false for no token.
+func (t *Tokenizer) Token(id uint32) (string, bool) {
+	s := C.spingalett_tokenizer_token(t.p, C.uint32_t(id))
+	if s == nil {
+		return "", false
+	}
+	return C.GoString(s), true
+}
+
+// ID gives the id of a token as the vocabulary writes it (added tokens first); false when there is none.
+func (t *Tokenizer) ID(token string) (uint32, bool) {
+	ctoken := C.CString(token)
+	defer C.free(unsafe.Pointer(ctoken))
+	id := uint32(C.spingalett_tokenizer_id(t.p, ctoken))
+	return id, id != NoToken
+}
+
+func present(id C.uint32_t) (uint32, bool) { return uint32(id), uint32(id) != NoToken }
+
+// Vocabulary is the number of token ids: the largest one + 1 (the model's tokens and the added ones).
+func (t *Tokenizer) Vocabulary() uint32 { return uint32(C.spingalett_tokenizer_info(t.p).vocabulary) }
+
+// BOS is the token beginning a text; false when the tokenizer names none.
+func (t *Tokenizer) BOS() (uint32, bool) { return present(C.spingalett_tokenizer_info(t.p).bos) }
+
+// EOS is the token ending a text; false when the tokenizer names none.
+func (t *Tokenizer) EOS() (uint32, bool) { return present(C.spingalett_tokenizer_info(t.p).eos) }

@@ -57,6 +57,24 @@ static inline int spingalett_thread_num(void) { return omp_get_thread_num(); }
 static inline int spingalett_thread_num(void) { return 0; }
 #endif
 
+/* SPINGALETT_FOR_PIECES(cond, n, size, s, at, len, body): an element-wise pass over n samples of `size` values,
+   in items of at most SPINGALETT_PIECE values (sample s, its values at .. at + len - 1), on the threads when cond
+   holds. A training chunk often holds fewer samples than there are threads (a sequence of a language model is
+   millions of values): items keep every thread busy. A sample's items start at multiples of SPINGALETT_PIECE
+   from its start, so that vector loops (blocks of up to 256 values from where they start, scalar tails) split it
+   where they did when they took it whole: the same bits. */
+#define SPINGALETT_PIECE 8192u
+#define SPINGALETT_FOR_PIECES(cond, n, size, s, at, len, ...) do { \
+    const uint64_t spg_per_ = ((uint64_t)(size) + SPINGALETT_PIECE - 1u) / SPINGALETT_PIECE; \
+    const int64_t spg_items_ = (int64_t)((uint64_t)(n) * spg_per_); \
+    SPINGALETT_PARALLEL_FOR((cond) && spg_items_ > 1, \
+        for (int64_t spg_i_ = 0; spg_i_ < spg_items_; spg_i_++) { \
+            const uint64_t s = (uint64_t)spg_i_ / spg_per_, at = (uint64_t)spg_i_ % spg_per_ * SPINGALETT_PIECE; \
+            const uint64_t len = (uint64_t)(size) - at < SPINGALETT_PIECE ? (uint64_t)(size) - at : SPINGALETT_PIECE; \
+            __VA_ARGS__ \
+        }); \
+} while (0)
+
 #define SPINGALETT_NEURON(net, l, j)        ((net)->neurons[(net)->neuron_offsets[l] + (uint64_t)(j)])
 #define SPINGALETT_LAYER_PTR(net, l)        ((net)->neurons + (net)->neuron_offsets[l])
 
@@ -88,9 +106,16 @@ typedef struct {
 /* Samples per batch-path chunk: bounds workspace memory (full-batch training over a large dataset
    runs in chunks whose gradients are accumulated) while keeping the GEMMs large. Networks with more
    than SPINGALETT_BATCH_FLOATS / SPINGALETT_BATCH_CHUNK activations per sample (convolutions) take
-   fewer samples per chunk, so that one chunk's activations stay near SPINGALETT_BATCH_FLOATS. */
+   fewer samples per chunk, so that one chunk's activations stay near SPINGALETT_BATCH_FLOATS. A
+   network's products then take a chunk's samples times their cells as rows: a sample of few cells but
+   many values (a sequence of a language model, millions of values over 256 cells) left chunks of one or
+   two, products over 256 or 512 rows that kept six threads busy half the time; such chunks take more
+   samples, up to SPINGALETT_BATCH_ROWS rows or SPINGALETT_NETWORK_FLOATS values (GPT on the CPU trained 1.5
+   times as fast). Deployment models size their chunks by SPINGALETT_BATCH_FLOATS alone. */
 #define SPINGALETT_BATCH_CHUNK 2048u
 #define SPINGALETT_BATCH_FLOATS (1u << 24)
+#define SPINGALETT_BATCH_ROWS 2048u
+#define SPINGALETT_NETWORK_FLOATS (1u << 26)
 
 typedef struct SpingalettGemmScratch SpingalettGemmScratch;
 
@@ -139,6 +164,18 @@ typedef struct BatchWorkspace {
     float *attn;
     SpingalettGemmScratch **attn_gemm;
     int attn_threads;
+    /* training: the gradient of cross-attention layer l's keys and values (dkv[l], capacity x the outputs of its
+       second input), which its backward pass for the queries writes and the second input's takes */
+    float **dkv;
+    float *dkv_flat;
+    /* activation recomputation (training with recompute): kept[l] whether layer l's outputs live through the
+       backward pass, segment[l] the kept layers below l (a segment: the layers between two kept ones, and the
+       later); the others' outputs, gradients, values before their activation and dropout masks share memory
+       with the other segments' and are computed again before their segment's backward pass. NULL: every layer
+       kept */
+    uint8_t *kept;
+    uint32_t *segment;
+    size_t flat_floats;     /* the floats of flat (the layers' outputs and gradients) */
     bool training;          /* normalize with batch statistics */
     float smoothing;        /* LOSS_SPARSE_CROSS_ENTROPY: label smoothing of the loss's targets */
     uint32_t capacity;
@@ -146,14 +183,22 @@ typedef struct BatchWorkspace {
 
 BatchWorkspace *spingalett_batch_workspace_create(const NeuralNetwork *net, uint32_t capacity,
                                                   bool training, bool gather, ComputeMode mode);
+/* A training workspace that recomputes activations (BatchWorkspace.kept). */
+BatchWorkspace *spingalett_batch_workspace_recompute(const NeuralNetwork *net, uint32_t capacity, bool gather,
+                                                     ComputeMode mode);
 void spingalett_batch_workspace_free(BatchWorkspace *ws);
+/* Samples per chunk for `count` samples: at most count and SPINGALETT_BATCH_CHUNK, what fits
+   SPINGALETT_BATCH_FLOATS activations, or more for products of fewer than SPINGALETT_BATCH_ROWS rows (up to
+   SPINGALETT_NETWORK_FLOATS activations), at least 1. */
+uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
 /* Forward pass over N samples (ws->act[0] must point at them). `dropout` (or NULL) masks hidden
    layers; samples are numbered position_offset + s for the dropout hash. */
-/* Samples per chunk for `count` samples: at most count, SPINGALETT_BATCH_CHUNK and what fits
-   SPINGALETT_BATCH_FLOATS activations, at least 1. */
-uint32_t spingalett_batch_capacity(const NeuralNetwork *net, uint32_t count);
 void spingalett_batch_forward(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N,
                               const DropoutContext *dropout, uint32_t position_offset, ComputeMode mode);
+/* The forward pass of the layers of segment s that are not kept (recomputation), as the full pass computes
+   them. */
+void spingalett_batch_forward_segment(NeuralNetwork *net, BatchWorkspace *ws, uint32_t N, const DropoutContext *dropout,
+                                      uint32_t position_offset, ComputeMode mode, uint32_t s);
 /* Inference: whether layer l (dense or convolution, no activation) feeds only the batch
    normalization l + 1, which then runs in its product's epilogue and l's output is never stored. */
 bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint32_t l);
@@ -312,12 +357,14 @@ void spingalett_multiply_backward(const float *const *x, uint32_t count, uint32_
    scratch a thread needs, the forward pass (y without activation; lse, when training, each query's log
    of the softmax's sum) and the input's gradient dx from dy = dL/dy (lse the forward pass's), with one
    scratch of spingalett_attention_scratch() floats and one matrix product scratch a
-   thread (ws->attn, ws->attn_gemm). */
+   thread (ws->attn, ws->attn_gemm). Cross-attention reads its keys and values from kvx (the second input; NULL
+   for self-attention) and writes their gradient to dkv; dx then holds the queries' only. */
 size_t spingalett_attention_scratch(const NeuralNetwork *net, uint32_t l, bool training);
-void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, float *y, uint32_t n,
-                                  float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
-void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *dy, float *dx,
-                                   uint32_t n, const float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+void spingalett_attention_forward(const NeuralNetwork *net, uint32_t l, const float *x, const float *kvx, float *y,
+                                  uint32_t n, float *lse, const float *rope, BatchWorkspace *ws, ComputeMode mode);
+void spingalett_attention_backward(const NeuralNetwork *net, uint32_t l, const float *x, const float *kvx,
+                                   const float *dy, float *dx, float *dkv, uint32_t n, const float *lse,
+                                   const float *rope, BatchWorkspace *ws, ComputeMode mode);
 /* The sparse cross-entropy of one sample (LOSS_SPARSE_CROSS_ENTROPY): `cells` rows of C logits z and a
    target a cell (a class index; outside 0 .. C - 1: none), the targets smoothed (one-hot times 1 -
    smoothing, plus smoothing / C at every class). Returns the mean loss over the cells with targets (0
@@ -364,12 +411,18 @@ bool spingalett_has_dropout(const NeuralNetwork *net);
 /* dropout == NULL: inference. Otherwise hidden layers with a dropout rate are masked. */
 float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,
                                const DropoutContext *dropout);
-/* Masks n activations y (outputs of activation act) in place and stores mask * f'(a) in dmask. */
+/* Masks n activations y (outputs of activation act) in place and stores mask * f'(a) in dmask. The _at form masks
+   the values from `offset` on of a sample's (a multiple of 256: the masks and blocks of the whole sample's). */
 void spingalett_dropout_apply(float *restrict y, float *restrict dmask, uint32_t n,
                               ActivationFunction act, float rate,
                               const DropoutContext *ctx, uint32_t layer, uint32_t position);
+void spingalett_dropout_apply_at(float *restrict y, float *restrict dmask, uint32_t n, ActivationFunction act,
+                                 float rate, const DropoutContext *ctx, uint32_t layer, uint32_t position,
+                                 uint32_t offset);
 
 void spingalett_log(LogLevel level, const char *fmt, ...);
+/* +1: messages below warnings quiet on this thread until the matching -1 */
+void spingalett_log_quiet(int delta);
 
 /* ------------------------------------------------------------------------- importers (Import.c) */
 
@@ -404,6 +457,21 @@ void spingalett_import_transposed_filters(float *dst, const uint8_t *src, int dt
 size_t spingalett_dense_scratch(uint32_t out, uint32_t in, bool transposed);
 void spingalett_import_dense(float *dst, const uint8_t *src, int dtype, uint32_t out, uint32_t in, uint32_t C,
                              uint32_t HW, bool transposed, float alpha, float *scratch);
+
+/* A tensor of a safetensors file: its name (not NUL-terminated), element type, shape and bytes. */
+typedef struct {
+    const char *name;
+    size_t name_len;
+    int dtype;                      /* SPG_DTYPE_*, SPG_DTYPE_OTHER for types that do not convert to float */
+    int ndims;
+    int64_t dims[8];
+    const uint8_t *data;
+    uint64_t bytes;
+} SpgTensor;
+/* The tensors of a safetensors file in memory (Torch.c), in a malloc'ed array that points into data;
+   false with a message of at most error_size bytes in error. */
+bool spingalett_safetensors(const uint8_t *data, size_t size, SpgTensor **tensors, size_t *count, char *error,
+                            size_t error_size);
 
 /* count strings copied into one allocation (a NULL-terminated array of pointers; free() releases it). */
 char **spingalett_copy_names(const char *const *names, uint32_t count);
@@ -457,11 +525,41 @@ void apply_softmax(float *layer, uint32_t size);
 void apply_activation_batch(float *data, uint32_t size, ActivationFunction act);
 void apply_activation_bulk(float *data, uint64_t total, ActivationFunction act);
 void apply_derivative_batch(float *deriv, const float *act_data, uint64_t total, ActivationFunction act);
+/* The activation of training's forward pass, from the values before it that training keeps (GELU, SiLU):
+   GELU, its tanh form and SiLU in vectors (erf as the GPU computes it, the vector exp), as their derivatives in
+   apply_derivative_batch(); inference (spingalett_engine_activate_one(), the engine's) keeps libm's erff and
+   expf, which the engine on its own, its WebAssembly build and sessions agree on. Other activations as
+   apply_activation_bulk(). */
+void spingalett_activate_training(float *data, uint64_t total, ActivationFunction act);
+/* row[i] = exp(row[i] - shift) for i < n, the vector exp in blocks of 8 from the start (expf for the rest), and
+   their sum (eight lanes, then across them, then the rest in order): attention's softmax in training and
+   predict(); deployment models attend through spingalett_engine_attend(). */
+float spingalett_vec_exp_shifted(float *row, uint32_t n, float shift);
+/* The sum of n values in spingalett_vec_exp_shifted()'s order. */
+float spingalett_vec_sum_lanes(const float *row, uint32_t n);
 
 void     rng_seed(uint64_t seed);
 uint32_t rng_next(void);
 uint64_t rng_next64(void);
 float    rng_next_float(void);
+
+/* The next token of text generation from a row of V logits (Spingalett.Session.c): the most likely
+   (temperature 0: the first of equals), or a draw from the softmax of the logits divided by the
+   temperature among the top_k most likely and the most likely whose probabilities add up to top_p, from a
+   splitmix64 generator (*state) in an order fixed by the logits. candidates holds V. */
+typedef struct {
+    float p;
+    uint32_t token;
+} SpingalettCandidate;
+uint32_t spingalett_next_token(const float *logits, uint32_t V, float temperature, uint32_t top_k, float top_p,
+                               SpingalettCandidate *candidates, uint64_t *state);
+/* Whether spingalett_session_new() runs the model (a causal language model); sets no error. */
+bool spingalett_session_runs(const SpingalettModel *model);
+#if !defined(SPINGALETT_RUNTIME)
+/* Frees the deployment model spingalett_generate() keeps in the network (Spingalett.Generate.c): when the
+   network goes, or its layers change. */
+void spingalett_generate_release(NeuralNetwork *net);
+#endif
 
 float random_uniform_weight(void);
 float random_normal_weight(void);
@@ -501,6 +599,10 @@ typedef struct {
     const SpingalettGemmSource *a, *b;
     void (*epilogue)(const void *ctx, uint32_t row, uint32_t rows, uint32_t col, uint32_t cols, float *c, size_t ldc);
     const void *epilogue_ctx;
+    /* a product whose k runs far longer than M and N (a linear layer's weight gradient over a chunk's tokens), from
+       memory and without an epilogue: k in slots fixed by the shape, each summed by one thread (GEMM.c's
+       gemm_tall()) */
+    bool tall;
 } SpingalettGemmHooks;
 
 SpingalettGemmScratch *spingalett_gemm_scratch_create(int threads);
@@ -637,6 +739,16 @@ void spingalett_conv_direct_backward_data(const LayerShape *in, const LayerShape
 void spingalett_conv_direct_backward_weights(const LayerShape *in, const LayerShape *out, uint32_t g, const float *x,
                                              const float *dy, uint32_t n, float scale, float beta, float *gW,
                                              float *scratch, bool parallel, int threads);
+/* The rows of a pointwise convolution of one group (a linear layer) against its filters packed once: N
+   filters of K weights (W, rows of K) packed by spingalett_conv_pack() into
+   spingalett_conv_direct_packed_floats(N, K) floats; spingalett_conv_rows() then computes y[r][0..N) =
+   x[r] . filters for r < rows (x rows ldx floats apart, y rows ldy apart), each sum in the order the
+   forward kernel takes it (spingalett_conv_direct_forward()), so that a row gets the bits a whole sample's
+   pass gives it, however many rows there are: sessions run a token at a time on it. The epilogue (or
+   NULL) runs on every block of rows and columns, its columns starting at multiples of 8. */
+void spingalett_conv_pack(const float *W, uint32_t K, uint32_t N, float *packed);
+void spingalett_conv_rows(const float *x, size_t ldx, uint32_t rows, const float *packed, uint32_t K, uint32_t N,
+                          float *y, size_t ldy, const SpingalettGemmHooks *epilogue, bool parallel, int threads);
 /* Threads a GEMM scratch was made for. */
 int spingalett_gemm_scratch_threads(const SpingalettGemmScratch *scratch);
 

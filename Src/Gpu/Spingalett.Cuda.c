@@ -260,11 +260,15 @@ static uint32_t cub_max_workgroups(uint32_t axis) { return axis == 0 ? 0x7FFFFFF
 static bool cub_mma_bf16(void) { return cub_open(); }          /* (Ampere and later: mma.sync of bfloat16) */
 static bool cub_bf16_storage(void) { return cub_open(); }
 static bool cub_host_writes(void) { return false; }
+/* (flash.comp and rattn.comp are Vulkan's: attention runs on attn's units of flash.cu and rattn.cu here) */
+static bool cub_kernel_built(SpgKernel kernel) { return kernel != SPG_KERNEL_flash && kernel != SPG_KERNEL_rattn; }
 
 /* ------------------------------------------------------------------------- kernels */
 
 /* Bytes of dynamic shared memory a kernel takes (the product's stages). */
 static uint32_t dynamic_shared(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
+    if (kernel == SPG_KERNEL_gemm_mma && count >= 15 && spec[14])
+        return SPG_CUDA_PIPE_SHARED(spec[0], spec[1], spec[2], spec[14]);
     if (kernel == SPG_KERNEL_gemm_mma && count >= 3) return SPG_CUDA_MMA_SHARED(spec[0], spec[1], spec[2]);
     return kernel == SPG_KERNEL_gemm && count >= 3 ? SPG_CUDA_GEMM_SHARED(spec[0], spec[1], spec[2]) : 0u;
 }
@@ -275,6 +279,7 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
         case SPG_KERNEL_bn: case SPG_KERNEL_bn_h: case SPG_KERNEL_output: return 64u;
         case SPG_KERNEL_gemm: case SPG_KERNEL_gemm_mma: return count > 9 ? spec[9] : 0u;
         case SPG_KERNEL_attn: case SPG_KERNEL_attn_h: return count > 3 ? spec[3] : 0u;
+        case SPG_KERNEL_attn_cache: case SPG_KERNEL_attn_cache_h: return count > 1 ? spec[1] : 0u;
         default: return 256u;
     }
 }
@@ -285,6 +290,7 @@ static bool grid_stride(SpgKernel kernel) {
         case SPG_KERNEL_eltwise: case SPG_KERNEL_eltwise_h: case SPG_KERNEL_combine: case SPG_KERNEL_combine_h:
         case SPG_KERNEL_pool: case SPG_KERNEL_pool_h: case SPG_KERNEL_upsample: case SPG_KERNEL_upsample_h:
         case SPG_KERNEL_wtrans: case SPG_KERNEL_optim: case SPG_KERNEL_optim_h: case SPG_KERNEL_rows: case SPG_KERNEL_rows_h:
+        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h:
             return true;
         default:
             return false;
@@ -318,6 +324,13 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     } else if (kernel == SPG_KERNEL_gemm_mma) {
         if (count < 14) return -1;
         const bool general = !sloped_epilogue(spec[7], spec[8]);   /* (only the units with GENERAL, else none) */
+        if (count >= 15 && spec[14]) {      /* gemm_pipe.cu's tiles: their stages, both operands read eight at once */
+            snprintf(name, sizeof name, "gemm_pipe_%ux%ux%u_%ux%u_s%u_a%ub%u%s", spec[0], spec[1], spec[2], spec[3], spec[4],
+                     spec[14], spec[5], spec[6], general ? "_g" : "");
+            for (uint32_t u = 0; u < UNIT_COUNT; u++)
+                if (!strcmp(spg_cuda_units[u].name, name)) return (int)u;
+            return -1;
+        }
         /* each operand: kept as bfloat16 and read eight values at once (w: VEC 4, 8), floats read four at once
            (f: VEC 1, 2), else o; the instances of Kernels.def, or else the one that reads anything */
         const uint32_t vec = spec[11], half = spec[13];
@@ -333,10 +346,15 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
     } else if (kernel == SPG_KERNEL_attn || kernel == SPG_KERNEL_attn_h) {
         if (count < 3) return -1;
         /* the unit of its head size and pass: with BQ 0 the matrix units' (flash.cu), else rattn.cu's (heads of up
-           to 128) or attn.cu's */
-        if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], spec[0]);
-        else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u", spec[2], spec[0]);
-        else snprintf(name, sizeof name, "attn_d%u", spec[2]);
+           to 128) or attn.cu's; a pass of a layer with padding (SPG_ATTN_EXT) the units that read it (x) */
+        const uint32_t op = spec[0] & 3u;
+        const char *ext = spec[0] & SPG_ATTN_EXT ? "x" : "";
+        if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], op);
+        else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u%s", spec[2], op, op == SPG_ATTN_PRE ? "" : ext);
+        else snprintf(name, sizeof name, "attn_d%u%s", spec[2], ext);
+    } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
+        if (count < 2) return -1;
+        snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */
     } else if (kernel == SPG_KERNEL_dwconv || kernel == SPG_KERNEL_dwconv_h) {
         if (count >= 9 && spec[8] == (spec[4] - 1u) / 2u) {         /* the common windows, padded half of one */
             char window[64];
@@ -816,7 +834,10 @@ static void cub_dispatch(void *commands, SpgKernel kernel, const uint32_t *spec,
         memcpy(op->spec, spec, spec_count * sizeof(uint32_t));
         if (cu.profile) {
             int len = snprintf(op->label, sizeof op->label, "%s", spg_kernel_names[kernel]);
-            if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {  /* (its unit's ways of reading A and B, _g) */
+            if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 15 && spec[14]) {     /* (gemm_pipe.cu's stages) */
+                snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %ux%u s%u", spec[5], spec[6],
+                         spec[7], spec[0], spec[1], spec[3], spec[4], spec[14]);
+            } else if (kernel == SPG_KERNEL_gemm_mma && spec_count >= 8) {  /* (its unit's ways of reading A and B, _g) */
                 const char *unit = spg_cuda_units[unit_of(kernel, spec, spec_count)].name, *ways = strrchr(unit, '_');
                 if (ways && !strcmp(ways, "_g")) for (ways--; ways > unit && *ways != '_'; ways--) {}
                 snprintf(op->label + len, sizeof op->label - (size_t)len, " A%u B%u E%u %ux%u %s", spec[5], spec[6],
@@ -960,8 +981,8 @@ static bool cub_wait(void *commands) {
 
 const SpgGpuOps spg_cuda_ops = {
     cub_open, cub_device_name, cub_memory, cub_shared_memory, cub_subgroup_size, cub_max_workgroups, cub_mma_bf16,
-    cub_bf16_storage, cub_host_writes, cub_buffer_create, cub_buffer_free, cub_arena_create, cub_arena_add,
-    cub_arena_commit, cub_arena_free, cub_commands_create, cub_commands_free, cub_commands_untimed,
+    cub_bf16_storage, cub_host_writes, cub_kernel_built, cub_buffer_create, cub_buffer_free, cub_arena_create,
+    cub_arena_add, cub_arena_commit, cub_arena_free, cub_commands_create, cub_commands_free, cub_commands_untimed,
     cub_commands_stamps, cub_timestamp, cub_timestamps, cub_record_begin, cub_dispatch, cub_prepare, cub_barrier,
     cub_barrier_host, cub_copy, cub_fill, cub_record_end, cub_submit, cub_wait,
 };

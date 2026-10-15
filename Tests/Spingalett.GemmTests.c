@@ -133,6 +133,39 @@ static void check_split_threads(bool ta, bool tb, uint32_t M, uint32_t N, uint32
     free(A); free(B); free(C1); free(C2);
 }
 
+/* A product of long k in slots and parts (SpingalettGemmHooks.tall): against double precision, and the same bits on
+   one thread as on all of them. */
+static void check_tall(bool ta, bool tb, uint32_t M, uint32_t N, uint32_t K, float beta, SpingalettGemmScratch *scratch) {
+    const size_t lda = ta ? M : K, ldb = tb ? K : N, c_size = (size_t)M * N;
+    float *A = malloc(sizeof(float) * M * K), *B = malloc(sizeof(float) * K * N);
+    float *C0 = malloc(sizeof(float) * c_size), *C1 = malloc(sizeof(float) * c_size), *C2 = malloc(sizeof(float) * c_size);
+    for (size_t i = 0; i < (size_t)M * K; i++) A[i] = frand();
+    for (size_t i = 0; i < (size_t)K * N; i++) B[i] = frand();
+    for (size_t i = 0; i < c_size; i++) C0[i] = frand();
+    memcpy(C1, C0, sizeof(float) * c_size);
+    memcpy(C2, C0, sizeof(float) * c_size);
+    const SpingalettGemmHooks tall = {.tall = true};
+    gemm(scratch, ta, tb, M, N, K, 0.5f, A, lda, B, ldb, beta, C1, N, false, &tall);
+    gemm(scratch, ta, tb, M, N, K, 0.5f, A, lda, B, ldb, beta, C2, N, true, &tall);
+    double worst = 0;
+    for (uint32_t i = 0; i < M; i++)
+        for (uint32_t j = 0; j < N; j++) {
+            double sum = 0;
+            for (uint32_t k = 0; k < K; k++)
+                sum += (double)(ta ? A[(size_t)k * lda + i] : A[(size_t)i * lda + k]) *
+                       (tb ? B[(size_t)j * ldb + k] : B[(size_t)k * ldb + j]);
+            const double ref = 0.5 * sum + (beta == 0.0f ? 0.0 : beta * C0[(size_t)i * N + j]);
+            const double err = fabs(C1[(size_t)i * N + j] - ref) / (1.0 + sqrt((double)K) * 0.25);
+            if (!(err <= worst)) worst = err;
+        }
+    if (!(worst < 1e-5) || memcmp(C1, C2, sizeof(float) * c_size) != 0) {
+        failures++;
+        printf("  FAIL tall product ta=%d tb=%d M=%u N=%u K=%u beta=%g: err %.3e, threads %s\n", ta, tb, M, N, K, beta,
+               worst, memcmp(C1, C2, sizeof(float) * c_size) ? "differ" : "alike");
+    }
+    free(A); free(B); free(C0); free(C1); free(C2);
+}
+
 int main(void) {
     int threads = 1;
 #if defined(_OPENMP)
@@ -183,6 +216,8 @@ int main(void) {
                     cases++;
                 }
         for (int t = 0; t < 4; t++) check_split_threads(t & 1, t & 2, 48, 200, 5000, scratch);
+        /* long k over wide C: slots of k, parts of columns (three of 600, the last partial; a remainder of k) */
+        for (int t = 0; t < 4; t++) check_tall(t & 1, t & 2, 150, 600, 6150, t == 1 ? 0.5f : 0.0f, scratch);
         printf("%s kernels%s: %d failures\n", sets[k].name, k == 0 ? " (selected)" : "", failures - before);
     }
     /* K = 0 / alpha = 0 reduce to C = beta * C */

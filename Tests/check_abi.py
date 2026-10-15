@@ -37,7 +37,7 @@ def declarations(headers=None):
     """(kind, name, declaration) of the public headers (or of those named), the short names left out."""
     out = []
     for header in headers or [h for h, _ in make_reference.HEADERS]:
-        text = open(os.path.join(ROOT, 'Include', 'Spingalett', header)).read()
+        text = open(os.path.join(ROOT, 'Include', 'Spingalett', header), encoding='utf-8').read()
         text = text.split('#if defined(SPINGALETT_SHORT_NAMES)')[0]
         out += [(k, n, d) for k, n, d, _ in make_reference.items(text)]
     return out
@@ -98,7 +98,7 @@ def write_source(path):
             if not value.startswith('"'):
                 lines.append('    VALUE("constant", %s);' % name)
     lines += ['    return 0;', '}', '']
-    open(path, 'w').write('\n'.join(lines))
+    open(path, 'w', encoding='utf-8').write('\n'.join(lines))
 
 
 def current(dump):
@@ -123,7 +123,7 @@ def held(key):
 
 def read_baseline(path):
     out = {}
-    for line in open(path):
+    for line in open(path, encoding='utf-8'):
         line = line.rstrip('\n')
         if line and not line.startswith('#'):
             kind, name, value = line.split(' ', 2)
@@ -138,7 +138,7 @@ def map_symbols(path=MAP):
 def map_nodes(path):
     """name -> the version node of a version script that lists it."""
     out = {}
-    for node, body in re.findall(r'(SPINGALETT_[\d.]+)\s*\{(.*?)\}', strip_comments(open(path).read()), re.S):
+    for node, body in re.findall(r'(SPINGALETT_[\d.]+)\s*\{(.*?)\}', strip_comments(open(path, encoding='utf-8').read()), re.S):
         for name in re.findall(r'\b(spingalett_\w+);', body):
             out[name] = node
     return out
@@ -229,12 +229,12 @@ def update(dump, baseline):
     now = current(dump)
     if now.get('pointer') != '8':
         sys.exit('check_abi: the baseline is recorded on a 64-bit platform')
-    version = open(os.path.join(ROOT, 'CMakeLists.txt')).read()
+    version = open(os.path.join(ROOT, 'CMakeLists.txt'), encoding='utf-8').read()
     version = re.search(r'project\(Spingalett VERSION ([\d.]+)', version).group(1)
     lines = ['# The ABI of Spingalett %s, written by Tests/check_abi.py update: later releases keep every' % version,
              '# entry (layouts on 64-bit platforms). Recorded again at each release, with what it added.']
     lines += ['%s %s' % (k, v) for k, v in now.items() if k != 'pointer' and held(k)]
-    open(baseline, 'w').write('\n'.join(lines) + '\n')
+    open(baseline, 'w', encoding='utf-8', newline='\n').write('\n'.join(lines) + '\n')
     print('check_abi: wrote %s (%d entries)' % (baseline, len(lines) - 2))
 
 

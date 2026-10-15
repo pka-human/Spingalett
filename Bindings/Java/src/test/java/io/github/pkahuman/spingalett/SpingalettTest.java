@@ -3,6 +3,7 @@
 
 package io.github.pkahuman.spingalett;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -10,11 +11,16 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.StructLayout;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalInt;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -114,6 +120,89 @@ class SpingalettTest {
         }
     }
 
+    /** A file of the repository's Tests/Data (the tests run in Bindings/Java); the test is skipped without it. */
+    static Path data(String name) {
+        Path p = Path.of("../../Tests/Data", name);
+        Assumptions.assumeTrue(Files.exists(p), "no " + p);
+        return p;
+    }
+
+    static byte[] unhex(String hex) {
+        if (hex.equals("-")) return new byte[0];
+        byte[] b = new byte[hex.length() / 2];
+        for (int i = 0; i < b.length; i++) b[i] = (byte) Integer.parseInt(hex.substring(2 * i, 2 * i + 2), 16);
+        return b;
+    }
+
+    @Test
+    void tokenizerMatchesHuggingFace() throws Exception {
+        // every case of Tests/make_tokenizer_tests.py's expectations: special add text, the ids, both decodings
+        List<String> lines = new ArrayList<>();
+        for (String line : Files.readAllLines(data("tokenizer_llama3.txt"))) if (!line.startsWith("#")) lines.add(line);
+        try (Tokenizer tok = Tokenizer.load(data("tokenizer_llama3.json"))) {
+            int cases = 0;
+            for (int k = 0; k + 3 < lines.size(); k += 4, cases++) {
+                String[] head = lines.get(k).split(" ");
+                String text = new String(unhex(head[2]), StandardCharsets.UTF_8);
+                String[] counted = lines.get(k + 1).split(" ");
+                int[] ids = new int[Integer.parseInt(counted[0])];
+                for (int i = 0; i < ids.length; i++) ids[i] = Integer.parseInt(counted[i + 1]);
+                assertArrayEquals(ids, tok.encode(text, head[0].equals("1"), head[1].equals("1")), text);
+                assertEquals(new String(unhex(lines.get(k + 2)), StandardCharsets.UTF_8), tok.decode(ids, false));
+                assertEquals(new String(unhex(lines.get(k + 3)), StandardCharsets.UTF_8), tok.decode(ids, true));
+            }
+            assertTrue(cases >= 100, cases + " cases");
+            assertEquals(425, tok.vocabulary());
+            assertEquals(OptionalInt.of(420), tok.bos());
+            assertEquals(OptionalInt.of(421), tok.eos());
+            assertEquals(OptionalInt.empty(), tok.unk());
+            assertEquals("<|begin_of_text|>", tok.token(420));
+            assertEquals(OptionalInt.of(420), tok.id("<|begin_of_text|>"));
+            assertEquals(null, tok.token(1 << 20));
+            assertEquals(OptionalInt.empty(), tok.id("no such token"));
+            assertArrayEquals(new int[] {420}, tok.encode("<|begin_of_text|>", true, false));
+            String text = "Tokenizers cut text into pieces, ".repeat(200);
+            assertEquals(text, tok.decode(tok.encode(text, false, false), false));
+        }
+        try (Tokenizer tok = Tokenizer.fromBytes(Files.readAllBytes(data("tokenizer_llama3.json")))) {
+            assertEquals(425, tok.vocabulary());
+        }
+        assertThrows(SpingalettException.class, () -> Tokenizer.load(Path.of("/nonexistent/tokenizer.json")));
+    }
+
+    /** A window of tokens and PyTorch's logits for it (Tests/make_pretrained_tests.py's NAME.bin). */
+    static float[][] window(String name) throws Exception {
+        ByteBuffer b = ByteBuffer.wrap(Files.readAllBytes(data(name + ".bin"))).order(ByteOrder.LITTLE_ENDIAN);
+        assertEquals(0x54475053, b.getInt());          // "SPGT"
+        b.getInt();
+        int t = b.getInt(), n = b.getInt();
+        float[] tokens = new float[t], logits = new float[n];
+        b.asFloatBuffer().get(tokens).get(logits);
+        return new float[][] {tokens, logits};
+    }
+
+    @Test
+    void pretrainedModels() throws Exception {
+        Spingalett.setVerbose(false);
+        float[][] w = window("hf_llama");
+        for (String path : new String[] {"hf_llama", "gguf_llama.gguf"}) {
+            try (Network lm = Network.fromPretrained(data(path), w[0].length)) {
+                float[] got = lm.predict(w[0]);
+                assertEquals(w[1].length, got.length);
+                float worst = 0;
+                for (int i = 0; i < got.length; i++) worst = Math.max(worst, Math.abs(got[i] - w[1][i]));
+                assertTrue(worst < 1e-4f, path + ": logits " + worst + " from PyTorch's");
+            }
+        }
+        // the tokenizer of the model's directory: the window's tokens, and its tokenizer_config.json's EOS
+        try (Tokenizer tok = Tokenizer.load(data("hf_llama"))) {
+            int[] ids = tok.encode("The quick brown fox jumps over the lazy dog, it's 1234 times!", false, false);
+            for (int i = 0; i < w[0].length; i++) assertEquals((int) w[0][i], ids[i]);
+            assertEquals(OptionalInt.of(424), tok.eos());
+        }
+        assertThrows(SpingalettException.class, () -> Network.fromPretrained(Path.of("/nonexistent/model"), 0));
+    }
+
     @Test
     void layoutMatchesC() throws Exception {
         String tool = System.getenv("SPINGALETT_LAYOUT");
@@ -138,7 +227,9 @@ class SpingalettTest {
             {"EvaluateArgs", Native.EVALUATE_ARGS}, {"SaveArgs", Native.SAVE_ARGS},
             {"SpingalettGenerateArgs", Native.GENERATE_ARGS}, {"SpingalettTokenReaderOptions", Native.TOKEN_READER_OPTIONS},
             {"SpingalettDatasetInfo", Native.DATASET_INFO}, {"SpingalettNetworkLayer", Native.NETWORK_LAYER},
-            {"SpingalettModel", Native.MODEL},
+            {"SpingalettModel", Native.MODEL}, {"SpingalettTokenizerInfo", Native.TOKENIZER_INFO},
+            {"SpingalettTokenizeArgs", Native.TOKENIZE_ARGS}, {"SpingalettDetokenizeArgs", Native.DETOKENIZE_ARGS},
+            {"SpingalettPretrainedArgs", Native.PRETRAINED_ARGS},
         };
         for (Object[] s : structs) {
             String name = (String) s[0];

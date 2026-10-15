@@ -67,12 +67,14 @@ final class Native {
             i("padding"), i("kernel_h"), i("kernel_w"), i("stride_h"), i("stride_w"), i("padding_h"), i("padding_w"),
             i("groups"), f("epsilon"), f("momentum"), MemoryLayout.sequenceLayout(MAX_INPUTS, JAVA_INT).withName("inputs"),
             i("input_count"), i("upsample"), i("output_padding"), i("output_padding_h"), i("output_padding_w"),
-            i("vocabulary"), i("heads"), i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), reserved(RESERVED - 3));
+            i("vocabulary"), i("heads"), i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), b("ignore_padding"), i("tied"),
+            i("window"), i("token_offset"), i("token_count"), reserved(RESERVED - 5));
     static final StructLayout NETWORK_LAYER = struct(i("type"), i("height"), i("width"), i("channels"), i("outputs"),
             i("activation"), f("dropout_rate"), i("kernel_h"), i("kernel_w"), i("stride_h"), i("stride_w"), i("padding_h"),
             i("padding_w"), l("weight_count"), l("bias_count"), i("groups"), f("epsilon"), f("momentum"), i("input_count"),
             MemoryLayout.sequenceLayout(MAX_INPUTS, JAVA_INT).withName("inputs"), i("upsample"), i("vocabulary"), i("heads"),
-            i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), reserved(RESERVED - 2));
+            i("kv_heads"), f("rope_theta"), b("causal"), b("positions"), b("ignore_padding"), i("tied"), i("window"),
+            i("token_offset"), reserved(RESERVED - 4));
     static final StructLayout TRAIN_ARGS = struct(a("net"), i("training_mode"), i("training_strategy"),
             i("optimizer_type"), a("inputs"), a("targets"), a("device_inputs"), a("device_targets"), a("generator"),
             a("generator_data"), i("sample_count"), i("batch_size"), b("do_not_shuffle"), l("epochs"), f("learning_rate"),
@@ -83,7 +85,7 @@ final class Native {
             a("device_val_inputs"), a("device_val_targets"), i("val_count"), i("monitor"), l("early_stopping_patience"),
             f("early_stopping_min_delta"), b("restore_best_weights"), i("blas_num_threads"), i("augment_shift"),
             b("augment_flip"), f("label_smoothing"), f("lr_plateau_factor"), l("lr_plateau_patience"),
-            f("lr_plateau_min_lr"), reserved(RESERVED));
+            f("lr_plateau_min_lr"), i("accumulation_steps"), b("lr_per_step"), b("recompute"), reserved(RESERVED - 1));
     static final StructLayout TRAIN_REPORT = struct(i("status"), l("epochs_run"), f("train_loss"), b("has_validation"),
             EVAL_METRICS.withName("validation"), i("monitor"), l("best_epoch"), f("best_value"), b("restored_best"),
             reserved(RESERVED));
@@ -104,6 +106,13 @@ final class Native {
     static final StructLayout MODEL = struct(i("input_size"), i("output_size"), i("layer_count"), i("loss"),
             l("workspace_size"), a("image"), l("image_size"), i("max_width_"), i("max_int_inputs_"), l("conv_scratch_"),
             a("owner_"), l("activations_"), reserved(RESERVED));
+    static final StructLayout TOKENIZER_INFO = struct(i("vocabulary"), i("added"), i("bos"), i("eos"), i("pad"), i("unk"),
+            reserved(RESERVED));
+    static final StructLayout TOKENIZE_ARGS = struct(a("tokenizer"), a("text"), l("length"), a("tokens"), l("capacity"),
+            b("special"), b("add_special"), reserved(RESERVED));
+    static final StructLayout DETOKENIZE_ARGS = struct(a("tokenizer"), a("tokens"), l("count"), a("text"), l("capacity"),
+            b("skip_special"), reserved(RESERVED));
+    static final StructLayout PRETRAINED_ARGS = struct(a("path"), i("context"), reserved(RESERVED));
 
     private static final Map<String, VarHandle> HANDLES = new ConcurrentHashMap<>();
 
@@ -179,6 +188,24 @@ final class Native {
     static final MethodHandle MODEL_LOAD = fn("spingalett_model_load", ADDRESS, ADDRESS);
     static final MethodHandle MODEL_FREE = fn("spingalett_model_free", null, ADDRESS);
     static final MethodHandle MODEL_PREDICT = fn("spingalett_model_predict", JAVA_BOOLEAN, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
+
+    /**
+     * The functions of 1.3 (tokenizers, pretrained language models), resolved when first used, so that the rest of
+     * the bindings still runs on a library of 1.2.
+     */
+    static final class LanguageModels {
+        private LanguageModels() {}
+
+        static final MethodHandle TOKENIZER_LOAD = fn("spingalett_tokenizer_load", ADDRESS, ADDRESS);
+        static final MethodHandle TOKENIZER_FROM_MEMORY = fn("spingalett_tokenizer_from_memory", ADDRESS, ADDRESS, JAVA_LONG);
+        static final MethodHandle TOKENIZER_FREE = fn("spingalett_tokenizer_free", null, ADDRESS);
+        static final MethodHandle TOKENIZER_INFO_OF = fn("spingalett_tokenizer_info", TOKENIZER_INFO, ADDRESS);
+        static final MethodHandle TOKENIZER_TOKEN = fn("spingalett_tokenizer_token", ADDRESS, ADDRESS, JAVA_INT);
+        static final MethodHandle TOKENIZER_ID = fn("spingalett_tokenizer_id", JAVA_INT, ADDRESS, ADDRESS);
+        static final MethodHandle TOKENIZE = fn("spingalett_tokenize_args", JAVA_LONG, TOKENIZE_ARGS);
+        static final MethodHandle DETOKENIZE = fn("spingalett_detokenize_args", JAVA_LONG, DETOKENIZE_ARGS);
+        static final MethodHandle LOAD_PRETRAINED = fn("spingalett_load_pretrained_args", ADDRESS, PRETRAINED_ARGS);
+    }
 
     /** A C string's text, or null for a null pointer. */
     static String string(MemorySegment p) {

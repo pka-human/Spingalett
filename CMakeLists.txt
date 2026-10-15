@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 1.2.0 LANGUAGES C)
+project(Spingalett VERSION 1.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -241,11 +241,15 @@ elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID
     message(STATUS "Spingalett: INT8 kernels for the ARM dot product instructions chosen at run time")
 endif()
 
-# The inference engine and batched model inference compute in IEEE order (no reassociation,
-# reciprocals or contraction), so the two agree bit for bit and match the standalone engine.
+# The inference engine, batched model inference and sessions compute in IEEE order (no reassociation,
+# reciprocals or contraction), so that they agree bit for bit and match the standalone engine; GGUF's
+# dequantization too, so that a quantized file gives llama.cpp's weights on every platform; and the host's
+# part of integer models on the GPU (batch normalization's coefficients), which must give the CPU's bits
+# (Clang contracts a * b + c by default where GCC's ISO C mode does not).
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
-    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c
+    set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c Src/Spingalett.Session.c
+                                Src/Spingalett.Gguf.c Src/Gpu/Spingalett.GpuModel.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
 endif()
 
@@ -573,6 +577,7 @@ if(BUILD_TESTS)
         if(SPINGALETT_HAS_CXX23_EXPECTED)
             add_executable(SpingalettCpp ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.Cpp.cpp)
             target_link_libraries(SpingalettCpp PRIVATE spingalett)
+            target_compile_definitions(SpingalettCpp PRIVATE SPINGALETT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Tests/Data")
             set_target_properties(SpingalettCpp PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
             if(UNIX AND NOT APPLE)
                 set_target_properties(SpingalettCpp PROPERTIES BUILD_RPATH "$ORIGIN")
@@ -583,7 +588,7 @@ if(BUILD_TESTS)
         endif()
     endif()
 
-    foreach(group grad conv norm graph transformer onnx equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
+    foreach(group grad conv norm graph transformer onnx tokenizer pretrained equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

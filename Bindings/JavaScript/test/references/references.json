@@ -1,0 +1,37 @@
+{
+ "platform": "linux x64",
+ "compiler": "cc (GCC) 16.1.1 20260625",
+ "models": [
+  {"name":"mlp_fp16","count":16,"outputs":160},
+  {"name":"mlp_int8","count":16,"outputs":160},
+  {"name":"mlp_int4","count":16,"outputs":160},
+  {"name":"mlp_int2","count":16,"outputs":160},
+  {"name":"cnn_fp32","count":16,"outputs":64},
+  {"name":"cnn_int8","count":16,"outputs":64},
+  {"name":"conv9_int8","count":16,"outputs":48},
+  {"name":"norm1_fp32","count":16,"outputs":48},
+  {"name":"norm3_int4","count":16,"outputs":32},
+  {"name":"conv5_bf16","count":16,"outputs":48},
+  {"name":"conv7_int2","count":16,"outputs":48},
+  {"name":"conv8_int8","count":16,"outputs":32},
+  {"name":"graph0_int8","count":16,"outputs":48},
+  {"name":"graph1_fp16","count":16,"outputs":48},
+  {"name":"graph3_fp32","count":16,"outputs":48},
+  {"name":"resnet_int8","count":16,"outputs":64},
+  {"name":"graph5_fp32","count":16,"outputs":48},
+  {"name":"graph5_int4","count":16,"outputs":48},
+  {"name":"graph6_int8","count":16,"outputs":32},
+  {"name":"graph7_bf16","count":16,"outputs":48},
+  {"name":"gpt_fp32","count":8,"outputs":1792},
+  {"name":"gpt_int8","count":8,"outputs":1792},
+  {"name":"llama_fp32","count":8,"outputs":1792},
+  {"name":"llama_int8","count":8,"outputs":1792}
+ ],
+ "generations": [
+  {"model":"gpt_int8","prompt":[21,9,6,0,18],"count":24,"temperature":0,"topK":0,"topP":0,"seed":1,"tokens":[22,10,4,12,0,3,19,16,24,15,0,7,16,25,0,11,22,14,17,20,0,16,23,6]},
+  {"model":"llama_int8","prompt":[16,23,6,19,0,21,9,6],"count":24,"temperature":0,"topK":0,"topP":0,"seed":1,"tokens":[0,13,2,27,26,0,5,16,8,1,0,21,9,6,0,18,22,10,4,12,0,3,19,16]},
+  {"model":"gpt_fp32","prompt":[11,22,14,17,20],"count":24,"temperature":2.5,"topK":12,"topP":0.95,"seed":42,"tokens":[0,16,23,6,19,16,23,18,22,24,15,0,4,22,10,4,12,0,3,19,10,4,12,0]},
+  {"model":"llama_int8","prompt":[2],"count":24,"temperature":3,"topK":0,"topP":0,"seed":7,"tokens":[27,26,12,0,17,20,0,16,23,6,3,5,22,4,18,19,1,19,17,0,14,0,16,23]},
+  {"model":"llama_fp32","prompt":[13,2,27,26],"count":24,"temperature":1.5,"topK":5,"topP":0,"seed":2026,"tokens":[0,5,16,8,1,0,21,9,6,0,18,22,10,4,12,0,3,19,16,24,15,0,7,16]}
+ ]
+}

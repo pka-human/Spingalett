@@ -37,6 +37,24 @@ try (Network lm = new Network(Loss.SPARSE_CROSS_ENTROPY)) {   // a small LLaMA-l
 }
 ```
 
+With a library of 1.3 or later, pretrained language models and their tokenizers come from Hugging Face's model
+directories (`config.json` and safetensors weights; LLaMA, Mistral, Qwen2, GPT-2) and from GGUF files
+(llama.cpp's, their weights dequantized from F32 to the k-quants), read by the library itself:
+
+```java
+Path model = Path.of("models/SmolLM2-135M");            // or Path.of("SmolLM2-135M.Q4_K_M.gguf")
+try (Network lm = Network.fromPretrained(model, 512); Tokenizer tok = Tokenizer.load(model)) {
+    int[] prompt = tok.encode("The three primary colors are", false, true);   // special, addSpecial (BOS)
+    int[] tokens = lm.generate(prompt, 32, new Sampling().temperature(0.7f).stop(tok.eos().orElse(-1)));
+    System.out.println(tok.decode(tokens, true));
+}
+```
+
+`Tokenizer.encode(text, special, addSpecial)` gives the ids of Hugging Face's `tokenizers` (byte-level BPE,
+tiktoken's encodings, SentencePiece's BPE): `special` turns special tokens written in the text
+(`<|im_start|>`) into their ids, `addSpecial` adds the tokenizer's own (LLaMA's BOS). `decode(ids, skipSpecial)`,
+`token(id)`, `id(token)`, `vocabulary()`, `bos()` and `eos()` read the rest; a `Tokenizer` may be shared by threads.
+
 A `Network` is used by one thread at a time; a `Model` may be shared. Tests: `mvn test` with the library on
 `LD_LIBRARY_PATH`; `SPINGALETT_LAYOUT=/path/to/Bin/SpingalettLayout` also compares every structure's layout
 with the C compiler's.

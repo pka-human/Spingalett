@@ -1,4 +1,4 @@
-# The ABI of Spingalett 1.2.0, written by Tests/check_abi.py update: later releases keep every
+# The ABI of Spingalett 1.3.0, written by Tests/check_abi.py update: later releases keep every
 # entry (layouts on 64-bit platforms). Recorded again at each release, with what it added.
 enum SPINGALETT_INIT_RANDOM 0
 enum SPINGALETT_INIT_XAVIER 1
@@ -46,6 +46,10 @@ field SpingalettNetworkLayer.kv_heads offset 164 size 4
 field SpingalettNetworkLayer.rope_theta offset 168 size 4
 field SpingalettNetworkLayer.causal offset 172 size 1
 field SpingalettNetworkLayer.positions offset 173 size 1
+field SpingalettNetworkLayer.ignore_padding offset 174 size 1
+field SpingalettNetworkLayer.tied offset 176 size 4
+field SpingalettNetworkLayer.window offset 180 size 4
+field SpingalettNetworkLayer.token_offset offset 184 size 4
 enum SPINGALETT_PARAM_WEIGHTS 0
 enum SPINGALETT_PARAM_BIASES 1
 enum SPINGALETT_PARAM_WEIGHT_GRADIENTS 2
@@ -125,6 +129,11 @@ field SpingalettLayerArgs.kv_heads offset 184 size 4
 field SpingalettLayerArgs.rope_theta offset 188 size 4
 field SpingalettLayerArgs.causal offset 192 size 1
 field SpingalettLayerArgs.positions offset 193 size 1
+field SpingalettLayerArgs.ignore_padding offset 194 size 1
+field SpingalettLayerArgs.tied offset 196 size 4
+field SpingalettLayerArgs.window offset 200 size 4
+field SpingalettLayerArgs.token_offset offset 204 size 4
+field SpingalettLayerArgs.token_count offset 208 size 4
 struct SpingalettForwardArgs size 80
 field SpingalettForwardArgs.net offset 0 size 8
 field SpingalettForwardArgs.input offset 8 size 8
@@ -179,6 +188,9 @@ field SpingalettTrainArgs.label_smoothing offset 284 size 4
 field SpingalettTrainArgs.lr_plateau_factor offset 288 size 4
 field SpingalettTrainArgs.lr_plateau_patience offset 296 size 8
 field SpingalettTrainArgs.lr_plateau_min_lr offset 304 size 4
+field SpingalettTrainArgs.accumulation_steps offset 308 size 4
+field SpingalettTrainArgs.lr_per_step offset 312 size 1
+field SpingalettTrainArgs.recompute offset 313 size 1
 struct SpingalettPredictArgs size 104
 field SpingalettPredictArgs.net offset 0 size 8
 field SpingalettPredictArgs.inputs offset 8 size 8
@@ -229,6 +241,32 @@ field SpingalettGenerateArgs.top_p offset 44 size 4
 field SpingalettGenerateArgs.seed offset 48 size 8
 field SpingalettGenerateArgs.stop_tokens offset 56 size 8
 field SpingalettGenerateArgs.stop_count offset 64 size 4
+constant SPINGALETT_NO_TOKEN 4294967295
+struct SpingalettTokenizerInfo size 88
+field SpingalettTokenizerInfo.vocabulary offset 0 size 4
+field SpingalettTokenizerInfo.added offset 4 size 4
+field SpingalettTokenizerInfo.bos offset 8 size 4
+field SpingalettTokenizerInfo.eos offset 12 size 4
+field SpingalettTokenizerInfo.pad offset 16 size 4
+field SpingalettTokenizerInfo.unk offset 20 size 4
+struct SpingalettTokenizeArgs size 112
+field SpingalettTokenizeArgs.tokenizer offset 0 size 8
+field SpingalettTokenizeArgs.text offset 8 size 8
+field SpingalettTokenizeArgs.length offset 16 size 8
+field SpingalettTokenizeArgs.tokens offset 24 size 8
+field SpingalettTokenizeArgs.capacity offset 32 size 8
+field SpingalettTokenizeArgs.special offset 40 size 1
+field SpingalettTokenizeArgs.add_special offset 41 size 1
+struct SpingalettDetokenizeArgs size 112
+field SpingalettDetokenizeArgs.tokenizer offset 0 size 8
+field SpingalettDetokenizeArgs.tokens offset 8 size 8
+field SpingalettDetokenizeArgs.count offset 16 size 8
+field SpingalettDetokenizeArgs.text offset 24 size 8
+field SpingalettDetokenizeArgs.capacity offset 32 size 8
+field SpingalettDetokenizeArgs.skip_special offset 40 size 1
+struct SpingalettPretrainedArgs size 80
+field SpingalettPretrainedArgs.path offset 0 size 8
+field SpingalettPretrainedArgs.context offset 8 size 4
 enum SPINGALETT_DATASET_ENCODING_AUTO 0
 enum SPINGALETT_DATASET_ENCODING_FLOAT32 1
 enum SPINGALETT_DATASET_ENCODING_FP16 2
@@ -287,6 +325,29 @@ enum SPINGALETT_COMPUTE_VULKAN 4
 struct SpingalettEvalMetrics size 72
 field SpingalettEvalMetrics.loss offset 0 size 4
 field SpingalettEvalMetrics.accuracy offset 4 size 4
+struct SpingalettSessionOptions size 72
+field SpingalettSessionOptions.max_length offset 0 size 4
+field SpingalettSessionOptions.sequences offset 4 size 4
+struct SpingalettSessionFeed size 104
+field SpingalettSessionFeed.sequence offset 0 size 4
+field SpingalettSessionFeed.tokens offset 8 size 8
+field SpingalettSessionFeed.count offset 16 size 4
+field SpingalettSessionFeed.logits offset 24 size 8
+field SpingalettSessionFeed.all offset 32 size 1
+struct SpingalettSessionGenerateArgs size 152
+field SpingalettSessionGenerateArgs.session offset 0 size 8
+field SpingalettSessionGenerateArgs.sequences offset 8 size 4
+field SpingalettSessionGenerateArgs.prompts offset 16 size 8
+field SpingalettSessionGenerateArgs.prompt_lengths offset 24 size 8
+field SpingalettSessionGenerateArgs.tokens offset 32 size 8
+field SpingalettSessionGenerateArgs.made offset 40 size 8
+field SpingalettSessionGenerateArgs.count offset 48 size 4
+field SpingalettSessionGenerateArgs.temperature offset 52 size 4
+field SpingalettSessionGenerateArgs.top_k offset 56 size 4
+field SpingalettSessionGenerateArgs.top_p offset 60 size 4
+field SpingalettSessionGenerateArgs.seed offset 64 size 8
+field SpingalettSessionGenerateArgs.stop_tokens offset 72 size 8
+field SpingalettSessionGenerateArgs.stop_count offset 80 size 4
 constant SPINGALETT_MAX_INPUTS 16
 constant SPINGALETT_RESERVED 8
 constant SPINGALETT_OK 0
@@ -372,6 +433,10 @@ field SpingalettLayerInfo.kv_heads offset 156 size 4
 field SpingalettLayerInfo.rope_theta offset 160 size 4
 field SpingalettLayerInfo.causal offset 164 size 1
 field SpingalettLayerInfo.positions offset 165 size 1
+field SpingalettLayerInfo.ignore_padding offset 166 size 1
+field SpingalettLayerInfo.tied offset 168 size 4
+field SpingalettLayerInfo.window offset 172 size 4
+field SpingalettLayerInfo.token_offset offset 176 size 4
 function spingalett_gpu_device const char *spingalett_gpu_device(void);
 function spingalett_cuda_device const char *spingalett_cuda_device(void);
 function spingalett_set_gpu_precision bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
@@ -396,6 +461,8 @@ function spingalett_lr_cosine_decay float spingalett_lr_cosine_decay(size_t epoc
 function spingalett_lr_linear_warmup float spingalett_lr_linear_warmup(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 function spingalett_lr_step_decay float spingalett_lr_step_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 function spingalett_lr_warmup_cosine float spingalett_lr_warmup_cosine(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+function spingalett_lr_linear_decay float spingalett_lr_linear_decay(size_t epoch, size_t total_epochs, float initial_lr, void *params);
+function spingalett_lr_warmup_linear float spingalett_lr_warmup_linear(size_t epoch, size_t total_epochs, float initial_lr, void *params);
 function spingalett_predict_args bool spingalett_predict_args(SpingalettPredictArgs args);
 function spingalett_evaluate_args SpingalettEvalMetrics spingalett_evaluate_args(SpingalettEvaluateArgs args);
 function spingalett_train_args SpingalettTrainReport spingalett_train_args(SpingalettTrainArgs args);
@@ -423,6 +490,15 @@ function spingalett_import_onnx SpingalettNetwork *spingalett_import_onnx(const 
 function spingalett_import_onnx_from_memory SpingalettNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
 function spingalett_load_pytorch bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const char *const *modules, uint32_t module_count);
 function spingalett_load_pytorch_from_memory bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size, const char *const *modules, uint32_t module_count);
+function spingalett_tokenizer_load SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
+function spingalett_tokenizer_from_memory SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
+function spingalett_tokenizer_free void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
+function spingalett_tokenizer_info SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
+function spingalett_tokenizer_token const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
+function spingalett_tokenizer_id uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
+function spingalett_tokenize_args int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
+function spingalett_detokenize_args int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+function spingalett_load_pretrained_args SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args);
 function spingalett_model_from_network SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
 function spingalett_export_c_header bool spingalett_export_c_header(const SpingalettNetwork *net, const char *path, const char *name, SpingalettPrecisionMode precision);
 function spingalett_load_idx bool spingalett_load_idx(const char *images_path, const char *labels_path, uint32_t num_classes, SpingalettDataset *dataset);
@@ -468,6 +544,14 @@ function spingalett_model_from_memory SpingalettModel *spingalett_model_from_mem
 function spingalett_model_free void spingalett_model_free(SpingalettModel *model);
 function spingalett_model_predict bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs);
 function spingalett_model_evaluate SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, const float *inputs, const float *targets, uint32_t count);
+function spingalett_session_new SpingalettSession *spingalett_session_new(const SpingalettModel *model, const SpingalettSessionOptions *options);
+function spingalett_session_free void spingalett_session_free(SpingalettSession *session);
+function spingalett_session_vocabulary uint32_t spingalett_session_vocabulary(const SpingalettSession *session);
+function spingalett_session_length uint32_t spingalett_session_length(const SpingalettSession *session, uint32_t sequence);
+function spingalett_session_feed bool spingalett_session_feed(SpingalettSession *session, const SpingalettSessionFeed *feeds, uint32_t count);
+function spingalett_session_rewind bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
+function spingalett_session_copy bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
+function spingalett_session_generate_args uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
 function spingalett_model_init int spingalett_model_init(SpingalettModel *model, const void *image, size_t size);
 function spingalett_model_run int spingalett_model_run(const SpingalettModel *model, const float *input, float *output, void *workspace);
 function spingalett_model_layer bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, SpingalettLayerInfo *info);

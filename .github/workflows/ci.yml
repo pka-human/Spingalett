@@ -113,7 +113,7 @@ jobs:
   # the bindings of other languages against the library, installed: their tests, and their structures' layout
   # against the C compiler's (SpingalettLayout)
   bindings:
-    name: bindings (Rust, .NET, Go, Java)
+    name: bindings (Rust, .NET, Go, Java, PHP)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -159,6 +159,32 @@ jobs:
         working-directory: Bindings/Java
         run: mvn -B -q test
 
+      # PHP: the oldest version the bindings support, then a current one (which gives the structures'
+      # offsets, so that the layout is checked too)
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.0"
+          extensions: ffi
+          ini-values: ffi.enable=true
+          coverage: none
+          tools: none
+
+      - name: PHP 8.0
+        working-directory: Bindings/PHP
+        run: php tests/run.php
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: ffi
+          ini-values: ffi.enable=true
+          coverage: none
+          tools: composer
+
+      - name: PHP
+        working-directory: Bindings/PHP
+        run: composer validate && php tests/run.php
+
   inference-only:
     name: inference engine alone
     runs-on: ubuntu-24.04
@@ -193,6 +219,42 @@ jobs:
           cmake -S consumer -B consumer/build -DCMAKE_PREFIX_PATH=$PWD/prefix
           cmake --build consumer/build
           consumer/build/c
+
+  # the engine in WebAssembly (Bindings/JavaScript): built by Clang for wasm32 without a C library, and its
+  # package's tests in Node: the module against the native engine's outputs (test/references) and against
+  # the same code built natively by GCC
+  javascript:
+    name: JavaScript (WebAssembly) / Node ${{ matrix.node }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Clang and wasm-ld
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+          clang --version | head -1
+          command -v wasm-ld || command -v wasm-ld-18 || clang -print-prog-name=wasm-ld
+
+      - name: Build
+        working-directory: Bindings/JavaScript
+        run: sh build.sh
+
+      - name: Test
+        working-directory: Bindings/JavaScript
+        run: CC=gcc npm test
+
+      - name: Package
+        working-directory: Bindings/JavaScript
+        run: npm pack --dry-run
 
   runtime:
     name: ${{ matrix.cc }} / runtime alone

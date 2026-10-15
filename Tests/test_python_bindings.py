@@ -83,6 +83,15 @@ with sg.Network(sg.Loss.MSE, [2, sg.Layer(4, sg.Activation.TANH), sg.Layer(1)]) 
     # built-in schedules
     check(abs(sg.CosineDecay()(50, 100, 1.0) - 0.5) < 1e-6 and abs(sg.StepDecay(10, 0.5)(25, 100, 1.0) - 0.25) < 1e-6, "builtin schedule values")
     net.train(x, y, epochs=10, lr_scheduler=sg.WarmupCosine(warmup_epochs=2))
+    check(abs(sg.LinearDecay(min_lr=0.1)(50, 100, 1.0) - 0.55) < 1e-6 and
+          abs(sg.WarmupLinear(4, 0.1)(54, 104, 1.0) - 0.55) < 1e-6, "linear schedule values")
+    # schedules by step, with gradient accumulation: steps of 2 mini-batches of 1 over the 4 samples, 3 epochs
+    calls, steps = [], net.time_step
+    net.train(x, y, epochs=3, strategy=sg.Strategy.MINI_BATCH, batch_size=1, accumulation_steps=2, lr_per_step=True,
+              lr_scheduler=lambda e, t, lr: (calls.append((e, t)), lr)[1])
+    check(calls == [(e, 6) for e in range(6)] and net.time_step == steps + 6, f"schedule by step {calls}")
+    net.train(x, y, epochs=2, strategy=sg.Strategy.MINI_BATCH, batch_size=2, accumulation_steps=2,
+              lr_per_step=True, lr_scheduler=sg.WarmupLinear(warmup_epochs=1))
     # validation errors
     for bad in (lambda: net.train(x[:, :1], y, epochs=1), lambda: net.train(x, y[:3], epochs=1), lambda: net.forward([1, 2, 3])):
         try: bad(); check(False, "bad shape accepted")
@@ -706,7 +715,7 @@ if torch is not None:
             x = x + lin(a, h + "self_attn.o_proj")
             y = rms(x, sd[h + "post_attention_layernorm.weight"])
             x = x + lin(tf.silu(lin(y, h + "mlp.gate_proj")) * lin(y, h + "mlp.up_proj"), h + "mlp.down_proj")
-        return rms(x, sd["model.norm.weight"]) @ sd["lm_head.weight"].T
+        return rms(x, sd["model.norm.weight"]) @ sd.get("lm_head.weight", sd["model.embed_tokens.weight"]).T
 
     torch.manual_seed(11)
     V, T, d, heads = 50, 12, 32, 4
@@ -729,6 +738,14 @@ if torch is not None:
         got = gpt.forward(tokens.numpy().astype(np.float32)).reshape(T, V)
         check(np.abs(got - want).max() < 2e-4, f"gpt2_from_state_dict ({'Conv1D' if conv1d else 'Linear'}): "
               f"{np.abs(got - want).max():.2e} from PyTorch")
+        # the head tied to the token embeddings: one table, trained by both, saved and loaded so
+        check(gpt.layer(-1).tied == 1 and gpt.layer(-1).weight_count == 0, f"gpt2 head tied: {gpt.layer(-1)}")
+        back = sg.Network.from_bytes(gpt.to_bytes())
+        check(back.layer(-1).tied == 1 and np.array_equal(back.forward(tokens.numpy().astype(np.float32)).reshape(T, V), got),
+              "tied gpt2 saved and loaded")
+        model = gpt.to_model(sg.Precision.FLOAT32)
+        check(model.layers[-1].tied == 1 and np.abs(model.predict(tokens.numpy().astype(np.float32)).reshape(T, V) - got).max() < 1e-4,
+              "tied gpt2 as a model")
     for qwen in (False, True):
         kv, ff, theta = 2, 48, 500000.0
         sd = {"model.embed_tokens.weight": r(V, d), "model.norm.weight": 1 + r(d), "lm_head.weight": r(V, d)}
@@ -742,9 +759,12 @@ if torch is not None:
             if qwen:
                 for n, m in (("q", d), ("k", kv * d // heads), ("v", kv * d // heads)):
                     sd[h + f"self_attn.{n}_proj.bias"] = r(m)
+        if qwen:
+            del sd["lm_head.weight"]        # (tie_word_embeddings: no head of its own)
         tokens = torch.randint(0, V, (T,))
         want = ref_llama(sd, tokens, heads, kv, theta, 1e-6).numpy()
         lm = sg.llama_from_state_dict(sd, heads, kv, context=T, rope_theta=theta)
+        check(lm.layer(-1).tied == (1 if qwen else 0), f"llama head tied {qwen}: {lm.layer(-1).tied}")
         got = lm.forward(tokens.numpy().astype(np.float32)).reshape(T, V)
         check(np.abs(got - want).max() < 2e-4, f"llama_from_state_dict ({'with' if qwen else 'no'} biases): "
               f"{np.abs(got - want).max():.2e} from PyTorch")
@@ -790,6 +810,175 @@ check(drawn == lm.generate([3, 4, 5], 20, temperature=1.0, top_p=0.9, seed=8) an
       "generate: draws repeat with their seed")
 check(lm.generate([3, 4, 5], 20, stop=[9]) == [6, 7, 8, 9], "generate: stop tokens")
 os.remove(tokens_path)
+
+# sequences of different lengths: attention ignoring the keys of padding (-1), its outputs at the real tokens
+# those of the sequence alone (the padding's values do not matter: here, the network's cells past the sequence)
+enc = sg.Network(sg.Loss.SPARSE_CROSS_ENTROPY, [8, sg.Embedding(V, 8, positions=True), sg.Linear(24),
+                                                sg.Attention(heads=2, ignore_padding=True), sg.Linear(V)])
+check(enc.layer(3).ignore_padding and enc.to_model(sg.Precision.FLOAT32).layers[2].ignore_padding,
+      "ignore_padding described")
+short = np.array([4, 7, 1, -1, -1, -1, -1, -1], dtype=np.float32)
+out = enc.forward(short).reshape(8, V)
+enc.set_biases(0, np.concatenate([enc.get_biases(0)[:24], np.zeros(40, np.float32)]))   # the padding's positions
+check(np.allclose(enc.forward(short).reshape(8, V)[:3], out[:3], atol=1e-6), "padding ignored by attention")
+r = enc.train(np.stack([short, np.arange(8, dtype=np.float32) % V]), np.stack([short, np.arange(8, dtype=np.float32) % V]),
+              epochs=2, strategy=sg.Strategy.FULL_BATCH)
+check(r.status == sg.TrainStatus.COMPLETED, "a padded batch trains")
+
+# a sliding window: with queries and keys of zeros and the positions' one-hot vectors as values, a cell's outputs
+# are the mean of the keys' it attends to (itself and the one before it)
+win = sg.Network(sg.Loss.MSE, [6, sg.Embedding(6, 18), sg.Attention(heads=1, causal=True, window=2)])
+table = np.zeros((6, 18), np.float32)
+table[np.arange(6), 12 + np.arange(6)] = 1.0
+win.set_weights(0, table.ravel())
+expect = np.array([[1.0 if j == i or (j == i - 1 and i > 0) else 0.0 for j in range(6)] for i in range(6)])
+expect /= expect.sum(axis=1, keepdims=True)
+check(win.layer(2).window == 2 and win.to_model(sg.Precision.FLOAT32).layers[1].window == 2, "window described")
+check(np.allclose(win.forward(np.arange(6, dtype=np.float32)).reshape(6, 6), expect, atol=1e-6), "window attended to")
+
+# an encoder-decoder: 6 source tokens then 5 target tokens in one input, cross-attention from the decoder to the
+# encoder; it learns to copy the source's first tokens, saves and loads, and deploys
+S, Q = 6, 5
+seq = sg.Network(sg.Loss.SPARSE_CROSS_ENTROPY, [S + Q])
+seq.add_embedding(V, 16, positions=True, token_count=S).add_linear(48).add_attention(heads=2).add_layer_norm()
+encoder = seq.last
+seq.add_linear(32, inputs=[encoder])
+kv = seq.last
+seq.add_embedding(V, 16, positions=True, token_offset=S, inputs=[0]).add_linear(48)
+seq.add_attention(heads=2, causal=True).add_linear(16)
+seq.add_attention(heads=2, inputs=[seq.last, kv]).add_linear(V)
+check(seq.layer(1).token_offset == 0 and seq.layer(1).shape[1] == S and seq.layer(6).token_offset == S and
+      seq.layer(6).shape[1] == Q and seq.layer(10).inputs == (9, kv), "an encoder-decoder described")
+rng = np.random.default_rng(3)
+src = rng.integers(0, V, (256, S)).astype(np.float32)
+xs = np.concatenate([src, np.zeros((256, Q), np.float32)], axis=1)
+xs[:, S + 1:] = src[:, :Q - 1]                      # the target's tokens so far: the source's, shifted
+r = seq.train(xs, src[:, :Q], epochs=100, batch_size=32, strategy=sg.Strategy.MINI_BATCH, learning_rate=1e-2,
+              optimizer=sg.Optimizer.ADAM)
+m = seq.evaluate(xs, src[:, :Q])
+check(r.status == sg.TrainStatus.COMPLETED and m.accuracy > 0.9, f"an encoder-decoder learns to copy ({m.accuracy:.3f})")
+back = sg.Network.from_bytes(seq.to_bytes())
+check(np.array_equal(back.forward(xs[:4]), seq.forward(xs[:4])) and back.layer(6).token_offset == S,
+      "an encoder-decoder saved and loaded")
+model = seq.to_model(sg.Precision.FLOAT32)
+check(np.allclose(model.predict(xs[:4]), seq.forward(xs[:4]), atol=1e-5) and model.layers[5].token_offset == S,
+      "an encoder-decoder deployed")
+# activation recomputation trains to the same weights
+copies = [sg.Network.from_bytes(seq.to_bytes()) for _ in range(2)]
+for net, again in zip(copies, (False, True)):
+    sg.seed(4)
+    net.train(xs[:64], src[:64, :Q], epochs=2, batch_size=16, strategy=sg.Strategy.MINI_BATCH, learning_rate=1e-3,
+              optimizer=sg.Optimizer.ADAMW, recompute=again)
+check(all(np.array_equal(copies[0].get_weights(i), copies[1].get_weights(i)) for i in range(len(seq) - 1)),
+      "activation recomputation: the same weights")
+# sessions: the model a token at a time with a key-value cache, the logits of its batched prediction bit for bit
+for precision in (sg.Precision.FLOAT32, sg.Precision.INT8):
+    model = lm.to_model(precision)
+    window = [(5 + i) % V for i in range(T)]
+    whole = model.predict(np.array(window, dtype=np.float32)).reshape(T, V)
+    with model.session(sequences=3) as s:
+        check(s.vocabulary == V and s.length() == 0, "session: vocabulary and length")
+        alone = np.array([s.feed([t]) for t in window])
+        check(np.array_equal(alone, whole) and s.length() == T, f"session {precision.name}: a token at a time")
+        s.rewind(4)
+        rest, both = s.feed_many([(0, window[4:]), (1, window)], all=True)
+        check(np.array_equal(rest, whole[4:]) and np.array_equal(both, whole),
+              f"session {precision.name}: two sequences in one call, after a rewind")
+        s.copy(1, 2); s.rewind(9, sequence=2)
+        check(np.array_equal(s.feed(window[9:], sequence=2), whole[-1]), f"session {precision.name}: a copy")
+        for b in range(3): s.rewind(0, sequence=b)
+        together = s.generate([[3, 4, 5], [7], [1, 2]], 8, temperature=0.8, top_k=5, seed=21)
+    alone = []
+    for b, prompt in enumerate([[3, 4, 5], [7], [1, 2]]):
+        with model.session() as one:
+            alone += one.generate([prompt], 8, temperature=0.8, top_k=5, seed=21 + b)
+    check(together == alone and all(len(t) == 8 for t in together), f"session {precision.name}: batched generation")
+    with model.session() as s:
+        check(s.generate([[3, 4, 5]], 20)[0] == [(6 + i) % V for i in range(20)][:T - 3 + 1],
+              f"session {precision.name}: greedy generation stops after a full sequence")
+try:
+    sg.Network(sg.Loss.MSE, [4, 3]).to_model(sg.Precision.FLOAT32).session(); check(False, "a session of an MLP")
+except sg.SpingalettError as e:
+    check("causal language model" in str(e), "a session of an MLP is refused")
+# tokenizers: the ids and texts of Hugging Face's tokenizers (Tests/make_tokenizer_tests.py), and of sentencepiece for a
+# GGUF vocabulary
+def expectations(name):
+    lines = [line.rstrip("\n") for line in open(os.path.join(data_dir, name), encoding="ascii") if not line.startswith("#")]
+    unhex = lambda h: "" if h == "-" else bytes.fromhex(h).decode("utf-8")
+    for k in range(0, len(lines) - 3, 4):
+        special, add, text = lines[k].split()
+        ids = [int(x) for x in lines[k + 1].split()[1:]]
+        yield bool(int(special)), bool(int(add)), unhex(text), ids, \
+            None if lines[k + 2] == "*" else unhex(lines[k + 2]), unhex(lines[k + 3])
+
+
+for tokenizer_file, expected_file in [(f"tokenizer_{n}.json", f"tokenizer_{n}.txt") for n in
+                                      ("gpt2", "llama3", "qwen2", "o200k", "spm", "metaspace")] + \
+                                     [("gguf_llama.gguf", "tokenizer_llama3.txt"), ("gguf_qwen2.gguf", "tokenizer_qwen2.txt"),
+                                      ("gguf_spm.gguf", "gguf_spm.txt")]:
+    with sg.Tokenizer(os.path.join(data_dir, tokenizer_file)) as tok:
+        wrong = 0
+        for special, add, text, ids, decoded, decoded_skip in expectations(expected_file):
+            wrong += tok.encode(text, special=special, add_special=add) != ids
+            wrong += (decoded is not None and tok.decode(ids) != decoded) or tok.decode(ids, skip_special=True) != decoded_skip
+        check(wrong == 0, f"Tokenizer({tokenizer_file}): {wrong} encodings or decodings differ from the reference's")
+with open(os.path.join(data_dir, "tokenizer_llama3.json"), "rb") as f:
+    tok = sg.Tokenizer.from_bytes(f.read())
+check(tok.bos == 420 and tok.eos == 421 and tok.unk is None and len(tok) == 425 and tok.added == 5, f"tokenizer info {tok!r}")
+check(tok.id("<|begin_of_text|>") == 420 and tok.token(420) == "<|begin_of_text|>" and tok.id("no such token") is None
+      and tok.token(10 ** 6) is None, "tokens by id and by name")
+check(tok.encode("<|begin_of_text|>", special=True) == [420] and len(tok.encode("<|begin_of_text|>")) > 1,
+      "special tokens only when asked")
+long_text = "Tokenizers cut text into pieces, " * 300
+check(tok.decode(tok.encode(long_text)) == long_text, "a long text encoded and decoded")
+tok.close()
+try:
+    sg.Tokenizer(os.path.join(data_dir, "no_such_tokenizer.json"))
+    check(False, "a missing tokenizer loaded")
+except sg.SpingalettError:
+    pass
+
+# pretrained models: Hugging Face's directories and GGUF files against PyTorch's logits (Tests/make_pretrained_tests.py)
+def window(name):
+    with open(os.path.join(data_dir, name + ".bin"), "rb") as f:
+        head = np.frombuffer(f.read(16), dtype="<u4")
+        t, n = int(head[2]), int(head[3])
+        return np.frombuffer(f.read(4 * t), dtype="<f4"), np.frombuffer(f.read(4 * n), dtype="<f4")
+
+
+for path, bin_name in [("hf_llama", "hf_llama"), ("hf_qwen2", "hf_qwen2"), ("hf_mistral", "hf_mistral"), ("hf_gpt2", "hf_gpt2"),
+                       ("gguf_llama.gguf", "hf_llama"), ("gguf_qwen2.gguf", "hf_qwen2"), ("gguf_gpt2.gguf", "hf_gpt2"),
+                       ("gguf_quant.gguf", "gguf_quant")]:
+    tokens, logits = window(bin_name)
+    with sg.Network.from_pretrained(os.path.join(data_dir, path), context=len(tokens)) as lm:
+        got = lm.forward(tokens)
+        scale = max(1.0, float(np.abs(logits).max()))
+        check(lm.loss == sg.Loss.SPARSE_CROSS_ENTROPY and np.abs(got - logits).max() < 1e-4 * scale,
+              f"Network.from_pretrained({path}): {np.abs(got - logits).max():.2e} from PyTorch")
+with sg.Tokenizer(os.path.join(data_dir, "hf_llama")) as tok:
+    tokens, _ = window("hf_llama")
+    check(tok.encode("The quick brown fox jumps over the lazy dog, it's 1234 times!")[:len(tokens)] == tokens.astype(int).tolist()
+          and tok.eos == 424, "the tokenizer of a model directory")
+try:
+    sg.Network.from_pretrained(os.path.join(data_dir, "no_such_model"))
+    check(False, "a missing model loaded")
+except sg.SpingalettError:
+    pass
+# the C loader against the 1.2 loader of state dicts, where PyTorch and safetensors are installed: the same network
+try:
+    from safetensors.torch import load_file as load_safetensors
+except ImportError:
+    load_safetensors = None
+if torch is not None and load_safetensors is not None:
+    d = os.path.join(data_dir, "hf_llama")
+    sd = {}
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".safetensors"):
+            sd.update(load_safetensors(os.path.join(d, f)))
+    tokens, _ = window("hf_llama")
+    py = sg.llama_from_state_dict(sd, 4, 2, context=len(tokens), rope_theta=500000.0, epsilon=1e-5).forward(tokens)
+    check(np.array_equal(py, sg.Network.from_pretrained(d, context=len(tokens)).forward(tokens)),
+          "Network.from_pretrained and llama_from_state_dict give the same logits")
 
 # the library versions the bindings accept: major.minor before 1.0, then the major and a minor at least theirs
 check(sg._compatible("0.14.2", "0.14.0") and not sg._compatible("0.13.1", "0.14.0"), "versions of 0.x")

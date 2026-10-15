@@ -27,7 +27,8 @@ model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels whe
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
 alike; programs that only run models link the runtime, a library of that part alone. Models come in
 from ONNX files and PyTorch weights (GPT-2 and LLaMA-like checkpoints in Python), and bindings for
-Python (wheels with the library inside), C++, Rust, .NET, Go and Java are included.
+Python (wheels with the library inside), C++, Rust, .NET, Go, Java and PHP are included, and for
+JavaScript the inference engine in WebAssembly, which runs models in Node and in browsers.
 
 ## Contents
 
@@ -55,22 +56,22 @@ Python (wheels with the library inside), C++, Rust, .NET, Go and Java are includ
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
-| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens), GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens) with a key-value cache (sessions of deployment models: each token computed once, several sequences generated together), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) and GGUF files (dequantized from 15 types) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
-| Training | Per-sample, full-batch and mini-batch strategies; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
+| Training | Per-sample, full-batch and mini-batch strategies; gradient accumulation over mini-batches; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
 | Data | `.slettd` data set files (compact, lossless by default, streamable into training), token files, IDX (MNIST), CIFAR-10/100 and CSV readers, shuffling, hold-out splits |
 | Regularization and stability | Dropout, weight decay, global gradient-norm clipping, NaN/Inf detection |
-| Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, or a custom callback |
+| Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, linear decay, warm-up + linear decay, or a custom callback; by epoch or by optimizer step |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
-| Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()` |
-| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap) |
+| Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()`, sessions of language models (`spingalett_session_feed()`) |
+| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
-| Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`), PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
-| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API) |
-| Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes |
+| Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`) of CNNs, MLPs and transformers, PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
+| Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension); JavaScript and TypeScript for the inference engine in WebAssembly |
+| Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes, an npm package |
 
 ## Building
 
@@ -146,7 +147,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 and `Spingalett::runtime` for the runtime, which carry the include paths:
 
 ```cmake
-find_package(Spingalett 1.2 REQUIRED)         # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 1.3 REQUIRED)         # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)    # or Spingalett::runtime
 ```
 
@@ -162,8 +163,8 @@ pip install spingalett                    # Python: wheels with the library insi
 brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
 scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
 nix build github:pka-human/Spingalett     # the flake's package; nix develop: a shell to build it in
-sudo apt install ./spingalett_1.2.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
-docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.2.0     # the library, tools and Python, CUDA and Vulkan
+sudo apt install ./spingalett_1.3.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.3.0     # the library, tools and Python, CUDA and Vulkan
 ```
 
 The `.deb` and `.rpm` packages are assets of each [release](https://github.com/pka-human/Spingalett/releases),
@@ -466,8 +467,8 @@ cross-entropy compares with the next token. A GPT-2 small, and the changes that 
 ```c
 NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
 layer(.net = net, .neurons_amount = 1024);                          /* a window of 1024 tokens */
-uint32_t x = embedding(.net = net, .vocabulary = 50257, .neurons_amount = 768,
-                       .positions = true);                          /* learned positions, as GPT-2's */
+uint32_t e = embedding(.net = net, .vocabulary = 50257, .neurons_amount = 768,
+                       .positions = true), x = e;                   /* learned positions, as GPT-2's */
 for (int b = 0; b < 12; b++) {
     layer_norm(.net = net);
     linear(.net = net, .neurons_amount = 3 * 768);                  /* queries, keys and values */
@@ -480,7 +481,8 @@ for (int b = 0; b < 12; b++) {
     x = add_layers(.net = net, .inputs = {x, a});
 }
 layer_norm(.net = net);
-linear(.net = net, .neurons_amount = 50257);                        /* each position's logits */
+linear(.net = net, .neurons_amount = 50257, .tied = e);             /* each position's logits, with the
+                                                                       embedding's table (tied, as GPT-2's) */
 
 /* LLaMA: RMS normalization, grouped-query attention with rotary embeddings, a SwiGLU MLP */
 uint32_t n = rms_norm(.net = net, .epsilon = 1e-5f);
@@ -512,27 +514,223 @@ uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length
 | Builder or call | Arguments | What it does |
 |---|---|---|
 | `spingalett_embedding()` | `vocabulary`, `neurons_amount` (the width), `positions` | Each token id's vector (ids outside the vocabulary give zeros); with `positions`, a learned vector per position added (the layer's biases) |
-| `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs` | Each position's channels times a matrix, plus biases |
-| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled; outputs the heads' vectors side by side |
+| `spingalett_linear()` | `neurons_amount`, `act_func`, `inputs`, `tied` | Each position's channels times a matrix, plus biases; with `tied`, an embedding's index, that embedding's table is the matrix (tied input and output embeddings: one table, its gradient the sum of both layers') |
+| `spingalett_attention()` | `heads`, `kv_heads` (0: as many; fewer: grouped queries, 1: multi-query), `causal`, `rope_theta` (0: none), `ignore_padding`, `window` (0: none), `act_func` | Softmax attention of each query head over the keys of its group, `1 / sqrt(head size)` scaled, the keys of padding left out with `ignore_padding`, the keys `window` or more cells away with `window` (Mistral's sliding window: with `causal` a cell and the `window - 1` before it); outputs the heads' vectors side by side |
 | `spingalett_rms_norm()` | `epsilon` (1e-5) | Each position's channels over their root mean square, times a gain (no biases) |
 | `spingalett_multiply_layers()` | `inputs` | The element-wise product of layers of one shape |
 | `spingalett_dataset_open_tokens()` | `context`, `token_bytes` (2 or 4), `stride`, `offset`, `shuffle` | Windows of a token file: inputs and, as targets, the tokens after them |
 | `spingalett_generate()` | `prompt`, `count`, `temperature` (0: greedy), `top_k`, `top_p`, `seed`, `stop_tokens` | Tokens continuing the prompt |
+
+A deployment model of a causal language model (its first layer an embedding of the tokens, its other
+layers treating each position alone but for causal attention) runs a token at a time in a session:
+each attention layer keeps the keys and values of the tokens a sequence has been fed, so that a new
+token costs one row through every layer and its attention over those, not a pass over the window. A
+session holds several sequences; the tokens of several fed in one call (a prompt, or a token of each
+sequence) run through the layers together, so that sequences generated together share each product.
+The logits are those `spingalett_model_predict()` gives each position of the whole window, bit for
+bit, however the tokens come, in every precision (integer models too: the linear layers of a language
+model quantize each token alone); sessions are part of the runtime. On the CPU `spingalett_generate()`
+runs one, on the network's deployment model of single precision (kept in the network until its
+parameters change), with the tokens it gave before: the CharGPT model (256 wide, 4 blocks, a window of
+128) generates 3230 tokens a second on one thread of an Intel Core i7-12650H where predicting the
+window for every token gave 72.7, and 3568 on six threads where it gave 121.
+
+In the GPU modes a session runs on the GPU, its model a network there and the keys and values in the GPU's
+memory. An integer model's linear layers then multiply its codes, kept on the GPU with their scales and
+widened to floats as they are read (weight-only: 8, 4 or 2 bits read a weight a token; the activations in
+the GPU's precision): the logits are those of the model's weights as floats to rounding, near the CPU's
+integer session's but not its bits. A model of GPT-2 small's size (12 blocks of 768, a vocabulary of
+50,257) generates 684 tokens a second in INT8 and 854 in INT4 on CUDA on an RTX 4050 Laptop GPU, where
+the same model in BF16 gives 368 (four sequences together: 1,953 and 2,053).
+
+```c
+SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);   /* or spingalett_model_load() */
+SpingalettSession *s = spingalett_session_new(model, &(SpingalettSessionOptions){.sequences = 4});
+const uint32_t *prompts[4] = {p0, p1, p2, p3};
+uint32_t lengths[4] = {3, 5, 1, 2}, tokens[4 * 100], made[4];
+spingalett_session_generate(.session = s, .sequences = 4, .prompts = prompts, .prompt_lengths = lengths,
+                            .tokens = tokens, .made = made, .count = 100, .temperature = 0.8f, .top_k = 40,
+                            .seed = 1);                             /* sequence b's tokens from tokens + 100 b */
+
+float logits[50257];                                                /* or a token at a time */
+spingalett_session_rewind(s, 0, 0);
+spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 0, .tokens = p0, .count = 3, .logits = logits}, 1);
+spingalett_session_free(s);
+```
+
+| Call | Arguments | What it does |
+|---|---|---|
+| `spingalett_session_new()` | a model; `max_length` (the model's window at most), `sequences` | A session, or NULL with the reason for a model that is no causal language model |
+| `spingalett_session_feed()` | per sequence: `tokens`, `count`, `logits`, `all` | Appends tokens to several sequences in one pass; the logits of the token after the last (or after each) |
+| `spingalett_session_rewind()`, `spingalett_session_copy()`, `spingalett_session_length()` | a sequence, a length; two sequences | Truncates a sequence; copies one (a prompt fed once for several continuations) |
+| `spingalett_session_generate()` | `sequences`, `prompts`, `count`, `temperature`, `top_k`, `top_p`, `seed` (sequence b: seed + b), `stop_tokens` | Sequences continued together, each drawing as `spingalett_generate()` draws |
 
 - The rotary embeddings rotate the halves of each head's queries and keys (the `rotate_half` form
   of GPT-NeoX and of Hugging Face's LLaMA weights). GELU comes in its erf form (`ACT_GELU`) and
   GPT-2's tanh form (`ACT_GELU_TANH`), SiLU as `ACT_SILU`.
 - The sparse cross-entropy takes one class index a position (`spingalett_target_size()` per sample);
   an index outside the classes leaves the position out of the loss. Label smoothing applies.
+- Sequences of different lengths train in one batch padded with the token -1 (inputs and targets): an
+  embedding reads it as zeros, the loss leaves its positions out (a sample's loss is the mean over its real
+  tokens), and attention with `.ignore_padding = true` leaves its keys out (their tokens in the network's
+  input, which the keys' cells come from through an embedding). The gradient of a padded batch is then the
+  mean of the sequences' own, each trained alone in a network of its length, up to the order of the sums,
+  on the CPU and the GPU. Causal attention over right padding never reaches it anyway; non-causal attention
+  and left padding need the option. Batch normalization takes its statistics over padded cells too.
 - Attention never stores the scores: the CPU computes a block of queries at a time, the backward
   pass recomputes the probabilities from each query's log-sum-exp. On the GPU it runs in tiles
-  (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16 on
-  CUDA), deterministic like everything else.
-- Networks of these layers save to `.slett` files (format 8), become deployment models in every
-  precision (the linear maps in INT8 down to INT2) and run on the runtime and the engine.
+  (register-tiled kernels in single precision, flash attention on the matrix units in bfloat16, on
+  CUDA and Vulkan alike), deterministic like everything else.
+- A sliding window costs what it reads: the CPU and the GPU's kernels of single precision skip the blocks of
+  keys outside every query's window (in bfloat16 on CUDA such layers run on those kernels, not on flash
+  attention).
+- Encoder-decoders take the source's tokens and then the target's in one input: an embedding reads each part
+  (`.token_offset`, `.token_count`; the decoder's names the input layer, `.inputs = {0}, .input_count = 1`),
+  and cross-attention, an attention of two inputs, takes the decoder's queries over the encoder's keys and
+  values (a linear layer of `2 kv_heads x head size` outputs reading the encoder), ignoring the source's
+  padding with `.ignore_padding`:
+
+  ```c
+  uint32_t src = embedding(.net = net, .vocabulary = V, .neurons_amount = 512, .positions = true,
+                           .token_count = 64);                 /* the first 64 tokens: the source */
+  /* ... the encoder's blocks, its output e ... */
+  uint32_t kv = linear(.net = net, .inputs = {e}, .neurons_amount = 2 * 512);
+  uint32_t tgt = embedding(.net = net, .inputs = {0}, .input_count = 1, .vocabulary = V,
+                           .neurons_amount = 512, .positions = true, .token_offset = 64);
+  /* ... the decoder's causal self-attention, its queries q = linear(512) ... */
+  attention(.net = net, .inputs = {q, kv}, .heads = 8, .ignore_padding = true);
+  ```
+- Networks of these layers save to `.slett` files (format 8; 9 with a tied head, its table stored once,
+  padding ignored, a sliding window, cross-attention or embeddings of part of their input),
+  become deployment models in every precision (the linear maps in INT8 down to INT2) and run on the
+  runtime and the engine.
 - `Examples/CharGPT.c` trains a character-level GPT on any text file and samples it after every
   epoch. In Python, `gpt2_from_state_dict()` and `llama_from_state_dict()` make networks of GPT-2
-  checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2).
+  checkpoints (Hugging Face's or nanoGPT's) and LLaMA-like ones (LLaMA, Mistral, Qwen2), the head tied
+  to the embedding when the checkpoint ties them.
+
+### Tokenizers
+
+`spingalett_tokenizer_load()` reads the tokenizer of a language model: a Hugging Face
+`tokenizer.json` file, a model directory holding one (its `tokenizer_config.json` then names the
+BOS and EOS tokens) or a GGUF file (see below). `spingalett_tokenize()` turns UTF-8 text into token ids and
+`spingalett_detokenize()` ids back into text, id for id and byte for byte as Hugging Face's
+`tokenizers` library does:
+
+```c
+SpingalettTokenizer *tok = spingalett_tokenizer_load("models/SmolLM2-135M");     /* NULL on error */
+uint32_t ids[256];
+int64_t n = spingalett_tokenize(.tokenizer = tok, .text = "<|im_start|>user\nHello!<|im_end|>",
+                                .tokens = ids, .capacity = 256, .special = true);
+char text[1024];
+spingalett_detokenize(.tokenizer = tok, .tokens = ids, .count = (size_t)n, .text = text, .capacity = sizeof text);
+uint32_t end = spingalett_tokenizer_id(tok, "<|im_end|>");                /* a chat format's stop token */
+SpingalettTokenizerInfo info = spingalett_tokenizer_info(tok);            /* vocabulary, BOS, EOS, ... */
+spingalett_tokenizer_free(tok);
+```
+
+| Family | Models | What the file holds |
+|---|---|---|
+| Byte-level BPE | GPT-2, SmolLM | ByteLevel pre-tokenizer (GPT-2's expression), digits apart |
+| tiktoken's encodings | LLaMA 3 (cl100k), Qwen2 (cl100k with single digits, NFC), GPT-4o-like (o200k) | a Split by the expression, then ByteLevel; ignore_merges |
+| SentencePiece's BPE | LLaMA 2, TinyLlama, Mistral, Phi-3 | Prepend and Replace of `▁` (or Metaspace), byte fallback to `<0xXX>` tokens |
+
+- The steps are those of the `tokenizers` library: added tokens found first (leftmost, longest,
+  with their `lstrip`, `rstrip` and `single_word` rules), the normalizers (NFC, Prepend, Replace,
+  Strip), the pre-tokenizers (ByteLevel, Split, Metaspace, Digits), the BPE merges by rank, the
+  template of the post-processor (`.add_special`: LLaMA's BOS), and in decoding ByteLevel,
+  ByteFallback, Replace, Fuse, Strip and Metaspace. Merges go through a heap of candidate pairs, so a
+  piece of n characters takes n log n steps; a SentencePiece text, which is one piece, is merged word
+  by word where the vocabulary shows that no merge joins a word to the `▁` after it (the same
+  tokens, without a heap of the whole text). Other models (WordPiece, Unigram), normalizers and
+  expressions are refused with an error that names them.
+- The pre-tokenizers' regular expressions are matched by hand, not by a regular expression library:
+  GPT-2's, cl100k's (with up to three or single digits) and o200k's (with tekken's variant) are
+  recognized by their text and matched with the semantics of the Oniguruma expressions the
+  `tokenizers` library runs, letters, numbers and marks from the Unicode tables of
+  `Src/Spingalett.Unicode.h` (written by `Src/make_unicode.py`).
+- Special tokens written in a text become their ids only with `.special = true`; by default they are
+  text like any other, so that text from users cannot forge a chat format's control tokens. Added
+  tokens that are not special are always found. `.skip_special` leaves special tokens out of
+  decoded text; bytes that are no UTF-8 (a character split between tokens) decode to U+FFFD.
+- Both calls return the full count (tokens, or bytes of text) also when the array is too small,
+  writing what fits: call again with room for all. Input that is not UTF-8 is an error.
+- On the tokenizers of GPT-2, LLaMA 3.2, Qwen2.5, SmolLM2, TinyLlama, Mistral 7B (v0.1 and v0.3) and
+  Phi-3, the ids and decoded texts equal those of `tokenizers` 0.23 on texts of every script, emoji,
+  combining marks, whitespace runs, digits and special tokens. On an i7-12650H 0.9 MB of prose and
+  code encode in 0.055 s with GPT-2's tokenizer (0.30 s in `tokenizers` 0.23), 0.030 s with LLaMA
+  3's (0.25 s), 0.075 s with Qwen2.5's (0.27 s) and 0.067 s with TinyLlama's (0.31 s), medians of
+  seven runs on one thread.
+
+### Pretrained language models
+
+`spingalett_load_pretrained()` makes a network of a Hugging Face model directory: `config.json` and
+the weights in `model.safetensors`, or in the shards `model.safetensors.index.json` lists. The model
+types are `llama`, `mistral`, `qwen2` and `gpt2`; the network takes a window of `.context` token ids
+and gives every position's logits, so it generates, trains further (fine-tuning), saves and deploys
+like any other:
+
+```c
+NeuralNetwork *net = spingalett_load_pretrained(.path = "models/SmolLM2-135M", .context = 512);
+SpingalettTokenizer *tok = spingalett_tokenizer_load("models/SmolLM2-135M");
+uint32_t prompt[512], tokens[64];
+int64_t n = spingalett_tokenize(.tokenizer = tok, .text = "The history of computing", .tokens = prompt, .capacity = 512);
+uint32_t made = spingalett_generate(.net = net, .prompt = prompt, .prompt_length = (uint32_t)n, .tokens = tokens,
+                                    .count = 64, .temperature = 0.7f, .top_p = 0.9f,
+                                    .stop_tokens = &(uint32_t){spingalett_tokenizer_info(tok).eos}, .stop_count = 1);
+```
+
+- LLaMA, Mistral and Qwen2 become RMS normalizations, grouped-query attention with rotary
+  embeddings (the queries', keys' and values' projections in one linear layer, with Qwen2's biases;
+  a `head_dim` of its own), and SwiGLU as a SiLU layer times a linear one; GPT-2 layer
+  normalizations, learned positions, its GELU (`gelu_new`: the tanh form) and its Conv1D weights,
+  transposed. Without `lm_head.weight` (tied embeddings) the head is tied to the embedding (`.tied`:
+  one table, trained by both layers). These are the networks of the Python bindings' `llama_from_state_dict()` and `gpt2_from_state_dict()`,
+  which give the same logits bit for bit.
+- Weights in F32, F16 or BF16 are decoded straight from the mapped files into the network, whose
+  arrays are reserved at their final sizes first, so a model is never copied: SmolLM2-135M (BF16)
+  loads in 0.17 s on an i7-12650H.
+- `Examples/Pretrained.c` continues a prompt with any of these models, printing each token as it
+  comes: `Bin/Pretrained models/SmolLM2-135M "The three primary colors are" 64`.
+- `.context` 0 takes the model's positions (GPT-2's all, LLaMA's up to 2048). Mistral's sliding
+  window is the attention layers' `window`. Scaled rotary embeddings (LLaMA 3.1's
+  `llama3`, YaRN) are refused, as is anything else the layers do not compute, with an error that
+  names it.
+- On SmolLM2-135M the logits are those of `transformers` within 2.4e-4 (of logits up to 42), on
+  Qwen2.5-0.5B-Instruct within 4e-4 (of 24), and the greedy continuations are the same; on Hugging
+  Face's tiny random LLaMA and GPT-2 within 2e-7. The
+  `pretrained` test group checks tiny LLaMA (BF16, sharded), Qwen2 (F16, biases, tied), Mistral
+  and GPT-2 checkpoints (`Tests/make_pretrained_tests.py`) against PyTorch, within 2e-6.
+
+GGUF files, llama.cpp's, load the same way: `.path` names the file, `spingalett_tokenizer_load()` reads
+its vocabulary, and the network is that of its `general.architecture` (`llama`, which covers Mistral,
+`qwen2` or `gpt2`) with the hyper-parameters of its metadata:
+
+```c
+NeuralNetwork *net = spingalett_load_pretrained(.path = "SmolLM2-135M.Q4_K_M.gguf", .context = 512);
+SpingalettTokenizer *tok = spingalett_tokenizer_load("SmolLM2-135M.Q4_K_M.gguf");
+```
+
+- Quantized weights become floats as llama.cpp's `dequantize_row_*()` computes them: F32, F16, BF16,
+  Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, the k-quants Q2_K to Q6_K, and IQ4_NL and IQ4_XS, which quantized
+  files of widths that are no multiple of 256 hold where k-quants cannot be. The network keeps
+  floats (quantize it again with `spingalett_model_from_network()` to deploy it). The other i-quants
+  are refused, naming the tensor and its type. On quantized files of SmolLM2-135M, TinyStories and
+  Qwen2.5-0.5B (tensors of Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q3_K, Q4_K, Q5_K, Q6_K and IQ4_NL), and on
+  random blocks of every type above, the weights are those of the `gguf` Python package's
+  dequantization, bit for bit (the dequantization is compiled in IEEE order, so they are the same on
+  every platform); a Q4_K_M file of SmolLM2-135M loads in 0.18 s on an i7-12650H.
+- llama.cpp's converter stores LLaMA's queries and keys with the rows of each head's two halves
+  interleaved, for its rotation of adjacent pairs; they are put back in Hugging Face's order, which
+  the library's rotation of halves expects (Qwen2's are stored in that order already).
+- A vocabulary of the `gpt2` model is a byte-level BPE of its merges, cut by the pre-tokenizer
+  `tokenizer.ggml.pre` names (`llama-bpe`, `qwen2`, `smollm`, `gpt-2`, ...); one of the `llama` model
+  is SentencePiece's BPE of its scores, with byte fallback and the space before each text and after
+  each special token, as llama.cpp and the `sentencepiece` library encode it. Control tokens are
+  special, user-defined tokens are found in any text, and `tokenizer.ggml.add_bos_token` gives the
+  BOS of `.add_special`. The GGUF vocabularies of SmolLM2, Qwen2.5 and TinyStories give the ids of
+  the `tokenizer.json` files they were converted from (TinyStories' finds its special tokens in the
+  normalized text, which llama.cpp does not: with `.special` those differ).
 
 ### Importing models: ONNX and PyTorch
 
@@ -554,6 +752,37 @@ in an external file next to the model (`torch.onnx.export` of models over 2 GB) 
 model's folder when importing from its path. Files are mapped rather than read, and each tensor goes
 into its layer in one pass: on an i7-12650H a 100 MB ResNet-50 imports in 0.09 s and a 500 MB model
 in 0.17 s.
+
+Transformers import into the library's own layers (models exported with an example of one sample, or
+with a dynamic batch). An input of token ids (`[N, T]`, integers) becomes an input layer of `T`
+values and `Gather` from a constant table an embedding, a learned position table added to it
+(GPT-2's) its positions; an input `[N, T, C]` becomes a layer of `1 x T` cells. `MatMul` and `Gemm`
+by constant weights on the tokens become linear layers; layer normalization and RMS normalization
+over each token (`LayerNormalization`, `RMSNormalization`, or written out with `ReduceMean`, `Pow`,
+`Sqrt` and `Div`) become theirs; element-wise expressions are recognised as the activations they
+compute (GELU as `Gelu` or written out in its erf or tanh form, SiLU as `x * Sigmoid(x)`), and
+products of two layers (`Mul`, SwiGLU's gate) become multiplication layers. Attention as exporters
+write it out becomes one attention layer: queries, keys and values from one product or three, split
+into heads by `Reshape`, `Transpose`, `Split` or `Slice`, the product of queries and keys scaled (on
+either side or both, as `scaled_dot_product_attention` exports it), masked causally (`Where`, or an
+added triangle of `-inf`), a `Softmax` over the keys, the product with the values, keys and values
+repeated for grouped queries (`Expand`, `Tile`), and rotary embeddings (`rotate_half` with tables of
+cosines and sines, whose base the importer reads from the tables). The queries', keys' and values'
+products become the one linear layer the attention layer reads, a scale other than
+`1/sqrt(head size)` folded into the queries' weights. Opset 23's `Attention` imports the same way,
+and so do the fused operators of ONNX Runtime's transformer optimizer (`com.microsoft`'s
+`Attention`, `MultiHeadAttention`, `SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`,
+`FastGelu`, `BiasGelu`). Nodes whose inputs are all constants are computed on import, the shape
+arithmetic both exporters leave in graphs among them. GPT-2-, LLaMA- (grouped queries, rotary
+embeddings, SwiGLU), Gemma- and BERT-like models and `nn.TransformerEncoderLayer`, exported by
+either exporter at opsets 14 to 23, import into the layers the library builds such models of (a
+GPT-2 block is 9 layers) and agree with PyTorch to the rounding of single precision (within 3e-6 on
+the tests' models); a language model takes the sparse cross-entropy loss, so it trains further and
+generates as it is, and a model of GPT-2 small's size (124M parameters, 650 MB) imports in 0.57 s.
+What no layer computes is named in the error: a softmax over each token's channels (the library's
+softmax spans a layer's outputs), a product of two computed tensors outside an attention, masks or
+caches given as inputs, rotary embeddings over part of a head or of interleaved pairs, attention
+between two sequences.
 
 PyTorch weights load into a network built with the same layers:
 `spingalett_load_pytorch(net, "model.pt", NULL, 0)` reads a state dict saved with `torch.save`
@@ -607,6 +836,7 @@ below.
 | `epochs` | required | Number of passes over the data |
 | `training_strategy` | `SPINGALETT_STRATEGY_SAMPLE` | `SPINGALETT_STRATEGY_SAMPLE` (one step per sample), `SPINGALETT_STRATEGY_FULL_BATCH`, `SPINGALETT_STRATEGY_SMALL_BATCH` |
 | `batch_size` | 32 | Mini-batch size |
+| `accumulation_steps` | 0 (off) | Gradient accumulation: an optimizer step after every this many mini-batches, with the mean gradient of their samples (see below) |
 | `do_not_shuffle` | false | Per-sample and mini-batch training reshuffle the samples every epoch unless set |
 | `optimizer_type` | `SPINGALETT_OPTIMIZER_SGD` | `SGD`, `MOMENTUM`, `RMSPROP`, `ADAM`, `ADAMW` |
 | `learning_rate` | 0.01 | Base learning rate |
@@ -615,6 +845,8 @@ below.
 | `weight_decay` | 0 | L2 penalty; decoupled (`w *= 1 - lr * wd`) for AdamW. Biases are not decayed |
 | `max_grad_norm` | 0 (off) | Clip the global L2 norm of every step's gradient |
 | `lr_scheduler`, `lr_scheduler_data` | none | Learning-rate schedule, see below |
+| `lr_per_step` | false | Evaluate the schedule before every optimizer step instead of every epoch |
+| `recompute` | false | Activation recomputation on the CPU: less memory for about one more forward pass, the same results (see below) |
 | `reset_optimizer` | false | Clear moment estimates and the step counter before training |
 | `nan_check_interval` | 0 (off) | Stop when weights become NaN/Inf, checked every N epochs |
 | `report_interval` | 0 (off) | Log the training loss every N epochs |
@@ -631,6 +863,27 @@ below.
 The reported loss is averaged over the samples of an epoch: the sum of squared errors per sample
 for MSE, and categorical (softmax) or binary (sigmoid) cross-entropy otherwise. Cross-entropy
 requires a softmax or sigmoid output layer; `spingalett_train()` rejects other combinations.
+
+Gradient accumulation (`.accumulation_steps = 4` with `.batch_size = 8`) trains on steps of four
+mini-batches with the memory of one: the step's samples run in chunks of a mini-batch, and its
+gradient is their mean. That is the gradient of one batch of 32 samples computed in chunks of 8, bit
+for bit (`spingalett_train()` computes batches larger than its workspace holds that way: a full
+batch of 5,000 samples in chunks of 2,048 gives the bits of 3 x 2,048 accumulated); against a batch
+of 32 computed in one chunk, only the order of the sums differs, and batch normalization takes its
+statistics over each mini-batch. Dropout masks and augmentation are drawn by a sample's position in
+its step, as for the larger batch. With a generator, a step is `accumulation_steps` calls of it;
+full-batch training ignores the option, its step being the whole set. On the GPU the step's
+mini-batches are its chunks in the same way.
+
+Activation recomputation (checkpointing, `.recompute = true`) trades a forward pass for memory: the
+workspace keeps through the backward pass the outputs of the layers several layers read (a transformer's
+residual stream, one a block), of batch normalizations and of the output layer, and the other layers'
+outputs, gradients and values before their activations for one segment between two kept layers at a time
+(a block), computing a segment's outputs again just before its backward pass. The weights come out bit for
+bit as without it. A GPT-like network of six blocks of 256 channels over 256 tokens trains in chunks of 16
+samples with a peak of 141 MB instead of 216 MB (the parameters and AdamW's moments are 80 MB of either),
+taking 18.2 s instead of 14.2 s on one thread and 7.8 s instead of 5.6 s on eight (i7-12650H). It applies
+to mini-batch and full-batch training on the CPU; the GPU keeps every layer.
 
 Optimizer state (moment estimates and the step counter used for Adam's bias correction) is stored
 in the network, so training can be resumed by calling `spingalett_train()` again or after loading a
@@ -678,8 +931,12 @@ typedef float (*LRSchedulerFn)(size_t epoch, size_t total_epochs, float initial_
 ```
 
 The scheduler runs before every epoch; `epoch` counts the epochs already completed (0 for the
-first). Four schedules are built in and take an optional `SpingalettLRScheduleParams` as
-`user_data`:
+first). With `.lr_per_step = true` it runs before every optimizer step instead, `epoch` counting the
+steps taken in the call and `total_epochs` the steps of the call (epochs times steps an epoch; with a
+generator and no `sample_count`, 0 during the first epoch, then that epoch's steps times the epochs),
+as language models are trained: a warm-up of a few thousand steps, then a decay. Six schedules are
+built in and take an optional `SpingalettLRScheduleParams` as `user_data` (its `warmup_epochs` and
+`step_size` counting steps with `lr_per_step`):
 
 ```c
 LRScheduleParams schedule = {.warmup_epochs = 10, .min_lr = 1e-5f};
@@ -693,6 +950,8 @@ train(.net = net, /* ... */ .learning_rate = 1e-3f,
 | `spingalett_lr_linear_warmup` | `warmup_epochs` (default 5% of the run) |
 | `spingalett_lr_step_decay` | `step_size` (default a third of the run), `gamma` (default 0.1) |
 | `spingalett_lr_warmup_cosine` | `warmup_epochs`, `min_lr` |
+| `spingalett_lr_linear_decay` | `min_lr` |
+| `spingalett_lr_warmup_linear` | `warmup_epochs`, `min_lr` |
 
 Reduce on plateau works with or without a schedule: with `.lr_plateau_patience = 5` and
 `.lr_plateau_factor = 0.5f`, five epochs without improvement of the monitored value (`monitor`:
@@ -1110,7 +1369,8 @@ spingalett_model_free(model);
 ```
 
 INT8, INT4 and INT2 layers run in integer arithmetic: each layer quantizes its input to 8 bits per
-sample (the largest magnitude maps to 127), multiplies it with the weights in 32-bit integers
+sample (the largest magnitude maps to 127; per token for the linear layers of language models, whose
+tokens then do not depend on each other), multiplies it with the weights in 32-bit integers
 (AVX2 with VNNI where available, SSE2, NEON with the dot-product extension where available, the Arm
 DSP extension, or portable C) and rescales each output by its weight row's scale. With AVX2 and
 NEON, INT4 and INT2 codes are decoded in registers, so they run about as fast as INT8 from a half or
@@ -1140,7 +1400,33 @@ size of INT2 layers. A model stays safe to use from several threads at once. Mod
 `spingalett_model_init()` over an image of your own prepare on every call. Float layers on one
 sample or a few compute through dot products rather than the batched kernels, so their outputs can
 differ in the last bits from those of the same samples in a larger batch; integer layers compute
-exactly what `spingalett_model_run()` computes, in batches of any size.
+exactly what `spingalett_model_run()` computes, in batches of any size. A model of a language model
+also runs in sessions, a token at a time with a key-value cache (see
+[Transformers and language models](#transformers-and-language-models)): the first session packs the
+float linear layers' filters once more for its kernels of few rows (the float size of those layers
+again), which the model keeps for every session.
+
+In the full library's GPU modes (`SPINGALETT_COMPUTE_CUDA`, `SPINGALETT_COMPUTE_VULKAN`) a model that owns
+its image predicts on the GPU, which the first call prepares and later calls reuse. A model of float
+weights runs as a network there, its outputs the CPU's to rounding. An integer model (INT8, INT4, INT2)
+runs as the CPU computes it, its outputs those of `spingalett_model_run()` bit for bit: each layer's
+inputs are quantized on the GPU as the CPU quantizes them (the divisions rounded as IEEE's, the values
+to the nearest even integer), its codes multiply them on the matrix kernels as floats or bfloat16, which
+hold such integers exactly, in sums of at most 1,040 products of INT8 codes (16,512 of INT4), which stay
+below 2^24 where floats are exact integers (longer sums run in slices added as integers), and the outputs
+are rescaled in the CPU's order of operations; pooling, additions, products and concatenations of
+layers, batch normalization and upsampling follow the CPU's order too. The activations inside the
+network must be none, ReLU or leaky ReLU (the last layer's, softmax or sigmoid among them, runs on the
+CPU); a model with others, layer normalization or attention keeps the CPU. On an RTX 4050 Laptop GPU,
+against all 16 threads of the Intel Core i7-12650H next to it (samples per second, INT8, medians):
+
+| Model (`Examples/Benchmark.c`) | CPU | CUDA | Vulkan |
+|---|---:|---:|---:|
+| 784-512-1000-10 MLP, 20,000 samples | 658,000 | 2,490,000 | 2,010,000 |
+| CNN of MNIST, 10,000 samples | 86,400 | 567,000 | 367,000 |
+| ResNet-20, 4,096 images of 32 x 32 | 10,300 | 69,900 | 56,900 |
+| MobileNet-style network, 4,096 images | 15,400 | 89,400 | 76,400 |
+| U-Net, 1,024 images of 64 x 64 | 3,130 | 15,200 | 14,100 |
 
 Accuracy on the 10,000 test images of MNIST (`ModelTool eval`) and CIFAR-10
 (`spingalett_model_evaluate()`):
@@ -1175,7 +1461,8 @@ Sapphire Rapids), one sample at a time and batched:
 Programs that only run trained models can link the runtime instead of the library.
 `libspingalett-runtime`, declared by `Spingalett.Runtime.h`, holds what this section describes:
 `.slett` files loaded as models, `spingalett_model_predict()` and `spingalett_model_evaluate()` with
-the library's kernels, threads and choice of instruction sets at run time, the engine of
+the library's kernels, threads and choice of instruction sets at run time, sessions of language models
+(`spingalett_session_feed()`, generation with a key-value cache), the engine of
 `Spingalett.Inference.h`, errors, logging and the thread settings. It has no networks, training,
 data sets, importers or GPU backend, which leaves 510 KB of the full library's 2.0 MB without the
 CUDA backend's kernels and 12.6 MB with them (the x86-64 release builds, with the kernels for AVX2 and
@@ -1219,6 +1506,7 @@ them with `SPINGALETT_ERR_FORMAT_VERSION`, and `ModelTool convert` rewrites them
 | Header | `Spingalett.h` | `Spingalett.Runtime.h` | `Spingalett.Inference.h` |
 | Training, networks, data sets, importers, the GPU | yes | | |
 | `.slett` models from FP32 to INT2 | yes | yes | yes |
+| Sessions of language models (key-value cache) | yes | yes | |
 | Batches, threads, kernels chosen at run time | yes | yes | one sample at a time |
 | Heap, files | yes | yes | |
 | Size | 12.6 MB (x86-64; 2.0 MB without CUDA) | 510 KB (x86-64) | about 12 KB of code on a Cortex-M4 |
@@ -1257,6 +1545,26 @@ with convolutions and pooling. CMake builds it alone with `-DSPINGALETT_INFERENC
 [Examples/Embedded](Examples/Embedded) runs the MNIST models on a Cortex-M4F in QEMU with the
 weights in flash: the 784-256-128-10 network with 2.8 KB of RAM, the CNN (INT8, 424 KB of flash)
 with 208 KB.
+
+### WebAssembly: Node and browsers
+
+[`Bindings/JavaScript`](Bindings/JavaScript/README.md) builds the engine for WebAssembly with Clang and
+`wasm-ld`, without a C library (`sh Bindings/JavaScript/build.sh`; the mathematical functions it calls
+round as glibc's do), and wraps it in an npm package `spingalett`: an ES module with TypeScript
+declarations for Node 18 and later and for browsers, around a 62 KB module that imports nothing. A
+model, of any kind and precision the engine runs, is loaded from its bytes and runs sample by sample
+with the native engine's results (integer models bit for bit); language models give the next token's
+logits and generate as `spingalett_generate()` does:
+
+```js
+import { loadModel } from 'spingalett';
+
+const model = await loadModel(await (await fetch('chargpt.slett')).arrayBuffer());
+console.log(model.layers.map((l) => `${l.type} ${l.precision}`));
+const tokens = model.generate([...new TextEncoder().encode('ROMEO:')], 200, { temperature: 0.8, topK: 40 });
+```
+
+Each release attaches the package (`spingalett-<version>.tgz`, for `npm install`) and the module.
 
 ### ModelTool
 
@@ -1306,6 +1614,10 @@ resnet = sg.Network.from_torch(torch_module, torch.rand(1, 3, 32, 32))   # throu
 gpt = sg.gpt2_from_state_dict(GPT2LMHeadModel.from_pretrained("gpt2").state_dict(), heads=12, context=256)
 gpt.train_from_tokens("train.bin", epochs=1, batch_size=8, optimizer=sg.Optimizer.ADAMW, learning_rate=3e-4)
 print(gpt.generate([15496, 11, 314], 50, temperature=0.8, top_k=40))
+
+lm = sg.Network.from_pretrained("SmolLM2-135M.Q4_K_M.gguf", context=512)    # or a Hugging Face directory
+tok = sg.Tokenizer("SmolLM2-135M.Q4_K_M.gguf")
+print(tok.decode(lm.generate(tok.encode("The three primary colors are"), 24)))
 ```
 
 See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
@@ -1349,16 +1661,20 @@ sg::Result<sg::Model> int8 = net->to_model(sg::Precision::Int8);
 one, for residual blocks and branches; `add_layers()` and `concat_layers()` take their inputs
 directly. `linear()`, `embedding()`, `attention()`, `rms_norm()` and `multiply_layers()` build
 transformers; `Network::train_tokens()` trains on a token file and `generate()` continues a prompt
-(`sg::Sampling`). `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()`
+(`sg::Sampling`). `Network::from_pretrained(path, context)` loads a Hugging Face model directory or a
+GGUF file, and `sg::Tokenizer::load(path)` its tokenizer (`encode()`, `decode()`, `token()`, `id()`,
+`info()`). `TrainOptions::raw` carries every other field of `SpingalettTrainArgs`, and `raw()`
 gives the C object of a wrapper for whatever the wrapper does not cover.
 
 ## Bindings for other languages
 
-`Bindings/` holds bindings for Rust, .NET, Go and Java over the shared library: networks of every
+`Bindings/` holds bindings for Rust, .NET, Go, Java and PHP over the shared library: networks of every
 kind of layer built in each language's style, training on arrays or token files, prediction,
-evaluation, generation, parameters, files and deployment models. Each one's tests train XOR and a
-small LLaMA-like model whose generation they check, and compare every structure the binding lays out
-with the C compiler's layout (CI runs them against the installed library):
+evaluation, generation, parameters, files and deployment models, pretrained language models (Hugging
+Face directories, GGUF files) and their tokenizers. Each one's tests train XOR and a small LLaMA-like
+model whose generation they check, check the tokenizers and pretrained models against the C tests'
+expectations, and compare every structure the binding lays out with the C compiler's layout (CI runs
+them against the installed library):
 
 | Language | Directory | Interface | Builds with |
 |---|---|---|---|
@@ -1366,6 +1682,7 @@ with the C compiler's layout (CI runs them against the installed library):
 | C# (.NET 8+) | [`Bindings/CSharp`](Bindings/CSharp/README.md) | package `Spingalett` (`LibraryImport`) | dotnet |
 | Go | [`Bindings/Go`](Bindings/Go/README.md) | module `github.com/pka-human/Spingalett/Bindings/Go` (cgo) | go; pkg-config |
 | Java (22+) | [`Bindings/Java`](Bindings/Java/README.md) | `io.github.pkahuman.spingalett` (the foreign function and memory API) | Maven |
+| PHP (8.0+) | [`Bindings/PHP`](Bindings/PHP/README.md) | package `pka-human/spingalett` (the FFI extension; `spingalett.h`, the C declarations) | Composer; `SPINGALETT_LIB_DIR` |
 
 ```rust
 let mut lm = Network::new(Loss::SparseCrossEntropy)?;
@@ -1380,6 +1697,9 @@ lm.add(Layer::linear(256))?;
 lm.train_tokens("train.bin", 64, &TrainOptions { epochs: 5, ..Default::default() })?;
 let text = lm.generate(&[72, 101], 100, &Sampling { temperature: 0.8, top_k: 40, ..Default::default() })?;
 ```
+
+JavaScript runs the inference engine itself, compiled to WebAssembly: see
+[WebAssembly: Node and browsers](#webassembly-node-and-browsers).
 
 ## DigitPad demo
 
@@ -1414,15 +1734,16 @@ position of half of them, in tokens per second. `Examples/benchmark_pytorch.py` 
 workloads in PyTorch. Run them with `Bin/Benchmark [threads]` and `python
 Examples/benchmark_pytorch.py [threads]`.
 
-Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 efficiency cores, AVX2
-and AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16
-and uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel
-MKL and oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13
-to 19% faster and runs them 15 to 27% faster, and leaves the fully connected network as it was;
-0.11 to 0.13 leave all of them as they were on the CPU (within 4% of the release before, either
-way, in interleaved runs), and 1.2 leaves them as 1.1 did (within 3% either way, in interleaved
-runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style network, new in 0.14, with
-0.14, the GPT, new in 1.2, with 1.2 (the means of two runs):
+Samples per second on a laptop (Intel Core i7-12650H: 6 performance and 4 efficiency cores, AVX2 and
+AVX-VNNI, no AVX-512), medians of three interleaved runs. Spingalett 0.10 is built with GCC 16 and
+uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build from PyPI (Intel MKL and
+oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13 to 19%
+faster and runs them 15 to 27% faster, and leaves the fully connected network as it was; 0.11 to 0.13
+leave all of them as they were on the CPU (within 4% of the release before, either way, in
+interleaved runs), and 1.2 and 1.3 leave them as the release before did (within 3% either way, in
+interleaved runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style network, new in
+0.14, with 0.14, the GPT, whose training 1.3 made 1.4 times as fast on one thread and 3.2 times on
+eight, with 1.3:
 
 | Fully connected network | Threads | Full batch | Mini-batch 64 | Inference |
 |---|---:|---:|---:|---:|
@@ -1466,24 +1787,22 @@ runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style networ
 
 | GPT, tokens/s | Threads | Training | Inference |
 |---|---:|---:|---:|
-| Spingalett | 1 | 1,120 | 3,595 |
-| PyTorch | 1 | 1,435 | 568 |
-| Spingalett (OpenMP) | 8 | 2,088 | 9,226 |
-| PyTorch | 8 | 4,284 | 1,690 |
+| Spingalett | 1 | 1,616 | 3,893 |
+| PyTorch | 1 | 1,534 | 591 |
+| Spingalett (OpenMP) | 8 | 7,065 | 19,043 |
+| PyTorch | 8 | 4,314 | 1,679 |
 
 Spingalett trains the convolutional network 1.4 to 2.3 times as fast as PyTorch and runs it 2.6 to
 3.9 times as fast; with batch normalization 1.5 to 2.4 times and 3.4 to 5.5 times, since the
 normalization runs in the convolution's epilogue at inference. ResNet-20 trains 1.1 to 1.8 times as
 fast and runs 1.5 to 2.8 times as fast, the U-Net 1.1 to 1.6 times and 1.7 to 3.3 times, the
-MobileNet-style network 1.35 to 2 times and 2.3 to 4.2 times. The GPT infers 5.5 to 6.3 times as
-fast as in PyTorch, and trains at 0.78 times PyTorch's speed on one thread and 0.49 times on eight,
-which [ROADMAP.md](ROADMAP.md) plans to improve. For the
-fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast, full batches 1.1 to
-1.6 times and infers 1.1 to 1.7 times as fast. The indirect convolution kernels of 0.10 account for the gains over 0.9: built without them
-(`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20 trains at 234 and 986 samples per second and infers at 958
-and 4,798.
+MobileNet-style network 1.35 to 2 times and 2.3 to 4.2 times, the GPT 1.05 to 1.64 times and 6.6 to
+11.3 times. For the fully connected network Spingalett trains mini-batches 1.9 to 2 times as fast,
+full batches 1.1 to 1.6 times and infers 1.1 to 1.7 times as fast. The indirect convolution kernels
+of 0.10 account for the gains over 0.9: built without them (`-DSPINGALETT_NO_DIRECT_CONV`), ResNet-20
+trains at 234 and 986 samples per second and infers at 958 and 4,798.
 
-On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 1.2 runs
+On the laptop's GPU (NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB, driver 610.43), Spingalett 1.3 runs
 the same workloads with `SPINGALETT_COMPUTE_CUDA` and `SPINGALETT_COMPUTE_VULKAN` (`Bin/Benchmark
 gpu`), in single precision and in bfloat16 (`spingalett_set_gpu_precision()`), against PyTorch 2.14.1
 with CUDA 13.0, cuBLAS and cuDNN 9.24, as it runs by default (`python Examples/benchmark_pytorch.py
@@ -1492,67 +1811,70 @@ bfloat16) and at its fastest (`--max`: `torch.compile` with `max-autotune` and C
 `cudnn.benchmark`, channels-last tensors, fused optimizers). The figures are medians of three rounds.
 The laptop's GPU slows down by up to 12% as it warms, so each block of runs (Spingalett on CUDA,
 PyTorch by default, PyTorch at its fastest, Spingalett on Vulkan) starts with the GPU at 60 °C, and
-the blocks' order changes from round to round. The first four columns keep the data in GPU memory
-from the start: Spingalett's data sets (`spingalett_device_data_new()`), PyTorch's tensors. The last
-two take it from host memory: Spingalett's arrays, each chunk copied over while the GPU works on the
-ones before, and PyTorch's pinned tensors, each batch copied as it is used and the outputs of
-inference copied back (`--host-data`). Inference is timed after a first call (Spingalett) or a
-warm-up step (PyTorch):
+the blocks' order changes from round to round. The GPT, which comes last in a block, is measured on
+its own (`Bin/Benchmark gpu cuda bf16 gpt`, `benchmark_pytorch.py --cuda-bf16 --max --gpt`), each run
+from the GPU at 60 °C: a precision of a backend a run, PyTorch a configuration a run. The fully
+connected network's mini-batches vary by up to 8% from run to run, in 1.2 as in 1.3. The first four
+columns keep the data in GPU memory from the start: Spingalett's data sets
+(`spingalett_device_data_new()`), PyTorch's tensors. The last two take it from host memory:
+Spingalett's arrays, each chunk copied over while the GPU works on the ones before, and PyTorch's
+pinned tensors, each batch copied as it is used and the outputs of inference copied back
+(`--host-data`). Inference is timed after a first call (Spingalett) or a warm-up step (PyTorch):
 
 | On the GPU, samples/s | CUDA, data on GPU (FP32 / bf16) | Vulkan, data on GPU (FP32 / bf16) | PyTorch, data on GPU (TF32 / FP32 / bf16) | PyTorch `--max`, data on GPU (TF32 / FP32 / bf16) | CUDA, host data (FP32 / bf16) | PyTorch, host data (TF32 / bf16) |
 |---|---:|---:|---:|---:|---:|---:|
-| ResNet-20, training | 11,740 / 22,680 | 10,680 / 18,360 | 8,521 / 7,573 / 12,270 | 9,779 / 8,744 / 20,700 | 11,770 / 22,700 | 8,401 / 12,040 |
-| ResNet-20, inference | 42,590 / 89,400 | 38,410 / 73,400 | 19,840 / 19,670 / 31,580 | 33,650 / 23,120 / 72,720 | 43,020 / 89,710 | 19,410 / 30,460 |
-| Convolutional network, training | 117,200 / 217,400 | 109,300 / 169,200 | 61,970 / 61,240 / 102,500 | 90,840 / 86,060 / 115,500 | 117,800 / 220,800 | 58,050 / 104,500 |
-| Convolutional network, inference | 390,300 / 982,800 | 345,600 / 507,600 | 132,900 / 144,100 / 237,800 | 214,400 / 179,900 / 423,500 | 386,500 / 974,700 | 128,000 / 226,300 |
-| With batch normalization, training | 80,760 / 153,300 | 76,050 / 121,900 | 48,330 / 48,780 / 83,100 | 66,650 / 63,720 / 103,600 | 80,970 / 154,200 | 47,960 / 82,560 |
-| With batch normalization, inference | 374,100 / 939,200 | 316,700 / 481,300 | 107,400 / 114,300 / 198,100 | 216,800 / 181,100 / 429,500 | 377,700 / 942,600 | 104,100 / 187,700 |
-| Fully connected network, mini-batch 64 | 371,000 / 529,900 | 322,800 / 444,200 | 82,480 / 80,670 / 70,960 | 109,800 / 113,900 / 123,500 | 375,700 / 551,600 | 75,080 / 53,900 |
-| Fully connected network, full batch | 1,339,000 / 3,263,000 | 1,273,000 / 2,897,000 | 1,055,000 / 1,057,000 / 2,542,000 | 1,019,000 / 1,005,000 / 2,386,000 | 1,215,000 / 3,016,000 | 845,600 / 1,574,000 |
-| Fully connected network, inference | 3,776,000 / 9,925,000 | 3,684,000 / 8,091,000 | 2,950,000 / 2,956,000 / 6,274,000 | 2,629,000 / 2,595,000 / 5,198,000 | 2,977,000 / 6,627,000 | 1,708,000 / 2,473,000 |
-| U-Net, training | 4,538 / 8,204 | 4,056 / 7,032 | 3,359 / 3,108 / 5,010 | 4,054 / 3,428 / 8,064 | 4,503 / 8,218 | 3,247 / 4,457 |
-| U-Net, inference | 15,320 / 31,880 | 14,850 / 25,650 | 6,464 / 6,694 / 11,950 | 11,220 / 7,796 / 26,770 | 15,280 / 31,460 | 5,961 / 11,060 |
-| MobileNet-style network, training | 15,140 / 33,600 | 14,700 / 31,760 | 9,917 / 8,701 / 22,830 | 9,160 / 8,255 / 21,750 | 14,910 / 33,400 | 9,784 / 22,230 |
-| MobileNet-style network, inference | 119,600 / 186,100 | 115,700 / 149,700 | 19,580 / 17,880 / 38,830 | 40,700 / 40,600 / 77,140 | 119,400 / 183,200 | 19,180 / 37,360 |
-| GPT, training (tokens/s) | 64,130 / 167,200 | 34,310 / 52,180 | 63,500 / 60,220 / 156,500 | 63,200 / 58,400 / 182,900 | 66,780 / 169,200 | 57,980 / 152,800 |
-| GPT, inference (tokens/s) | 209,100 / 535,100 | 129,100 / 209,000 | 204,100 / 196,000 / 507,700 | 192,100 / 181,900 / 610,600 | 218,500 / 547,600 | 177,900 / 471,400 |
+| ResNet-20, training | 11,840 / 22,640 | 10,830 / 18,690 | 8,528 / 7,713 / 12,320 | 9,808 / 8,917 / 20,410 | 11,790 / 22,620 | 8,457 / 12,160 |
+| ResNet-20, inference | 43,330 / 89,300 | 40,200 / 75,680 | 19,860 / 19,790 / 31,630 | 33,820 / 23,250 / 73,570 | 43,030 / 89,160 | 19,470 / 30,690 |
+| Convolutional network, training | 117,400 / 219,400 | 110,000 / 169,600 | 62,050 / 61,210 / 102,500 | 92,160 / 88,530 / 117,000 | 117,900 / 222,000 | 57,390 / 99,220 |
+| Convolutional network, inference | 389,500 / 995,400 | 345,300 / 506,900 | 132,700 / 144,200 / 238,200 | 214,600 / 180,000 / 427,400 | 385,900 / 982,500 | 128,300 / 223,900 |
+| With batch normalization, training | 80,970 / 153,600 | 75,880 / 122,400 | 48,480 / 48,860 / 83,470 | 66,210 / 63,840 / 107,400 | 80,720 / 154,700 | 48,160 / 57,900 |
+| With batch normalization, inference | 376,100 / 938,000 | 318,400 / 478,700 | 107,400 / 114,400 / 198,200 | 214,000 / 180,100 / 427,100 | 379,500 / 947,800 | 104,300 / 188,000 |
+| Fully connected network, mini-batch 64 | 349,700 / 531,800 | 322,500 / 443,400 | 88,040 / 79,800 / 70,040 | 87,730 / 113,400 / 129,400 | 383,000 / 557,800 | 91,530 / 73,800 |
+| Fully connected network, full batch | 1,313,000 / 3,270,000 | 1,285,000 / 2,903,000 | 1,049,000 / 1,055,000 / 2,546,000 | 1,016,000 / 1,021,000 / 2,393,000 | 1,228,000 / 3,023,000 | 844,600 / 1,573,000 |
+| Fully connected network, inference | 3,806,000 / 10,174,000 | 3,621,000 / 8,085,000 | 2,958,000 / 2,958,000 / 6,281,000 | 2,616,000 / 2,626,000 / 5,243,000 | 2,990,000 / 6,472,000 | 1,709,000 / 2,465,000 |
+| U-Net, training | 4,546 / 8,230 | 4,193 / 7,092 | 3,339 / 3,113 / 5,014 | 4,092 / 3,599 / 8,028 | 4,492 / 8,254 | 3,257 / 4,586 |
+| U-Net, inference | 15,340 / 31,820 | 15,220 / 25,760 | 6,467 / 6,711 / 12,000 | 11,200 / 7,813 / 26,780 | 15,310 / 31,620 | 6,113 / 11,070 |
+| MobileNet-style network, training | 15,170 / 33,430 | 14,700 / 31,850 | 9,895 / 8,692 / 22,910 | 9,116 / 8,232 / 21,980 | 14,960 / 33,350 | 9,773 / 22,280 |
+| MobileNet-style network, inference | 120,000 / 183,800 | 116,700 / 163,500 | 19,590 / 17,900 / 38,920 | 40,700 / 40,740 / 78,000 | 118,800 / 182,200 | 19,210 / 37,430 |
+| GPT, training (tokens/s) | 69,230 / 197,600 | 68,330 / 181,300 | 64,030 / 64,090 / 156,800 | 66,460 / 66,410 / 193,000 | 73,560 / 198,700 | 64,060 / 156,800 |
+| GPT, inference (tokens/s) | 224,200 / 684,800 | 217,600 / 583,100 | 208,100 / 208,400 / 517,800 | 207,400 / 207,200 / 655,000 | 231,800 / 687,300 | 203,200 / 497,400 |
 
-On CUDA Spingalett is ahead of PyTorch at its fastest in every workload but the GPT in bfloat16.
-With the data in GPU memory, in single precision, against the fastest of PyTorch's runs in single
-precision or with TF32 convolutions, it trains ResNet-20 1.2 times as fast and runs it 1.27 times as
-fast, the convolutional networks 1.2 to 1.3 and 1.7 to 1.8 times, the U-Net 1.12 and 1.37 times, the
-MobileNet-style network 1.5 and 2.9 times, and the fully connected network 1.27 times as fast in
-full batches and 3.3 times in mini-batches, and infers 1.28 times as fast; the GPT trains 1.01 times
-as fast and infers 1.02 times as fast. In bfloat16, against PyTorch's fastest run in bfloat16:
-ResNet-20 1.1 and 1.23 times, the convolutional networks 1.5 to 1.9 and 2.2 to 2.3 times, the U-Net
-1.02 and 1.19 times, the MobileNet-style network 1.47 and 2.4 times, the fully connected network
-1.28 times in full batches, 4.3 times in mini-batches and 1.6 times in inference. The GPT in
-bfloat16 trains at 0.91 times and infers at 0.88 times the speed of PyTorch compiled, and 1.06 times
-as fast as PyTorch by default, both: the products of its forward pass and data gradients run at 15
-to 17 TFLOPS on the matrix units where cuBLAS reaches 22 to 23, which 1.3 plans to close
-([ROADMAP.md](ROADMAP.md)). Against PyTorch by default the margins are wider: in single precision
-ResNet-20 trains 1.38 times as fast as PyTorch with TF32 (1.55 times as fast as in single precision)
-and infers 2.15 times as fast, and the MobileNet-style network infers 6.1 times as fast; in bfloat16
-ResNet-20 trains 1.85 times as fast and infers 2.8 times as fast, and the fully connected network
-trains mini-batches 7.5 times as fast. From host arrays the margins are as wide or wider (PyTorch
-copies each batch as it uses it; Spingalett copies a chunk while the GPU works on the ones before):
-the fully connected network, whose inference the bus binds, infers 1.74 times as fast in single
-precision and 2.7 times in bfloat16.
+On CUDA Spingalett is ahead of PyTorch at its fastest in every workload. With the data in GPU memory,
+in single precision, against the fastest of PyTorch's runs in single precision or with TF32
+convolutions, it trains ResNet-20 1.21 times as fast and runs it 1.28 times as fast, the
+convolutional networks 1.2 to 1.3 and 1.8 times, the U-Net 1.11 and 1.37 times, the MobileNet-style
+network 1.5 and 2.9 times, the GPT 1.04 and 1.08 times, and the fully connected network 1.24 times as
+fast in full batches and 3.1 times in mini-batches, and infers 1.29 times as fast. In bfloat16,
+against PyTorch's fastest run in bfloat16: ResNet-20 1.11 and 1.21 times, the convolutional networks
+1.4 to 1.9 and 2.2 to 2.3 times, the U-Net 1.03 and 1.19 times, the MobileNet-style network 1.46 and
+2.4 times, the GPT 1.02 and 1.05 times (where 1.2.0, measured the same way, trained at 0.94 times and
+inferred at 0.89 times the speed of PyTorch compiled), the fully connected network 1.28 times in full
+batches, 4.1 times in mini-batches and 1.6 times in inference. Against PyTorch by default the margins
+are wider: in single precision ResNet-20 trains 1.39 times as fast as PyTorch with TF32 (1.53 times
+as fast as in single precision) and infers 2.18 times as fast, and the MobileNet-style network infers
+6.1 times as fast; in bfloat16 ResNet-20 trains 1.84 times as fast and infers 2.8 times as fast, the
+GPT trains 1.26 times as fast and infers 1.32 times as fast, and the fully connected network trains
+mini-batches 7.6 times as fast. From host arrays the margins are as wide or wider (PyTorch copies
+each batch as it uses it; Spingalett copies a chunk while the GPU works on the ones before): the
+fully connected network, whose inference the bus binds, infers 1.75 times as fast in single precision
+and 2.6 times in bfloat16.
 
 The CUDA backend is the faster on this GPU: against the Vulkan backend (the same executor) it trains
-the networks of 1.1 1.03 to 1.15 times as fast in single precision and 1.06 to 1.28 times in
-bfloat16, and infers them 1.02 to 1.18 times as fast in single precision and 1.22 to 1.95 times in
-bfloat16, where its products of the tensor cores, its kernel for a network's first convolution
-(`dconv.cu`) and its depthwise convolutions pull ahead. It trains the GPT 1.9 times as fast in
-single precision and 3.2 times in bfloat16, and infers it 1.6 and 2.6 times as fast: its attention
-runs in register tiles and on the tensor cores, Vulkan's without the matrix units. Against 1.1.0,
-measured in the same way (both built alike), 1.2 infers the networks of 1.1 in bfloat16 as fast (the
-convolutional network) to 1.21 times as fast (ResNet-20 1.14 times, the U-Net 1.09, the
-MobileNet-style network 1.14, the convolutional network with batch normalization 1.21, the fully
-connected network 1.1), trains them in bfloat16 up to 1.03 times as fast, and runs the rest within
-1.5% of 1.1 either way (the fully connected network's inference from host arrays in single precision
-1.04 times as fast). In single precision Spingalett trains ResNet-20 on the GPU 7.4 times as fast as
-on the eight threads of the CPU.
+the other networks 1.02 to 1.09 times as fast in single precision and 1.05 to 1.29 times in bfloat16,
+and infers them 1.01 to 1.18 times as fast in single precision and 1.12 to 1.96 times in bfloat16,
+where its products of the tensor cores, its kernel for a network's first convolution (`dconv.cu`) and
+its depthwise convolutions pull ahead. The GPT, whose attention runs on the matrix units in bfloat16
+and in register tiles in single precision on both backends since 1.3, trains 1.01 times as fast on
+CUDA in single precision and 1.09 times in bfloat16, and infers 1.03 and 1.17 times as fast: CUDA's
+products of 128 x 128 outputs over three stages (`gemm_pipe.cu`) are ahead of Vulkan's on cooperative
+matrices. Against 1.2.0, measured in the same way (both built alike, in interleaved runs of every
+workload), 1.3 trains the GPT on Vulkan 3.1 to 3.2 times as fast in bfloat16 and 1.9 times in single
+precision and infers it 2.6 to 2.7 and 1.6 times as fast, on CUDA 1.10 and 1.04 times as fast and
+infers it 1.12 to 1.14 and 1.03 to 1.05 times as fast, and runs the other workloads as 1.2 did:
+within 3% either way, but for a few rows that moved by up to 6% either way in those runs as the GPU
+warmed, of which the slower ran within 2.5% of 1.2 in runs of their workloads alone. In single
+precision Spingalett trains ResNet-20 on the GPU 7.4 times as fast as on the eight threads of the
+CPU.
 
 0.9 took its time out of the calls these workloads do not measure: small batches and single
 samples, files, data sets and Python. Same VM, 4 threads, 0.8 against 0.9 (see the
@@ -1620,14 +1942,15 @@ Src/                  Library sources (network, training, kernels, serialization
 Src/Gpu/              The GPU backends: device layer, network executor, Vulkan's compute shaders
                       (Shaders/) and the CUDA kernels (Cuda/)
 Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, CharGPT (a
-                      character-level GPT), throughput benchmark (C and PyTorch counterpart),
-                      DatasetTool, ModelTool
+                      character-level GPT), Pretrained (a Hugging Face or GGUF language model continuing a
+                      prompt), throughput benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
 Examples/Runtime/     RunModel, a program of the runtime alone
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets)
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
-Bindings/             Bindings for Python, Rust, .NET (C#), Go and Java
+Bindings/             Bindings for Python, Rust, .NET (C#), Go, Java and PHP; the engine in WebAssembly
+                      for JavaScript
 packaging/            Conan, vcpkg, AUR, conda recipes and the container image (Formula/: Homebrew,
                       bucket/: Scoop, flake.nix: Nix)
 cmake/                CMake package, pkg-config, runtime and inference-only build helpers
@@ -1652,7 +1975,7 @@ what 1.0 gave, and only 2.0 may take anything away.
   per release that adds some), so that the loader refuses a library older than the program needs.
   The test `api.abi` compares every release with the one before.
 - **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7;
-  1.2 adds format 8 for transformers)
+  1.2 adds format 8 for transformers, 1.3 format 9 for the training features of language models)
   and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
   later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
   that uses only what it knows.
@@ -1667,8 +1990,8 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.2.0. Its API (prefixed names, structs that can grow, zero as every
-field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 8, `.slettd` 2)
+Spingalett is at version 1.3.0. Its API (prefixed names, structs that can grow, zero as every
+field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 9, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and
 remain loadable.
@@ -1680,11 +2003,14 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
 - 1.2 (released): transformers and language models (embeddings, attention, RMS normalization,
   GELU, SiLU, the sparse cross-entropy, token files, generation, GPT-2 and LLaMA checkpoints),
   flash attention on CUDA, bindings for Rust, .NET, Go and Java, packages for the usual managers
-- 1.3: a KV cache and batched generation, mixed precision with loss scaling, gradient
-  checkpointing, deployment models on the GPU, ahead of PyTorch where 1.2 is not (the GPT in
-  bfloat16 on CUDA, transformers' training on the CPU and on Vulkan), bindings for PHP
-- 1.4 to 2.0: training across several GPUs, mixture-of-experts layers, Arm and Apple GPUs, sequence
-  models beyond attention
+- 1.3 (released): sessions with a key-value cache and batched generation on the CPU and both GPU
+  backends, deployment models on the GPU (integer ones to the CPU's bits, weight-only decoding),
+  tokenizers and Hugging Face and GGUF checkpoints in C, the training features of language models
+  (tied embeddings, recomputation, accumulation, padding, sliding windows, cross-attention), ONNX
+  import of transformers, the engine in WebAssembly, bindings for PHP; ahead of PyTorch where 1.2 was
+  not (the GPT in bfloat16 on CUDA, transformers' training on the CPU)
+- 1.4 to 2.0: training across several GPUs, FP16 products with loss scaling, mixture-of-experts
+  layers, Arm and Apple GPUs, sequence models beyond attention
 
 ## Contributing
 

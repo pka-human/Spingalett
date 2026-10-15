@@ -7,7 +7,8 @@
  * Token embeddings (Spingalett.Transformer.c's passes):
  *
  *   FORWARD   y[s][p] = row t of the table w (zeros for t outside it) + pos[p] (with FLAG_POS), t the
- *             value of x at the cell; n samples of `tokens` cells of d channels
+ *             value of x at the cell; n samples of `tokens` cells of d channels (with FLAG_ROWS n rows of one
+ *             token each, at position keys[row]: decoding)
  *   KEYS      for the `total` positions of the batch: keys[i] = its token (the vocabulary for none),
  *             keys[total + i] = i
  *   HIST      a block of 256 keys: part[digit blocks + block] = how many of them have that value of the
@@ -42,6 +43,7 @@ layout(local_size_x = 256) in;
 
 #define FLAG_FROM 1u
 #define FLAG_POS  2u
+#define FLAG_ROWS 4u
 
 layout(push_constant) uniform Push {
     F32 x, w, y, pos;
@@ -64,7 +66,7 @@ void main() {
             const uint cell = i / d, c = i % d;
             const float t = p.x.v[cell];
             float v = t >= 0.0 && t < float(p.vocab) ? p.w.v[uint(t) * d + c] : 0.0;
-            if (positions) v += p.pos.v[(cell % p.tokens) * d + c];
+            if (positions) v += p.pos.v[((p.flags & FLAG_ROWS) != 0u ? p.keys.v[cell] : cell % p.tokens) * d + c];
             st(p.y, i, 2u, v);
         }
         return;

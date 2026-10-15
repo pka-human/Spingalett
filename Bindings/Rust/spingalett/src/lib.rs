@@ -119,7 +119,7 @@ c_enum!(
     Init { Random = 0, Xavier = 1, He = 2, Zeros = 3, LeCun = 4 }
 );
 
-/// The library's version ("1.2.0").
+/// The library's version ("1.3.0").
 pub fn version() -> String {
     unsafe { CStr::from_ptr(sys::spingalett_version()).to_string_lossy().into_owned() }
 }
@@ -348,6 +348,31 @@ impl Layer {
         self.args.positions = positions;
         self
     }
+    /// Attention: keys of padding (tokens of -1 in the network's input) left out, for sequences of different
+    /// lengths in one batch.
+    pub fn ignore_padding(mut self, ignore: bool) -> Self {
+        self.args.ignore_padding = ignore;
+        self
+    }
+    /// An embedding of part of its input: `count` tokens (0: the rest) from value `offset` on of its one row (an
+    /// encoder's and a decoder's tokens side by side in one input).
+    pub fn tokens(mut self, offset: u32, count: u32) -> Self {
+        self.args.token_offset = offset;
+        self.args.token_count = count;
+        self
+    }
+    /// Attention: a sliding window, keys less than `window` cells away (with causal the cell and the
+    /// `window - 1` before it); 0: every key.
+    pub fn window(mut self, window: u32) -> Self {
+        self.args.window = window;
+        self
+    }
+    /// A linear layer computing with the table of the embedding of this index (tied input and output
+    /// embeddings); its outputs the embedding's vocabulary.
+    pub fn tied(mut self, embedding: u32) -> Self {
+        self.args.tied = embedding;
+        self
+    }
 }
 
 /// Options of Network::train() (the defaults: 10 epochs of mini-batches of 32, Adam at 0.001).
@@ -367,6 +392,10 @@ pub struct TrainOptions {
     pub label_smoothing: f32,
     /// Keep the samples in order.
     pub no_shuffle: bool,
+    /// Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one).
+    pub accumulation_steps: u32,
+    /// Activation recomputation on the CPU: less memory, a forward pass more, the same results.
+    pub recompute: bool,
 }
 
 impl Default for TrainOptions {
@@ -384,6 +413,8 @@ impl Default for TrainOptions {
             max_grad_norm: 0.0,
             label_smoothing: 0.0,
             no_shuffle: false,
+            accumulation_steps: 0,
+            recompute: false,
         }
     }
 }
@@ -439,6 +470,18 @@ impl Network {
         let path = c_path(path.as_ref())?;
         let ptr = unsafe { sys::spingalett_load(path.as_ptr()) };
         NonNull::new(ptr).map(|ptr| Network { ptr }).ok_or_else(|| last_error("load failed"))
+    }
+
+    /// A language model as a network: a Hugging Face model directory (config.json and safetensors weights,
+    /// sharded or not; model_type llama, mistral, qwen2 or gpt2) or a GGUF file (llama, qwen2 or gpt2, its
+    /// weights dequantized from F32 down to the k-quants). `context` is the window of tokens (0: the model's
+    /// positions, LLaMA's at most 2048); the network gives every position's logits and generates, trains and
+    /// saves like any other. Its tokenizer: Tokenizer::load() of the same path.
+    pub fn from_pretrained(path: impl AsRef<Path>, context: u32) -> Result<Self> {
+        let path = c_path(path.as_ref())?;
+        let args = sys::PretrainedArgs { path: path.as_ptr(), context, reserved: [0; sys::RESERVED] };
+        let ptr = unsafe { sys::spingalett_load_pretrained_args(args) };
+        NonNull::new(ptr).map(|ptr| Network { ptr }).ok_or_else(|| last_error("spingalett_load_pretrained failed"))
     }
 
     fn raw(&self) -> *mut sys::Network {
@@ -532,6 +575,8 @@ impl Network {
             beta2: o.beta2,
             max_grad_norm: o.max_grad_norm,
             label_smoothing: o.label_smoothing,
+            accumulation_steps: o.accumulation_steps,
+            recompute: o.recompute,
             ..Default::default()
         }
     }
@@ -713,5 +758,136 @@ impl Model {
 impl Drop for Model {
     fn drop(&mut self) {
         unsafe { sys::spingalett_model_free(self.ptr.as_ptr()) }
+    }
+}
+
+/// A language model's tokenizer: a Hugging Face tokenizer.json file, a model directory holding one (its
+/// tokenizer_config.json names BOS and EOS) or a GGUF file. Byte-level BPE (GPT-2, SmolLM), tiktoken's
+/// encodings (LLaMA 3, Qwen2) and SentencePiece's BPE (LLaMA 2, Mistral, Phi-3), encoding and decoding as
+/// Hugging Face's tokenizers library does.
+pub struct Tokenizer {
+    ptr: NonNull<sys::Tokenizer>,
+}
+
+// A tokenizer is read-only once loaded: threads may share it.
+unsafe impl Send for Tokenizer {}
+unsafe impl Sync for Tokenizer {}
+
+fn token_or_none(id: u32) -> Option<u32> {
+    if id == sys::NO_TOKEN { None } else { Some(id) }
+}
+
+impl Tokenizer {
+    /// The tokenizer of a tokenizer.json file, a model directory or a GGUF file.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = c_path(path.as_ref())?;
+        let ptr = unsafe { sys::spingalett_tokenizer_load(path.as_ptr()) };
+        NonNull::new(ptr).map(|ptr| Tokenizer { ptr }).ok_or_else(|| last_error("spingalett_tokenizer_load failed"))
+    }
+
+    /// The tokenizer of the bytes of a tokenizer.json or GGUF file (they are not kept).
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let ptr = unsafe { sys::spingalett_tokenizer_from_memory(data.as_ptr() as *const c_void, data.len()) };
+        NonNull::new(ptr).map(|ptr| Tokenizer { ptr })
+            .ok_or_else(|| last_error("spingalett_tokenizer_from_memory failed"))
+    }
+
+    fn raw(&self) -> *const sys::Tokenizer {
+        self.ptr.as_ptr()
+    }
+
+    /// The ids of a text. `special`: special tokens written in it ("<|im_start|>") become their ids (otherwise
+    /// they are text like any other, so that text from users cannot forge them); `add_special`: the tokens the
+    /// tokenizer adds around a text (LLaMA's BOS).
+    pub fn encode(&self, text: &str, special: bool, add_special: bool) -> Result<Vec<u32>> {
+        if text.is_empty() {
+            // the call reads an empty length as up to the NUL: an empty C string
+            let empty = [0u8];
+            return self.encode_bytes(empty.as_ptr() as *const std::os::raw::c_char, 0, special, add_special);
+        }
+        self.encode_bytes(text.as_ptr() as *const std::os::raw::c_char, text.len(), special, add_special)
+    }
+
+    fn encode_bytes(&self, text: *const std::os::raw::c_char, length: usize, special: bool, add_special: bool)
+        -> Result<Vec<u32>> {
+        let mut tokens = vec![0u32; length + 16];
+        loop {
+            let args = sys::TokenizeArgs {
+                tokenizer: self.raw(), text, length, tokens: tokens.as_mut_ptr(), capacity: tokens.len(), special,
+                add_special, reserved: [0; sys::RESERVED],
+            };
+            let count = unsafe { sys::spingalett_tokenize_args(args) };
+            if count < 0 {
+                return Err(last_error("spingalett_tokenize failed"));
+            }
+            if count as usize <= tokens.len() {
+                tokens.truncate(count as usize);
+                return Ok(tokens);
+            }
+            tokens.resize(count as usize, 0);       // more tokens than guessed: again with room for all
+        }
+    }
+
+    /// The text of ids (`skip_special`: without the special tokens); bytes that are no UTF-8, as a character
+    /// split between tokens, become U+FFFD.
+    pub fn decode(&self, tokens: &[u32], skip_special: bool) -> Result<String> {
+        let mut text = vec![0u8; 4 * tokens.len() + 64];
+        loop {
+            let args = sys::DetokenizeArgs {
+                tokenizer: self.raw(), tokens: tokens.as_ptr(), count: tokens.len(),
+                text: text.as_mut_ptr() as *mut std::os::raw::c_char, capacity: text.len(), skip_special,
+                reserved: [0; sys::RESERVED],
+            };
+            let size = unsafe { sys::spingalett_detokenize_args(args) };
+            if size < 0 {
+                return Err(last_error("spingalett_detokenize failed"));
+            }
+            if (size as usize) < text.len() {
+                text.truncate(size as usize);
+                return Ok(String::from_utf8_lossy(&text).into_owned());
+            }
+            text.resize(size as usize + 1, 0);      // a longer text than guessed, and its NUL
+        }
+    }
+
+    /// The token of an id as the vocabulary writes it ("Ġthe", "▁the", "<|im_start|>"), None for no token.
+    pub fn token(&self, id: u32) -> Option<String> {
+        let s = unsafe { sys::spingalett_tokenizer_token(self.raw(), id) };
+        if s.is_null() { None } else { Some(unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()) }
+    }
+
+    /// The id of a token as the vocabulary writes it (added tokens first), None when there is none.
+    pub fn id(&self, token: &str) -> Option<u32> {
+        let token = CString::new(token).ok()?;
+        token_or_none(unsafe { sys::spingalett_tokenizer_id(self.raw(), token.as_ptr()) })
+    }
+
+    fn info(&self) -> sys::TokenizerInfo {
+        unsafe { sys::spingalett_tokenizer_info(self.raw()) }
+    }
+
+    /// Token ids: the largest one + 1 (the model's tokens and the added ones).
+    pub fn vocabulary(&self) -> u32 {
+        self.info().vocabulary
+    }
+    /// The token that begins a text, when the tokenizer names one.
+    pub fn bos(&self) -> Option<u32> {
+        token_or_none(self.info().bos)
+    }
+    /// The token that ends a text, when the tokenizer names one.
+    pub fn eos(&self) -> Option<u32> {
+        token_or_none(self.info().eos)
+    }
+    pub fn pad(&self) -> Option<u32> {
+        token_or_none(self.info().pad)
+    }
+    pub fn unk(&self) -> Option<u32> {
+        token_or_none(self.info().unk)
+    }
+}
+
+impl Drop for Tokenizer {
+    fn drop(&mut self) {
+        unsafe { sys::spingalett_tokenizer_free(self.ptr.as_ptr()) }
     }
 }

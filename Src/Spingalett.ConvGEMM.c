@@ -193,6 +193,98 @@ static void wkernel(uint32_t pixels, const float *a, size_t lda, const float *co
 
 #endif
 
+/* Few rows against packed panels (spingalett_conv_rows()): c[r][0..cols) = sum over k < K of a[r][k] *
+   b[k][0..cols) for ROWS rows (a[r] rows lda apart) and PANELS panels side by side (panel p at b + p NR K),
+   each sum taken from zero by one multiply-add per k in the order of k, as ikernel takes a pointwise
+   convolution's (one tap of K): the same bits, for one to four rows without ikernel's MR. The shapes keep
+   eight vectors of sums in flight. */
+#if defined(__AVX512F__) || defined(__AVX__)
+
+#if defined(__AVX512F__)
+typedef __m512 RVec;
+#define R_ZERO() _mm512_setzero_ps()
+#define R_LOAD(p) _mm512_load_ps(p)
+#define R_SET1(x) _mm512_set1_ps(x)
+#define R_FMA(a, b, c) _mm512_fmadd_ps((a), (b), (c))
+#define R_STORE(p, v) _mm512_store_ps((p), (v))
+#else
+typedef __m256 RVec;
+#define R_ZERO() _mm256_setzero_ps()
+#define R_LOAD(p) _mm256_load_ps(p)
+#define R_SET1(x) _mm256_set1_ps(x)
+#define R_FMA(a, b, c) FMA256((a), (b), (c))
+#define R_STORE(p, v) _mm256_store_ps((p), (v))
+#endif
+
+/* Stores the sums of row r, panel p (vectors v0, v1) for the columns there are. */
+static inline void rows_store(float *c, size_t ldc, uint32_t r, uint32_t p, RVec v0, RVec v1, uint32_t cols) {
+    _Alignas(64) float t[NR];
+    R_STORE(t, v0);
+    R_STORE(t + VW, v1);
+    if (cols > p * NR) memcpy(c + (size_t)r * ldc + p * NR, t, (cols - p * NR < NR ? cols - p * NR : NR) * sizeof(float));
+}
+
+/* one row, four panels */
+static void rkernel_1x4(uint32_t K, const float *a, size_t lda, const float *b, float *c, size_t ldc, uint32_t cols) {
+    RVec s00 = R_ZERO(), s01 = R_ZERO(), s10 = R_ZERO(), s11 = R_ZERO();
+    RVec s20 = R_ZERO(), s21 = R_ZERO(), s30 = R_ZERO(), s31 = R_ZERO();
+    const float *b0 = b, *b1 = b + (size_t)NR * K, *b2 = b + (size_t)2 * NR * K, *b3 = b + (size_t)3 * NR * K;
+    (void)lda;
+    for (uint32_t k = 0; k < K; k++, b0 += NR, b1 += NR, b2 += NR, b3 += NR) {
+        const RVec x = R_SET1(a[k]);
+        s00 = R_FMA(x, R_LOAD(b0), s00); s01 = R_FMA(x, R_LOAD(b0 + VW), s01);
+        s10 = R_FMA(x, R_LOAD(b1), s10); s11 = R_FMA(x, R_LOAD(b1 + VW), s11);
+        s20 = R_FMA(x, R_LOAD(b2), s20); s21 = R_FMA(x, R_LOAD(b2 + VW), s21);
+        s30 = R_FMA(x, R_LOAD(b3), s30); s31 = R_FMA(x, R_LOAD(b3 + VW), s31);
+    }
+    rows_store(c, ldc, 0, 0, s00, s01, cols);
+    rows_store(c, ldc, 0, 1, s10, s11, cols);
+    rows_store(c, ldc, 0, 2, s20, s21, cols);
+    rows_store(c, ldc, 0, 3, s30, s31, cols);
+}
+
+/* two rows, two panels */
+static void rkernel_2x2(uint32_t K, const float *a, size_t lda, const float *b, float *c, size_t ldc, uint32_t cols) {
+    RVec s00 = R_ZERO(), s01 = R_ZERO(), s10 = R_ZERO(), s11 = R_ZERO();      /* row, panel half */
+    RVec t00 = R_ZERO(), t01 = R_ZERO(), t10 = R_ZERO(), t11 = R_ZERO();      /* the second panel */
+    const float *a0 = a, *a1 = a + lda, *b0 = b, *b1 = b + (size_t)NR * K;
+    for (uint32_t k = 0; k < K; k++, b0 += NR, b1 += NR) {
+        const RVec x0 = R_SET1(a0[k]), x1 = R_SET1(a1[k]);
+        const RVec p0 = R_LOAD(b0), p1 = R_LOAD(b0 + VW), q0 = R_LOAD(b1), q1 = R_LOAD(b1 + VW);
+        s00 = R_FMA(x0, p0, s00); s01 = R_FMA(x0, p1, s01); t00 = R_FMA(x0, q0, t00); t01 = R_FMA(x0, q1, t01);
+        s10 = R_FMA(x1, p0, s10); s11 = R_FMA(x1, p1, s11); t10 = R_FMA(x1, q0, t10); t11 = R_FMA(x1, q1, t11);
+    }
+    rows_store(c, ldc, 0, 0, s00, s01, cols);
+    rows_store(c, ldc, 0, 1, t00, t01, cols);
+    rows_store(c, ldc, 1, 0, s10, s11, cols);
+    rows_store(c, ldc, 1, 1, t10, t11, cols);
+}
+
+/* four rows, one panel */
+static void rkernel_4x1(uint32_t K, const float *a, size_t lda, const float *b, float *c, size_t ldc, uint32_t cols) {
+    RVec s00 = R_ZERO(), s01 = R_ZERO(), s10 = R_ZERO(), s11 = R_ZERO();
+    RVec s20 = R_ZERO(), s21 = R_ZERO(), s30 = R_ZERO(), s31 = R_ZERO();
+    const float *a0 = a, *a1 = a + lda, *a2 = a + 2 * lda, *a3 = a + 3 * lda;
+    for (uint32_t k = 0; k < K; k++, b += NR) {
+        const RVec p0 = R_LOAD(b), p1 = R_LOAD(b + VW);
+        RVec x = R_SET1(a0[k]);
+        s00 = R_FMA(x, p0, s00); s01 = R_FMA(x, p1, s01);
+        x = R_SET1(a1[k]);
+        s10 = R_FMA(x, p0, s10); s11 = R_FMA(x, p1, s11);
+        x = R_SET1(a2[k]);
+        s20 = R_FMA(x, p0, s20); s21 = R_FMA(x, p1, s21);
+        x = R_SET1(a3[k]);
+        s30 = R_FMA(x, p0, s30); s31 = R_FMA(x, p1, s31);
+    }
+    rows_store(c, ldc, 0, 0, s00, s01, cols);
+    rows_store(c, ldc, 1, 0, s10, s11, cols);
+    rows_store(c, ldc, 2, 0, s20, s21, cols);
+    rows_store(c, ldc, 3, 0, s30, s31, cols);
+}
+
+#define ROWS_KERNELS 1
+#endif
+
 /* ------------------------------------------------------------------------- drivers */
 
 /* Window positions of a convolution: rows are pixels of one map (output pixels for the forward
@@ -269,13 +361,24 @@ static void row_taps(const Taps *g, uint64_t row, uint32_t rows, const float **p
     }
 }
 
-/* Packs B[k][j] = src[j * ldj + k * ldk] for k < K, j < cols into NR-wide panels (zero-padded). */
-static void pack_panels(float *dst, const float *src, size_t ldj, size_t ldk, uint32_t K, uint32_t cols) {
-    for (uint32_t j0 = 0; j0 < cols; j0 += NR) {
-        uint32_t width = cols - j0 < NR ? cols - j0 : NR;
-        for (uint32_t k = 0; k < K; k++, dst += NR) {
-            for (uint32_t j = 0; j < width; j++) dst[j] = src[(size_t)(j0 + j) * ldj + (size_t)k * ldk];
-            for (uint32_t j = width; j < NR; j++) dst[j] = 0.0f;
+/* Whether packing `floats` weights pays for the threads (every chunk of a training step packs its layers again). */
+static inline bool pack_parallel(bool parallel, uint64_t floats) { return parallel && floats >= (1u << 15); }
+
+/* Packs B[k][j] = src[j * ldj + k * ldk] for k < K, j < cols into NR-wide panels (zero-padded), a panel a thread
+   when parallel. */
+static void pack_panels(float *dst, const float *src, size_t ldj, size_t ldk, uint32_t K, uint32_t cols, bool parallel,
+                        int threads) {
+    const int64_t panels = (int64_t)((cols + NR - 1) / NR);
+    (void)threads; (void)parallel;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(pack_parallel(parallel, (uint64_t)K * cols) && panels > 1)
+#endif
+    for (int64_t pn = 0; pn < panels; pn++) {
+        const uint32_t j0 = (uint32_t)pn * NR, width = cols - j0 < NR ? cols - j0 : NR;
+        float *d = dst + (size_t)j0 * K;
+        for (uint32_t k = 0; k < K; k++, d += NR) {
+            for (uint32_t j = 0; j < width; j++) d[j] = src[(size_t)(j0 + j) * ldj + (size_t)k * ldk];
+            for (uint32_t j = width; j < NR; j++) d[j] = 0.0f;
         }
     }
 }
@@ -285,9 +388,13 @@ static void indirect_product(const Taps *g, uint64_t rows_total, const float *pa
                              const SpingalettGemmHooks *hooks, bool parallel, int threads) {
     const uint32_t K = g->taps * g->run;
     const int64_t tiles = (int64_t)((rows_total + MR - 1) / MR);
-    (void)threads; (void)parallel;
+    /* tiles handed out eight at a time when small (a convolutional network's: a microsecond or two each), one at a
+       time when large (a transformer's linear layers: 20 to 70 us each, where eight left threads waiting at the end
+       of each product for a tenth of it) */
+    const int chunk = (uint64_t)MR * cols * K >= (1u << 19) ? 1 : 8;
+    (void)threads; (void)parallel; (void)chunk;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(dynamic, 8) num_threads(threads) if(parallel && tiles > 1)
+#pragma omp parallel for schedule(dynamic, chunk) num_threads(threads) if(parallel && tiles > 1)
 #endif
     for (int64_t t = 0; t < tiles; t++) {
         const float *p[MR * SPINGALETT_CONV_DIRECT_TAPS];
@@ -308,7 +415,7 @@ void CONV_NAME(spingalett_conv_direct_forward)(const LayerShape *in, const Layer
     const uint32_t taps = out->kernel_h * out->kernel_w, K = taps * CG;
     float *packed = scratch, *zeros = scratch + spingalett_conv_direct_packed_floats(OG, K);
     memset(zeros, 0, ((size_t)(CG > OG ? CG : OG) + 32u) * sizeof(float));
-    pack_panels(packed, W + (size_t)g * OG * K, K, 1, K, OG);
+    pack_panels(packed, W + (size_t)g * OG * K, K, 1, K, OG, parallel, threads);
     Taps tp = {taps, CG, out->kernel_w, out->stride_h, out->stride_w, out->pad_h, out->pad_w, out->height, out->width,
                in->height, in->width, C, g * CG, false, x, zeros, {0}};
     taps_init(&tp);
@@ -399,10 +506,14 @@ void CONV_NAME(spingalett_conv_direct_backward_data)(const LayerShape *in, const
         strided_backward_data(in, out, g, W, dy, dx, n, packed, zeros, epilogue, parallel, threads);
         return;
     }
-    /* B[t * OG + oc][j] = W[g OG + oc][t CG + j] */
+    /* B[t * OG + oc][j] = W[g OG + oc][t CG + j], a panel a thread when parallel */
     const float *Wg = W + (size_t)g * OG * K;
-    for (uint32_t j0 = 0; j0 < CG; j0 += NR) {
-        uint32_t width = CG - j0 < NR ? CG - j0 : NR;
+    const int64_t panels = (int64_t)((CG + NR - 1) / NR);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads) if(pack_parallel(parallel, (uint64_t)KR * CG) && panels > 1)
+#endif
+    for (int64_t pn = 0; pn < panels; pn++) {
+        const uint32_t j0 = (uint32_t)pn * NR, width = CG - j0 < NR ? CG - j0 : NR;
         float *dst = packed + (size_t)j0 * KR;
         for (uint32_t t = 0; t < taps; t++)
             for (uint32_t oc = 0; oc < OG; oc++, dst += NR) {
@@ -504,6 +615,75 @@ void CONV_NAME(spingalett_conv_direct_backward_weights)(const LayerShape *in, co
     );
 }
 
+/* ------------------------------------------------------------------------- rows of a linear layer */
+
+void CONV_NAME(spingalett_conv_pack)(const float *W, uint32_t K, uint32_t N, float *packed) {
+    pack_panels(packed, W, K, 1, K, N, false, 1);
+}
+
+/* Rows are taken MR at a time by ikernel, the rest four, two or one at a time; a work item is a block of
+   rows by the panels of one kernel call (1, 2 or 4), so that few rows still give every thread work. */
+void CONV_NAME(spingalett_conv_rows)(const float *x, size_t ldx, uint32_t rows, const float *packed, uint32_t K,
+                                     uint32_t N, float *y, size_t ldy, const SpingalettGemmHooks *epilogue,
+                                     bool parallel, int threads) {
+    const uint32_t panels = (N + NR - 1) / NR, full = rows / MR * MR;
+    uint32_t blocks[3], heights[3], widths[3], starts[3], count = 0, at = full;
+    /* the rows after the MR blocks: 4, 2 and 1 at a time (MR = 4 runs them all as one block) */
+#if defined(ROWS_KERNELS)
+    static const uint32_t shape_rows[3] = {4, 2, 1}, shape_panels[3] = {1, 2, 4};
+    for (int s = 0; s < 3; s++) {
+        const uint32_t n = (rows - at) / shape_rows[s];
+        if (!n) continue;
+        blocks[count] = n, heights[count] = shape_rows[s], widths[count] = shape_panels[s], starts[count] = at;
+        at += n * shape_rows[s];
+        count++;
+    }
+#else
+    if (at < rows) blocks[0] = 1, heights[0] = rows - at, widths[0] = 1, starts[0] = at, count = 1;
+#endif
+    const int64_t tile_items = (int64_t)(full / MR) * panels;
+    int64_t items = tile_items, first[3];
+    for (uint32_t s = 0; s < count; s++) {
+        first[s] = items;
+        items += (int64_t)blocks[s] * ((panels + widths[s] - 1) / widths[s]);
+    }
+    (void)threads; (void)parallel; (void)heights; (void)starts; (void)first;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads) if(parallel && items > 1)
+#endif
+    for (int64_t it = 0; it < items; it++) {
+        uint32_t row, height, q, width;
+        if (it < tile_items) {
+            row = (uint32_t)(it / panels) * MR, height = MR, q = (uint32_t)(it % panels), width = 1;
+        } else {
+            uint32_t s = 0;
+            while (s + 1 < count && it >= first[s + 1]) s++;
+            const int64_t groups = (panels + widths[s] - 1) / widths[s], local = it - first[s];
+            row = starts[s] + (uint32_t)(local / groups) * heights[s], height = heights[s];
+            width = widths[s], q = (uint32_t)(local % groups) * width;
+        }
+        const uint32_t c0 = q * NR, cols = N - c0 < width * NR ? N - c0 : width * NR;
+        const float *a = x + (size_t)row * ldx, *b = packed + (size_t)c0 * K;
+        float *c = y + (size_t)row * ldy + c0;
+#if defined(ROWS_KERNELS)
+        if (height == 1 && q + 4 <= panels) rkernel_1x4(K, a, ldx, b, c, ldy, cols);
+        else if (height == 2 && q + 2 <= panels) rkernel_2x2(K, a, ldx, b, c, ldy, cols);
+        else if (height == 4) rkernel_4x1(K, a, ldx, b, c, ldy, cols);
+        else
+#endif
+        {
+            /* MR rows, or the last panels of fewer rows, through ikernel (rows past `height` read zeros) */
+            const float *p[MR];
+            for (uint32_t r = 0; r < MR; r++) p[r] = a + (size_t)(r < height ? r : 0) * ldx;
+            for (uint32_t j = 0; j < width && c0 + j * NR < N; j++) {
+                const uint32_t cj = c0 + j * NR;
+                ikernel(1, K, p, b + (size_t)j * NR * K, c + (size_t)j * NR, ldy, height, N - cj < NR ? N - cj : NR);
+            }
+        }
+        if (epilogue && epilogue->epilogue) epilogue->epilogue(epilogue->epilogue_ctx, row, height, c0, cols, c, ldy);
+    }
+}
+
 /* ------------------------------------------------------------------------- dispatch */
 
 #if !defined(SPINGALETT_CONV_VARIANT)
@@ -515,9 +695,14 @@ void CONV_NAME(spingalett_conv_direct_backward_weights)(const LayerShape *in, co
 #define spingalett_conv_direct_backward_data_ARGS spingalett_conv_direct_forward_ARGS
 #define spingalett_conv_direct_backward_weights_ARGS (const LayerShape *, const LayerShape *, uint32_t, const float *, \
     const float *, uint32_t, float, float, float *, float *, bool, int)
+#define spingalett_conv_pack_ARGS (const float *, uint32_t, uint32_t, float *)
+#define spingalett_conv_rows_ARGS (const float *, size_t, uint32_t, const float *, uint32_t, uint32_t, float *, size_t, \
+    const SpingalettGemmHooks *, bool, int)
 CONV_VARIANTS(spingalett_conv_direct_forward)
 CONV_VARIANTS(spingalett_conv_direct_backward_data)
 CONV_VARIANTS(spingalett_conv_direct_backward_weights)
+CONV_VARIANTS(spingalett_conv_pack)
+CONV_VARIANTS(spingalett_conv_rows)
 
 /* 0: baseline, 1: AVX2 and FMA, 2: AVX-512, as the GEMM chooses */
 static int conv_level(void) {
@@ -553,6 +738,15 @@ void spingalett_conv_direct_backward_weights(const LayerShape *in, const LayerSh
                                              float *scratch, bool parallel, int threads) {
     DISPATCH(spingalett_conv_direct_backward_weights, in, out, g, x, dy, n, scale, beta, gW, scratch, parallel,
              threads);
+}
+
+void spingalett_conv_pack(const float *W, uint32_t K, uint32_t N, float *packed) {
+    DISPATCH(spingalett_conv_pack, W, K, N, packed);
+}
+
+void spingalett_conv_rows(const float *x, size_t ldx, uint32_t rows, const float *packed, uint32_t K, uint32_t N,
+                          float *y, size_t ldy, const SpingalettGemmHooks *epilogue, bool parallel, int threads) {
+    DISPATCH(spingalett_conv_rows, x, ldx, rows, packed, K, N, y, ldy, epilogue, parallel, threads);
 }
 
 #endif

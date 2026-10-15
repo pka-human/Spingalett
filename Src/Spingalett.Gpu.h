@@ -24,6 +24,8 @@
 #include "Spingalett.Private.h"
 
 typedef struct SpgGpuNet SpgGpuNet;
+typedef struct SpgGpuDecoder SpgGpuDecoder;
+typedef struct SpgGpuModel SpgGpuModel;
 
 /* Fixed for a training run. */
 typedef struct {
@@ -97,7 +99,37 @@ void spingalett_gpu_set_smoothing(SpgGpuNet *g, float smoothing);
 /* Copies the network's parameters (weights, biases, running statistics and optimizer moments) to
    the device, or back from it after the work submitted so far. */
 bool spingalett_gpu_upload(SpgGpuNet *g);
+
+/* Decoding a token at a time with key-value caches (sessions of language models, spingalett_generate()): a
+   decoder runs an inference network of a causal language model (an embedding of tokens first, then layers that
+   treat each token alone and causal attention) on rows of tokens of `sequences` sequences of up to `length`
+   positions, each attention layer keeping the keys and values of every sequence's positions. NULL (with *why)
+   for other networks, or when memory runs out. */
+SpgGpuDecoder *spingalett_gpu_decoder_new(SpgGpuNet *g, uint32_t sequences, uint32_t length, const char **why);
+void spingalett_gpu_decoder_free(SpgGpuDecoder *d);
+/* Rows a step takes at most. */
+uint32_t spingalett_gpu_decoder_rows(const SpgGpuDecoder *d);
+/* One step: row k is token tokens[k] of sequence sequence[k] at position position[k] (the positions before it
+   fed already); writes every row's logits ([rows x outputs]) when logits is not NULL, and waits. */
+bool spingalett_gpu_decoder_step(SpgGpuDecoder *d, uint32_t rows, const uint32_t *tokens, const uint32_t *sequence,
+                                 const uint32_t *position, float *logits);
+/* An integer model's image whose network the decoder runs (spingalett_load_from_memory() of it): its linear layers then
+   multiply the model's codes, kept on the device with their scales and widened in registers (weight-only: the
+   activations as the network keeps them, the sums in single precision), rather than the network's weights. The
+   number of such layers (0: a model of float weights), -1 when memory runs out (the network's weights stay in use). */
+int spingalett_gpu_decoder_quantize(SpgGpuDecoder *d, const uint8_t *image);
+/* Copies the first `length` positions' keys and values of sequence `from` to sequence `to`. */
+bool spingalett_gpu_decoder_copy(SpgGpuDecoder *d, uint32_t from, uint32_t to, uint32_t length);
 bool spingalett_gpu_download(SpgGpuNet *g);
+
+/* Deployment models of integer weights on the GPU (Spingalett.GpuModel.c): batched prediction that gives the bits
+   of spingalett_model_run(), for models whose every layer the GPU computes as the CPU does (integer products, the
+   activations that need no libm but the last layer's, pooling, additions and concatenations, batch normalization);
+   NULL with *why for other models, or when memory runs out. Made on the calling thread's backend. */
+SpgGpuModel *spingalett_gpu_model_new(const SpingalettModel *model, const char **why);
+void spingalett_gpu_model_free(SpgGpuModel *m);
+/* outputs [count x output_size] for inputs [count x input_size], in chunks; waits */
+bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t count, float *outputs);
 
 /* Where the next chunk's inputs and targets go (rows of the input and output layers), once the
    device is done with the chunk that used that memory before. */
@@ -201,7 +233,38 @@ static inline bool spingalett_gpu_net_reuse(SpgGpuNet *g, uint32_t capacity, con
 }
 static inline void spingalett_gpu_set_smoothing(SpgGpuNet *g, float smoothing) { (void)g; (void)smoothing; }
 static inline bool spingalett_gpu_upload(SpgGpuNet *g) { (void)g; return false; }
+static inline SpgGpuDecoder *spingalett_gpu_decoder_new(SpgGpuNet *g, uint32_t sequences, uint32_t length,
+                                                        const char **why) {
+    (void)g; (void)sequences; (void)length;
+    if (why) *why = "no GPU backend";
+    return NULL;
+}
+static inline void spingalett_gpu_decoder_free(SpgGpuDecoder *d) { (void)d; }
+static inline int spingalett_gpu_decoder_quantize(SpgGpuDecoder *d, const uint8_t *image) {
+    (void)d; (void)image;
+    return -1;
+}
+static inline uint32_t spingalett_gpu_decoder_rows(const SpgGpuDecoder *d) { (void)d; return 0; }
+static inline bool spingalett_gpu_decoder_step(SpgGpuDecoder *d, uint32_t rows, const uint32_t *tokens,
+                                               const uint32_t *sequence, const uint32_t *position, float *logits) {
+    (void)d; (void)rows; (void)tokens; (void)sequence; (void)position; (void)logits;
+    return false;
+}
+static inline bool spingalett_gpu_decoder_copy(SpgGpuDecoder *d, uint32_t from, uint32_t to, uint32_t length) {
+    (void)d; (void)from; (void)to; (void)length;
+    return false;
+}
 static inline bool spingalett_gpu_download(SpgGpuNet *g) { (void)g; return false; }
+static inline SpgGpuModel *spingalett_gpu_model_new(const SpingalettModel *model, const char **why) {
+    (void)model;
+    if (why) *why = "no GPU backend";
+    return NULL;
+}
+static inline void spingalett_gpu_model_free(SpgGpuModel *m) { (void)m; }
+static inline bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t count, float *outputs) {
+    (void)m; (void)inputs; (void)count; (void)outputs;
+    return false;
+}
 static inline uint16_t *spingalett_gpu_chunk_inputs_bf16(SpgGpuNet *g, float **targets) {
     (void)g; (void)targets;
     return NULL;

@@ -29,6 +29,23 @@ SPG_CUDA_UNIT(dconv27, dconv, "-DKMAX=27 -DEXACT=1")
 SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
 SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
 SPG_CUDA_UNIT(embed, embed, "")
+SPG_CUDA_UNIT(attn_cache, attn_cache, "")   /* attention over a cache of keys and values (decoding) */
+SPG_CUDA_UNIT(iquant, iquant, "")           /* integer models: their activations quantized, */
+SPG_CUDA_UNIT(ipass, ipass, "")             /* their other passes */
+/* integer models' linear layers in sessions: products of a few rows with their codes widened in registers, a unit of
+   BITS and ROWS each (wqmv_b<BITS>_r<ROWS>) */
+SPG_CUDA_UNIT(wqmv_b8_r1, wqmv, "-DBITS=8u -DROWS=1u")
+SPG_CUDA_UNIT(wqmv_b8_r2, wqmv, "-DBITS=8u -DROWS=2u")
+SPG_CUDA_UNIT(wqmv_b8_r4, wqmv, "-DBITS=8u -DROWS=4u")
+SPG_CUDA_UNIT(wqmv_b8_r8, wqmv, "-DBITS=8u -DROWS=8u")
+SPG_CUDA_UNIT(wqmv_b4_r1, wqmv, "-DBITS=4u -DROWS=1u")
+SPG_CUDA_UNIT(wqmv_b4_r2, wqmv, "-DBITS=4u -DROWS=2u")
+SPG_CUDA_UNIT(wqmv_b4_r4, wqmv, "-DBITS=4u -DROWS=4u")
+SPG_CUDA_UNIT(wqmv_b4_r8, wqmv, "-DBITS=4u -DROWS=8u")
+SPG_CUDA_UNIT(wqmv_b2_r1, wqmv, "-DBITS=2u -DROWS=1u")
+SPG_CUDA_UNIT(wqmv_b2_r2, wqmv, "-DBITS=2u -DROWS=2u")
+SPG_CUDA_UNIT(wqmv_b2_r4, wqmv, "-DBITS=2u -DROWS=4u")
+SPG_CUDA_UNIT(wqmv_b2_r8, wqmv, "-DBITS=2u -DROWS=8u")
 SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")     /* attention in single precision: heads of up to 256, */
 SPG_CUDA_UNIT(rattn_d32_o0, rattn, "-DD=32u -DOPC=0u")   /* of up to 32, 64, 128 a unit per pass */
 SPG_CUDA_UNIT(rattn_d32_o1, rattn, "-DD=32u -DOPC=1u")
@@ -42,6 +59,17 @@ SPG_CUDA_UNIT(rattn_d128_o0, rattn, "-DD=128u -DOPC=0u")
 SPG_CUDA_UNIT(rattn_d128_o1, rattn, "-DD=128u -DOPC=1u")
 SPG_CUDA_UNIT(rattn_d128_o2, rattn, "-DD=128u -DOPC=2u")
 SPG_CUDA_UNIT(rattn_d128_o3, rattn, "-DD=128u -DOPC=3u")
+/* the same for layers with padding (EXT, SPG_ATTN_EXT): the units above stay those of layers without */
+SPG_CUDA_UNIT(attn_d256x, attn, "-DDMAX=256u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d32_o0x, rattn, "-DD=32u -DOPC=0u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d32_o2x, rattn, "-DD=32u -DOPC=2u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d32_o3x, rattn, "-DD=32u -DOPC=3u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d64_o0x, rattn, "-DD=64u -DOPC=0u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d64_o2x, rattn, "-DD=64u -DOPC=2u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d64_o3x, rattn, "-DD=64u -DOPC=3u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d128_o0x, rattn, "-DD=128u -DOPC=0u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d128_o2x, rattn, "-DD=128u -DOPC=2u -DEXT=1")
+SPG_CUDA_UNIT(rattn_d128_o3x, rattn, "-DD=128u -DOPC=3u -DEXT=1")
 /* attention on the matrix units (networks in bfloat16): a unit per head size and pass (0 FORWARD, 2 DQ, 3 DKV) */
 SPG_CUDA_UNIT(flash_d32_o0, flash, "-DD=32u -DOPC=0u")
 SPG_CUDA_UNIT(flash_d32_o2, flash, "-DD=32u -DOPC=2u")
@@ -139,3 +167,15 @@ SPG_CUDA_MMA_GENERAL(0, 1, 2, 1)
 SPG_CUDA_MMA_GENERAL(0, 1, 2, 2)
 SPG_CUDA_MMA_GENERAL(0, 0, 2, 1)
 SPG_CUDA_MMA_GENERAL(0, 0, 2, 2)
+
+/* the large tiles on the matrix units (gemm_pipe.cu): BM x BN outputs over warps of 16 TM x 16 TN, steps of BK, STAGES
+   of them in shared memory, which is also the table of Spingalett.GpuKernels.c, for the dense modes of operands kept
+   as bfloat16, read eight values at once (A, B), and with GENERAL (_g) for those listed so: units
+   gemm_pipe_<BM>x<BN>x<BK>_<TM>x<TN>_s<STAGES>_a<A>b<B> */
+SPG_CUDA_PIPE_TILE(128, 128, 32, 4, 4, 3)
+
+SPG_CUDA_PIPE_MODES(0, 1)           /* forward */
+SPG_CUDA_PIPE_MODES(0, 0)           /* data gradient */
+SPG_CUDA_PIPE_MODES(1, 0)           /* weight gradient */
+SPG_CUDA_PIPE_GENERAL(0, 1)
+SPG_CUDA_PIPE_GENERAL(0, 0)

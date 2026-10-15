@@ -27,7 +27,8 @@ int main(void) {
     FIELD(LayerArgs, upsample); FIELD(LayerArgs, output_padding); FIELD(LayerArgs, output_padding_h);
     FIELD(LayerArgs, output_padding_w);
     FIELD(LayerArgs, vocabulary); FIELD(LayerArgs, heads); FIELD(LayerArgs, kv_heads); FIELD(LayerArgs, rope_theta);
-    FIELD(LayerArgs, causal); FIELD(LayerArgs, positions);
+    FIELD(LayerArgs, causal); FIELD(LayerArgs, positions); FIELD(LayerArgs, ignore_padding); FIELD(LayerArgs, tied);
+    FIELD(LayerArgs, window); FIELD(LayerArgs, token_offset); FIELD(LayerArgs, token_count);
 
     SIZE(SpingalettNetworkLayer); FIELD(SpingalettNetworkLayer, reserved);
     FIELD(SpingalettNetworkLayer, type); FIELD(SpingalettNetworkLayer, height); FIELD(SpingalettNetworkLayer, width);
@@ -39,7 +40,9 @@ int main(void) {
     FIELD(SpingalettNetworkLayer, input_count); FIELD(SpingalettNetworkLayer, inputs);
     FIELD(SpingalettNetworkLayer, upsample);
     FIELD(SpingalettNetworkLayer, vocabulary); FIELD(SpingalettNetworkLayer, heads); FIELD(SpingalettNetworkLayer, kv_heads); FIELD(SpingalettNetworkLayer, rope_theta);
-    FIELD(SpingalettNetworkLayer, causal); FIELD(SpingalettNetworkLayer, positions);
+    FIELD(SpingalettNetworkLayer, causal); FIELD(SpingalettNetworkLayer, positions); FIELD(SpingalettNetworkLayer, ignore_padding);
+    FIELD(SpingalettNetworkLayer, tied); FIELD(SpingalettNetworkLayer, window);
+    FIELD(SpingalettNetworkLayer, token_offset);
 
     SIZE(ForwardArgs); FIELD(ForwardArgs, reserved); FIELD(ForwardArgs, net); FIELD(ForwardArgs, input);
 
@@ -62,6 +65,7 @@ int main(void) {
     FIELD(TrainArgs, restore_best_weights); FIELD(TrainArgs, blas_num_threads); FIELD(TrainArgs, augment_shift);
     FIELD(TrainArgs, augment_flip); FIELD(TrainArgs, label_smoothing);
     FIELD(TrainArgs, lr_plateau_factor); FIELD(TrainArgs, lr_plateau_patience); FIELD(TrainArgs, lr_plateau_min_lr);
+    FIELD(TrainArgs, accumulation_steps); FIELD(TrainArgs, lr_per_step); FIELD(TrainArgs, recompute);
 
     SIZE(EvalMetrics); FIELD(EvalMetrics, reserved); FIELD(EvalMetrics, loss); FIELD(EvalMetrics, accuracy);
 
@@ -122,6 +126,35 @@ int main(void) {
     FIELD(SpingalettGenerateArgs, top_k); FIELD(SpingalettGenerateArgs, top_p); FIELD(SpingalettGenerateArgs, seed);
     FIELD(SpingalettGenerateArgs, stop_tokens); FIELD(SpingalettGenerateArgs, stop_count);
 
+    SIZE(SpingalettSessionOptions); FIELD(SpingalettSessionOptions, reserved);
+    FIELD(SpingalettSessionOptions, max_length); FIELD(SpingalettSessionOptions, sequences);
+    SIZE(SpingalettSessionFeed); FIELD(SpingalettSessionFeed, reserved);
+    FIELD(SpingalettSessionFeed, sequence); FIELD(SpingalettSessionFeed, tokens); FIELD(SpingalettSessionFeed, count);
+    FIELD(SpingalettSessionFeed, logits); FIELD(SpingalettSessionFeed, all);
+    SIZE(SpingalettSessionGenerateArgs); FIELD(SpingalettSessionGenerateArgs, reserved);
+    FIELD(SpingalettSessionGenerateArgs, session); FIELD(SpingalettSessionGenerateArgs, sequences);
+    FIELD(SpingalettSessionGenerateArgs, prompts); FIELD(SpingalettSessionGenerateArgs, prompt_lengths);
+    FIELD(SpingalettSessionGenerateArgs, tokens); FIELD(SpingalettSessionGenerateArgs, made);
+    FIELD(SpingalettSessionGenerateArgs, count); FIELD(SpingalettSessionGenerateArgs, temperature);
+    FIELD(SpingalettSessionGenerateArgs, top_k); FIELD(SpingalettSessionGenerateArgs, top_p);
+    FIELD(SpingalettSessionGenerateArgs, seed); FIELD(SpingalettSessionGenerateArgs, stop_tokens);
+    FIELD(SpingalettSessionGenerateArgs, stop_count);
+    SIZE(SpingalettTokenizerInfo); FIELD(SpingalettTokenizerInfo, reserved);
+    FIELD(SpingalettTokenizerInfo, vocabulary); FIELD(SpingalettTokenizerInfo, added); FIELD(SpingalettTokenizerInfo, bos);
+    FIELD(SpingalettTokenizerInfo, eos); FIELD(SpingalettTokenizerInfo, pad); FIELD(SpingalettTokenizerInfo, unk);
+
+    SIZE(SpingalettTokenizeArgs); FIELD(SpingalettTokenizeArgs, reserved);
+    FIELD(SpingalettTokenizeArgs, tokenizer); FIELD(SpingalettTokenizeArgs, text); FIELD(SpingalettTokenizeArgs, length);
+    FIELD(SpingalettTokenizeArgs, tokens); FIELD(SpingalettTokenizeArgs, capacity); FIELD(SpingalettTokenizeArgs, special);
+    FIELD(SpingalettTokenizeArgs, add_special);
+
+    SIZE(SpingalettDetokenizeArgs); FIELD(SpingalettDetokenizeArgs, reserved);
+    FIELD(SpingalettDetokenizeArgs, tokenizer); FIELD(SpingalettDetokenizeArgs, tokens); FIELD(SpingalettDetokenizeArgs, count);
+    FIELD(SpingalettDetokenizeArgs, text); FIELD(SpingalettDetokenizeArgs, capacity); FIELD(SpingalettDetokenizeArgs, skip_special);
+
+    SIZE(SpingalettPretrainedArgs); FIELD(SpingalettPretrainedArgs, reserved);
+    FIELD(SpingalettPretrainedArgs, path); FIELD(SpingalettPretrainedArgs, context);
+
     SIZE(PredictArgs); FIELD(PredictArgs, reserved);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);
     FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);
@@ -145,7 +178,8 @@ int main(void) {
     FIELD(SpingalettLayerInfo, groups); FIELD(SpingalettLayerInfo, epsilon); FIELD(SpingalettLayerInfo, input_count);
     FIELD(SpingalettLayerInfo, input_layers); FIELD(SpingalettLayerInfo, upsample);
     FIELD(SpingalettLayerInfo, vocabulary); FIELD(SpingalettLayerInfo, heads); FIELD(SpingalettLayerInfo, kv_heads); FIELD(SpingalettLayerInfo, rope_theta);
-    FIELD(SpingalettLayerInfo, causal); FIELD(SpingalettLayerInfo, positions);
+    FIELD(SpingalettLayerInfo, causal); FIELD(SpingalettLayerInfo, positions); FIELD(SpingalettLayerInfo, ignore_padding);
+    FIELD(SpingalettLayerInfo, tied); FIELD(SpingalettLayerInfo, window); FIELD(SpingalettLayerInfo, token_offset);
 
     SIZE(LRScheduleParams); FIELD(LRScheduleParams, reserved);
     FIELD(LRScheduleParams, warmup_epochs); FIELD(LRScheduleParams, step_size);

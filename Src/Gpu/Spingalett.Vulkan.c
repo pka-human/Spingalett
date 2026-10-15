@@ -439,6 +439,11 @@ static bool vkb_host_writes(void) {
     return vkb_open() && gpu.host_writes;
 }
 
+/* (a build whose glslc could not compile a kernel holds an empty module for it) */
+static bool vkb_kernel_built(SpgKernel kernel) {
+    return vkb_open() && kernel < SPG_KERNEL_COUNT && spg_kernel_spirv_size[kernel] > 20u;
+}
+
 /* The pipeline of a kernel with these specialization constants made so far, or VK_NULL_HANDLE (under
    the lock). */
 static VkPipeline made_pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
@@ -471,7 +476,7 @@ static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t coun
     VkComputePipelineCreateInfo cci = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL,
-                  kernel == SPG_KERNEL_gemm_mma && gpu.full_subgroups
+                  (kernel == SPG_KERNEL_gemm_mma || kernel == SPG_KERNEL_flash || kernel == SPG_KERNEL_rattn) && gpu.full_subgroups
                       ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT : 0u,
                   VK_SHADER_STAGE_COMPUTE_BIT, module, "main", count ? &si : NULL},
         .layout = gpu.layout,
@@ -951,8 +956,8 @@ static bool vkb_wait(void *c_) {
 
 const SpgGpuOps spg_vulkan_ops = {
     vkb_open, vkb_device_name, vkb_memory, vkb_shared_memory, vkb_subgroup_size, vkb_max_workgroups, vkb_mma_bf16,
-    vkb_bf16_storage, vkb_host_writes, vkb_buffer_create, vkb_buffer_free, vkb_arena_create, vkb_arena_add,
-    vkb_arena_commit, vkb_arena_free, vkb_commands_create, vkb_commands_free, vkb_commands_untimed,
+    vkb_bf16_storage, vkb_host_writes, vkb_kernel_built, vkb_buffer_create, vkb_buffer_free, vkb_arena_create,
+    vkb_arena_add, vkb_arena_commit, vkb_arena_free, vkb_commands_create, vkb_commands_free, vkb_commands_untimed,
     vkb_commands_stamps, vkb_timestamp, vkb_timestamps, vkb_record_begin, vkb_dispatch, vkb_prepare, vkb_barrier,
     vkb_barrier_host, vkb_copy, vkb_fill, vkb_record_end, vkb_submit, vkb_wait,
 };

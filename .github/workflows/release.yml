@@ -184,10 +184,20 @@ jobs:
             fi
           done
 
+      # (a failure's first errors also as annotations, which the API gives without signing in)
       - name: Build
         run: |
-          cmake --build Build --parallel
-          cmake --build BuildRuntime --parallel
+          for build in Build BuildRuntime; do
+            status=0
+            cmake --build $build --parallel > build.log 2>&1 || status=$?
+            cat build.log
+            if [ "$status" -ne 0 ]; then
+              grep -m8 -E "error|Error|undefined reference|FAILED" build.log | while IFS= read -r line; do
+                echo "::error::$build: ${line:0:900}"
+              done
+              exit 1
+            fi
+          done
 
       - name: Test
         run: |
@@ -589,6 +599,39 @@ jobs:
           path: spingalett-*-inference-engine.zip
           if-no-files-found: error
 
+  # the engine in WebAssembly: the JavaScript package (npm pack: the module, index.js, its types) and the
+  # module alone, attached to the release (publishing the package on npm takes the maintainer's account)
+  javascript:
+    needs: version
+    if: needs.version.outputs.binaries == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build, test, pack
+        working-directory: Bindings/JavaScript
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld
+          sh build.sh
+          CC=gcc npm test
+          version=${{ needs.version.outputs.version }}
+          test "$(node -p 'require("./package.json").version')" = "$version"     # the package's is the library's
+          npm pack
+          cp spingalett.wasm "spingalett-$version.wasm"
+          ls -l "spingalett-$version.tgz" "spingalett-$version.wasm"
+          tar -tzf "spingalett-$version.tgz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-javascript
+          path: |
+            Bindings/JavaScript/spingalett-*.tgz
+            Bindings/JavaScript/spingalett-*.wasm
+          if-no-files-found: error
+
   # the DigitPad model, trained once for the AppImage and the Windows zip
   model:
     needs: version
@@ -702,13 +745,14 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   publish:
-    needs: [version, package, wheels, sdist, engine, model, appimage, digitpad-windows, bindings]
+    needs: [version, package, wheels, sdist, engine, javascript, model, appimage, digitpad-windows, bindings]
     if: >-
       always() && needs.version.outputs.publish == 'true' &&
       (needs.bindings.result == 'success' || needs.bindings.result == 'skipped') &&
       (needs.package.result == 'success' || needs.package.result == 'skipped') &&
       (needs.wheels.result == 'success' || needs.wheels.result == 'skipped') &&
       (needs.engine.result == 'success' || needs.engine.result == 'skipped') &&
+      (needs.javascript.result == 'success' || needs.javascript.result == 'skipped') &&
       (needs.model.result == 'success' || needs.model.result == 'skipped') &&
       (needs.appimage.result == 'success' || needs.appimage.result == 'skipped') &&
       (needs.digitpad-windows.result == 'success' || needs.digitpad-windows.result == 'skipped')

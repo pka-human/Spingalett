@@ -18,6 +18,10 @@ MIRRORS = {
     "SpingalettTargetSet": sg._TargetSet, "DatasetReaderOptions": sg._DatasetReaderOptions,
     "SpingalettModel": sg._Model, "SpingalettLayerInfo": sg._LayerInfo,
     "SpingalettTokenReaderOptions": sg._TokenReaderOptions, "SpingalettGenerateArgs": sg._GenerateArgs,
+    "SpingalettSessionOptions": sg._SessionOptions, "SpingalettSessionFeed": sg._SessionFeed,
+    "SpingalettSessionGenerateArgs": sg._SessionGenerateArgs,
+    "SpingalettTokenizerInfo": sg._TokenizerInfo, "SpingalettTokenizeArgs": sg._TokenizeArgs,
+    "SpingalettDetokenizeArgs": sg._DetokenizeArgs, "SpingalettPretrainedArgs": sg._PretrainedArgs,
 }
 
 lines = subprocess.run([sys.argv[1]], check=True, capture_output=True, text=True).stdout.splitlines()

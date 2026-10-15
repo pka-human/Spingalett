@@ -96,6 +96,14 @@ public sealed unsafe class Layer
     public Layer Causal(bool causal = true) { Args.causal = (byte)(causal ? 1 : 0); return this; }
     public Layer RopeTheta(float theta) { Args.rope_theta = theta; return this; }
     public Layer Positions(bool positions = true) { Args.positions = (byte)(positions ? 1 : 0); return this; }
+    /// <summary>A linear layer computing with the table of the embedding of this index (tied embeddings).</summary>
+    public Layer Tied(uint embedding) { Args.tied = embedding; return this; }
+    /// <summary>Attention: keys of padding (tokens of -1) left out (sequences of different lengths in one batch).</summary>
+    public Layer IgnorePadding(bool ignore = true) { Args.ignore_padding = (byte)(ignore ? 1 : 0); return this; }
+    /// <summary>Attention: a sliding window, keys less than this many cells away (0: every key).</summary>
+    public Layer Window(uint window) { Args.window = window; return this; }
+    /// <summary>An embedding of part of its input: count tokens (0: the rest) from value offset on.</summary>
+    public Layer Tokens(uint offset, uint count = 0) { Args.token_offset = offset; Args.token_count = count; return this; }
     /// <summary>The layers it reads (indices that Network.Add returned); none: the last one.</summary>
     public Layer Inputs(params uint[] inputs)
     {
@@ -121,6 +129,10 @@ public sealed record TrainOptions
     public float MaxGradNorm { get; init; }
     public float LabelSmoothing { get; init; }
     public bool NoShuffle { get; init; }
+    /// <summary>Gradient accumulation: an optimizer step after every this many mini-batches (0 or 1: every one).</summary>
+    public uint AccumulationSteps { get; init; }
+    /// <summary>Activation recomputation on the CPU: less memory, a forward pass more, the same results.</summary>
+    public bool Recompute { get; init; }
 }
 
 public readonly record struct TrainResult(bool Completed, int EpochsRun, float TrainLoss);
@@ -157,6 +169,25 @@ public sealed unsafe class Network : IDisposable
     {
         nint ptr = Lib.spingalett_load(path);
         return ptr != 0 ? new Network(ptr) : throw SpingalettException.Last("load failed");
+    }
+
+    /// <summary>A language model as a network: a Hugging Face model directory (config.json and safetensors weights,
+    /// sharded or not; llama, mistral, qwen2, gpt2) or a GGUF file (llama, qwen2, gpt2; weights dequantized from F32
+    /// to the k-quants). `context` is its window of tokens (0: the model's positions, LLaMA's at most 2048); the
+    /// network gives every position's logits. Its tokenizer: Tokenizer.Load on the same path.</summary>
+    public static Network FromPretrained(string path, uint context = 0)
+    {
+        nint name = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            Lib.spingalett_clear_error();
+            nint ptr = Lib.spingalett_load_pretrained_args(new PretrainedArgs { path = name, context = context });
+            return ptr != 0 ? new Network(ptr) : throw SpingalettException.Last("spingalett_load_pretrained failed");
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(name);
+        }
     }
 
     nint Ptr => _ptr != 0 ? _ptr : throw new ObjectDisposedException(nameof(Network));
@@ -196,6 +227,8 @@ public sealed unsafe class Network : IDisposable
         beta2 = o.Beta2,
         max_grad_norm = o.MaxGradNorm,
         label_smoothing = o.LabelSmoothing,
+        accumulation_steps = o.AccumulationSteps,
+        recompute = (byte)(o.Recompute ? 1 : 0),
     };
 
     static TrainResult Run(TrainArgs args)
@@ -380,4 +413,117 @@ public sealed unsafe class Model : IDisposable
     }
 
     ~Model() { if (_ptr != 0) Lib.spingalett_model_free(_ptr); }
+}
+
+/// <summary>The tokenizer of a language model: a Hugging Face tokenizer.json file, a model directory holding one (its
+/// tokenizer_config.json names BOS and EOS) or a GGUF file. Byte-level BPE (GPT-2, SmolLM), tiktoken's encodings
+/// (LLaMA 3, Qwen2) and SentencePiece's BPE (LLaMA 2, Mistral, Phi-3), encoding and decoding as Hugging Face's
+/// tokenizers library does. Read-only once loaded: threads may share one.</summary>
+public sealed unsafe class Tokenizer : IDisposable
+{
+    nint _ptr;
+
+    Tokenizer(nint ptr) { _ptr = ptr; }
+
+    /// <summary>A tokenizer.json file, a model directory or a GGUF file.</summary>
+    public static Tokenizer Load(string path)
+    {
+        Lib.spingalett_clear_error();
+        nint ptr = Lib.spingalett_tokenizer_load(path);
+        return ptr != 0 ? new Tokenizer(ptr) : throw SpingalettException.Last("spingalett_tokenizer_load failed");
+    }
+
+    /// <summary>The bytes of a tokenizer.json file or of a GGUF file.</summary>
+    public static Tokenizer FromBytes(byte[] data)
+    {
+        Lib.spingalett_clear_error();
+        fixed (byte* d = data)
+        {
+            nint ptr = Lib.spingalett_tokenizer_from_memory(d, (nuint)data.Length);
+            return ptr != 0 ? new Tokenizer(ptr) : throw SpingalettException.Last("spingalett_tokenizer_from_memory failed");
+        }
+    }
+
+    nint Ptr => _ptr != 0 ? _ptr : throw new ObjectDisposedException(nameof(Tokenizer));
+
+    /// <summary>The ids of a text. `special`: special tokens written in it ("&lt;|im_start|&gt;") become their ids
+    /// (otherwise they are text, so that text from users cannot forge them); `addSpecial`: the tokens the tokenizer
+    /// adds around a text (LLaMA's BOS).</summary>
+    public uint[] Encode(string text, bool special = false, bool addSpecial = false)
+    {
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text + "\0");
+        int length = bytes.Length - 1;
+        var tokens = new uint[length + 16];
+        while (true)
+        {
+            fixed (byte* t = bytes)
+            fixed (uint* ids = tokens)
+            {
+                var args = new TokenizeArgs
+                {
+                    tokenizer = Ptr, text = (nint)t, length = (nuint)length, tokens = (nint)ids, capacity = (nuint)tokens.Length,
+                    special = (byte)(special ? 1 : 0), add_special = (byte)(addSpecial ? 1 : 0),
+                };
+                Lib.spingalett_clear_error();
+                long count = Lib.spingalett_tokenize_args(args);
+                if (count < 0) throw SpingalettException.Last("spingalett_tokenize failed");
+                if (count <= tokens.Length) return tokens[..(int)count];
+                tokens = new uint[count];
+            }
+        }
+    }
+
+    /// <summary>The text of ids (`skipSpecial`: without the special tokens); bytes that are no UTF-8, as a character
+    /// split between tokens, become U+FFFD.</summary>
+    public string Decode(uint[] ids, bool skipSpecial = false)
+    {
+        var text = new byte[4 * ids.Length + 64];
+        while (true)
+        {
+            fixed (uint* t = ids)
+            fixed (byte* s = text)
+            {
+                var args = new DetokenizeArgs
+                {
+                    tokenizer = Ptr, tokens = (nint)t, count = (nuint)ids.Length, text = (nint)s, capacity = (nuint)text.Length,
+                    skip_special = (byte)(skipSpecial ? 1 : 0),
+                };
+                Lib.spingalett_clear_error();
+                long size = Lib.spingalett_detokenize_args(args);
+                if (size < 0) throw SpingalettException.Last("spingalett_detokenize failed");
+                if (size < text.Length) return System.Text.Encoding.UTF8.GetString(text, 0, (int)size);
+                text = new byte[size + 1];
+            }
+        }
+    }
+
+    /// <summary>The token of an id as the vocabulary writes it ("Ġthe", "▁the", "&lt;|im_start|&gt;"), null for no
+    /// token.</summary>
+    public string? Token(uint id) => Marshal.PtrToStringUTF8(Lib.spingalett_tokenizer_token(Ptr, id));
+
+    /// <summary>The id of a token as the vocabulary writes it (added tokens first), null when there is none.</summary>
+    public uint? Id(string token)
+    {
+        uint id = Lib.spingalett_tokenizer_id(Ptr, token);
+        return id == Const.NoToken ? null : id;
+    }
+
+    static uint? Known(uint id) => id == Const.NoToken ? null : id;
+
+    /// <summary>Token ids: the largest one + 1.</summary>
+    public uint Vocabulary => Lib.spingalett_tokenizer_info(Ptr).vocabulary;
+    public uint Added => Lib.spingalett_tokenizer_info(Ptr).added;
+    public uint? Bos => Known(Lib.spingalett_tokenizer_info(Ptr).bos);
+    public uint? Eos => Known(Lib.spingalett_tokenizer_info(Ptr).eos);
+    public uint? Pad => Known(Lib.spingalett_tokenizer_info(Ptr).pad);
+    public uint? Unk => Known(Lib.spingalett_tokenizer_info(Ptr).unk);
+
+    public void Dispose()
+    {
+        if (_ptr != 0) Lib.spingalett_tokenizer_free(_ptr);
+        _ptr = 0;
+        GC.SuppressFinalize(this);
+    }
+
+    ~Tokenizer() { if (_ptr != 0) Lib.spingalett_tokenizer_free(_ptr); }
 }

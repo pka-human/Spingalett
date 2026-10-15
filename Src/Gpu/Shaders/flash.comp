@@ -1,0 +1,534 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * flash: attn.comp's FORWARD, DQ and DKV on the matrix units (VK_KHR_cooperative_matrix, 16 x 16 x 16 products
+ * of bfloat16 adding in single precision), for networks whose products are in bfloat16; Src/Gpu/Cuda/flash.cu
+ * computes the same on CUDA. A subgroup takes 16 rows (queries, or keys in DKV), a workgroup WARPS of them;
+ * the other side's tiles of BT rows pass through shared memory (rows of D + 8 bfloat16). Queries and keys are
+ * rotated (ROPE) and rounded to bfloat16 as they are loaded; the scores are scaled in single precision.
+ *
+ *   FORWARD  S = Q K^T a tile of keys at a time; the online softmax in shared memory (where an accumulator keeps
+ *            which of its values is not said, its scores are stored and each row is read by SG / 16 invocations
+ *            of the subgroup, its maximum and sum combined over them in a fixed pattern), P written as bfloat16
+ *            and loaded back as the left operand of O += P V; the accumulators of O scaled by the rows' factors
+ *            through an accumulator of a factor a row (loaded with a stride of 0), as their elements' rows are
+ *            not known. y = O / sum, and the log sum with STATS.
+ *   DQ       per block of 16 keys: S and dP = dO V^T, stored; P = exp(S - lse), dS = P (dP - rowsum(dO o)) as
+ *            bfloat16; then dQ += dS K over the tile.
+ *   DKV      per tile of queries (the group's query heads and tiles in order), per block of 16 queries: S^T = K
+ *            Q^T and dP^T = V dO^T, stored; P^T and dS^T as bfloat16; then dV += P^T dO, dK += dS^T Q.
+ *
+ * Tiles of activations kept as bfloat16 load sixteen bytes a thread at a time, the next tile of the loop into
+ * registers while the workgroup computes on the current one (rotated as they go to shared memory); tiles of
+ * floats load as they are needed.
+ *
+ * Every product adds its 16 values of k at a time in the order of k (keys, queries, or the head's values),
+ * every row's sums are combined in the same pattern: the same bits on every run. Spec: OP, D (32, 64, 128),
+ * WARPS, BT, SG (the subgroup size, 16 or more), HALF (words: x 0, y 1, dy 2, dx 3), THREADS (WARPS SG).
+ * Shared memory (bytes): 4 BT SD (the tiles) + 2 WARPS NP 16 PS (P) + 16 WARPS FS (scratch of vec4) + 64 WARPS
+ * with FORWARD (the rows' factors) + 8 BT with DKV (the tile's statistics), as flash_shared() in
+ * Spingalett.Gpu.c counts them.
+ */
+
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#define SPG_HALF
+#include "common.glsl"
+
+/* (the defaults are those of the most shared memory: some drivers size it before specialization) */
+layout(constant_id = 0) const uint OP = 3;
+layout(constant_id = 1) const uint D = 64;
+layout(constant_id = 2) const uint WARPS = 4;
+layout(constant_id = 3) const uint BT = 64;
+layout(constant_id = 4) const uint SG = 32;
+layout(constant_id = 5) const uint HALF = 0;
+layout(constant_id = 6) const uint THREADS = 128;
+layout(local_size_x_id = 6) in;
+
+#define FORWARD 0u
+#define DQ      2u
+#define DKV     3u
+#define FLAG_CAUSAL 1u
+#define FLAG_ROPE   2u
+#define FLAG_STATS  4u
+
+layout(push_constant) uniform Push {
+    F32 x, y, dy, dx, stats, table;
+    uint n, cells, heads, kv, d, flags;
+    float scale;
+} p;
+
+#include "half.glsl"
+
+/* Eight bfloat16 as they are in memory, sixteen bytes at a time. */
+struct Raw8 { u16vec4 lo, hi; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer R8 { Raw8 v[]; };
+
+const uint SD = D + 8u;                         /* bfloat16 a row of a tile */
+const uint PS = (BT > D ? BT : D) + 8u;         /* and of a subgroup's P (which also stages its own rows) */
+const uint NP = OP == DKV ? 2u : 1u;            /* P tiles a subgroup: P^T and dS^T in DKV */
+const uint FB = 20u;                            /* floats a row of a stored 16 x 16 block (rows in distinct banks) */
+/* floats of a subgroup's scratch: FORWARD's scores (16 rows of BT + 4), else two 16 x 16 blocks */
+const uint FS = OP == FORWARD ? (16u * (BT + 4u) > 2u * 16u * FB ? 16u * (BT + 4u) : 2u * 16u * FB) : 2u * 16u * FB;
+const uint KS = D / 16u, DT = D / 16u, BB = BT / 16u;
+const uint TPR = SG / 16u;                      /* invocations a row of a subgroup's 16 */
+const uint CPL = BT / TPR;                      /* FORWARD: scores of a row an invocation takes */
+const uint NCH = BT * D / 8u / THREADS;         /* chunks of eight values of a tile a thread loads */
+
+shared bf16vec4 sT[BT * SD / 4u], sU[BT * SD / 4u];
+shared bf16vec4 sP[WARPS * NP * 16u * PS / 4u];
+shared vec4 sS[WARPS * FS / 4u];
+shared float sV[OP == FORWARD ? WARPS * 16u : 1u];
+shared float sL[OP == DKV ? BT : 1u], sDl[OP == DKV ? BT : 1u];
+
+const float NEG = -3.402823466e38;
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MATA coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+/* Eight values of x from index at on (a multiple of eight), floats or bfloat16 (word w of HALF) */
+void load8(F32 x, uint at, uint w, out vec4 lo, out vec4 hi) {
+    if (((HALF >> w) & 1u) != 0u) {
+        const Raw8 r = R8(x).v[at >> 3];
+        lo = vec4(uintBitsToBFloat16EXT(r.lo));
+        hi = vec4(uintBitsToBFloat16EXT(r.hi));
+    } else {
+        lo = F32x4(x).v[at >> 2];
+        hi = F32x4(x).v[(at >> 2) + 1u];
+    }
+}
+
+/* the rotation of values c .. c + 7 (a) and c + D / 2 .. (b) of a vector at position pos (ROPE) */
+void rotate8(uint pos, uint c, inout vec4 a0, inout vec4 a1, inout vec4 b0, inout vec4 b1) {
+    const uint at = pos * (D / 2u) + c, sn = p.cells * (D / 2u);
+    const vec4 c0 = F32x4(p.table).v[at >> 2], c1 = F32x4(p.table).v[(at >> 2) + 1u];
+    const vec4 s0 = F32x4(p.table).v[(sn + at) >> 2], s1 = F32x4(p.table).v[((sn + at) >> 2) + 1u];
+    const vec4 x0 = a0, x1 = a1;
+    a0 = x0 * c0 - b0 * s0;
+    a1 = x1 * c1 - b1 * s1;
+    b0 = b0 * c0 + x0 * s0;
+    b1 = b1 * c1 + x1 * s1;
+}
+
+/* Rows r0 .. r0 + count - 1 (of the sample's cells; zeros past them) of a head (values `head` on of rows of
+   `stride`) of x into rows of `pitch` bfloat16 of a shared tile from `base` (in bfloat16, a multiple of four),
+   rotated with rotate (ROPE), by `threads` invocations from `first`: eight values (with ROPE a chunk and its
+   pair of the other half of the vector) an invocation at a time. */
+void load_rows(bool to_t, uint base, uint pitch, uint s, uint r0, uint count, uint head, uint stride, F32 x, uint w,
+               bool rotate, uint first, uint threads) {
+    const bool rope = rotate && (p.flags & FLAG_ROPE) != 0u;
+    const uint chunks = rope ? D / 16u : D / 8u;
+    for (uint e = first; e < count * chunks; e += threads) {
+        const uint row = e / chunks, c = 8u * (e % chunks), pos = r0 + row;
+        vec4 a0 = vec4(0.0), a1 = vec4(0.0), b0 = vec4(0.0), b1 = vec4(0.0);
+        if (pos < p.cells) {
+            const uint at = (s * p.cells + pos) * stride + head + c;
+            load8(x, at, w, a0, a1);
+            if (rope) {
+                load8(x, at + D / 2u, w, b0, b1);
+                rotate8(pos, c, a0, a1, b0, b1);
+            }
+        }
+        const uint i = (base + row * pitch + c) >> 2;
+        if (to_t) {
+            sT[i] = bf16vec4(a0);
+            sT[i + 1u] = bf16vec4(a1);
+            if (rope) {
+                sT[i + D / 8u] = bf16vec4(b0);
+                sT[i + D / 8u + 1u] = bf16vec4(b1);
+            }
+        } else {
+            sP[i] = bf16vec4(a0);
+            sP[i + 1u] = bf16vec4(a1);
+            if (rope) {
+                sP[i + D / 8u] = bf16vec4(b0);
+                sP[i + D / 8u + 1u] = bf16vec4(b1);
+            }
+        }
+    }
+}
+
+/* the same into sU (no rotation) */
+void load_rows_u(uint s, uint r0, uint head, uint stride, F32 x, uint w) {
+    for (uint e = gl_LocalInvocationID.x; e < BT * (D / 8u); e += THREADS) {
+        const uint row = e / (D / 8u), c = 8u * (e % (D / 8u)), pos = r0 + row;
+        vec4 a0 = vec4(0.0), a1 = vec4(0.0);
+        if (pos < p.cells) load8(x, (s * p.cells + pos) * stride + head + c, w, a0, a1);
+        const uint i = (row * SD + c) >> 2;
+        sU[i] = bf16vec4(a0);
+        sU[i + 1u] = bf16vec4(a1);
+    }
+}
+
+/* A tile of BT rows from r0 of a head kept as bfloat16 into this invocation's registers: chunk k is chunk
+   e = tid + THREADS k of the tile, row e / (D / 8), values 8 (e % (D / 8)) on; with rope chunks in pairs,
+   e = tid + THREADS (k / 2) of row e / (D / 16), values c = 8 (e % (D / 16)) (k even) and c + D / 2 (k odd).
+   Zeros past the cells. */
+void fetch_tile(uint s, uint r0, uint head, uint stride, F32 x, bool rope, out Raw8 v[NCH]) {
+    [[unroll]] for (uint k = 0u; k < NCH; k++) {
+        const uint e = gl_LocalInvocationID.x + THREADS * (rope ? k / 2u : k);
+        const uint row = rope ? e / (D / 16u) : e / (D / 8u);
+        const uint c = rope ? 8u * (e % (D / 16u)) + (k & 1u) * (D / 2u) : 8u * (e % (D / 8u)), pos = r0 + row;
+        v[k] = Raw8(u16vec4(0us), u16vec4(0us));
+        if (pos < p.cells) v[k] = R8(x).v[((s * p.cells + pos) * stride + head + c) >> 3];
+    }
+}
+
+/* and from the registers into sT (to_t) or sU, rotated with rope (ROPE) as load_rows() rotates */
+void put_tile(bool to_t, uint r0, bool rope, Raw8 v[NCH]) {
+    if (!(rope && (p.flags & FLAG_ROPE) != 0u)) {
+        [[unroll]] for (uint k = 0u; k < NCH; k++) {
+            const uint e = gl_LocalInvocationID.x + THREADS * (rope ? k / 2u : k);
+            const uint row = rope ? e / (D / 16u) : e / (D / 8u);
+            const uint c = rope ? 8u * (e % (D / 16u)) + (k & 1u) * (D / 2u) : 8u * (e % (D / 8u));
+            const uint i = (row * SD + c) >> 2;
+            if (to_t) {
+                sT[i] = uintBitsToBFloat16EXT(v[k].lo);
+                sT[i + 1u] = uintBitsToBFloat16EXT(v[k].hi);
+            } else {
+                sU[i] = uintBitsToBFloat16EXT(v[k].lo);
+                sU[i + 1u] = uintBitsToBFloat16EXT(v[k].hi);
+            }
+        }
+        return;
+    }
+    [[unroll]] for (uint k = 0u; k < NCH; k += 2u) {
+        const uint e = gl_LocalInvocationID.x + THREADS * (k / 2u), row = e / (D / 16u), c = 8u * (e % (D / 16u));
+        const uint i = (row * SD + c) >> 2;
+        vec4 a0 = vec4(uintBitsToBFloat16EXT(v[k].lo)), a1 = vec4(uintBitsToBFloat16EXT(v[k].hi));
+        vec4 b0 = vec4(uintBitsToBFloat16EXT(v[k + 1u].lo)), b1 = vec4(uintBitsToBFloat16EXT(v[k + 1u].hi));
+        if (r0 + row < p.cells) rotate8(r0 + row, c, a0, a1, b0, b1);
+        sT[i] = bf16vec4(a0);
+        sT[i + 1u] = bf16vec4(a1);
+        sT[i + D / 8u] = bf16vec4(b0);
+        sT[i + D / 8u + 1u] = bf16vec4(b1);
+    }
+}
+
+/* Eight results of a row (values c .. c + 7) of a head of dx (or y) at index at: sixteen bytes of bfloat16 or
+   two vec4 of floats */
+void store8(F32 x, uint at, uint w, vec4 lo, vec4 hi) {
+    if (((HALF >> w) & 1u) != 0u) {
+        R8(x).v[at >> 3] = Raw8(u16vec4(to_bf16(lo.x), to_bf16(lo.y), to_bf16(lo.z), to_bf16(lo.w)),
+                                u16vec4(to_bf16(hi.x), to_bf16(hi.y), to_bf16(hi.z), to_bf16(hi.w)));
+    } else {
+        F32x4(x).v[at >> 2] = lo;
+        F32x4(x).v[(at >> 2) + 1u] = hi;
+    }
+}
+
+void sync_subgroup() {
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
+
+/* Accumulators acc[j] and acc[j + D / 32] (values 16 j .. and the other half of the vector's) of a subgroup's
+   16 rows through its scratch into dx (or y, word w) at rows of `stride` from row0 of sample s, values head on,
+   times `scale`, rotated back with rotate (ROPE): every pair of blocks of the head. */
+void store_rows(ACC acc[DT], uint sub, uint lane, uint s, uint row0, uint head, uint stride, F32 x, uint w,
+                float scale, bool rotate) {
+    const uint fs = sub * (FS / 4u), r = lane % 16u, h = lane / 16u, i = row0 + r, half_ = DT / 2u;
+    const bool rope = rotate && (p.flags & FLAG_ROPE) != 0u;
+    [[unroll]] for (uint j = 0u; j < half_; j++) {
+        coopMatStore(acc[j], sS, fs, FB / 4u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc[j + half_], sS, fs + 16u * FB / 4u, FB / 4u, gl_CooperativeMatrixLayoutRowMajor);
+        sync_subgroup();
+        /* invocation (r, h): row r, values 8 h .. of the block and of its pair (SG 32; others in turns) */
+        for (uint q = h; q < 2u; q += TPR) {
+            vec4 a0 = sS[fs + (r * FB + 8u * q) / 4u] * scale, a1 = sS[fs + (r * FB + 8u * q + 4u) / 4u] * scale;
+            vec4 b0 = sS[fs + (16u * FB + r * FB + 8u * q) / 4u] * scale;
+            vec4 b1 = sS[fs + (16u * FB + r * FB + 8u * q + 4u) / 4u] * scale;
+            const uint c = 16u * j + 8u * q;
+            if (i < p.cells) {
+                if (rope) {
+                    /* (the inverse rotation: a cos + b sin, b cos - a sin) */
+                    const uint at = i * (D / 2u) + c, sn = p.cells * (D / 2u);
+                    const vec4 c0 = F32x4(p.table).v[at >> 2], c1 = F32x4(p.table).v[(at >> 2) + 1u];
+                    const vec4 s0 = F32x4(p.table).v[(sn + at) >> 2], s1 = F32x4(p.table).v[((sn + at) >> 2) + 1u];
+                    const vec4 x0 = a0, x1 = a1;
+                    a0 = x0 * c0 + b0 * s0;
+                    a1 = x1 * c1 + b1 * s1;
+                    b0 = b0 * c0 - x0 * s0;
+                    b1 = b1 * c1 - x1 * s1;
+                }
+                const uint at = (s * p.cells + i) * stride + head + c;
+                store8(x, at, w, a0, a1);
+                store8(x, at + D / 2u, w, b0, b1);
+            }
+        }
+        sync_subgroup();
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, sub = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint C = (p.heads + 2u * p.kv) * D, out_c = p.heads * D, group = p.heads / p.kv;
+    const bool causal = (p.flags & FLAG_CAUSAL) != 0u;
+    const float scale = p.scale;
+    const uint s = gl_WorkGroupID.z, rows_all = p.n * p.heads * p.cells, ROWS = 16u * WARPS;
+    const uint r = lane % 16u, h = lane / 16u;          /* this invocation's row of the subgroup's, and part */
+    const uint pbase = sub * NP * 16u * PS;              /* the subgroup's P (bfloat16) */
+    const uint fs = sub * (FS / 4u);                     /* and scratch (vec4) */
+    if (OP == FORWARD || OP == DQ) {
+        const uint hq = gl_WorkGroupID.y, kh = hq / group, i0 = gl_WorkGroupID.x * ROWS, q0 = i0 + 16u * sub;
+        /* the subgroup's queries (and with DQ the outputs' gradient) through its P into registers */
+        MATA qa[KS], da[OP == DQ ? KS : 1u];
+        load_rows(false, pbase, PS, s, q0, 16u, hq * D, C, p.x, 0u, true, lane, SG);
+        sync_subgroup();
+        [[unroll]] for (uint k = 0u; k < KS; k++)
+            coopMatLoad(qa[k], sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+        if (OP == DQ) {
+            sync_subgroup();
+            load_rows(false, pbase, PS, s, q0, 16u, hq * D, out_c, p.dy, 2u, false, lane, SG);
+            sync_subgroup();
+            [[unroll]] for (uint k = 0u; k < KS; k++)
+                coopMatLoad(da[k], sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        sync_subgroup();
+        const uint row = q0 + r, sa = (s * p.heads + hq) * p.cells;
+        float lse = 0.0, del = 0.0;
+        if (OP == DQ && row < p.cells) {
+            lse = p.stats.v[sa + row];
+            del = p.stats.v[rows_all + sa + row];
+        }
+        ACC o[DT];
+        [[unroll]] for (uint j = 0u; j < DT; j++) o[j] = ACC(0.0);
+        float m = NEG, l = 0.0;                         /* (FORWARD: the row's maximum, this invocation's part of its sum) */
+        const uint keys = causal ? min(p.cells, i0 + ROWS) : p.cells;
+        const bool fast = (HALF & 1u) != 0u;            /* (x kept as bfloat16: its tiles a step ahead) */
+        Raw8 rk[NCH], rv[NCH];
+        if (fast) {
+            fetch_tile(s, 0u, (p.heads + kh) * D, C, p.x, true, rk);
+            fetch_tile(s, 0u, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+        }
+        for (uint j0 = 0u; j0 < keys; j0 += BT) {
+            barrier();
+            if (fast) {
+                put_tile(true, j0, true, rk);
+                put_tile(false, j0, false, rv);
+            } else {
+                load_rows(true, 0u, SD, s, j0, BT, (p.heads + kh) * D, C, p.x, 0u, true, tid, THREADS);
+                load_rows_u(s, j0, (p.heads + p.kv + kh) * D, C, p.x, 0u);
+            }
+            barrier();
+            if (fast && j0 + BT < keys) {
+                fetch_tile(s, j0 + BT, (p.heads + kh) * D, C, p.x, true, rk);
+                fetch_tile(s, j0 + BT, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+            }
+            /* (causal: a tile of keys all after the subgroup's queries adds nothing to them) */
+            if (causal && j0 >= q0 + 16u) continue;
+            if (OP == FORWARD) {
+                ACC sc[BB];
+                [[unroll]] for (uint j = 0u; j < BB; j++) sc[j] = ACC(0.0);
+                [[unroll]] for (uint k = 0u; k < KS; k++)
+                    [[unroll]] for (uint j = 0u; j < BB; j++) {
+                        MATB b;
+                        coopMatLoad(b, sT, (16u * j * SD + 16u * k) / 4u, SD / 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                        sc[j] = coopMatMulAdd(qa[k], b, sc[j]);
+                    }
+                [[unroll]] for (uint j = 0u; j < BB; j++)
+                    coopMatStore(sc[j], sS, fs + 4u * j, (BT + 4u) / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                sync_subgroup();
+                /* the row's scores: this invocation's BT / TPR of them (columns h BT / TPR ..), scaled and masked */
+                const uint c0 = h * CPL;
+                vec4 v[CPL / 4u];
+                float top = NEG;
+                const bool edge = j0 + BT > p.cells || q0 + 16u > p.cells || (causal && j0 + BT - 1u > q0);
+                [[unroll]] for (uint e = 0u; e < CPL / 4u; e++) {
+                    vec4 x = sS[fs + (r * (BT + 4u) + c0 + 4u * e) / 4u] * scale;
+                    if (edge)
+                        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                            const uint key = j0 + c0 + 4u * e + k;
+                            if (!(key < p.cells && row < p.cells && (!causal || key <= row))) x[k] = NEG;
+                        }
+                    v[e] = x;
+                    top = max(top, max(max(x.x, x.y), max(x.z, x.w)));
+                }
+                for (uint o_ = 16u; o_ < SG; o_ <<= 1) top = max(top, subgroupShuffleXor(top, o_));
+                const float mnew = max(m, top), alpha = mnew == NEG ? 1.0 : exp(m - mnew);
+                float sum = 0.0;
+                [[unroll]] for (uint e = 0u; e < CPL / 4u; e++) {
+                    vec4 pe = exp(v[e] - mnew);
+                    if (edge)
+                        [[unroll]] for (uint k = 0u; k < 4u; k++)
+                            if (v[e][k] == NEG) pe[k] = 0.0;
+                    sum += (pe.x + pe.y) + (pe.z + pe.w);
+                    sP[(pbase + r * PS + c0 + 4u * e) / 4u] = bf16vec4(pe);
+                }
+                l = l * alpha + sum;
+                m = mnew;
+                if (h == 0u) sV[16u * sub + r] = alpha;
+                sync_subgroup();
+                /* O times the rows' factors, then O += P V */
+                ACC f;
+                coopMatLoad(f, sV, 16u * sub, 0u, gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint j = 0u; j < DT; j++) o[j] = o[j] * f;
+                [[unroll]] for (uint k = 0u; k < BB; k++) {
+                    MATA a;
+                    coopMatLoad(a, sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (uint j = 0u; j < DT; j++) {
+                        MATB b;
+                        coopMatLoad(b, sU, (16u * k * SD + 16u * j) / 4u, SD / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                        o[j] = coopMatMulAdd(a, b, o[j]);
+                    }
+                }
+            } else {
+                /* DQ: per block of 16 keys, S and dP, then dS = P (dP - delta) as bfloat16 */
+                [[unroll]] for (uint jb = 0u; jb < BB; jb++) {
+                    ACC sc = ACC(0.0), dp = ACC(0.0);
+                    [[unroll]] for (uint k = 0u; k < KS; k++) {
+                        MATB b;
+                        coopMatLoad(b, sT, (16u * jb * SD + 16u * k) / 4u, SD / 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                        sc = coopMatMulAdd(qa[k], b, sc);
+                        coopMatLoad(b, sU, (16u * jb * SD + 16u * k) / 4u, SD / 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                        dp = coopMatMulAdd(da[k], b, dp);
+                    }
+                    coopMatStore(sc, sS, fs, FB / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatStore(dp, sS, fs + 16u * FB / 4u, FB / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                    sync_subgroup();
+                    for (uint q = h; q < 4u; q += TPR) {        /* row r, keys 4 q .. 4 q + 3 of the block */
+                        const vec4 x = sS[fs + (r * FB + 4u * q) / 4u], y = sS[fs + (16u * FB + r * FB + 4u * q) / 4u];
+                        vec4 ds;
+                        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                            const uint key = j0 + 16u * jb + 4u * q + k;
+                            const bool valid = key < p.cells && row < p.cells && (!causal || key <= row);
+                            const float pv = valid ? exp(x[k] * scale - lse) : 0.0;
+                            ds[k] = pv * (y[k] - del);
+                        }
+                        sP[(pbase + r * PS + 16u * jb + 4u * q) / 4u] = bf16vec4(ds);
+                    }
+                    sync_subgroup();
+                }
+                /* dQ += dS K */
+                [[unroll]] for (uint k = 0u; k < BB; k++) {
+                    MATA a;
+                    coopMatLoad(a, sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (uint j = 0u; j < DT; j++) {
+                        MATB b;
+                        coopMatLoad(b, sT, (16u * k * SD + 16u * j) / 4u, SD / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                        o[j] = coopMatMulAdd(a, b, o[j]);
+                    }
+                }
+            }
+        }
+        if (OP == FORWARD) {
+            /* y = O / sum (the parts of the row's sum added over its invocations); the log sum */
+            for (uint o_ = 16u; o_ < SG; o_ <<= 1) l += subgroupShuffleXor(l, o_);
+            if (h == 0u) sV[16u * sub + r] = 1.0 / l;
+            sync_subgroup();
+            ACC f;
+            coopMatLoad(f, sV, 16u * sub, 0u, gl_CooperativeMatrixLayoutColumnMajor);
+            [[unroll]] for (uint j = 0u; j < DT; j++) o[j] = o[j] * f;
+            sync_subgroup();
+            store_rows(o, sub, lane, s, q0, hq * D, out_c, p.y, 1u, 1.0, false);
+            if ((p.flags & FLAG_STATS) != 0u && h == 0u && row < p.cells) p.stats.v[sa + row] = m + log(l);
+            return;
+        }
+        /* dQ: the scale, rotated back */
+        store_rows(o, sub, lane, s, q0, hq * D, C, p.dx, 3u, scale, true);
+        return;
+    }
+    /* DKV: the workgroup's keys (and values) of head kh, the subgroup's 16 of them; queries of the group's heads */
+    const uint kh = gl_WorkGroupID.y, j0 = gl_WorkGroupID.x * ROWS, k0 = j0 + 16u * sub, key = k0 + r;
+    MATA ka[KS], va[KS];
+    load_rows(false, pbase, PS, s, k0, 16u, (p.heads + kh) * D, C, p.x, 0u, true, lane, SG);
+    sync_subgroup();
+    [[unroll]] for (uint k = 0u; k < KS; k++)
+        coopMatLoad(ka[k], sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+    sync_subgroup();
+    load_rows(false, pbase, PS, s, k0, 16u, (p.heads + p.kv + kh) * D, C, p.x, 0u, false, lane, SG);
+    sync_subgroup();
+    [[unroll]] for (uint k = 0u; k < KS; k++)
+        coopMatLoad(va[k], sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+    sync_subgroup();
+    ACC dk[DT], dv[DT];
+    [[unroll]] for (uint j = 0u; j < DT; j++) {
+        dk[j] = ACC(0.0);
+        dv[j] = ACC(0.0);
+    }
+    const uint dbase = pbase + 16u * PS;                /* the subgroup's dS^T, after its P^T */
+    const bool fast = (HALF & 5u) == 5u;                /* (x and dy kept as bfloat16: their tiles a step ahead) */
+    Raw8 rq[NCH], rg[NCH];
+    for (uint hq = kh * group; hq < (kh + 1u) * group; hq++) {
+        const uint sa = (s * p.heads + hq) * p.cells, first = causal ? (j0 / BT) * BT : 0u;
+        if (fast) {
+            fetch_tile(s, first, hq * D, C, p.x, true, rq);
+            fetch_tile(s, first, hq * D, out_c, p.dy, false, rg);
+        }
+        for (uint q0 = first; q0 < p.cells; q0 += BT) {
+            barrier();
+            if (fast) {
+                put_tile(true, q0, true, rq);
+                put_tile(false, q0, false, rg);
+            } else {
+                load_rows(true, 0u, SD, s, q0, BT, hq * D, C, p.x, 0u, true, tid, THREADS);
+                load_rows_u(s, q0, hq * D, out_c, p.dy, 2u);
+            }
+            for (uint e = tid; e < BT; e += THREADS) {
+                const bool live = q0 + e < p.cells;
+                sL[e] = live ? p.stats.v[sa + q0 + e] : 0.0;
+                sDl[e] = live ? p.stats.v[rows_all + sa + q0 + e] : 0.0;
+            }
+            barrier();
+            if (fast && q0 + BT < p.cells) {
+                fetch_tile(s, q0 + BT, hq * D, C, p.x, true, rq);
+                fetch_tile(s, q0 + BT, hq * D, out_c, p.dy, false, rg);
+            }
+            /* (causal: a tile of queries all before the subgroup's keys takes nothing from them) */
+            if (causal && q0 + BT <= k0) continue;
+            [[unroll]] for (uint qb = 0u; qb < BB; qb++) {
+                ACC st = ACC(0.0), dpt = ACC(0.0);
+                [[unroll]] for (uint k = 0u; k < KS; k++) {
+                    MATB b;
+                    coopMatLoad(b, sT, (16u * qb * SD + 16u * k) / 4u, SD / 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                    st = coopMatMulAdd(ka[k], b, st);
+                    coopMatLoad(b, sU, (16u * qb * SD + 16u * k) / 4u, SD / 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                    dpt = coopMatMulAdd(va[k], b, dpt);
+                }
+                coopMatStore(st, sS, fs, FB / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatStore(dpt, sS, fs + 16u * FB / 4u, FB / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                sync_subgroup();
+                for (uint q = h; q < 4u; q += TPR) {    /* key r, queries 4 q .. 4 q + 3 of the block */
+                    const vec4 x = sS[fs + (r * FB + 4u * q) / 4u], y = sS[fs + (16u * FB + r * FB + 4u * q) / 4u];
+                    vec4 pt, ds;
+                    [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                        const uint qc = 16u * qb + 4u * q + k, query = q0 + qc;
+                        const bool valid = query < p.cells && key < p.cells && (!causal || key <= query);
+                        pt[k] = valid ? exp(x[k] * scale - sL[qc]) : 0.0;
+                        ds[k] = pt[k] * (y[k] - sDl[qc]);
+                    }
+                    sP[(pbase + r * PS + 16u * qb + 4u * q) / 4u] = bf16vec4(pt);
+                    sP[(dbase + r * PS + 16u * qb + 4u * q) / 4u] = bf16vec4(ds);
+                }
+                sync_subgroup();
+            }
+            /* dV += P^T dO, dK += dS^T Q */
+            [[unroll]] for (uint k = 0u; k < BB; k++) {
+                MATA a, b_;
+                coopMatLoad(a, sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b_, sP, (dbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint j = 0u; j < DT; j++) {
+                    MATB b;
+                    coopMatLoad(b, sU, (16u * k * SD + 16u * j) / 4u, SD / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                    dv[j] = coopMatMulAdd(a, b, dv[j]);
+                    coopMatLoad(b, sT, (16u * k * SD + 16u * j) / 4u, SD / 4u, gl_CooperativeMatrixLayoutRowMajor);
+                    dk[j] = coopMatMulAdd(b_, b, dk[j]);
+                }
+            }
+        }
+    }
+    /* dK times the scale, rotated back; dV as it is */
+    store_rows(dk, sub, lane, s, k0, (p.heads + kh) * D, C, p.dx, 3u, scale, true);
+    store_rows(dv, sub, lane, s, k0, (p.heads + p.kv + kh) * D, C, p.dx, 3u, 1.0, false);
+}

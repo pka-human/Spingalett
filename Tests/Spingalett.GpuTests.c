@@ -19,7 +19,8 @@
  *                                 as bfloat16, as training in bfloat16 keeps them; "fw" with half: the
  *                                 MLP's weights as floats, as training keeps them; SPINGALETT_BENCH_CONV
  *                                 = "n h w c out kh kw sh sw ph pw groups" times that convolution instead
- *                                 of ResNet-20's)
+ *                                 of ResNet-20's, SPINGALETT_BENCH_DENSE = "n in out" that dense layer
+ *                                 instead of the MLP's)
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -467,10 +468,13 @@ static void bench(bool dense_only) {
         conv_free(&b);
         free(x); free(w); free(dy);
     }
-    /* the MLP of Examples/Benchmark.c: products of 2048 rows, forward, data and weight gradients */
-    static const uint32_t dense[][2] = {{784, 512}, {512, 1000}};
-    for (size_t k = 0; k < 2; k++) {
-        const uint32_t n = 2048, in = dense[k][0], out = dense[k][1];
+    /* the MLP of Examples/Benchmark.c: products of 2048 rows, forward, data and weight gradients; or with
+       SPINGALETT_BENCH_DENSE="n in out" that dense layer's */
+    uint32_t dense[][3] = {{2048, 784, 512}, {2048, 512, 1000}};
+    const char *layer = getenv("SPINGALETT_BENCH_DENSE");
+    const bool one_layer = layer && sscanf(layer, "%u %u %u", &dense[0][0], &dense[0][1], &dense[0][2]) == 3;
+    for (size_t k = 0; k < (one_layer ? 1u : 2u); k++) {
+        const uint32_t n = dense[k][0], in = dense[k][1], out = dense[k][2];
         const double flops = 2.0 * n * in * out;
         SpgGpuBuffer bx, bw, bd, by;
         float *host = malloc((size_t)n * (in > out ? in : out) * 4);
@@ -529,6 +533,341 @@ static void bench(bool dense_only) {
     }
 }
 
+/* bfloat16 bits of x, to the nearest (ties to even), and their value */
+static uint16_t bf16_bits(float x) {
+    uint32_t u;
+    x = bf16(x);
+    memcpy(&u, &x, 4);
+    return (uint16_t)(u >> 16);
+}
+static float bits_value(uint16_t h) {
+    uint32_t u = (uint32_t)h << 16;
+    float x;
+    memcpy(&x, &u, 4);
+    return x;
+}
+static double gelu(double x) { return 0.5 * x * (1.0 + erf(x / sqrt(2.0))); }
+static double gelu_derivative(double x) { return 0.5 * (1.0 + erf(x / sqrt(2.0))) + x * exp(-0.5 * x * x) * 0.39894228040143268; }
+
+/* A dense layer's products on the matrix units as training in bfloat16 runs them: operands and results kept as
+   bfloat16, read eight values at once; the forward pass with its bias and GELU (the values before it kept),
+   or ReLU, or a batch normalization's scale and shift; the data gradient times GELU's or ReLU's derivative, added
+   to what C holds (beta 1); the weight gradient in slices. Every tile must give the same bits (gemm_mma.cu's and gemm_pipe.cu's), near a reference in double. */
+static void test_dense_half(uint32_t n, uint32_t in, uint32_t out) {
+    const size_t nx = (size_t)n * in, nw = (size_t)out * in, ny = (size_t)n * out;
+    uint16_t *x = malloc(nx * 2), *w = malloc(nw * 2), *d = malloc(ny * 2), *pre_in = malloc(nx * 2), *c0 = malloc(nx * 2);
+    float *bias = malloc(out * 4), *scale = malloc(out * 4);
+    for (size_t i = 0; i < nx; i++) x[i] = bf16_bits(uniform());
+    for (size_t i = 0; i < nw; i++) w[i] = bf16_bits(uniform());
+    for (size_t i = 0; i < ny; i++) d[i] = bf16_bits(uniform());
+    for (size_t i = 0; i < nx; i++) pre_in[i] = bf16_bits(2.0f * uniform());
+    for (size_t i = 0; i < nx; i++) c0[i] = bf16_bits(uniform());
+    for (uint32_t j = 0; j < out; j++) bias[j] = uniform(), scale[j] = uniform();
+    /* references: y = act(x w^T + b) and its values before, ReLU(s x w^T + b); dx = (d w + c0) act'(pre_in) for GELU
+       and ReLU; dw = d^T x */
+    double *y = malloc(ny * 8), *pre = malloc(ny * 8), *relu = malloc(ny * 8), *scaled = malloc(ny * 8);
+    double *dx = malloc(nx * 8), *dxr = malloc(nx * 8), *dw = malloc(nw * 8);
+    for (uint32_t s = 0; s < n; s++)
+        for (uint32_t j = 0; j < out; j++) {
+            double acc = 0;
+            for (uint32_t i = 0; i < in; i++) acc += (double)bits_value(x[(size_t)s * in + i]) * bits_value(w[(size_t)j * in + i]);
+            pre[(size_t)s * out + j] = acc + bias[j];
+            y[(size_t)s * out + j] = gelu(acc + bias[j]);
+            relu[(size_t)s * out + j] = acc + bias[j] > 0 ? acc + bias[j] : 0.0;
+            const double v = acc * scale[j] + bias[j];
+            scaled[(size_t)s * out + j] = v > 0 ? v : 0.0;
+        }
+    for (uint32_t s = 0; s < n; s++)
+        for (uint32_t i = 0; i < in; i++) {
+            double acc = 0;
+            for (uint32_t j = 0; j < out; j++) acc += (double)bits_value(d[(size_t)s * out + j]) * bits_value(w[(size_t)j * in + i]);
+            dx[(size_t)s * in + i] = (acc + bits_value(c0[(size_t)s * in + i])) * gelu_derivative(bits_value(pre_in[(size_t)s * in + i]));
+            dxr[(size_t)s * in + i] = bits_value(pre_in[(size_t)s * in + i]) > 0 ? acc + bits_value(c0[(size_t)s * in + i]) : 0.0;
+        }
+    for (uint32_t j = 0; j < out; j++)
+        for (uint32_t i = 0; i < in; i++) {
+            double acc = 0;
+            for (uint32_t s = 0; s < n; s++) acc += (double)bits_value(d[(size_t)s * out + j]) * bits_value(x[(size_t)s * in + i]);
+            dw[(size_t)j * in + i] = acc;
+        }
+    uint32_t slice_k, slices = spg_gemm_split(out, in, n, 1, &slice_k);
+    if (slices < 2) slices = 3, slice_k = ((n + 2) / 3 + 7u) & ~7u, slices = (n + slice_k - 1) / slice_k;
+    SpgGpuBuffer bx, bw, bd, bb, bs, bpi, by, bpre, bdx, bdw, bpart;
+    bool ok = upload(&bx, x, nx * 2) && upload(&bw, w, nw * 2) && upload(&bd, d, ny * 2) && upload(&bb, bias, out * 4) &&
+              upload(&bs, scale, out * 4) &&
+              upload(&bpi, pre_in, nx * 2) && spg_gpu_buffer_create(&by, ny * 2, false) &&
+              spg_gpu_buffer_create(&bpre, ny * 2, false) && spg_gpu_buffer_create(&bdx, nx * 2, false) &&
+              spg_gpu_buffer_create(&bdw, nw * 4, false) && spg_gpu_buffer_create(&bpart, (size_t)slices * nw * 4, false);
+    /* each result's bits from the first tile, and the worst distance to the references */
+    const size_t sizes[8] = {ny * 2, ny * 2, ny * 2, nx * 2, (size_t)slices * nw * 4, nx * 2, ny * 2};
+    void *first[8], *got = malloc((size_t)slices * nw * 4 + ny * 4 + nx * 4);
+    for (int k = 0; k < 7; k++) first[k] = malloc(sizes[k]);
+    bool same = true;
+    double worst[8] = {0, 0, 0, 0, 0, 0, 0};
+    for (uint32_t tile = 0; ok && tile <= spg_gemm_tiles(true); tile++) {
+        for (int pass = 0; pass < 6; pass++) {
+            SpgGemmPush p;
+            SpgGemmMode m;
+            if (pass < 2) {             /* forward: GELU with the values before it, or ReLU */
+                p = (SpgGemmPush){.a = bx.address, .b = bw.address, .c = by.address, .e0 = bb.address,
+                                  .e1 = bpre.address, .M = n, .N = out, .K = in, .lda = in, .ldb = in, .ldc = out,
+                                  .alpha = 1.0f, .flags = SPG_GEMM_BIAS | (pass == 0 ? SPG_GEMM_PRE : 0u)};
+                m = (SpgGemmMode){SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, pass == 0 ? SPINGALETT_ACT_GELU : SPINGALETT_ACT_RELU,
+                                  1, false, true, true, tile, 0, true, 7u, true, true};
+            } else if (pass == 2 || pass == 4) {    /* data gradient onto c0, times GELU's or ReLU's derivative */
+                upload(&bdx, c0, nx * 2);
+                p = (SpgGemmPush){.a = bd.address, .b = bw.address, .c = bdx.address, .e0 = bpi.address, .M = n,
+                                  .N = in, .K = out, .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f, .beta = 1.0f};
+                m = (SpgGemmMode){SPG_A_ROW, SPG_B_ROW, SPG_EPI_DERIV, pass == 2 ? SPINGALETT_ACT_GELU : SPINGALETT_ACT_RELU,
+                                  1, false, true, true, tile, 0, true, 15u, true, true};
+            } else if (pass == 5) {     /* forward with a batch normalization's scale and shift, ReLU */
+                p = (SpgGemmPush){.a = bx.address, .b = bw.address, .c = by.address, .e0 = bs.address, .e1 = bb.address,
+                                  .M = n, .N = out, .K = in, .lda = in, .ldb = in, .ldc = out, .alpha = 1.0f};
+                m = (SpgGemmMode){SPG_A_ROW, SPG_B_COL, SPG_EPI_SCALE_ACT, SPINGALETT_ACT_RELU, 1, false, true, true, tile, 0,
+                                  true, 7u, true, true};
+            } else {                    /* weight gradient in slices */
+                p = (SpgGemmPush){.a = bd.address, .b = bx.address, .c = bpart.address, .M = out, .N = in, .K = n,
+                                  .lda = out, .ldb = in, .ldc = in, .alpha = 1.0f, .slices = slices, .slice_k = slice_k};
+                m = (SpgGemmMode){SPG_A_COL, SPG_B_ROW, SPG_EPI_PARTIAL, SPINGALETT_ACT_NONE, 1, false, true, true, tile, 0,
+                                  true, 3u, true, true};
+            }
+            if (run(&p, &m, 1) == 0.0) { failures++; continue; }
+            if (pass < 2) {
+                for (int b = 0; b < (pass == 0 ? 2 : 1); b++) {
+                    uint16_t *h = (uint16_t *)got;
+                    download(h, b ? &bpre : &by, ny * 2);
+                    float *v = (float *)((uint16_t *)got + ny);
+                    for (size_t i = 0; i < ny; i++) v[i] = bits_value(h[i]);
+                    const int kind = pass == 0 ? b : 2;
+                    worst[kind] = fmax(worst[kind], compare(v, kind == 0 ? y : kind == 1 ? pre : relu, ny));
+                    if (tile == 0) memcpy(first[kind], h, ny * 2);
+                    else same = same && !memcmp(first[kind], h, ny * 2);
+                }
+            } else if (pass == 2 || pass == 4 || pass == 5) {
+                const size_t count = pass == 5 ? ny : nx;
+                const int kind = pass == 2 ? 3 : pass == 4 ? 5 : 6;
+                uint16_t *h = (uint16_t *)got;
+                download(h, pass == 5 ? &by : &bdx, count * 2);
+                float *v = (float *)((uint16_t *)got + count);
+                for (size_t i = 0; i < count; i++) v[i] = bits_value(h[i]);
+                worst[kind] = fmax(worst[kind], compare(v, pass == 2 ? dx : pass == 4 ? dxr : scaled, count));
+                if (tile == 0) memcpy(first[kind], h, count * 2);
+                else same = same && !memcmp(first[kind], h, count * 2);
+            } else {
+                float *part = (float *)got, *sum = part + (size_t)slices * nw;
+                download(part, &bpart, (size_t)slices * nw * 4);
+                add_slices(sum, part, slices, nw, 1);
+                worst[4] = fmax(worst[4], compare(sum, dw, nw));
+                if (tile == 0) memcpy(first[4], part, sizes[4]);
+                else same = same && !memcmp(first[4], part, sizes[4]);
+            }
+        }
+    }
+    /* (bfloat16 results: within a few of their units in the last place of the largest) */
+    bool good = ok && same && worst[4] < 1e-5;
+    for (int k = 0; k < 7; k++) good = good && (k == 4 || worst[k] < 1e-2);
+    if (!same) printf("  tiles differ in their results\n");
+    failures += !good;
+    printf("  bf16 kept dense %u x %u -> %u: GELU %.1e (before %.1e), ReLU %.1e, scaled %.1e, data %.1e (ReLU %.1e), "
+           "weights %.1e in %u slices  %s\n", n, in, out, worst[0], worst[1], worst[2], worst[6], worst[3], worst[5], worst[4],
+           slices, good ? "ok" : "FAILED");
+    SpgGpuBuffer *all[] = {&bx, &bw, &bd, &bb, &bs, &bpi, &by, &bpre, &bdx, &bdw, &bpart};
+    for (size_t k = 0; k < sizeof all / sizeof all[0]; k++) spg_gpu_buffer_free(all[k]);
+    for (int k = 0; k < 7; k++) free(first[k]);
+    free(x); free(w); free(d); free(pre_in); free(c0); free(bias); free(scale); free(got);
+    free(y); free(pre); free(relu); free(scaled); free(dx); free(dxr); free(dw);
+}
+
+/* ------------------------------------------------------------------------- attention */
+
+/* The two ways of a pass of attention in bfloat16: the matrix units' (flash.comp on Vulkan, flash.cu on CUDA: attn
+   with BQ 0) and attn.comp's tiles in single precision (rattn.cu on CUDA), as Spingalett.Gpu.c's attn_pass()
+   dispatches them; their workgroups over `cells` rows of n samples of `heads` heads (kv in DKV). False when the
+   matrix units' way does not run here. */
+static bool attn_dispatch(SpgGpuCommands *c, bool flash, uint32_t op, uint32_t head, const SpgAttnPush *p,
+                          uint32_t half_mask) {
+    const bool cuda = spg_gpu_using() == SPG_BACKEND_CUDA;
+    const uint32_t rows = p->n * p->heads * p->cells, gy = op == SPG_ATTN_DKV ? p->kv : p->heads;
+    uint32_t warps, bt;
+    if (flash && !cuda) {
+        if (!spg_flash_tiles(head, op, &warps, &bt)) return false;
+        const uint32_t sg = spg_gpu_subgroup_size(), spec[7] = {op, head, warps, bt, sg, half_mask, warps * sg};
+        spg_gpu_dispatch(c, SPG_KERNEL_flash, spec, 7, p, sizeof *p, (p->cells + 16u * warps - 1u) / (16u * warps), gy,
+                         p->n);
+        return true;
+    }
+    if (flash && !spg_gpu_mma_bf16()) return false;
+    uint32_t bq, threads;
+    if (flash) {                            /* (flash.cu: BQ 0 names it) */
+        bq = head <= 64u ? 64u : 32u;
+        threads = 2u * bq;
+        if (op == SPG_ATTN_FORWARD && head <= 64u) bq = 128u;
+    } else if (cuda) {
+        bq = SPG_RATTN_ROWS(head, op);
+        threads = SPG_RATTN_THREADS(head, op);
+    } else {
+        bq = head == 32u ? 32u : head == 64u ? 16u : 8u;
+        threads = head == 32u ? 128u : 64u;
+    }
+    const uint32_t spec[5] = {op, flash ? 0u : bq, head, threads, half_mask};
+    if (op == SPG_ATTN_PRE)
+        spg_gpu_dispatch(c, SPG_KERNEL_attn_h, spec, 5, p, sizeof *p, (rows + threads - 1u) / threads, 1, 1);
+    else
+        spg_gpu_dispatch(c, SPG_KERNEL_attn_h, spec, 5, p, sizeof *p, (p->cells + bq - 1u) / bq, gy, p->n);
+    return true;
+}
+
+typedef struct {
+    SpgGpuBuffer x, dy, table, stats, y, dx;
+} AttnBuffers;
+
+/* Attention's passes as training in bfloat16 runs them (x, y, dy and dx kept as bfloat16), those of `passes` (bits 0
+   to 3: FORWARD with the log sums, PRE, DQ, DKV) `reps` times, the matrix units' way (flash) or attn.comp's; the
+   seconds a round takes in *elapsed; false when it does not run here. */
+static bool attn_passes(const AttnBuffers *b, bool flash, uint32_t head, const SpgAttnPush *base, uint32_t passes,
+                        int reps, double *elapsed) {
+    SpgGpuCommands *c = spg_gpu_commands_create();
+    bool ok = c && spg_gpu_record_begin(c), runs = true;
+    SpgAttnPush p = *base;
+    p.stats = b->stats.address;
+    p.table = b->table.address;
+    for (int rep = 0; ok && runs && rep < reps; rep++) {
+        if (passes & 1u) {
+            p.x = b->x.address, p.y = b->y.address, p.dy = 0, p.dx = 0, p.flags = base->flags | SPG_ATTN_STATS;
+            runs = attn_dispatch(c, flash, SPG_ATTN_FORWARD, head, &p, 0x3);
+            spg_gpu_barrier(c);
+        }
+        if (passes & 2u) {
+            p.x = b->y.address, p.y = 0, p.dy = b->dy.address, p.dx = 0, p.flags = base->flags;
+            runs = runs && attn_dispatch(c, false, SPG_ATTN_PRE, head, &p, 0x5);
+            spg_gpu_barrier(c);
+        }
+        p.x = b->x.address, p.y = 0, p.dy = b->dy.address, p.dx = b->dx.address, p.flags = base->flags;
+        if (passes & 4u) runs = runs && attn_dispatch(c, flash, SPG_ATTN_DQ, head, &p, 0xD);
+        if (passes & 8u) runs = runs && attn_dispatch(c, flash, SPG_ATTN_DKV, head, &p, 0xD);
+        spg_gpu_barrier(c);
+    }
+    ok = ok && runs && spg_gpu_record_end(c);
+    const double start = seconds();
+    ok = ok && spg_gpu_submit(c) && spg_gpu_wait(c);
+    if (elapsed) *elapsed = (seconds() - start) / reps;
+    spg_gpu_commands_free(c);
+    return ok;
+}
+
+static void attn_free(AttnBuffers *b) {
+    SpgGpuBuffer *all[] = {&b->x, &b->dy, &b->table, &b->stats, &b->y, &b->dx};
+    for (size_t k = 0; k < sizeof all / sizeof all[0]; k++) spg_gpu_buffer_free(all[k]);
+}
+
+/* n samples of T cells of `heads` heads of `head` values (kv heads of keys and values), random, as bfloat16; the
+   rotary table (theta 10,000) */
+static bool attn_buffers(AttnBuffers *b, uint32_t n, uint32_t T, uint32_t heads, uint32_t kv, uint32_t head) {
+    const size_t nx = (size_t)n * T * (heads + 2u * kv) * head, ny = (size_t)n * T * heads * head;
+    const size_t rows = (size_t)n * heads * T;
+    uint16_t *x = malloc(nx * 2), *dy = malloc(ny * 2);
+    float *table = malloc((size_t)T * head * 4);
+    for (size_t i = 0; i < nx; i++) x[i] = bf16_bits(1.5f * uniform());
+    for (size_t i = 0; i < ny; i++) dy[i] = bf16_bits(uniform());
+    for (uint32_t pos = 0; pos < T; pos++)
+        for (uint32_t i = 0; i < head / 2u; i++) {
+            const double angle = pos * pow(10000.0, -2.0 * i / head);
+            table[pos * (head / 2u) + i] = (float)cos(angle);
+            table[(size_t)T * (head / 2u) + pos * (head / 2u) + i] = (float)sin(angle);
+        }
+    memset(b, 0, sizeof *b);
+    const bool ok = upload(&b->x, x, nx * 2) && upload(&b->dy, dy, ny * 2) && upload(&b->table, table, (size_t)T * head * 4) &&
+                    spg_gpu_buffer_create(&b->stats, rows * 8, false) && spg_gpu_buffer_create(&b->y, ny * 2, false) &&
+                    spg_gpu_buffer_create(&b->dx, nx * 2, false);
+    free(x); free(dy); free(table);
+    return ok;
+}
+
+/* worst |got - want| over the largest |want|, of n bfloat16 values */
+static double compare_bf16(const uint16_t *got, const uint16_t *want, size_t n) {
+    double worst = 0.0, scale = 1e-6;
+    for (size_t i = 0; i < n; i++) scale = fmax(scale, fabs(bits_value(want[i])));
+    for (size_t i = 0; i < n; i++) worst = fmax(worst, fabs(bits_value(got[i]) - bits_value(want[i])) / scale);
+    return worst;
+}
+
+/* The matrix units' attention (flash.comp on Vulkan, flash.cu on CUDA) against attn.comp's on the same inputs kept
+   as bfloat16: the outputs, the log sums, the gradients of queries, keys and values (from the same statistics), and
+   two runs alike. T cells of n samples, causal or not, rotary or not, grouped (kv < heads) or not. */
+static void test_attention(uint32_t head, uint32_t heads, uint32_t kv, uint32_t T, uint32_t n, bool causal, bool rope) {
+    AttnBuffers b;
+    const size_t nx = (size_t)n * T * (heads + 2u * kv) * head, ny = (size_t)n * T * heads * head;
+    const size_t rows = (size_t)n * heads * T;
+    if (!attn_buffers(&b, n, T, heads, kv, head)) {
+        failures++;
+        attn_free(&b);
+        return;
+    }
+    const SpgAttnPush base = {.n = n, .cells = T, .heads = heads, .kv = kv, .d = head,
+                              .flags = (causal ? SPG_ATTN_CAUSAL : 0u) | (rope ? SPG_ATTN_ROPE : 0u),
+                              .scale = 1.0f / sqrtf((float)head)};
+    /* attn.comp's outputs, statistics and gradients; then the matrix units' outputs and log sums, and their
+       gradients from attn.comp's statistics; again, for the bits */
+    uint16_t *y[3], *dx[3];
+    float *stats[2];
+    for (int k = 0; k < 3; k++) y[k] = malloc(ny * 2), dx[k] = malloc(nx * 2);
+    for (int k = 0; k < 2; k++) stats[k] = malloc(rows * 8);
+    bool ok = attn_passes(&b, false, head, &base, 15u, 1, NULL) && download(y[0], &b.y, ny * 2) &&
+              download(dx[0], &b.dx, nx * 2) && download(stats[0], &b.stats, rows * 8);
+    bool runs = true;
+    for (int k = 1; ok && runs && k < 3; k++) {
+        runs = attn_passes(&b, true, head, &base, 1u, 1, NULL);
+        ok = runs && download(y[k], &b.y, ny * 2) && (k > 1 || download(stats[1], &b.stats, rows * 4)) &&
+             upload(&b.stats, stats[0], rows * 8) && attn_passes(&b, true, head, &base, 12u, 1, NULL) &&
+             download(dx[k], &b.dx, nx * 2);
+    }
+    if (!runs) {
+        printf("  attention head %u: no matrix units' way here, skipped\n", head);
+    } else {
+        double lse = 0.0;
+        for (size_t i = 0; ok && i < rows; i++) lse = fmax(lse, fabs((double)stats[1][i] - stats[0][i]));
+        const double dy_ = ok ? compare_bf16(y[1], y[0], ny) : 1.0, dx_ = ok ? compare_bf16(dx[1], dx[0], nx) : 1.0;
+        const bool same = ok && !memcmp(y[1], y[2], ny * 2) && !memcmp(dx[1], dx[2], nx * 2);
+        const bool good = ok && same && dy_ < 3e-2 && dx_ < 3e-2 && lse < 3e-2;
+        failures += !good;
+        printf("  attention head %u%s%s%s, %u cells x %u: outputs %.1e, log sums %.1e, gradients %.1e from attn's, "
+               "deterministic %s  %s\n", head, rope ? ", rotary" : "", kv < heads ? ", grouped" : "",
+               causal ? ", causal" : "", T, n, dy_, lse, dx_, same ? "yes" : "no", good ? "ok" : "FAILED");
+    }
+    for (int k = 0; k < 3; k++) free(y[k]), free(dx[k]);
+    for (int k = 0; k < 2; k++) free(stats[k]);
+    attn_free(&b);
+}
+
+/* The passes of the GPT of Examples/Benchmark.c (chunks of 16 sequences of 256 tokens, 6 heads of 64, causal), or
+   SPINGALETT_BENCH_ATTN = "n cells heads kv head causal rope": each pass's time both ways. */
+static void bench_attention(void) {
+    uint32_t n = 16, T = 256, heads = 6, kv = 6, head = 64, causal = 1, rope = 0;
+    const char *env = getenv("SPINGALETT_BENCH_ATTN");
+    if (env) sscanf(env, "%u %u %u %u %u %u %u", &n, &T, &heads, &kv, &head, &causal, &rope);
+    AttnBuffers b;
+    if (!attn_buffers(&b, n, T, heads, kv, head)) {
+        attn_free(&b);
+        return;
+    }
+    const SpgAttnPush base = {.n = n, .cells = T, .heads = heads, .kv = kv, .d = head,
+                              .flags = (causal ? SPG_ATTN_CAUSAL : 0u) | (rope ? SPG_ATTN_ROPE : 0u),
+                              .scale = 1.0f / sqrtf((float)head)};
+    printf("attention: %u samples of %u cells, %u heads of %u (%u of keys)%s%s\n", n, T, heads, head, kv,
+           causal ? ", causal" : "", rope ? ", rotary" : "");
+    attn_passes(&b, false, head, &base, 3u, 1, NULL);       /* (the statistics) */
+    static const char *const names[4] = {"forward", "pre", "dq", "dkv"};
+    for (uint32_t pass = 0; pass < 4; pass++) {
+        double t[2] = {0, 0};
+        for (int flash = 0; flash < 2; flash++) {
+            if (!attn_passes(&b, flash, head, &base, 1u << pass, 3, NULL)) continue;
+            attn_passes(&b, flash, head, &base, 1u << pass, 20, &t[flash]);
+        }
+        printf("  %-8s attn %8.1f us   matrix units %8.1f us\n", names[pass], t[0] * 1e6, t[1] * 1e6);
+    }
+    attn_free(&b);
+}
+
 int main(int argc, char **argv) {
     const char *backend = getenv("SPINGALETT_GPU_BACKEND");
     const bool cuda = backend && !strcmp(backend, "cuda");
@@ -547,7 +886,8 @@ int main(int argc, char **argv) {
             if (!strcmp(argv[k], "half")) half = spg_gpu_mma_bf16() && spg_gpu_bf16_storage();
             if (!strcmp(argv[k], "fw")) float_weights = true;
         }
-        bench(dense);
+        if (argc > 2 && !strcmp(argv[2], "attn")) bench_attention();
+        else bench(dense);
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "all")) tile_step = 1;
@@ -566,6 +906,23 @@ int main(int argc, char **argv) {
         /* products whose A and C exceed L2 (on GPUs of up to 28 MB of it): CUDA runs gemm.cu's blocks in bands of
            eight tiles of rows then, the tiles of rows after the last whole band (8,200 rows) as they are */
         if (cuda && !mma) test_dense(8200, 384, 520);
+        if (mma && spg_gpu_bf16_storage()) {
+            test_dense_half(37, 48, 24);
+            test_dense_half(200, 72, 136);
+            test_dense_half(520, 264, 392);
+        }
+    }
+    if (spg_gpu_bf16_storage()) {
+        /* attention on the matrix units against attn.comp: heads of 32, 64 and 128, rotary, grouped, causal or not,
+           several tiles of rows, the last ones partial */
+        test_attention(64, 6, 6, 256, 2, true, false);
+        test_attention(32, 4, 4, 80, 3, true, false);
+        test_attention(64, 4, 2, 80, 3, true, true);
+        test_attention(128, 4, 1, 80, 2, true, true);
+        test_attention(64, 4, 4, 300, 2, true, false);
+        test_attention(64, 4, 2, 200, 2, false, true);
+        test_attention(32, 4, 2, 150, 2, true, false);
+        test_attention(128, 2, 2, 150, 2, false, false);
     }
     printf(failures ? "%d FAILED\n" : "ALL PASSED\n", failures);
     return failures != 0;

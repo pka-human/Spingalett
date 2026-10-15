@@ -39,6 +39,27 @@ public final class Network implements AutoCloseable {
         }
     }
 
+    /**
+     * A language model as a network (spingalett_load_pretrained()): a Hugging Face model directory (config.json and
+     * safetensors weights, sharded or not; llama, mistral, qwen2, gpt2) or a GGUF file (llama, qwen2, gpt2; its
+     * weights dequantized to floats). context is the network's window of tokens (0: the model's positions, LLaMA's
+     * at most 2048); the network gives every position's logits. Its tokenizer: Tokenizer.load() on the same path.
+     */
+    public static Network fromPretrained(Path path, int context) {
+        try (Arena arena = Arena.ofConfined()) {
+            var A = Native.PRETRAINED_ARGS;
+            MemorySegment a = arena.allocate(A);
+            Native.set(a, A, "path", arena.allocateFrom(path.toString()));
+            Native.set(a, A, "context", context);
+            SpingalettException.clear();
+            MemorySegment p = (MemorySegment) Native.LanguageModels.LOAD_PRETRAINED.invokeExact(a);
+            if (p.equals(MemorySegment.NULL)) throw SpingalettException.last("spingalett_load_pretrained failed");
+            return new Network(p);
+        } catch (Throwable t) {
+            throw Native.rethrow(t);
+        }
+    }
+
     MemorySegment ptr() {
         if (ptr == null) throw new IllegalStateException("closed network");
         return ptr;
@@ -101,6 +122,8 @@ public final class Network implements AutoCloseable {
         Native.set(a, T, "beta2", o.beta2);
         Native.set(a, T, "max_grad_norm", o.maxGradNorm);
         Native.set(a, T, "label_smoothing", o.labelSmoothing);
+        Native.set(a, T, "accumulation_steps", o.accumulationSteps);
+        Native.set(a, T, "recompute", (byte) (o.recompute ? 1 : 0));
         return a;
     }
 
