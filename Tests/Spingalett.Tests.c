@@ -3868,7 +3868,7 @@ static void norm_learns(ComputeMode mode) {
     batch_norm(.net = net, .act_func = ACT_RELU);
     max_pool2d(.net = net, .kernel = 2);
     layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
-    train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 15, .learning_rate = 0.05f,
+    train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 25, .learning_rate = 0.05f,
           .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32);
     EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y, .sample_count = N);
     printf("  normalized conv learns bars mode=%d: accuracy %.1f%%, loss %.4f\n", mode, 100.0 * m.accuracy, m.loss);
