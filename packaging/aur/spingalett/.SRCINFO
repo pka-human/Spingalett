@@ -17,6 +17,6 @@ pkgbase = spingalett
 	optdepends = nvidia-utils: training and inference on NVIDIA GPUs through CUDA
 	optdepends = python-numpy: the Python bindings (Bindings/Python)
 	source = spingalett-1.3.0.tar.gz::https://github.com/pka-human/Spingalett/archive/refs/tags/v1.3.0.tar.gz
-	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums = 6a0b2901638ece8178fc707b761ba37550909b7935d5c02efa2336f60b03f6ec
 
 pkgname = spingalett
