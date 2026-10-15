@@ -37,6 +37,12 @@ GPT-2, LLaMA 1 and 2, Mistral and Qwen2/2.5 (and loads those GGUF files, their w
 float); 1.4 to 1.6 add the rest, in order of the models they open, and from 1.4 a command-line program
 in a repository of its own, on the runtime library, serves them (**SaLaM**, below).
 
+GGUF is read because that is where the models are; `.slett` stays the library's own format and grows
+to hold language models as well as GGUF does, with what GGUF cannot: a `.slett` file holds the network's
+graph, not only its weights, so a model converted once runs on any later runtime without code of its
+family, the engine runs its image in place, and its integer precisions compute the same bits on every
+backend.
+
 Each release measures against llama.cpp on the same GGUF files (`llama-bench`: prompt processing of 512
 tokens, generation of 128, at 1 and 8 threads, on CUDA and on Vulkan) as well as against PyTorch, and
 checks each family on real checkpoints: the logits of a prompt against transformers', the tokens of
@@ -54,6 +60,13 @@ Dense models of the current families, from GGUF files computed as they are store
   matrix kernels, or into integer tiles) on AVX2, AVX-512 VNNI and NEON with the dot product, on CUDA
   (dp4a and the tensor cores' integer products) and on Vulkan (integer dot products, cooperative
   matrices). Sums in fixed orders, as everywhere: the same bits on any number of threads.
+- **`.slett` for language models** (format 10): weights quantized in groups (a scale for every 32 to 128
+  weights, at 8, 6, 5, 4, 3 and 2 bits) beside 1.3's scale a row, and GGUF's block types as precisions of
+  their own, so that a GGUF file converts without loss and both run on the same kernels; the tokenizer,
+  its special tokens, the chat template and generation's defaults in the file; sections aligned for
+  mapping, the weights used where they lie, checksums verified a section at a time when first read
+  rather than over gigabytes at loading; `ModelTool convert` from GGUF files and Hugging Face's
+  directories. SaLaM runs both and converts on request.
 - **The blocks of today's dense families**: scaled rotary embeddings (LLaMA 3's, YaRN, linear and NTK
   scaling: LLaMA 3.1 and 3.2 are refused today), rotary embeddings on part of a head (Phi, GLM,
   StableLM), RMS normalization of each head's queries and keys inside attention (QK-norm: Qwen3, Gemma 3,

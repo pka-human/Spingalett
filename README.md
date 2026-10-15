@@ -2047,7 +2047,9 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
   not (the GPT in bfloat16 on CUDA, transformers' training on the CPU)
 - 1.4: the language models of today from GGUF files computed as they are stored (Q4_0 to Q8_0, the
   k-quants, IQ4), scaled and partial rotary embeddings, QK-norm, Gemma's blocks, architectures as
-  descriptions, the runtime reading GGUF files with their tokenizers and chat templates; checkpoints
+  descriptions, `.slett` format 10 for language models (grouped quantization, GGUF's block types,
+  the tokenizer and chat template in the file), the runtime reading GGUF and `.slett` language models
+  with their tokenizers and chat templates; checkpoints
   that resume a training run exactly. The aim: any GGUF of a common architecture, faster than llama.cpp,
   and a command-line program on the runtime (SaLaM) in a repository of its own
 - 1.5: mixture of experts (Mixtral, Qwen3 MoE, gpt-oss), experts kept on the host, speculative decoding
