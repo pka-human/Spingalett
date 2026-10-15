@@ -2013,8 +2013,16 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
   (tied embeddings, recomputation, accumulation, padding, sliding windows, cross-attention), ONNX
   import of transformers, the engine in WebAssembly, bindings for PHP; ahead of PyTorch where 1.2 was
   not (the GPT in bfloat16 on CUDA, transformers' training on the CPU)
-- 1.4 to 2.0: training across several GPUs, FP16 products with loss scaling, mixture-of-experts
-  layers, Arm and Apple GPUs, sequence models beyond attention
+- 1.4: the language models of today from GGUF files computed as they are stored (Q4_0 to Q8_0, the
+  k-quants, IQ4), scaled and partial rotary embeddings, QK-norm, Gemma's blocks, architectures as
+  descriptions, the runtime reading GGUF files with their tokenizers and chat templates; checkpoints
+  that resume a training run exactly. The aim: any GGUF of a common architecture, faster than llama.cpp,
+  and a command-line program on the runtime (SaLaM) in a repository of its own
+- 1.5: mixture of experts (Mixtral, Qwen3 MoE, gpt-oss), experts kept on the host, speculative decoding
+- 1.6: hybrid models with linear attention and state spaces (Qwen3.5, Qwen3-Next, Mamba-2), vision
+  encoders
+- 1.7 to 2.0: Arm and Apple (NEON training, Metal), training across several GPUs, multi-head latent
+  attention, FP16 products with loss scaling
 
 ## Contributing
 
