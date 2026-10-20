@@ -21,6 +21,7 @@
  */
 
 #include "Spingalett.Model.h"
+#include "Spingalett.Blocks.h"
 #if !defined(SPINGALETT_RUNTIME)
 #include "Spingalett.Gpu.h"
 #endif
@@ -506,6 +507,9 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
         spingalett_conv_rows(x[0], L->in_c, rows, prep->panels, L->row_len, L->rows, y, L->out_c, &hooks,
                              s->team > 1 && (uint64_t)rows * L->rows * L->row_len >= ROWS_PARALLEL_WORK, s->team);
         return;
+    } else if (slett_block_layer(L)) {
+        /* a linear layer of a block precision: its bias in, each row quantized alone */
+        spingalett_block_layer(image, L, x[0], y, rows, w->blockq, s->team);
     } else if (L->type == LAYER_CONV2D && rows <= INT_ROWS) {
         session_int_linear(s, L, prep, x[0], y, rows, mode);
     } else {

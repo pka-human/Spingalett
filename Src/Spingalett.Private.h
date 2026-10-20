@@ -407,6 +407,10 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l);
 /* The image of a deployment model: net with every batch normalization that directly follows a dense
    or convolution layer without activation folded into that layer, without optimizer state. */
 void *spingalett_save_deployment(const NeuralNetwork *net, PrecisionMode precision, size_t *size);
+/* A row of n weights (whole blocks) quantized in a block precision into dst, as llama.cpp's reference quantizers
+   (quantize_row_*_ref(), and of IQ4_NL and IQ4_XS quantize_iq4_nl() and quantize_iq4_xs() without an importance
+   matrix) choose the codes and scales (Spingalett.Quantize.c). */
+void spingalett_block_quantize(PrecisionMode p, const float *x, uint8_t *dst, uint32_t n);
 bool spingalett_has_dropout(const NeuralNetwork *net);
 /* dropout == NULL: inference. Otherwise hidden layers with a dropout rate are masked. */
 float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,

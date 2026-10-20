@@ -115,6 +115,19 @@ class Precision(enum.IntEnum):
     INT8 = 3
     INT4 = 4
     INT2 = 5
+    # GGUF's block types (format 10): language models' layers, blocks of 32 or super-blocks of 256 weights
+    Q8_0 = 6
+    Q4_0 = 7
+    Q4_1 = 8
+    Q5_0 = 9
+    Q5_1 = 10
+    Q2_K = 11
+    Q3_K = 12
+    Q4_K = 13
+    Q5_K = 14
+    Q6_K = 15
+    IQ4_NL = 16
+    IQ4_XS = 17
 
 
 class LayerType(enum.IntEnum):

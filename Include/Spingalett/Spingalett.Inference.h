@@ -65,8 +65,9 @@ extern "C" {
    upsampling or layer normalization, 8 with embeddings, attention, RMS normalization, products of
    layers, the GELU and SiLU activations or the sparse cross-entropy loss, 9 with the training features of
    language models (output layers tied to an embedding's table, attention ignoring padding or of a sliding
-   window), so that engines of earlier releases still run what they can; versions 1 and 2 still load. */
-#define SPINGALETT_FORMAT_VERSION 9
+   window), 10 with the block precisions of GGUF's types, so that engines of earlier releases still run what
+   they can; versions 1 and 2 still load. */
+#define SPINGALETT_FORMAT_VERSION 10
 
 /* Most inputs a layer can have (SPINGALETT_LAYER_ADD, SPINGALETT_LAYER_CONCAT and SPINGALETT_LAYER_MULTIPLY read
    several). */
@@ -184,7 +185,13 @@ typedef enum {
 } SpingalettUpsampleMode;
 
 /* How parameters are stored: in .slett files, and as the weights a model computes with. The
-   integer precisions keep one scale per weight row (output unit). */
+   integer precisions keep one scale per weight row (output unit). The block precisions (format 10,
+   Spingalett 1.4 on) are GGUF's quantization types, as llama.cpp stores them: each row of weights
+   is blocks of 32 values (Q8_0 to Q5_1, IQ4_NL) or super-blocks of 256 with scales of their own a
+   sub-block of 16 or 32 (the k-quants Q2_K to Q6_K, IQ4_XS), so a row's length is a multiple of the
+   block. A layer in a block precision quantizes its input to 8 bits in blocks of the same size and
+   sums each block in integers (docs/ModelFormat.md). Dense layers, linear layers (1 x 1
+   convolutions of one group) and embeddings take them. */
 typedef enum {
     SPINGALETT_PRECISION_FLOAT32,
     SPINGALETT_PRECISION_FP16,                 /* IEEE half */
@@ -192,6 +199,18 @@ typedef enum {
     SPINGALETT_PRECISION_INT8,                 /* q * scale, q in -127..127 */
     SPINGALETT_PRECISION_INT4,                 /* q * scale, q in -7..7 */
     SPINGALETT_PRECISION_INT2,                 /* ternary: q * scale, q in {-1, 0, 1} */
+    SPINGALETT_PRECISION_Q8_0,                 /* blocks of 32: d q, q of 8 bits (8.5 bits a weight) */
+    SPINGALETT_PRECISION_Q4_0,                 /* blocks of 32: d (q - 8), q of 4 bits (4.5 bits) */
+    SPINGALETT_PRECISION_Q4_1,                 /* blocks of 32: d q + m (5 bits) */
+    SPINGALETT_PRECISION_Q5_0,                 /* blocks of 32: d (q - 16), q of 5 bits (5.5 bits) */
+    SPINGALETT_PRECISION_Q5_1,                 /* blocks of 32: d q + m (6 bits) */
+    SPINGALETT_PRECISION_Q2_K,                 /* super-blocks of 256: 2-bit q, 4-bit scales and minima of 16 (2.625 bits) */
+    SPINGALETT_PRECISION_Q3_K,                 /* 3-bit q, 6-bit scales of 16 (3.4375 bits) */
+    SPINGALETT_PRECISION_Q4_K,                 /* 4-bit q, 6-bit scales and minima of 32 (4.5 bits) */
+    SPINGALETT_PRECISION_Q5_K,                 /* 5-bit q, 6-bit scales and minima of 32 (5.5 bits) */
+    SPINGALETT_PRECISION_Q6_K,                 /* 6-bit q, 8-bit scales of 16 (6.5625 bits) */
+    SPINGALETT_PRECISION_IQ4_NL,               /* blocks of 32: d times a 4-bit code's value of a fixed table (4.5 bits) */
+    SPINGALETT_PRECISION_IQ4_XS,               /* super-blocks of 256: IQ4_NL's codes, 6-bit scales of 32 (4.25 bits) */
     SPINGALETT_PRECISION_COUNT
 } SpingalettPrecisionMode;
 
@@ -247,7 +266,7 @@ typedef struct {
 } SpingalettLayerInfo;
 
 /*
- * Checks a .slett image (format version 3 to 9: header, layer table, shapes, bounds and CRC-32
+ * Checks a .slett image (format version 3 to 10: header, layer table, shapes, bounds and CRC-32
  * checksums) and fills *model. Nothing is copied, so the image must stay valid and unchanged while the model is in
  * use, and its address must be a multiple of 4. size may exceed the image (e.g. a flash region).
  * Returns SPINGALETT_OK or an error code (SPINGALETT_ERR_FORMAT_VERSION for images of other format
@@ -326,5 +345,17 @@ typedef SpingalettPrecisionMode PrecisionMode;
 #define PRECISION_INT8 SPINGALETT_PRECISION_INT8
 #define PRECISION_INT4 SPINGALETT_PRECISION_INT4
 #define PRECISION_INT2 SPINGALETT_PRECISION_INT2
+#define PRECISION_Q8_0 SPINGALETT_PRECISION_Q8_0
+#define PRECISION_Q4_0 SPINGALETT_PRECISION_Q4_0
+#define PRECISION_Q4_1 SPINGALETT_PRECISION_Q4_1
+#define PRECISION_Q5_0 SPINGALETT_PRECISION_Q5_0
+#define PRECISION_Q5_1 SPINGALETT_PRECISION_Q5_1
+#define PRECISION_Q2_K SPINGALETT_PRECISION_Q2_K
+#define PRECISION_Q3_K SPINGALETT_PRECISION_Q3_K
+#define PRECISION_Q4_K SPINGALETT_PRECISION_Q4_K
+#define PRECISION_Q5_K SPINGALETT_PRECISION_Q5_K
+#define PRECISION_Q6_K SPINGALETT_PRECISION_Q6_K
+#define PRECISION_IQ4_NL SPINGALETT_PRECISION_IQ4_NL
+#define PRECISION_IQ4_XS SPINGALETT_PRECISION_IQ4_XS
 #define PRECISION_COUNT SPINGALETT_PRECISION_COUNT
 #endif

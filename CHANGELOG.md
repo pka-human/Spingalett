@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Block precisions**, GGUF's quantization types as deployment precisions (`.slett` format 10):
+  `SPINGALETT_PRECISION_Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, the k-quants `Q2_K` to `Q6_K`, `IQ4_NL` and
+  `IQ4_XS`, for dense layers, linear layers and embeddings, each row stored as llama.cpp stores a row of the
+  type (docs/ModelFormat.md, **Block precisions**). A network saved or made a model in one quantizes its weights
+  as llama.cpp's quantizers do without an importance matrix, byte for byte (checked against ggml's), layers whose
+  rows are no whole blocks taking llama.cpp's fallback types. Such a layer quantizes its input to 8 bits in
+  blocks of the type's size and sums each block's sub-blocks in integers, scaled by their integer scales, the
+  blocks' terms then added in float block after block: the engine, batched prediction, sessions and the runtime
+  give the same bits on any number of threads (the `model` group: dense layers of every type within the bound
+  of the inputs' quantization, and language models in every type whose engine, batched and session logits are
+  equal). `spingalett_load()` reads such files with the weights decoded as llama.cpp's `dequantize_row_*()`
+  decodes them. In every binding, and `ModelTool` and `RunModel` name them.
 - **Checkpoints of training runs**: `spingalett_save_checkpoint()` and `spingalett_load_checkpoint()` (in
   Python `Network.save_checkpoint()` and `Network.load_checkpoint()`) keep a network, its optimizer state
   and the state of the `spingalett_train()` run that trained it, as its last epoch left it: the seeds of

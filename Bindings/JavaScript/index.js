@@ -12,7 +12,7 @@
 const LAYER_TYPES = ['dense', 'conv2d', 'max_pool2d', 'avg_pool2d', 'batch_norm', 'add', 'concat', 'global_avg_pool',
     'conv_transpose2d', 'upsample', 'layer_norm', 'embedding', 'attention', 'rms_norm', 'multiply'];
 const ACTIVATIONS = ['none', 'sigmoid', 'relu', 'tanh', 'leaky_relu', 'foo52', 'softmax', 'gelu', 'gelu_tanh', 'silu'];
-const PRECISIONS = ['fp32', 'fp16', 'bf16', 'int8', 'int4', 'int2'];
+const PRECISIONS = ['fp32', 'fp16', 'bf16', 'int8', 'int4', 'int2', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'q2_k', 'q3_k', 'q4_k', 'q5_k', 'q6_k', 'iq4_nl', 'iq4_xs'];
 const LOSSES = ['mse', 'cross_entropy', 'sparse_cross_entropy'];
 const UPSAMPLE = ['nearest', 'bilinear'];
 

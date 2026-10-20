@@ -20,7 +20,9 @@
  *                                      an ONNX model as a network (FLOAT32 unless P is given;
  *                                      its input is channels-last)
  *
- * P is fp32, fp16, bf16, int8, int4 or int2; by default the precision the model is stored in.
+ * P is fp32, fp16, bf16, int8, int4 or int2, or a block precision of GGUF's types (q8_0, q4_0, q4_1, q5_0, q5_1,
+ * q2_k, q3_k, q4_k, q5_k, q6_k, iq4_nl, iq4_xs: language models' layers); by default the precision the model is
+ * stored in (evaluate and bench without one compare fp32 to int2).
  */
 
 #include <Spingalett/Spingalett.Short.h>
@@ -33,8 +35,9 @@
 #endif
 
 static const char *precision_name(PrecisionMode p) {
-    static const char *names[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
-    return (unsigned)p < PRECISION_COUNT ? names[p] : "?";
+    static const char *names[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2", "q8_0", "q4_0", "q4_1", "q5_0",
+                                  "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl", "iq4_xs"};
+    return (unsigned)p < sizeof names / sizeof *names ? names[p] : "?";
 }
 
 static const char *activation_name(ActivationFunction a) {
@@ -43,8 +46,12 @@ static const char *activation_name(ActivationFunction a) {
 }
 
 static bool parse_precision(const char *s, PrecisionMode *p) {
-    static const char *names[][2] = {{"fp32", "float32"}, {"fp16", "half"}, {"bf16", "bfloat16"}, {"int8", "i8"}, {"int4", "i4"}, {"int2", "ternary"}};
-    for (int i = 0; i < PRECISION_COUNT; i++)
+    static const char *names[][2] = {{"fp32", "float32"}, {"fp16", "half"}, {"bf16", "bfloat16"}, {"int8", "i8"},
+                                     {"int4", "i4"}, {"int2", "ternary"}, {"q8_0", "Q8_0"}, {"q4_0", "Q4_0"},
+                                     {"q4_1", "Q4_1"}, {"q5_0", "Q5_0"}, {"q5_1", "Q5_1"}, {"q2_k", "Q2_K"},
+                                     {"q3_k", "Q3_K"}, {"q4_k", "Q4_K"}, {"q5_k", "Q5_K"}, {"q6_k", "Q6_K"},
+                                     {"iq4_nl", "IQ4_NL"}, {"iq4_xs", "IQ4_XS"}};
+    for (int i = 0; i < (int)(sizeof names / sizeof *names) && i < PRECISION_COUNT; i++)
         if (!strcmp(s, names[i][0]) || !strcmp(s, names[i][1])) { *p = (PrecisionMode)i; return true; }
     return false;
 }
@@ -182,7 +189,8 @@ static int eval(const char *path, const char *data, const char *labels, bool hav
     printf("%u samples\n  precision     bytes    accuracy      loss\n", d.count);
     int rc = 0;
     for (int p = 0; p < PRECISION_COUNT; p++) {
-        if (have_precision && p != (int)precision) continue;
+        /* (the block precisions, for language models, when asked for) */
+        if (have_precision ? p != (int)precision : p > PRECISION_INT2) continue;
         SpingalettModel *q = spingalett_model_from_network(net, (PrecisionMode)p);
         if (!q) { rc = fail(precision_name((PrecisionMode)p)); continue; }
         EvalMetrics e = spingalett_model_evaluate(q, d.inputs, d.targets, d.count);
@@ -206,7 +214,8 @@ static int bench(const char *path, bool have_precision, PrecisionMode precision)
     for (size_t i = 0; i < (size_t)n * in; i++) x[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
     printf("  precision     bytes   one sample     batched\n");
     for (int p = 0; p < PRECISION_COUNT; p++) {
-        if (have_precision && p != (int)precision) continue;
+        /* (the block precisions, for language models, when asked for) */
+        if (have_precision ? p != (int)precision : p > PRECISION_INT2) continue;
         SpingalettModel *q = spingalett_model_from_network(net, (PrecisionMode)p);
         if (!q) continue;
         void *ws = malloc(q->workspace_size);
@@ -258,7 +267,8 @@ static int usage(void) {
         "       ModelTool eval <model.slett> <data.slettd | images labels> [--precision P]\n"
         "       ModelTool bench <model.slett> [--precision P]\n"
         "       ModelTool import <model.onnx> <out.slett> [--precision P]\n"
-        "P: fp32, fp16, bf16, int8, int4, int2 (default: as stored)\n");
+        "P: fp32, fp16, bf16, int8, int4, int2, q8_0, q4_0, q4_1, q5_0, q5_1, q2_k, q3_k, q4_k, q5_k, q6_k,\n"
+        "   iq4_nl, iq4_xs (default: as stored)\n");
     return 2;
 }
 

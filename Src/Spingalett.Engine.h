@@ -34,6 +34,7 @@ static inline bool spingalett_precision_is_int(PrecisionMode p) {
     return p == PRECISION_INT8 || p == PRECISION_INT4 || p == PRECISION_INT2;
 }
 
+
 /* One entry of the layer table: entry i describes layer i + 1 and what feeds it, the output of layer
    i before version 6, of its inputs (the first gives the input shape) from version 6 on. */
 typedef struct {
@@ -104,6 +105,56 @@ static inline ActivationFunction slett_act(uint32_t code) {
          : code < (uint32_t)ACT_COUNT ? (ActivationFunction)code : ACT_COUNT;
 }
 static inline uint64_t slett_align(uint64_t x) { return (x + SLETT_SECTION_ALIGN - 1) & ~(uint64_t)(SLETT_SECTION_ALIGN - 1); }
+
+/* The block precisions (format 10): GGUF's types, a row whole blocks of slett_block_values() weights in
+   slett_block_bytes() bytes each, laid out as llama.cpp lays them out (docs/ModelFormat.md). A layer of
+   such weights quantizes its input in blocks of as many values (spingalett_quantize_blocks()). */
+static inline bool spingalett_precision_is_block(PrecisionMode p) {
+    return p >= PRECISION_Q8_0 && p < PRECISION_COUNT;
+}
+static inline uint32_t slett_block_values(PrecisionMode p) {
+    return p >= PRECISION_Q2_K && p <= PRECISION_Q6_K ? 256u : p == PRECISION_IQ4_XS ? 256u : 32u;
+}
+static inline uint32_t slett_block_bytes(PrecisionMode p) {
+    switch (p) {
+        case PRECISION_Q8_0:   return 34u;     /* d, 32 signed bytes */
+        case PRECISION_Q4_0:   return 18u;     /* d, 16 bytes of codes */
+        case PRECISION_Q4_1:   return 20u;     /* d, m, 16 bytes */
+        case PRECISION_Q5_0:   return 22u;     /* d, 4 bytes of fifth bits, 16 bytes */
+        case PRECISION_Q5_1:   return 24u;     /* d, m, 4, 16 */
+        case PRECISION_Q2_K:   return 84u;     /* 16 bytes of scales and minima, 64 of codes, d, dmin */
+        case PRECISION_Q3_K:   return 110u;    /* 32 bytes of third bits, 64 of codes, 12 of scales, d */
+        case PRECISION_Q4_K:   return 144u;    /* d, dmin, 12 bytes of scales and minima, 128 of codes */
+        case PRECISION_Q5_K:   return 176u;    /* d, dmin, 12, 32 bytes of fifth bits, 128 */
+        case PRECISION_Q6_K:   return 210u;    /* 128 bytes of low bits, 64 of high bits, 16 scales, d */
+        case PRECISION_IQ4_NL: return 18u;     /* d, 16 bytes of codes */
+        case PRECISION_IQ4_XS: return 136u;    /* d, 2 + 4 bytes of scales, 128 of codes */
+        default:               return 0u;
+    }
+}
+/* Whether layer L multiplies weights of a block precision: a dense or linear layer (the precision byte of kinds
+   without parameters is the file's, which they do not use). */
+static inline bool slett_block_layer(const SlettLayer *L) {
+    return spingalett_precision_is_block(L->precision) && (L->type == LAYER_DENSE || L->type == LAYER_CONV2D);
+}
+/* Bytes of the quantized input of a block layer of n inputs (spingalett_quantize_blocks()): the codes, a
+   scale for every block of 32 at most, and a sum for every 16 codes. */
+static inline uint64_t slett_block_input_bytes(uint64_t n) {
+    return slett_align(n) + slett_align(n / 8u) + slett_align(n / 4u);
+}
+
+/* n weights (whole blocks) of a block precision as floats, as llama.cpp's dequantize_row_*() computes them. */
+void spingalett_block_decode(PrecisionMode p, const uint8_t *row, float *y, uint32_t n);
+/* n inputs (a multiple of block, 32 or 256) quantized a block at a time by spingalett_quantize_activations():
+   xq the codes, dx[b] block b's scale, sums[i] the sum of codes 16 i to 16 i + 15. */
+void spingalett_quantize_blocks(const float *x, uint32_t n, uint32_t block, int8_t *xq, float *dx, int32_t *sums);
+/* The dot product of a row of n weights of a block precision with an input quantized in its blocks, as every
+   kernel computes it: in each block, the integer sums of the codes' products in each of its sub-blocks, times
+   the sub-blocks' integer scales, added in integers (I1; and, of the types with minima, the minima times the
+   sub-blocks' sums of codes, I2); the block then adds (d dx) I1 (+ (m dx) I2) to a float sum, block after
+   block (docs/ModelFormat.md, **Block precisions**). */
+float spingalett_block_dot(PrecisionMode p, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *sums,
+                           uint32_t n);
 
 bool spingalett_host_is_little_endian(void);
 

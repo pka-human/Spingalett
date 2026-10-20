@@ -94,7 +94,8 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
             }
             return (float)(kept / count);
         }
-        default:
+        default:                            /* the block precisions: whole blocks, their scales inside */
+            spingalett_block_quantize(precision, w, dst, n);
             return 0.0f;
     }
 }
@@ -103,8 +104,13 @@ static float quantize_row(const float *w, uint32_t n, PrecisionMode precision, u
    pooling layers, 5 with batch normalization or grouped convolutions, 6 for graphs, 7 with
    transposed convolutions, upsampling or layer normalization, 8 with the layers, activations or the
    loss of transformers, 9 with the training features of language models (layers tied to an embedding,
-   attention ignoring padding or of a sliding window, cross-attention, embeddings of part of their input). */
-static uint16_t format_version(const NeuralNetwork *net) {
+   attention ignoring padding or of a sliding window, cross-attention, embeddings of part of their input), 10 with
+   layers of the block precisions. */
+static PrecisionMode layer_precision(const NeuralNetwork *net, uint32_t l, PrecisionMode precision);
+
+static uint16_t format_version(const NeuralNetwork *net, PrecisionMode precision) {
+    for (uint32_t l = 0; l + 1 < net->layers; l++)
+        if (spingalett_precision_is_block(layer_precision(net, l, precision))) return 10u;
     for (uint32_t l = 1; l < net->layers; l++) {
         const LayerShape *s = &net->shapes[l];
         if (s->tied || s->mask || s->window || (s->type == LAYER_ATTENTION && spingalett_input_count(net, l) == 2) ||
@@ -128,9 +134,26 @@ static uint16_t format_version(const NeuralNetwork *net) {
 }
 
 /* Normalizations keep their parameters (and batch normalization its statistics) in FLOAT32 whatever
-   the file's precision. */
-static inline PrecisionMode layer_precision(const NeuralNetwork *net, uint32_t l, PrecisionMode precision) {
-    return spingalett_normalization(net->shapes[l + 1].type) ? PRECISION_FLOAT32 : precision;
+   the file's precision. A block precision applies to dense layers, linear layers (1 x 1 convolutions of one
+   group) and embeddings whose rows are whole blocks: of a k-quant or IQ4_XS, rows of whole blocks of 32 take
+   the type of 32 llama.cpp falls back to (Q2_K, Q3_K and IQ4_XS IQ4_NL, Q4_K Q5_0, Q5_K Q5_1, Q6_K Q8_0), and
+   other layers FP16. */
+static PrecisionMode layer_precision(const NeuralNetwork *net, uint32_t l, PrecisionMode precision) {
+    const LayerShape *s = &net->shapes[l + 1];
+    if (spingalett_normalization(s->type)) return PRECISION_FLOAT32;
+    if (!spingalett_precision_is_block(precision) || spingalett_weight_rows(net, l) == 0) return precision;
+    const bool linear = s->type == LAYER_DENSE || s->type == LAYER_EMBEDDING ||
+                        (s->type == LAYER_CONV2D && s->kernel_h == 1 && s->kernel_w == 1 && s->stride_h == 1 &&
+                         s->stride_w == 1 && s->pad_h == 0 && s->pad_w == 0 && s->groups <= 1);
+    const uint32_t n = spingalett_weight_row_len(net, l);
+    if (!linear || n % 32u) return PRECISION_FP16;
+    if (n % slett_block_values(precision) == 0) return precision;
+    switch (precision) {
+        case PRECISION_Q4_K: return PRECISION_Q5_0;
+        case PRECISION_Q5_K: return PRECISION_Q5_1;
+        case PRECISION_Q6_K: return PRECISION_Q8_0;
+        default:             return PRECISION_IQ4_NL;
+    }
 }
 
 /* Byte offsets of the layers' outputs among the engine's activations (version 6), every layer
@@ -172,7 +195,7 @@ static void *save_image(const NeuralNetwork *net, PrecisionMode precision, bool 
         set_error(SPINGALETT_ERR_INVALID, "save: the .slett format needs a little-endian host");
         return NULL;
     }
-    const uint16_t version = format_version(net);
+    const uint16_t version = format_version(net, precision);
     const size_t entry_size = version == 3u ? SLETT_LAYER_ENTRY_SIZE : version == 4u ? SLETT_LAYER_ENTRY_SIZE_4
                             : version == 5u ? SLETT_LAYER_ENTRY_SIZE_5 : SLETT_LAYER_ENTRY_SIZE_6;
     uint32_t L = net->layers - 1;              /* weight layers */
@@ -710,10 +733,14 @@ static NeuralNetwork *load_image(const uint8_t *p, size_t size, PrecisionMode *p
                 case PRECISION_INT8:
                     for (uint32_t k = 0; k < e.row_len; k++) dst[k] = (float)(int8_t)r[k] * scale;
                     break;
-                default:
+                case PRECISION_INT4:
+                case PRECISION_INT2:
                     if (e.precision == PRECISION_INT4) spingalett_unpack_int4(r, codes, e.row_len);
                     else spingalett_unpack_int2(r, codes, e.row_len);
                     for (uint32_t k = 0; k < e.row_len; k++) dst[k] = (float)codes[k] * scale;
+                    break;
+                default:                        /* the block precisions */
+                    spingalett_block_decode(e.precision, r, dst, e.row_len);
                     break;
             }
         }

@@ -22,7 +22,7 @@ export type LayerType =
     | 'conv_transpose2d' | 'upsample' | 'layer_norm' | 'embedding' | 'attention' | 'rms_norm' | 'multiply';
 export type Activation =
     | 'none' | 'sigmoid' | 'relu' | 'tanh' | 'leaky_relu' | 'foo52' | 'softmax' | 'gelu' | 'gelu_tanh' | 'silu';
-export type Precision = 'fp32' | 'fp16' | 'bf16' | 'int8' | 'int4' | 'int2';
+export type Precision = 'fp32' | 'fp16' | 'bf16' | 'int8' | 'int4' | 'int2' | 'q8_0' | 'q4_0' | 'q4_1' | 'q5_0' | 'q5_1' | 'q2_k' | 'q3_k' | 'q4_k' | 'q5_k' | 'q6_k' | 'iq4_nl' | 'iq4_xs';
 export type Loss = 'mse' | 'cross_entropy' | 'sparse_cross_entropy';
 
 /** A weight layer, as spingalett_model_layer() describes it. Shapes are [height, width, channels]

@@ -42,6 +42,8 @@ typedef struct PredictWorkspace {
     size_t tile_stride, tile_sums;              /* bytes per thread, offset of the sums */
     float *conv;                                /* gathered windows of float convolutions (OpenBLAS) */
     float *norm;                                /* batch normalization coefficients */
+    uint8_t *blockq;                            /* the quantized inputs of a layer of a block precision
+                                                   (spingalett_block_layer()) */
     SpingalettGemmScratch *gemm;
     /* what the workspace was made for, and its size */
     int threads;
@@ -108,5 +110,5 @@ static inline bool spingalett_slett_language_model(const uint8_t *image) {
 
 /* A float linear layer of a language model, which sessions run on packed panels. */
 static inline bool spingalett_session_panels(const SlettLayer *L, bool language_model) {
-    return language_model && L->groups == 1 && !spingalett_precision_is_int(L->precision) && slett_conv_pointwise(L);
+    return language_model && L->groups == 1 && L->precision <= PRECISION_BFLOAT16 && slett_conv_pointwise(L);
 }

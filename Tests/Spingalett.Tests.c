@@ -31,6 +31,10 @@
 #endif
 
 static int failures = 0;
+/* The precisions of a scale a row, which the tests of 1.3 and before take one by one (the block precisions of
+   format 10 have tests of their own). */
+#define ROW_PRECISIONS (PRECISION_INT2 + 1)
+
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static unsigned lcg_state = 12345;
@@ -3446,7 +3450,7 @@ static void model_shared(void) {
     for (size_t i = 0; i < (size_t)40 * 192; i++) x[i] = frand();
     ComputeMode mode = spingalett_get_compute_mode();
     spingalett_set_compute_mode(COMPUTE_OPENMP);
-    for (int p = 0; p < PRECISION_COUNT; p++) {
+    for (int p = 0; p < ROW_PRECISIONS; p++) {
         SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
         float *expect[SIZES], *y = malloc((size_t)40 * 5 * sizeof(float));
         bool same = m && y;
@@ -3604,7 +3608,7 @@ static void model_files(void) {
     if (v1) free_network(v1);
 
     /* NaN in, NaN out, in every precision */
-    for (int p = 0; p < PRECISION_COUNT; p++) {
+    for (int p = 0; p < ROW_PRECISIONS; p++) {
         SpingalettModel *m = spingalett_model_from_network(a, (PrecisionMode)p);
         float in[6] = {0.1f, NAN, 0.3f, 0, 0, 0}, out[3];
         CHECK(m && spingalett_model_run(m, in, out, NULL) == SPINGALETT_OK && isnan(out[0]), "files: NaN input, precision %d", p);
@@ -3927,7 +3931,7 @@ static void model_conv(void) {
     float *x = malloc((size_t)N * in * sizeof(float)), *ref = malloc((size_t)N * out * sizeof(float));
     float *one = malloc((size_t)N * out * sizeof(float)), *batch = malloc((size_t)N * out * sizeof(float));
     for (size_t i = 0; i < (size_t)N * in; i++) x[i] = frand() * 2 - 1;
-    for (int p = 0; p < PRECISION_COUNT; p++) {
+    for (int p = 0; p < ROW_PRECISIONS; p++) {
         SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
         CHECK(m && m->input_size == in && m->output_size == out && m->layer_count == 6, "conv model p=%d: fields", p);
         if (!m) continue;
@@ -4194,7 +4198,7 @@ static void norm_inference(ComputeMode mode) {
               "norm: model layers");
         spingalett_model_free(m);
     }
-    for (int prec = PRECISION_FP16; prec < PRECISION_COUNT; prec++) {
+    for (int prec = PRECISION_FP16; prec < ROW_PRECISIONS; prec++) {
         SpingalettModel *qm = spingalett_model_from_network(net, (PrecisionMode)prec);
         CHECK(qm != NULL, "norm: model in precision %d", prec);
         if (!qm) continue;
@@ -4798,7 +4802,7 @@ static void graph_inference(ComputeMode mode) {
         }
         spingalett_free(img);
 
-        for (int pr = 0; pr < PRECISION_COUNT; pr++) {
+        for (int pr = 0; pr < ROW_PRECISIONS; pr++) {
             SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)pr);
             CHECK(m != NULL, "graph %d: no model in precision %d", which, pr);
             if (!m) continue;
@@ -4890,7 +4894,7 @@ static void graph_folding(void) {
     float y[18];
     for (int i = 0; i < 18; i++) y[i] = frand() * 2 - 1;
     predict(.net = net, .inputs = y, .sample_count = 1, .outputs = p);
-    for (int pr = 0; pr < PRECISION_COUNT; pr++) {
+    for (int pr = 0; pr < ROW_PRECISIONS; pr++) {
         m = spingalett_model_from_network(net, (PrecisionMode)pr);
         CHECK(m && m->layer_count == 2, "graph folding: a transposed convolution keeps %u layers", m ? m->layer_count : 0);
         if (m) {
@@ -5263,7 +5267,7 @@ static void tf_models(void) {
         spingalett_free(img);
         /* (random weights through several layers: quantization's error grows with depth) */
         const float tol[PRECISION_COUNT] = {2e-5f, 1e-2f, 6e-2f, 0.25f, 2.5f, 6.0f};
-        for (int p = 0; p < PRECISION_COUNT; p++) {
+        for (int p = 0; p < ROW_PRECISIONS; p++) {
             SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
             CHECK(m != NULL, "transformer models net %d: model of precision %d", which, p);
             if (!m) continue;
@@ -5727,7 +5731,7 @@ static void tf_token_quantization(void) {
             float *x = malloc((size_t)N * T * sizeof(float)), *y = malloc((size_t)N * T * V * sizeof(float));
             float *z = malloc((size_t)N * T * V * sizeof(float)), *r = malloc((size_t)N * T * V * sizeof(float));
             for (uint32_t i = 0; i < N * T; i++) x[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
-            for (int p = PRECISION_INT8; p < PRECISION_COUNT; p++) {
+            for (int p = PRECISION_INT8; p < ROW_PRECISIONS; p++) {
                 SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
                 CHECK(m != NULL, "token quantization: model");
                 if (!m) continue;
@@ -5847,7 +5851,7 @@ static void session_equivalence(void) {
                 for (uint32_t t = 0; t < T; t++) x[s * T + t] = (float)(tok[s][t] = (uint32_t)(frand() * 4096.0f) % V);
             tok[2][3] = V + 4;                              /* a token outside the vocabulary: zeros */
             x[2 * T + 3] = (float)tok[2][3];
-            for (int p = 0; p < PRECISION_COUNT; p++)
+            for (int p = 0; p < ROW_PRECISIONS; p++)
                 for (int mode = 0; mode < 2; mode++) {
                     spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
                     SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
@@ -5895,6 +5899,146 @@ static void session_equivalence(void) {
         }
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     printf("  sessions: %d of %d models and modes give batched prediction's logits bit for bit\n", exact, runs);
+}
+
+static const char *const block_names[] = {"Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K",
+                                          "Q6_K", "IQ4_NL", "IQ4_XS"};
+
+/* Dense layers of the block precisions (inputs of 1 to 9 blocks, some of zeros): the engine's outputs against the
+   weights the file decodes to times the inputs, within what quantizing the inputs in blocks costs (half a block's
+   scale an input, times the weights' magnitudes), and batched prediction on one thread and many against the
+   engine, bit for bit. */
+static void block_kernels(PrecisionMode p) {
+    const uint32_t S = p >= PRECISION_Q2_K && p != PRECISION_IQ4_NL ? 256u : 32u, N = 7, n = 40;
+    static const uint32_t blocks[] = {1, 2, 3, 9};
+    lcg_state = 300 + p;
+    double worst = 0;
+    int exact = 1;
+    for (size_t t = 0; t < sizeof blocks / sizeof *blocks; t++) {
+        const uint32_t K = blocks[t] * S;
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(net, K);
+        layer(net, N, ACT_NONE);
+        for (uint32_t j = 0; j < N; j++)
+            for (uint32_t k = 0; k < K; k++)
+                net->weights[(size_t)j * K + k] = j == 3 ? 0.0f : (frand() * 2 - 1) * powf(10.0f, (float)j - 3.0f) *
+                                                                     (k % 37 == 0 ? 6.0f : 1.0f);
+        for (uint32_t j = 0; j < N; j++) net->biases[j] = frand() - 0.5f;
+        SpingalettModel *m = spingalett_model_from_network(net, p);
+        SpingalettLayerInfo li;
+        CHECK(m && spingalett_model_layer(m, 0, &li) && li.precision == p && ((const uint8_t *)m->image)[6] == 10,
+              "blocks %s K=%u: no model of the precision (%s)", block_names[p - PRECISION_Q8_0], K,
+              spingalett_last_error_message());
+        NeuralNetwork *decoded = m ? spingalett_load_from_memory(m->image, m->image_size) : NULL;
+        CHECK(decoded, "blocks %s K=%u: the image does not load", block_names[p - PRECISION_Q8_0], K);
+        if (!m || !decoded) { spingalett_model_free(m); free_network(net); free_network(decoded); continue; }
+        float *x = malloc((size_t)n * K * sizeof(float)), *y = malloc((size_t)n * N * sizeof(float));
+        float *b = malloc((size_t)n * N * sizeof(float));
+        void *ws = malloc(m->workspace_size);           /* exact size: ASan catches overruns */
+        for (uint32_t s = 0; s < n; s++)
+            for (uint32_t k = 0; k < K; k++)
+                x[(size_t)s * K + k] = s % 5 == 4 || (s % 5 == 3 && k < S) ? 0.0f : (frand() * 2 - 1) * (k % 11 ? 1.0f : 9.0f);
+        for (uint32_t s = 0; s < n; s++) {
+            const float *xs = x + (size_t)s * K;
+            CHECK(spingalett_model_run(m, xs, y + (size_t)s * N, ws) == SPINGALETT_OK, "blocks: run failed");
+            for (uint32_t j = 0; j < N; j++) {
+                const float *w = decoded->weights + (size_t)j * K;
+                double ref = decoded->biases[j], bound = 1e-6 * fabs(ref);
+                for (uint32_t b0 = 0; b0 < K; b0 += S) {
+                    float amax = 0.0f;
+                    for (uint32_t k = b0; k < b0 + S; k++) amax = fmaxf(amax, fabsf(xs[k]));
+                    for (uint32_t k = b0; k < b0 + S; k++) {
+                        ref += (double)w[k] * xs[k];
+                        bound += fabs((double)w[k]) * (amax / 127.0 * 0.5 + 1e-6 * fabs(xs[k]));
+                    }
+                }
+                const double d = fabs((double)y[(size_t)s * N + j] - ref);
+                if (d > bound * 1.01 + 1e-30 && d / (bound + 1e-30) > worst) worst = d / (bound + 1e-30);
+            }
+        }
+        for (int mode = 0; mode < 2; mode++) {
+            spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+            memset(b, 0, (size_t)n * N * sizeof(float));
+            exact &= spingalett_model_predict(m, x, n, b) && !memcmp(b, y, (size_t)n * N * sizeof(float));
+        }
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        free(x); free(y); free(b); free(ws);
+        spingalett_model_free(m);
+        free_network(net);
+        free_network(decoded);
+    }
+    printf("  blocks %-6s: %s, predict %s\n", block_names[p - PRECISION_Q8_0], worst == 0 ? "within the quantization's bound"
+           : "OFF", exact ? "== run" : "DIFFERS");
+    CHECK(worst == 0 && exact, "blocks %s: outputs beyond the bound (%.2f x) or predict differs from run",
+          block_names[p - PRECISION_Q8_0], worst);
+}
+
+/* Language models (LLaMA-like, Mistral-like with a tied head) of width 256 in every block precision, on one thread
+   and many: batched prediction gives the engine's logits, sessions batched prediction's, bit for bit (a token at a
+   time, a prompt, two sequences at once); and the logits stay near those of the weights the file decodes to. */
+static void block_models(void) {
+    const uint32_t T = 12, V = 29, N = 2, d = 256;
+    int exact = 0, runs = 0;
+    for (int kind = 1; kind < 3; kind++) {
+        lcg_state = 900 + (unsigned)kind;
+        NeuralNetwork *net = lm_net(kind, T, V, d);
+        tf_init(net);
+        uint32_t tok[2][12];
+        float *x = malloc((size_t)N * T * sizeof(float)), *ref = malloc((size_t)N * T * V * sizeof(float));
+        float *got = malloc((size_t)N * T * V * sizeof(float)), *one = malloc((size_t)T * V * sizeof(float));
+        float *flt = malloc((size_t)N * T * V * sizeof(float));
+        for (uint32_t s = 0; s < N; s++)
+            for (uint32_t t = 0; t < T; t++) x[s * T + t] = (float)(tok[s][t] = (uint32_t)(frand() * 4096.0f) % V);
+        for (int p = PRECISION_Q8_0; p < PRECISION_COUNT; p++) {
+            const char *name = block_names[p - PRECISION_Q8_0];
+            SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+            NeuralNetwork *decoded = m ? spingalett_load_from_memory(m->image, m->image_size) : NULL;
+            CHECK(m && decoded, "block model kind %d %s: no model (%s)", kind, name, spingalett_last_error_message());
+            if (!m || !decoded) { spingalett_model_free(m); free_network(decoded); continue; }
+            void *ws = malloc(m->workspace_size);
+            bool same = true;
+            for (uint32_t s = 0; s < N; s++) {
+                same = same && spingalett_model_run(m, x + (size_t)s * T, one, ws) == SPINGALETT_OK;
+                memcpy(ref + (size_t)s * T * V, one, (size_t)T * V * sizeof(float));
+            }
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            predict(.net = decoded, .inputs = x, .sample_count = N, .outputs = flt);
+            double err = 0, norm = 0;
+            for (size_t i = 0; i < (size_t)N * T * V; i++) {
+                err += (double)(ref[i] - flt[i]) * (ref[i] - flt[i]);
+                norm += (double)flt[i] * flt[i];
+            }
+            for (int mode = 0; mode < 2; mode++) {
+                spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+                memset(got, 0, (size_t)N * T * V * sizeof(float));
+                same = same && spingalett_model_predict(m, x, N, got) && !memcmp(got, ref, (size_t)N * T * V * 4);
+                SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = N});
+                bool ok = s != NULL;
+                float *g0 = got, *g1 = got + (size_t)T * V;
+                memset(got, 0, (size_t)N * T * V * sizeof(float));
+                for (uint32_t t = 0; t < 4 && ok; t++) ok = feed_span(s, 0, tok[0], t, t + 1, false, g0, V);
+                SpingalettSessionFeed both[2] = {
+                    {.sequence = 1, .tokens = tok[1], .count = T, .logits = g1, .all = true},
+                    {.sequence = 0, .tokens = tok[0] + 4, .count = T - 4, .logits = g0 + (size_t)4 * V, .all = true}};
+                ok = ok && spingalett_session_feed(s, both, 2);
+                same = same && ok && !memcmp(got, ref, (size_t)N * T * V * 4);
+                spingalett_session_free(s);
+            }
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            const double rel = sqrt(err / norm);
+            const double limit = p == PRECISION_Q2_K || p == PRECISION_Q3_K ? 0.08 : 0.05;
+            CHECK(same, "block model kind %d %s: engine, predict and sessions differ", kind, name);
+            CHECK(rel < limit, "block model kind %d %s: logits %.3f from the decoded weights' (relative)", kind, name, rel);
+            exact += same && rel < limit, runs++;
+            free(ws);
+            spingalett_model_free(m);
+            free_network(decoded);
+        }
+        free(x); free(ref); free(got); free(one); free(flt);
+        free_network(net);
+    }
+    printf("  block models: %d of %d (two language models, twelve types) give the engine's logits in batches and "
+           "sessions\n", exact, runs);
 }
 
 /* What sessions refuse: models that are no causal language models, a window too long, and feeds, rewinds
@@ -5996,7 +6140,7 @@ static void session_shared(void) {
     for (uint32_t t = 0; t < T; t++) x[t] = (float)(tok[t] = (uint32_t)(frand() * 4096.0f) % V);
     ComputeMode mode = spingalett_get_compute_mode();
     spingalett_set_compute_mode(COMPUTE_OPENMP);
-    for (int p = 0; p < PRECISION_COUNT; p += 3) {
+    for (int p = 0; p < ROW_PRECISIONS; p += 3) {
         SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
         bool same = m && spingalett_model_predict(m, x, 1, expect);
         SpingalettModel bare;
@@ -8948,7 +9092,8 @@ static bool write_floats(const char *dir, const char *name, const char *suffix, 
    language models NAME.sess, the logits of runtime_session(). The runtime must give the same bits
    (Spingalett.RuntimeTests.c). DIR/models.txt lists the names and the samples of each. */
 static int export_runtime_models(const char *dir) {
-    static const char *pnames[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
+    static const char *pnames[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2", "q8_0", "q4_0", "q4_1", "q5_0",
+                                   "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl", "iq4_xs"};
     char path[1024];
     snprintf(path, sizeof path, "%s/models.txt", dir);
     FILE *list = fopen(path, "w");
@@ -9245,7 +9390,7 @@ int main(int argc, char **argv) {
     }
     if (!*only || !strcmp(only, "model")) {
         printf("[deployment models]\n");
-        for (int p = 0; p < PRECISION_COUNT; p++) model_kernels((PrecisionMode)p);
+        for (int p = 0; p < ROW_PRECISIONS; p++) model_kernels((PrecisionMode)p);
         model_inference(PRECISION_FLOAT32, 1e-5f);
         model_inference(PRECISION_FP16, 2e-3f);
         model_inference(PRECISION_BFLOAT16, 2e-2f);
@@ -9258,8 +9403,10 @@ int main(int argc, char **argv) {
         session_shared();
         model_validation();
         model_files();
-        for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);
+        for (int p = 0; p < ROW_PRECISIONS; p++) model_conv_kernels((PrecisionMode)p);
         model_conv();
+        for (int p = PRECISION_Q8_0; p < PRECISION_COUNT; p++) block_kernels((PrecisionMode)p);
+        block_models();
     }
     for (int backend = 0; backend < 2; backend++) {
         /* the group "gpu" on Vulkan, "cuda" on CUDA */

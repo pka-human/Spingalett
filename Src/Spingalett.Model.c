@@ -10,6 +10,7 @@
  */
 
 #include "Spingalett.Model.h"
+#include "Spingalett.Blocks.h"
 #if !defined(SPINGALETT_RUNTIME)
 #include "Spingalett.Gpu.h"
 #endif
@@ -140,6 +141,7 @@ void spingalett_predict_workspace_free(PredictWorkspace *w) {
     spingalett_aligned_free(w->window);
     spingalett_aligned_free(w->conv);
     spingalett_aligned_free(w->norm);
+    spingalett_aligned_free(w->blockq);
     spingalett_aligned_free(w->tile);
     spingalett_gemm_scratch_free(w->gemm);
     free(w);
@@ -380,6 +382,7 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
     w->sessions = sessions;
     uint32_t int_inputs = 0, int_window = 0, norm_channels = 0, transposed_window = 0, scales = 1;
     size_t conv_floats = 0, tile_x = 0, tile_acc = 0;
+    uint64_t block_bytes = 0;
     bool has_float = false, ok = true;
     for (uint32_t i = 0; i < model->layer_count; i++) {
         SlettLayer L;
@@ -405,6 +408,11 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
             continue;
         }
         if (L.rows == 0 || L.type == LAYER_BATCH_NORM || L.type == LAYER_LAYER_NORM) continue;      /* pooling, normalizations */
+        if (slett_block_layer(&L)) {
+            const uint64_t need = spingalett_block_scratch(&L, (uint64_t)chunk * (L.inputs / L.row_len));
+            if (need > block_bytes) block_bytes = need;
+            continue;
+        }
         bool conv = L.type == LAYER_CONV2D;
         if (spingalett_precision_is_int(L.precision)) {
             if (L.inputs > int_inputs) int_inputs = L.inputs;
@@ -456,6 +464,11 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
                must have some */
             if (ok) memset(w->tile, 0, (size_t)w->threads * w->tile_stride);
         }
+    }
+    if (ok && block_bytes) {
+        ok = block_bytes <= SIZE_MAX;
+        w->blockq = ok ? (uint8_t *)workspace_alloc(w, (size_t)block_bytes) : NULL;
+        ok = w->blockq != NULL;
     }
     if (ok && conv_floats) {
         w->conv = (float *)workspace_alloc(w, conv_floats * sizeof(float));
@@ -739,6 +752,17 @@ void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const P
                 spingalett_engine_activate(ys, out, L->activation);
             }
         );
+        return;
+    }
+    if (slett_block_layer(L)) {
+        /* a dense or linear layer: every cell of every sample through the block kernels */
+        const uint64_t items = (uint64_t)n * (in / L->row_len);
+        int threads = 1;
+#if defined(_OPENMP)
+        if (use_omp_int(mode, items * L->row_len * L->rows)) threads = omp_get_max_threads();
+#endif
+        spingalett_block_layer(image, L, x, y, items, w->blockq, threads);
+        activate_samples(y, n, out, L->activation, mode);
         return;
     }
     if (L->type != LAYER_DENSE) {

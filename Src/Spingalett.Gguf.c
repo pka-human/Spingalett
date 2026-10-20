@@ -43,9 +43,6 @@ enum {
     GGML_IQ4_XS = 23, GGML_BF16 = 30
 };
 
-/* The sixteen values of IQ4_NL's and IQ4_XS's 4-bit codes (kvalues_iq4nl). */
-static const int8_t iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-
 typedef struct {
     const char *key;
     uint32_t key_len;
@@ -291,219 +288,32 @@ static bool kv_string(const Gguf *g, const char *key, char *out, size_t cap) {
 
 /* ------------------------------------------------------------------------- dequantization */
 
-static float half(const uint8_t *p) { return spingalett_fp16_to_float(slett_get16(p)); }
-
-/* The 6-bit scale and minimum j of a Q4_K or Q5_K super-block (get_scale_min_k4()). */
-static void scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
-    if (j < 4) {
-        *d = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
-        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+/* The block precision of a ggml type, PRECISION_COUNT for the others. */
+static PrecisionMode block_precision(uint32_t type) {
+    switch (type) {
+        case GGML_Q8_0: return PRECISION_Q8_0;
+        case GGML_Q4_0: return PRECISION_Q4_0;
+        case GGML_Q4_1: return PRECISION_Q4_1;
+        case GGML_Q5_0: return PRECISION_Q5_0;
+        case GGML_Q5_1: return PRECISION_Q5_1;
+        case GGML_Q2_K: return PRECISION_Q2_K;
+        case GGML_Q3_K: return PRECISION_Q3_K;
+        case GGML_Q4_K: return PRECISION_Q4_K;
+        case GGML_Q5_K: return PRECISION_Q5_K;
+        case GGML_Q6_K: return PRECISION_Q6_K;
+        case GGML_IQ4_NL: return PRECISION_IQ4_NL;
+        case GGML_IQ4_XS: return PRECISION_IQ4_XS;
+        default: return PRECISION_COUNT;
     }
 }
 
-/* n values (a multiple of the type's block) of a ggml type at x into y. */
+/* n values (a multiple of the type's block) of a ggml type at x into y, as llama.cpp's dequantize_row_*(). */
 static void dequantize(const uint8_t *x, uint32_t type, float *y, uint64_t n) {
     switch (type) {
         case GGML_F32: spingalett_decode(y, x, SPG_DTYPE_F32, (size_t)n); return;
         case GGML_F16: spingalett_decode(y, x, SPG_DTYPE_F16, (size_t)n); return;
         case GGML_BF16: spingalett_decode(y, x, SPG_DTYPE_BF16, (size_t)n); return;
-        default: break;
-    }
-    for (uint64_t i = 0; i < n;) {
-        switch (type) {
-            case GGML_Q4_0: {                   /* d, qs[16]: (q - 8) d */
-                const float d = half(x);
-                for (int j = 0; j < 16; j++) {
-                    y[j] = (float)((x[2 + j] & 0x0F) - 8) * d;
-                    y[j + 16] = (float)((x[2 + j] >> 4) - 8) * d;
-                }
-                x += 18; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q4_1: {                   /* d, m, qs[16]: q d + m */
-                const float d = half(x), m = half(x + 2);
-                for (int j = 0; j < 16; j++) {
-                    y[j] = (float)(x[4 + j] & 0x0F) * d + m;
-                    y[j + 16] = (float)(x[4 + j] >> 4) * d + m;
-                }
-                x += 20; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q5_0: {                   /* d, qh (32 fifth bits), qs[16]: (q - 16) d */
-                const float d = half(x);
-                const uint32_t qh = slett_get32(x + 2);
-                for (int j = 0; j < 16; j++) {
-                    const uint8_t h0 = (uint8_t)(((qh >> j) << 4) & 0x10), h1 = (uint8_t)((qh >> (j + 12)) & 0x10);
-                    y[j] = (float)(((x[6 + j] & 0x0F) | h0) - 16) * d;
-                    y[j + 16] = (float)(((x[6 + j] >> 4) | h1) - 16) * d;
-                }
-                x += 22; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q5_1: {                   /* d, m, qh, qs[16]: q d + m */
-                const float d = half(x), m = half(x + 2);
-                const uint32_t qh = slett_get32(x + 4);
-                for (int j = 0; j < 16; j++) {
-                    const uint8_t h0 = (uint8_t)(((qh >> j) << 4) & 0x10), h1 = (uint8_t)((qh >> (j + 12)) & 0x10);
-                    y[j] = (float)((x[8 + j] & 0x0F) | h0) * d + m;
-                    y[j + 16] = (float)((x[8 + j] >> 4) | h1) * d + m;
-                }
-                x += 24; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q8_0: {                   /* d, qs[32] signed: q d */
-                const float d = half(x);
-                for (int j = 0; j < 32; j++) y[j] = (float)(int8_t)x[2 + j] * d;
-                x += 34; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q2_K: {                   /* scales[16] (4-bit scale and minimum), qs[64], d, dmin */
-                const uint8_t *sc = x, *q = x + 16;
-                const float d = half(x + 80), dmin = half(x + 82);
-                int is = 0;
-                for (int nb = 0; nb < 256; nb += 128) {
-                    int shift = 0;
-                    for (int j = 0; j < 4; j++) {
-                        uint8_t s = sc[is++];
-                        float dl = d * (float)(s & 0xF), ml = dmin * (float)(s >> 4);
-                        for (int l = 0; l < 16; l++) *y++ = dl * (float)((int8_t)((q[l] >> shift) & 3)) - ml;
-                        s = sc[is++];
-                        dl = d * (float)(s & 0xF);
-                        ml = dmin * (float)(s >> 4);
-                        for (int l = 0; l < 16; l++) *y++ = dl * (float)((int8_t)((q[l + 16] >> shift) & 3)) - ml;
-                        shift += 2;
-                    }
-                    q += 32;
-                }
-                x += 84; i += 256;
-                break;
-            }
-            case GGML_Q3_K: {                   /* hmask[32], qs[64], scales[12] (6-bit), d */
-                const uint8_t *hm = x, *q = x + 32;
-                const float d_all = half(x + 108);
-                /* the sixteen 6-bit scales, unpacked as llama.cpp's kmask1, kmask2 shuffle does */
-                uint32_t aux[4];
-                const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
-                aux[0] = slett_get32(x + 96); aux[1] = slett_get32(x + 100); aux[2] = slett_get32(x + 104);
-                const uint32_t tmp = aux[2];
-                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-                aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-                int8_t scales[16];
-                for (int k = 0; k < 16; k++) scales[k] = (int8_t)(uint8_t)(aux[k / 4] >> (8 * (k % 4)));
-                int is = 0;
-                uint8_t m = 1;
-                for (int nb = 0; nb < 256; nb += 128) {
-                    int shift = 0;
-                    for (int j = 0; j < 4; j++) {
-                        float dl = d_all * (float)(scales[is++] - 32);
-                        for (int l = 0; l < 16; l++)
-                            *y++ = dl * (float)((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
-                        dl = d_all * (float)(scales[is++] - 32);
-                        for (int l = 0; l < 16; l++)
-                            *y++ = dl * (float)((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
-                        shift += 2;
-                        m = (uint8_t)(m << 1);
-                    }
-                    q += 32;
-                }
-                x += 110; i += 256;
-                break;
-            }
-            case GGML_Q4_K: {                   /* d, dmin, scales[12], qs[128] */
-                const float d = half(x), dmin = half(x + 2);
-                const uint8_t *sc = x + 4, *q = x + 16;
-                int is = 0;
-                for (int j = 0; j < 256; j += 64) {
-                    uint8_t s, mn;
-                    scale_min_k4(is, sc, &s, &mn);
-                    const float d1 = d * s, m1 = dmin * mn;
-                    scale_min_k4(is + 1, sc, &s, &mn);
-                    const float d2 = d * s, m2 = dmin * mn;
-                    for (int l = 0; l < 32; l++) *y++ = d1 * (float)(q[l] & 0xF) - m1;
-                    for (int l = 0; l < 32; l++) *y++ = d2 * (float)(q[l] >> 4) - m2;
-                    q += 32;
-                    is += 2;
-                }
-                x += 144; i += 256;
-                break;
-            }
-            case GGML_Q5_K: {                   /* d, dmin, scales[12], qh[32], qs[128] */
-                const float d = half(x), dmin = half(x + 2);
-                const uint8_t *sc = x + 4, *qh = x + 16, *ql = x + 48;
-                int is = 0;
-                uint8_t u1 = 1, u2 = 2;
-                for (int j = 0; j < 256; j += 64) {
-                    uint8_t s, mn;
-                    scale_min_k4(is, sc, &s, &mn);
-                    const float d1 = d * s, m1 = dmin * mn;
-                    scale_min_k4(is + 1, sc, &s, &mn);
-                    const float d2 = d * s, m2 = dmin * mn;
-                    for (int l = 0; l < 32; l++) *y++ = d1 * (float)((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
-                    for (int l = 0; l < 32; l++) *y++ = d2 * (float)((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
-                    ql += 32;
-                    is += 2;
-                    u1 = (uint8_t)(u1 << 2);
-                    u2 = (uint8_t)(u2 << 2);
-                }
-                x += 176; i += 256;
-                break;
-            }
-            case GGML_Q6_K: {                   /* ql[128], qh[64], scales[16] signed, d */
-                const float d = half(x + 208);
-                const uint8_t *ql = x, *qh = x + 128;
-                const int8_t *sc = (const int8_t *)(x + 192);
-                for (int nb = 0; nb < 256; nb += 128) {
-                    for (int l = 0; l < 32; l++) {
-                        const int is = l / 16;
-                        const int8_t q1 = (int8_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                        const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                        const int8_t q3 = (int8_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                        const int8_t q4 = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                        y[l] = d * (float)sc[is] * (float)q1;
-                        y[l + 32] = d * (float)sc[is + 2] * (float)q2;
-                        y[l + 64] = d * (float)sc[is + 4] * (float)q3;
-                        y[l + 96] = d * (float)sc[is + 6] * (float)q4;
-                    }
-                    y += 128;
-                    ql += 64;
-                    qh += 32;
-                    sc += 8;
-                }
-                x += 210; i += 256;
-                break;
-            }
-            case GGML_IQ4_NL: {                 /* d, qs[16]: d times the code's value */
-                const float d = half(x);
-                for (int j = 0; j < 16; j++) {
-                    y[j] = d * (float)iq4_values[x[2 + j] & 0xF];
-                    y[j + 16] = d * (float)iq4_values[x[2 + j] >> 4];
-                }
-                x += 18; y += 32; i += 32;
-                break;
-            }
-            default: {                          /* GGML_IQ4_XS: d, scales_h, scales_l[4] (6-bit scales of 32 values), qs[128] */
-                const float d = half(x);
-                const uint16_t scales_h = slett_get16(x + 2);
-                const uint8_t *scales_l = x + 4, *qs = x + 8;
-                for (int ib = 0; ib < 8; ib++) {
-                    const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
-                    const float dl = d * (float)(ls - 32);
-                    for (int j = 0; j < 16; j++) {
-                        y[j] = dl * (float)iq4_values[qs[j] & 0xF];
-                        y[j + 16] = dl * (float)iq4_values[qs[j] >> 4];
-                    }
-                    y += 32;
-                    qs += 16;
-                }
-                x += 136; i += 256;
-                break;
-            }
-        }
+        default: spingalett_block_decode(block_precision(type), x, y, (uint32_t)n); return;
     }
 }
 

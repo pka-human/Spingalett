@@ -1,4 +1,4 @@
-# The .slett model format, versions 3 to 9
+# The .slett model format, versions 3 to 10
 
 `.slett` files store a network: its shape, its parameters in a chosen precision and, optionally,
 the optimizer state for resuming training. `spingalett_save()` and `spingalett_save_to_memory()`
@@ -11,7 +11,9 @@ convolutions, upsampling or layer normalization (0.13 on), version 8 for the lay
 (embeddings, attention, RMS normalization, products of layers), the GELU and SiLU activations and the
 sparse cross-entropy loss (1.2 on), version 9 for the training features of language models: dense and
 linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window,
-cross-attention and embeddings of part of their input (1.3 on). `spingalett_load()` and `spingalett_load_from_memory()` read versions 1 to 9.
+cross-attention and embeddings of part of their input (1.3 on), version 10 for layers whose weights are in a
+block precision, one of GGUF's quantization types (1.4 on). `spingalett_load()` and `spingalett_load_from_memory()`
+read versions 1 to 10.
 A checkpoint (`spingalett_save_checkpoint()`, 1.4 on) is an image of one of these versions with a
 record of a training run after it, which readers of the image ignore (**Checkpoints**).
 
@@ -25,7 +27,8 @@ normalization; version 6 adds the layers each layer reads and where its output l
 engine's workspace; version 7 adds three kinds of layers and the field of the upsampling mode, in
 version 6's layout; version 8 adds four kinds of layers, three activations and a loss, in version 6's
 layout too (their fields in the existing ones and the reserved bytes 104 to 111); version 9 adds fields
-to version 8's entries in bytes that were 0 for their kinds. The differences are marked below.
+to version 8's entries in bytes that were 0 for their kinds; version 10 adds the codes of the block precisions in
+version 9's layout. The differences are marked below.
 
 Batch normalization is folded when a network is saved for deployment: files written in a precision
 other than FLOAT32 without optimizer state, and the models of `spingalett_model_from_network()`,
@@ -39,8 +42,8 @@ still be version 3 or 4.
 ones cannot express (kinds of layers, precisions, activations, fields in space reserved as zero),
 and leave what a version 7 file means unchanged; a 1.x writer writes the oldest version that holds
 the network, as now, and every 1.x engine runs every file whose layers it has. Codes of version 7
-(activations, layer kinds, precisions) keep their values. Version 8 (Spingalett 1.2) and version 9
-(Spingalett 1.3) are such additions.
+(activations, layer kinds, precisions) keep their values. Version 8 (Spingalett 1.2), version 9
+(Spingalett 1.3) and version 10 (Spingalett 1.4) are such additions.
 
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 CRC-32 is the IEEE polynomial (0xEDB88320, reflected, initial value and final XOR 0xFFFFFFFF), as
@@ -50,12 +53,12 @@ in zlib and PNG.
 
 ```
 header (64 bytes) | layer table (48 bytes per entry in version 3, 64 in version 4, 80 in version 5,
-112 in versions 6 to 9) | sections ...
+112 in versions 6 to 10) | sections ...
 ```
 
 A network of `L` layers (the input layer included) has `L - 1` table entries; entry `i` (counted
 from 0) describes layer `i + 1` and what feeds it: the output of layer `i` in versions 3 to 5, the
-outputs of the layers it names in versions 6 to 9 (always layers before it, so that the table order is an
+outputs of the layers it names in versions 6 to 10 (always layers before it, so that the table order is an
 order in which every layer can be computed after its inputs). Each dense or convolution layer
 owns up to four sections: its weights, the per-row scales of integer weights, its biases and its
 optimizer state; a batch normalization owns the same four, its scales section holding its running
@@ -73,16 +76,16 @@ its input as a flat vector; its output has shape `1 x 1 x out`. In version 3 eve
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 6 | magic `SLETTM` |
-| 6 | 2 | format version, 3 to 9 |
+| 6 | 2 | format version, 3 to 10 |
 | 8 | 4 | `L`: number of layers, input layer included (2 to 65536) |
 | 12 | 1 | loss function: 0 mean squared error, 1 cross-entropy, 2 sparse cross-entropy (version 8: a softmax over each cell's channels of the output layer against a class index a cell) |
 | 13 | 1 | flags: bit 0 set when the file holds optimizer state; other bits 0 |
 | 14 | 2 | reserved, 0 |
 | 16 | 8 | optimizer time step (number of steps taken; 0 without optimizer state) |
 | 24 | 8 | file size in bytes |
-| 32 | 4 | versions 4 to 9: height of the input layer (1 to 65535); version 3: reserved, 0 |
-| 36 | 4 | versions 4 to 9: width of the input layer (1 to 65535); version 3: reserved, 0 |
-| 40 | 8 | versions 6 to 9: bytes of activations, the part of the engine's workspace that holds the layers' outputs (see below); versions 3 to 5: reserved, 0 |
+| 32 | 4 | versions 4 to 10: height of the input layer (1 to 65535); version 3: reserved, 0 |
+| 36 | 4 | versions 4 to 10: width of the input layer (1 to 65535); version 3: reserved, 0 |
+| 40 | 8 | versions 6 to 10: bytes of activations, the part of the engine's workspace that holds the layers' outputs (see below); versions 3 to 5: reserved, 0 |
 | 48 | 8 | reserved, 0 |
 | 56 | 4 | CRC-32 of bytes 64 to file size - 1 (the layer table and all sections) |
 | 60 | 4 | CRC-32 of bytes 0 to 59 |
@@ -95,42 +98,42 @@ The input layer's channels are its units (`in` of the first entry) divided by he
 ## Layer table
 
 `L - 1` entries start at offset 64, 48 bytes each in version 3, 64 bytes in version 4, 80 bytes
-in version 5 and 112 bytes in versions 6 to 9:
+in version 5 and 112 bytes in versions 6 to 10:
 
 | Offset | Size | Field |
 |---:|---:|---|
-| 0 | 4 | `in`: units of layer `i` (for the first entry, the network's input size); versions 6 to 9: units of the entry's first input |
+| 0 | 4 | `in`: units of layer `i` (for the first entry, the network's input size); versions 6 to 10: units of the entry's first input |
 | 4 | 4 | `out`: units of layer `i + 1`; in versions 3 to 5 equals `in` of the next entry |
 | 8 | 1 | activation of layer `i + 1` (codes below) |
 | 9 | 1 | weight precision (codes below) |
-| 10 | 1 | versions 4 to 9: kind of layer `i + 1`: 0 dense, 1 convolution, 2 max pooling, 3 average pooling, 4 batch normalization (versions 5 to 9), 5 addition, 6 concatenation, 7 global average pooling (versions 6 to 9), 8 transposed convolution, 9 upsampling, 10 layer normalization (versions 7 to 9), 11 embedding, 12 attention, 13 RMS normalization, 14 multiplication (versions 8 and 9); version 3: reserved, 0 |
+| 10 | 1 | versions 4 to 10: kind of layer `i + 1`: 0 dense, 1 convolution, 2 max pooling, 3 average pooling, 4 batch normalization (versions 5 to 10), 5 addition, 6 concatenation, 7 global average pooling (versions 6 to 10), 8 transposed convolution, 9 upsampling, 10 layer normalization (versions 7 to 10), 11 embedding, 12 attention, 13 RMS normalization, 14 multiplication (versions 8 to 10); version 3: reserved, 0 |
 | 11 | 1 | reserved, 0 |
 | 12 | 4 | dropout rate of layer `i + 1`, a float in [0, 1) (used only when training) |
 | 16 | 8 | offset of the weights; 0 for kinds without parameters (pooling, addition, concatenation) |
 | 24 | 8 | offset of the row scales (batch normalization: of its running statistics); 0 for FLOAT32, FP16 and BFLOAT16 dense and convolution layers, and for kinds without parameters |
 | 32 | 8 | offset of the biases; 0 for kinds without parameters |
 | 40 | 8 | offset of the optimizer state; 0 when the file has none, and for kinds without parameters |
-| 48 | 2 | versions 4 to 9: output height of layer `i + 1` |
-| 50 | 2 | versions 4 to 9: output width of layer `i + 1` |
-| 52 | 2 | versions 4 to 9: kernel height (window rows) |
-| 54 | 2 | versions 4 to 9: kernel width (window columns) |
-| 56 | 2 | versions 4 to 9: vertical stride |
-| 58 | 2 | versions 4 to 9: horizontal stride |
-| 60 | 2 | versions 4 to 9: padding at the top and at the bottom |
-| 62 | 2 | versions 4 to 9: padding on the left and on the right |
-| 64 | 4 | versions 5 to 9: convolution groups `g` (at least 1, dividing `in_c` and `out_c`; also of transposed convolutions); versions 8 and 9: an attention's heads, an embedding's vocabulary (the rows of its table); 0 for other kinds |
-| 68 | 4 | versions 5 to 9: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); 0 for other kinds |
-| 72 | 4 | versions 5 to 9: batch normalization's momentum, a float in [0, 1] (used only when training); version 9: an attention's sliding window `w`, an integer (0: every key); 0 for other kinds |
-| 76 | 4 | versions 7 to 9: upsampling mode, 0 nearest or 1 bilinear; versions 8 and 9: attention's flags (bit 0: causal; version 9: bit 1, padding ignored, with bits 16 to 31 the index of the embedding whose tokens tell it; other bits 0), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
-| 80 | 4 | versions 6 to 9: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications; version 9: 2 for cross-attention) |
-| 84 | 4 | versions 6 to 9: the first of them, a layer index from 0 (the network's input) to `i` |
-| 88 | 8 | versions 6 to 9: offset of the input list, `k` 32-bit layer indices (the first equal to the one above, all from 0 to `i`), when `k` is 2 or more; 0 otherwise |
-| 96 | 8 | versions 6 to 9: byte offset of the layer's output among the activations (a multiple of 16); 0 for the last layer |
-| 104 | 4 | versions 8 and 9: an attention's key and value heads (at least 1, dividing its heads); version 9 also: a dense or convolution layer's tied embedding, the index of an embedding layer before it whose table are its weights (0: weights of its own), an embedding's token offset, the first of its input's values it reads; 0 for other kinds; versions 6 and 7: reserved, 0 |
-| 108 | 4 | versions 8 and 9: an attention's base of the rotary position embeddings, a float at least 0 (0: none); 0 for other kinds; versions 6 and 7: reserved, 0 |
+| 48 | 2 | versions 4 to 10: output height of layer `i + 1` |
+| 50 | 2 | versions 4 to 10: output width of layer `i + 1` |
+| 52 | 2 | versions 4 to 10: kernel height (window rows) |
+| 54 | 2 | versions 4 to 10: kernel width (window columns) |
+| 56 | 2 | versions 4 to 10: vertical stride |
+| 58 | 2 | versions 4 to 10: horizontal stride |
+| 60 | 2 | versions 4 to 10: padding at the top and at the bottom |
+| 62 | 2 | versions 4 to 10: padding on the left and on the right |
+| 64 | 4 | versions 5 to 10: convolution groups `g` (at least 1, dividing `in_c` and `out_c`; also of transposed convolutions); versions 8 to 10: an attention's heads, an embedding's vocabulary (the rows of its table); 0 for other kinds |
+| 68 | 4 | versions 5 to 10: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); 0 for other kinds |
+| 72 | 4 | versions 5 to 10: batch normalization's momentum, a float in [0, 1] (used only when training); version 9: an attention's sliding window `w`, an integer (0: every key); 0 for other kinds |
+| 76 | 4 | versions 7 to 10: upsampling mode, 0 nearest or 1 bilinear; versions 8 to 10: attention's flags (bit 0: causal; version 9: bit 1, padding ignored, with bits 16 to 31 the index of the embedding whose tokens tell it; other bits 0), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
+| 80 | 4 | versions 6 to 10: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications; version 9: 2 for cross-attention) |
+| 84 | 4 | versions 6 to 10: the first of them, a layer index from 0 (the network's input) to `i` |
+| 88 | 8 | versions 6 to 10: offset of the input list, `k` 32-bit layer indices (the first equal to the one above, all from 0 to `i`), when `k` is 2 or more; 0 otherwise |
+| 96 | 8 | versions 6 to 10: byte offset of the layer's output among the activations (a multiple of 16); 0 for the last layer |
+| 104 | 4 | versions 8 to 10: an attention's key and value heads (at least 1, dividing its heads); version 9 also: a dense or convolution layer's tied embedding, the index of an embedding layer before it whose table are its weights (0: weights of its own), an embedding's token offset, the first of its input's values it reads; 0 for other kinds; versions 6 and 7: reserved, 0 |
+| 108 | 4 | versions 8 to 10: an attention's base of the rotary position embeddings, a float at least 0 (0: none); 0 for other kinds; versions 6 and 7: reserved, 0 |
 
 The input shape of entry `i` is the output shape of entry `i - 1` in versions 4 and 5, and the
-output shape of its first input in versions 6 to 9 (the input layer's shape from the header when that is
+output shape of its first input in versions 6 to 10 (the input layer's shape from the header when that is
 layer 0): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output channels are
 `out_c = out / (out_h * out_w)`. Both divisions must be exact.
 
@@ -224,10 +227,41 @@ are stored back to back without padding; what a row looks like depends on the pr
 | 3 | INT8 | `n` | `q * scale[j]`, `q` a signed byte in -127..127 |
 | 4 | INT4 | ceil(`n` / 2) | `q * scale[j]`; `q` is the 4-bit two's complement code in the low nibble of byte `k / 2` for even `k`, the high nibble for odd `k`, in -7..7 |
 | 5 | INT2 | ceil(`n` / 4) | `q * scale[j]`; `q` is the 2-bit two's complement code at bits `2 (k mod 4)` of byte `k / 4`: 0 is 0, 1 is +1, 3 is -1 (2 is not written) |
+| 6 to 17 | the block precisions (version 10): Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS | `n` / block x the block's bytes | **Block precisions** below |
 
 Sections of FLOAT32 weights start at a multiple of 4 and those of FP16 and BFLOAT16 at a multiple
 of 2 (all sections are 16-aligned anyway). Each row of INT4 and INT2 weights starts on a byte; the
 unused bits of a row's last byte are 0.
+
+### Block precisions
+
+From version 10 the weights of dense layers, embeddings and linear layers (convolutions of a 1 x 1 window, stride
+1, no padding and one group) may be in a block precision: GGUF's quantization types, each row stored as llama.cpp
+stores a row of a tensor of that type (`block_q4_K` and the others of ggml), so that a GGUF file's tensors are
+copied into an image as they are and back. A row of `n` weights, `n` a multiple of the type's block, is `n` /
+block blocks back to back; such layers have no row scales (offset 24 is 0), their scales are in the blocks.
+`d`, `dmin` and `m` below are IEEE binary16, all multi-byte values little-endian, and weight `k` of a block is:
+
+| Code | Type | Block | Bytes | Layout | Weight `k` |
+|---:|---|---:|---:|---|---|
+| 6 | Q8_0 | 32 | 34 | `d`, `qs[32]` signed bytes | `d qs[k]` |
+| 7 | Q4_0 | 32 | 18 | `d`, `qs[16]` | `d (c - 8)`, `c` the low nibble of `qs[k]` for `k` < 16, the high nibble of `qs[k - 16]` after |
+| 8 | Q4_1 | 32 | 20 | `d`, `m`, `qs[16]` | `d c + m`, `c` as Q4_0's |
+| 9 | Q5_0 | 32 | 22 | `d`, `qh` (32 bits), `qs[16]` | `d (c - 16)`, `c` Q4_0's nibble plus 16 times bit `k` of `qh` |
+| 10 | Q5_1 | 32 | 24 | `d`, `m`, `qh`, `qs[16]` | `d c + m`, `c` as Q5_0's |
+| 11 | Q2_K | 256 | 84 | `scales[16]`, `qs[64]`, `d`, `dmin` | for `k = 128 h + 32 j + l` (`l` < 32) the 2-bit code `c` at bits `2 j` of `qs[32 h + l]`, sub-block `s = k / 16`: `d (scales[s] & 15) c - dmin (scales[s] >> 4)` |
+| 12 | Q3_K | 256 | 110 | `hmask[32]`, `qs[64]`, `scales[12]`, `d` | `c` as Q2_K's, minus 4 when bit `4 h + j` of `hmask[l]` is 0; `d (sc[s] - 32) c` with the 16 scales of 6 bits `sc` unpacked from `scales` as llama.cpp's `kmask1`/`kmask2` shuffle does |
+| 13 | Q4_K | 256 | 144 | `d`, `dmin`, `scales[12]`, `qs[128]` | for `k = 64 i + 32 u + l` the low (`u` 0) or high (`u` 1) nibble `c` of `qs[32 i + l]`, sub-block `s = k / 32`: `d sc[s] c - dmin mn[s]`, the 6-bit `sc` and `mn` of `scales` as `get_scale_min_k4()` reads them |
+| 14 | Q5_K | 256 | 176 | `d`, `dmin`, `scales[12]`, `qh[32]`, `qs[128]` | as Q4_K's with `c` plus 16 times bit `s` of `qh[l]` |
+| 15 | Q6_K | 256 | 210 | `ql[128]`, `qh[64]`, `scales[16]` signed bytes, `d` | for `k = 128 h + 32 g + l` the low (`g` < 2) or high nibble of `ql[64 h + 32 (g mod 2) + l]` plus 16 times bits `2 g` of `qh[32 h + l]`, minus 32: `d scales[k / 16] c` |
+| 16 | IQ4_NL | 32 | 18 | `d`, `qs[16]` | `d v[c]`, `c` as Q4_0's and `v` the table -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 |
+| 17 | IQ4_XS | 256 | 136 | `d`, `scales_h` (16 bits), `scales_l[4]`, `qs[128]` | sub-block `s = k / 32` of IQ4_NL's codes in `qs[16 s ..]`: `d (ls - 32) v[c]`, `ls` the nibble `s mod 2` of `scales_l[s / 2]` plus 16 times bits `2 s` of `scales_h` |
+
+Writers (`spingalett_save()` in one of these precisions) choose the codes and scales as llama.cpp's quantizers do
+without an importance matrix, byte for byte. A layer whose rows are not whole blocks of a k-quant or IQ4_XS
+takes the type llama.cpp falls back to (Q2_K, Q3_K and IQ4_XS IQ4_NL, Q4_K Q5_0, Q5_K Q5_1, Q6_K Q8_0), and a
+layer that takes no block precision (other kinds, rows not of whole blocks of 32) FP16; normalizations stay
+FLOAT32.
 
 Writers compute the scales per row (per output unit or filter):
 
@@ -262,7 +296,9 @@ and AdamW use both. For a batch normalization the weights are gamma and the bias
 A reader should reject an image when the magic, the version or either checksum does not match;
 when the recorded file size exceeds the data; when `L` is outside 2..65536 or the loss, an
 activation, a precision or a layer kind code is unknown; when `in` or `out` is 0, an entry's `in`
-differs from the previous entry's `out` or a dropout rate lies outside [0, 1); in versions 4 and 5,
+differs from the previous entry's `out` or a dropout rate lies outside [0, 1); when a precision code above 5
+appears before version 10, or a block precision is the precision of a layer with parameters other than a dense
+layer, an embedding or a linear layer, whose rows are not whole blocks, or which has a row scales section; in versions 4 and 5,
 when the shapes, windows, groups, normalization constants or section offsets disagree with the
 layer kind as described above (a batch normalization in a version 4 file, a kind from 5 to 7 before
 version 6, a kind above 7 before version 7, or a kind above 10, an activation code above 6 or loss 2
@@ -274,7 +310,7 @@ or an attention's flags have bits other than those above, bit 1 without an embed
 reads another layer than the input or has another number of cells than its keys, or a cross-attention reads the
 network's input or keys and values of other channels, or is causal, windowed or rotary, or an embedding's range
 lies beyond its input or its input has several rows;
-and in versions 6 to 9, when an entry reads a layer that is not before it,
+and in versions 6 to 10, when an entry reads a layer that is not before it,
 more than 16 layers, several layers without being an addition, concatenation, multiplication or (version 9)
 cross-attention, or
 layers whose shapes do not
@@ -343,6 +379,16 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   of 1 x 1 windows, stride 1, no padding and one group (a linear map of each cell) quantizes each
   cell's channels alone instead, with an `s` of their own, so that a token's outputs depend on that
   token only (engines before Spingalett 1.3 quantize the whole tensor there too).
+- Layers of a block precision quantize their input in blocks of the type's size (32 or 256 values; a linear
+  layer's cells never share a block): each block as INT8 layers quantize a tensor, `dx = max |x| / 127` and
+  `xq = round(x / dx)`, with `X_i` the sum of the codes `16 i` to `16 i + 15`. A row's output is then `b[j]`
+  plus a float sum over its blocks in order, starting at 0: a block of weight codes `c` (the signed codes,
+  offsets applied, of the table above), of sub-blocks of 16 or 32 with integer scales `sc` (1 for the types of
+  32; Q3_K's and IQ4_XS's less 32) and minima `mn`, adds `t = (d dx) I1`, plus `(m dx) I2` for the types with
+  minima, where `I1 = sum over sub-blocks of sc (sum of c xq)` and `I2 = sum over sub-blocks of mn X` are 32-bit
+  integers (`X` a sub-block's sum of codes; `m` is Q4_1's and Q5_1's `m` with `mn` 1, and `-dmin` for Q2_K,
+  Q4_K and Q5_K), each product of two floats rounded, `I1` and `I2` converted to float. Every kernel of the
+  library computes these bits.
 - A convolution computes, for each output pixel `(oh, ow)`, its `out_c` outputs as above with `x`
   the pixel's window: `kernel_h x kernel_w x in_c` values in the order of the filter rows, 0 where
   the window lies in the padding (for integer layers, the window of the quantized input); with
@@ -407,4 +453,4 @@ and decode as `q / 127`, `q / 7` and `q` times it. Reading such a file and savin
 version 3 file (`ModelTool convert`).
 
 Spingalett 0.5 and 0.6 read versions 1 to 3; version 4 appeared in 0.7, version 5 in 0.8,
-version 6 in 0.10, version 7 in 0.13, version 8 in 1.2 and version 9 in 1.3.
+version 6 in 0.10, version 7 in 0.13, version 8 in 1.2, version 9 in 1.3 and version 10 in 1.4.

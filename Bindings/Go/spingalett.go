@@ -73,6 +73,19 @@ const (
 	Int8     Precision = C.SPINGALETT_PRECISION_INT8
 	Int4     Precision = C.SPINGALETT_PRECISION_INT4
 	Int2     Precision = C.SPINGALETT_PRECISION_INT2
+	// GGUF's block types (format 10): language models' layers
+	Q8_0  Precision = C.SPINGALETT_PRECISION_Q8_0
+	Q4_0  Precision = C.SPINGALETT_PRECISION_Q4_0
+	Q4_1  Precision = C.SPINGALETT_PRECISION_Q4_1
+	Q5_0  Precision = C.SPINGALETT_PRECISION_Q5_0
+	Q5_1  Precision = C.SPINGALETT_PRECISION_Q5_1
+	Q2K   Precision = C.SPINGALETT_PRECISION_Q2_K
+	Q3K   Precision = C.SPINGALETT_PRECISION_Q3_K
+	Q4K   Precision = C.SPINGALETT_PRECISION_Q4_K
+	Q5K   Precision = C.SPINGALETT_PRECISION_Q5_K
+	Q6K   Precision = C.SPINGALETT_PRECISION_Q6_K
+	IQ4NL Precision = C.SPINGALETT_PRECISION_IQ4_NL
+	IQ4XS Precision = C.SPINGALETT_PRECISION_IQ4_XS
 )
 
 // Optimizer of training (the zero value: Adam).

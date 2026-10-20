@@ -103,8 +103,9 @@ c_enum!(
     ComputeMode { SingleThreaded = 0, OpenMp = 1, OpenBlas = 2, Cuda = 3, Vulkan = 4 }
 );
 c_enum!(
-    /// Precision of deployment models, and of the GPU's products (Float32 or BFloat16).
-    Precision { Float32 = 0, Fp16 = 1, BFloat16 = 2, Int8 = 3, Int4 = 4, Int2 = 5 }
+    /// Precision of deployment models, and of the GPU's products (Float32 or BFloat16); from Q8_0 on GGUF's block
+    /// types (language models' layers).
+    Precision { Float32 = 0, Fp16 = 1, BFloat16 = 2, Int8 = 3, Int4 = 4, Int2 = 5, Q8_0 = 6, Q4_0 = 7, Q4_1 = 8, Q5_0 = 9, Q5_1 = 10, Q2K = 11, Q3K = 12, Q4K = 13, Q5K = 14, Q6K = 15, Iq4Nl = 16, Iq4Xs = 17 }
 );
 c_enum!(
     /// Optimizer of training.
