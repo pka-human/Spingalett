@@ -109,8 +109,27 @@ SPINGALETT_API bool spingalett_get_verbose(void);
 
 /* Reads a .slett file. Images (format versions 3 to SPINGALETT_FORMAT_VERSION) are used as stored;
    the full library converts files of versions 1 and 2 in the precision they were saved in, which
-   the runtime reports as SPINGALETT_ERR_FORMAT_VERSION. */
+   the runtime reports as SPINGALETT_ERR_FORMAT_VERSION. A GGUF file (llama.cpp's) becomes the model of
+   its language model, as spingalett_model_open() with the defaults makes it. */
 SPINGALETT_API SpingalettModel *spingalett_model_load(const char *path);
+
+typedef struct {
+    const char *path;               /* a .slett file, or a language model's GGUF file */
+    uint32_t context;               /* GGUF: the model's window, the tokens a sequence holds at most (0: the
+                                       model's positions, 4096 at most) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettModelOpenArgs;
+
+/* Opens a model file. A GGUF file of a language model (general.architecture llama, qwen2, qwen3 or gpt2:
+   LLaMA 1 to 3.x, Mistral, Qwen2 and 2.5, Qwen3, GPT-2) becomes its network as a deployment model: its tensors
+   used as the file stores them, the quantized types as the block precisions of format 10 (Q8_0, Q4_0, Q4_1,
+   Q5_0, Q5_1, Q2_K to Q6_K, IQ4_NL, IQ4_XS; other types are refused), F16, BF16 and F32 as FP16, BFLOAT16 and
+   FLOAT32; LLaMA's queries and keys taken back from llama.cpp's order of their rows, LLaMA 3's scaled rotary
+   embeddings as their frequencies, Qwen3's normalized queries and keys in its attention. The model takes a
+   window of `context` token ids and gives every position's logits; sessions (spingalett_session_new()) run
+   it a token at a time. NULL with the error set. */
+#define spingalett_model_open(...) spingalett_model_open_args((SpingalettModelOpenArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettModel *spingalett_model_open_args(SpingalettModelOpenArgs args);
 /* Same, from an image in memory, which is copied. */
 SPINGALETT_API SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
 SPINGALETT_API void spingalett_model_free(SpingalettModel *model);

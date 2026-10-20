@@ -6843,6 +6843,56 @@ static void pretrained_model(const char *name, bool tokenizer) {
     free(data);
 }
 
+/* GGUF files as deployment models (spingalett_model_open()), their tensors as the files store them: the logits of a
+   window against PyTorch's (LLaMA's permuted queries and keys, Qwen2's biases, GPT-2's positions, Qwen3's normalized
+   queries and keys, LLaMA 3's scaled rotary embeddings; the matrices of fifteen types computed in their blocks, near
+   the logits of their dequantized weights), and a session's logits batched prediction's, bit for bit. */
+static void gguf_deployment(void) {
+    static const struct { const char *file, *logits; } cases[] = {
+        {"gguf_llama.gguf", "hf_llama"}, {"gguf_qwen2.gguf", "hf_qwen2"}, {"gguf_gpt2.gguf", "hf_gpt2"},
+        {"gguf_qwen3.gguf", "hf_qwen3"}, {"gguf_llama3.gguf", "hf_llama3"}, {"gguf_quant.gguf", "gguf_quant"}};
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, cases[k].logits);
+        long size = 0;
+        unsigned char *data = read_file(path, &size);
+        CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+        if (!data) continue;
+        const uint32_t T = rd32(data + 8), out = rd32(data + 12), V = out / T;
+        const float *tokens = (const float *)(const void *)(data + 16), *expected = tokens + T;
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, cases[k].file);
+        SpingalettModel *m = spingalett_model_open(.path = path, .context = T);
+        CHECK(m && m->input_size == T && m->output_size == out && m->loss == LOSS_SPARSE_CROSS_ENTROPY, "%s: %s",
+              cases[k].file, spingalett_last_error_message());
+        SpingalettSession *s = m ? spingalett_session_new(m, NULL) : NULL;
+        CHECK(s, "%s: no session (%s)", cases[k].file, spingalett_last_error_message());
+        if (!s) { spingalett_model_free(m); free(data); continue; }
+        float *y = malloc((size_t)out * sizeof(float)), *z = malloc((size_t)out * sizeof(float));
+        uint32_t ids[64];
+        for (uint32_t t = 0; t < T; t++) ids[t] = (uint32_t)tokens[t];
+        bool ok = spingalett_model_predict(m, tokens, 1, y) &&
+                  spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = ids, .count = T, .logits = z, .all = true}, 1);
+        double worst = 0.0, err = 0.0, norm = 0.0;
+        for (uint32_t i = 0; ok && i < out; i++) {
+            worst = fmax(worst, fabs((double)y[i] - expected[i]));
+            err += ((double)y[i] - expected[i]) * ((double)y[i] - expected[i]);
+            norm += (double)expected[i] * expected[i];
+        }
+        /* the quantized model's layers take its matrices' types, and its inputs quantized in their blocks */
+        const bool blocks = !strcmp(cases[k].logits, "gguf_quant");
+        const double rel = sqrt(err / norm);
+        CHECK(ok && (blocks ? rel < 0.03 : worst < 1e-4), "%s: logits differ from PyTorch's (%g, %.4f relative)",
+              cases[k].file, worst, rel);
+        CHECK(ok && !memcmp(y, z, (size_t)out * sizeof(float)), "%s: a session's logits differ from batched prediction's",
+              cases[k].file);
+        if (ok) printf("  %-20s a model of %u layers, %u x %u logits, |logits - PyTorch| %.1e (%.4f relative)\n",
+                       cases[k].file, m->layer_count, T, V, worst, rel);
+        free(y); free(z); free(data);
+        spingalett_session_free(s);
+        spingalett_model_free(m);
+    }
+}
+
 static void write_text(const char *path, const char *text) {
     FILE *f = fopen(path, "wb");
     if (f) { fputs(text, f); fclose(f); }
@@ -9274,6 +9324,7 @@ int main(int argc, char **argv) {
         pretrained_model("hf_gpt2", true);
         pretrained_errors();
         gguf_models();
+        gguf_deployment();
         gguf_errors();
     }
     if (!*only || !strcmp(only, "equiv")) {

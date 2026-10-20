@@ -69,10 +69,18 @@ typedef struct {
     bool cells;                                     /* an integer linear layer of a language model
                                                        (slett_token_linear()): each cell's channels
                                                        quantized with a scale of their own */
+    uint32_t rotary;                                /* version 10: an attention's dimensions of a head rotated (the
+                                                       head's when the file says 0); 0 without rotary embeddings */
+    float score_scale;                              /* version 10: an attention's scale of the scores (0: 1 /
+                                                       sqrt(head)) */
+    bool qk_norm;                                   /* version 10: an attention normalizes each head's queries and
+                                                       keys (RMS, eps; the queries' and keys' gammas its weights) */
+    bool freqs;                                     /* version 10: an attention's rotary frequencies are its own
+                                                       (rotary / 2 floats, its scales section) */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3 to 9 */
+    uint32_t version;           /* 3 to 10 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -268,12 +276,13 @@ void spingalett_engine_rms_norm(const float *x, uint32_t cells, uint32_t channel
                                 float *y, float *stats);
 /* y = x[0] x[1] ... over n values, the inputs multiplied in their order. */
 void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y, uint32_t n);
-/* The rotary position embeddings of `cells` positions and heads of `head` values: table[p * half + i] the
-   cosine and table[cells * half + p * half + i] the sine of p theta^(-2 i / head), for i below half = head
-   / 2, computed in double and rounded to float (alike on every platform that rounds double alike: the
-   same table for every backend). A vector's halves are paired: x'[i] = x[i] cos - x[i + half] sin,
-   x'[i + half] = x[i + half] cos + x[i] sin. */
-void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, float *table);
+/* The rotary position embeddings of `cells` positions over the first `rot` values of a head: table[p * half + i]
+   the cosine and table[cells * half + p * half + i] the sine of p f_i, for i below half = rot / 2, with f_i =
+   freqs[i] (format 10: frequencies of the layer's own, as LLaMA 3's and YaRN's scaling give them) or theta^(-2 i
+   / rot), computed in double and rounded to float (alike on every platform that rounds double alike: the same
+   table for every backend). A vector's halves of its first rot values are paired: x'[i] = x[i] cos - x[i + half]
+   sin, x'[i + half] = x[i + half] cos + x[i] sin; the values from rot on stay. */
+void spingalett_engine_rope_table(uint32_t cells, uint32_t rot, float theta, const float *freqs, float *table);
 /* An attention layer of one sample: `cells` cells (of queries), heads query heads and kv key and value heads of
    head values; causal; keys less than `window` cells away (0: all); ignoring padding, the keys' tokens (the
    network's inputs: a negative one marks a key left out), else NULL. Cross-attention: kv_input the keys and values
@@ -284,6 +293,10 @@ typedef struct {
     bool causal;
     const float *tokens;
     const float *kv_input;
+    uint32_t rot;               /* the values of a head the rotary embeddings rotate (0: none) */
+    const float *gq, *gk;       /* format 10: the gammas of the queries' and keys' RMS normalization (NULL: none) */
+    float eps;                  /* and its epsilon */
+    float scale;                /* the scores' scale */
 } SlettAttention;
 
 /* The attention of one sample, as the engine computes it: x of `cells` cells of (heads + 2 kv) x head
@@ -291,15 +304,22 @@ typedef struct {
    a->kv_input), y of cells x heads x head values; each query's scores in the order of the keys, its softmax online
    (the running maximum and sum, the values' weighted sum rescaled when the maximum grows), causal: the keys up
    to its cell, with a window those less than window cells away, the keys of padding left out (a query without a
-   key gives zeros). With a table (the rotary embeddings) the queries and keys are rotated first, in scratch of
-   slett_attention_floats() floats. */
+   key gives zeros). Each query head and key head is first normalized with gq and gk (RMS over the head's values,
+   spingalett_engine_rms_norm()), then rotated with the table (the rotary embeddings of a->rot values), in scratch
+   of slett_attention_floats() floats. */
 void spingalett_engine_attention(const SlettAttention *a, const float *x, const float *table, float *y, float *scratch);
 /* The attention of layer L for one sample of the network's inputs `input` (whose tokens a layer ignoring padding
    reads); a cross-attention's kv_input is the caller's to set. */
 void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, const float *input, SlettAttention *a);
-/* A head vector rotated by its position's angles (cosines and sines: the table's halves of its row). */
+/* A head vector rotated by its position's angles (cosines and sines: the table's halves of its row): its first
+   2 half values (in place when src is dst). */
 void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, const float *cosines,
                                    const float *sines);
+/* A query or key head of `head` values made ready for scores: normalized with gamma (format 10's QK
+   normalization, NULL: none) into dst, then its first rot values rotated by the angles of its position (rot 0:
+   none). */
+void spingalett_engine_head(const float *src, float *dst, uint32_t head, const float *gamma, float eps, uint32_t rot,
+                            const float *cosines, const float *sines);
 /* One query's attention over `count` keys and values (key j at keys + j key_stride, its value at values + j
    value_stride) as spingalett_engine_attention() computes it, into o[head]: the scores in the order of the
    keys, times scale, the softmax online; with tokens, key j left out when tokens[j] is negative (padding), and
@@ -313,8 +333,16 @@ void spingalett_engine_attend(const float *q, const float *keys, size_t key_stri
 void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);
 /* The same for one cell: token (an input value) at `position`. */
 void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float token, uint32_t position, float *y);
-static inline uint64_t slett_attention_floats(uint32_t cells, uint32_t kv, uint32_t head, bool rope) {
-    return rope ? (uint64_t)cells * kv * head + (uint64_t)cells * head + head : 0u;
+/* Scratch of an attention whose queries and keys are prepared (rotated or normalized): the keys, the table, a
+   query. */
+static inline uint64_t slett_attention_floats(uint32_t cells, uint32_t kv, uint32_t head, bool prepared) {
+    return prepared ? (uint64_t)cells * kv * head + (uint64_t)cells * head + head : 0u;
+}
+/* Whether attention L prepares its queries and keys (rotary embeddings, or format 10's QK normalization), and the
+   scale of its scores. */
+static inline bool slett_attention_prepared(const SlettLayer *L) { return L->theta > 0.0f || L->qk_norm; }
+static inline float slett_attention_scale(const SlettLayer *L) {
+    return L->score_scale != 0.0f ? L->score_scale : 1.0f / sqrtf((float)(L->out_c / L->heads));
 }
 
 /* GELU, its tanh approximation and SiLU of one value. */
@@ -335,7 +363,8 @@ static inline float spingalett_engine_activate_one(float x, ActivationFunction a
 static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
     if (L->type == LAYER_BATCH_NORM) return (uint64_t)L->out_c * 8u;
     if (L->type == LAYER_ATTENTION)
-        return 4u * slett_attention_floats(L->out_h * L->out_w, L->kv_heads, L->out_c / L->heads, L->theta > 0.0f);
+        return 4u * slett_attention_floats(L->out_h * L->out_w, L->kv_heads, L->out_c / L->heads,
+                                           slett_attention_prepared(L));
     if (L->type == LAYER_CONV_TRANSPOSE2D) return (uint64_t)L->row_len * 4u;     /* a window of its group */
     if (L->type != LAYER_CONV2D) return 0;
     if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) {

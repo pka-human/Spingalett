@@ -27,12 +27,13 @@ typedef enum {
     SPG_PART_GATE, SPG_PART_GATE_BIAS,          /* LLaMA's SwiGLU: down(silu(gate x) * up x) */
     SPG_PART_UP, SPG_PART_UP_BIAS,              /* GPT-2's MLP: down(act(up x)) */
     SPG_PART_DOWN, SPG_PART_DOWN_BIAS,
+    SPG_PART_Q_NORM, SPG_PART_K_NORM,           /* Qwen3's normalization of each head's queries and keys, [head size] */
     SPG_PART_COUNT
 } SpgPart;
 
 typedef enum {
     SPG_ARCH_LLAMA,                 /* RMS normalization, rotary grouped-query attention, SwiGLU (LLaMA, Mistral,
-                                       Qwen2) */
+                                       Qwen2; Qwen3 with its queries and keys normalized) */
     SPG_ARCH_GPT2                   /* layer normalization, learned positions, a GELU MLP */
 } SpgArch;
 
@@ -46,6 +47,8 @@ typedef struct {
     float theta;                    /* rotary embeddings' base (LLaMA) */
     uint32_t window;                /* a sliding window (Mistral's): the keys of the last `window` tokens (0: all) */
     ActivationFunction act;         /* GPT-2's MLP */
+    bool qk_norm;                   /* each head's queries and keys normalized (Qwen3: SPG_PART_Q_NORM, _K_NORM) */
+    const float *freqs;             /* rotary frequencies of the model's own (head_size / 2: LLaMA 3's scaling), or NULL */
 } SpgTransformer;
 
 /* Where a format's tensors come from. */
@@ -70,3 +73,7 @@ void spingalett_decode_parallel(float *dst, const uint8_t *src, int dtype, uint6
 /* The network of a GGUF file in memory (Spingalett.Gguf.c), whose bytes it no longer needs once made; NULL
    with the error set. */
 NeuralNetwork *spingalett_gguf_network(const uint8_t *data, size_t size, uint32_t context);
+/* The deployment model's image of a GGUF file in memory: its tensors as the file stores them (its quantized types
+   as block precisions, F16, BF16, F32), a window of `context` tokens (0: the model's positions, 4096 at most);
+   NULL with the error set. */
+uint8_t *spingalett_gguf_image(const uint8_t *data, size_t size, uint32_t context, size_t *image_size);

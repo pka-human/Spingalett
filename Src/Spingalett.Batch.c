@@ -319,7 +319,7 @@ static BatchWorkspace *workspace_create(const NeuralNetwork *net, uint32_t capac
             const LayerShape *a = &net->shapes[l];
             if (a->type != LAYER_ATTENTION || a->theta <= 0.0f) continue;
             ws->rope[l] = ws->rope_flat + off;
-            spingalett_engine_rope_table(a->height * a->width, a->channels / a->heads, a->theta, ws->rope[l]);
+            spingalett_engine_rope_table(a->height * a->width, a->channels / a->heads, a->theta, NULL, ws->rope[l]);
             off += a->height * a->width * (a->channels / a->heads);
         }
     }

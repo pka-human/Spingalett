@@ -11,6 +11,7 @@
 
 #include "Spingalett.Model.h"
 #include "Spingalett.Blocks.h"
+#include "Spingalett.Pretrained.h"
 #if !defined(SPINGALETT_RUNTIME)
 #include "Spingalett.Gpu.h"
 #endif
@@ -111,14 +112,33 @@ SpingalettModel *spingalett_model_from_memory(const void *data, size_t size) {
     return model_from_buffer(copy, size);
 }
 
-SpingalettModel *spingalett_model_load(const char *path) {
-    if (!path) {
+SpingalettModel *spingalett_model_open_args(SpingalettModelOpenArgs args) {
+    if (!args.path) {
         set_error(SPINGALETT_ERR_INVALID, "model: path is NULL");
         return NULL;
     }
-    size_t size = 0;
-    void *data = spingalett_read_file(path, &size);
-    return data ? model_from_buffer(data, size) : NULL;
+    /* a GGUF file mapped while its image is made, its tensors copied into it */
+    SpgFileView file;
+    if (!spingalett_file_open(&file, args.path)) return NULL;
+    if (file.size >= 4 && !memcmp(file.data, "GGUF", 4)) {
+        size_t size = 0;
+        uint8_t *image = spingalett_gguf_image(file.data, file.size, args.context, &size);
+        spingalett_file_close(&file);
+        return image ? adopt_image(image, size) : NULL;
+    }
+    void *data = spingalett_aligned_alloc(file.size);
+    if (data) memcpy(data, file.data, file.size);
+    const size_t size = file.size;
+    spingalett_file_close(&file);
+    if (!data) {
+        set_error(SPINGALETT_ERR_ALLOC, "model: allocation failed");
+        return NULL;
+    }
+    return model_from_buffer(data, size);
+}
+
+SpingalettModel *spingalett_model_load(const char *path) {
+    return spingalett_model_open(.path = path);
 }
 
 void spingalett_model_free(SpingalettModel *model) {
@@ -702,12 +722,15 @@ void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const P
                     SlettAttention a;
                     spingalett_engine_attention_of(image, L, input ? input + (size_t)s * input_size : NULL, &a);
                     if (kv) a.kv_input = kv + (size_t)s * a.kcells * 2u * a.kv * a.head;  /* (cross-attention) */
-                    /* (no scratch without rotary embeddings: the window may not exist) */
+                    /* (no scratch without rotary embeddings or normalized heads: the window may not exist) */
                     float *scratch = NULL, *table = NULL;
-                    if (L->theta > 0.0f) {
+                    if (slett_attention_prepared(L))
                         scratch = (float *)(void *)(w->window + (size_t)spingalett_thread_num() * w->window_stride);
+                    if (L->theta > 0.0f) {
                         table = scratch + (size_t)a.cells * a.kv * a.head + a.head;
-                        spingalett_engine_rope_table(a.cells, a.head, L->theta, table);
+                        spingalett_engine_rope_table(a.cells, a.rot, L->theta,
+                                                     L->freqs ? (const float *)(const void *)(image + L->scales) : NULL,
+                                                     table);
                     }
                     spingalett_engine_attention(&a, xs, table, ys, scratch);
                 } else {

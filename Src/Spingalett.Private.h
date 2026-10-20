@@ -209,10 +209,10 @@ bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint3
    caller's buffers) and the products whose normalization is fused take none (UINT64_MAX). Returns
    the floats per sample all outputs need. */
 uint64_t spingalett_plan_outputs(const NeuralNetwork *net, const uint32_t *uses, uint64_t *offsets);
-/* The same over `count` steps from a description of each: steps[s] is the output it computes,
-   reads[s] the outputs it reads (read_count[s] of them), sizes[t] the floats of output t (0: not
-   stored); output t is computed by step `producer[t]` or never. Generic so that deployment models
-   and model files share it. offsets of outputs that are not stored are UINT64_MAX. */
+/* The same over `count` steps from a description of each (Spingalett.Image.c): steps[s] is the output it
+   computes, reads[s] the outputs it reads (read_count[s] of them), sizes[t] the floats of output t (0: not
+   stored); output t is computed by step `producer[t]` or never. Generic so that deployment models, model files
+   and the images of language models' files share it. offsets of outputs that are not stored are UINT64_MAX. */
 uint64_t spingalett_plan_buffers(uint32_t outputs, const uint64_t *sizes, uint32_t count, const uint32_t *steps,
                                  const uint32_t *const *reads, const uint32_t *read_count, uint64_t align,
                                  uint64_t *offsets);
@@ -430,7 +430,7 @@ void spingalett_log_quiet(int delta);
 
 /* ------------------------------------------------------------------------- importers (Import.c) */
 
-/* A file's bytes: mapped read-only where the platform allows, read into memory otherwise. */
+/* A file's bytes: mapped read-only where the platform allows, read into memory otherwise (Memory.c). */
 typedef struct {
     const uint8_t *data;
     size_t size;
@@ -440,7 +440,7 @@ typedef struct {
 bool spingalett_file_open(SpgFileView *f, const char *path);       /* false with the error set */
 void spingalett_file_close(SpgFileView *f);
 
-/* Element types of imported tensors (little-endian, at any alignment). */
+/* Element types of imported tensors (little-endian, at any alignment; Image.c decodes them). */
 enum { SPG_DTYPE_F32, SPG_DTYPE_F16, SPG_DTYPE_BF16, SPG_DTYPE_F64, SPG_DTYPE_I32, SPG_DTYPE_I64, SPG_DTYPE_OTHER };
 size_t spingalett_dtype_size(int dtype);                            /* 0 for SPG_DTYPE_OTHER */
 void spingalett_decode(float *dst, const uint8_t *src, int dtype, size_t n);

@@ -14,7 +14,11 @@ Hugging Face's form and GGUF files, with the logits a PyTorch reference computes
 - hf_mistral/: Mistral with a sliding window (16 tokens) and a head size (8) other than the width over the
   heads, float32, without a tokenizer;
 - hf_gpt2/: GPT-2 with its Conv1D weights ([in][out]), the causal mask buffers of old checkpoints, tied
-  embeddings, float32, GPT-2's form of tokenizer.
+  embeddings, float32, GPT-2's form of tokenizer;
+- hf_qwen3/: Qwen3 with each head's queries and keys RMS-normalized, a head size (12) other than the width over
+  the heads, tied embeddings, float16, without a tokenizer;
+- hf_llama3/: LLaMA with LLaMA 3's scaled rotary embeddings (rope_scaling of rope_type "llama3", its original
+  context short enough that the window sees every regime of its frequencies), bfloat16, without a tokenizer.
 
 NAME.bin holds "SPGT", then as 32-bit little-endian integers 1, the tokens and the logits a window has (T
 and T x vocabulary), then the tokens (as floats) and the logits. The tokens are those the directory's
@@ -26,6 +30,9 @@ GGUF files, written by the small writer below as llama.cpp's converter writes th
   bfloat16, vectors in float32) and its tokenizer as a vocabulary of the "gpt2" model ("llama-bpe");
 - gguf_qwen2.gguf: hf_qwen2's (float16, its biases, no output.weight) and its tokenizer ("qwen2");
 - gguf_gpt2.gguf: hf_gpt2's (its Conv1D matrices transposed to [out][in], learned positions), no vocabulary;
+- gguf_qwen3.gguf: hf_qwen3's (float16, attn_q_norm and attn_k_norm), architecture "qwen3";
+- gguf_llama3.gguf: hf_llama3's (bfloat16, queries and keys permuted) with rope_freqs.weight, the factors llama.cpp's
+  converter computes;
 - gguf_quant.gguf (version 2): a LLaMA of width 256 whose sixteen matrices are random blocks of fifteen
   types, from F32 to the k-quants and IQ4_NL, IQ4_XS; gguf_quant.bin the logits of its weights as
   llama.cpp's formulas dequantize them (the numpy functions below, checked against the gguf package's
@@ -72,7 +79,29 @@ def llama_weights(cfg, dtype, biases, tied, gen):
         if biases:
             for n, m in (("q", H * hd), ("k", KV * hd), ("v", KV * hd)):
                 sd[h + f"self_attn.{n}_proj.bias"] = r(m)
+        if cfg["model_type"] == "qwen3":
+            sd[h + "self_attn.q_norm.weight"], sd[h + "self_attn.k_norm.weight"] = 1 + r(hd), 1 + r(hd)
     return {k: v.to(dtype).contiguous() for k, v in sd.items()}
+
+
+def llama3_frequencies(cfg):
+    """LLaMA 3's rotary frequencies (transformers' _compute_llama3_parameters(), in double precision) and the factors
+    llama.cpp's converter writes in rope_freqs.weight (its generate_extra_tensors(): the base frequency over each)."""
+    hd = cfg.get("head_dim", cfg["hidden_size"] // cfg["num_attention_heads"])
+    base = 1.0 / cfg["rope_theta"] ** (torch.arange(0, hd, 2, dtype=torch.float64) / hd)
+    sc = cfg["rope_scaling"]
+    factor, low, high, old = sc["factor"], sc["low_freq_factor"], sc["high_freq_factor"], sc["original_max_position_embeddings"]
+    inv, factors = [], []
+    for f in base.tolist():
+        wavelen = 2 * math.pi / f
+        if wavelen < old / high:
+            inv.append(f), factors.append(1.0)
+        elif wavelen > old / low:
+            inv.append(f / factor), factors.append(factor)
+        else:
+            smooth = (old / wavelen - low) / (high - low)
+            inv.append((1 - smooth) * f / factor + smooth * f), factors.append(1 / ((1 - smooth) / factor + smooth))
+    return torch.tensor(inv, dtype=torch.float64), np.array(factors, dtype=np.float32)
 
 
 def ref_llama(sd, cfg, tokens):
@@ -82,6 +111,8 @@ def ref_llama(sd, cfg, tokens):
     hd, eps, theta = cfg.get("head_dim", d // H), cfg["rms_norm_eps"], cfg["rope_theta"]
     rms = lambda x, w: x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
     inv = 1.0 / theta ** (torch.arange(0, hd, 2, dtype=torch.float64) / hd)
+    if cfg.get("rope_scaling"):
+        inv = llama3_frequencies(cfg)[0]
     f = torch.outer(torch.arange(n, dtype=torch.float64), inv)
     cos, sin = torch.cat([f, f], -1).cos().float(), torch.cat([f, f], -1).sin().float()
     rot = lambda x: torch.cat([-x[..., hd // 2:], x[..., :hd // 2]], -1)
@@ -93,6 +124,8 @@ def ref_llama(sd, cfg, tokens):
         q = lin(y, h + "self_attn.q_proj").view(n, H, hd).transpose(0, 1)
         k = lin(y, h + "self_attn.k_proj").view(n, KV, hd).transpose(0, 1)
         v = lin(y, h + "self_attn.v_proj").view(n, KV, hd).transpose(0, 1)
+        if h + "self_attn.q_norm.weight" in sd:             # Qwen3: each head's queries and keys normalized
+            q, k = rms(q, sd[h + "self_attn.q_norm.weight"]), rms(k, sd[h + "self_attn.k_norm.weight"])
         q, k = q * cos + rot(q) * sin, k * cos + rot(k) * sin
         k, v = k.repeat_interleave(H // KV, 0), v.repeat_interleave(H // KV, 0)
         a = tf.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(0, 1).reshape(n, H * hd)
@@ -426,7 +459,7 @@ def gguf_from_hf(file, arch, cfg, sd, matrices, vocabulary=None):
              "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output", "post_attention_layernorm": "ffn_norm",
              "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down", "ln_1": "attn_norm",
              "attn.c_attn": "attn_qkv", "attn.c_proj": "attn_output", "ln_2": "ffn_norm", "mlp.c_fc": "ffn_up",
-             "mlp.c_proj": "ffn_down"}
+             "mlp.c_proj": "ffn_down", "self_attn.q_norm": "attn_q_norm", "self_attn.k_norm": "attn_k_norm"}
     tensors = []
     for key in sorted(sd):
         w = sd[key].to(torch.float32).numpy()
@@ -456,6 +489,9 @@ def gguf_from_hf(file, arch, cfg, sd, matrices, vocabulary=None):
     else:
         metadata = llama_metadata(cfg, file.split(".")[0].replace("gguf_", "hf_"), arch)
     metadata += vocabulary_metadata(*vocabulary) if vocabulary else []
+    if cfg.get("rope_scaling"):                         # LLaMA 3's factors, as the converter adds them
+        factors = llama3_frequencies(cfg)[1]
+        tensors.append(("rope_freqs.weight", [len(factors)], "F32", factors.astype("<f4").tobytes()))
     size = gguf_file(os.path.join(DATA, file), metadata, tensors)
     print(f"{file}: {len(tensors)} tensors, {size} bytes")
 
@@ -635,6 +671,37 @@ def main():
     gguf_from_hf("gguf_gpt2.gguf", "gpt2", gpt2, gpt2_sd, "F32")
     gguf_quantized()
     gguf_sentencepiece()
+    gen = torch.Generator().manual_seed(2026)
+    qwen3 = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "vocab_size": 96, "hidden_size": 16,
+             "intermediate_size": 24, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+             "head_dim": 12, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "max_position_embeddings": 64,
+             "hidden_act": "silu", "tie_word_embeddings": True, "attention_bias": False, "torch_dtype": "float16"}
+    qwen3_sd = llama_weights(qwen3, torch.float16, False, True, gen)
+    write("hf_qwen3", qwen3, qwen3_sd, ref_llama)
+    llama3 = {"architectures": ["LlamaForCausalLM"], "model_type": "llama", "vocab_size": 80, "hidden_size": 32,
+              "intermediate_size": 24, "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+              "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "max_position_embeddings": 64, "hidden_act": "silu",
+              "tie_word_embeddings": False, "torch_dtype": "bfloat16",
+              "rope_scaling": {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                               "original_max_position_embeddings": 32}}
+    llama3_sd = llama_weights(llama3, torch.bfloat16, False, False, gen)
+    write("hf_llama3", llama3, llama3_sd, ref_llama)
+    gguf_from_hf("gguf_qwen3.gguf", "qwen3", qwen3, qwen3_sd, "F16")
+    gguf_from_hf("gguf_llama3.gguf", "llama", llama3, llama3_sd, "BF16")
+    try:                                    # transformers' models, where it is installed: the reference's own check
+        import transformers
+        for name in ("hf_qwen3", "hf_llama3", "hf_llama", "hf_qwen2"):
+            model = transformers.AutoModelForCausalLM.from_pretrained(os.path.join(DATA, name), torch_dtype=torch.float32)
+            raw = open(os.path.join(DATA, name + ".bin"), "rb").read()
+            n = struct.unpack("<I", raw[8:12])[0]
+            tokens = np.frombuffer(raw[16:16 + 4 * n], dtype=np.float32).astype(np.int64)
+            want = np.frombuffer(raw[16 + 4 * n:], dtype=np.float32).reshape(n, -1)
+            with torch.no_grad():
+                got = model(torch.tensor(tokens)[None]).logits[0].numpy()
+            assert np.abs(got - want).max() < 1e-4, (name, np.abs(got - want).max())
+        print("  (the references agree with transformers' models)")
+    except ImportError:
+        pass
 
 
 if __name__ == "__main__":

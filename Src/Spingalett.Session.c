@@ -53,8 +53,11 @@
 typedef struct {
     uint32_t heads, kv, head;
     uint32_t window;                /* a sliding window: the keys of the last `window` positions (0: all) */
-    float *keys, *values;           /* [sequences x max_length x kv x head] each, the keys rotated */
+    float *keys, *values;           /* [sequences x max_length x kv x head] each, the keys prepared */
     float *table;                   /* the rotary embeddings of max_length positions (cosines, then sines), or NULL */
+    uint32_t rot;                   /* the values of a head they rotate */
+    const float *gq, *gk;           /* the gammas of the queries' and keys' normalization, or NULL */
+    float eps, scale;               /* its epsilon; the scores' scale */
 } Cache;
 
 struct SpingalettSession {
@@ -303,7 +306,10 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
         if (L.type == LAYER_CONV2D) s->token_work += (uint64_t)L.rows * L.row_len;
         if (L.type != LAYER_ATTENTION) continue;
         Cache *c = &s->caches[i];
+        SlettAttention a;
+        spingalett_engine_attention_of(image, &L, NULL, &a);
         c->heads = L.heads, c->kv = L.kv_heads, c->head = L.out_c / L.heads, c->window = L.window;
+        c->rot = a.rot, c->gq = a.gq, c->gk = a.gk, c->eps = a.eps, c->scale = a.scale;
         const size_t floats = (size_t)sequences * max_length * c->kv * c->head;
         c->keys = (float *)spingalett_aligned_alloc(floats * sizeof(float));
         c->values = (float *)spingalett_aligned_alloc(floats * sizeof(float));
@@ -311,7 +317,9 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
         if (ok && L.theta > 0.0f) {
             c->table = (float *)spingalett_aligned_alloc((size_t)max_length * c->head * sizeof(float));
             ok = c->table != NULL;
-            if (ok) spingalett_engine_rope_table(max_length, c->head, L.theta, c->table);
+            if (ok)
+                spingalett_engine_rope_table(max_length, c->rot, L.theta,
+                                             L.freqs ? (const float *)(const void *)(image + L.scales) : NULL, c->table);
         }
         if (c->head > s->query_floats) s->query_floats = c->head;
     }
@@ -453,23 +461,25 @@ static void session_int_linear(SpingalettSession *s, const SlettLayer *L, const 
    them). Every key is live: tokens are 0 or more, so that a layer ignoring padding finds none. */
 static void session_attention(SpingalettSession *s, const Cache *c, const float *x, float *y, uint32_t rows,
                               ComputeMode mode) {
-    const uint32_t heads = c->heads, kv = c->kv, head = c->head, half = head / 2u, group = heads / kv;
-    const uint32_t C = (heads + 2u * kv) * head, out_c = heads * head;
+    const uint32_t heads = c->heads, kv = c->kv, head = c->head, half = c->rot / 2u, group = heads / kv;
+    const uint32_t C = (heads + 2u * kv) * head, out_c = heads * head, rot = c->table ? c->rot : 0u;
     const size_t per = (size_t)kv * head, sequence = (size_t)s->max_length * per;
     const float *sines = c->table ? c->table + (size_t)s->max_length * half : NULL;
+    const bool prepared = c->table || c->gk;
     for (uint32_t r = 0; r < rows; r++) {
         const uint32_t p = s->row_position[r];
         float *keys = c->keys + s->row_sequence[r] * sequence + p * per;
         float *values = c->values + s->row_sequence[r] * sequence + p * per;
         for (uint32_t g = 0; g < kv; g++) {
             const float *k = x + (size_t)r * C + (size_t)(heads + g) * head;
-            if (c->table) spingalett_engine_rope_rotate(k, keys + (size_t)g * head, half, c->table + (size_t)p * half,
-                                                        sines + (size_t)p * half);
+            if (prepared)
+                spingalett_engine_head(k, keys + (size_t)g * head, head, c->gk, c->eps, rot,
+                                       c->table ? c->table + (size_t)p * half : NULL, sines ? sines + (size_t)p * half : NULL);
             else memcpy(keys + (size_t)g * head, k, head * sizeof(float));
             memcpy(values + (size_t)g * head, x + (size_t)r * C + (size_t)(heads + kv + g) * head, head * sizeof(float));
         }
     }
-    const float scale = 1.0f / sqrtf((float)head);
+    const float scale = c->scale;
     uint64_t work = 0;
     for (uint32_t r = 0; r < rows; r++) work += (uint64_t)(s->row_position[r] + 1u) * head * heads * 2u;
     SPINGALETT_PARALLEL_FOR_THREADS(s->team, s->team > 1 && spingalett_use_omp(mode, work),
@@ -477,10 +487,11 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
             const uint32_t r = (uint32_t)(it / heads), h = (uint32_t)(it % heads), g = h / group;
             const uint32_t p = s->row_position[r];
             const float *q = x + (size_t)r * C + (size_t)h * head;
-            if (c->table) {
-                float *rotated = s->queries + (size_t)spingalett_thread_num() * s->query_floats;
-                spingalett_engine_rope_rotate(q, rotated, half, c->table + (size_t)p * half, sines + (size_t)p * half);
-                q = rotated;
+            if (prepared) {
+                float *ready = s->queries + (size_t)spingalett_thread_num() * s->query_floats;
+                spingalett_engine_head(q, ready, head, c->gq, c->eps, rot, c->table ? c->table + (size_t)p * half : NULL,
+                                       sines ? sines + (size_t)p * half : NULL);
+                q = ready;
             }
             const uint32_t first = c->window && p + 1u > c->window ? p + 1u - c->window : 0u;
             const size_t at = s->row_sequence[r] * sequence + first * per + (size_t)g * head;

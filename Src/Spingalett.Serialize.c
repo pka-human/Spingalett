@@ -636,6 +636,13 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
                 a.token_count = e.out_h * e.out_w;
             }
         } else if (e.type == LAYER_ATTENTION) {
+            if (e.qk_norm || e.freqs || e.score_scale != 0.0f || (e.theta > 0.0f && e.rotary != e.out_c / e.heads)) {
+                free_network(net);
+                set_error(SPINGALETT_ERR_INVALID, "load: attention that normalizes its queries and keys, has rotary "
+                          "frequencies or a scale of its own, or rotates part of its heads (format 10) runs as a model, "
+                          "not yet as a network");
+                return NULL;
+            }
             a.heads = e.heads;
             a.kv_heads = e.kv_heads;
             a.rope_theta = e.theta;

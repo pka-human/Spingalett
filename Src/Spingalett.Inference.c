@@ -1678,6 +1678,17 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
             layer->window = slett_get32(e + 72);
             layer->momentum = 0.0f;
         }
+        /* version 10: bit 2 normalizes the queries and keys, bit 3 gives rotary frequencies of its own; the dimensions
+           rotated in the kernel's height, the scores' scale in the strides' bytes (fields of windows, 0 then) */
+        if (version >= 10u) {
+            layer->qk_norm = (layer->mode & 4u) != 0;
+            layer->freqs = (layer->mode & 8u) != 0;
+            layer->mode &= ~12u;
+            layer->rotary = layer->kernel_h;
+            const uint32_t scale = slett_get32(e + 56);
+            memcpy(&layer->score_scale, &scale, 4);
+            layer->kernel_h = layer->stride_h = layer->stride_w = 0;
+        }
     }
     if (version >= 8u && layer->type == LAYER_EMBEDDING) {
         layer->positions = (layer->mode & 1u) != 0;
@@ -1708,6 +1719,8 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
     }
     /* (embeddings exist from version 8 on) */
     layer->cells = version >= 8u && index > 0 && slett_token_linear(layer, entry_at(image, 0)[10] == LAYER_EMBEDDING);
+    if (layer->type == LAYER_ATTENTION && layer->theta > 0.0f && layer->rotary == 0 && layer->heads)
+        layer->rotary = layer->out_c / layer->heads;
 }
 
 uint64_t spingalett_slett_act_offset(const uint8_t *image, uint32_t j) {
@@ -1803,16 +1816,20 @@ static bool shape_ok(const SlettLayer *L, uint16_t version) {
                       L->pad_h == 0 && L->pad_w == 0;
     bool parameterless = L->weights == 0 && L->scales == 0 && L->biases == 0 && L->optimizer == 0;
     if (L->type == LAYER_ATTENTION) {
-        /* queries, keys and values of one head size in, the heads' results out; no parameters */
+        /* queries, keys and values of one head size in, the heads' results out; no parameters but (version 10) the
+           gammas of the queries' and keys' normalization (its epsilon) and rotary frequencies */
         const uint64_t heads = L->heads, kv = L->kv_heads;
-        if (!windowless || !parameterless || L->eps != 0.0f || L->momentum != 0.0f || heads == 0 || kv == 0 ||
-            heads % kv != 0 || L->out_h != L->in_h || L->out_w != L->in_w || L->out_c % heads != 0)
+        if (!windowless || L->biases != 0 || L->optimizer != 0 || (L->weights != 0) != L->qk_norm ||
+            (L->scales != 0) != L->freqs || (L->qk_norm ? !(L->eps > 0.0f && L->eps < 1.0f) : L->eps != 0.0f) ||
+            L->momentum != 0.0f || heads == 0 || kv == 0 || heads % kv != 0 || L->out_h != L->in_h ||
+            L->out_w != L->in_w || L->out_c % heads != 0 || !(L->score_scale >= 0.0f && L->score_scale <= FLT_MAX))
             return false;
         const uint64_t head = L->out_c / heads;
         if (L->input_count == 2)            /* cross-attention: queries in (the keys' and values' input checked apart) */
-            return L->in_c == heads * head && !L->causal && L->window == 0 && L->theta == 0.0f;
+            return L->in_c == heads * head && !L->causal && L->window == 0 && L->theta == 0.0f && !L->qk_norm &&
+                   !L->freqs && L->score_scale == 0.0f;
         return L->in_c == (heads + 2u * kv) * head && L->theta >= 0.0f && L->theta < FLT_MAX &&
-               (L->theta == 0.0f || head % 2u == 0);
+               (L->theta == 0.0f ? L->rotary == 0 && !L->freqs : L->rotary % 2u == 0 && L->rotary <= head);
     }
     if (L->type == LAYER_EMBEDDING)          /* a row of the table a value: h x (w c) cells, or (version 9) a range */
         return windowless && L->eps == 0.0f && L->momentum == 0.0f && L->vocabulary != 0 && L->out_h == L->in_h &&
@@ -1977,6 +1994,13 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
                      section_ok(L.optimizer, (2u * weights + 2u * biases) * 4u, file_size, 4);
             }
             if (!ok)
+                return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: a section exceeds the image or is misaligned");
+        }
+        if (L.type == LAYER_ATTENTION && (L.qk_norm || L.freqs)) {
+            /* version 10: the gammas of the queries' and keys' normalization, the rotary frequencies */
+            const uint64_t head = L.out_c / L.heads;
+            if ((L.qk_norm && !section_ok(L.weights, 8u * head, file_size, 4)) ||
+                (L.freqs && !section_ok(L.scales, (uint64_t)L.rotary / 2u * 4u, file_size, 4)))
                 return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: a section exceeds the image or is misaligned");
         }
         if (i + 2 < layers && L.outputs > info->max_width) info->max_width = L.outputs;
@@ -2653,10 +2677,10 @@ void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y,
         for (uint32_t i = 0; i < n; i++) y[i] *= x[k][i];
 }
 
-void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, float *table) {
-    const uint32_t half = head / 2u;
+void spingalett_engine_rope_table(uint32_t cells, uint32_t rot, float theta, const float *freqs, float *table) {
+    const uint32_t half = rot / 2u;
     for (uint32_t i = 0; i < half; i++) {
-        const double inv = pow((double)theta, -2.0 * (double)i / (double)head);
+        const double inv = freqs ? (double)freqs[i] : pow((double)theta, -2.0 * (double)i / (double)rot);
         for (uint32_t p = 0; p < cells; p++) {
             const double angle = (double)p * inv;
             table[(size_t)p * half + i] = (float)cos(angle);
@@ -2672,6 +2696,17 @@ void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, 
         dst[i] = a * c - b * sn;
         dst[i + half] = b * c + a * sn;
     }
+}
+
+void spingalett_engine_head(const float *src, float *dst, uint32_t head, const float *gamma, float eps, uint32_t rot,
+                            const float *cosines, const float *sines) {
+    if (gamma) spingalett_engine_rms_norm(src, 1, head, gamma, eps, dst, NULL);
+    if (rot) spingalett_engine_rope_rotate(gamma ? dst : src, dst, rot / 2u, cosines, sines);
+    if (gamma || !rot) {
+        if (!gamma && src != dst) memcpy(dst, src, (size_t)head * sizeof(float));
+        return;
+    }
+    if (src != dst) memcpy(dst + rot, src + rot, (size_t)(head - rot) * sizeof(float));
 }
 
 void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,
@@ -2707,26 +2742,28 @@ void spingalett_engine_attention(const SlettAttention *a, const float *x, const 
     /* a cell's values of keys and values (and, in self-attention, of queries before them first) */
     const uint32_t C = (a->kv_input ? 2u * kv : heads + 2u * kv) * head, Cq = a->kv_input ? heads * head : C;
     const uint32_t kbase = a->kv_input ? 0u : heads;
-    const uint32_t out_c = heads * head, group = heads / kv, half = head / 2u;
-    const float scale = 1.0f / sqrtf((float)head);
-    float *keys = scratch, *q = table ? scratch + (size_t)kcells * kv * head : NULL;    /* (scratch: with a table) */
-    /* the keys rotated once (kv heads a cell, side by side), a query rotated as it is used */
-    if (table)
+    const uint32_t out_c = heads * head, group = heads / kv, rot = table ? a->rot : 0u, half = rot / 2u;
+    const float scale = a->scale;
+    /* (scratch: with a table, or normalized keys) */
+    const bool prepared = table || a->gk;
+    float *keys = scratch, *q = prepared ? scratch + (size_t)kcells * kv * head : NULL;
+    /* the keys normalized and rotated once (kv heads a cell, side by side), a query as it is used */
+    if (prepared)
         for (uint32_t p = 0; p < kcells; p++)
             for (uint32_t g = 0; g < kv; g++)
-                spingalett_engine_rope_rotate(kvx + (size_t)p * C + (size_t)(kbase + g) * head,
-                                              keys + ((size_t)p * kv + g) * head, half, table + (size_t)p * half,
-                                              table + (size_t)cells * half + (size_t)p * half);
+                spingalett_engine_head(kvx + (size_t)p * C + (size_t)(kbase + g) * head, keys + ((size_t)p * kv + g) * head,
+                                       head, a->gk, a->eps, rot, table ? table + (size_t)p * half : NULL,
+                                       table ? table + (size_t)cells * half + (size_t)p * half : NULL);
     for (uint32_t h = 0; h < heads; h++) {
         const uint32_t g = h / group;
-        /* key j of head g: rotated in the scratch, kv heads a cell, or in the input */
-        const float *k = table ? keys + (size_t)g * head : kvx + (size_t)(kbase + g) * head;
-        const size_t key_stride = table ? (size_t)kv * head : C;
+        /* key j of head g: prepared in the scratch, kv heads a cell, or in the input */
+        const float *k = prepared ? keys + (size_t)g * head : kvx + (size_t)(kbase + g) * head;
+        const size_t key_stride = prepared ? (size_t)kv * head : C;
         for (uint32_t i = 0; i < cells; i++) {
             const float *qi = x + (size_t)i * Cq + (size_t)h * head;
-            if (table) {
-                spingalett_engine_rope_rotate(qi, q, half, table + (size_t)i * half,
-                                              table + (size_t)cells * half + (size_t)i * half);
+            if (prepared) {
+                spingalett_engine_head(qi, q, head, a->gq, a->eps, rot, table ? table + (size_t)i * half : NULL,
+                                       table ? table + (size_t)cells * half + (size_t)i * half : NULL);
                 qi = q;
             }
             /* its keys: up to it when causal; with a window, less than window cells away */
@@ -2754,6 +2791,11 @@ void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, c
     a->causal = L->causal;
     a->tokens = NULL;
     a->kv_input = NULL;
+    a->rot = L->theta > 0.0f ? L->rotary : 0u;
+    a->gq = L->qk_norm ? (const float *)(const void *)(image + L->weights) : NULL;
+    a->gk = a->gq ? a->gq + a->head : NULL;
+    a->eps = L->eps;
+    a->scale = slett_attention_scale(L);
     if (L->mask && input) {             /* the keys' tokens: those of the embedding, from its first on */
         SlettLayer E;
         spingalett_slett_layer(image, L->mask - 1u, &E);
@@ -2851,9 +2893,10 @@ static void layer_forward(const uint8_t *image, const SlettLayer *L, const float
             spingalett_engine_attention_of(image, L, input, &a);
             a.kv_input = kv;
             float *table = NULL, *scratch = (float *)window;
-            if (L->theta > 0.0f) {          /* the table after the rotated keys and the query */
+            if (L->theta > 0.0f) {          /* the table after the prepared keys and the query */
                 table = scratch + (size_t)a.cells * a.kv * a.head + a.head;
-                spingalett_engine_rope_table(a.cells, a.head, L->theta, table);
+                spingalett_engine_rope_table(a.cells, a.rot, L->theta,
+                                             L->freqs ? (const float *)(const void *)(image + L->scales) : NULL, table);
             }
             spingalett_engine_attention(&a, x, table, y, scratch);
             break;

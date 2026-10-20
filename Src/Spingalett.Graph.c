@@ -24,58 +24,6 @@ static inline bool parallel(ComputeMode mode, uint32_t n, uint64_t work) {
 
 /* ------------------------------------------------------------------------- memory plan */
 
-typedef struct {
-    uint64_t offset, size;
-    uint32_t last;              /* the last step that reads it */
-} LiveBuffer;
-
-uint64_t spingalett_plan_buffers(uint32_t outputs, const uint64_t *sizes, uint32_t count, const uint32_t *steps,
-                                 const uint32_t *const *reads, const uint32_t *read_count, uint64_t align,
-                                 uint64_t *offsets) {
-    uint32_t *last = (uint32_t *)malloc(((size_t)outputs + 1) * sizeof(uint32_t));
-    LiveBuffer *live = (LiveBuffer *)malloc(((size_t)outputs + 1) * sizeof(LiveBuffer));
-    if (!last || !live) {
-        free(last);
-        free(live);
-        return UINT64_MAX;
-    }
-    for (uint32_t t = 0; t < outputs; t++) {
-        last[t] = 0;
-        offsets[t] = UINT64_MAX;
-    }
-    for (uint32_t s = 0; s < count; s++) {     /* readers come after their producer */
-        last[steps[s]] = s;                    /* an output nothing reads lives for its own step */
-        for (uint32_t k = 0; k < read_count[s]; k++) last[reads[s][k]] = s;
-    }
-
-    uint64_t total = 0;
-    uint32_t n = 0;                            /* live buffers, by increasing offset */
-    for (uint32_t s = 0; s < count; s++) {
-        uint32_t keep = 0;
-        for (uint32_t i = 0; i < n; i++)
-            if (live[i].last >= s) live[keep++] = live[i];
-        n = keep;
-        uint32_t t = steps[s];
-        if (sizes[t] == 0) continue;
-        uint64_t size = (sizes[t] + align - 1) / align * align, at = 0;
-        uint32_t pos = 0;
-        /* the lowest gap that holds it */
-        for (; pos < n; pos++) {
-            if (at + size <= live[pos].offset) break;
-            uint64_t end = live[pos].offset + live[pos].size;
-            if (end > at) at = end;
-        }
-        memmove(live + pos + 1, live + pos, (size_t)(n - pos) * sizeof(LiveBuffer));
-        live[pos] = (LiveBuffer){at, size, last[t]};
-        n++;
-        offsets[t] = at;
-        if (at + size > total) total = at + size;
-    }
-    free(last);
-    free(live);
-    return total;
-}
-
 bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint32_t l) {
     LayerType type = net->shapes[l].type;
     return (type == LAYER_DENSE || type == LAYER_CONV2D) && net->act_func[l - 1] == ACT_NONE && l + 1 < net->layers &&
