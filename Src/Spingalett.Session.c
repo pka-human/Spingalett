@@ -22,6 +22,7 @@
 
 #include "Spingalett.Model.h"
 #include "Spingalett.Blocks.h"
+#include "Spingalett.Attention.h"
 #if !defined(SPINGALETT_RUNTIME)
 #include "Spingalett.Gpu.h"
 #endif
@@ -53,7 +54,9 @@
 typedef struct {
     uint32_t heads, kv, head;
     uint32_t window;                /* a sliding window: the keys of the last `window` positions (0: all) */
-    float *keys, *values;           /* [sequences x max_length x kv x head] each, the keys prepared */
+    float *keys;                    /* [sequences x kv] blocks of SPG_KEY_BLOCK keys (spingalett_key_store()), prepared */
+    float *values;                  /* [sequences x max_length x kv x head] */
+    size_t key_floats;              /* the keys of one sequence and head: max_length rounded up to blocks, x head */
     float *table;                   /* the rotary embeddings of max_length positions (cosines, then sines), or NULL */
     uint32_t rot;                   /* the values of a head they rotate */
     const float *gq, *gk;           /* the gammas of the queries' and keys' normalization, or NULL */
@@ -311,7 +314,8 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
         c->heads = L.heads, c->kv = L.kv_heads, c->head = L.out_c / L.heads, c->window = L.window;
         c->rot = a.rot, c->gq = a.gq, c->gk = a.gk, c->eps = a.eps, c->scale = a.scale;
         const size_t floats = (size_t)sequences * max_length * c->kv * c->head;
-        c->keys = (float *)spingalett_aligned_alloc(floats * sizeof(float));
+        c->key_floats = (size_t)(max_length + SPG_KEY_BLOCK - 1u) / SPG_KEY_BLOCK * SPG_KEY_BLOCK * c->head;
+        c->keys = (float *)spingalett_aligned_calloc((size_t)sequences * c->kv * c->key_floats, sizeof(float));
         c->values = (float *)spingalett_aligned_alloc(floats * sizeof(float));
         ok = c->keys && c->values;
         if (ok && L.theta > 0.0f) {
@@ -372,7 +376,10 @@ bool spingalett_session_copy(SpingalettSession *s, uint32_t from, uint32_t to) {
         const Cache *c = &s->caches[i];
         if (!c->keys) continue;
         const size_t per = (size_t)c->kv * c->head, sequence = (size_t)s->max_length * per;
-        memcpy(c->keys + to * sequence, c->keys + from * sequence, s->length[from] * per * sizeof(float));
+        const size_t blocks = (s->length[from] + SPG_KEY_BLOCK - 1u) / SPG_KEY_BLOCK * SPG_KEY_BLOCK * c->head;
+        for (uint32_t g = 0; g < c->kv; g++)
+            memcpy(c->keys + ((size_t)to * c->kv + g) * c->key_floats, c->keys + ((size_t)from * c->kv + g) * c->key_floats,
+                   blocks * sizeof(float));
         memcpy(c->values + to * sequence, c->values + from * sequence, s->length[from] * per * sizeof(float));
     }
     s->length[to] = s->length[from];
@@ -466,16 +473,16 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
     const size_t per = (size_t)kv * head, sequence = (size_t)s->max_length * per;
     const float *sines = c->table ? c->table + (size_t)s->max_length * half : NULL;
     const bool prepared = c->table || c->gk;
+    float *key = s->queries;            /* (a prepared key, before it goes into its block) */
     for (uint32_t r = 0; r < rows; r++) {
         const uint32_t p = s->row_position[r];
-        float *keys = c->keys + s->row_sequence[r] * sequence + p * per;
         float *values = c->values + s->row_sequence[r] * sequence + p * per;
         for (uint32_t g = 0; g < kv; g++) {
             const float *k = x + (size_t)r * C + (size_t)(heads + g) * head;
             if (prepared)
-                spingalett_engine_head(k, keys + (size_t)g * head, head, c->gk, c->eps, rot,
-                                       c->table ? c->table + (size_t)p * half : NULL, sines ? sines + (size_t)p * half : NULL);
-            else memcpy(keys + (size_t)g * head, k, head * sizeof(float));
+                spingalett_engine_head(k, key, head, c->gk, c->eps, rot, c->table ? c->table + (size_t)p * half : NULL,
+                                       sines ? sines + (size_t)p * half : NULL);
+            spingalett_key_store(c->keys + ((size_t)s->row_sequence[r] * kv + g) * c->key_floats, head, p, prepared ? key : k);
             memcpy(values + (size_t)g * head, x + (size_t)r * C + (size_t)(heads + kv + g) * head, head * sizeof(float));
         }
     }
@@ -494,9 +501,9 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
                 q = ready;
             }
             const uint32_t first = c->window && p + 1u > c->window ? p + 1u - c->window : 0u;
-            const size_t at = s->row_sequence[r] * sequence + first * per + (size_t)g * head;
-            spingalett_engine_attend(q, c->keys + at, per, c->values + at, per, p + 1u - first, head, scale, NULL,
-                                     y + (size_t)r * out_c + (size_t)h * head);
+            spingalett_attend_blocks(q, c->keys + ((size_t)s->row_sequence[r] * kv + g) * c->key_floats,
+                                     c->values + s->row_sequence[r] * sequence + (size_t)g * head, per, first, p + 1u - first,
+                                     head, scale, y + (size_t)r * out_c + (size_t)h * head);
         }
     );
 }

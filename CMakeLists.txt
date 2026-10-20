@@ -249,7 +249,8 @@ endif()
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
     set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c Src/Spingalett.Session.c
-                                Src/Spingalett.Blocks.c Src/Spingalett.Gguf.c Src/Gpu/Spingalett.GpuModel.c
+                                Src/Spingalett.Blocks.c Src/Spingalett.Attention.c Src/Spingalett.Gguf.c
+                                Src/Gpu/Spingalett.GpuModel.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
 endif()
 

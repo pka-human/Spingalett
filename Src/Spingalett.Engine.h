@@ -320,9 +320,13 @@ void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, 
    none). */
 void spingalett_engine_head(const float *src, float *dst, uint32_t head, const float *gamma, float eps, uint32_t rot,
                             const float *cosines, const float *sines);
+/* exp(x) rounded to float as glibc's expf computes it without fused multiply-adds (its table of 2^(i / 32) through
+   spingalett_exp2f_table()): attention's exponentials, the same on every platform. */
+float spingalett_expf(float x);
+const uint64_t *spingalett_exp2f_table(void);
 /* One query's attention over `count` keys and values (key j at keys + j key_stride, its value at values + j
    value_stride) as spingalett_engine_attention() computes it, into o[head]: the scores in the order of the
-   keys, times scale, the softmax online; with tokens, key j left out when tokens[j] is negative (padding), and
+   keys, times scale, the softmax online (spingalett_expf()); with tokens, key j left out when tokens[j] is negative (padding), and
    zeros when no key is left. Sessions (spingalett_session_feed()) attend over the keys they keep with it, so
    that their results are the engine's. */
 void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,

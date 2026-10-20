@@ -11,11 +11,15 @@
  * block. The outputs are split between threads by rows, each computed whole by one of them, so that a cell's
  * outputs do not depend on the cells computed with it or on the threads.
  *
- * With AVX2 a row's block is first unpacked: its codes as unsigned bytes (the code plus an offset of the type:
- * 8 for Q4_0, 128 for Q8_0 and the IQ4 types' table, ...) and its sub-blocks' integer scales and minima, so that
- * one kernel serves every type. Rows are taken four at a time: each row's products of a block are summed in
- * eight lanes of 32 bits (dpbusd with VNNI, maddubs and madd without), the lanes of the four rows reduced into
- * one vector, and the float terms of the four rows computed side by side, each lane in the reference's order.
+ * With AVX2, few items (a token of each sequence) take rows four at a time: each row's products of a block with an
+ * item are summed in eight lanes of 32 bits (dpbusd with VNNI, maddubs and madd without; the k-quants' sub-blocks
+ * scaled in 16 bits as their pairs of products are added, dpwssd), the codes taken into registers as they are read,
+ * the lanes of the four rows reduced into one vector, and the float terms of the four rows computed side by side,
+ * each lane in the reference's order. Many items (a prompt) are transposed in groups of eight, so that a vector
+ * holds four codes of each of eight items; four rows of the weights are unpacked once (their codes as unsigned
+ * bytes with an offset of the type, their sub-blocks' integer scales and minima) and each row's four codes are
+ * broadcast against a group's, the items' sums then exact in the lanes, without reductions. Each kernel is compiled
+ * once for each type.
  */
 
 #include "Spingalett.Blocks.h"
@@ -28,16 +32,34 @@
 #  define BLOCK_AVX2 1
 #  if defined(__AVXVNNI__)
 #    define BLOCK_VNNI(acc, u, s) _mm256_dpbusd_avx_epi32((acc), (u), (s))
+#    define BLOCK_VNNI16(acc, a, b) _mm256_dpwssd_avx_epi32((acc), (a), (b))
 #  elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
 #    define BLOCK_VNNI(acc, u, s) _mm256_dpbusd_epi32((acc), (u), (s))
+#    define BLOCK_VNNI16(acc, a, b) _mm256_dpwssd_epi32((acc), (a), (b))
 #  endif
 #endif
 
-/* Rows of the weights a thread takes at a time. */
-#define BLOCK_ROWS 64u
+/* Items a group of the kernel of many items holds (a vector's lanes), and the items from which it takes them. */
+#define GROUP 8u
+#define MANY_ITEMS 16u
 
-uint64_t spingalett_block_scratch(const SlettLayer *L, uint64_t items) {
-    return slett_block_input_bytes(items * L->row_len);
+/* The scratch of a layer of n inputs a cell over `items` cells: the cells quantized (slett_block_input_bytes()), and
+   for the kernel of many items the cells transposed in groups of GROUP (codes, scales and sums of every 16 codes
+   lane by lane) and, for each thread, four rows of the weights unpacked. */
+static uint64_t transposed_bytes(uint64_t items, uint32_t n) {
+    const uint64_t groups = (items + GROUP - 1u) / GROUP;
+    return slett_align(groups * GROUP * n) + slett_align(groups * GROUP * (n / 32u) * 4u) +
+           slett_align(groups * GROUP * (n / 16u) * 4u);
+}
+static uint64_t tile_bytes(uint32_t n) {
+    return slett_align(4u * (uint64_t)n) + 2u * slett_align(4u * (uint64_t)(n / 32u) * 4u) +
+           2u * slett_align(4u * (uint64_t)(n / 16u) * 2u);
+}
+
+uint64_t spingalett_block_scratch(const SlettLayer *L, uint64_t items, int threads) {
+    const uint64_t natural = slett_block_input_bytes(items * L->row_len);
+    if (items < MANY_ITEMS) return natural;
+    return natural + transposed_bytes(items, L->row_len) + (uint64_t)(threads > 1 ? threads : 1) * tile_bytes(L->row_len);
 }
 
 /* An input quantized in blocks: item i's codes at xq + i C, its blocks' scales at dx + i C / S, its sums of 16
@@ -320,6 +342,153 @@ static inline __attribute__((always_inline)) __m256i codes32(PrecisionMode p, co
     }
 }
 
+/* acc + the products of 32 codes with an item's 32, each pair of products times its sub-block's scale (lo for the first
+   16 codes, hi for the last): maddubs then a 16-bit multiply-add, for codes of 63 at most; wider ones (IQ4_XS's, signed:
+   code - 128) by the sign trick. */
+static inline __m256i scaled_products(__m256i acc, __m256i u, __m256i x, int16_t lo, int16_t hi, bool wide) {
+    __m256i pairs;
+    if (wide) {
+        const __m256i q = _mm256_xor_si256(u, _mm256_set1_epi8((char)0x80));
+        pairs = _mm256_maddubs_epi16(_mm256_sign_epi8(q, q), _mm256_sign_epi8(x, q));
+    } else {
+        pairs = _mm256_maddubs_epi16(u, x);
+    }
+    const __m256i scales = _mm256_set_m128i(_mm_set1_epi16(hi), _mm_set1_epi16(lo));
+#if defined(BLOCK_VNNI16)
+    return BLOCK_VNNI16(acc, pairs, scales);
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, scales));
+#endif
+}
+
+/* A row's super-block of 256 against an item's codes x (X16: the item's sums of the sub-blocks as 16-bit values, one
+   a lane), its codes taken into registers as they are read: the scaled products in eight lanes, and in eight lanes
+   too the scales' and the minima's products with the sums (whose totals are the offset's part over the offset and
+   I2); its scale and minimum's scale in *d and *m. Compiled for each type. */
+static inline __attribute__((always_inline)) __m256i super_lanes(const PrecisionMode p, const uint8_t *w, const int8_t *x,
+                                                                 __m256i X16, float *d, float *m, __m256i *off, __m256i *mins) {
+    int16_t sc[16] __attribute__((aligned(32))) = {0}, mn[16] __attribute__((aligned(32))) = {0};
+    __m256i acc = _mm256_setzero_si256();
+    const __m256i low = _mm256_set1_epi8(0x0F), three = _mm256_set1_epi8(3), one = _mm256_set1_epi8(1);
+#define XV(k) _mm256_loadu_si256((const __m256i *)(const void *)(x + (k)))
+    switch (p) {
+        case PRECISION_Q4_K:
+        case PRECISION_Q5_K: {
+            /* the eight 6-bit scales and minima (llama.cpp's utmp shuffle) */
+            uint32_t ut[4];
+            memcpy(ut, w + 4, 12);
+            const uint32_t kmask1 = 0x3f3f3f3fu, kmask2 = 0x0f0f0f0fu, kmask3 = 0x03030303u;
+            ut[3] = ((ut[2] >> 4) & kmask2) | (((ut[1] >> 6) & kmask3) << 4);
+            const uint32_t aux = ut[1] & kmask1;
+            ut[1] = (ut[2] & kmask2) | (((ut[0] >> 6) & kmask3) << 4);
+            ut[2] = aux;
+            ut[0] &= kmask1;
+            const uint8_t *bytes = (const uint8_t *)ut;
+            for (int k = 0; k < 8; k++) {
+                sc[k] = bytes[k];
+                mn[k] = bytes[8 + k];
+            }
+            *d = half_of(w);
+            *m = -half_of(w + 2);
+            const bool five = p == PRECISION_Q5_K;
+            const uint8_t *q = w + (five ? 48 : 16);
+            const __m256i qh = _mm256_loadu_si256((const __m256i *)(const void *)(w + 16));
+            for (int c = 0; c < 4; c++) {
+                const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(q + 32 * c));
+                __m256i lo = _mm256_and_si256(v, low), hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), low);
+                if (five) {
+                    lo = _mm256_or_si256(lo, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * c), one), 4));
+                    hi = _mm256_or_si256(hi, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * c + 1), one), 4));
+                }
+                acc = scaled_products(acc, lo, XV(64 * c), sc[2 * c], sc[2 * c], false);
+                acc = scaled_products(acc, hi, XV(64 * c + 32), sc[2 * c + 1], sc[2 * c + 1], false);
+            }
+            break;
+        }
+        case PRECISION_Q6_K: {
+            for (int k = 0; k < 16; k++) sc[k] = (int8_t)w[192 + k];
+            *d = half_of(w + 208);
+            for (int h = 0; h < 2; h++) {
+                const __m256i l0 = _mm256_loadu_si256((const __m256i *)(const void *)(w + 64 * h));
+                const __m256i l1 = _mm256_loadu_si256((const __m256i *)(const void *)(w + 64 * h + 32));
+                const __m256i hb = _mm256_loadu_si256((const __m256i *)(const void *)(w + 128 + 32 * h));
+                const __m256i lows[4] = {_mm256_and_si256(l0, low), _mm256_and_si256(l1, low),
+                                         _mm256_and_si256(_mm256_srli_epi16(l0, 4), low),
+                                         _mm256_and_si256(_mm256_srli_epi16(l1, 4), low)};
+                for (int g = 0; g < 4; g++) {
+                    const __m256i c = _mm256_or_si256(lows[g], _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hb, 2 * g),
+                                                                                                three), 4));
+                    acc = scaled_products(acc, c, XV(128 * h + 32 * g), sc[8 * h + 2 * g], sc[8 * h + 2 * g + 1], false);
+                }
+            }
+            break;
+        }
+        case PRECISION_Q2_K:
+        case PRECISION_Q3_K: {
+            const bool three_bits = p == PRECISION_Q3_K;
+            if (three_bits) {
+                const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
+                uint32_t aux[4];
+                aux[0] = slett_get32(w + 96);
+                aux[1] = slett_get32(w + 100);
+                const uint32_t tmp = slett_get32(w + 104);
+                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
+                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+                const uint8_t *bytes = (const uint8_t *)aux;
+                for (int k = 0; k < 16; k++) sc[k] = (int16_t)(bytes[k] - 32);
+                *d = half_of(w + 108);
+            } else {
+                for (int k = 0; k < 16; k++) {
+                    sc[k] = w[k] & 0xF;
+                    mn[k] = w[k] >> 4;
+                }
+                *d = half_of(w + 80);
+                *m = -half_of(w + 82);
+            }
+            const uint8_t *q = w + (three_bits ? 32 : 16);
+            const __m256i hm = _mm256_loadu_si256((const __m256i *)(const void *)w);
+            for (int h = 0; h < 2; h++) {
+                const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(q + 32 * h));
+                for (int jj = 0; jj < 4; jj++) {
+                    __m256i c = _mm256_and_si256(_mm256_srli_epi16(v, 2 * jj), three);
+                    if (three_bits)
+                        c = _mm256_or_si256(c, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hm, 4 * h + jj), one), 2));
+                    acc = scaled_products(acc, c, XV(128 * h + 32 * jj), sc[8 * h + 2 * jj], sc[8 * h + 2 * jj + 1], false);
+                }
+            }
+            break;
+        }
+        default: {                                  /* IQ4_XS */
+            const __m256i table = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(const void *)iq4_unsigned));
+            const uint32_t high = slett_get16(w + 2);
+            for (int ib = 0; ib < 8; ib++) {
+                const uint32_t lowb = w[4 + ib / 2];
+                sc[ib] = (int16_t)((int32_t)(((lowb >> (4u * (uint32_t)(ib % 2))) & 0xFu) | (((high >> (2u * (uint32_t)ib)) & 3u) << 4)) - 32);
+                acc = scaled_products(acc, _mm256_shuffle_epi8(table, nibbles(w + 8 + 16 * ib)), XV(32 * ib), sc[ib], sc[ib], true);
+            }
+            *d = half_of(w);
+            break;
+        }
+    }
+#undef XV
+    const __m256i sc16 = _mm256_load_si256((const __m256i *)(const void *)sc);
+    *off = _mm256_madd_epi16(sc16, X16);
+    *mins = _mm256_madd_epi16(_mm256_load_si256((const __m256i *)(const void *)mn), X16);
+    return acc;
+}
+
+/* An item's sums of a super-block's sub-blocks (sixteen of 16, or eight of 32) as 16-bit values, one a lane. */
+static inline __m256i sub_sums(const int32_t *X, uint32_t sub) {
+    const __m256i lo = _mm256_loadu_si256((const __m256i *)(const void *)X);
+    const __m256i hi = _mm256_loadu_si256((const __m256i *)(const void *)(X + 8));
+    if (sub == 16u) return _mm256_permute4x64_epi64(_mm256_packs_epi32(lo, hi), 0xD8);
+    /* the pairs added: eight sums of 32 in the low lanes */
+    const __m256i pairs = _mm256_permute4x64_epi64(_mm256_hadd_epi32(lo, hi), 0xD8);
+    return _mm256_permute4x64_epi64(_mm256_packs_epi32(pairs, _mm256_setzero_si256()), 0xD8);
+}
+
 /* Rows j0 .. j0 + 4 n - 1 for `items` items: y[i OC + j] = bias[j] + the row's dot product with item i, the four rows
    of a group side by side, each lane's float sum in the reference's order; up to 8 items at a time share each
    row's unpacked block. Compiled once for each type (the type a constant). */
@@ -362,6 +531,26 @@ static inline __attribute__((always_inline)) void rows_by_four_of(const Precisio
                     }
                     continue;
                 }
+                if (count == 1u) {
+                    /* one item: each row's codes into registers as they are read */
+                    const int8_t *x = q->xq + (size_t)i0 * q->C + (size_t)b * S;
+                    const __m256i X16 = sub_sums(q->sums + (size_t)i0 * per + (size_t)b * (S / 16u), t.sub);
+                    float d[4], m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    __m256i o0, o1, o2, o3, n0, n1, n2, n3;
+                    const __m256i a0 = super_lanes(p, wb, x, X16, &d[0], &m[0], &o0, &n0);
+                    const __m256i a1 = super_lanes(p, wb + row, x, X16, &d[1], &m[1], &o1, &n1);
+                    const __m256i a2 = super_lanes(p, wb + 2u * row, x, X16, &d[2], &m[2], &o2, &n2);
+                    const __m256i a3 = super_lanes(p, wb + 3u * row, x, X16, &d[3], &m[3], &o3, &n3);
+                    __m128i i1 = reduce4(a0, a1, a2, a3);
+                    if (t.offset && !t.wide)
+                        i1 = _mm_sub_epi32(i1, _mm_mullo_epi32(_mm_set1_epi32(t.offset), reduce4(o0, o1, o2, o3)));
+                    const __m128 dx = _mm_set1_ps(q->dx[(size_t)i0 * blocks + b]);
+                    __m128 term = _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(d), dx), _mm_cvtepi32_ps(i1));
+                    if (t.mins)
+                        term = _mm_add_ps(term, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(m), dx), _mm_cvtepi32_ps(reduce4(n0, n1, n2, n3))));
+                    acc[0] = _mm_add_ps(acc[0], term);
+                    continue;
+                }
                 for (uint32_t r = 0; r < 4u; r++) unpack(p, wb + (size_t)r * row, u[r], &s[r]);
                 const __m128 dv = _mm_set_ps(s[3].d, s[2].d, s[1].d, s[0].d), mv = _mm_set_ps(s[3].m, s[2].m, s[1].m, s[0].m);
                 for (uint32_t i = 0; i < count; i++) {
@@ -402,6 +591,214 @@ static void rows_by_four(PrecisionMode p, const uint8_t *weights, size_t row, co
         default: rows_by_four_of(PRECISION_IQ4_XS, weights, row, bias, j0, n, q, items, y, OC); return;
     }
 #undef ROWS_OF
+}
+
+/* ------------------------------------------------------------------------- many items */
+
+/* The quantized items transposed in groups of GROUP: group g's codes k .. k + 3 of item t at x + (g C + 8 k) + 4 t
+   (32 bytes a step of four codes), its blocks' scales at dx + (g blocks + b) GROUP + t, its sums of 16 codes at
+   X + (g (C / 16) + i) GROUP + t. Items past the last are zeros. */
+typedef struct {
+    int8_t *x;
+    float *dx;
+    int32_t *X;
+} Transposed;
+
+static void transpose_group(const Quantized *q, uint64_t items, uint32_t g, const Transposed *t) {
+    const uint32_t C = q->C, blocks = C / q->S, per = C / 16u;
+    const uint64_t first = (uint64_t)g * GROUP;
+    const uint32_t count = items - first < GROUP ? (uint32_t)(items - first) : GROUP;
+    int8_t *x = t->x + (size_t)g * GROUP * C;
+    for (uint32_t k = 0; k < C; k += 32u) {
+        /* eight items' 32 codes, four at a time across the items: an 8 x 8 transposition of 4-byte words */
+        __m256i r[8];
+        for (uint32_t i = 0; i < GROUP; i++)
+            r[i] = i < count ? _mm256_loadu_si256((const __m256i *)(const void *)(q->xq + (first + i) * C + k))
+                             : _mm256_setzero_si256();
+        const __m256i a0 = _mm256_unpacklo_epi32(r[0], r[1]), a1 = _mm256_unpackhi_epi32(r[0], r[1]);
+        const __m256i a2 = _mm256_unpacklo_epi32(r[2], r[3]), a3 = _mm256_unpackhi_epi32(r[2], r[3]);
+        const __m256i a4 = _mm256_unpacklo_epi32(r[4], r[5]), a5 = _mm256_unpackhi_epi32(r[4], r[5]);
+        const __m256i a6 = _mm256_unpacklo_epi32(r[6], r[7]), a7 = _mm256_unpackhi_epi32(r[6], r[7]);
+        const __m256i b0 = _mm256_unpacklo_epi64(a0, a2), b1 = _mm256_unpackhi_epi64(a0, a2);
+        const __m256i b2 = _mm256_unpacklo_epi64(a1, a3), b3 = _mm256_unpackhi_epi64(a1, a3);
+        const __m256i b4 = _mm256_unpacklo_epi64(a4, a6), b5 = _mm256_unpackhi_epi64(a4, a6);
+        const __m256i b6 = _mm256_unpacklo_epi64(a5, a7), b7 = _mm256_unpackhi_epi64(a5, a7);
+        __m256i *out = (__m256i *)(void *)(x + 8u * (size_t)k);
+        _mm256_storeu_si256(out + 0, _mm256_permute2x128_si256(b0, b4, 0x20));
+        _mm256_storeu_si256(out + 1, _mm256_permute2x128_si256(b1, b5, 0x20));
+        _mm256_storeu_si256(out + 2, _mm256_permute2x128_si256(b2, b6, 0x20));
+        _mm256_storeu_si256(out + 3, _mm256_permute2x128_si256(b3, b7, 0x20));
+        _mm256_storeu_si256(out + 4, _mm256_permute2x128_si256(b0, b4, 0x31));
+        _mm256_storeu_si256(out + 5, _mm256_permute2x128_si256(b1, b5, 0x31));
+        _mm256_storeu_si256(out + 6, _mm256_permute2x128_si256(b2, b6, 0x31));
+        _mm256_storeu_si256(out + 7, _mm256_permute2x128_si256(b3, b7, 0x31));
+    }
+    for (uint32_t b = 0; b < blocks; b++)
+        for (uint32_t i = 0; i < GROUP; i++)
+            t->dx[((size_t)g * blocks + b) * GROUP + i] = i < count ? q->dx[(first + i) * blocks + b] : 0.0f;
+    for (uint32_t j = 0; j < per; j++)
+        for (uint32_t i = 0; i < GROUP; i++)
+            t->X[((size_t)g * per + j) * GROUP + i] = i < count ? q->sums[(first + i) * per + j] : 0;
+}
+
+/* Four rows of the weights unpacked (all their blocks): codes [4][C], the blocks' scales and minima [4][blocks],
+   the sub-blocks' integer scales and minima [4][subs]. */
+typedef struct {
+    uint8_t *u;
+    float *d, *m;
+    int16_t *sc, *mn;
+} Tile;
+
+static Tile tile_at(uint8_t *base, uint32_t n) {
+    Tile t;
+    t.u = base;
+    t.d = (float *)(void *)(base + slett_align(4u * (uint64_t)n));
+    t.m = (float *)(void *)((uint8_t *)t.d + slett_align(4u * (uint64_t)(n / 32u) * 4u));
+    t.sc = (int16_t *)(void *)((uint8_t *)t.m + slett_align(4u * (uint64_t)(n / 32u) * 4u));
+    t.mn = (int16_t *)(void *)((uint8_t *)t.sc + slett_align(4u * (uint64_t)(n / 16u) * 2u));
+    return t;
+}
+
+/* Rows j .. j + 3 for every group of items: y[i OC + j + r] = bias[j + r] + the row's dot product with item i, the
+   items of a group in a vector's lanes (each row's four codes broadcast against the items' four), each lane's float sum
+   in the reference's order. Compiled once for each type. */
+static inline __attribute__((always_inline)) void tile_of(const PrecisionMode p, const uint8_t *weights, size_t row,
+                                                          const float *bias, uint32_t j, const Transposed *xt, uint32_t C,
+                                                          uint64_t items, float *y, uint32_t OC, const Tile *tl) {
+    const BlockType t = block_type(p);
+    const uint32_t S = t.values, blocks = C / S, B = slett_block_bytes(p), subs = S / t.sub, per = C / 16u;
+    /* the four rows unpacked once for every group */
+    for (uint32_t r = 0; r < 4u; r++)
+        for (uint32_t b = 0; b < blocks; b++) {
+            Unpacked s;
+            s.m = 0.0f;
+            const uint8_t *w = weights + (size_t)(j + r) * row + (size_t)b * B;
+            uint8_t *u = tl->u + (size_t)r * C + (size_t)b * S;
+            if (S == 32u) {
+                _mm256_storeu_si256((__m256i *)(void *)u, codes32(p, w, &s.d, &s.m));
+            } else {
+                unpack(p, w, u, &s);
+                for (uint32_t k = 0; k < subs; k++) {
+                    tl->sc[((size_t)r * blocks + b) * subs + k] = (int16_t)s.sc[k];
+                    if (t.mins) tl->mn[((size_t)r * blocks + b) * subs + k] = (int16_t)s.mn[k];
+                }
+            }
+            tl->d[(size_t)r * blocks + b] = s.d;
+            tl->m[(size_t)r * blocks + b] = s.m;
+        }
+    const uint64_t groups = (items + GROUP - 1u) / GROUP;
+    const __m256i offset = _mm256_set1_epi32(t.offset);
+    for (uint64_t g = 0; g < groups; g++) {
+        const int8_t *xg = xt->x + (size_t)g * GROUP * C;
+        __m256 f0 = _mm256_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
+        for (uint32_t b = 0; b < blocks; b++) {
+            const int8_t *xb = xg + 8u * (size_t)b * S;
+            const int32_t *X = xt->X + ((size_t)g * per + (size_t)b * (S / 16u)) * GROUP;
+            __m256i i10, i11, i12, i13, i20, i21, i22, i23;
+            if (S == 32u) {
+                const uint8_t *u = tl->u + (size_t)b * 32u;
+                __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+                for (uint32_t k = 0; k < 32u; k += 4u) {
+                    const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xb + 8u * k));
+                    int32_t w0, w1, w2, w3;
+                    memcpy(&w0, u + k, 4);
+                    memcpy(&w1, u + C + k, 4);
+                    memcpy(&w2, u + 2u * C + k, 4);
+                    memcpy(&w3, u + 3u * C + k, 4);
+                    a0 = _mm256_add_epi32(a0, products(_mm256_set1_epi32(w0), x, t.wide));
+                    a1 = _mm256_add_epi32(a1, products(_mm256_set1_epi32(w1), x, t.wide));
+                    a2 = _mm256_add_epi32(a2, products(_mm256_set1_epi32(w2), x, t.wide));
+                    a3 = _mm256_add_epi32(a3, products(_mm256_set1_epi32(w3), x, t.wide));
+                }
+                const __m256i Xb = _mm256_add_epi32(_mm256_loadu_si256((const __m256i *)(const void *)X),
+                                                    _mm256_loadu_si256((const __m256i *)(const void *)(X + GROUP)));
+                const __m256i o = _mm256_mullo_epi32(offset, Xb);
+                i10 = t.offset ? _mm256_sub_epi32(a0, o) : a0;
+                i11 = t.offset ? _mm256_sub_epi32(a1, o) : a1;
+                i12 = t.offset ? _mm256_sub_epi32(a2, o) : a2;
+                i13 = t.offset ? _mm256_sub_epi32(a3, o) : a3;
+                i20 = i21 = i22 = i23 = Xb;
+            } else {
+                i10 = i11 = i12 = i13 = i20 = i21 = i22 = i23 = _mm256_setzero_si256();
+                for (uint32_t sb = 0; sb < subs; sb++) {
+                    const uint32_t k0 = sb * t.sub;
+                    const uint8_t *u = tl->u + (size_t)b * S + k0;
+                    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+                    for (uint32_t k = 0; k < t.sub; k += 4u) {
+                        const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xb + 8u * (k0 + k)));
+                        int32_t w0, w1, w2, w3;
+                        memcpy(&w0, u + k, 4);
+                        memcpy(&w1, u + C + k, 4);
+                        memcpy(&w2, u + 2u * C + k, 4);
+                        memcpy(&w3, u + 3u * C + k, 4);
+                        a0 = _mm256_add_epi32(a0, products(_mm256_set1_epi32(w0), x, t.wide));
+                        a1 = _mm256_add_epi32(a1, products(_mm256_set1_epi32(w1), x, t.wide));
+                        a2 = _mm256_add_epi32(a2, products(_mm256_set1_epi32(w2), x, t.wide));
+                        a3 = _mm256_add_epi32(a3, products(_mm256_set1_epi32(w3), x, t.wide));
+                    }
+                    __m256i Xs = _mm256_loadu_si256((const __m256i *)(const void *)(X + (size_t)sb * (t.sub / 16u) * GROUP));
+                    if (t.sub == 32u)
+                        Xs = _mm256_add_epi32(Xs, _mm256_loadu_si256((const __m256i *)(const void *)(X + ((size_t)sb * 2u + 1u) *
+                                                                                                         GROUP)));
+                    if (t.offset) {
+                        const __m256i o = _mm256_mullo_epi32(offset, Xs);
+                        a0 = _mm256_sub_epi32(a0, o);
+                        a1 = _mm256_sub_epi32(a1, o);
+                        a2 = _mm256_sub_epi32(a2, o);
+                        a3 = _mm256_sub_epi32(a3, o);
+                    }
+                    const int16_t *sc = tl->sc + (size_t)b * subs + sb, *mn = tl->mn + (size_t)b * subs + sb;
+                    const size_t rs = (size_t)blocks * subs;
+                    i10 = _mm256_add_epi32(i10, _mm256_mullo_epi32(a0, _mm256_set1_epi32(sc[0])));
+                    i11 = _mm256_add_epi32(i11, _mm256_mullo_epi32(a1, _mm256_set1_epi32(sc[rs])));
+                    i12 = _mm256_add_epi32(i12, _mm256_mullo_epi32(a2, _mm256_set1_epi32(sc[2u * rs])));
+                    i13 = _mm256_add_epi32(i13, _mm256_mullo_epi32(a3, _mm256_set1_epi32(sc[3u * rs])));
+                    if (t.mins) {
+                        i20 = _mm256_add_epi32(i20, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[0])));
+                        i21 = _mm256_add_epi32(i21, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[rs])));
+                        i22 = _mm256_add_epi32(i22, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[2u * rs])));
+                        i23 = _mm256_add_epi32(i23, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[3u * rs])));
+                    }
+                }
+            }
+            const __m256 dx = _mm256_loadu_ps(xt->dx + ((size_t)g * blocks + b) * GROUP);
+#define TILE_TERM(r) do { \
+                __m256 term = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(tl->d[(size_t)(r) * blocks + b]), dx), \
+                                            _mm256_cvtepi32_ps(i1##r)); \
+                if (t.mins) \
+                    term = _mm256_add_ps(term, _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(tl->m[(size_t)(r) * blocks + b]), dx), \
+                                                             _mm256_cvtepi32_ps(i2##r))); \
+                f##r = _mm256_add_ps(f##r, term); \
+            } while (0)
+            TILE_TERM(0);
+            TILE_TERM(1);
+            TILE_TERM(2);
+            TILE_TERM(3);
+#undef TILE_TERM
+        }
+        /* the four rows' sums of the group's items, item by item */
+        float out[4][GROUP];
+        _mm256_storeu_ps(out[0], f0);
+        _mm256_storeu_ps(out[1], f1);
+        _mm256_storeu_ps(out[2], f2);
+        _mm256_storeu_ps(out[3], f3);
+        const uint64_t first = g * GROUP;
+        const uint32_t count = items - first < GROUP ? (uint32_t)(items - first) : GROUP;
+        for (uint32_t i = 0; i < count; i++)
+            for (uint32_t r = 0; r < 4u; r++) y[(first + i) * OC + j + r] = bias[j + r] + out[r][i];
+    }
+}
+
+static void tile(PrecisionMode p, const uint8_t *weights, size_t row, const float *bias, uint32_t j, const Transposed *xt,
+                 uint32_t C, uint64_t items, float *y, uint32_t OC, const Tile *tl) {
+#define TILE_OF(type) case type: tile_of(type, weights, row, bias, j, xt, C, items, y, OC, tl); return;
+    switch (p) {
+        TILE_OF(PRECISION_Q8_0) TILE_OF(PRECISION_Q4_0) TILE_OF(PRECISION_Q4_1) TILE_OF(PRECISION_Q5_0)
+        TILE_OF(PRECISION_Q5_1) TILE_OF(PRECISION_Q2_K) TILE_OF(PRECISION_Q3_K) TILE_OF(PRECISION_Q4_K)
+        TILE_OF(PRECISION_Q5_K) TILE_OF(PRECISION_Q6_K) TILE_OF(PRECISION_IQ4_NL)
+        default: tile_of(PRECISION_IQ4_XS, weights, row, bias, j, xt, C, items, y, OC, tl); return;
+    }
+#undef TILE_OF
 }
 
 /* ------------------------------------------------------------------------- quantizing the inputs */
@@ -498,10 +895,35 @@ void spingalett_block_layer(const uint8_t *image, const SlettLayer *L, const flo
         for (int64_t i = 0; i < (int64_t)items; i++)
             quantize_item(x + (size_t)i * C, C, S, xq + (size_t)i * C, dx + (size_t)i * (C / S), sums + (size_t)i * (C / 16u));
     );
-    const int64_t blocks = (int64_t)((OC + BLOCK_ROWS - 1u) / BLOCK_ROWS);
+#if defined(BLOCK_AVX2)
+    if (items >= MANY_ITEMS) {
+        /* the items transposed in groups, then four rows at a time against all of them */
+        const uint64_t groups = (items + GROUP - 1u) / GROUP;
+        uint8_t *at = scratch + slett_block_input_bytes(n);
+        const Transposed xt = {(int8_t *)at, (float *)(void *)(at + slett_align(groups * GROUP * C)),
+                               (int32_t *)(void *)(at + slett_align(groups * GROUP * C) + slett_align(groups * GROUP * (C / 32u) * 4u))};
+        uint8_t *tiles = at + transposed_bytes(items, C);
+        SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1 && groups > 1,
+            for (int64_t g = 0; g < (int64_t)groups; g++) transpose_group(&q, items, (uint32_t)g, &xt);
+        );
+        const int64_t fours = (int64_t)(OC / 4u);
+        SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1,
+            for (int64_t f = 0; f < fours; f++) {
+                const Tile tl = tile_at(tiles + (size_t)spingalett_thread_num() * tile_bytes(C), C);
+                tile(p, weights, row, bias, (uint32_t)f * 4u, &xt, C, items, y, OC, &tl);
+            }
+        );
+        if (OC % 4u) rows_task(p, weights, row, bias, OC / 4u * 4u, OC, &q, items, y, OC);
+        return;
+    }
+#endif
+    /* as many pieces of rows (whole groups of four) as threads, of one size: few items are bound by reading the
+       weights, which the threads then share evenly */
+    const uint32_t team = threads > 1 ? (uint32_t)threads : 1u, size = ((OC + team - 1u) / team + 3u) / 4u * 4u;
+    const int64_t pieces = (int64_t)((OC + size - 1u) / size);
     SPINGALETT_PARALLEL_FOR_THREADS(threads, threads > 1,
-        for (int64_t b = 0; b < blocks; b++) {
-            const uint32_t j0 = (uint32_t)b * BLOCK_ROWS, end = OC - j0 < BLOCK_ROWS ? OC : j0 + BLOCK_ROWS;
+        for (int64_t b = 0; b < pieces; b++) {
+            const uint32_t j0 = (uint32_t)b * size, end = OC - j0 < size ? OC : j0 + size;
             rows_task(p, weights, row, bias, j0, end, &q, items, y, OC);
         }
     );

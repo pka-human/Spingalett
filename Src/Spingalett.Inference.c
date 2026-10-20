@@ -2677,6 +2677,51 @@ void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y,
         for (uint32_t i = 0; i < n; i++) y[i] *= x[k][i];
 }
 
+/* expf as glibc's algorithm computes it (Arm's optimized routines, MIT, Copyright (c) 2017-2018 Arm Limited), in
+   double without fused multiply-adds, rounded to float once: attention's exponentials, alike on every platform and in
+   the vectors of Spingalett.Attention.c (glibc itself differs on 2 of the 2^32 floats where it fuses them). */
+static const uint64_t exp2f_table[32] = {
+    0x3ff0000000000000u, 0x3fefd9b0d3158574u, 0x3fefb5586cf9890fu, 0x3fef9301d0125b51u,
+    0x3fef72b83c7d517bu, 0x3fef54873168b9aau, 0x3fef387a6e756238u, 0x3fef1e9df51fdee1u,
+    0x3fef06fe0a31b715u, 0x3feef1a7373aa9cbu, 0x3feedea64c123422u, 0x3feece086061892du,
+    0x3feebfdad5362a27u, 0x3feeb42b569d4f82u, 0x3feeab07dd485429u, 0x3feea47eb03a5585u,
+    0x3feea09e667f3bcdu, 0x3fee9f75e8ec5f74u, 0x3feea11473eb0187u, 0x3feea589994cce13u,
+    0x3feeace5422aa0dbu, 0x3feeb737b0cdc5e5u, 0x3feec49182a3f090u, 0x3feed503b23e255du,
+    0x3feee89f995ad3adu, 0x3feeff76f2fb5e47u, 0x3fef199bdd85529cu, 0x3fef3720dcef9069u,
+    0x3fef5818dcfba487u, 0x3fef7c97337b9b5fu, 0x3fefa4afa2a490dau, 0x3fefd0765b6e4540u,
+};
+
+const uint64_t *spingalett_exp2f_table(void) { return exp2f_table; }
+
+float spingalett_expf(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const uint32_t abstop = (bits >> 20) & 0x7FFu;
+    if (abstop >= 0x42Bu) {                             /* |x| >= 88, or NaN */
+        if (bits == 0xFF800000u) return 0.0f;           /* -inf */
+        if (abstop >= 0x7F8u) return x + x;             /* +inf, NaN */
+        if (x > 0x1.62e42ep6f) return (float)(0x1p97 * 0x1p97);   /* overflow: inf */
+        if (x < -0x1.9fe368p6f) return 0.0f;            /* below half the smallest subnormal */
+        if (x < -0x1.9d1d9ep6f) return 0x1p-149f;       /* the smallest subnormal */
+    }
+    /* x 32 / ln 2 = k + r, k an integer and |r| <= 1/2; exp(x) = 2^(k/32) 2^(r/32), the second factor a cubic in r */
+    const double z = 0x1.71547652b82fep+5 * (double)x;
+    double kd = z + 0x1.8p52;                           /* the integer in its low bits */
+    uint64_t ki, t;
+    memcpy(&ki, &kd, 8);
+    kd -= 0x1.8p52;
+    const double r = z - kd;
+    t = exp2f_table[ki % 32u] + (ki << 47);
+    double s;
+    memcpy(&s, &t, 8);
+    const double c0 = 0x1.c6af84b912394p-5 / 32 / 32 / 32, c1 = 0x1.ebfce50fac4f3p-3 / 32 / 32;
+    const double c2 = 0x1.62e42ff0c52d6p-1 / 32;
+    const double p = c0 * r + c1, r2 = r * r;
+    double y = c2 * r + 1.0;
+    y = p * r2 + y;
+    return (float)(y * s);
+}
+
 void spingalett_engine_rope_table(uint32_t cells, uint32_t rot, float theta, const float *freqs, float *table) {
     const uint32_t half = rot / 2u;
     for (uint32_t i = 0; i < half; i++) {
@@ -2721,12 +2766,12 @@ void spingalett_engine_attend(const float *q, const float *keys, size_t key_stri
         for (uint32_t d = 0; d < head; d++) score += q[d] * k[d];
         score *= scale;
         if (score > m) {            /* a new maximum: what was summed so far scaled down to it */
-            const float r = expf(m - score);
+            const float r = spingalett_expf(m - score);
             sum *= r;
             for (uint32_t d = 0; d < head; d++) o[d] *= r;
             m = score;
         }
-        const float w = expf(score - m);
+        const float w = spingalett_expf(score - m);
         sum += w;
         for (uint32_t d = 0; d < head; d++) o[d] += w * v[d];
     }

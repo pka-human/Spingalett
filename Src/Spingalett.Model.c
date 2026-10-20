@@ -429,7 +429,7 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
         }
         if (L.rows == 0 || L.type == LAYER_BATCH_NORM || L.type == LAYER_LAYER_NORM) continue;      /* pooling, normalizations */
         if (slett_block_layer(&L)) {
-            const uint64_t need = spingalett_block_scratch(&L, (uint64_t)chunk * (L.inputs / L.row_len));
+            const uint64_t need = spingalett_block_scratch(&L, (uint64_t)chunk * (L.inputs / L.row_len), w->threads);
             if (need > block_bytes) block_bytes = need;
             continue;
         }
