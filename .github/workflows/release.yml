@@ -447,8 +447,10 @@ jobs:
           path: ptx
       - name: Build the library
         run: |
-          dnf install -y vulkan-headers
-          python3.12 -m pip install --quiet cmake ninja build wheel numpy
+          # (the image's package mirrors and PyPI fail now and then: the tags of 1.4.0 and 1.5.0 lost this job so)
+          for try in 1 2 3 4 5; do dnf install -y vulkan-headers && break; echo "dnf failed ($try), again"; sleep 30; done
+          rpm -q vulkan-headers
+          for try in 1 2 3 4 5; do python3.12 -m pip install --quiet cmake ninja build wheel numpy && break; sleep 30; done
           export PATH="/opt/python/cp312-cp312/bin:$PATH"
           gcc --version | head -1
           cmake -S . -B Build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSPINGALETT_NATIVE_ARCH=OFF -DBUILD_WITH_OPENMP=ON \
