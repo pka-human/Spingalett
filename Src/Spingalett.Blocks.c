@@ -367,7 +367,9 @@ static inline __m256i scaled_products(__m256i acc, __m256i u, __m256i x, int16_t
    I2); its scale and minimum's scale in *d and *m. Compiled for each type. */
 static inline __attribute__((always_inline)) __m256i super_lanes(const PrecisionMode p, const uint8_t *w, const int8_t *x,
                                                                  __m256i X16, float *d, float *m, __m256i *off, __m256i *mins) {
-    int16_t sc[16] __attribute__((aligned(32))) = {0}, mn[16] __attribute__((aligned(32))) = {0};
+    /* (the scales and minima as vectors of 16-bit lanes built in registers, and as bytes for the products: arrays
+       written then read as vectors would stall on their stores) */
+    __m256i sc16 = _mm256_setzero_si256(), mn16 = _mm256_setzero_si256();
     __m256i acc = _mm256_setzero_si256();
     const __m256i low = _mm256_set1_epi8(0x0F), three = _mm256_set1_epi8(3), one = _mm256_set1_epi8(1);
 #define XV(k) _mm256_loadu_si256((const __m256i *)(const void *)(x + (k)))
@@ -375,19 +377,13 @@ static inline __attribute__((always_inline)) __m256i super_lanes(const Precision
         case PRECISION_Q4_K:
         case PRECISION_Q5_K: {
             /* the eight 6-bit scales and minima (llama.cpp's utmp shuffle) */
-            uint32_t ut[4];
-            memcpy(ut, w + 4, 12);
             const uint32_t kmask1 = 0x3f3f3f3fu, kmask2 = 0x0f0f0f0fu, kmask3 = 0x03030303u;
-            ut[3] = ((ut[2] >> 4) & kmask2) | (((ut[1] >> 6) & kmask3) << 4);
-            const uint32_t aux = ut[1] & kmask1;
-            ut[1] = (ut[2] & kmask2) | (((ut[0] >> 6) & kmask3) << 4);
-            ut[2] = aux;
-            ut[0] &= kmask1;
-            const uint8_t *bytes = (const uint8_t *)ut;
-            for (int k = 0; k < 8; k++) {
-                sc[k] = bytes[k];
-                mn[k] = bytes[8 + k];
-            }
+            const uint32_t u0 = slett_get32(w + 4), u1 = slett_get32(w + 8), u2 = slett_get32(w + 12);
+            const uint32_t s0 = u0 & kmask1, s1 = (u2 & kmask2) | (((u0 >> 6) & kmask3) << 4);
+            const uint32_t m0 = u1 & kmask1, m1 = ((u2 >> 4) & kmask2) | (((u1 >> 6) & kmask3) << 4);
+            const uint64_t scales = (uint64_t)s0 | (uint64_t)s1 << 32, minima = (uint64_t)m0 | (uint64_t)m1 << 32;
+            sc16 = _mm256_zextsi128_si256(_mm_cvtepu8_epi16(_mm_cvtsi64_si128((long long)scales)));
+            mn16 = _mm256_zextsi128_si256(_mm_cvtepu8_epi16(_mm_cvtsi64_si128((long long)minima)));
             *d = half_of(w);
             *m = -half_of(w + 2);
             const bool five = p == PRECISION_Q5_K;
@@ -400,13 +396,15 @@ static inline __attribute__((always_inline)) __m256i super_lanes(const Precision
                     lo = _mm256_or_si256(lo, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * c), one), 4));
                     hi = _mm256_or_si256(hi, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * c + 1), one), 4));
                 }
-                acc = scaled_products(acc, lo, XV(64 * c), sc[2 * c], sc[2 * c], false);
-                acc = scaled_products(acc, hi, XV(64 * c + 32), sc[2 * c + 1], sc[2 * c + 1], false);
+                const int16_t sa = (int16_t)((scales >> (16 * c)) & 0xFF), sb = (int16_t)((scales >> (16 * c + 8)) & 0xFF);
+                acc = scaled_products(acc, lo, XV(64 * c), sa, sa, false);
+                acc = scaled_products(acc, hi, XV(64 * c + 32), sb, sb, false);
             }
             break;
         }
         case PRECISION_Q6_K: {
-            for (int k = 0; k < 16; k++) sc[k] = (int8_t)w[192 + k];
+            sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(const void *)(w + 192)));
+            const int8_t *sc = (const int8_t *)(w + 192);
             *d = half_of(w + 208);
             for (int h = 0; h < 2; h++) {
                 const __m256i l0 = _mm256_loadu_si256((const __m256i *)(const void *)(w + 64 * h));
@@ -426,56 +424,61 @@ static inline __attribute__((always_inline)) __m256i super_lanes(const Precision
         case PRECISION_Q2_K:
         case PRECISION_Q3_K: {
             const bool three_bits = p == PRECISION_Q3_K;
+            uint32_t a0, a1, a2, a3;                /* the sixteen scales as bytes (Q3_K's less 32 below) */
             if (three_bits) {
                 const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
-                uint32_t aux[4];
-                aux[0] = slett_get32(w + 96);
-                aux[1] = slett_get32(w + 100);
-                const uint32_t tmp = slett_get32(w + 104);
-                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-                aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
-                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-                const uint8_t *bytes = (const uint8_t *)aux;
-                for (int k = 0; k < 16; k++) sc[k] = (int16_t)(bytes[k] - 32);
+                const uint32_t x0 = slett_get32(w + 96), x1 = slett_get32(w + 100), tmp = slett_get32(w + 104);
+                a2 = ((x0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                a3 = ((x1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                a0 = (x0 & kmask2) | ((tmp & kmask1) << 4);
+                a1 = (x1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+                sc16 = _mm256_cvtepi8_epi16(_mm_sub_epi8(_mm_setr_epi32((int)a0, (int)a1, (int)a2, (int)a3), _mm_set1_epi8(32)));
                 *d = half_of(w + 108);
             } else {
-                for (int k = 0; k < 16; k++) {
-                    sc[k] = w[k] & 0xF;
-                    mn[k] = w[k] >> 4;
-                }
+                const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)w);
+                sc16 = _mm256_cvtepu8_epi16(_mm_and_si128(v, _mm_set1_epi8(0x0F)));
+                mn16 = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F)));
+                a0 = slett_get32(w) & 0x0F0F0F0Fu;
+                a1 = slett_get32(w + 4) & 0x0F0F0F0Fu;
+                a2 = slett_get32(w + 8) & 0x0F0F0F0Fu;
+                a3 = slett_get32(w + 12) & 0x0F0F0F0Fu;
                 *d = half_of(w + 80);
                 *m = -half_of(w + 82);
             }
+            const uint64_t first = (uint64_t)a0 | (uint64_t)a1 << 32, second = (uint64_t)a2 | (uint64_t)a3 << 32;
+            const int16_t bias3 = three_bits ? 32 : 0;
             const uint8_t *q = w + (three_bits ? 32 : 16);
             const __m256i hm = _mm256_loadu_si256((const __m256i *)(const void *)w);
             for (int h = 0; h < 2; h++) {
                 const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(q + 32 * h));
+                const uint64_t bytes = h ? second : first;
                 for (int jj = 0; jj < 4; jj++) {
                     __m256i c = _mm256_and_si256(_mm256_srli_epi16(v, 2 * jj), three);
                     if (three_bits)
                         c = _mm256_or_si256(c, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hm, 4 * h + jj), one), 2));
-                    acc = scaled_products(acc, c, XV(128 * h + 32 * jj), sc[8 * h + 2 * jj], sc[8 * h + 2 * jj + 1], false);
+                    const int16_t sa = (int16_t)((int16_t)((bytes >> (16 * jj)) & 0xFF) - bias3);
+                    const int16_t sb = (int16_t)((int16_t)((bytes >> (16 * jj + 8)) & 0xFF) - bias3);
+                    acc = scaled_products(acc, c, XV(128 * h + 32 * jj), sa, sb, false);
                 }
             }
             break;
         }
         default: {                                  /* IQ4_XS */
             const __m256i table = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(const void *)iq4_unsigned));
-            const uint32_t high = slett_get16(w + 2);
+            const uint32_t high = slett_get16(w + 2), lows = slett_get32(w + 4);
+            int16_t sc[8];
             for (int ib = 0; ib < 8; ib++) {
-                const uint32_t lowb = w[4 + ib / 2];
-                sc[ib] = (int16_t)((int32_t)(((lowb >> (4u * (uint32_t)(ib % 2))) & 0xFu) | (((high >> (2u * (uint32_t)ib)) & 3u) << 4)) - 32);
+                sc[ib] = (int16_t)((int32_t)(((lows >> (4u * (uint32_t)ib)) & 0xFu) | (((high >> (2u * (uint32_t)ib)) & 3u) << 4)) - 32);
                 acc = scaled_products(acc, _mm256_shuffle_epi8(table, nibbles(w + 8 + 16 * ib)), XV(32 * ib), sc[ib], sc[ib], true);
             }
+            sc16 = _mm256_zextsi128_si256(_mm_setr_epi16(sc[0], sc[1], sc[2], sc[3], sc[4], sc[5], sc[6], sc[7]));
             *d = half_of(w);
             break;
         }
     }
 #undef XV
-    const __m256i sc16 = _mm256_load_si256((const __m256i *)(const void *)sc);
     *off = _mm256_madd_epi16(sc16, X16);
-    *mins = _mm256_madd_epi16(_mm256_load_si256((const __m256i *)(const void *)mn), X16);
+    *mins = _mm256_madd_epi16(mn16, X16);
     return acc;
 }
 
@@ -579,6 +582,103 @@ static inline __attribute__((always_inline)) void rows_by_four_of(const Precisio
             }
         }
     }
+}
+
+/* The codes of a block of 32 as codes32() gives them, its scale's and minimum's half-precision bits apart. */
+static inline __attribute__((always_inline)) __m256i codes32_bits(PrecisionMode p, const uint8_t *w, short *d, short *m) {
+    float unused_d, unused_m;
+    *d = (short)slett_get16(w);
+    if (p == PRECISION_Q4_1 || p == PRECISION_Q5_1) *m = (short)slett_get16(w + 2);
+    return codes32(p, w, &unused_d, &unused_m);
+}
+
+/* Four rows' term of a block of 32 for one item: (d dx) I1 (+ (m dx) I2), the four rows side by side. */
+static inline __attribute__((always_inline)) __m128 term32(const PrecisionMode p, const BlockType *t, const uint8_t *wb,
+                                                           size_t row, __m256i x, int32_t X, __m128 dx) {
+    short d0, d1, d2, d3, m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+    const __m256i c0 = codes32_bits(p, wb, &d0, &m0), c1 = codes32_bits(p, wb + row, &d1, &m1);
+    const __m256i c2 = codes32_bits(p, wb + 2u * row, &d2, &m2), c3 = codes32_bits(p, wb + 3u * row, &d3, &m3);
+    __m128i i1 = reduce4(products(c0, x, t->wide), products(c1, x, t->wide), products(c2, x, t->wide),
+                         products(c3, x, t->wide));
+    if (t->offset) i1 = _mm_sub_epi32(i1, _mm_set1_epi32(t->offset * X));
+    const __m128 d = _mm_cvtph_ps(_mm_setr_epi16(d0, d1, d2, d3, 0, 0, 0, 0));
+    __m128 term = _mm_mul_ps(_mm_mul_ps(d, dx), _mm_cvtepi32_ps(i1));
+    if (t->mins) {
+        const __m128 m = _mm_cvtph_ps(_mm_setr_epi16(m0, m1, m2, m3, 0, 0, 0, 0));
+        term = _mm_add_ps(term, _mm_mul_ps(_mm_mul_ps(m, dx), _mm_set1_ps((float)X)));
+    }
+    return term;
+}
+
+/* Four rows' term of a super-block of 256 for one item (super_lanes()). */
+static inline __attribute__((always_inline)) __m128 term256(const PrecisionMode p, const BlockType *t, const uint8_t *wb,
+                                                            size_t row, const int8_t *x, __m256i X16, __m128 dx) {
+    float d[4], m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    __m256i o0, o1, o2, o3, n0, n1, n2, n3;
+    const __m256i a0 = super_lanes(p, wb, x, X16, &d[0], &m[0], &o0, &n0);
+    const __m256i a1 = super_lanes(p, wb + row, x, X16, &d[1], &m[1], &o1, &n1);
+    const __m256i a2 = super_lanes(p, wb + 2u * row, x, X16, &d[2], &m[2], &o2, &n2);
+    const __m256i a3 = super_lanes(p, wb + 3u * row, x, X16, &d[3], &m[3], &o3, &n3);
+    __m128i i1 = reduce4(a0, a1, a2, a3);
+    if (t->offset && !t->wide) i1 = _mm_sub_epi32(i1, _mm_mullo_epi32(_mm_set1_epi32(t->offset), reduce4(o0, o1, o2, o3)));
+    __m128 term = _mm_mul_ps(_mm_mul_ps(_mm_set_ps(d[3], d[2], d[1], d[0]), dx), _mm_cvtepi32_ps(i1));
+    if (t->mins)
+        term = _mm_add_ps(term, _mm_mul_ps(_mm_mul_ps(_mm_set_ps(m[3], m[2], m[1], m[0]), dx),
+                                           _mm_cvtepi32_ps(reduce4(n0, n1, n2, n3))));
+    return term;
+}
+
+/* Rows j0 .. j0 + 8 n - 1 for one item (a token): two groups of four rows at a time, their sums in registers, so
+   that the sums of the two groups advance side by side. Compiled for each type. */
+static inline __attribute__((always_inline)) void rows_by_eight_of(const PrecisionMode p, const uint8_t *weights, size_t row,
+                                                                   const float *bias, uint32_t j0, uint32_t n,
+                                                                   const Quantized *q, uint32_t item, float *y, uint32_t OC) {
+    const BlockType t = block_type(p);
+    const uint32_t S = t.values, blocks = q->C / S, B = slett_block_bytes(p), per = q->C / 16u;
+    const int8_t *xi = q->xq + (size_t)item * q->C;
+    const int32_t *Xi = q->sums + (size_t)item * per;
+    const float *dxi = q->dx + (size_t)item * blocks;
+    for (uint32_t g = 0; g < n; g++) {
+        const uint32_t j = j0 + 8u * g;
+        const uint8_t *w0 = weights + (size_t)j * row, *w1 = w0 + 4u * row;
+        /* the next eight rows fetched while these are summed, a share of their lines a block: rows of a few
+           thousand bytes are too short for the processor's own prefetching to keep up */
+        const uint8_t *next = w0 + 8u * row;
+        const size_t lines = g + 1u < n ? (8u * row + 63u) / 64u : 0u, share = (lines + blocks - 1u) / blocks;
+        __m128 f0 = _mm_setzero_ps(), f1 = _mm_setzero_ps();
+        for (uint32_t b = 0; b < blocks; b++) {
+            for (size_t l = (size_t)b * share; l < (size_t)(b + 1u) * share && l < lines; l++)
+                _mm_prefetch((const char *)(next + 64u * l), _MM_HINT_T0);
+            const __m128 dx = _mm_set1_ps(dxi[b]);
+            if (S == 32u) {
+                const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xi + (size_t)b * 32u));
+                const int32_t X = Xi[2u * b] + Xi[2u * b + 1u];
+                f0 = _mm_add_ps(f0, term32(p, &t, w0 + (size_t)b * B, row, x, X, dx));
+                f1 = _mm_add_ps(f1, term32(p, &t, w1 + (size_t)b * B, row, x, X, dx));
+            } else {
+                const int8_t *x = xi + (size_t)b * S;
+                const __m256i X16 = sub_sums(Xi + (size_t)b * (S / 16u), t.sub);
+                f0 = _mm_add_ps(f0, term256(p, &t, w0 + (size_t)b * B, row, x, X16, dx));
+                f1 = _mm_add_ps(f1, term256(p, &t, w1 + (size_t)b * B, row, x, X16, dx));
+            }
+        }
+        float out[8];
+        _mm_storeu_ps(out, f0);
+        _mm_storeu_ps(out + 4, f1);
+        for (uint32_t r = 0; r < 8u; r++) y[(size_t)item * OC + j + r] = bias[j + r] + out[r];
+    }
+}
+
+static void rows_by_eight(PrecisionMode p, const uint8_t *weights, size_t row, const float *bias, uint32_t j0, uint32_t n,
+                          const Quantized *q, uint32_t item, float *y, uint32_t OC) {
+#define ROWS_OF(type) case type: rows_by_eight_of(type, weights, row, bias, j0, n, q, item, y, OC); return;
+    switch (p) {
+        ROWS_OF(PRECISION_Q8_0) ROWS_OF(PRECISION_Q4_0) ROWS_OF(PRECISION_Q4_1) ROWS_OF(PRECISION_Q5_0)
+        ROWS_OF(PRECISION_Q5_1) ROWS_OF(PRECISION_Q2_K) ROWS_OF(PRECISION_Q3_K) ROWS_OF(PRECISION_Q4_K)
+        ROWS_OF(PRECISION_Q5_K) ROWS_OF(PRECISION_Q6_K) ROWS_OF(PRECISION_IQ4_NL)
+        default: rows_by_eight_of(PRECISION_IQ4_XS, weights, row, bias, j0, n, q, item, y, OC); return;
+    }
+#undef ROWS_OF
 }
 
 static void rows_by_four(PrecisionMode p, const uint8_t *weights, size_t row, const float *bias, uint32_t j0, uint32_t n,
@@ -867,8 +967,13 @@ static void rows_task(PrecisionMode p, const uint8_t *weights, size_t row, const
                       const Quantized *q, uint64_t items, float *y, uint32_t OC) {
     uint32_t j = j0;
 #if defined(BLOCK_AVX2)
-    const uint32_t fours = (end - j0) / 4u;
-    rows_by_four(p, weights, row, bias, j0, fours, q, (uint32_t)items, y, OC);
+    if (items == 1u) {                      /* (a token: eight rows at a time) */
+        const uint32_t eights = (end - j0) / 8u;
+        rows_by_eight(p, weights, row, bias, j0, eights, q, 0, y, OC);
+        j += 8u * eights;
+    }
+    const uint32_t fours = (end - j) / 4u;
+    rows_by_four(p, weights, row, bias, j, fours, q, (uint32_t)items, y, OC);
     j += 4u * fours;
 #endif
     const uint32_t C = q->C, S = q->S;
