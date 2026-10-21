@@ -6875,7 +6875,8 @@ typedef struct {
     uint64_t bytes;
 } CaseTensor;
 
-static bool case_tensors(const uint8_t **p, const uint8_t *end, CaseTensor *out, uint32_t *count, uint32_t most) {
+static bool case_tensors(const uint8_t *file, const uint8_t **p, const uint8_t *end, CaseTensor *out, uint32_t *count,
+                         uint32_t most) {
     if (end - *p < 4) return false;
     memcpy(count, *p, 4);
     *p += 4;
@@ -6899,7 +6900,8 @@ static bool case_tensors(const uint8_t **p, const uint8_t *end, CaseTensor *out,
         *p += 8 * (size_t)c->t.rank;
         memcpy(&c->bytes, *p, 8);
         *p += 8;
-        if ((uint64_t)(end - *p) < c->bytes) return false;
+        *p += (8 - (size_t)(*p - file) % 8) % 8;      /* (the values at offsets of multiples of 8) */
+        if (*p > end || (uint64_t)(end - *p) < c->bytes) return false;
         c->t.data = (void *)*p;
         *p += c->bytes;
     }
@@ -6955,7 +6957,7 @@ static void operator_cases(void) {
             memcpy(&rtol, p, 4);
             memcpy(&atol, p + 4, 4);
             p += 8;
-            parsed = case_tensors(&p, end, ins, &nin, MOST) && case_tensors(&p, end, refs, &nout, MOST);
+            parsed = case_tensors(file, &p, end, ins, &nin, MOST) && case_tensors(file, &p, end, refs, &nout, MOST);
         }
         CHECK(parsed, "graph_cases.bin: case %u malformed", c);
         if (!parsed) break;

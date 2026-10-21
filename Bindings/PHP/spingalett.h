@@ -7,7 +7,8 @@
  * libspingalett's C API as PHP's FFI parses it: the declarations of Include/Spingalett/Spingalett.h,
  * Spingalett.Runtime.h and Spingalett.Inference.h without the preprocessor. The function-like macros
  * (spingalett_layer(), spingalett_train(), ...) are left out: their *_args functions take the
- * structures themselves. SPINGALETT_RESERVED is written as 8 and SPINGALETT_MAX_INPUTS as 16; the other
+ * structures themselves. SPINGALETT_RESERVED is written as 8, SPINGALETT_MAX_INPUTS as 16 and
+ * SPINGALETT_MAX_RANK as 8; the other
  * macros (error codes, SPINGALETT_NO_LAYER) are constants of the PHP classes. Spingalett\Library loads
  * this file with FFI::cdef() and the library it finds, or FFI::load() through Library::preload(). The
  * tests compare every declaration with the C headers' and every structure's layout with the C
@@ -794,6 +795,58 @@ typedef struct {
     uint64_t reserved[8];
 } SpingalettChatArgs;
 int64_t spingalett_chat_render_args(SpingalettChatArgs args);
+typedef struct SpingalettGraph SpingalettGraph;
+typedef enum {
+    SPINGALETT_DTYPE_UNDEFINED = 0,
+    SPINGALETT_DTYPE_FLOAT32 = 1,
+    SPINGALETT_DTYPE_UINT8 = 2,
+    SPINGALETT_DTYPE_INT8 = 3,
+    SPINGALETT_DTYPE_INT32 = 6,
+    SPINGALETT_DTYPE_INT64 = 7,
+    SPINGALETT_DTYPE_BOOL = 9,
+    SPINGALETT_DTYPE_FLOAT16 = 10,
+    SPINGALETT_DTYPE_BFLOAT16 = 16
+} SpingalettDType;
+typedef struct {
+    const char *path;
+    const void *data;
+    size_t size;
+    uint64_t reserved[8];
+} SpingalettGraphOpenArgs;
+SpingalettGraph *spingalett_graph_open_args(SpingalettGraphOpenArgs args);
+void spingalett_graph_free(SpingalettGraph *graph);
+typedef struct {
+    const char *name;
+    SpingalettDType dtype;
+    uint32_t rank;
+    int64_t shape[8];
+    const char *symbols[8];
+    uint64_t reserved[4];
+} SpingalettTensorInfo;
+uint32_t spingalett_graph_input_count(const SpingalettGraph *graph);
+uint32_t spingalett_graph_output_count(const SpingalettGraph *graph);
+SpingalettTensorInfo spingalett_graph_input(const SpingalettGraph *graph, uint32_t i);
+SpingalettTensorInfo spingalett_graph_output(const SpingalettGraph *graph, uint32_t i);
+typedef struct {
+    const char *name;
+    SpingalettDType dtype;
+    uint32_t rank;
+    int64_t shape[8];
+    void *data;
+    uint64_t reserved[4];
+} SpingalettTensor;
+typedef struct {
+    SpingalettGraph *graph;
+    const SpingalettTensor *inputs;
+    uint32_t input_count;
+    SpingalettTensor *outputs;
+    uint32_t output_count;
+    uint64_t reserved[8];
+} SpingalettGraphRunArgs;
+bool spingalett_graph_run_args(SpingalettGraphRunArgs args);
+bool spingalett_graph_save(const SpingalettGraph *graph, const char *path);
+uint32_t spingalett_graph_node_count(const SpingalettGraph *graph);
+const char *spingalett_graph_node_op(const SpingalettGraph *graph, uint32_t i);
 typedef struct {
     const char *path;
     uint32_t context;

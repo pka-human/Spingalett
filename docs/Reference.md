@@ -2101,7 +2101,7 @@ int64_t spingalett_chat_render_args(SpingalettChatArgs args);
 
 ### `SpingalettGraph`
 
-Graphs of operators: models as graphs of about a hundred operators over tensors of up to eight axes, their sizes numbers or named symbols (a batch, a sequence's tokens), several named inputs and outputs: ONNX files, read one operator to one, and `.slett` files of format 11, which spingalett_graph_save() writes (docs/Graphs.md). The operators are ONNX's, with ONNX's semantics (broadcasting, attributes, opset 23's attention, rotary embeddings and RMS normalization), computed on the CPU in single precision for floats (float16 and bfloat16 constants and inputs widened, outputs narrowed back) and in their own types for integers and booleans, every operator summing in fixed orders: the same bits on any number of threads. Products and convolutions run on the library's matrix kernels. Constants are folded when a graph opens, and what no output needs is left out. A graph runs one call at a time (calls from several threads wait for each other); its outputs live in its memory until its next run.
+Graphs of operators (docs/Graphs.md): models as graphs of 155 operators over tensors of up to eight axes, their sizes numbers or named symbols (a batch, a sequence's tokens), several named inputs and outputs: ONNX files, read one operator to one, and `.slett` files of format 11, which spingalett_graph_save() writes. The operators are ONNX's, with ONNX's semantics (opsets 7 to 28: broadcasting, attributes, opset 23's attention and rotary embeddings), computed on the CPU in single precision for floats (float16 and bfloat16 constants and inputs widened, outputs narrowed back) and in their own types for integers and booleans, every operator summing in fixed orders: the same bits on any number of threads, in SPINGALETT_COMPUTE_OPENMP's threads. When a graph opens, constants are folded, what no output needs and repeated nodes are left out, and chains of operators are fused into the library's kernels (products by constant matrices with their bias and activation, attention, GELU, a convolution's activation). A graph runs one call at a time (calls from several threads wait for each other); its outputs live in its memory until its next run. With SPINGALETT_GRAPH_PROFILE=1 in the environment, a graph prints the time of each operator when it is freed.
 
 ```c
 typedef struct SpingalettGraph SpingalettGraph;
@@ -2138,7 +2138,7 @@ Most axes of a graph's tensors.
 ```c
 typedef struct {
     const char *path;               /* an ONNX file (its external data files beside it) or a .slett file of format 11 */
-    const void *data;               /* or its bytes (path NULL), which need not outlive the call */
+    const void *data;               /* or its bytes (path NULL), copied: they need not outlive the call */
     size_t size;
     uint64_t reserved[SPINGALETT_RESERVED];
 } SpingalettGraphOpenArgs;
@@ -2215,8 +2215,8 @@ typedef struct {
     SpingalettDType dtype;          /* inputs: its type (FLOAT32 for a graph's float16 or bfloat16 input is widened) */
     uint32_t rank;
     int64_t shape[SPINGALETT_MAX_RANK];
-    void *data;                     /* inputs: the values (read only); outputs: set by the run, in the graph's memory
-                                       until its next run or its end */
+    void *data;                     /* inputs: the values (read only, aligned for their type); outputs: set by the
+                                       run, in the graph's memory until its next run or its end */
     uint64_t reserved[4];
 } SpingalettTensor;
 ```

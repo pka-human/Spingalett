@@ -173,6 +173,18 @@ int main(void) {
     SIZE(SpingalettPretrainedArgs); FIELD(SpingalettPretrainedArgs, reserved);
     FIELD(SpingalettPretrainedArgs, path); FIELD(SpingalettPretrainedArgs, context);
 
+    SIZE(SpingalettGraphOpenArgs); FIELD(SpingalettGraphOpenArgs, reserved);
+    FIELD(SpingalettGraphOpenArgs, path); FIELD(SpingalettGraphOpenArgs, data); FIELD(SpingalettGraphOpenArgs, size);
+    SIZE(SpingalettTensorInfo); FIELD(SpingalettTensorInfo, reserved);
+    FIELD(SpingalettTensorInfo, name); FIELD(SpingalettTensorInfo, dtype); FIELD(SpingalettTensorInfo, rank);
+    FIELD(SpingalettTensorInfo, shape); FIELD(SpingalettTensorInfo, symbols);
+    SIZE(SpingalettTensor); FIELD(SpingalettTensor, reserved);
+    FIELD(SpingalettTensor, name); FIELD(SpingalettTensor, dtype); FIELD(SpingalettTensor, rank);
+    FIELD(SpingalettTensor, shape); FIELD(SpingalettTensor, data);
+    SIZE(SpingalettGraphRunArgs); FIELD(SpingalettGraphRunArgs, reserved);
+    FIELD(SpingalettGraphRunArgs, graph); FIELD(SpingalettGraphRunArgs, inputs); FIELD(SpingalettGraphRunArgs, input_count);
+    FIELD(SpingalettGraphRunArgs, outputs); FIELD(SpingalettGraphRunArgs, output_count);
+
     SIZE(PredictArgs); FIELD(PredictArgs, reserved);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);
     FIELD(PredictArgs, sample_count); FIELD(PredictArgs, outputs);

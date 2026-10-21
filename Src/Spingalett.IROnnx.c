@@ -491,7 +491,7 @@ static bool read_node(Reader *rd, Pb n) {
         return fail(rd, "graph: a node of %s has more than 64 inputs, outputs or attributes%s", shown_op, NULL);
     const IrOp code = ir_op_of(op.p, op.n, domain.p ? domain.p : "", domain.n);
     if (code == IR_OP_COUNT) {
-        char version[48];
+        char version[160];
         snprintf(version, sizeof version, "%s, opset %lld", domain.n ? shown_domain : "ONNX's domain", (long long)rd->opset);
         return fail(rd, "graph: the operator %s (%s) is not supported", shown_op, version);
     }

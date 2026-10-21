@@ -8,6 +8,31 @@ All notable changes to this project are documented in this file. The format foll
 ## [Unreleased]
 
 ### Added
+- **Graphs of operators** (`docs/Graphs.md`): any model built of ONNX's operators runs as a graph: values (inputs,
+  constants, what nodes compute), tensors of up to eight axes whose sizes are numbers or named symbols, several named
+  inputs and outputs, nodes of 155 operators with ONNX's semantics (opsets 7 to 28): element-wise arithmetic,
+  comparisons, logic, bitwise operators and functions with broadcasting, MatMul, Gemm, Einsum, convolutions and
+  transposed ones of one to three spatial axes, pooling, the normalizations, reductions, TopK, CumSum, shapes and
+  data (Reshape to ScatterND), Resize in every mode, quantization, opset 23's Attention and RotaryEmbedding, opset
+  27's LinearAttention and CausalConvWithState, SwiGLU. `spingalett_graph_open()` reads ONNX files (external data
+  files beside them) and `.slett` files of the new format 11, which `spingalett_graph_save()` writes;
+  `spingalett_graph_run()` takes the inputs by name or in order (`SpingalettTensor`) and gives the outputs;
+  `spingalett_graph_input()` and `_output()` describe them (`SpingalettTensorInfo`), `spingalett_graph_node_op()`
+  the nodes; in the runtime too. Floats compute in single precision (float16 and bfloat16 widened, outputs narrowed
+  back), integers in their types. When a graph opens, constants fold, dead nodes and common subexpressions go, and
+  fusions make operators of the library's own: Linear (a product by a constant matrix packed once for the row kernel
+  of language models, its bias and GELU, SiLU, ReLU, sigmoid or tanh in the epilogue), FusedAttention (Q K^T, scale,
+  mask, softmax or PyTorch's safe softmax and V in blocks of 64 queries, the heads' transposes taken in), Gelu and
+  Swish from their written-out forms, a convolution's activation; convolutions run on the library's channels-last
+  kernels; tensors take blocks of a pool kept between runs. Every operator sums in a fixed order: the same bits on any
+  number of threads. The new `operators` group runs ONNX's 1262 conformance cases of single operators that hold the
+  library's types (Tests/make_graph_tests.py) on one and four threads; `Tests/check_graph_models.py` compares whole
+  models exported by `torch.onnx` with PyTorch, which they match within 1e-5: on six performance cores of an
+  i7-12650H ResNet-50 runs in 24.5 ms (PyTorch 2.14: 21.1), BERT-base in 97 (80), GPT-2 in 42 (35), ViT-B/16 in 79
+  (61), CLIP's text encoder in 45 (29), Whisper's encoder in 81 (65), Stable Diffusion's VAE decoder in 1127 (987)
+  and a UNet of SDXL's architecture in 34.7 (33.9). `SPINGALETT_GRAPH_PROFILE=1` prints the time of each operator.
+  Python: `Graph.load()`, `Graph.from_bytes()`, `Graph.from_torch()`, `Graph.run()`, `Graph.save()`;
+  `Examples/Runtime/RunGraph.c` times a graph on random inputs.
 - **Chat templates**: `spingalett_chat_render()` (`SpingalettChatArgs`, `SpingalettChatMessage`) renders a conversation
   with a language model's Jinja chat template as Hugging Face's transformers renders it (`apply_chat_template()`:
   jinja2's sandbox with trim_blocks and lstrip_blocks, loop controls, its `tojson`, `raise_exception()` and
@@ -48,6 +73,10 @@ All notable changes to this project are documented in this file. The format foll
   language model needs the runtime alone; its tests check them on the expectations of JSON and GGUF tokenizers.
 
 ### Changed
+- **Products by large matrices read them once**: `spingalett_conv_rows()`, the row kernel of float linear layers in
+  sessions, takes its tiles panel by panel when the filters outnumber the rows (row block by row block otherwise), so
+  that a panel of filters is read from memory once and not once a block of rows: the same sums; GPT-2's logits of 64
+  tokens take 12.7 ms instead of 26.6, and the prompt of a float32 Qwen2.5-0.5B 1.5% less.
 - **Draws sort only what they reach**: a draw sorted every token of the vocabulary by probability (152,000 for
   Qwen2.5) for every token it drew; it now sorts them a part at a time, the most likely first, as far as top-k, top-p,
   min-p and the draw itself reach, and sums the probabilities of a draw without top-k in the order of the tokens. A

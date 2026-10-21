@@ -23,6 +23,8 @@ MIRRORS = {
     "SpingalettTokenizerInfo": sg._TokenizerInfo, "SpingalettTokenizeArgs": sg._TokenizeArgs,
     "SpingalettChatMessage": sg._ChatMessage, "SpingalettChatArgs": sg._ChatArgs, "SpingalettSampling": sg._Sampling,
     "SpingalettDetokenizeArgs": sg._DetokenizeArgs, "SpingalettPretrainedArgs": sg._PretrainedArgs,
+    "SpingalettGraphOpenArgs": sg._GraphOpenArgs, "SpingalettTensorInfo": sg._TensorInfo, "SpingalettTensor": sg._Tensor,
+    "SpingalettGraphRunArgs": sg._GraphRunArgs,
 }
 
 lines = subprocess.run([sys.argv[1]], check=True, capture_output=True, text=True).stdout.splitlines()

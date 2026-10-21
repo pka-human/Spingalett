@@ -1,4 +1,4 @@
-# The .slett model format, versions 3 to 10
+# The .slett model format, versions 3 to 11
 
 `.slett` files store a network: its shape, its parameters in a chosen precision and, optionally,
 the optimizer state for resuming training. `spingalett_save()` and `spingalett_save_to_memory()`
@@ -13,7 +13,8 @@ sparse cross-entropy loss (1.2 on), version 9 for the training features of langu
 linear layers tied to an embedding's table, attention that ignores padding or reads a sliding window,
 cross-attention and embeddings of part of their input (1.3 on), version 10 for layers whose weights are in a
 block precision, one of GGUF's quantization types (1.4 on). `spingalett_load()` and `spingalett_load_from_memory()`
-read versions 1 to 10.
+read versions 1 to 10. Version 11 (1.5 on) holds a graph of operators instead of a network of layers
+(**Graphs of operators**): `spingalett_graph_save()` writes it and `spingalett_graph_open()` reads it.
 A checkpoint (`spingalett_save_checkpoint()`, 1.4 on) is an image of one of these versions with a
 record of a training run after it, which readers of the image ignore (**Checkpoints**).
 
@@ -43,7 +44,9 @@ ones cannot express (kinds of layers, precisions, activations, fields in space r
 and leave what a version 7 file means unchanged; a 1.x writer writes the oldest version that holds
 the network, as now, and every 1.x engine runs every file whose layers it has. Codes of version 7
 (activations, layer kinds, precisions) keep their values. Version 8 (Spingalett 1.2), version 9
-(Spingalett 1.3) and version 10 (Spingalett 1.4) are such additions.
+(Spingalett 1.3) and version 10 (Spingalett 1.4) are such additions. Version 11 (Spingalett 1.5) is a format
+of its own after the same magic: its operators' codes keep their values, new operators take new codes, and every
+1.x reader of graphs opens every file whose operators it has.
 
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 CRC-32 is the IEEE polynomial (0xEDB88320, reflected, initial value and final XOR 0xFFFFFFFF), as
@@ -365,6 +368,140 @@ single precision):
 A file with bytes after its image that are not a record of this length, version and checksum does not
 load as a checkpoint.
 
+## Graphs of operators (version 11)
+
+A file of version 11 holds a graph (`docs/Graphs.md`): values (the graph's inputs, its constants and what its
+nodes compute), nodes of operators that read and compute values, and the graph's inputs and outputs. It starts
+with the magic and the version of the other versions and lays out the rest as follows.
+
+```
+header (128 bytes) | values (112 bytes each) | nodes (32 bytes each) | attributes (24 bytes each) | edges (4 bytes
+each) | strings | numbers | constants (each at an offset of a multiple of 64)
+```
+
+A writer places the tables in this order; a reader relies only on the offsets. Strings are UTF-8 and end with a
+NUL; a string is given by its offset in the strings, and offset 0 holds the empty string.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 6 | magic `SLETTM` |
+| 6 | 2 | format version, 11 |
+| 8 | 4 | `V`: values |
+| 12 | 4 | `N`: nodes |
+| 16 | 4 | `I`: the graph's inputs |
+| 20 | 4 | `O`: the graph's outputs |
+| 24 | 8 | file size in bytes |
+| 32 | 4 | `S`: symbols (names of sizes, such as a batch) |
+| 36 | 4 | `A`: attributes |
+| 40 | 4 | the opset: the version of ONNX's default domain whose semantics the operators follow (Softmax and Hardmax before 13 over the axes from theirs on, Resize before 11 by asymmetric coordinates) |
+| 44 | 4 | the producer (a string) |
+| 48 | 8 | offset of the strings |
+| 56 | 8 | bytes of the strings |
+| 64 | 8 | offset of the values |
+| 72 | 8 | offset of the nodes |
+| 80 | 8 | offset of the edges |
+| 88 | 8 | offset of the attributes |
+| 96 | 8 | offset of the numbers |
+| 104 | 8 | bytes of the numbers |
+| 112 | 8 | the end of the tables (the constants come after it) |
+| 120 | 4 | CRC-32 of bytes 128 to the end of the tables - 1 |
+| 124 | 4 | CRC-32 of bytes 0 to 123 |
+
+The checksums cover the header and the tables, not the constants, so that a graph of gigabytes opens without its
+constants being read whole.
+
+**Values** (112 bytes each, value `v` at `values + 112 v`):
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | name (a string) |
+| 4 | 1 | type: ONNX's codes (`SpingalettDType`): 1 float32, 2 uint8, 3 int8, 6 int32, 7 int64, 9 bool (a byte, 0 or 1), 10 float16, 16 bfloat16 |
+| 5 | 1 | rank, 0 to 8 |
+| 6 | 1 | kind: 0 an input of the graph, 1 a constant, 2 computed by a node |
+| 7 | 1 | flags: bit 0 set when the type and shape are known (inputs, constants, declared outputs) |
+| 8 | 64 | the sizes of the eight axes (int64; -1 for a size a symbol or nothing gives; axes past the rank -1) |
+| 72 | 16 | the symbols of the eight axes (uint16: a symbol's number + 1, 0 for none) |
+| 88 | 8 | constants: the offset of the values, a multiple of 64 at or after the end of the tables |
+| 96 | 8 | constants: the bytes of the values (the product of the sizes times the type's size) |
+| 104 | 8 | reserved, 0 |
+
+A constant's values are in row-major order, little-endian, in its type (float16 and bfloat16 as their bits).
+
+**Nodes** (32 bytes each), in an order in which every node runs after the nodes computing what it reads:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 2 | the operator's code (below) |
+| 2 | 2 | reserved, 0 |
+| 4 | 4 | name (a string) |
+| 8 | 4 | its first edge: its inputs' values, then its outputs', from there in the edges |
+| 12 | 4 | inputs |
+| 16 | 4 | outputs |
+| 20 | 4 | its first attribute |
+| 24 | 4 | attributes |
+| 28 | 4 | reserved, 0 |
+
+**Edges** are values' numbers (uint32), 0xFFFFFFFF for an optional input left out: the nodes' inputs and outputs,
+then the graph's `I` inputs and `O` outputs, then the `S` symbols' names (strings).
+
+**Attributes** (24 bytes each):
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | name (a string) |
+| 4 | 1 | type: 0 an integer, 1 a float, 2 integers, 3 floats, 4 a string, 5 a tensor |
+| 5 | 3 | reserved, 0 |
+| 8 | 8 | an integer (int64); a float's bits (in the low 4 bytes); integers and floats: their offset in the numbers (a multiple of 8 and of 4); a string's offset; a tensor's value (a constant) |
+| 16 | 4 | integers and floats: how many (int64 and floats each) |
+| 20 | 4 | reserved, 0 |
+
+The operators are ONNX's, with ONNX's attributes and inputs, and three of the library's own, which the fusions of
+a graph that opens make (`Src/Spingalett.IRFuse.c`): **Linear** (`X`, `W`, an optional bias: `X` (..., K) times
+the constant `W` (K x N; with the integer attribute `trans_b` 1, N x K and taken transposed) plus the bias, through
+the activation of the integer attribute `activation`, an `ActivationFunction`), **FusedAttention** (`Q`, `K`, `V`, an optional mask: softmax(`Q K^T` times the float
+attribute `scale` plus the mask) `V`, the softmax over the keys, rows of no keys 0 with the integer attribute
+`safe` 1; with `layout` 0 `Q` (..., S, D), the second input `K^T` (..., D, T) and `V` (..., T, Dv) over broadcast
+batches, with `layout` 1 `Q` (B, S, H, D), `K` (B, T, H or 1, D) and `V` (B, T, H or 1, Dv) into (B, S, H, Dv)), and
+Conv's integer attribute `activation`, applied after the convolution and its bias. Codes:
+
+| | | | | | |
+|---|---|---|---|---|---|
+| 0 Add | 1 Sub | 2 Mul | 3 Div | 4 Pow | 5 Mod |
+| 6 Max | 7 Min | 8 Sum | 9 Mean | 10 Equal | 11 Less |
+| 12 LessOrEqual | 13 Greater | 14 GreaterOrEqual | 15 And | 16 Or | 17 Xor |
+| 18 PRelu | 19 Where | 20 Abs | 21 Neg | 22 Exp | 23 Log |
+| 24 Sqrt | 25 Reciprocal | 26 Sin | 27 Cos | 28 Tanh | 29 Sigmoid |
+| 30 Erf | 31 Relu | 32 LeakyRelu | 33 Elu | 34 Selu | 35 Gelu |
+| 36 HardSigmoid | 37 HardSwish | 38 Softplus | 39 Softsign | 40 Mish | 41 Floor |
+| 42 Ceil | 43 Round | 44 Sign | 45 Not | 46 IsNaN | 47 IsInf |
+| 48 Tan | 49 Asin | 50 Acos | 51 Atan | 52 Sinh | 53 Cosh |
+| 54 Asinh | 55 Acosh | 56 Atanh | 57 Celu | 58 ThresholdedRelu | 59 Shrink |
+| 60 Swish | 61 BitwiseNot | 62 BitwiseAnd | 63 BitwiseOr | 64 BitwiseXor | 65 BitShift |
+| 66 SwiGLU | 67 Clip | 68 Cast | 69 CastLike | 70 Identity | 71 Dropout |
+| 72 MatMul | 73 Gemm | 74 Conv | 75 ConvTranspose | 76 MaxPool | 77 AveragePool |
+| 78 LpPool | 79 GlobalAveragePool | 80 GlobalMaxPool | 81 BatchNormalization | 82 InstanceNormalization | 83 LayerNormalization |
+| 84 GroupNormalization | 85 RMSNormalization | 86 LpNormalization | 87 MeanVarianceNormalization | 88 LRN | 89 Softmax |
+| 90 LogSoftmax | 91 Hardmax | 92 ReduceSum | 93 ReduceMean | 94 ReduceMax | 95 ReduceMin |
+| 96 ReduceProd | 97 ReduceSumSquare | 98 ReduceL1 | 99 ReduceL2 | 100 ReduceLogSumExp | 101 ReduceLogSum |
+| 102 ArgMax | 103 ArgMin | 104 TopK | 105 CumSum | 106 CumProd | 107 Reshape |
+| 108 Flatten | 109 Squeeze | 110 Unsqueeze | 111 Transpose | 112 Concat | 113 Split |
+| 114 Slice | 115 Gather | 116 GatherElements | 117 GatherND | 118 ScatterND | 119 ScatterElements |
+| 120 Scatter | 121 TensorScatter | 122 Expand | 123 Tile | 124 Pad | 125 Shape |
+| 126 Size | 127 Range | 128 ConstantOfShape | 129 Constant | 130 Trilu | 131 Resize |
+| 132 Upsample | 133 DepthToSpace | 134 SpaceToDepth | 135 NonZero | 136 OneHot | 137 EyeLike |
+| 138 Compress | 139 ReverseSequence | 140 BlackmanWindow | 141 HannWindow | 142 HammingWindow | 143 Einsum |
+| 144 QuantizeLinear | 145 DequantizeLinear | 146 DynamicQuantizeLinear | 147 MatMulInteger | 148 QLinearMatMul | 149 Attention |
+| 150 RotaryEmbedding | 151 LinearAttention | 152 CausalConvWithState | 153 Linear | 154 FusedAttention |  |
+
+A reader should reject a file whose magic, version or either checksum does not match; whose recorded size exceeds
+the data; whose tables, strings or numbers lie outside the file, or whose strings do not end with a NUL; with a
+value of an unknown type, kind, a rank above 8, a size below -1 or a symbol beyond `S`; with a constant whose bytes
+differ from its shape's, lie before the end of the tables or outside the file, or whose offset is no multiple of 64;
+with a node of an unknown operator, or whose edges or attributes lie beyond the tables, or that reads or writes a
+value beyond `V`; with an attribute of an unknown type, numbers outside the numbers or a tensor that is not a
+constant; with an input that is not a value of kind 0; and with a graph whose nodes compute a value twice, read a
+value that nothing computes, or read each other in a cycle.
+
 ## How the inference engine computes
 
 The engine evaluates the layers in order; the output of the last one is the network's output.
@@ -466,4 +603,4 @@ and decode as `q / 127`, `q / 7` and `q` times it. Reading such a file and savin
 version 3 file (`ModelTool convert`).
 
 Spingalett 0.5 and 0.6 read versions 1 to 3; version 4 appeared in 0.7, version 5 in 0.8,
-version 6 in 0.10, version 7 in 0.13, version 8 in 1.2, version 9 in 1.3 and version 10 in 1.4.
+version 6 in 0.10, version 7 in 0.13, version 8 in 1.2, version 9 in 1.3, version 10 in 1.4 and version 11 in 1.5.

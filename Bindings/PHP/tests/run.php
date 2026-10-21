@@ -412,7 +412,8 @@ test('declarations against the C headers', function (): void {
     // Comments, preprocessor lines and spaces out; the macros spingalett.h writes as numbers replaced.
     $normal = function (string $code): string {
         $code = preg_replace(['~/\*.*?\*/~s', '~//[^\n]*~', '~^\s*#.*$~m'], ' ', $code);
-        $code = str_replace(['SPINGALETT_API', 'SPINGALETT_RESERVED', 'SPINGALETT_MAX_INPUTS'], ['', '8', '16'], $code);
+        $code = str_replace(['SPINGALETT_API', 'SPINGALETT_RESERVED', 'SPINGALETT_MAX_INPUTS', 'SPINGALETT_MAX_RANK'],
+                            ['', '8', '16', '8'], $code);
         return preg_replace('~\s+~', '', $code);
     };
     $c = '';

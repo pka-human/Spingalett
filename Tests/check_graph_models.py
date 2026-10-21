@@ -2,8 +2,8 @@
 # Copyright (c) 2026 pka_human (pka_human@proton.me)
 """Whole models as graphs of operators against PyTorch: each model, with random weights in its published architecture
 (no downloads), exported by torch.onnx, opened by spingalett.Graph and run on the same inputs; the outputs are compared
-(the largest difference relative to the largest reference value) and both are timed (medians of interleaved runs on
-the threads given):
+(the largest difference relative to the largest reference value), as are the graph's outputs with and without its
+fusions, and both are timed (medians of interleaved runs on the threads given):
 
     SPINGALETT_LIBRARY=Bin/libspingalett.so python Tests/check_graph_models.py [names...] [--threads N] [--keep DIR]
 
@@ -96,7 +96,9 @@ def resnet50():
 
 def vit_b16():
     import torchvision
-    return torchvision.models.vit_b_16().eval(), (torch.randn(1, 3, 224, 224),), ["image"]
+    model = torchvision.models.vit_b_16().eval()
+    torch.nn.init.normal_(model.heads.head.weight, std=0.02)       # (torchvision starts the head at zeros)
+    return model, (torch.randn(1, 3, 224, 224),), ["image"]
 
 
 def bert_base():
@@ -195,6 +197,14 @@ def check_in(name, model, inputs, names, directory, runs):
             print(f"{name}: an output of shape {g.shape}, PyTorch's {r.shape}")
             return False
         worst = max(worst, float(np.max(np.abs(g.astype(np.float64) - r)) / max(np.max(np.abs(r)), 1e-30)))
+    # the fusions against the graph without them
+    os.environ["SPINGALETT_GRAPH_FUSE"] = "0"
+    plain = sp.Graph.load(path)
+    del os.environ["SPINGALETT_GRAPH_FUSE"]
+    unfused = plain.run(feeds)
+    fusion = max(float(np.max(np.abs(unfused[o.name].astype(np.float64) - g)) / max(np.max(np.abs(g)), 1e-30))
+                 for o, g in zip(graph.outputs, got))
+    plain.close()
     # the same bits through a file of format 11, and again on one thread
     slett = os.path.join(directory, name + ".slett")
     graph.save(slett)
@@ -210,8 +220,9 @@ def check_in(name, model, inputs, names, directory, runs):
         for _ in range(runs):
             ours.append(median_time(lambda: graph.run(feeds), 1))
             theirs.append(median_time(lambda: model(*inputs), 1))
-    ok = worst < 1e-3 and same and same_threads
-    print(f"{name:16s} {'ok ' if ok else 'BAD'} rel. error {worst:.2e}  file {'same' if same else 'DIFFERS'}  "
+    ok = worst < 1e-3 and fusion < 1e-3 and same and same_threads
+    print(f"{name:16s} {'ok ' if ok else 'BAD'} rel. error {worst:.2e}  fused/not {fusion:.1e}  "
+          f"file {'same' if same else 'DIFFERS'}  "
           f"threads {'same' if same_threads else 'DIFFER'}  nodes {len(graph.operators):5d}  open {opened * 1000:7.1f} ms  "
           f"run {statistics.median(ours) * 1000:9.2f} ms  PyTorch {statistics.median(theirs) * 1000:9.2f} ms")
     return ok

@@ -27,8 +27,11 @@ model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels whe
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
 alike; programs that only run models link the runtime, a library of that part alone. Language models'
 GGUF files (LLaMA 1 to 3.x, Mistral, Qwen2 to Qwen3, Gemma 3, GPT-2) run as they are stored, their
-quantized types computed in their blocks, faster than llama.cpp on the same processor. Models come in
-from ONNX files and PyTorch weights (GPT-2 and LLaMA-like checkpoints in Python), and bindings for
+quantized types computed in their blocks, faster than llama.cpp on the same processor. Any model built of ONNX's operators runs as
+a graph of operators: ONNX files and PyTorch's exports (classifiers, transformers' encoders and decoders, CLIP,
+Whisper, Stable Diffusion's VAE and UNet), with ONNX's semantics, fused into the library's kernels and the same bits
+on any number of threads. Models also come in
+from ONNX files and PyTorch weights as networks to train (GPT-2 and LLaMA-like checkpoints in Python), and bindings for
 Python (wheels with the library inside), C++, Rust, .NET, Go, Java and PHP are included, and for
 JavaScript the inference engine in WebAssembly, which runs models in Node and in browsers.
 
@@ -71,7 +74,8 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
 | Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4, INT2 or GGUF's block types, optional optimizer state, CRC-32 checksums; to and from memory; versioned format; checkpoints of training runs, which a stopped run carries on from to the bits of one that never stopped |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
-| Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`) of CNNs, MLPs and transformers, PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
+| Graphs of operators | Any ONNX model run as it is (`spingalett_graph_open()`, `spingalett_graph_run()`; in the runtime): 155 operators with ONNX's semantics over tensors of up to eight axes, symbolic sizes, several inputs and outputs, float32, float16, bfloat16 and integer types; constants folded, products, attention, GELU and activations fused into the library's kernels; `.slett` format 11; ONNX's conformance cases and whole models (ResNet, ViT, BERT, GPT-2, CLIP, Whisper, Stable Diffusion's VAE and an SDXL-style UNet) checked against PyTorch |
+| Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`) of CNNs, MLPs and transformers into networks that train, PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` and `Graph.from_torch()` in Python |
 | Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension); JavaScript and TypeScript for the inference engine in WebAssembly |
 | Packages | PyPI wheels, release archives for Linux, Windows and macOS, Debian and RPM packages, AUR, a Homebrew tap, a Scoop bucket, a Nix flake, a container image, Conan and vcpkg recipes, an npm package |
 
@@ -847,6 +851,44 @@ NeuralNetwork *net = spingalett_import_onnx("resnet.onnx");      /* NULL on erro
 float out[10];
 predict(.net = net, .inputs = image_hwc, .sample_count = 1, .outputs = out);
 ```
+
+### Graphs of operators: any ONNX model
+
+Import makes networks of the library's layers, which train. To run a model as it is, whatever its operators, open
+it as a graph of operators ([docs/Graphs.md](docs/Graphs.md)): values (inputs, constants, what nodes compute),
+tensors of up to eight axes whose sizes may be named symbols (a batch, a sequence's tokens), several named inputs and
+outputs, and nodes of 155 operators with ONNX's semantics: arithmetic and functions with broadcasting, products,
+convolutions of one to three spatial axes, pooling, the normalizations, reductions, shapes and data, Resize,
+quantization, Einsum, opset 23's Attention and RotaryEmbedding, and opset 27's linear attention and causal
+convolutions of hybrid models. The tensors stay in ONNX's layout (NCHW images, say).
+
+```c
+SpingalettGraph *g = spingalett_graph_open(.path = "unet.onnx");    /* an ONNX file, or a .slett file of format 11 */
+SpingalettTensor in[3] = {
+    {.name = "sample", .dtype = SPINGALETT_DTYPE_FLOAT32, .rank = 4, .shape = {1, 4, 64, 64}, .data = latents},
+    {.name = "timestep", .dtype = SPINGALETT_DTYPE_FLOAT32, .rank = 1, .shape = {1}, .data = &t},
+    {.name = "text", .dtype = SPINGALETT_DTYPE_FLOAT32, .rank = 3, .shape = {1, 77, 2048}, .data = text},
+};
+SpingalettTensor out = {0};                                         /* NULL name: the first output */
+if (spingalett_graph_run(.graph = g, .inputs = in, .input_count = 3, .outputs = &out, .output_count = 1))
+    use(out.data, out.shape);                                       /* valid until the graph's next run */
+spingalett_graph_save(g, "unet.slett");                             /* format 11, mapped when opened */
+spingalett_graph_free(g);
+```
+
+When a graph opens, its constants are folded, nodes no output needs and repeated ones are left out, and chains of
+operators are fused into the library's kernels: a product by a constant matrix with its bias and activation
+(packed once for the row kernel of language models), attention written out as products, a mask and a softmax (in
+blocks of 64 queries, never all the scores in memory), GELU and SiLU written out, a convolution's activation.
+Convolutions run on the library's channels-last kernels. Floats compute in single precision (float16 and bfloat16
+widened), integers in their types; every operator sums in a fixed order, so a graph gives the same bits on any
+number of threads. ONNX's 1262 conformance cases of single operators that hold these types pass (the `operators`
+group), and whole models exported by `torch.onnx` with random weights match PyTorch within 1e-5
+(`Tests/check_graph_models.py`): on six performance cores of an i7-12650H, ResNet-50 runs in 24.5 ms (PyTorch: 21.1),
+BERT-base on two sequences of 128 tokens in 97 (80), GPT-2 on 64 tokens in 42 (35) and a UNet of SDXL's
+architecture in 34.7 (33.9). Control flow (If, Loop, Scan), sequences and strings are not graphs' operators;
+`Examples/Runtime/RunGraph.c` prints a graph's inputs, outputs and operators and times it, and
+`SPINGALETT_GRAPH_PROFILE=1` prints the time of each operator.
 
 ### Inspecting a network
 
@@ -1698,6 +1740,10 @@ gpt = sg.gpt2_from_state_dict(GPT2LMHeadModel.from_pretrained("gpt2").state_dict
 gpt.train_from_tokens("train.bin", epochs=1, batch_size=8, optimizer=sg.Optimizer.ADAMW, learning_rate=3e-4)
 print(gpt.generate([15496, 11, 314], 50, temperature=0.8, top_k=40))
 
+graph = sg.Graph.load("model.onnx")                    # any ONNX model, as a graph of operators
+print(graph.inputs, graph.run({"image": np.zeros((1, 3, 224, 224), np.float32)}))
+vision = sg.Graph.from_torch(torch_module, torch.rand(1, 3, 224, 224))     # through torch.onnx
+
 lm = sg.Network.from_pretrained("SmolLM2-135M.Q4_K_M.gguf", context=512)    # or a Hugging Face directory
 tok = sg.Tokenizer("SmolLM2-135M.Q4_K_M.gguf")
 print(tok.decode(lm.generate(tok.encode("The three primary colors are"), 24)))
@@ -2049,9 +2095,9 @@ Src/Gpu/              The GPU backends: device layer, network executor, Vulkan's
 Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, CharGPT (a
                       character-level GPT), Pretrained (a Hugging Face or GGUF language model continuing a
                       prompt), throughput benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
-Examples/Runtime/     RunModel, a program of the runtime alone
+Examples/Runtime/     Programs of the runtime alone: RunModel, RunGraph (graphs of operators), Chat
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
-docs/                 File format specifications (models, data sets)
+docs/                 File format specifications (models, data sets), graphs of operators, the API reference
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
 Tests/                Test suite (CTest) and fixtures
 Bindings/             Bindings for Python, Rust, .NET (C#), Go, Java and PHP; the engine in WebAssembly
@@ -2081,7 +2127,8 @@ what 1.0 gave, and only 2.0 may take anything away.
   The test `api.abi` compares every release with the one before.
 - **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7;
   1.2 adds format 8 for transformers, 1.3 format 9 for the training features of language models, 1.4
-  format 10 for GGUF's block precisions and today's attention)
+  format 10 for GGUF's block precisions and today's attention, 1.5 format 11 for graphs of operators, whose
+  operators' codes every later 1.x keeps)
   and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
   later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
   that uses only what it knows.
@@ -2119,25 +2166,23 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
   GPT-2), GGUF's quantization types as block precisions of `.slett` format 10 with AVX2 and VNNI kernels,
   the attention of today's families; faster than llama.cpp on the CPU (prompts 1.6 to 2.9 times as fast);
   checkpoints that resume a training run exactly
-- 1.5: language models on the GPU and in programs: GGUF's block types on CUDA and Vulkan, NEON kernels,
-  the other dense families (Phi, Gemma 2, OLMo 2, GLM-4, SmolLM3), the runtime reading tokenizers,
-  generation as llama.cpp offers it (min-p, penalties, stop strings, chat templates). The aim: any GGUF
-  of a common architecture, faster than llama.cpp, and a command-line program on the runtime (SaLaM) in a
-  repository of its own
-- 1.6: mixture of experts (Mixtral, Qwen3 MoE, gpt-oss), experts kept on the host, speculative decoding
-- 1.7: hybrid models with linear attention and state spaces (Qwen3.5, Qwen3-Next, Mamba-2), vision
-  encoders
-- 1.8: beyond neural networks: gradient-boosted trees and random forests (deterministic histogram
-  training on the CPU and GPU, trees in the engine and the runtime, imports from XGBoost, LightGBM and
-  scikit-learn), linear models, k-means, PCA, scikit-learn-style estimators in Python
-- 1.9: learning from rewards: reinforcement learning for games, robots, control and decisions (PPO,
-  SAC, DQN, several agents and self-play, tree search; environments stepped by the program or its own
-  loop, rewards in named terms), bandits, learning from logs, language models tuned by GRPO and DPO with
-  low-rank adapters, and evolution (genetic algorithms with crossover and mutation over any genome,
-  several objectives, evolution strategies, evolved topologies, population-based training), seeded
-  throughout
-- 1.10 to 2.0: Arm and Apple (NEON training, Metal), training across several GPUs, multi-head latent
-  attention, FP16 products with loss scaling
+- 1.5: graphs of operators: any ONNX model run as it is, in the runtime too (155 operators with ONNX's
+  semantics, `.slett` format 11, fusions into the library's kernels, the same bits on any number of threads), checked
+  on ONNX's conformance cases and on whole models against PyTorch; language models in programs (tokenizers in the
+  runtime, chat templates, sampling as llama.cpp offers it, SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files)
+- 1.6: language models on the graph and on the GPU: GGUF and Hugging Face's directories as graphs (new families as
+  converters alone), sessions of graphs, GGUF's block types on CUDA and Vulkan, NEON kernels, graphs on the GPU, the
+  runtime's command-line program (SaLaM) in a repository of its own
+- 1.7: diffusion: SDXL, then FLUX.1, with no line of the executor specific to diffusion; samplers outside the graph
+- 1.8: mixture of experts (Mixtral, Qwen3 MoE, gpt-oss), experts kept on the host, speculative decoding
+- 1.9: hybrid models with linear attention and state spaces (Qwen3.5, Qwen3-Next, Mamba-2), vision encoders
+- 1.10: beyond neural networks: gradient-boosted trees and random forests, linear models, k-means, PCA,
+  scikit-learn-style estimators in Python
+- 1.11: learning from rewards: reinforcement learning (PPO, SAC, DQN, self-play, tree search), bandits, language
+  models tuned by GRPO and DPO with low-rank adapters, and evolution, seeded throughout
+- 1.12 and 1.13: Arm and Apple (NEON training, Metal, a static subset of graphs in the engine for microcontrollers),
+  training across several GPUs, multi-head latent attention, FP16 products with loss scaling
+- 2.0: training through graphs, so that any graph trains
 
 ## Contributing
 

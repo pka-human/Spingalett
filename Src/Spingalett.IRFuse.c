@@ -4,20 +4,22 @@
 */
 
 /*
- * Graphs of operators: the fusions a graph gets when it opens, after its constants are folded. Each replaces a
- * chain of nodes whose intermediate values nothing else reads by one node of the library's own operators
- * (Spingalett.IROps.def's last), which computes the same in fewer passes over memory:
+ * Graphs of operators: what a graph's nodes become when it opens, after its constants are folded. Nodes of one
+ * operator on the same inputs with the same attributes become one (common subexpressions). Then fusions, each of
+ * which replaces a chain of nodes whose intermediate values nothing else reads by one node, of the library's own
+ * operators (Spingalett.IROps.def's last) or of ONNX's, which computes the same in fewer passes over memory
+ * (SPINGALETT_GRAPH_FUSE=0 in the environment leaves them out, to compare with):
  *
- *   GELU, SiLU   x * 0.5 * (1 + Erf(x / sqrt 2)), its tanh form, and x * Sigmoid(x), as exporters write them out,
- *                become Gelu and Swish
- *   Linear       MatMul by a constant matrix, then an Add of a constant row, then Relu, Sigmoid, Tanh or Gelu
- *                (each optional), becomes Linear: the matrix packed once, the bias and activation in the
- *                product's epilogue
+ *   GELU, SiLU   x * 0.5 * (1 + Erf(x / sqrt 2)), its tanh form, x * Sigmoid(x) and x * Sigmoid(a x), as exporters
+ *                write them out, become Gelu and Swish
+ *   Linear       MatMul by a constant matrix, then an Add of a constant row, then Relu, Sigmoid, Tanh, Gelu or SiLU
+ *                (each optional), or a Gemm by a constant matrix and row then such an activation, becomes Linear:
+ *                the matrix packed once, the bias and activation in the product's epilogue (an activation after
+ *                a Reshape of the product too, the Reshape then making the activation's output)
  *   attention    MatMul(Q, K^T) (Q and K^T scaled by constants or not), a scaling by a constant, an Add of a
  *                mask, Softmax over the last axis (PyTorch's safe softmax too, which zeroes rows of no keys) and
  *                MatMul by V becomes FusedAttention: blocks of 64 queries at a time, their scores never all in
- *                memory
- *
+ *                memory; the transposes of heads around it are taken in
  *   Conv         Conv then Relu, Sigmoid, Tanh, Gelu or SiLU: the activation in the convolution's epilogue (an
  *                attribute "activation" of the library's)
  *
@@ -251,16 +253,49 @@ static bool fuse_silu(Fuse *f, IrNode *sigmoid) {
 
 /* ------------------------------------------------------------------------- Linear */
 
+/* The only reader of v when it is an activation the products' epilogue applies (Relu, Sigmoid, Tanh, SiLU, Gelu),
+   and its ActivationFunction; NULL otherwise. */
+static IrNode *activation_reader(const Fuse *f, uint32_t v, int64_t *act) {
+    if (!single(f, v)) return NULL;
+    for (uint32_t k = 0; k < f->g->node_count; k++) {
+        IrNode *n = &f->g->nodes[k];
+        if (f->dead[k] || n->input_count < 1 || n->inputs[0] != v) continue;
+        if (n->op == IR_Relu) *act = ACT_RELU;
+        else if (n->op == IR_Sigmoid) *act = ACT_SIGMOID;
+        else if (n->op == IR_Tanh) *act = ACT_TANH;
+        else if (n->op == IR_Swish && (!ir_attr(n, "alpha") || ir_attr_float(n, "alpha", 1.0f) == 1.0f)) *act = ACT_SILU;
+        else if (n->op == IR_Gelu) {
+            const IrAttr *ap = ir_attr(n, "approximate");
+            *act = ap && ap->type == ATTR_STRING && !strcmp(ap->s, "tanh") ? ACT_GELU_TANH : ACT_GELU;
+        } else return NULL;
+        return n;
+    }
+    return NULL;
+}
+
 static bool fuse_linear(Fuse *f, IrNode *mm) {
     SpingalettGraph *g = f->g;
+    if (mm->input_count < 2) return true;
     const uint32_t a = mm->inputs[0], w = mm->inputs[1];
     if (a == IR_NONE || w == IR_NONE) return true;
     const IrValue *W = &g->values[w];
     if (W->kind != VALUE_CONST || W->dtype != SPINGALETT_DTYPE_FLOAT32 || W->rank != 2 || g->values[a].kind == VALUE_CONST)
         return true;
-    const int64_t N = W->dims[1];
+    /* Gemm: of A as it is (no transA), alpha and beta 1, C a constant row or none; transB's matrix taken as it is */
+    const bool gemm = mm->op == IR_Gemm;
+    const bool trans = gemm && ir_attr_int(mm, "transB", 0) != 0;
+    if (gemm && (ir_attr_int(mm, "transA", 0) || ir_attr_float(mm, "alpha", 1.0f) != 1.0f ||
+                 ir_attr_float(mm, "beta", 1.0f) != 1.0f)) return true;
+    const int64_t N = trans ? W->dims[0] : W->dims[1];
     uint32_t y = mm->outputs[0], bias = IR_NONE;
-    IrNode *last = mm, *add = consumer_of(f, y, IR_Add, NULL), *act_node = NULL;
+    if (gemm && mm->input_count > 2 && mm->inputs[2] != IR_NONE) {
+        const IrValue *C = &g->values[mm->inputs[2]];
+        bool row = C->kind == VALUE_CONST && C->dtype == SPINGALETT_DTYPE_FLOAT32 && C->rank >= 1 && C->dims[C->rank - 1] == N;
+        for (uint32_t d = 0; row && d + 1 < C->rank; d++) row = C->dims[d] == 1;
+        if (!row) return true;
+        bias = mm->inputs[2];
+    }
+    IrNode *last = mm, *add = bias == IR_NONE ? consumer_of(f, y, IR_Add, NULL) : NULL, *act_node = NULL;
     if (add) {
         const uint32_t b = other(add, y);
         const IrValue *B = b == IR_NONE ? NULL : &g->values[b];
@@ -275,43 +310,37 @@ static bool fuse_linear(Fuse *f, IrNode *mm) {
         }
     }
     int64_t act = ACT_NONE;
-    if (single(f, y)) {
-        for (uint32_t k = 0; k < g->node_count && !act_node; k++) {
-            IrNode *n = &g->nodes[k];
-            if (f->dead[k] || n->input_count < 1 || n->inputs[0] != y) continue;
-            if (n->op == IR_Relu) act = ACT_RELU;
-            else if (n->op == IR_Sigmoid) act = ACT_SIGMOID;
-            else if (n->op == IR_Tanh) act = ACT_TANH;
-            else if (n->op == IR_Swish && !ir_attr(n, "alpha")) act = ACT_SILU;
-            else if (n->op == IR_Gelu) {
-                const IrAttr *ap = ir_attr(n, "approximate");
-                act = ap && ap->type == ATTR_STRING && !strcmp(ap->s, "tanh") ? ACT_GELU_TANH : ACT_GELU;
-            }
-            if (act != ACT_NONE) act_node = n;
-        }
+    act_node = activation_reader(f, y, &act);
+    /* an activation after a Reshape of the product (they commute): into the epilogue, the Reshape then making the
+       activation's output */
+    IrNode *hop = NULL;
+    uint32_t slot;
+    if (!act_node && (hop = consumer_of(f, y, IR_Reshape, &slot)) && slot == 0) {
+        act_node = activation_reader(f, hop->outputs[0], &act);
+        if (!act_node) hop = NULL;
     }
-    if (last == mm && !act_node) {
-        /* a bare product by a constant: Linear all the same, for its packed matrix */
-        IrAttr none[1];
-        const uint32_t ins[2] = {a, w};
-        kill(f, mm);
-        return rewrite(f, mm, IR_Linear, ins, 2, mm->outputs[0], none, 0);
-    }
-    if (act_node) {
+    if (gemm && !act_node) return true;        /* (a Gemm by a constant packs it once as it is) */
+    if (act_node && hop) {
+        hop->outputs[0] = act_node->outputs[0];
+        f->producer[hop->outputs[0]] = (int32_t)(hop - g->nodes);
+    } else if (act_node) {
         last = act_node;
         y = act_node->outputs[0];
     }
-    IrAttr attr;
-    memset(&attr, 0, sizeof attr);
-    attr.name = ir_strdup(g, "activation", 10);
-    attr.type = ATTR_INT;
-    attr.i = act;
-    if (!attr.name) return false;
+    IrAttr attrs[2];
+    memset(attrs, 0, sizeof attrs);
+    attrs[0].name = ir_strdup(g, "activation", 10);
+    attrs[0].type = ATTR_INT;
+    attrs[0].i = act;
+    attrs[1].name = ir_strdup(g, "trans_b", 7);
+    attrs[1].type = ATTR_INT;
+    attrs[1].i = 1;
+    if (!attrs[0].name || !attrs[1].name) return false;
     kill(f, mm);
-    if (add && last != mm && bias != IR_NONE) kill(f, add);
+    if (add && last != mm && bias != IR_NONE && !gemm) kill(f, add);
     if (act_node) kill(f, act_node);
     const uint32_t ins[3] = {a, w, bias};
-    return rewrite(f, last, IR_Linear, ins, bias != IR_NONE ? 3u : 2u, y, &attr, 1);
+    return rewrite(f, last, IR_Linear, ins, bias != IR_NONE ? 3u : 2u, y, attrs, trans ? 2u : 1u);
 }
 
 /* ------------------------------------------------------------------------- attention */
@@ -442,22 +471,9 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
 /* Conv then Relu, Sigmoid, Tanh, Gelu or Swish: the activation an attribute of the Conv, applied in its epilogue. */
 static bool fuse_conv_activation(Fuse *f, IrNode *conv) {
     const uint32_t y = conv->outputs[0];
-    if (ir_attr(conv, "activation") || !single(f, y)) return true;
-    IrNode *act_node = NULL;
+    if (ir_attr(conv, "activation")) return true;
     int64_t act = ACT_NONE;
-    for (uint32_t k = 0; k < f->g->node_count && !act_node; k++) {
-        IrNode *n = &f->g->nodes[k];
-        if (f->dead[k] || n->input_count < 1 || n->inputs[0] != y) continue;
-        if (n->op == IR_Relu) act = ACT_RELU;
-        else if (n->op == IR_Sigmoid) act = ACT_SIGMOID;
-        else if (n->op == IR_Tanh) act = ACT_TANH;
-        else if (n->op == IR_Swish && !ir_attr(n, "alpha")) act = ACT_SILU;
-        else if (n->op == IR_Gelu) {
-            const IrAttr *ap = ir_attr(n, "approximate");
-            act = ap && ap->type == ATTR_STRING && !strcmp(ap->s, "tanh") ? ACT_GELU_TANH : ACT_GELU;
-        }
-        if (act != ACT_NONE) act_node = n;
-    }
+    IrNode *act_node = activation_reader(f, y, &act);
     if (!act_node) return true;
     IrAttr *attrs = (IrAttr *)ir_alloc(f->g, (conv->attr_count + 1u) * sizeof(IrAttr));
     if (!attrs) return false;
@@ -477,7 +493,81 @@ static bool fuse_conv_activation(Fuse *f, IrNode *conv) {
     return rewrite(f, act_node, IR_Conv, ins, count, out, attrs, conv->attr_count + 1u);
 }
 
+/* ------------------------------------------------------------------------- common subexpressions */
+
+static bool same_attrs(const IrNode *a, const IrNode *b) {
+    if (a->attr_count != b->attr_count) return false;
+    for (uint32_t k = 0; k < a->attr_count; k++) {
+        const IrAttr *x = &a->attrs[k], *y = ir_attr(b, x->name);
+        if (!y || x->type != y->type) return false;
+        switch (x->type) {
+            case ATTR_INT: if (x->i != y->i) return false; break;
+            case ATTR_FLOAT: if (memcmp(&x->f, &y->f, sizeof x->f)) return false; break;
+            case ATTR_INTS: if (x->count != y->count || (x->count && memcmp(x->ints, y->ints, x->count * sizeof(int64_t)))) return false; break;
+            case ATTR_FLOATS: if (x->count != y->count || (x->count && memcmp(x->floats, y->floats, x->count * sizeof(float)))) return false; break;
+            case ATTR_STRING: if (strcmp(x->s, y->s)) return false; break;
+            default: if (x->tensor != y->tensor) return false; break;
+        }
+    }
+    return true;
+}
+
+/* Nodes of one operator on the same inputs with the same attributes compute the same: each later one is left out
+   and what read its outputs reads the first's (not where an output of the graph would lose its name). */
+static bool common_subexpressions(SpingalettGraph *g) {
+    const uint32_t N = g->node_count;
+    uint32_t *rename = (uint32_t *)malloc((size_t)(g->value_count ? g->value_count : 1u) * sizeof(uint32_t));
+    uint8_t *output = (uint8_t *)calloc(g->value_count ? g->value_count : 1u, 1);
+    uint32_t *first = (uint32_t *)malloc((size_t)(N ? N : 1u) * sizeof(uint32_t));
+    uint8_t *gone = (uint8_t *)calloc(N ? N : 1u, 1);
+    /* a table of the nodes by a hash of their operator and inputs */
+    uint32_t cap = 64;
+    while (cap < 2u * N + 2u) cap *= 2;
+    uint32_t *table = (uint32_t *)calloc(cap, sizeof(uint32_t));
+    if (!rename || !output || !first || !gone || !table) {
+        free(rename); free(output); free(first); free(gone); free(table);
+        set_error(SPINGALETT_ERR_ALLOC, "graph: out of memory");
+        return false;
+    }
+    for (uint32_t v = 0; v < g->value_count; v++) rename[v] = v;
+    for (uint32_t o = 0; o < g->output_count; o++) output[g->outputs[o]] = 1;
+    for (uint32_t k = 0; k < N; k++) {
+        IrNode *n = &g->nodes[k];
+        for (uint32_t i = 0; i < n->input_count; i++)
+            if (n->inputs[i] != IR_NONE) n->inputs[i] = rename[n->inputs[i]];
+        bool candidate = n->output_count > 0;
+        for (uint32_t o = 0; o < n->output_count && candidate; o++)
+            candidate = n->outputs[o] != IR_NONE && !output[n->outputs[o]];
+        if (!candidate) continue;
+        uint32_t h = 2166136261u ^ n->op;
+        for (uint32_t i = 0; i < n->input_count; i++) h = (h ^ n->inputs[i]) * 16777619u;
+        uint32_t at = h & (cap - 1u);
+        for (; table[at]; at = (at + 1u) & (cap - 1u)) {
+            const IrNode *m = &g->nodes[table[at] - 1u];
+            if (m->op != n->op || m->input_count != n->input_count || m->output_count != n->output_count ||
+                memcmp(m->inputs, n->inputs, n->input_count * sizeof(uint32_t)) || !same_attrs(m, n)) continue;
+            bool outputs_ok = true;
+            for (uint32_t o = 0; o < m->output_count && outputs_ok; o++) outputs_ok = m->outputs[o] != IR_NONE;
+            if (!outputs_ok) continue;
+            for (uint32_t o = 0; o < n->output_count; o++) rename[n->outputs[o]] = m->outputs[o];
+            gone[k] = 1;
+            break;
+        }
+        if (!gone[k]) table[at] = k + 1u;
+    }
+    uint32_t kept = 0;
+    for (uint32_t k = 0; k < N; k++)
+        if (!gone[k]) g->nodes[kept++] = g->nodes[k];
+    g->node_count = kept;
+    free(rename); free(output); free(first); free(gone); free(table);
+    return true;
+}
+
 bool ir_fuse(SpingalettGraph *g) {
+    if (!common_subexpressions(g)) return false;
+    /* (SPINGALETT_GRAPH_FUSE=0 leaves the graph as its file has it, to compare the fusions with it) */
+    const char *fuse = getenv("SPINGALETT_GRAPH_FUSE");
+    if (fuse && !strcmp(fuse, "0")) return true;
     Fuse f;
     f.g = g;
     f.producer = (int32_t *)malloc((size_t)(g->value_count ? g->value_count : 1u) * sizeof(int32_t));
@@ -503,7 +593,7 @@ bool ir_fuse(SpingalettGraph *g) {
     for (uint32_t k = 0; ok && k < g->node_count; k++)
         if (!f.dead[k] && g->nodes[k].op == IR_Softmax) ok = fuse_attention(&f, &g->nodes[k]);
     for (uint32_t k = 0; ok && k < g->node_count; k++)
-        if (!f.dead[k] && g->nodes[k].op == IR_MatMul) ok = fuse_linear(&f, &g->nodes[k]);
+        if (!f.dead[k] && (g->nodes[k].op == IR_MatMul || g->nodes[k].op == IR_Gemm)) ok = fuse_linear(&f, &g->nodes[k]);
     for (uint32_t k = 0; ok && k < g->node_count; k++)
         if (!f.dead[k] && g->nodes[k].op == IR_Conv) ok = fuse_conv_activation(&f, &g->nodes[k]);
     if (ok) {

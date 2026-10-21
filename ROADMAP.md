@@ -51,49 +51,57 @@ processing of 512 tokens, generation of 128, at 1 and 8 threads, on CUDA and on 
 family checked on real checkpoints (the logits of a prompt against transformers', the tokens of greedy generation
 against llama.cpp's). **SaLaM** (below), a program of its own on the runtime, serves them.
 
-## 1.5: graphs of operators
+## 1.5: graphs of operators (done on dev/1.5)
 
-The foundation, on the CPU; the language-model work of 1.5 that needs no new format comes with it.
+The foundation, on the CPU, with the language-model work of 1.5 that needed no new format.
 
-- **The IR**: tensors of up to eight axes, their sizes numbers or named symbols (batch, tokens, height, width)
-  inferred when a graph loads and fixed when it runs; dtypes float32, float16, bfloat16, int64, int32, int8, uint8 and
-  bool, and GGUF's block types as dtypes of constants; several named inputs and outputs. About sixty primitive
-  operators with ONNX's names and semantics where ONNX defines them: element-wise arithmetic, comparisons and
-  functions with broadcasting, `Where`, `Cast`; `MatMul` (batched, broadcast, its constant operand in a block dtype)
-  and `Gemm`; `Conv` and `ConvTranspose` of one to three dimensions (groups, strides, dilations, asymmetric padding),
-  pooling; `Reshape`, `Transpose`, `Slice`, `Concat` and `Split` along any axis, `Pad`, `Expand`, `Gather`,
-  `Shape`, `Range`, `Squeeze`, `Unsqueeze`; reductions, `Softmax`, `ArgMax`, `TopK`, `CumSum`; `Resize`. Composite
-  operators with a reference decomposition into primitives, so that a backend without a kernel of its own still runs
-  them: layer, RMS and group normalization, attention (a mask, a scale, a soft cap, a window), rotary embeddings of an
-  explicit table of frequencies, gated MLPs.
-- **`.slett` format 11**: a graph's values (dtype, shape with symbols), nodes and typed attributes, its opset version
-  (an operator the runtime does not know is an error that names it and its version), constants in sections aligned
-  for mapping and used where they lie, metadata (a tokenizer, a chat template, generation's defaults, the family as a
-  hint to the passes, never as a condition of running). Files of formats 3 to 10 stay layer models.
-- **The executor** (`spingalett_graph_open()`, `spingalett_graph_run()`; in the runtime and Python): shapes inferred
-  at loading and checked at every run, buffers planned by the values' lifetimes, a reference kernel on the CPU for
-  every operator and dtype that sums in fixed orders (the same bits on any number of threads), the library's matrix
-  and convolution kernels under `MatMul`, `Gemm` and `Conv`.
-- **Passes**: constant folding, dead values, common subexpressions; fusions into the library's kernels where they
-  already exist (products with their bias and activation, attention), each checked against the graph it replaces.
-- **Converters**: ONNX one operator to one, without the patterns of 1.4's importer (which go on making networks to
-  train); PyTorch through `torch.onnx` in Python.
-- **Checked**: every operator against ONNX's reference implementation (`onnx.reference`) on cases of its own
-  attributes and broadcasts; whole models exported from PyTorch against PyTorch: classifiers, a transformer's
-  encoder, CLIP's text encoder, Stable Diffusion's VAE decoder, a UNet of SDXL's architecture. The layer models,
-  their benchmarks and `llama-bench` on the files of 1.4 are untouched and no slower.
-- **Language models in programs** (done on dev/1.5): the tokenizers in the runtime; chat templates (the Jinja of
+- **The IR**: tensors of up to eight axes, their sizes numbers or named symbols, the symbols checked at every run;
+  float32, float16, bfloat16, int64, int32, int8, uint8 and bool; several named inputs and outputs. 155 operators with
+  ONNX's names and semantics (opsets 7 to 28, earlier forms where they differ): element-wise arithmetic, comparisons,
+  logic and bitwise operators and functions with broadcasting, products and convolutions of one to three spatial
+  axes, pooling, normalizations, reductions, shapes and data, Resize in every mode, quantization, Einsum, opset 23's
+  Attention and RotaryEmbedding, opset 27's LinearAttention and CausalConvWithState, SwiGLU; three of the library's
+  own that fusions make (Linear, FusedAttention, Conv with an activation).
+- **`.slett` format 11**: values (type, shape with symbols), nodes, typed attributes, the opset, constants at offsets
+  of 64 used where a mapped file holds them; checksums of the tables, not the constants.
+- **The executor** (`spingalett_graph_open()`, `spingalett_graph_run()`; in the runtime and Python): kernels
+  for every operator that sum in fixed orders (the same bits on any number of threads), the library's row kernel
+  under products by constants (packed once) and its channels-last kernels under convolutions, a pool of buffers kept
+  between runs, values freed after their last reader, shape operators as views.
+- **Passes**: constant folding, dead nodes, common subexpressions; fusions: Linear (a product by a constant matrix,
+  its bias and activation), FusedAttention (Q K^T, scale, mask, softmax and V in blocks of 64 queries, the heads'
+  transposes taken in), GELU and SiLU from their written-out forms, a convolution's activation; each compared with
+  the graph without it.
+- **Converters**: ONNX one operator to one; PyTorch through `torch.onnx` in Python (`Graph.from_torch()`).
+- **Checked**: ONNX's 1262 conformance cases of single operators that hold the library's types (the `operators`
+  group, on one and four threads, under the sanitizers of GCC and Clang); whole models exported from PyTorch against
+  PyTorch (`Tests/check_graph_models.py`): ResNet-50, ViT-B/16, BERT-base, GPT-2, CLIP's text encoder, Whisper's
+  encoder, Stable Diffusion's VAE decoder, a UNet of SDXL's architecture, within 1e-5 and at 0.6 to 0.98 times
+  PyTorch's speed. The layer models and their benchmarks are untouched and no slower.
+- **Language models in programs**: the tokenizers in the runtime; chat templates (the Jinja of
   `tokenizer.chat_template` rendered as transformers renders it); sampling as llama.cpp offers it (min-p, repeat,
   frequency and presence penalties, stop strings, a stream of tokens) and draws that sort only what they reach;
   SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files on 1.4's layers; a chat in the terminal on the runtime alone.
 - **Decided**: an opset of the library's own, ONNX's semantics where ONNX has them (free references) and its own
-  composite operators and block dtypes where it has not; no control flow in graphs (generation loops and samplers
-  stay code of the host, as now); training through graphs waits for 2.0 (the training API stays the layers'); the
-  engine for microcontrollers runs layer models until a static subset of graphs reaches it (1.12).
+  operators where it has not; no control flow in graphs (generation loops and samplers stay code of the host);
+  training through graphs waits for 2.0 (the training API stays the layers'); the engine for microcontrollers runs
+  layer models until a static subset of graphs reaches it (1.12).
+- **Moved to 1.6**, where language models and the GPU need them: GGUF's block types as types of constants, the
+  metadata of a model in format 11 (a tokenizer, a chat template, generation's defaults), shapes inferred when a
+  graph opens (kernels compute them as they run in 1.5) and composite operators' decompositions into primitives
+  for backends without their kernels.
 
 ## 1.6: language models on the graph and on the GPU
 
 What was planned for 1.5 before the IR, built on it: the families become converters, the GPU an executor of graphs.
+
+- **What the IR still lacks for them**: GGUF's block types as types of constants (`MatMul` and `Gather` by them in
+  1.4's kernels), a model's metadata in format 11 (a tokenizer, a chat template, generation's defaults, the family
+  as a hint to the passes), shapes inferred when a graph opens (and buffers planned from them), composite operators'
+  decompositions into primitives for backends without their kernels. Graphs run as fast as PyTorch on the CPU in
+  more places: activations kept channels-last between convolutions (1.5 transposes around each), GroupNorm written
+  out as InstanceNormalization fused back, the transposes of heads around attention taken in wherever exporters write
+  them.
 
 - **GGUF and Hugging Face's directories as graphs**: `Gguf.c` and `Pretrained.c` as generators of graphs from a
   family's metadata, families added as converters alone: Gemma 2 (soft-capped scores and logits: `Tanh` and `Mul`),

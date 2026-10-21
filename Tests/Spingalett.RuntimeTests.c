@@ -332,6 +332,86 @@ static void library_models(const char *dir) {
     free(entries);
 }
 
+/* Graphs of operators: Tests/Data/graph_small.onnx (Tests/make_graph_tests.py) run on its inputs against the
+   reference's outputs, its declared inputs and outputs, a .slett file of format 11 giving the same bits, and the
+   errors of a wrong input. */
+static void graphs(const char *data_dir) {
+    char path[1024], saved[1024];
+    printf("[graphs]\n");
+    size_t size = 0;
+    unsigned char *bin = NULL;
+    if (join(path, sizeof path, data_dir, "graph_small.bin")) bin = (unsigned char *)read_file(path, &size);
+    CHECK(bin && size >= 4, "%s: no expectations", path);
+    if (!bin) return;
+    uint32_t rows;
+    memcpy(&rows, bin, 4);
+    CHECK(size == 4 + rows * (4 * 4 + 3 * 4 + 8), "graph_small.bin of %u bytes", (unsigned)size);
+    const float *x = (const float *)(bin + 4), *want = x + rows * 4;
+    int64_t want_k[16];
+    memcpy(want_k, want + rows * 3, rows * 8u);
+    join(path, sizeof path, data_dir, "graph_small.onnx");
+    SpingalettGraph *g = spingalett_graph_open(.path = path);
+    CHECK(g, "graph_small.onnx: %s", spingalett_last_error_message());
+    if (!g) { free(bin); return; }
+    SpingalettTensorInfo in = spingalett_graph_input(g, 0), out = spingalett_graph_output(g, 1);
+    CHECK(spingalett_graph_input_count(g) == 1 && spingalett_graph_output_count(g) == 2, "inputs and outputs");
+    CHECK(!strcmp(in.name, "x") && in.rank == 2 && in.shape[0] == -1 && in.symbols[0] && !strcmp(in.symbols[0], "batch") &&
+          in.shape[1] == 4 && in.dtype == SPINGALETT_DTYPE_FLOAT32, "the input as declared");
+    CHECK(!strcmp(out.name, "k") && out.dtype == SPINGALETT_DTYPE_INT64 && out.rank == 1, "the second output as declared");
+    /* the written-out GELU fused into Linear: MatMul, Add, Div, Erf, Add, Mul, Mul become one node */
+    uint32_t linear = 0;
+    for (uint32_t k = 0; k < spingalett_graph_node_count(g); k++) linear += !strcmp(spingalett_graph_node_op(g, k), "Linear");
+    CHECK(linear == 1 && spingalett_graph_node_count(g) == 3, "%u nodes, %u Linear", spingalett_graph_node_count(g), linear);
+    SpingalettTensor input = {0}, outputs[2];
+    input.name = "x";
+    input.dtype = SPINGALETT_DTYPE_FLOAT32;
+    input.rank = 2;
+    input.shape[0] = rows;
+    input.shape[1] = 4;
+    input.data = (void *)x;
+    memset(outputs, 0, sizeof outputs);
+    bool ok = spingalett_graph_run(.graph = g, .inputs = &input, .input_count = 1, .outputs = outputs, .output_count = 2);
+    CHECK(ok, "run: %s", spingalett_last_error_message());
+    float first[64];
+    if (ok) {
+        CHECK(outputs[0].dtype == SPINGALETT_DTYPE_FLOAT32 && outputs[0].rank == 2 && outputs[0].shape[0] == rows &&
+              outputs[0].shape[1] == 3 && !strcmp(outputs[0].name ? outputs[0].name : "y", "y"), "the softmax's shape");
+        float worst = 0.0f;
+        for (uint32_t i = 0; i < rows * 3; i++) {
+            const float d = fabsf(((const float *)outputs[0].data)[i] - want[i]);
+            if (d > worst) worst = d;
+        }
+        CHECK(worst < 1e-5f, "the softmax %g from the reference's", worst);
+        CHECK(!memcmp(outputs[1].data, want_k, rows * 8u), "the argmax");
+        memcpy(first, outputs[0].data, rows * 3 * sizeof(float));
+    }
+    /* through a file of format 11 */
+    snprintf(saved, sizeof saved, "%s", "graph_small_saved.slett");
+    CHECK(spingalett_graph_save(g, saved), "save: %s", spingalett_last_error_message());
+    SpingalettGraph *again = spingalett_graph_open(.path = saved);
+    CHECK(again, "%s: %s", saved, spingalett_last_error_message());
+    if (again && ok) {
+        SpingalettTensor y = {0};
+        y.name = "y";
+        CHECK(spingalett_graph_run(.graph = again, .inputs = &input, .input_count = 1, .outputs = &y, .output_count = 1) &&
+              !memcmp(y.data, first, rows * 3 * sizeof(float)), "the saved graph's bits");
+    }
+    spingalett_graph_free(again);
+    remove(saved);
+    /* a wrong input: refused, named */
+    input.shape[1] = 5;
+    CHECK(!spingalett_graph_run(.graph = g, .inputs = &input, .input_count = 1, .outputs = outputs, .output_count = 2) &&
+          strstr(spingalett_last_error_message(), "'x'"), "a wrong shape refused: %s", spingalett_last_error_message());
+    input.shape[1] = 4;
+    input.name = "nothing";
+    CHECK(!spingalett_graph_run(.graph = g, .inputs = &input, .input_count = 1, .outputs = outputs, .output_count = 2),
+          "an unknown input refused");
+    spingalett_graph_free(g);
+    const char junk[] = "not a model at all";
+    CHECK(!spingalett_graph_open(.data = junk, .size = sizeof junk - 1), "bytes of no model refused");
+    free(bin);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: SpingalettRuntimeTests DATA_DIR [EXPORT_DIR]\n");
@@ -339,6 +419,7 @@ int main(int argc, char **argv) {
     }
     api(argv[1]);
     tokenizers(argv[1]);
+    graphs(argv[1]);
     release_models(argv[1]);
     if (argc > 2) library_models(argv[2]);
     printf(failures ? "%d FAILED\n" : "all passed\n", failures);

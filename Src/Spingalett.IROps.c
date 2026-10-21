@@ -1347,7 +1347,18 @@ static bool k_pad(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uin
     if (!ir_output(r, out[0], x->dtype, R, dims)) return false;
     const size_t size = ir_dtype_size(x->dtype);
     uint8_t fill[8] = {0};
-    if (kind == 0 && n > 2 && in[2] && in[2]->count) memcpy(fill, in[2]->data, size);
+    if (kind == 0 && n > 2 && in[2] && in[2]->count) {
+        memcpy(fill, in[2]->data, size);
+    } else if (kind == 0 && ir_attr(r->node, "value")) {
+        /* (the constant an attribute before opset 11) */
+        const float v = ir_attr_float(r->node, "value", 0.0f);
+        IrTensor one;
+        memset(&one, 0, sizeof one);
+        one.dtype = x->dtype;
+        one.data = fill;
+        if (x->dtype == F32) memcpy(fill, &v, 4);
+        else put_int(&one, 0, (int64_t)v);
+    }
     int64_t xs[IR_MAX_RANK], s = 1;
     for (uint32_t d = R; d-- > 0;) { xs[d] = s; s *= x->dims[d]; }
     FOR_PIECES(r, out[0]->count, begin, end,
@@ -2449,12 +2460,14 @@ static int ranked_up(const void *a, const void *b) {
 }
 
 static bool k_topk(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
-    if (n < 2 || m < 2 || !in[0] || !in[1]) return ir_fail(r, "an input, K and two outputs are needed");
+    if (n < 1 || m < 2 || !in[0] || ((n < 2 || !in[1]) && !ir_attr(r->node, "k")))
+        return ir_fail(r, "an input, K and two outputs are needed");
     const IrTensor *X = in[0];
     if (X->dtype != F32 && !is_int(X->dtype)) return ir_fail(r, "an input of %s", ir_dtype_name(X->dtype));
     uint32_t axis;
     if (!axis_of(r, ir_attr_int(r->node, "axis", -1), X->rank, &axis)) return false;
-    const int64_t K = in[1]->count ? ir_get_int(in[1], 0) : -1;
+    /* (K an input from opset 10, an attribute before) */
+    const int64_t K = n > 1 && in[1] ? (in[1]->count ? ir_get_int(in[1], 0) : -1) : ir_attr_int(r->node, "k", -1);
     if (K < 0 || K > X->dims[axis]) return ir_fail(r, "K of %lld for an axis of %lld", (long long)K, (long long)X->dims[axis]);
     int64_t dims[IR_MAX_RANK];
     for (uint32_t d = 0; d < X->rank; d++) dims[d] = d == axis ? K : X->dims[d];
@@ -3681,14 +3694,16 @@ static bool k_causal_conv(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **
 
 /* ------------------------------------------------------------------------- the library's own operators */
 
-/* Linear (fusions make it): X (..., K) times a constant W (K x N), plus a bias of N when given, through an
-   activation (the attribute: an ActivationFunction), into (..., N); W's columns packed once. */
+/* Linear (fusions make it): X (..., K) times a constant W (K x N; with trans_b 1, N x K transposed), plus a bias of
+   N when given, through an activation (the attribute: an ActivationFunction), into (..., N); W's columns packed
+   once. */
 static bool k_linear(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
     if (n < 2 || m < 1 || !in[0] || !in[1]) return ir_fail(r, "an input, weights and an output are needed");
     const IrTensor *X = in[0], *W = in[1], *bias = n > 2 ? in[2] : NULL;
     if (X->dtype != F32 || W->dtype != F32 || W->rank != 2 || !X->rank || !W->constant)
         return ir_fail(r, "an input, or weights that are no constant matrix, not float32");
-    const int64_t K = W->dims[0], N = W->dims[1];
+    const bool trans = ir_attr_int(r->node, "trans_b", 0) != 0;
+    const int64_t K = trans ? W->dims[1] : W->dims[0], N = trans ? W->dims[0] : W->dims[1];
     if (X->dims[X->rank - 1] != K) return ir_fail(r, "an input of %lld columns for %lld rows of weights",
                                                   (long long)X->dims[X->rank - 1], (long long)K);
     if (bias && (bias->dtype != F32 || bias->count != (uint64_t)N)) return ir_fail(r, "a bias of another size");
@@ -3702,7 +3717,7 @@ static bool k_linear(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
         if (act != ACT_NONE) apply_activation_bulk(fdata(out[0]), out[0]->count, (ActivationFunction)act);
         return true;
     }
-    const Packed *p = packed_of(r, W, false);
+    const Packed *p = packed_of(r, W, trans);
     if (!p || !ir_output_raw(r, out[0], F32, X->rank, dims)) return false;
     product_rows(r, p, fdata(X), X->count / (uint64_t)K, fdata(out[0]), bias ? fdata(bias) : NULL, (ActivationFunction)act);
     return true;

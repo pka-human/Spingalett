@@ -3086,6 +3086,26 @@ class Graph:
         return cls._wrap(_call(fn, _GraphOpenArgs(path=_encode_path(path))))
 
     @classmethod
+    def from_torch(cls, module, *example_inputs, input_names=None, opset: int = 18, **export_args) -> "Graph":
+        """A PyTorch module as a graph: exported by ``torch.onnx.export`` (its dynamo exporter, the given opset) on
+        the example inputs, then opened from the bytes. ``input_names`` name the graph's inputs (by default input_0,
+        input_1, ...); other keyword arguments go to the exporter (``dynamic_shapes``, say)."""
+        import io
+        import torch
+        names = list(input_names) if input_names is not None else [f"input_{k}" for k in range(len(example_inputs))]
+        buffer = io.BytesIO()
+        was_training = module.training
+        module.eval()
+        try:
+            with torch.no_grad():
+                program = torch.onnx.export(module, tuple(example_inputs), input_names=names, dynamo=True,
+                                            opset_version=opset, external_data=False, **export_args)
+            program.save(buffer)
+        finally:
+            module.train(was_training)
+        return cls.from_bytes(buffer.getvalue())
+
+    @classmethod
     def from_bytes(cls, data) -> "Graph":
         """Open a graph from the bytes of an ONNX or .slett file (copied)."""
         fn = _require(_graph_open, "Graph", "1.5")
