@@ -22,6 +22,13 @@ All notable changes to this project are documented in this file. The format foll
   DeepSeek-R1's distillations, Granite 3.3, OLMo 2, GLM-4 (two) and Falcon 3 to transformers' text byte for byte, or
   to their errors (192 cases, `Tests/make_chat_tests.py`). Python: `Tokenizer.chat_template`,
   `Tokenizer.apply_chat_template(messages, add_generation_prompt, tools, **variables)` and `render_chat_template()`.
+- **SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files**: `spingalett_model_open()` opens the architectures `smollm3`
+  (every fourth layer without rotary embeddings), `olmo2` (the attention's and the MLP's outputs normalized and not
+  their inputs, queries and keys normalized over all heads as layers of their own; OLMo 3's windows), `phi3` (Phi-3
+  and Phi-3.5: queries, keys and values in one matrix, the gate and up in one, LongRoPE's short or long factors by
+  the window and its magnitude of the rotations, which scales the scores) and `glm4` (half of each head turned, in
+  llama.cpp's adjacent pairs, the outputs normalized); rotary embeddings on part of a head where the file's
+  `rope.dimension_count` says so. The `pretrained` group compares each with transformers' model (within 3.2e-6).
 - **Sampling as llama.cpp offers it**: `SpingalettSampling`, given to `spingalett_session_generate()` and
   `spingalett_generate()` through their new `sampling` field (which takes a word of their reserved space): min-p
   (after the temperature, top-k and top-p, as transformers applies it), llama.cpp's repeat, frequency and presence

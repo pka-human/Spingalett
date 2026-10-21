@@ -57,6 +57,14 @@ typedef struct {
     uint32_t window_pattern;        /* with a window, of every `window_pattern` layers the last attends to every key
                                        (Gemma 3: 6); 0: every layer windowed */
     float theta_local;              /* the rotary base of the windowed layers of a pattern (0: theta) */
+    uint32_t rotary;                /* the values of a head the rotary embeddings turn (0: all; GLM-4, Phi-4 mini) */
+    uint32_t nope_interval;         /* of every `nope_interval` layers the last has no rotary embeddings (SmolLM3: 4) */
+    bool no_pre_norms;              /* the attention and the MLP read the block's input unnormalized (OLMo 2) */
+    bool wide_qk_norm;              /* the queries and the keys normalized over all their heads at once (OLMo 2:
+                                       SPG_PART_Q_NORM and _K_NORM of heads x head size values) */
+    bool fused_up;                  /* SPG_PART_UP holds the gate's rows, then the up's (Phi-3, GLM-4) */
+    float score_scale;              /* attention's scores times this, over the square root of the head (0: 1; Phi-3's
+                                       LongRoPE: the square of its factor of the rotations' magnitude) */
 } SpgTransformer;
 
 /* Where a format's tensors come from. */
