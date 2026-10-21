@@ -120,7 +120,7 @@ c_enum!(
     Init { Random = 0, Xavier = 1, He = 2, Zeros = 3, LeCun = 4 }
 );
 
-/// The library's version ("1.4.0").
+/// The library's version ("1.4.1").
 pub fn version() -> String {
     unsafe { CStr::from_ptr(sys::spingalett_version()).to_string_lossy().into_owned() }
 }

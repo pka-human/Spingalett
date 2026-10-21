@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 pkgname=spingalett-git
-pkgver=1.4.0.r0.g0000000
+pkgver=1.4.1.r0.g0000000
 pkgrel=1
 pkgdesc="Neural networks in C: training on the CPU and GPUs (CUDA, Vulkan), transformers, deployment down to INT2"
 arch=('x86_64' 'aarch64')
