@@ -250,8 +250,15 @@ static bool binary_into(IrRun *r, IrOp op, IrTensor *a, IrTensor *b, IrTensor *y
             );
         } else if (b->count == 1 && a->count == out.count) {
             const float s = z[0];
+            /* (powers by 2, 3, 0.5, 1 and -1: products, a root, a copy and a reciprocal, each correctly rounded) */
+            const int power = op != IR_Pow ? 0 : s == 2.0f ? 2 : s == 3.0f ? 3 : s == 0.5f ? 5 : s == 1.0f ? 1 : s == -1.0f ? 6 : 0;
             FOR_PIECES(r, out.count, begin, end,
-                switch (op) {
+                switch (power ? (IrOp)IR_OP_COUNT : op) {
+                    case IR_OP_COUNT:
+                        for (uint64_t i = begin; i < end; i++)
+                            o[i] = power == 2 ? x[i] * x[i] : power == 3 ? x[i] * x[i] * x[i] : power == 5 ? sqrtf(x[i])
+                                 : power == 1 ? x[i] : 1.0f / x[i];
+                        break;
                     case IR_Add: case IR_Sum: for (uint64_t i = begin; i < end; i++) o[i] = x[i] + s; break;
                     case IR_Sub: for (uint64_t i = begin; i < end; i++) o[i] = x[i] - s; break;
                     case IR_Mul: for (uint64_t i = begin; i < end; i++) o[i] = x[i] * s; break;
@@ -3497,8 +3504,59 @@ static bool k_dynamic_quantize(IrRun *r, IrTensor *const *in, uint32_t n, IrTens
     return true;
 }
 
+/* B less its zero points, transposed: N rows of K int16 (K rounded up to 16, zeros after), made once for constants. */
+typedef struct {
+    int16_t *rows;
+    int64_t K, N, Kp;
+} IntRows;
+
+static void int_rows_free(void *p) {
+    if (!p) return;
+    spingalett_aligned_free(((IntRows *)p)->rows);
+    free(p);
+}
+
+/* B's batches as rows, kept by a node whose B and zero point are constants. */
+typedef struct {
+    uint64_t count;
+    IntRows **list;
+} IntRowsList;
+
+static void int_rows_list_free(void *p) {
+    IntRowsList *l = (IntRowsList *)p;
+    if (!l) return;
+    for (uint64_t q = 0; q < l->count; q++) int_rows_free(l->list[q]);
+    free(l->list);
+    free(l);
+}
+
+static IntRows *int_rows_of(const IrTensor *B, const IrTensor *bzp, uint64_t batch, int64_t K, int64_t N) {
+    IntRows *t = (IntRows *)calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->K = K;
+    t->N = N;
+    t->Kp = (K + 15) / 16 * 16;
+    t->rows = (int16_t *)spingalett_aligned_alloc((size_t)(N * t->Kp) * sizeof(int16_t) + 64);
+    if (!t->rows) { free(t); return NULL; }
+    for (int64_t n = 0; n < N; n++) {
+        const int64_t z = bzp ? ir_get_int(bzp, bzp->count == 1 ? 0 : (uint64_t)n) : 0;
+        int16_t *row = t->rows + n * t->Kp;
+        for (int64_t k = 0; k < K; k++) row[k] = (int16_t)(ir_get_int(B, batch + (uint64_t)(k * N + n)) - z);
+        for (int64_t k = K; k < t->Kp; k++) row[k] = 0;
+    }
+    return t;
+}
+
+/* The sum of a[k] b[k] for k < n: values within 255 of zero, so that up to 32767 products sum exactly in 32 bits. */
+static int32_t dot16(const int16_t *restrict a, const int16_t *restrict b, int64_t n) {
+    int32_t acc = 0;
+    for (int64_t k = 0; k < n; k++) acc += (int32_t)a[k] * (int32_t)b[k];
+    return acc;
+}
+
 /* MatMulInteger (and QLinearMatMul, its result requantized): products of 8-bit integers less their zero points (one
-   for all, or one a row of A and a column of B), summed exactly in 32 bits, over broadcast batches. */
+   for all, or one a row of A and a column of B), summed exactly in 32 bits, over broadcast batches; the operands as
+   16-bit integers (B's columns made rows once when it is a constant), whose products the compiler sums in vectors. */
 static bool k_matmul_integer(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
     const bool qlinear = OP(r) == IR_QLinearMatMul;
     const IrTensor *A = in[0], *B = qlinear ? (n > 3 ? in[3] : NULL) : (n > 1 ? in[1] : NULL);
@@ -3506,10 +3564,12 @@ static bool k_matmul_integer(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor
     const IrTensor *bzp = qlinear ? (n > 5 ? in[5] : NULL) : n > 3 ? in[3] : NULL;
     if (!A || !B || m < 1) return ir_fail(r, "two operands and an output are needed");
     if (qlinear && (n < 7 || !in[1] || !in[4] || !in[6])) return ir_fail(r, "scales are needed");
-    if (!is_int(A->dtype) || !is_int(B->dtype) || A->rank < 1 || B->rank < 1) return ir_fail(r, "operands not integers");
+    if (!is_int(A->dtype) || !is_int(B->dtype) || A->rank < 1 || B->rank < 1 || ir_dtype_size(A->dtype) != 1 ||
+        ir_dtype_size(B->dtype) != 1) return ir_fail(r, "operands not 8-bit integers");
     const int64_t M = A->rank >= 2 ? A->dims[A->rank - 2] : 1, K = A->dims[A->rank - 1];
     const int64_t Kb = B->rank >= 2 ? B->dims[B->rank - 2] : B->dims[0], N = B->rank >= 2 ? B->dims[B->rank - 1] : 1;
     if (K != Kb) return ir_fail(r, "operands of %lld and %lld columns and rows", (long long)K, (long long)Kb);
+    if (K > 32767) return ir_fail(r, "sums of more than 32767 products");
     if (azp && azp->count != 1 && azp->count != (uint64_t)M) return ir_fail(r, "A's zero point of another size");
     if (bzp && bzp->count != 1 && bzp->count != (uint64_t)N) return ir_fail(r, "B's zero point of another size");
     IrTensor ba, bb;
@@ -3523,18 +3583,38 @@ static bool k_matmul_integer(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor
     uint32_t R;
     int64_t dims[IR_MAX_RANK];
     if (!broadcast_shape(r, pair, 2, &R, dims)) return false;
-    uint64_t batches = 1;
+    uint64_t batches = 1, bbatches = 1;
     for (uint32_t d = 0; d < R; d++) batches *= (uint64_t)dims[d];
+    for (uint32_t d = 0; d < bb.rank; d++) bbatches *= (uint64_t)bb.dims[d];
     int64_t odims[IR_MAX_RANK];
     uint32_t orank = R;
     for (uint32_t d = 0; d < R; d++) odims[d] = dims[d];
     if (A->rank >= 2) odims[orank++] = M;
     if (B->rank >= 2) odims[orank++] = N;
     const uint8_t type = qlinear ? (n > 7 && in[7] ? in[7]->dtype : A->dtype) : I32;
-    if (orank > IR_MAX_RANK || !ir_output(r, out[0], type, orank, odims)) return r->error[0] ? false : ir_fail(r, "more than eight axes");
+    if (orank > IR_MAX_RANK || !ir_output_raw(r, out[0], type, orank, odims)) return r->error[0] ? false : ir_fail(r, "more than eight axes");
     int64_t sa[IR_MAX_RANK], sb[IR_MAX_RANK];
     broadcast_strides(&ba, R, dims, sa);
     broadcast_strides(&bb, R, dims, sb);
+    /* B's batches as rows: once for a constant B and zero point, else for this call */
+    const bool keep = B->constant && (!bzp || bzp->constant);
+    IntRowsList *kept = keep ? (IntRowsList *)ir_prepared(r) : NULL;
+    if (!kept) {
+        kept = (IntRowsList *)calloc(1, sizeof *kept);
+        if (kept) kept->list = (IntRows **)calloc(bbatches ? bbatches : 1, sizeof(IntRows *));
+        bool ok = kept && kept->list;
+        for (uint64_t q = 0; ok && q < bbatches; q++) {
+            kept->list[q] = int_rows_of(B, bzp, q * (uint64_t)(K * N), K, N);
+            kept->count = q + 1;
+            ok = kept->list[q] != NULL;
+        }
+        if (!ok) {
+            int_rows_list_free(kept);
+            return ir_fail(r, "out of memory");
+        }
+        if (keep) ir_prepare(r, kept, int_rows_list_free);
+    }
+    IntRows **rows = kept->list;
     float mult = 1.0f;
     int64_t yzp = 0, lo = INT32_MIN, hi = INT32_MAX;
     if (qlinear) {
@@ -3543,6 +3623,8 @@ static bool k_matmul_integer(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor
         lo = type == SPINGALETT_DTYPE_UINT8 ? 0 : -128;
         hi = type == SPINGALETT_DTYPE_UINT8 ? 255 : 127;
     }
+    const int64_t Kp = (K + 15) / 16 * 16;
+    bool failed = false;
     SPINGALETT_PARALLEL_FOR(r->parallel && batches * (uint64_t)(M * N * K) >= PARALLEL_WORK,
         for (int64_t q = 0; q < (int64_t)(batches * (uint64_t)M); q++) {
             const uint64_t bt = (uint64_t)q / (uint64_t)M, i = (uint64_t)q % (uint64_t)M;
@@ -3554,24 +3636,31 @@ static bool k_matmul_integer(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor
                 oa += c * sa[d];
                 ob += c * sb[d];
             }
-            const uint64_t abase = (uint64_t)oa * (uint64_t)(M * K) + i * (uint64_t)K, bbase = (uint64_t)ob * (uint64_t)(K * N);
+            int16_t arow[256], *a = Kp <= 256 ? arow : (int16_t *)malloc((size_t)Kp * sizeof(int16_t));
+            if (!a) { failed = true; continue; }
+            const uint64_t abase = (uint64_t)oa * (uint64_t)(M * K) + i * (uint64_t)K;
             const int64_t za = azp ? ir_get_int(azp, azp->count == 1 ? 0 : i) : 0;
+            if (A->dtype == SPINGALETT_DTYPE_UINT8)
+                for (int64_t k = 0; k < K; k++) a[k] = (int16_t)(((const uint8_t *)A->data)[abase + (uint64_t)k] - za);
+            else
+                for (int64_t k = 0; k < K; k++) a[k] = (int16_t)(((const int8_t *)A->data)[abase + (uint64_t)k] - za);
+            for (int64_t k = K; k < Kp; k++) a[k] = 0;
+            const IntRows *b = rows[ob];
+            const uint64_t at0 = (bt * (uint64_t)M + i) * (uint64_t)N;
             for (int64_t j = 0; j < N; j++) {
-                const int64_t zb = bzp ? ir_get_int(bzp, bzp->count == 1 ? 0 : (uint64_t)j) : 0;
-                int64_t acc = 0;
-                for (int64_t k = 0; k < K; k++)
-                    acc += (ir_get_int(A, abase + (uint64_t)k) - za) * (ir_get_int(B, bbase + (uint64_t)(k * N + j)) - zb);
-                const uint64_t at = (bt * (uint64_t)M + i) * (uint64_t)N + (uint64_t)j;
+                const int32_t acc = dot16(a, b->rows + j * Kp, Kp);
                 if (qlinear) {
-                    double v = nearbyint((double)(int32_t)acc * (double)mult) + (double)yzp;
-                    put_int(out[0], at, v < (double)lo ? lo : v > (double)hi ? hi : (int64_t)v);
+                    double v = nearbyint((double)acc * (double)mult) + (double)yzp;
+                    put_int(out[0], at0 + (uint64_t)j, v < (double)lo ? lo : v > (double)hi ? hi : (int64_t)v);
                 } else {
-                    put_int(out[0], at, (int32_t)acc);
+                    ((int32_t *)out[0]->data)[at0 + (uint64_t)j] = acc;
                 }
             }
+            if (a != arow) free(a);
         }
     );
-    return true;
+    if (!keep) int_rows_list_free(kept);
+    return failed ? ir_fail(r, "out of memory") : true;
 }
 
 /* ------------------------------------------------------------------------- recurrent operators of hybrid models */
@@ -3723,22 +3812,22 @@ static bool k_linear(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
     return true;
 }
 
-/* FusedAttention (fusions make it): softmax(Q K^T * scale + mask) V, the softmax over the keys (with "safe", rows
-   of no keys 0, as PyTorch's safe softmax). With layout 0, over the broadcast batches of Q (..., S, D), K^T
+/* FusedAttention (fusions make it): softmax(Where(keep, Q K^T * scale, fill) + mask) V, the softmax over the keys
+   (with "safe", rows of no keys 0, as PyTorch's safe softmax); the mask and keep optional. With layout 0, over the broadcast batches of Q (..., S, D), K^T
    (..., D, T), V (..., T, Dv) and a mask broadcast to (..., S, T), into (..., S, Dv); with layout 1 (the transposes
    around attention taken in), Q (B, S, H, D), K (B, T, H or 1, D), V (B, T, H or 1, Dv) into (B, S, H, Dv), the mask
    broadcast to (B, H, S, T). Blocks of 64 queries of a batch and head at a time, each on one thread: their scores by
    a product, then the mask, the softmax (the vector exp) and their outputs by a second product. */
 static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
     if (n < 3 || m < 1 || !in[0] || !in[1] || !in[2]) return ir_fail(r, "queries, keys, values and an output are needed");
-    const IrTensor *Q = in[0], *K = in[1], *V = in[2], *mask = n > 3 ? in[3] : NULL;
-    if (Q->dtype != F32 || K->dtype != F32 || V->dtype != F32 || (mask && mask->dtype != F32 && mask->dtype != BOOL))
-        return ir_fail(r, "inputs not float32");
-    const float scale = ir_attr_float(r->node, "scale", 1.0f);
+    const IrTensor *Q = in[0], *K = in[1], *V = in[2], *mask = n > 3 ? in[3] : NULL, *keep = n > 4 ? in[4] : NULL;
+    if (Q->dtype != F32 || K->dtype != F32 || V->dtype != F32 || (mask && mask->dtype != F32 && mask->dtype != BOOL) ||
+        (keep && keep->dtype != BOOL)) return ir_fail(r, "inputs not float32, or masks of other types");
+    const float scale = ir_attr_float(r->node, "scale", 1.0f), fill = ir_attr_float(r->node, "fill", -INFINITY);
     const bool safe = ir_attr_int(r->node, "safe", 0) != 0, heads_inside = ir_attr_int(r->node, "layout", 0) == 1;
     uint32_t R;                     /* the batch's axes (layout 1: B and H) */
     int64_t dims[IR_MAX_RANK], S, D, T, Dv;
-    int64_t sq[IR_MAX_RANK], sk[IR_MAX_RANK], sv[IR_MAX_RANK], sm[IR_MAX_RANK] = {0};
+    int64_t sq[IR_MAX_RANK], sk[IR_MAX_RANK], sv[IR_MAX_RANK], sm[IR_MAX_RANK] = {0}, sw[IR_MAX_RANK] = {0};
     size_t ldq, ldk, ldv, ldy;
     if (heads_inside) {
         if (Q->rank != 4 || K->rank != 4 || V->rank != 4) return ir_fail(r, "inputs of four axes");
@@ -3796,6 +3885,14 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
         }
         broadcast_strides(mask, R + 2, full, sm);
     }
+    if (keep) {
+        if (keep->rank > R + 2) return ir_fail(r, "a mask of more axes than the scores");
+        for (uint32_t d = 0; d < keep->rank; d++) {
+            const int64_t want = full[R + 2 - keep->rank + d];
+            if (keep->dims[d] != want && keep->dims[d] != 1) return ir_fail(r, "a mask that does not broadcast to the scores");
+        }
+        broadcast_strides(keep, R + 2, full, sw);
+    }
     int64_t odims[IR_MAX_RANK];
     if (heads_inside) {
         odims[0] = dims[0]; odims[1] = S; odims[2] = dims[1]; odims[3] = Dv;
@@ -3814,7 +3911,7 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
     SPINGALETT_PARALLEL_FOR(across,
         for (int64_t it = 0; it < items; it++) {
             const int64_t blk = it % blocks, bt = it / blocks, q0 = blk * BLOCK, rows = S - q0 < BLOCK ? S - q0 : BLOCK;
-            int64_t oq = 0, ok_ = 0, ov = 0, om = 0;
+            int64_t oq = 0, ok_ = 0, ov = 0, om = 0, ow = 0;
             uint64_t t = (uint64_t)bt;
             for (uint32_t d = R; d-- > 0;) {
                 const int64_t c = (int64_t)(t % (uint64_t)dims[d]);
@@ -3823,6 +3920,7 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
                 ok_ += c * sk[d];
                 ov += c * sv[d];
                 om += c * sm[d];
+                ow += c * sw[d];
             }
             float *s = (float *)spingalett_aligned_alloc((size_t)(rows * T) * sizeof(float) + 64);
             if (!s) { failed = true; continue; }
@@ -3833,6 +3931,11 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
                                    !across && r->parallel);
             for (int64_t i = 0; i < rows; i++) {
                 float *row = s + i * T;
+                if (keep) {
+                    const uint8_t *kb = (const uint8_t *)keep->data;
+                    const int64_t base = ow + (q0 + i) * sw[R];
+                    for (int64_t j = 0; j < T; j++) if (!kb[base + j * sw[R + 1]]) row[j] = fill;
+                }
                 if (mask) {
                     const int64_t base = om + (q0 + i) * sm[R];
                     if (mask->dtype == BOOL) {

@@ -13,8 +13,8 @@
  *   --threads N                                     at most N threads (all cores by default)
  *   --save model.slett                              writes the graph as a .slett file of format 11
  *
- * Inputs are filled with values from a fixed generator: floats in [-1, 1), integers in [0, 100) (token ids, positions
- * and masks of 1 for inputs whose names say mask), booleans true.
+ * Inputs are filled with values from a fixed generator: floats in [-1, 1), integers in [0, 100) (token ids and
+ * positions; 1 for inputs whose names say mask, 0 for those whose names say type), booleans true.
  */
 
 #define SPINGALETT_SHORT_NAMES
@@ -151,14 +151,14 @@ int main(int argc, char **argv) {
         const size_t width = x->dtype == SPINGALETT_DTYPE_INT64 ? 8 : x->dtype == SPINGALETT_DTYPE_FLOAT32 ||
                              x->dtype == SPINGALETT_DTYPE_INT32 ? 4 : 1;
         x->data = malloc(count * width + 1);
-        const int mask = strstr(info.name, "mask") != NULL;
+        const int mask = strstr(info.name, "mask") != NULL, zero = strstr(info.name, "type") != NULL;
         for (size_t k = 0; k < count; k++) {
             state = state * 6364136223846793005ull + 1442695040888963407ull;
             const uint32_t bits = (uint32_t)(state >> 33);
             switch (x->dtype) {
                 case SPINGALETT_DTYPE_FLOAT32: ((float *)x->data)[k] = (float)bits / 1073741824.0f - 1.0f; break;
-                case SPINGALETT_DTYPE_INT64: ((int64_t *)x->data)[k] = mask ? 1 : bits % 100; break;
-                case SPINGALETT_DTYPE_INT32: ((int32_t *)x->data)[k] = mask ? 1 : (int32_t)(bits % 100); break;
+                case SPINGALETT_DTYPE_INT64: ((int64_t *)x->data)[k] = zero ? 0 : mask ? 1 : bits % 100; break;
+                case SPINGALETT_DTYPE_INT32: ((int32_t *)x->data)[k] = zero ? 0 : mask ? 1 : (int32_t)(bits % 100); break;
                 case SPINGALETT_DTYPE_BOOL: ((uint8_t *)x->data)[k] = 1; break;
                 default: ((uint8_t *)x->data)[k] = (uint8_t)(bits % 100); break;
             }

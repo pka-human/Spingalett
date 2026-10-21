@@ -16,18 +16,23 @@
  *                (each optional), or a Gemm by a constant matrix and row then such an activation, becomes Linear:
  *                the matrix packed once, the bias and activation in the product's epilogue (an activation after
  *                a Reshape of the product too, the Reshape then making the activation's output)
- *   attention    MatMul(Q, K^T) (Q and K^T scaled by constants or not), a scaling by a constant, an Add of a
- *                mask, Softmax over the last axis (PyTorch's safe softmax too, which zeroes rows of no keys) and
- *                MatMul by V becomes FusedAttention: blocks of 64 queries at a time, their scores never all in
- *                memory; the transposes of heads around it are taken in
- *   Conv         Conv then Relu, Sigmoid, Tanh, Gelu or SiLU: the activation in the convolution's epilogue (an
- *                attribute "activation" of the library's)
+ *   attention    MatMul(Q, K^T) (Q and K^T scaled by constants or not), a scaling by a constant, a Where keeping
+ *                scores (the rest a large negative), an Add of a mask, Softmax over the last axis (PyTorch's safe
+ *                softmax too, which zeroes rows of no keys) and MatMul by V, Casts to float between them, becomes
+ *                FusedAttention: blocks of 64 queries at a time, their scores never all in memory; the
+ *                transposes of heads around it are taken in
+ *   Conv         a channel's Mul and Add of constants and an inference BatchNormalization after a convolution folded
+ *                into new filters and a bias; then Relu, Sigmoid, Tanh, Gelu or SiLU: the activation in the
+ *                convolution's epilogue (an attribute "activation" of the library's)
+ *   norms        layer and RMS normalization over the last axis written out (ReduceMean, Sub, Pow, Sqrt, Div, a
+ *                scale and a bias) become LayerNormalization and RMSNormalization
  *
  * A fused node takes the place of the chain's last node, which runs after everything the chain reads.
  */
 
 #include "Spingalett.IR.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -362,42 +367,102 @@ static IrNode *transposed(const Fuse *f, uint32_t v, unsigned digits, uint32_t *
     return t;
 }
 
+/* The rank of a value where the graph says it: declared, or made by a Transpose's permutation or a Reshape to a
+   constant shape; -1 otherwise. */
+static int64_t rank_of(const Fuse *f, uint32_t v) {
+    const SpingalettGraph *g = f->g;
+    if (v == IR_NONE) return -1;
+    if (g->values[v].declared) return g->values[v].rank;
+    if (f->producer[v] < 0) return -1;
+    const IrNode *n = &g->nodes[f->producer[v]];
+    if (n->op == IR_Transpose) {
+        const IrAttr *p = ir_attr(n, "perm");
+        return p && p->type == ATTR_INTS ? (int64_t)p->count : -1;
+    }
+    if (n->op == IR_Reshape && n->input_count > 1 && n->inputs[1] != IR_NONE && g->values[n->inputs[1]].kind == VALUE_CONST &&
+        g->values[n->inputs[1]].rank == 1) return g->values[n->inputs[1]].dims[0];
+    return -1;
+}
+
 static bool fuse_attention(Fuse *f, IrNode *softmax) {
     SpingalettGraph *g = f->g;
-    /* the softmax over the last axis only */
+    /* the softmax over the last axis only (-1, or the last of a rank the graph tells) */
     const IrAttr *ax = ir_attr(softmax, "axis");
-    if (!(ax ? ax->type == ATTR_INT && ax->i == -1 : g->opset >= 13)) return true;
-    uint32_t scores = softmax->inputs[0], mask = IR_NONE;
-    if (!single(f, scores)) return true;
-    IrNode *add = producer_of(f, scores, IR_Add), *scale_node = NULL;
-    uint32_t before = scores;
-    if (add) {
-        /* scores + mask: the operand a product (scaled or not) makes is the scores */
-        for (int k = 0; k < 2 && mask == IR_NONE; k++) {
-            const uint32_t s = add->inputs[k];
-            if (single(f, s) && (producer_of(f, s, IR_MatMul) || producer_of(f, s, IR_Mul) || producer_of(f, s, IR_Div))) {
-                mask = add->inputs[1 - k];
-                before = s;
-            }
+    if (ax && ax->type == ATTR_INT && ax->i >= 0) {
+        IrNode *mm = NULL;
+        uint32_t v = softmax->inputs[0];
+        /* (the scores' rank: their product's operands') */
+        for (int hops = 0; hops < 3 && !mm && v != IR_NONE && f->producer[v] >= 0; hops++) {
+            IrNode *n = &g->nodes[f->producer[v]];
+            if (n->op == IR_MatMul) mm = n;
+            else v = n->inputs[0];
         }
-        if (mask == IR_NONE) return true;
+        const int64_t rank = mm ? (rank_of(f, mm->inputs[0]) > rank_of(f, mm->inputs[1]) ? rank_of(f, mm->inputs[0])
+                                                                                          : rank_of(f, mm->inputs[1])) : -1;
+        if (rank < 2 || ax->i != rank - 1) return true;
+    } else if (!(ax ? ax->type == ATTR_INT && ax->i == -1 : g->opset >= 13)) {
+        return true;
     }
-    float scale = 1.0f, c;
-    IrNode *mul = producer_of(f, before, IR_Mul), *div = producer_of(f, before, IR_Div);
-    uint32_t product = before;
-    if (mul && single(f, before)) {
-        for (int k = 0; k < 2 && product == before; k++)
-            if (scalar_of(g, mul->inputs[k], &c)) { scale = c; product = mul->inputs[1 - k]; scale_node = mul; }
-    } else if (div && single(f, before) && scalar_of(g, div->inputs[1], &c) && c != 0.0f) {
-        scale = 1.0f / c;
-        product = div->inputs[0];
-        scale_node = div;
+    /* back from the softmax's input: the mask added, a Where keeping some scores (the rest a large negative fill),
+       Casts to float (which change nothing of floats), a scaling, the product: in that order */
+    uint32_t v = softmax->inputs[0], mask = IR_NONE, keep = IR_NONE;
+    float scale = 1.0f, fill = 0.0f, c;
+    IrNode *eaten[16], *qk = NULL;
+    int count = 0, stage = 4;               /* 3 mask, 2 Where, 1 scale */
+    while (count < 12) {
+        if (!single(f, v) || f->producer[v] < 0 || f->dead[f->producer[v]]) return true;
+        IrNode *n = &g->nodes[f->producer[v]];
+        if (n->op == IR_MatMul) {
+            qk = n;
+            break;
+        }
+        if (n->op == IR_Cast && ir_attr_int(n, "to", 0) == SPINGALETT_DTYPE_FLOAT32) {
+            v = n->inputs[0];
+        } else if (n->op == IR_Add && stage > 3) {
+            /* scores + mask: the scores the operand the chain goes on from */
+            uint32_t s0 = IR_NONE;
+            for (int k = 0; k < 2 && s0 == IR_NONE; k++) {
+                const uint32_t o = n->inputs[k];
+                if (o != IR_NONE && single(f, o) && f->producer[o] >= 0) {
+                    const IrOp op = (IrOp)g->nodes[f->producer[o]].op;
+                    if (op == IR_MatMul || op == IR_Mul || op == IR_Div || op == IR_Where || op == IR_Cast) {
+                        s0 = o;
+                        mask = n->inputs[1 - k];
+                    }
+                }
+            }
+            if (s0 == IR_NONE) return true;
+            v = s0;
+            stage = 3;
+        } else if (n->op == IR_Where && stage > 2 && n->input_count == 3 && scalar_of(g, n->inputs[2], &fill) &&
+                   fill <= -1e30f) {
+            keep = n->inputs[0];
+            v = n->inputs[1];
+            stage = 2;
+        } else if ((n->op == IR_Mul || n->op == IR_Div) && stage > 1 && n->input_count == 2) {
+            if (n->op == IR_Div && scalar_of(g, n->inputs[1], &c) && c != 0.0f) {
+                scale = 1.0f / c;
+                v = n->inputs[0];
+            } else if (n->op == IR_Mul && scalar_of(g, n->inputs[1], &c)) {
+                scale = c;
+                v = n->inputs[0];
+            } else if (n->op == IR_Mul && scalar_of(g, n->inputs[0], &c)) {
+                scale = c;
+                v = n->inputs[1];
+            } else return true;
+            stage = 1;
+        } else {
+            return true;
+        }
+        eaten[count++] = n;
     }
-    IrNode *qk = producer_of(f, product, IR_MatMul);
-    if (!qk || !single(f, product)) return true;
-    /* the probabilities, or PyTorch's safe softmax of them: Where(IsNaN(p), 0, p), which makes rows of no keys 0 */
+    if (!qk) return true;
+    /* the probabilities (a Cast to float after them changes nothing), or PyTorch's safe softmax of them:
+       Where(IsNaN(p), 0, p), which makes rows of no keys 0 */
     uint32_t probs = softmax->outputs[0], slot;
-    IrNode *isnan_node = NULL, *where = NULL;
+    IrNode *isnan_node = NULL, *where = NULL, *cast = consumer_of(f, probs, IR_Cast, NULL);
+    if (cast && ir_attr_int(cast, "to", 0) == SPINGALETT_DTYPE_FLOAT32) probs = cast->outputs[0];
+    else cast = NULL;
     if (f->uses[probs] == 2) {
         for (uint32_t k = 0; k < g->node_count && (!isnan_node || !where); k++) {
             IrNode *n = &g->nodes[k];
@@ -425,18 +490,18 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
         kt = base;
     } else ks = NULL;
     /* the transposes of heads around it (Q, K and V as (B, S, H, D), the output's back to that): taken in */
-    uint32_t v = pv->inputs[1], y = pv->outputs[0], xq, xk, xv;
-    IrNode *tq = transposed(f, q, 0x0213, &xq), *tk = transposed(f, kt, 0x0231, &xk), *tv = transposed(f, v, 0x0213, &xv);
+    uint32_t vv = pv->inputs[1], y = pv->outputs[0], xq, xk, xv;
+    IrNode *tq = transposed(f, q, 0x0213, &xq), *tk = transposed(f, kt, 0x0231, &xk), *tv = transposed(f, vv, 0x0213, &xv);
     IrNode *ty = consumer_of(f, y, IR_Transpose, NULL);
     const bool layout = tq && tk && tv && ty && perm_is(ty, 0x0213) && xv != xq && xk != xq;
     if (layout) {
         q = xq;
         kt = xk;
-        v = xv;
+        vv = xv;
         y = ty->outputs[0];
     }
-    const uint32_t ins[4] = {q, kt, v, mask};
-    IrAttr attrs[3];
+    const uint32_t ins[5] = {q, kt, vv, mask, keep};
+    IrAttr attrs[4];
     memset(attrs, 0, sizeof attrs);
     attrs[0].name = ir_strdup(g, "scale", 5);
     attrs[0].type = ATTR_FLOAT;
@@ -447,7 +512,10 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
     attrs[2].name = ir_strdup(g, "layout", 6);
     attrs[2].type = ATTR_INT;
     attrs[2].i = layout;
-    if (!attrs[0].name || !attrs[1].name || !attrs[2].name) return false;
+    attrs[3].name = ir_strdup(g, "fill", 4);
+    attrs[3].type = ATTR_FLOAT;
+    attrs[3].f = fill;
+    if (!attrs[0].name || !attrs[1].name || !attrs[2].name || !attrs[3].name) return false;
     if (layout) {
         kill(f, tq);
         kill(f, tk);
@@ -458,15 +526,241 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
     kill(f, pv);
     if (qs) kill(f, qs);
     if (ks) kill(f, ks);
-    if (scale_node) kill(f, scale_node);
-    if (add) kill(f, add);
+    for (int k = 0; k < count; k++) kill(f, eaten[k]);
     kill(f, softmax);
+    if (cast) kill(f, cast);
     if (isnan_node) kill(f, isnan_node);
     if (where) kill(f, where);
-    return rewrite(f, layout ? ty : pv, IR_FusedAttention, ins, mask != IR_NONE ? 4u : 3u, y, attrs, 3);
+    const uint32_t inputs = keep != IR_NONE ? 5u : mask != IR_NONE ? 4u : 3u;
+    return rewrite(f, layout ? ty : pv, IR_FusedAttention, ins, inputs, y, attrs, keep != IR_NONE ? 4u : 3u);
+}
+
+/* ------------------------------------------------------------------------- normalizations written out */
+
+/* A ReduceMean over the last axis alone (its axes an attribute or a constant input), keeping it. */
+static bool mean_of_last(const Fuse *f, const IrNode *n) {
+    if (n->op != IR_ReduceMean || ir_attr_int(n, "keepdims", 1) == 0) return false;
+    const IrAttr *a = ir_attr(n, "axes");
+    if (a) return a->type == ATTR_INTS && a->count == 1 && a->ints[0] == -1;
+    if (n->input_count < 2 || n->inputs[1] == IR_NONE) return false;
+    const IrValue *axes = &f->g->values[n->inputs[1]];
+    return axes->kind == VALUE_CONST && axes->dtype == SPINGALETT_DTYPE_INT64 && axes->rank == 1 && axes->dims[0] == 1 &&
+           ((const int64_t *)axes->data)[0] == -1;
+}
+
+/* A constant of float32 of one axis (a scale or a bias over the last axis), or of one value. */
+static bool row_constant(const SpingalettGraph *g, uint32_t v) {
+    if (v == IR_NONE) return false;
+    const IrValue *c = &g->values[v];
+    return c->kind == VALUE_CONST && c->dtype == SPINGALETT_DTYPE_FLOAT32 && c->rank == 1;
+}
+
+/* LayerNormalization as exporters write it out: mean = ReduceMean(x), d = x - mean, var = ReduceMean(d^2),
+   (d / Sqrt(var + eps)) * gamma + beta (gamma and beta optional); and RMSNormalization: x / Sqrt(ReduceMean(x^2) + eps)
+   (or x * 1 / that) * gamma. */
+static bool fuse_layer_norm(Fuse *f, IrNode *first) {
+    SpingalettGraph *g = f->g;
+    if (!mean_of_last(f, first)) return true;
+    const uint32_t x = first->inputs[0];
+    float c, eps;
+    /* d = x - mean: read by the square and the division */
+    IrNode *sub = NULL, *pow = NULL, *mean2 = NULL;
+    for (uint32_t k = 0; k < g->node_count; k++) {
+        IrNode *n = &g->nodes[k];
+        if (!f->dead[k] && n->op == IR_Sub && n->input_count == 2 && n->inputs[0] == x && n->inputs[1] == first->outputs[0]) sub = n;
+    }
+    bool rms = false;
+    uint32_t centered = IR_NONE;
+    if (sub && single(f, first->outputs[0]) && f->uses[sub->outputs[0]] == 2) {
+        centered = sub->outputs[0];
+    } else if (!sub) {
+        /* RMS: the first mean is of x^2 */
+        IrNode *sq = producer_of(f, x, IR_Pow);
+        if (!sq || !single(f, x) || !scalar_of(g, sq->inputs[1], &c) || c != 2.0f) return true;
+        rms = true;
+        pow = sq;
+        mean2 = first;
+        centered = sq->inputs[0];
+    } else {
+        return true;
+    }
+    if (!rms) {
+        for (uint32_t k = 0; k < g->node_count && !pow; k++) {
+            IrNode *n = &g->nodes[k];
+            if (!f->dead[k] && n->op == IR_Pow && n->inputs[0] == centered && scalar_of(g, n->inputs[1], &c) && c == 2.0f) pow = n;
+        }
+        if (!pow || !single(f, pow->outputs[0])) return true;
+        mean2 = consumer_of(f, pow->outputs[0], IR_ReduceMean, NULL);
+        if (!mean2 || !mean_of_last(f, mean2)) return true;
+    }
+    IrNode *add = consumer_of(f, mean2->outputs[0], IR_Add, NULL);
+    if (!add || !scalar_of(g, other(add, mean2->outputs[0]), &eps)) return true;
+    IrNode *root = consumer_of(f, add->outputs[0], IR_Sqrt, NULL);
+    if (!root) return true;
+    /* d / root, or d * Reciprocal(root) */
+    IrNode *div = consumer_of(f, root->outputs[0], IR_Div, NULL), *inv = NULL, *scale = NULL;
+    uint32_t normed;
+    if (div && div->inputs[0] == centered && div->inputs[1] == root->outputs[0]) {
+        normed = div->outputs[0];
+    } else if ((inv = consumer_of(f, root->outputs[0], IR_Reciprocal, NULL)) &&
+               (scale = consumer_of(f, inv->outputs[0], IR_Mul, NULL)) && other(scale, inv->outputs[0]) == centered) {
+        div = NULL;
+        normed = scale->outputs[0];
+    } else return true;
+    if (!rms && !(single(f, normed) || !consumer_of(f, normed, IR_Mul, NULL))) return true;
+    if (rms && f->uses[centered] != 2) return true;
+    /* * gamma, + beta */
+    IrNode *mg = consumer_of(f, normed, IR_Mul, NULL), *ab = NULL;
+    uint32_t gamma = IR_NONE, beta = IR_NONE, y = normed;
+    if (mg && row_constant(g, other(mg, normed))) {
+        gamma = other(mg, normed);
+        y = mg->outputs[0];
+        ab = rms ? NULL : consumer_of(f, y, IR_Add, NULL);
+        if (ab && row_constant(g, other(ab, y))) {
+            beta = other(ab, y);
+            y = ab->outputs[0];
+        } else ab = NULL;
+    } else mg = NULL;
+    if (gamma != IR_NONE && beta != IR_NONE && g->values[gamma].dims[0] != g->values[beta].dims[0]) return true;
+    /* the scale: gamma, or ones (a constant made here) */
+    if (gamma == IR_NONE) return true;      /* (normalizations without a scale stay written out) */
+    IrNode *eaten[10] = {first, sub, pow, mean2, add, root, div, inv, scale, mg};
+    IrNode *last = mg;
+    if (ab) last = ab;
+    for (int k = 0; k < 10; k++) if (eaten[k]) kill(f, eaten[k]);
+    if (ab) kill(f, ab);
+    IrAttr attrs[2];
+    memset(attrs, 0, sizeof attrs);
+    attrs[0].name = ir_strdup(g, "axis", 4);
+    attrs[0].type = ATTR_INT;
+    attrs[0].i = -1;
+    attrs[1].name = ir_strdup(g, "epsilon", 7);
+    attrs[1].type = ATTR_FLOAT;
+    attrs[1].f = eps;
+    if (!attrs[0].name || !attrs[1].name) return false;
+    const uint32_t ins[3] = {rms ? centered : x, gamma, beta};
+    return rewrite(f, last, rms ? IR_RMSNormalization : IR_LayerNormalization, ins, beta != IR_NONE ? 3u : 2u, y, attrs, 2);
 }
 
 /* ------------------------------------------------------------------------- convolutions */
+
+/* A constant of float32 of one value a channel of a convolution's output of `rank` axes (channels second): its
+   values, NULL otherwise. */
+static const float *per_channel(const SpingalettGraph *g, uint32_t v, uint32_t rank, int64_t channels) {
+    if (v == IR_NONE) return NULL;
+    const IrValue *c = &g->values[v];
+    if (c->kind != VALUE_CONST || c->dtype != SPINGALETT_DTYPE_FLOAT32 || c->rank > rank) return NULL;
+    /* (right-aligned to the output's axes: the channels' axis of their count or 1, every other axis 1) */
+    for (uint32_t d = 0; d < c->rank; d++)
+        if (c->dims[d] != 1 && !(d + rank - c->rank == 1 && c->dims[d] == channels)) return NULL;
+    return (const float *)c->data;
+}
+
+/* A new constant of float32 (the graph's memory), its value's index; IR_NONE when memory runs out. */
+static uint32_t new_constant(SpingalettGraph *g, const char *name, uint32_t rank, const int64_t *dims, float **data) {
+    uint64_t count = 1;
+    for (uint32_t d = 0; d < rank; d++) count *= (uint64_t)dims[d];
+    const uint32_t v = ir_value(g, name, strlen(name));
+    if (v == IR_NONE) return IR_NONE;
+    IrValue *value = &g->values[v];
+    value->kind = VALUE_CONST;
+    value->dtype = SPINGALETT_DTYPE_FLOAT32;
+    value->rank = (uint8_t)rank;
+    value->declared = true;
+    for (uint32_t d = 0; d < IR_MAX_RANK; d++) value->dims[d] = d < rank ? dims[d] : -1;
+    value->data = ir_alloc(g, (size_t)(count ? count : 1u) * sizeof(float));
+    *data = (float *)value->data;
+    return value->data ? v : IR_NONE;
+}
+
+/* Conv with constant filters then, a channel each, Mul by a constant, Add of a constant or an inference
+   BatchNormalization of constants: the filters and the bias made anew with them folded in, once. */
+static bool fuse_conv_affine(Fuse *f, IrNode *conv) {
+    SpingalettGraph *g = f->g;
+    if (conv->input_count < 2 || conv->inputs[1] == IR_NONE || ir_attr(conv, "activation")) return true;
+    const IrValue *W = &g->values[conv->inputs[1]];
+    const IrValue *B = conv->input_count > 2 && conv->inputs[2] != IR_NONE ? &g->values[conv->inputs[2]] : NULL;
+    if (W->kind != VALUE_CONST || W->dtype != SPINGALETT_DTYPE_FLOAT32 || W->rank < 3 ||
+        (B && (B->kind != VALUE_CONST || B->dtype != SPINGALETT_DTYPE_FLOAT32 || B->rank != 1))) return true;
+    const uint32_t rank = W->rank;
+    const int64_t OC = W->dims[0];
+    uint64_t per = 1;
+    for (uint32_t d = 1; d < rank; d++) per *= (uint64_t)W->dims[d];
+    double *scale = (double *)malloc((size_t)OC * sizeof(double)), *shift = (double *)malloc((size_t)OC * sizeof(double));
+    if (!scale || !shift) { free(scale); free(shift); return false; }
+    for (int64_t c = 0; c < OC; c++) {
+        scale[c] = 1.0;
+        shift[c] = B ? ((const float *)B->data)[c] : 0.0;
+    }
+    uint32_t y = conv->outputs[0];
+    IrNode *eaten[8];
+    int count = 0;
+    while (count < 8 && single(f, y)) {
+        IrNode *n = NULL;
+        for (uint32_t k = 0; k < g->node_count && !n; k++)
+            if (!f->dead[k] && g->nodes[k].input_count > 0 && (g->nodes[k].inputs[0] == y ||
+                (g->nodes[k].input_count > 1 && g->nodes[k].inputs[1] == y))) n = &g->nodes[k];
+        if (!n) break;
+        const float *k1;
+        if ((n->op == IR_Mul || n->op == IR_Add) && n->input_count == 2 && (k1 = per_channel(g, other(n, y), rank, OC))) {
+            const IrValue *kv = &g->values[other(n, y)];
+            uint64_t kc = 1;
+            for (uint32_t d = 0; d < kv->rank; d++) kc *= (uint64_t)kv->dims[d];
+            for (int64_t c = 0; c < OC; c++) {
+                const double a = k1[kc == 1 ? 0 : c];
+                if (n->op == IR_Mul) { scale[c] *= a; shift[c] *= a; }
+                else shift[c] += a;
+            }
+        } else if (n->op == IR_BatchNormalization && n->inputs[0] == y && n->input_count >= 5 && n->output_count >= 1 &&
+                   !ir_attr_int(n, "training_mode", 0)) {
+            const float *gm = per_channel(g, n->inputs[1], 1, OC), *bt = per_channel(g, n->inputs[2], 1, OC);
+            const float *mu = per_channel(g, n->inputs[3], 1, OC), *var = per_channel(g, n->inputs[4], 1, OC);
+            bool used = false;
+            for (uint32_t o = 1; o < n->output_count; o++) used |= n->outputs[o] != IR_NONE;
+            if (!gm || !bt || !mu || !var || used) break;
+            const double eps = ir_attr_float(n, "epsilon", 1e-5f);
+            for (int64_t c = 0; c < OC; c++) {
+                const double k = (double)gm[c] / sqrt((double)var[c] + eps);
+                scale[c] *= k;
+                shift[c] = (shift[c] - mu[c]) * k + bt[c];
+            }
+        } else break;
+        eaten[count++] = n;
+        y = n->outputs[0];
+    }
+    if (!count) { free(scale); free(shift); return true; }
+    char name[96];
+    snprintf(name, sizeof name, "%.80s/filters", conv->name ? conv->name : "conv");
+    float *w, *b;
+    const int64_t bias_dims[1] = {OC};
+    const uint32_t wv = new_constant(g, name, rank, W->dims, &w);
+    snprintf(name, sizeof name, "%.80s/bias", conv->name ? conv->name : "conv");
+    const uint32_t bv = wv == IR_NONE ? IR_NONE : new_constant(g, name, 1, bias_dims, &b);
+    if (bv == IR_NONE) { free(scale); free(shift); return false; }
+    W = &g->values[conv->inputs[1]];        /* (ir_value may have moved the values) */
+    for (int64_t c = 0; c < OC; c++) {
+        for (uint64_t i = 0; i < per; i++) w[(uint64_t)c * per + i] = (float)(((const float *)W->data)[(uint64_t)c * per + i] * scale[c]);
+        b[c] = (float)shift[c];
+    }
+    free(scale);
+    free(shift);
+    /* the values' tables grew: the fusion's own copies follow */
+    int32_t *producer = (int32_t *)realloc(f->producer, (size_t)g->value_count * sizeof(int32_t));
+    uint32_t *uses = (uint32_t *)realloc(f->uses, (size_t)g->value_count * sizeof(uint32_t));
+    if (!producer || !uses) {
+        if (producer) f->producer = producer;
+        if (uses) f->uses = uses;
+        return false;
+    }
+    f->producer = producer;
+    f->uses = uses;
+    for (uint32_t v = g->value_count - 2; v < g->value_count; v++) { f->producer[v] = -1; f->uses[v] = 0; }
+    const uint32_t ins[3] = {conv->inputs[0], wv, bv};
+    IrNode *last = eaten[count - 1];
+    kill(f, conv);
+    for (int k = 0; k < count; k++) kill(f, eaten[k]);
+    return rewrite(f, last, IR_Conv, ins, 3, y, conv->attrs, conv->attr_count);
+}
 
 /* Conv then Relu, Sigmoid, Tanh, Gelu or Swish: the activation an attribute of the Conv, applied in its epilogue. */
 static bool fuse_conv_activation(Fuse *f, IrNode *conv) {
@@ -584,6 +878,8 @@ bool ir_fuse(SpingalettGraph *g) {
     }
     for (uint32_t o = 0; ok && o < g->output_count; o++) f.uses[g->outputs[o]] += 2;     /* (never single) */
     /* GELU first (Linear takes it as its activation), attention before Linear (whose products it would take) */
+    for (uint32_t k = 0; ok && k < g->node_count; k++)
+        if (!f.dead[k] && g->nodes[k].op == IR_ReduceMean) ok = fuse_layer_norm(&f, &g->nodes[k]);
     for (uint32_t k = 0; ok && k < g->node_count; k++) {
         if (f.dead[k]) continue;
         if (g->nodes[k].op == IR_Erf) ok = fuse_gelu(&f, &g->nodes[k]);
@@ -594,6 +890,8 @@ bool ir_fuse(SpingalettGraph *g) {
         if (!f.dead[k] && g->nodes[k].op == IR_Softmax) ok = fuse_attention(&f, &g->nodes[k]);
     for (uint32_t k = 0; ok && k < g->node_count; k++)
         if (!f.dead[k] && (g->nodes[k].op == IR_MatMul || g->nodes[k].op == IR_Gemm)) ok = fuse_linear(&f, &g->nodes[k]);
+    for (uint32_t k = 0; ok && k < g->node_count; k++)
+        if (!f.dead[k] && g->nodes[k].op == IR_Conv) ok = fuse_conv_affine(&f, &g->nodes[k]);
     for (uint32_t k = 0; ok && k < g->node_count; k++)
         if (!f.dead[k] && g->nodes[k].op == IR_Conv) ok = fuse_conv_activation(&f, &g->nodes[k]);
     if (ok) {
