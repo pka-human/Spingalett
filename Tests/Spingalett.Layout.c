@@ -136,6 +136,7 @@ int main(void) {
     FIELD(SpingalettSampling, frequency_penalty); FIELD(SpingalettSampling, presence_penalty);
     FIELD(SpingalettSampling, penalty_window); FIELD(SpingalettSampling, tokenizer);
     FIELD(SpingalettSampling, stop_strings); FIELD(SpingalettSampling, stop_string_count);
+    FIELD(SpingalettSampling, on_token); FIELD(SpingalettSampling, user);
     SIZE(SpingalettModelOpenArgs); FIELD(SpingalettModelOpenArgs, reserved);
     FIELD(SpingalettModelOpenArgs, path); FIELD(SpingalettModelOpenArgs, context);
     SIZE(SpingalettSessionOptions); FIELD(SpingalettSessionOptions, reserved);

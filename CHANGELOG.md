@@ -22,6 +22,13 @@ All notable changes to this project are documented in this file. The format foll
   DeepSeek-R1's distillations, Granite 3.3, OLMo 2, GLM-4 (two) and Falcon 3 to transformers' text byte for byte, or
   to their errors (192 cases, `Tests/make_chat_tests.py`). Python: `Tokenizer.chat_template`,
   `Tokenizer.apply_chat_template(messages, add_generation_prompt, tools, **variables)` and `render_chat_template()`.
+- **`Examples/Runtime/Chat.c`**: a chat with a GGUF model in the terminal on the runtime alone: the model's chat
+  template renders the conversation every turn, the session keeps the tokens it shares with the turn before and
+  is fed the rest, the reply streams as it is drawn (min-p, top-p, temperature, a repeat penalty), and ends at EOS or
+  a token that ends turns in the common templates.
+- **Streams of tokens**: `SpingalettSampling.on_token` (`SpingalettTokenCallback`) is called with each token
+  `spingalett_session_generate()` and `spingalett_generate()` draw, as they draw it; false ends the sequence.
+  Python's `generate()` methods take `on_token`.
 - **SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files**: `spingalett_model_open()` opens the architectures `smollm3`
   (every fourth layer without rotary embeddings), `olmo2` (the attention's and the MLP's outputs normalized and not
   their inputs, queries and keys normalized over all heads as layers of their own; OLMo 3's windows), `phi3` (Phi-3

@@ -207,6 +207,7 @@ typedef struct {
 bool spingalett_session_feed(SpingalettSession *session, const SpingalettSessionFeed *feeds, uint32_t count);
 bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
 bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
+typedef bool (*SpingalettTokenCallback)(void *user, uint32_t sequence, uint32_t token);
 typedef struct {
     float min_p;
     float repetition_penalty;
@@ -216,7 +217,9 @@ typedef struct {
     const SpingalettTokenizer *tokenizer;
     const char *const *stop_strings;
     uint32_t stop_string_count;
-    uint64_t reserved[8];
+    SpingalettTokenCallback on_token;
+    void *user;
+    uint64_t reserved[8 - 2];
 } SpingalettSampling;
 typedef struct {
     SpingalettSession *session;

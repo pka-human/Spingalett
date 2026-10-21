@@ -540,7 +540,9 @@ class _Sampling(Structure):
         ("tokenizer", c_void_p),
         ("stop_strings", POINTER(c_char_p)),
         ("stop_string_count", c_uint32),
-        ("reserved", c_uint64 * _RESERVED),
+        ("on_token", ctypes.CFUNCTYPE(c_bool, c_void_p, c_uint32, c_uint32)),
+        ("user", c_void_p),
+        ("reserved", c_uint64 * (_RESERVED - 2)),
     ]
 
 
@@ -2077,7 +2079,7 @@ class Network:
     def generate(self, prompt, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
                  seed: int = 0, stop=(), min_p: float = 0.0, repetition_penalty: float = 1.0,
                  frequency_penalty: float = 0.0, presence_penalty: float = 0.0, penalty_window: int = 64,
-                 stop_strings=(), tokenizer=None) -> List[int]:
+                 stop_strings=(), tokenizer=None, on_token=None) -> List[int]:
         """Continue a prompt (token ids) by ``count`` tokens, a token at a time, with a causal language model
         whose outputs are the logits of every token of its vocabulary for each input token: the most likely
         token (``temperature`` 0), or a draw from the softmax of the logits over ``temperature`` among the
@@ -2085,7 +2087,8 @@ class Network:
         the most likely. ``repetition_penalty``, ``frequency_penalty`` and ``presence_penalty`` are llama.cpp's, over
         the last ``penalty_window`` tokens. ``seed`` (0: the library's generator) makes draws repeatable; a token of
         ``stop``, or a text of ``stop_strings`` (decoded by ``tokenizer``), ends the generation (the token is
-        returned last). On the CPU a causal model runs as its deployment model of single precision in a
+        returned last); ``on_token(sequence, token)`` is called with each token as it is drawn (False ends the
+        generation). On the CPU a causal model runs as its deployment model of single precision in a
         :class:`Session`, each token computed once."""
         p = np.ascontiguousarray(np.asarray(prompt, dtype=np.uint32).ravel())
         if p.size == 0:
@@ -2094,7 +2097,7 @@ class Network:
         out = np.zeros(max(int(count), 0), dtype=np.uint32)
         u32 = POINTER(c_uint32)
         sampling, keep = _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, penalty_window,
-                                   stop_strings, tokenizer)
+                                   stop_strings, tokenizer, on_token)
         args = _GenerateArgs(self._ptr, p.ctypes.data_as(u32), p.size, out.ctypes.data_as(u32), out.size,
                              float(temperature), int(top_k), float(top_p), int(seed),
                              s.ctypes.data_as(u32) if s.size else None, s.size, sampling)
@@ -2641,7 +2644,7 @@ class Session:
     def generate(self, prompts, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
                  seed: int = 0, stop=(), min_p: float = 0.0, repetition_penalty: float = 1.0,
                  frequency_penalty: float = 0.0, presence_penalty: float = 0.0, penalty_window: int = 64,
-                 stop_strings=(), tokenizer=None) -> List[List[int]]:
+                 stop_strings=(), tokenizer=None, on_token=None) -> List[List[int]]:
         """Continue sequences 0 .. len(prompts) - 1 together, each first fed its prompt (token ids, at least
         one), by up to ``count`` tokens each, drawn as :meth:`Network.generate` draws (sequence b with
         seed ``seed + b``; the penalties over its prompt and the tokens it generated); a token of ``stop`` or a
@@ -2658,7 +2661,7 @@ class Session:
         made = (c_uint32 * len(ps))()
         s = np.ascontiguousarray(np.asarray(list(stop), dtype=np.uint32))
         sampling, keep = _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, penalty_window,
-                                   stop_strings, tokenizer)
+                                   stop_strings, tokenizer, on_token)
         args = _SessionGenerateArgs(self._session(), len(ps), pointers, lengths, out.ctypes.data_as(u32), made, count,
                                     float(temperature), int(top_k), float(top_p), int(seed),
                                     s.ctypes.data_as(u32) if s.size else None, s.size, sampling)
@@ -2923,12 +2926,24 @@ class Tokenizer:
         return f"Tokenizer(vocabulary={self.vocabulary}, bos={self.bos}, eos={self.eos})"
 
 
-def _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, penalty_window, stop_strings, tokenizer):
+_OnToken = ctypes.CFUNCTYPE(c_bool, c_void_p, c_uint32, c_uint32)
+
+
+def _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, penalty_window, stop_strings, tokenizer,
+              on_token=None):
     """The SpingalettSampling of generate()'s keyword arguments, and what it points to; (None, None) when it has
-    nothing to say."""
+    nothing to say. on_token(sequence, token) is called with each token as it is drawn; False ends the sequence."""
     strings = [x.encode("utf-8") for x in stop_strings]
-    if not (min_p or repetition_penalty not in (0, 1) or frequency_penalty or presence_penalty or strings):
+    if not (min_p or repetition_penalty not in (0, 1) or frequency_penalty or presence_penalty or strings or on_token):
         return None, None
+    callback = None
+    if on_token is not None:
+        def call(_user, sequence, token):
+            try:
+                return on_token(int(sequence), int(token)) is not False
+            except Exception:
+                return False
+        callback = _OnToken(call)
     if strings and tokenizer is None:
         raise ValueError("stop_strings need the tokenizer that decodes the tokens")
     array = (c_char_p * max(len(strings), 1))(*strings)
@@ -2937,7 +2952,9 @@ def _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, pe
                   penalty_window=int(penalty_window) & 0xFFFFFFFF,
                   tokenizer=tokenizer._handle if tokenizer is not None else None,
                   stop_strings=array if strings else None, stop_string_count=len(strings))
-    return ctypes.pointer(s), (array, tokenizer)
+    if callback is not None:
+        s.on_token = callback
+    return ctypes.pointer(s), (array, tokenizer, callback)
 
 
 def _render_chat(handle, template, messages, add_generation_prompt, tools, time, variables) -> str:

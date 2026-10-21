@@ -51,9 +51,10 @@ void spingalett_generate_release(NeuralNetwork *net) {
 }
 
 static bool is_stop(const SpingalettGenerateArgs *a, uint32_t token, uint32_t made) {
-    for (uint32_t k = 0; k < a->stop_count; k++)
-        if (a->stop_tokens[k] == token) return true;
-    return spingalett_stop_string(a->sampling, a->tokens, made);
+    bool stop = spingalett_stop_string(a->sampling, a->tokens, made);
+    for (uint32_t k = 0; k < a->stop_count && !stop; k++) stop = a->stop_tokens[k] == token;
+    if (a->sampling && a->sampling->on_token && !a->sampling->on_token(a->sampling->user, 0, token)) stop = true;
+    return stop;
 }
 
 /* The next token of a row of logits of the sequence seq[0 .. length): the penalties of its last tokens, then the

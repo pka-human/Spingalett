@@ -218,6 +218,9 @@ SPINGALETT_API bool spingalett_session_rewind(SpingalettSession *session, uint32
    serves several continuations. */
 SPINGALETT_API bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
 
+/* A token drawn for sequence `sequence` (spingalett_session_generate(), spingalett_generate()). */
+typedef bool (*SpingalettTokenCallback)(void *user, uint32_t sequence, uint32_t token);
+
 /* More of llama.cpp's ways of drawing tokens, for spingalett_session_generate() and spingalett_generate(): the
    penalties apply to the logits before the draw (and before the most likely token is taken at temperature 0), in
    llama.cpp's way; min_p after the temperature, top_k and top_p, as transformers applies it. */
@@ -235,7 +238,11 @@ typedef struct {
                                                text of the tokens it generated holds one (the token that completes it
                                                is its last) */
     uint32_t stop_string_count;
-    uint64_t reserved[SPINGALETT_RESERVED];
+    SpingalettTokenCallback on_token;       /* called with each token as it is drawn, in the order of the draws (a
+                                               stream of text); false ends that sequence's generation (the token is
+                                               its last) */
+    void *user;                     /* on_token's first argument */
+    uint64_t reserved[SPINGALETT_RESERVED - 2];
 } SpingalettSampling;
 
 typedef struct {

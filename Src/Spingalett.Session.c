@@ -1003,6 +1003,8 @@ uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args) {
             bool stop = made[b] == args.count || s->length[b] == s->max_length;
             for (uint32_t k = 0; k < args.stop_count && !stop; k++) stop = args.stop_tokens[k] == token;
             stop = stop || spingalett_stop_string(args.sampling, generated, made[b]);
+            if (args.sampling && args.sampling->on_token && !args.sampling->on_token(args.sampling->user, b, token))
+                stop = true;
             going[b] = !stop;
             any = any || going[b];
             if (s->length[b] == s->max_length) continue;
