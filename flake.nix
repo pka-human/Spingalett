@@ -16,7 +16,7 @@
       packages = forAll (pkgs: rec {
         spingalett = pkgs.stdenv.mkDerivation {
           pname = "spingalett";
-          version = "1.4.0";
+          version = "1.4.1";
           src = self;
           nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.shaderc ];
           buildInputs = [ pkgs.vulkan-headers ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.llvmPackages.openmp ];

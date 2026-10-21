@@ -6,7 +6,7 @@
 class Spingalett < Formula
   desc "Neural networks in C: training on CPUs and GPUs, transformers, INT8 to INT2 deployment"
   homepage "https://github.com/pka-human/Spingalett"
-  url "https://github.com/pka-human/Spingalett/archive/refs/tags/v1.4.0.tar.gz"
+  url "https://github.com/pka-human/Spingalett/archive/refs/tags/v1.4.1.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
   head "https://github.com/pka-human/Spingalett.git", branch: "main"

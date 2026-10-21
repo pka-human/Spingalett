@@ -78,7 +78,7 @@ final class Library
         self::$ffi = self::checked($ffi, $path);
     }
 
-    /** The library's version ("1.4.0"). */
+    /** The library's version ("1.4.1"). */
     public static function version(): string
     {
         return (string) Native::string(self::ffi()->spingalett_version());
