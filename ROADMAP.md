@@ -26,83 +26,150 @@ against PyTorch on the same machine.
 | 1.2 | "Transformers": embeddings, multi-head attention (grouped-query, causal, rotary), RMS normalization, products of layers, GELU and SiLU, the sparse cross-entropy, `.slett` format 8, in training on the CPU and both GPU backends, the engine, deployment models and the runtime; token files, text generation, GPT-2 and LLaMA checkpoints in Python, a character-level GPT example; on CUDA flash attention on the tensor cores, register-tiled attention in single precision, GELU and SiLU in the products' epilogues, the weights' bfloat16 copy for sequences and images, block order kept in L2: ahead of PyTorch at its fastest (`torch.compile` with `max-autotune`) in every workload but the GPT in bfloat16 (0.91 times in training); bindings for Rust, .NET, Go and Java; Debian and RPM packages, AUR, Homebrew, Scoop, Nix, a container image, conda |
 | 1.3 | "Language models in production": sessions with a key-value cache on the CPU and both GPU backends (batched generation, sliding windows), deployment models predicting on the GPU (integer ones to the CPU's bits) and weight-only INT8, INT4 and INT2 decoding, tokenizers and Hugging Face and GGUF checkpoints in C and every binding, tied embeddings, activation recomputation, gradient accumulation, schedules by step, padding, sliding windows and cross-attention in training, ONNX import of transformers, the engine in WebAssembly (npm), PHP bindings; ahead of PyTorch where 1.2 was not: the GPT in bfloat16 on CUDA ahead of `torch.compile` (1.02 times in training, 1.05 in inference), transformers' training on the CPU (linear layers' weight gradients on the dense products in slots of tokens, GELU and SiLU in vectors, element-wise passes in pieces: the GPT 1.05 times as fast as PyTorch on one thread and 1.64 times on eight), and on Vulkan flash attention on cooperative matrices and register-tiled attention in single precision (the GPT trained 3.1 times as fast in bfloat16 and 1.9 times in single precision, there within 5% of CUDA) |
 | 1.4 | "GGUF on the CPU": language models' GGUF files run as they are stored (`spingalett_model_open()`: LLaMA 1 to 3.x, Mistral, Qwen2 and 2.5, Qwen3, Gemma 3, GPT-2), GGUF's quantization types as block precisions of `.slett` format 10 (Q8_0 to IQ4_XS, quantized byte for byte as llama.cpp's quantizers do), computed in their blocks by AVX2 and VNNI kernels with the engine's bits, the attention of today's families (normalized queries and keys, rotary frequencies of their own, embeddings' scales), sessions' attention in vectors, prompts split between the threads by their work; on an i7-12650H faster than llama.cpp on the same files (prompts 1.6 to 2.9 times as fast, generation 1.00 to 1.10 times); checkpoints of training runs that resume to the bits of an uninterrupted run, positions of data set readers |
+| 1.5 | "Graphs of operators": any ONNX model run as it is (`spingalett_graph_open()`, `spingalett_graph_run()`, in the runtime, Python and C++): 155 operators with ONNX's semantics over tensors of up to eight axes with symbolic sizes, `.slett` format 11, constants folded, common subexpressions, fusions into the library's kernels (products by constant matrices with their epilogues, attention in blocks, layer and RMS normalization, GELU and SiLU written out, convolutions with their batch normalization and activation), the same bits on any number of threads; ONNX's 1262 conformance cases, whole models against PyTorch and ONNX files of other tools against ONNX Runtime; language models in programs (tokenizers in the runtime, chat templates, sampling as llama.cpp offers it, SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF, a chat on the runtime alone) |
 
-## Language models: any GGUF, faster than llama.cpp
+## Every model: graphs of operators
 
-From 1.4 the releases aim at what llama.cpp and PyTorch do for language models: run the checkpoints
-people download (any GGUF file of a common architecture, and Hugging Face's directories) on the CPU and
-both GPU backends, faster than llama.cpp on the same machine and file. A model's file holds its weights
-and hyper-parameters, not its computation: every architecture is code of the library's, built from
-blocks (norms, attention and its positions, gated MLPs, experts, recurrent layers). 1.3 has the blocks of
-GPT-2, LLaMA 1 and 2, Mistral and Qwen2/2.5 (and loads those GGUF files, their weights expanded to
-float); 1.4 runs GGUF files of those and of LLaMA 3, Qwen3 and Gemma 3 as they are stored, on the CPU; 1.5 to
-1.7 add the GPU, the other families, experts and recurrent layers, and a command-line program in a repository
-of its own, on the runtime library, serves them (**SaLaM**, below).
+Up to 1.4 a model is a chain or graph of the library's fifteen kinds of layers over one sample of at most three
+axes, each kind a record of fixed fields, and every family of models beyond them is code of the library's: a new
+field in the record, a branch in the kernels of the CPU, CUDA and Vulkan, a branch in the converters. That grows
+with every family rather than with every new primitive, and it leaves out whatever is not made of those layers:
+models of several inputs (diffusion's latents, timesteps and texts), tensors of four axes and more, broadcasting,
+group normalization, the text encoders of image models.
 
-GGUF is read because that is where the models are; `.slett` stays the library's own format and grows
-to hold language models as well as GGUF does, with what GGUF cannot: a `.slett` file holds the network's
-graph, not only its weights, so a model converted once runs on any later runtime without code of its
-family, the engine runs its image in place, and its integer precisions compute the same bits on every
-backend.
+From 1.5 a model can be a graph of operators over tensors of any rank, with its weights and its configuration. The
+operators are primitives at the level of ONNX's kernels and a few composite ones with a reference decomposition into
+them; the library's layers and kernels (attention, normalizations, gated MLPs, the block precisions, sessions) are
+what its passes fuse a graph into, not what a model must be made of. A graph of known operators runs on any later
+runtime without code of its family, slowly where no pass applies; the code of an architecture lives only in the
+converters (ONNX, GGUF, Hugging Face's directories, PyTorch) and in the passes. The models of formats 3 to 10, the
+engine for microcontrollers and the training API go on as they are: the graph is a new path beside them, which the
+layer models join once it runs them no slower (1.6).
 
-Each release measures against llama.cpp on the same GGUF files (`llama-bench`: prompt processing of 512
-tokens, generation of 128, at 1 and 8 threads, on CUDA and on Vulkan) as well as against PyTorch, and
-checks each family on real checkpoints: the logits of a prompt against transformers', the tokens of
-greedy generation against llama.cpp's.
+The target that keeps this honest is diffusion: SDXL and FLUX.1 run with no line of code specific to diffusion in the
+executor (1.7). Language models keep their bar: on the same GGUF files faster than llama.cpp (`llama-bench`: prompt
+processing of 512 tokens, generation of 128, at 1 and 8 threads, on CUDA and on Vulkan) and against PyTorch, each
+family checked on real checkpoints (the logits of a prompt against transformers', the tokens of greedy generation
+against llama.cpp's). **SaLaM** (below), a program of its own on the runtime, serves them.
 
-## 1.5: language models on the GPU and in programs
+## 1.5: graphs of operators (released)
 
-What 1.4 left of running today's dense models as llama.cpp runs them: their GGUF files on both GPU backends,
-the families 1.4 does not open, and what a program serving them needs from the runtime.
+The foundation, on the CPU, with the language-model work of 1.5 that needed no new format.
 
-- **GGUF's block types on the GPU**: sessions of models of the block precisions on CUDA and Vulkan, the weights
-  kept in their blocks in the GPU's memory (a 1B model in Q4_K_M takes 800 MB of it, not the 5 GB of its
-  floats) and multiplied as they are read: products of a token bound by memory (dp4a and the integer dot
-  products of Vulkan), products of a prompt on the matrix units (the blocks decoded into tiles); the attention of
-  format 10 (normalized queries and keys, frequencies of its own, embeddings' scales) in the GPU's kernels.
-- **The CPU's other instruction sets**: the block kernels of 1.4 on NEON with the dot product (Apple silicon,
-  AArch64 servers) and on AVX-512 VNNI's 512-bit vectors.
-- **The other families**: Phi-3 and Phi-4 mini (fused gate and up, part of a head rotated, LongRoPE's two sets
-  of frequencies), Gemma 2 (soft-capped logits), OLMo 2 (normalizations of the queries and keys over the whole
-  layer), GLM-4, SmolLM3 (layers without rotary embeddings), YaRN's scaling; training of format 10's attention
-  (`spingalett_load()` of such models, fine-tuning).
-- **The runtime reads language models**: the tokenizers (`Tokenizer.c`, the GGUF vocabularies) in the runtime
-  library, so that a program serves a model with the runtime alone; Hugging Face's directories as deployment
-  models, quantized in a block precision as they are read.
-- **Generation as llama.cpp offers it**: min-p sampling, repetition, frequency and presence penalties, stop
-  strings; chat templates (the subset of Jinja that GGUF's `tokenizer.chat_template` uses, rendered in C); the
-  key-value cache in FP16 or 8 bits; a prompt's cache kept between requests and the context shifted when it
-  fills.
-- **`.slett` for language models**: the tokenizer, its special tokens, the chat template and generation's
-  defaults in the file; sections aligned for mapping, the weights used where they lie, checksums verified a
-  section at a time when first read rather than over gigabytes at loading.
+- **The IR**: tensors of up to eight axes, their sizes numbers or named symbols, the symbols checked at every run;
+  float32, float16, bfloat16, int64, int32, int8, uint8 and bool; several named inputs and outputs. 155 operators with
+  ONNX's names and semantics (opsets 7 to 28, earlier forms where they differ): element-wise arithmetic, comparisons,
+  logic and bitwise operators and functions with broadcasting, products and convolutions of one to three spatial
+  axes, pooling, normalizations, reductions, shapes and data, Resize in every mode, quantization, Einsum, opset 23's
+  Attention and RotaryEmbedding, opset 27's LinearAttention and CausalConvWithState, SwiGLU; three of the library's
+  own that fusions make (Linear, FusedAttention, Conv with an activation).
+- **`.slett` format 11**: values (type, shape with symbols), nodes, typed attributes, the opset, constants at offsets
+  of 64 used where a mapped file holds them; checksums of the tables, not the constants.
+- **The executor** (`spingalett_graph_open()`, `spingalett_graph_run()`; in the runtime and Python): kernels
+  for every operator that sum in fixed orders (the same bits on any number of threads), the library's row kernel
+  under products by constants (packed once) and its channels-last kernels under convolutions, a pool of buffers kept
+  between runs, values freed after their last reader, shape operators as views.
+- **Passes**: constant folding, dead nodes, common subexpressions; fusions: Linear (a product by a constant matrix,
+  its bias and activation), FusedAttention (Q K^T, scale, mask, softmax and V in blocks of 64 queries, the heads'
+  transposes taken in), GELU and SiLU from their written-out forms, a convolution's activation; each compared with
+  the graph without it.
+- **Converters**: ONNX one operator to one; PyTorch through `torch.onnx` in Python (`Graph.from_torch()`).
+- **Checked**: ONNX's 1262 conformance cases of single operators that hold the library's types (the `operators`
+  group, on one and four threads, under the sanitizers of GCC and Clang); whole models exported from PyTorch against
+  PyTorch (`Tests/check_graph_models.py`): ResNet-50, ViT-B/16, BERT-base, GPT-2, CLIP's text encoder, Whisper's
+  encoder, Stable Diffusion's VAE decoder, a UNet of SDXL's architecture, within 1e-5 and at 0.63 to 0.94 times
+  PyTorch's speed; transformers.js's ONNX files against ONNX Runtime (`Tests/check_graph_files.py`). The layer
+  models and their benchmarks are untouched and no slower (Examples/Benchmark.c's CPU workloads and GGUF sessions
+  measured against 1.4).
+- **Language models in programs**: the tokenizers in the runtime; chat templates (the Jinja of
+  `tokenizer.chat_template` rendered as transformers renders it); sampling as llama.cpp offers it (min-p, repeat,
+  frequency and presence penalties, stop strings, a stream of tokens) and draws that sort only what they reach;
+  SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files on 1.4's layers; a chat in the terminal on the runtime alone.
+- **Decided**: an opset of the library's own, ONNX's semantics where ONNX has them (free references) and its own
+  operators where it has not; no control flow in graphs (generation loops and samplers stay code of the host);
+  training through graphs waits for 2.0 (the training API stays the layers'); the engine for microcontrollers runs
+  layer models until a static subset of graphs reaches it (1.12).
+- **Moved to 1.6**, where language models and the GPU need them: GGUF's block types as types of constants, the
+  metadata of a model in format 11 (a tokenizer, a chat template, generation's defaults), shapes inferred when a
+  graph opens (kernels compute them as they run in 1.5) and composite operators' decompositions into primitives
+  for backends without their kernels.
 
-## 1.6: mixture of experts
+## 1.6: language models on the graph and on the GPU
+
+What was planned for 1.5 before the IR, built on it: the families become converters, the GPU an executor of graphs.
+
+- **What the IR still lacks for them**: GGUF's block types as types of constants (`MatMul` and `Gather` by them in
+  1.4's kernels), a model's metadata in format 11 (a tokenizer, a chat template, generation's defaults, the family
+  as a hint to the passes), shapes inferred when a graph opens (and buffers planned from them), composite operators'
+  decompositions into primitives for backends without their kernels. Graphs run as fast as PyTorch on the CPU in
+  more places: activations kept channels-last between convolutions (1.5 transposes around each), GroupNorm written
+  out as InstanceNormalization fused back, the transposes of heads around attention taken in wherever exporters write
+  them.
+
+- **GGUF and Hugging Face's directories as graphs**: `Gguf.c` and `Pretrained.c` as generators of graphs from a
+  family's metadata, families added as converters alone: Gemma 2 (soft-capped scores and logits: `Tanh` and `Mul`),
+  Phi-4 mini (part of a head rotated, LongRoPE's magnitude), YaRN, Granite's multipliers, Mistral's and Qwen's newest
+  dense models; Hugging Face's directories quantized into a block dtype as they are read.
+- **Sessions of graphs**: a session's named state (key-value caches, windows as rings), the graph's operators reading and
+  writing it, so that a decoder fed a token at a time is a graph like any other; the key-value cache in FP16 or 8
+  bits; a prompt's cache kept between requests, the context shifted when it fills.
+- **No slower than 1.4**: passes that fuse a language model's graph into 1.4's block kernels, sessions' attention and
+  their threads, measured with `llama-bench` on 1.4's files; then the layer models of formats 3 to 10 read as graphs
+  of composite operators with the same kernels, measured on every benchmark of README.
+- **The GPU executor**: CUDA and Vulkan kernels for the operators, an operator without one run on the CPU with its
+  data moved (a warning, and CI counting the coverage); GGUF's block types on the GPU: products of a token bound by
+  memory (dp4a, Vulkan's integer dot products), products of a prompt on the matrix units, the weights kept in their
+  blocks (a 1B model in Q4_K_M takes 800 MB of the GPU, not 5 GB).
+- **The CPU's other instruction sets** for the block kernels: NEON with the dot product (Apple silicon, AArch64
+  servers), AVX-512's 512-bit vectors.
+- **Tokenizers**: SentencePiece's Unigram (T5, many multilingual models) and WordPiece (BERT's encoders and embedding
+  models).
+- **Operators of the program's own**: a reference kernel registered by the program (and optionally GPU kernels),
+  named in the graph's opset.
+
+## 1.7: diffusion
+
+- **SDXL first**: its UNet, VAE and text encoders (CLIP-L, OpenCLIP bigG) from diffusers' directories and GGUF files,
+  in float16 and block dtypes; then **FLUX.1** (schnell and dev) with T5-XXL (Unigram) and its double and single
+  stream blocks, the only code of either being its converter.
+- **The GPU's kernels and fusions** for what diffusion spends its time in: group normalization with SiLU, adaLN's
+  scale and shift, attention over the tokens of an image, convolutions in bfloat16 and block dtypes, memory planned
+  for 1024 x 1024 images on a laptop's GPU.
+- **Sampling outside the graph**: Euler, DPM++ 2M and flow matching (with its shifted schedule), classifier-free
+  guidance as a batch of two, seeds and noise the same on every backend; a library of the runtime that SaLaM and the
+  examples call.
+- Measured against diffusers with `torch.compile` and against stable-diffusion.cpp on the same files: seconds an
+  image at 1024 x 1024 on the CPU, CUDA and Vulkan.
+
+## 1.8: mixture of experts
 
 - **A layer of experts** with a learned router (top-k gating, softmax or sigmoid scores, shared
   experts), the experts' products batched by expert, in inference and in training (the load-balancing
-  loss): Mixtral, Qwen3's and Qwen3.5's MoE models, gpt-oss, Llama 4, GLM-4.5 Air, OLMoE.
+  loss): Mixtral, Qwen3's and Qwen3.5's MoE models, gpt-oss, Llama 4, GLM-4.5 Air, OLMoE. In graphs a composite
+  operator (`TopK`, `Softmax`, gathers and batched `MatMul` its reference decomposition), with kernels of its own.
 - **Attention sinks** (gpt-oss: a learned logit in each head's softmax) and sliding windows alternating
-  with full attention by layer; MXFP4 weights (gpt-oss's GGUF files).
+  with full attention by layer; MXFP4 weights (gpt-oss's GGUF files), as a dtype.
 - **Experts kept on the host** while attention and the dense layers run on the GPU (the offload that
   makes 30B models of 3B active parameters fit a laptop's GPU), and layers split between the CPU and the
-  GPU for any model larger than the GPU's memory.
+  GPU for any model larger than the GPU's memory: placement as a pass over the graph.
 - **Speculative decoding** with a draft model (several tokens checked in one pass, the bits of plain
   sampling kept).
 
-## 1.7: hybrid models: linear attention and state spaces
+## 1.9: hybrid models: linear attention and state spaces
 
 - **Gated DeltaNet** (Qwen3.5, Qwen3-Next) with its short causal convolution and gated output, and
   attention with a gated output beside it; **Mamba-2** (Falcon-H1, Granite 4, Nemotron-H). Layers whose
   state is a matrix carried from token to token instead of a key-value cache: sessions keep it per
   sequence (rewound by checkpoints of the state), training runs the chunked parallel form, the GPU
-  backends scan in fixed orders. With 1.6's experts this opens every Qwen3.5 model, Qwen3.5-2B among them.
+  backends scan in fixed orders. In graphs the scans are composite operators whose reference decomposition is
+  their chunked form, the state the session's named state of 1.6. With 1.8's experts this opens every Qwen3.5
+  model, Qwen3.5-2B among them.
 - **Recurrent layers** (GRU, LSTM) on the same scans, as layers of the same graphs as attention.
 - **Multimodal inputs**: the vision encoders of these models (Qwen3.5's, Gemma 3's: patch embeddings,
-  their own attention) and audio frames, inputs of several kinds in one network.
+  their own attention) and audio frames, inputs of several kinds in one graph.
 - **ALiBi positions** and block-sparse masks in the flash kernels, for the models that use them.
 
-## 1.8: beyond neural networks: trees and the classical toolbox
+## 1.10: beyond neural networks: trees and the classical toolbox
 
 Most of the machine learning in production still runs on tables, and there gradient-boosted trees
 (XGBoost, LightGBM, CatBoost) beat neural networks; they are also the models most often run on
@@ -134,7 +201,7 @@ Measured against XGBoost, LightGBM and CatBoost (time to the same validation los
 throughput on Higgs, Covertype and Epsilon, on the CPU and the GPU) and against Treelite's compiled
 trees.
 
-## 1.9: learning from rewards: reinforcement learning and evolution
+## 1.11: learning from rewards: reinforcement learning and evolution
 
 Networks trained by the consequences of what they do rather than by labelled examples, wherever a
 program can score an outcome: characters and opponents in games (a character that learns to walk,
@@ -159,20 +226,20 @@ does.
 - **Algorithms**: PPO (discrete actions and continuous ones from Gaussian policies, generalized
   advantage estimation, clipping, an entropy bonus), SAC for continuous control from a replay buffer,
   DQN with its double and dueling variants for discrete actions; observations and rewards normalized by
-  running statistics saved with the policy; recurrent policies on 1.7's layers. Several agents in one
+  running statistics saved with the policy; recurrent policies on 1.9's layers. Several agents in one
   environment, each with a policy of its own or one shared, and self-play against a league of their past
   versions; tree search guided by a network's policy and value (AlphaZero's) for board games and for
   planning where the program can simulate a move. Every draw from a seed, the environments' too: a run
   repeats its bits on any number of threads, and resumes from a checkpoint as supervised training does.
 - **Bandits** for decisions whose reward comes at once (which item to recommend, which price or variant
-  to show): epsilon-greedy, LinUCB and Thompson sampling over 1.8's linear models or over networks, and
+  to show): epsilon-greedy, LinUCB and Thompson sampling over 1.10's linear models or over networks, and
   a new policy evaluated on logged decisions before it serves (inverse propensity and doubly robust
   estimates).
 - **Learning from logs** where exploring is costly or unsafe: behaviour cloning from recorded play or
   operation (a person's demonstrations, a running system's decisions) to start from before rewards take
   over, and offline reinforcement learning (implicit and conservative Q-learning) on recorded
   transitions, read as `.slettd` data sets.
-- **Language models from rewards and preferences**: the transformers of 1.4 to 1.7 tuned by GRPO (groups
+- **Language models from rewards and preferences**: the transformers of 1.4 to 1.9 tuned by GRPO (groups
   of completions sampled by the sessions' batched generation, scored by the program's function: tests
   passed, an answer checked, a format kept) and by DPO from pairs of preferred and rejected answers;
   low-rank adapters (LoRA), which train a small share of the parameters, serve supervised fine-tuning as
@@ -200,23 +267,25 @@ Measured against Stable-Baselines3 and CleanRL (wall time to the same returns on
 HalfCheetah and Humanoid in MuJoCo and on Atari games, on the CPU and the GPU), Vowpal Wabbit for bandits,
 TRL for GRPO and DPO, and evosax, EvoTorch, DEAP and pymoo for evolution.
 
-## 1.10: Arm, Apple and the edge
+## 1.12: Arm, Apple and the edge
 
-The CPU and GPU paths that 1.0 to 1.9 tuned on x86 and NVIDIA, brought to the other hardware the
+The CPU and GPU paths that 1.0 to 1.11 tuned on x86 and NVIDIA, brought to the other hardware the
 library runs on.
 
 - **NEON kernels for training** (and SVE where available), so that Apple silicon and AArch64
   servers train as fast as x86 does; AArch64 matrix kernels chosen at run time as x86's are.
-- **A Metal backend** for Apple GPUs (MoltenVK runs the Vulkan backend there today), on the same
-  executor, with bfloat16 products where the GPU has them and 1.4's GGUF kernels.
+- **A Metal backend** for Apple GPUs (MoltenVK runs the Vulkan backend there today), an executor of
+  graphs like 1.6's, with bfloat16 products where the GPU has them and GGUF's block types.
 - **Quantization-aware training**: fake-quantized forward passes with straight-through gradients,
   so that INT4 and INT2 models (and language models' INT4 weights) keep their accuracy (INT2 loses
   most of it on CIFAR-10 today).
 - **More of the engine on microcontrollers**: CMSIS-style kernels for Cortex-M55 (Helium/MVE) and
   RISC-V vector, transformers' layers within a microcontroller's memory, and models larger than RAM
-  run layer by layer from flash.
+  run layer by layer from flash. **Graphs in the engine**: the subset of 1.5's graphs of static shapes
+  and operators whose workspace is known when they are exported, run by the engine without a heap (C99,
+  as now) and in WebAssembly; an export outside the subset names the operator that keeps it out.
 
-## 1.11: scale
+## 1.13: scale
 
 Models that do not fit one GPU's memory or time (planned for 1.4 until the language models came first).
 
@@ -239,29 +308,30 @@ Models that do not fit one GPU's memory or time (planned for 1.4 until the langu
 
 A program in a repository of its own (working name SaLaM, "Spingalett Language Models"), built on the
 runtime library alone, that does for Spingalett what llama.cpp's programs do for llama.cpp: one binary
-without dependencies, packaged where the library is.
+without dependencies, packaged where the library is. It waits for its repository (the maintainer's account);
+`Examples/Runtime/Chat.c` is its seed.
 
-- **0.1, with 1.5** (it needs the runtime's tokenizers and chat templates): `salam run model.gguf -p "..."`
-  (a prompt's continuation), `salam chat` (the model's
-  chat template, the conversation's cache kept between turns), `salam bench` (prompt processing and
-  generation in tokens per second, as `llama-bench` reports them), GGUF files and Hugging Face's
-  directories, the CPU, CUDA or Vulkan chosen by flag, sampling options as llama.cpp's, models fetched
-  from Hugging Face by name.
-- **0.2, with 1.6**: a server with an OpenAI-compatible HTTP API (completions, chat, streaming) that
-  batches its requests in one session, the experts' offload and layer splits by flag, speculative
-  decoding with a draft model.
-- **0.3, with 1.7**: the hybrid models, images in chats (the vision encoders), grammars that constrain
-  generation (GBNF, JSON schemas).
+- **0.1, with 1.5** (the runtime's tokenizers, chat templates and sampling are there): `salam run model.gguf -p
+  "..."` (a prompt's continuation), `salam chat` (the model's chat template, the conversation's cache kept between
+  turns), `salam bench` (prompt processing and generation in tokens per second, as `llama-bench` reports them), GGUF
+  files, sampling options as llama.cpp's, models fetched from Hugging Face by name.
+- **0.2, with 1.6**: the GPU (CUDA or Vulkan by flag), Hugging Face's directories, a server with an
+  OpenAI-compatible HTTP API (completions, chat, streaming) that batches its requests in one session.
+- **0.3, with 1.7**: `salam image` (SDXL and FLUX.1: a prompt, a seed, a sampler, steps).
+- **0.4, with 1.8 and 1.9**: the experts' offload and layer splits by flag, speculative decoding with a draft model,
+  the hybrid models, images in chats (the vision encoders), grammars that constrain generation (GBNF, JSON schemas).
 
 ## 2.0: what 1.x cannot add
 
 A major release only for what would break programs; candidates so far:
 
-- tensors of more than three axes and of variable length in the API (sequences of any length per
-  call rather than a fixed input layer), which the transformer layers of 1.2 approximate with a
-  fixed context;
-- layers of the program's own (forward and backward callbacks, with GPU kernels) in networks the
-  library trains;
+- the training API on graphs: networks built as 1.5's graphs and trained through the gradients of their
+  operators, so that any graph trains, with tensors of more than three axes and of variable length (sequences
+  of any length per call rather than a fixed input layer, which the transformer layers of 1.2 approximate with
+  a fixed context), replacing the network of fixed layers that programs build today; inference has both from
+  1.5;
+- layers of the program's own in networks the library trains (their backward passes; operators of the
+  program's own run in graphs from 1.6);
 - training across machines.
 
 ## Distribution

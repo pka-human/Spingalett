@@ -30,15 +30,16 @@ import ctypes
 import ctypes.util
 import dataclasses
 import enum
+import json
 import os
 import sys
 from ctypes import (CFUNCTYPE, POINTER, Structure, c_bool, c_char_p, c_float, c_int,
                     c_size_t, c_uint32, c_uint64, c_void_p)
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -52,7 +53,7 @@ __all__ = [
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
-    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer",
+    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer", "render_chat_template", "Graph", "TensorInfo",
 ]
 
 
@@ -529,6 +530,22 @@ class _TokenReaderOptions(Structure):
     ]
 
 
+class _Sampling(Structure):
+    _fields_ = [
+        ("min_p", c_float),
+        ("repetition_penalty", c_float),
+        ("frequency_penalty", c_float),
+        ("presence_penalty", c_float),
+        ("penalty_window", c_uint32),
+        ("tokenizer", c_void_p),
+        ("stop_strings", POINTER(c_char_p)),
+        ("stop_string_count", c_uint32),
+        ("on_token", ctypes.CFUNCTYPE(c_bool, c_void_p, c_uint32, c_uint32)),
+        ("user", c_void_p),
+        ("reserved", c_uint64 * (_RESERVED - 2)),
+    ]
+
+
 class _GenerateArgs(Structure):
     _fields_ = [
         ("net", _NetPtr),
@@ -542,7 +559,8 @@ class _GenerateArgs(Structure):
         ("seed", c_uint64),
         ("stop_tokens", POINTER(c_uint32)),
         ("stop_count", c_uint32),
-        ("reserved", c_uint64 * _RESERVED),
+        ("sampling", POINTER(_Sampling)),
+        ("reserved", c_uint64 * (_RESERVED - 1)),
     ]
 
 
@@ -619,7 +637,8 @@ class _SessionGenerateArgs(Structure):
         ("seed", c_uint64),
         ("stop_tokens", POINTER(c_uint32)),
         ("stop_count", c_uint32),
-        ("reserved", c_uint64 * _RESERVED),
+        ("sampling", POINTER(_Sampling)),
+        ("reserved", c_uint64 * (_RESERVED - 1)),
     ]
 
 
@@ -704,6 +723,67 @@ class _DetokenizeArgs(Structure):
         ("text", c_void_p),
         ("capacity", c_size_t),
         ("skip_special", c_bool),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _ChatMessage(Structure):
+    _fields_ = [("role", c_char_p), ("content", c_char_p)]
+
+
+class _ChatArgs(Structure):
+    _fields_ = [
+        ("tokenizer", c_void_p),
+        ("chat_template", c_char_p),
+        ("messages", POINTER(_ChatMessage)),
+        ("count", c_uint32),
+        ("add_generation_prompt", c_bool),
+        ("variables", c_char_p),
+        ("time", c_uint64),
+        ("text", c_void_p),
+        ("capacity", c_size_t),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _GraphOpenArgs(Structure):
+    _fields_ = [
+        ("path", c_char_p),
+        ("data", c_void_p),
+        ("size", c_size_t),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _TensorInfo(Structure):
+    _fields_ = [
+        ("name", c_char_p),
+        ("dtype", c_int),
+        ("rank", c_uint32),
+        ("shape", ctypes.c_int64 * 8),
+        ("symbols", c_char_p * 8),
+        ("reserved", c_uint64 * 4),
+    ]
+
+
+class _Tensor(Structure):
+    _fields_ = [
+        ("name", c_char_p),
+        ("dtype", c_int),
+        ("rank", c_uint32),
+        ("shape", ctypes.c_int64 * 8),
+        ("data", c_void_p),
+        ("reserved", c_uint64 * 4),
+    ]
+
+
+class _GraphRunArgs(Structure):
+    _fields_ = [
+        ("graph", c_void_p),
+        ("inputs", POINTER(_Tensor)),
+        ("input_count", c_uint32),
+        ("outputs", POINTER(_Tensor)),
+        ("output_count", c_uint32),
         ("reserved", c_uint64 * _RESERVED),
     ]
 
@@ -907,6 +987,22 @@ _tokenizer_id = _bind_optional("spingalett_tokenizer_id", c_uint32, [c_void_p, c
 _tokenize = _bind_optional("spingalett_tokenize_args", ctypes.c_int64, [_TokenizeArgs])
 _detokenize = _bind_optional("spingalett_detokenize_args", ctypes.c_int64, [_DetokenizeArgs])
 _load_pretrained = _bind_optional("spingalett_load_pretrained_args", _NetPtr, [_PretrainedArgs])
+
+# 1.5: chat templates
+_chat_render = _bind_optional("spingalett_chat_render_args", ctypes.c_int64, [_ChatArgs])
+_tokenizer_chat_template = _bind_optional("spingalett_tokenizer_chat_template", c_char_p, [c_void_p])
+
+# 1.5: graphs of operators
+_graph_open = _bind_optional("spingalett_graph_open_args", c_void_p, [_GraphOpenArgs])
+_graph_free = _bind_optional("spingalett_graph_free", None, [c_void_p])
+_graph_input_count = _bind_optional("spingalett_graph_input_count", c_uint32, [c_void_p])
+_graph_output_count = _bind_optional("spingalett_graph_output_count", c_uint32, [c_void_p])
+_graph_input = _bind_optional("spingalett_graph_input", _TensorInfo, [c_void_p, c_uint32])
+_graph_output = _bind_optional("spingalett_graph_output", _TensorInfo, [c_void_p, c_uint32])
+_graph_run = _bind_optional("spingalett_graph_run_args", c_bool, [_GraphRunArgs])
+_graph_save = _bind_optional("spingalett_graph_save", c_bool, [c_void_p, c_char_p])
+_graph_node_count = _bind_optional("spingalett_graph_node_count", c_uint32, [c_void_p])
+_graph_node_op = _bind_optional("spingalett_graph_node_op", c_char_p, [c_void_p, c_uint32])
 
 # 1.4: checkpoints of training runs
 _save_checkpoint = _bind_optional("spingalett_save_checkpoint", c_bool, [_NetPtr, c_char_p])
@@ -2035,24 +2131,32 @@ class Network:
             _dataset_close(reader)
 
     def generate(self, prompt, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
-                 seed: int = 0, stop=()) -> List[int]:
+                 seed: int = 0, stop=(), min_p: float = 0.0, repetition_penalty: float = 1.0,
+                 frequency_penalty: float = 0.0, presence_penalty: float = 0.0, penalty_window: int = 64,
+                 stop_strings=(), tokenizer=None, on_token=None) -> List[int]:
         """Continue a prompt (token ids) by ``count`` tokens, a token at a time, with a causal language model
         whose outputs are the logits of every token of its vocabulary for each input token: the most likely
         token (``temperature`` 0), or a draw from the softmax of the logits over ``temperature`` among the
-        ``top_k`` most likely and those whose probabilities add up to ``top_p``. ``seed`` (0: the library's
-        generator) makes draws repeatable; a token of ``stop`` ends the generation (it is returned last).
-        On the CPU a causal model runs as its deployment model of single precision in a :class:`Session`,
-        each token computed once."""
+        ``top_k`` most likely, those whose probabilities add up to ``top_p`` and those ``min_p`` times as likely as
+        the most likely. ``repetition_penalty``, ``frequency_penalty`` and ``presence_penalty`` are llama.cpp's, over
+        the last ``penalty_window`` tokens. ``seed`` (0: the library's generator) makes draws repeatable; a token of
+        ``stop``, or a text of ``stop_strings`` (decoded by ``tokenizer``), ends the generation (the token is
+        returned last); ``on_token(sequence, token)`` is called with each token as it is drawn (False ends the
+        generation). On the CPU a causal model runs as its deployment model of single precision in a
+        :class:`Session`, each token computed once."""
         p = np.ascontiguousarray(np.asarray(prompt, dtype=np.uint32).ravel())
         if p.size == 0:
             raise ValueError("generate needs a prompt of one token at least")
         s = np.ascontiguousarray(np.asarray(list(stop), dtype=np.uint32))
         out = np.zeros(max(int(count), 0), dtype=np.uint32)
         u32 = POINTER(c_uint32)
+        sampling, keep = _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, penalty_window,
+                                   stop_strings, tokenizer, on_token)
         args = _GenerateArgs(self._ptr, p.ctypes.data_as(u32), p.size, out.ctypes.data_as(u32), out.size,
                              float(temperature), int(top_k), float(top_p), int(seed),
-                             s.ctypes.data_as(u32) if s.size else None, s.size)
+                             s.ctypes.data_as(u32) if s.size else None, s.size, sampling)
         made = _call(_generate, args)
+        del keep
         return out[:made].tolist()
 
     def _run(self, cfg: TrainConfig, mode: int, x, y, sample_count: int, generator,
@@ -2592,11 +2696,14 @@ class Session:
         return outs
 
     def generate(self, prompts, count: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
-                 seed: int = 0, stop=()) -> List[List[int]]:
+                 seed: int = 0, stop=(), min_p: float = 0.0, repetition_penalty: float = 1.0,
+                 frequency_penalty: float = 0.0, presence_penalty: float = 0.0, penalty_window: int = 64,
+                 stop_strings=(), tokenizer=None, on_token=None) -> List[List[int]]:
         """Continue sequences 0 .. len(prompts) - 1 together, each first fed its prompt (token ids, at least
         one), by up to ``count`` tokens each, drawn as :meth:`Network.generate` draws (sequence b with
-        seed ``seed + b``); a token of ``stop`` ends a sequence (it is returned last), and so does a full
-        sequence. Returns each sequence's tokens."""
+        seed ``seed + b``; the penalties over its prompt and the tokens it generated); a token of ``stop`` or a
+        text of ``stop_strings`` ends a sequence (the token is returned last), and so does a full sequence. Returns
+        each sequence's tokens."""
         ps = [np.ascontiguousarray(np.asarray(p, dtype=np.uint32).ravel()) for p in prompts]
         if not ps or any(p.size == 0 for p in ps):
             raise ValueError("generate needs a prompt of one token at least for each sequence")
@@ -2607,10 +2714,13 @@ class Session:
         out = np.zeros(len(ps) * max(count, 1), dtype=np.uint32)
         made = (c_uint32 * len(ps))()
         s = np.ascontiguousarray(np.asarray(list(stop), dtype=np.uint32))
+        sampling, keep = _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, penalty_window,
+                                   stop_strings, tokenizer, on_token)
         args = _SessionGenerateArgs(self._session(), len(ps), pointers, lengths, out.ctypes.data_as(u32), made, count,
                                     float(temperature), int(top_k), float(top_p), int(seed),
-                                    s.ctypes.data_as(u32) if s.size else None, s.size)
+                                    s.ctypes.data_as(u32) if s.size else None, s.size, sampling)
         _call(_session_generate, args)
+        del keep
         return [out[b * count:b * count + made[b]].tolist() for b in range(len(ps))]
 
     def __repr__(self) -> str:
@@ -2813,6 +2923,22 @@ class Tokenizer:
         i = _tokenizer_id(self._handle, token.encode("utf-8"))
         return None if i == NO_TOKEN else int(i)
 
+    @property
+    def chat_template(self) -> Optional[str]:
+        """The chat template of the tokenizer's GGUF file or directory (``chat_template.jinja`` or
+        ``tokenizer_config.json``'s), None when it has none."""
+        s = _call(_require(_tokenizer_chat_template, "Tokenizer.chat_template", "1.5"), self._handle)
+        return s.decode("utf-8") if s is not None else None
+
+    def apply_chat_template(self, messages, add_generation_prompt: bool = False, tools=None,
+                            chat_template: Optional[str] = None, time: int = 0, **variables) -> str:
+        """A conversation as the text the model was trained on, rendered by its chat template (or ``chat_template``) as
+        transformers' ``apply_chat_template(tokenize=False)`` renders it: ``messages`` a list of dicts (role and content,
+        tool calls, parts), ``tools`` the functions' JSON schemas, ``variables`` what else the template reads
+        (``enable_thinking=False``); ``bos_token`` and ``eos_token`` are the tokenizer's. ``time``: the seconds since
+        1970 strftime_now() formats (0: now)."""
+        return _render_chat(self._handle, chat_template, messages, add_generation_prompt, tools, time, variables)
+
     def _info(self) -> _TokenizerInfo:
         return _tokenizer_info(self._handle)
 
@@ -2852,6 +2978,241 @@ class Tokenizer:
         if not getattr(self, "_ptr", None):
             return "Tokenizer(closed)"
         return f"Tokenizer(vocabulary={self.vocabulary}, bos={self.bos}, eos={self.eos})"
+
+
+_OnToken = ctypes.CFUNCTYPE(c_bool, c_void_p, c_uint32, c_uint32)
+
+
+def _sampling(min_p, repetition_penalty, frequency_penalty, presence_penalty, penalty_window, stop_strings, tokenizer,
+              on_token=None):
+    """The SpingalettSampling of generate()'s keyword arguments, and what it points to; (None, None) when it has
+    nothing to say. on_token(sequence, token) is called with each token as it is drawn; False ends the sequence."""
+    strings = [x.encode("utf-8") for x in stop_strings]
+    if not (min_p or repetition_penalty not in (0, 1) or frequency_penalty or presence_penalty or strings or on_token):
+        return None, None
+    callback = None
+    if on_token is not None:
+        def call(_user, sequence, token):
+            try:
+                return on_token(int(sequence), int(token)) is not False
+            except Exception:
+                return False
+        callback = _OnToken(call)
+    if strings and tokenizer is None:
+        raise ValueError("stop_strings need the tokenizer that decodes the tokens")
+    array = (c_char_p * max(len(strings), 1))(*strings)
+    s = _Sampling(min_p=float(min_p), repetition_penalty=float(repetition_penalty),
+                  frequency_penalty=float(frequency_penalty), presence_penalty=float(presence_penalty),
+                  penalty_window=int(penalty_window) & 0xFFFFFFFF,
+                  tokenizer=tokenizer._handle if tokenizer is not None else None,
+                  stop_strings=array if strings else None, stop_string_count=len(strings))
+    if callback is not None:
+        s.on_token = callback
+    return ctypes.pointer(s), (array, tokenizer, callback)
+
+
+def _render_chat(handle, template, messages, add_generation_prompt, tools, time, variables) -> str:
+    values = dict(variables)
+    values["messages"] = list(messages)
+    if tools is not None:
+        values["tools"] = list(tools)
+    data = json.dumps(values, ensure_ascii=False).encode("utf-8")
+    source = template.encode("utf-8") if template is not None else None
+    capacity = 4096
+    while True:
+        buffer = ctypes.create_string_buffer(capacity)
+        args = _ChatArgs(tokenizer=handle, chat_template=source, messages=None, count=0,
+                         add_generation_prompt=add_generation_prompt, variables=data, time=int(time),
+                         text=ctypes.cast(buffer, c_void_p), capacity=capacity)
+        size = _call(_require(_chat_render, "apply_chat_template", "1.5"), args)
+        if size < 0:
+            raise SpingalettError(-1, "could not render the chat template")
+        if size < capacity:
+            return buffer.raw[:size].decode("utf-8")
+        capacity = int(size) + 1
+
+
+def render_chat_template(chat_template: str, messages, add_generation_prompt: bool = False, tools=None, time: int = 0,
+                         **variables) -> str:
+    """A conversation rendered by a chat template of one's own, as :meth:`Tokenizer.apply_chat_template` renders it
+    (``bos_token`` and ``eos_token`` among ``variables`` where the template reads them)."""
+    return _render_chat(None, chat_template, messages, add_generation_prompt, tools, time, variables)
+
+
+# --------------------------------------------------------------------------- graphs of operators
+
+# SpingalettDType codes (ONNX's) and numpy's types; bfloat16, which numpy lacks, comes out as float32
+_DTYPES = {1: np.dtype(np.float32), 2: np.dtype(np.uint8), 3: np.dtype(np.int8), 6: np.dtype(np.int32),
+           7: np.dtype(np.int64), 9: np.dtype(np.bool_), 10: np.dtype(np.float16), 16: np.dtype(np.float32)}
+_DTYPE_CODES = {np.dtype(np.float32): 1, np.dtype(np.uint8): 2, np.dtype(np.int8): 3, np.dtype(np.int32): 6,
+                np.dtype(np.int64): 7, np.dtype(np.bool_): 9, np.dtype(np.float16): 10}
+
+
+class TensorInfo(NamedTuple):
+    """A graph's input or output as it declares it: its numpy type, and its shape with a symbol's name (str) or None
+    where no number gives a size."""
+    name: str
+    dtype: np.dtype
+    shape: Tuple[Union[int, str, None], ...]
+
+
+def _tensor_info(info: _TensorInfo) -> TensorInfo:
+    shape = tuple(int(info.shape[k]) if info.shape[k] >= 0 else
+                  (info.symbols[k].decode() if info.symbols[k] else None) for k in range(info.rank))
+    return TensorInfo(info.name.decode(), _DTYPES.get(int(info.dtype), np.dtype(np.float32)), shape)
+
+
+class Graph:
+    """A graph of operators: an ONNX model (opset 7 and later; its external data files beside it) or a .slett file
+    of format 11, run on the CPU with ONNX's semantics. Floats compute in single precision; integers and booleans
+    keep their types. Open one with :meth:`Graph.load` or :meth:`Graph.from_bytes`; :meth:`run` takes the inputs by
+    name (a dict) or in order (a list) and returns the outputs by name."""
+
+    def __init__(self):
+        raise TypeError("use Graph.load or Graph.from_bytes")
+
+    @classmethod
+    def _wrap(cls, ptr) -> "Graph":
+        if not ptr:
+            raise SpingalettError(-1, "could not open the graph")
+        graph = cls.__new__(cls)
+        graph._ptr = ptr
+        return graph
+
+    @classmethod
+    def load(cls, path) -> "Graph":
+        """Open an ONNX file or a .slett file of format 11."""
+        fn = _require(_graph_open, "Graph", "1.5")
+        return cls._wrap(_call(fn, _GraphOpenArgs(path=_encode_path(path))))
+
+    @classmethod
+    def from_torch(cls, module, *example_inputs, input_names=None, opset: int = 18, **export_args) -> "Graph":
+        """A PyTorch module as a graph: exported by ``torch.onnx.export`` (its dynamo exporter, the given opset) on
+        the example inputs, then opened from the bytes. ``input_names`` name the graph's inputs (by default input_0,
+        input_1, ...); other keyword arguments go to the exporter (``dynamic_shapes``, say)."""
+        import io
+        import torch
+        names = list(input_names) if input_names is not None else [f"input_{k}" for k in range(len(example_inputs))]
+        buffer = io.BytesIO()
+        was_training = module.training
+        module.eval()
+        try:
+            with torch.no_grad():
+                program = torch.onnx.export(module, tuple(example_inputs), input_names=names, dynamo=True,
+                                            opset_version=opset, external_data=False, **export_args)
+            program.save(buffer)
+        finally:
+            module.train(was_training)
+        return cls.from_bytes(buffer.getvalue())
+
+    @classmethod
+    def from_bytes(cls, data) -> "Graph":
+        """Open a graph from the bytes of an ONNX or .slett file (copied)."""
+        fn = _require(_graph_open, "Graph", "1.5")
+        data = bytes(data)
+        buffer = ctypes.create_string_buffer(data, len(data))
+        return cls._wrap(_call(fn, _GraphOpenArgs(data=ctypes.cast(buffer, c_void_p), size=len(data))))
+
+    def _handle(self):
+        if not getattr(self, "_ptr", None):
+            raise SpingalettError(-1, "the graph is closed")
+        return self._ptr
+
+    @property
+    def inputs(self) -> List[TensorInfo]:
+        h = self._handle()
+        return [_tensor_info(_graph_input(h, i)) for i in range(_graph_input_count(h))]
+
+    @property
+    def outputs(self) -> List[TensorInfo]:
+        h = self._handle()
+        return [_tensor_info(_graph_output(h, i)) for i in range(_graph_output_count(h))]
+
+    @property
+    def operators(self) -> List[str]:
+        """The operators of the graph's nodes, in the order they run (after constants were folded and what no output
+        needs was left out)."""
+        h = self._handle()
+        return [_graph_node_op(h, i).decode() for i in range(_graph_node_count(h))]
+
+    def run(self, inputs, outputs=None) -> Dict[str, np.ndarray]:
+        """Run the graph: `inputs` a dict of the inputs' names and arrays, or a list in the graph's order; `outputs`
+        the names wanted (None: all). Returns copies of the outputs by name."""
+        h = self._handle()
+        infos = self.inputs
+        if isinstance(inputs, dict):
+            pairs = list(inputs.items())
+        else:
+            pairs = [(infos[k].name if k < len(infos) else None, value) for k, value in enumerate(inputs)]
+        arrays, tensors = [], (_Tensor * max(len(pairs), 1))()
+        for k, (name, value) in enumerate(pairs):
+            arr = np.asarray(value)
+            if not arr.flags.c_contiguous:
+                arr = np.ascontiguousarray(arr)     # (which would make a scalar an array of one value)
+            if arr.dtype == np.float64:
+                arr = arr.astype(np.float32)
+            code = _DTYPE_CODES.get(arr.dtype)
+            if code is None:
+                raise TypeError(f"input {name!r}: numpy type {arr.dtype} has no graph type")
+            if arr.ndim > 8:
+                raise ValueError(f"input {name!r}: more than eight axes")
+            arrays.append(arr)
+            t = tensors[k]
+            t.name = name.encode() if name is not None else None
+            t.dtype = code
+            t.rank = arr.ndim
+            for d in range(arr.ndim):
+                t.shape[d] = arr.shape[d]
+            t.data = arr.ctypes.data_as(c_void_p)
+        names = [o.name for o in self.outputs] if outputs is None else list(outputs)
+        outs = (_Tensor * max(len(names), 1))()
+        encoded = [n.encode() for n in names]
+        for k, n in enumerate(encoded):
+            outs[k].name = n
+        _call(_graph_run, _GraphRunArgs(graph=h, inputs=tensors, input_count=len(pairs), outputs=outs,
+                                        output_count=len(names)))
+        result = {}
+        for k, name in enumerate(names):
+            t = outs[k]
+            shape = tuple(int(t.shape[d]) for d in range(t.rank))
+            count = int(np.prod(shape)) if shape else 1
+            if int(t.dtype) == 16:      # bfloat16: its bits widened to float32
+                raw = np.ctypeslib.as_array(ctypes.cast(t.data, POINTER(ctypes.c_uint16)), (count,)) if count else \
+                    np.zeros(0, np.uint16)
+                arr = (raw.astype(np.uint32) << 16).view(np.float32).reshape(shape)
+            else:
+                dtype = _DTYPES.get(int(t.dtype))
+                if dtype is None:
+                    raise SpingalettError(-1, f"output {name!r} of an unknown type {int(t.dtype)}")
+                if count and t.data:
+                    buf = (ctypes.c_char * (count * dtype.itemsize)).from_address(t.data)
+                    arr = np.frombuffer(buf, dtype=dtype).reshape(shape).copy()
+                else:
+                    arr = np.zeros(shape, dtype=dtype)
+            result[name] = arr
+        return result
+
+    def save(self, path) -> None:
+        """Write the graph as a .slett file of format 11 (constants as the source held them: float16 stays 16 bits)."""
+        if not _call(_graph_save, self._handle(), _encode_path(path)):
+            raise SpingalettError(-1, "could not save the graph")
+
+    def close(self) -> None:
+        if getattr(self, "_ptr", None):
+            _graph_free(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 # --------------------------------------------------------------------------- language models from PyTorch

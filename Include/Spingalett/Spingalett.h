@@ -610,7 +610,8 @@ typedef struct {
     uint64_t seed;                  /* the draws' generator; 0: one draw of the library's (spingalett_seed) */
     const uint32_t *stop_tokens;    /* [stop_count] tokens that end the generation once generated, or NULL */
     uint32_t stop_count;
-    uint64_t reserved[SPINGALETT_RESERVED];
+    const SpingalettSampling *sampling;     /* min-p, penalties of repeated tokens, stop strings (NULL: none) */
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettGenerateArgs;
 
 /* Continues the prompt a token at a time: the network predicts on the window of the last context tokens
@@ -774,84 +775,8 @@ SPINGALETT_API bool spingalett_load_pytorch(SpingalettNetwork *net, const char *
 SPINGALETT_API bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size,
                                                         const char *const *modules, uint32_t module_count);
 
-/*
- * Tokenizers of language models: the byte-pair encodings of Hugging Face's tokenizer.json files (GPT-2's
- * byte-level BPE and tiktoken's encodings as LLaMA 3, Qwen2 and SmolLM use them; SentencePiece's BPE with
- * byte fallback as LLaMA 2, Mistral and Phi-3 use it) and of GGUF files' vocabularies (the BPE of merges
- * of their "gpt2" model, by the pre-tokenizer they name; SentencePiece's BPE of scores of their "llama"
- * model, as llama.cpp and sentencepiece encode). A text is encoded as Hugging Face's tokenizers
- * library encodes it: the added tokens found in it, the rest normalized (NFC, prepended and replaced
- * strings), cut into pieces by the pre-tokenizers (byte-level, the regular expressions of GPT-2, cl100k
- * and o200k, digits, Metaspace, splits on strings) and each piece merged pair by pair in the order of the
- * merges, in time n log n of the piece's length. Decoding reverses it (byte-level, byte fallback,
- * Metaspace, replacements, stripping). Other models (WordPiece, Unigram) and patterns are refused, naming
- * what is missing. A tokenizer is read-only once loaded: threads may share it.
- */
-typedef struct SpingalettTokenizer SpingalettTokenizer;
-
-/* An id no token has. */
-#define SPINGALETT_NO_TOKEN UINT32_MAX
-
-typedef struct {
-    uint32_t vocabulary;            /* token ids: the largest one + 1 (the model's tokens and the added ones) */
-    uint32_t added;                 /* added tokens (special ones, such as "<|endoftext|>", and others) */
-    uint32_t bos, eos;              /* the tokens beginning and ending a text (SPINGALETT_NO_TOKEN when unknown):
-                                       tokenizer_config.json's bos_token and eos_token, a GGUF file's ids, else
-                                       the template's tokens or special tokens named so ("<s>", "</s>",
-                                       "<|endoftext|>") */
-    uint32_t pad, unk;              /* padding, and the token of what the vocabulary lacks */
-    uint64_t reserved[SPINGALETT_RESERVED];
-} SpingalettTokenizerInfo;
-
-/* Reads a tokenizer.json file, a model directory holding one (its tokenizer_config.json, when there is
-   one, names the BOS and EOS tokens) or a GGUF file's vocabulary. NULL on error. */
-SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
-/* The bytes of a tokenizer.json file, or of a GGUF file, in memory; they are not kept. */
-SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
-SPINGALETT_API void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
-SPINGALETT_API SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
-/* The token of an id as the vocabulary writes it (in UTF-8: byte-level vocabularies write a space as U+0120,
-   SentencePiece's as U+2581; "<|im_start|>"), valid while the tokenizer lives; NULL for an id of no token. */
-SPINGALETT_API const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
-/* The id of a token as the vocabulary writes it (added tokens first), SPINGALETT_NO_TOKEN when none. */
-SPINGALETT_API uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
-
-typedef struct {
-    const SpingalettTokenizer *tokenizer;
-    const char *text;               /* UTF-8 (other bytes are an error) */
-    size_t length;                  /* its bytes; 0: up to its NUL */
-    uint32_t *tokens;               /* [capacity] receives the ids, or NULL with capacity 0 to count them */
-    size_t capacity;
-    bool special;                   /* special tokens written in the text ("<|im_start|>") become their ids;
-                                       otherwise they are text like any other (the default, so that text
-                                       from users cannot forge them). Added tokens that are not special
-                                       are always found. */
-    bool add_special;               /* the tokens the tokenizer adds around a text (LLaMA's BOS), as Hugging
-                                       Face's encode(add_special_tokens=True) */
-    uint64_t reserved[SPINGALETT_RESERVED];
-} SpingalettTokenizeArgs;
-
-/* Encodes a text. Returns its number of tokens, also when that exceeds capacity (the first capacity are
-   written: call again with room for all), -1 on error. */
-#define spingalett_tokenize(...) spingalett_tokenize_args((SpingalettTokenizeArgs){__VA_ARGS__})
-SPINGALETT_API int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
-
-typedef struct {
-    const SpingalettTokenizer *tokenizer;
-    const uint32_t *tokens;         /* [count] */
-    size_t count;
-    char *text;                     /* [capacity] receives the UTF-8 text and a NUL (NULL with capacity 0 to
-                                       measure it); bytes that are no UTF-8, as a lone byte of a character
-                                       split between tokens, become U+FFFD */
-    size_t capacity;
-    bool skip_special;              /* leaves special tokens out */
-    uint64_t reserved[SPINGALETT_RESERVED];
-} SpingalettDetokenizeArgs;
-
-/* Decodes tokens into text. Returns the text's bytes, also when they exceed capacity - 1 (the first
-   capacity - 1 are written, with a NUL), -1 on error (ids of no token among them). */
-#define spingalett_detokenize(...) spingalett_detokenize_args((SpingalettDetokenizeArgs){__VA_ARGS__})
-SPINGALETT_API int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+/* Tokenizers of language models (spingalett_tokenizer_load() and the rest) are the runtime's:
+   Spingalett.Runtime.h. */
 
 typedef struct {
     const char *path;               /* a model directory of Hugging Face's form (config.json and model.safetensors,

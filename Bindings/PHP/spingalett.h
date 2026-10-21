@@ -7,7 +7,8 @@
  * libspingalett's C API as PHP's FFI parses it: the declarations of Include/Spingalett/Spingalett.h,
  * Spingalett.Runtime.h and Spingalett.Inference.h without the preprocessor. The function-like macros
  * (spingalett_layer(), spingalett_train(), ...) are left out: their *_args functions take the
- * structures themselves. SPINGALETT_RESERVED is written as 8 and SPINGALETT_MAX_INPUTS as 16; the other
+ * structures themselves. SPINGALETT_RESERVED is written as 8, SPINGALETT_MAX_INPUTS as 16 and
+ * SPINGALETT_MAX_RANK as 8; the other
  * macros (error codes, SPINGALETT_NO_LAYER) are constants of the PHP classes. Spingalett\Library loads
  * this file with FFI::cdef() and the library it finds, or FFI::load() through Library::preload(). The
  * tests compare every declaration with the C headers' and every structure's layout with the C
@@ -186,6 +187,7 @@ SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettModel *model, co
                                                 const float *targets, uint32_t count);
 
 typedef struct SpingalettSession SpingalettSession;
+typedef struct SpingalettTokenizer SpingalettTokenizer;
 typedef struct {
     uint32_t max_length;
     uint32_t sequences;
@@ -206,6 +208,20 @@ typedef struct {
 bool spingalett_session_feed(SpingalettSession *session, const SpingalettSessionFeed *feeds, uint32_t count);
 bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
 bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
+typedef bool (*SpingalettTokenCallback)(void *user, uint32_t sequence, uint32_t token);
+typedef struct {
+    float min_p;
+    float repetition_penalty;
+    float frequency_penalty;
+    float presence_penalty;
+    uint32_t penalty_window;
+    const SpingalettTokenizer *tokenizer;
+    const char *const *stop_strings;
+    uint32_t stop_string_count;
+    SpingalettTokenCallback on_token;
+    void *user;
+    uint64_t reserved[8 - 2];
+} SpingalettSampling;
 typedef struct {
     SpingalettSession *session;
     uint32_t sequences;
@@ -220,7 +236,8 @@ typedef struct {
     uint64_t seed;
     const uint32_t *stop_tokens;
     uint32_t stop_count;
-    uint64_t reserved[8];
+    const SpingalettSampling *sampling;
+    uint64_t reserved[8 - 1];
 } SpingalettSessionGenerateArgs;
 uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
 
@@ -568,7 +585,8 @@ typedef struct {
     uint64_t seed;
     const uint32_t *stop_tokens;
     uint32_t stop_count;
-    uint64_t reserved[8];
+    const SpingalettSampling *sampling;
+    uint64_t reserved[8 - 1];
 } SpingalettGenerateArgs;
 
 uint32_t spingalett_generate_args(SpingalettGenerateArgs args);
@@ -725,7 +743,6 @@ uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t re
 void spingalett_print_network(const SpingalettNetwork *net);
 void spingalett_network_free(SpingalettNetwork *net);
 
-typedef struct SpingalettTokenizer SpingalettTokenizer;
 typedef struct {
     uint32_t vocabulary;
     uint32_t added;
@@ -760,6 +777,76 @@ typedef struct {
     uint64_t reserved[8];
 } SpingalettDetokenizeArgs;
 int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+typedef struct {
+    const char *role;
+    const char *content;
+} SpingalettChatMessage;
+const char *spingalett_tokenizer_chat_template(const SpingalettTokenizer *tokenizer);
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const char *chat_template;
+    const SpingalettChatMessage *messages;
+    uint32_t count;
+    bool add_generation_prompt;
+    const char *variables;
+    uint64_t time;
+    char *text;
+    size_t capacity;
+    uint64_t reserved[8];
+} SpingalettChatArgs;
+int64_t spingalett_chat_render_args(SpingalettChatArgs args);
+typedef struct SpingalettGraph SpingalettGraph;
+typedef enum {
+    SPINGALETT_DTYPE_UNDEFINED = 0,
+    SPINGALETT_DTYPE_FLOAT32 = 1,
+    SPINGALETT_DTYPE_UINT8 = 2,
+    SPINGALETT_DTYPE_INT8 = 3,
+    SPINGALETT_DTYPE_INT32 = 6,
+    SPINGALETT_DTYPE_INT64 = 7,
+    SPINGALETT_DTYPE_BOOL = 9,
+    SPINGALETT_DTYPE_FLOAT16 = 10,
+    SPINGALETT_DTYPE_BFLOAT16 = 16
+} SpingalettDType;
+typedef struct {
+    const char *path;
+    const void *data;
+    size_t size;
+    uint64_t reserved[8];
+} SpingalettGraphOpenArgs;
+SpingalettGraph *spingalett_graph_open_args(SpingalettGraphOpenArgs args);
+void spingalett_graph_free(SpingalettGraph *graph);
+typedef struct {
+    const char *name;
+    SpingalettDType dtype;
+    uint32_t rank;
+    int64_t shape[8];
+    const char *symbols[8];
+    uint64_t reserved[4];
+} SpingalettTensorInfo;
+uint32_t spingalett_graph_input_count(const SpingalettGraph *graph);
+uint32_t spingalett_graph_output_count(const SpingalettGraph *graph);
+SpingalettTensorInfo spingalett_graph_input(const SpingalettGraph *graph, uint32_t i);
+SpingalettTensorInfo spingalett_graph_output(const SpingalettGraph *graph, uint32_t i);
+typedef struct {
+    const char *name;
+    SpingalettDType dtype;
+    uint32_t rank;
+    int64_t shape[8];
+    void *data;
+    uint64_t reserved[4];
+} SpingalettTensor;
+typedef struct {
+    SpingalettGraph *graph;
+    const SpingalettTensor *inputs;
+    uint32_t input_count;
+    SpingalettTensor *outputs;
+    uint32_t output_count;
+    uint64_t reserved[8];
+} SpingalettGraphRunArgs;
+bool spingalett_graph_run_args(SpingalettGraphRunArgs args);
+bool spingalett_graph_save(const SpingalettGraph *graph, const char *path);
+uint32_t spingalett_graph_node_count(const SpingalettGraph *graph);
+const char *spingalett_graph_node_op(const SpingalettGraph *graph, uint32_t i);
 typedef struct {
     const char *path;
     uint32_t context;

@@ -1,0 +1,2 @@
+# The tests compare their data byte for byte: no line endings converted on checkout (Windows).
+Tests/Data/** -text

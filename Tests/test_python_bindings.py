@@ -1011,6 +1011,23 @@ with sg.Tokenizer(os.path.join(data_dir, "hf_llama")) as tok:
     tokens, _ = window("hf_llama")
     check(tok.encode("The quick brown fox jumps over the lazy dog, it's 1234 times!")[:len(tokens)] == tokens.astype(int).tolist()
           and tok.eos == 424, "the tokenizer of a model directory")
+# chat templates: a GGUF file's, and one of one's own, with tools and an error the template raises
+with sg.Tokenizer(os.path.join(data_dir, "gguf_qwen2.gguf")) as tok:
+    text = tok.apply_chat_template([{"role": "user", "content": "Hi"}], add_generation_prompt=True)
+    check(tok.chat_template is not None and text == "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a "
+          "helpful assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n",
+          f"the chat template of a GGUF file: {text!r}")
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}]
+    check('{"type": "function", "function": {"name": "f"' in tok.apply_chat_template([{"role": "user", "content": "x"}],
+                                                                                    tools=tools), "tools in a chat template")
+check(sg.render_chat_template("{% for m in messages %}{{ m.role }}:{{ m['content'] | trim }};{% endfor %}{{ flag }}",
+                              [{"role": "user", "content": " a "}, {"role": "assistant", "content": "b"}], flag=True)
+      == "user:a;assistant:b;True", "a chat template of one's own")
+try:
+    sg.render_chat_template("{{ raise_exception('roles must alternate') }}", [])
+    check(False, "a template's exception")
+except sg.SpingalettError as e:
+    check("roles must alternate" in str(e), "a template's exception is the error's message")
 try:
     sg.Network.from_pretrained(os.path.join(data_dir, "no_such_model"))
     check(False, "a missing model loaded")

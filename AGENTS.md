@@ -8,7 +8,7 @@ documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; 
 
 Spingalett is a neural-network library in C23: training (dense, convolutional, pooling, batch,
 layer and RMS normalization, adding, concatenating and multiplying layers, embeddings and attention
-for transformers, as chains or graphs), deployment models in FP32 down to INT2, the runtime (a library of the deployment models alone), a standalone inference engine for
+for transformers, as chains or graphs), deployment models in FP32 down to INT2, graphs of operators (any ONNX model run as it is), the runtime (a library of the deployment models and graphs alone), a standalone inference engine for
 microcontrollers (one C file, no heap) and its WebAssembly build for JavaScript, ONNX and PyTorch import, GPU backends through CUDA (its own
 kernels) and Vulkan compute, language-model tooling (token files, generation), bindings for Python
 (ctypes, wheels with the library inside), C++, Rust, .NET, Go and Java, packages for the usual
@@ -35,6 +35,8 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Import.c` | What the importers share: files mapped into memory, tensors decoded and reordered to channels-last in one pass |
 | `Src/Spingalett.Tokenizer.c`, `Src/Spingalett.Json.c` | Tokenizers of `tokenizer.json` files (BPE; the pre-tokenizers' expressions matched by hand over `Spingalett.Unicode.h`, written by `Src/make_unicode.py`); the JSON reader they and the checkpoints' files share |
 | `Src/Spingalett.Pretrained.c`, `.h` | Language models from Hugging Face's directories (`config.json`, safetensors through `Torch.c`): the transformer built from hyper-parameters, its tensors read from a source each format provides |
+| `Src/Spingalett.IR.h`, `IR.c`, `IROps.c`, `IROps.def` | Graphs of operators (`spingalett_graph_*()`, docs/Graphs.md): values, nodes, what happens when a graph opens (order, folding, dead nodes), runs (inputs bound, a pool of blocks, views, values freed after their last reader); the operators' kernels; the operators in the order of their codes in format 11 (new ones at the end) |
+| `Src/Spingalett.IROnnx.c`, `IRFile.c`, `IRFuse.c` | ONNX files as graphs (its own protocol buffer reader); `.slett` format 11; common subexpressions and the fusions into the library's operators (Linear, FusedAttention, Gelu and Swish written out, a Conv's activation) |
 | `Src/Spingalett.Gguf.c` | GGUF files: metadata, the families' hyper-parameters (`gguf_describe()`), a language model's `.slett` image built from the file's tensors as stored (`spingalett_gguf_image()`, which `spingalett_model_open()` runs), the float network of `spingalett_load_pretrained()`, the queries' and keys' rows put back in Hugging Face's order, vocabularies for `Tokenizer.c` |
 | `Src/Spingalett.Image.c`, `Src/Spingalett.Quantize.c` | `.slett` images written layer by layer without a network (the plan of the outputs' buffers); GGUF's quantizers, ggml's reference ones byte for byte |
 | `Src/Spingalett.Blocks.c`, `Src/Spingalett.Attention.c` | Layers of block precisions over many rows (a token's rows eight at a time, a prompt's tokens in transposed groups against unpacked tiles; AVX2, AVX-VNNI, AVX-512 VNNI, recompiled through `Src/Kernels/` for dispatch), and sessions' attention over keys kept transposed in blocks of eight: both give the engine's bits |
@@ -47,8 +49,8 @@ assumed (see [Performance work](#performance-work)).
 | `Bindings/Rust`, `CSharp`, `Go`, `Java` | Bindings over the shared library; their tests compare their structures with `Bin/SpingalettLayout` through `SPINGALETT_LAYOUT` (CI job `bindings`) |
 | `Bindings/JavaScript` | The engine in WebAssembly and its npm package: `build.sh` (Clang for wasm32, no C library), `wasm/` (the exports, `Spingalett.Libm.c` with the mathematical functions the engine calls, the parts of `<math.h>` and `<string.h>` it includes), `index.js` and `index.d.ts`; `test/` compares the module with the native engine (CI job `javascript`) |
 | `packaging/`, `Formula/`, `bucket/`, `flake.nix` | Conan, vcpkg, AUR, conda, the container image; Homebrew, Scoop, Nix; CPack (DEB, RPM) in `CMakeLists.txt` |
-| `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), `RuntimeTests.c` (the runtime alone, C99), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data` |
-| `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools (`Examples/Runtime/`: programs of the runtime), the demo app, the bindings (a package; `setup.py` builds wheels) |
+| `Tests/` | `Spingalett.Tests.c` (groups, see below), `EngineTests.c`, `GemmTests.c`, `GpuTests.c` (the GPU's matrix kernel; `bench` times every tile), `RuntimeTests.c` (the runtime alone, C99), Python tests, `Layout.c`; `make_test_models.py` writes the PyTorch models of `Tests/Data`, `make_graph_tests.py` ONNX's conformance cases of the `operators` group, `check_graph_models.py` compares whole models' graphs with PyTorch |
+| `Examples/`, `Apps/DigitPad/`, `Bindings/Python/spingalett/` | Examples and tools (`Examples/Runtime/`: programs of the runtime, RunGraph among them), the demo app, the bindings (a package; `setup.py` builds wheels) |
 
 ## Build and test
 
@@ -56,7 +58,7 @@ assumed (see [Performance work](#performance-work)).
 cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_OPENMP=ON
 cmake --build Build --parallel
 ctest --test-dir Build --output-on-failure          # all groups, about 10 s
-Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx tokenizer pretrained
+Bin/SpingalettTests model                           # one group: grad conv norm graph transformer onnx operators tokenizer pretrained
                                                     # equiv cont optim sched dropout gen predict valid step data resume io model
                                                     # gpu cuda xor
 ```
@@ -106,7 +108,8 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   joins `SPINGALETT_STRICT_FP` in `CMakeLists.txt`); epilogues use `spingalett_int_output()` so every path rounds
   alike. On the GPU integer models compute in the CPU's order (`iquant`, `ipass`, `precise`, CUDA's `mul.rn` and
   `add.rn`): `spingalett_model_predict()` gives `spingalett_model_run()`'s bits there too.
-- **Formats.** `.slett` versions 3 to 10 stay loadable; the writer picks the lowest version that
+- **Formats.** `.slett` versions 3 to 10 stay loadable (version 11, graphs of operators, opens through
+  `spingalett_graph_open()`); the writer picks the lowest version that
   can hold the network (chains 3 to 5, graphs 6, transposed convolutions, upsampling and layer
   normalization 7, embeddings, attention, RMS normalization, products of layers, GELU and SiLU, the
   sparse cross-entropy 8, layers tied to an embedding 9, block precisions and format 10's attention 10). Any change to the format updates `docs/ModelFormat.md` and adds a version.
@@ -223,6 +226,14 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   to the other), and sigmoid and tanh take the vector or scalar path of the row's place in
   a whole sample (`activate_rows()`). A layer that mixes positions in a new way keeps sessions from
   running the model (`session_model()`), or needs its own pass.
+- **Graphs repeat themselves.** Every operator's kernel computes each output value on one thread in one order fixed
+  by the shapes (products and convolutions on the library's matrix kernels, whose sums are fixed by the shape), so a
+  graph gives the same bits on any number of threads: the `operators` group runs ONNX's conformance cases on one
+  thread and on four and compares them with `memcmp`. A kernel that splits a sum between threads breaks it. A saved
+  graph (format 11) gives the bits of the graph it was saved from (`runtime` and `check_graph_models.py`). Operators
+  keep their codes in format 11 from 1.5 on: new ones go at the end of `Spingalett.IROps.def`. A fusion
+  (`IRFuse.c`) computes what the nodes it replaces compute, up to rounding (`check_graph_models.py` compares every
+  model with `SPINGALETT_GRAPH_FUSE=0`), and fuses only chains whose intermediate values nothing else reads.
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
   `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
   read afterwards (`model_shared` in the `model` group runs four threads, `session_shared` four sessions

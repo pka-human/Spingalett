@@ -6256,6 +6256,167 @@ static void generate_cached(void) {
 /* Batched generation: sequences of prompts of different lengths advanced together give the tokens each
    gives alone with its seed (seed + b), greedy and drawn, with a stop token, in FP32 and INT8; a sequence
    that fills its session stops after the token its last position predicts. */
+/* The draws of SpingalettSampling, specified again in full: llama.cpp's penalties on the window of the prompt and
+   the tokens generated, the temperature's probabilities (their total in the order of the tokens), top_k, top_p and
+   min_p on the order of all of them, sorted whole, a splitmix64 draw. */
+static uint64_t ref_splitmix(uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+typedef struct {
+    float p;
+    uint32_t token;
+} RefCandidate;
+
+static int ref_order(const void *a, const void *b) {
+    const RefCandidate *x = a, *y = b;
+    if (x->p != y->p) return x->p > y->p ? -1 : 1;
+    return x->token < y->token ? -1 : x->token > y->token;
+}
+
+static uint32_t ref_draw(float *logits, uint32_t V, const uint32_t *history, uint32_t n, float temperature, uint32_t top_k,
+                         float top_p, const SpingalettSampling *s, uint64_t *state) {
+    uint32_t window = s->penalty_window ? s->penalty_window : 64u;
+    const uint32_t from = n > window ? n - window : 0u;
+    for (uint32_t t = 0; t < V; t++) {
+        uint32_t count = 0;
+        for (uint32_t k = from; k < n; k++) count += history[k] == t;
+        if (!count) continue;
+        const float rep = s->repetition_penalty == 0.0f ? 1.0f : s->repetition_penalty;
+        float l = logits[t];
+        if (rep != 1.0f) l = l <= 0.0f ? l * rep : l / rep;
+        logits[t] = l - (float)count * s->frequency_penalty - s->presence_penalty;
+    }
+    uint32_t best = 0;
+    for (uint32_t v = 1; v < V; v++)
+        if (logits[v] > logits[best]) best = v;
+    if (!(temperature > 0.0f)) return best;
+    RefCandidate *c = malloc(V * sizeof *c);
+    double total = 0.0;
+    for (uint32_t v = 0; v < V; v++) {
+        c[v] = (RefCandidate){(float)exp(((double)logits[v] - logits[best]) * (1.0 / temperature)), v};
+        total += c[v].p;
+    }
+    qsort(c, V, sizeof *c, ref_order);
+    uint32_t kept = V;
+    if (top_k && top_k < V) {
+        kept = top_k;
+        total = 0.0;
+        for (uint32_t k = 0; k < kept; k++) total += c[k].p;
+    }
+    if (top_p > 0.0f && top_p < 1.0f) {
+        double sum = 0.0;
+        for (uint32_t k = 0; k < kept; k++)
+            if ((sum += c[k].p) >= top_p * total) { kept = k + 1u; total = sum; break; }
+    }
+    if (s->min_p > 0.0f) {
+        uint32_t k = 1;
+        while (k < kept && c[k].p >= s->min_p) k++;
+        if (k < kept) {
+            kept = k;
+            total = 0.0;
+            for (uint32_t j = 0; j < kept; j++) total += c[j].p;
+        }
+    }
+    const double u = (double)(ref_splitmix(state) >> 11) * (1.0 / 9007199254740992.0) * total;
+    double sum = 0.0;
+    uint32_t token = c[kept - 1u].token;
+    for (uint32_t k = 0; k < kept; k++)
+        if (u < (sum += c[k].p)) { token = c[k].token; break; }
+    free(c);
+    return token;
+}
+
+/* spingalett_session_generate() with SpingalettSampling against ref_draw() on the logits of the same session fed
+   token by token, at temperatures that spread the probabilities over many of the sampler's sorted parts; and stop
+   strings, which end the generation at the token that completes one. */
+static void generate_sampling(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/gguf_qwen2.gguf", SPINGALETT_TEST_DATA_DIR);
+    SpingalettModel *m = spingalett_model_open(.path = path);
+    SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+    SpingalettSession *s = m ? spingalett_session_new(m, &(SpingalettSessionOptions){.max_length = 32}) : NULL;
+    CHECK(s && tok, "%s: a session and a tokenizer", path);
+    if (!s || !tok) { spingalett_session_free(s); spingalett_model_free(m); spingalett_tokenizer_free(tok); return; }
+    const uint32_t V = spingalett_session_vocabulary(s), count = 20;
+    static const uint32_t prompt[] = {39, 68, 75, 75, 78, 266, 302, 75, 67, 39, 68};
+    const uint32_t P = sizeof prompt / sizeof *prompt;
+    static const struct { float temperature; uint32_t top_k; float top_p; SpingalettSampling s; } settings[] = {
+        {0.9f, 0, 0.0f, {0}}, {0.05f, 0, 0.0f, {0}}, {0.7f, 0, 0.9f, {0}}, {1.2f, 40, 0.0f, {.min_p = 0.05f}},
+        {0.08f, 0, 0.0f, {.min_p = 0.001f}}, {0.0f, 0, 0.0f, {.repetition_penalty = 1.3f, .frequency_penalty = 0.2f,
+                                                             .presence_penalty = 0.5f, .penalty_window = 16}},
+        {1.0f, 0, 0.95f, {.repetition_penalty = 1.1f, .penalty_window = UINT32_MAX}}, {1.5f, 0, 0.0f, {.min_p = 1.0f}},
+    };
+    int wrong = 0;
+    float *logits = malloc(V * sizeof(float));
+    uint32_t history[64], tokens[32];
+    for (size_t k = 0; k < sizeof settings / sizeof *settings; k++) {
+        const SpingalettSampling *sampling = &settings[k].s;
+        for (uint64_t seed = 1; seed <= 3; seed++) {
+            const uint32_t *prompts[] = {prompt};
+            uint32_t made = 0;
+            spingalett_session_rewind(s, 0, 0);
+            spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = &P, .tokens = tokens,
+                                        .made = &made, .count = count, .temperature = settings[k].temperature,
+                                        .top_k = settings[k].top_k, .top_p = settings[k].top_p, .seed = seed,
+                                        .sampling = sampling);
+            /* the reference: the same session fed a token at a time */
+            spingalett_session_rewind(s, 0, 0);
+            memcpy(history, prompt, sizeof prompt);
+            uint32_t n = P;
+            uint64_t state = seed;
+            bool same = made == count;
+            spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = prompt, .count = P, .logits = logits}, 1);
+            for (uint32_t i = 0; i < count && same; i++) {
+                const uint32_t t = ref_draw(logits, V, history, n, settings[k].temperature, settings[k].top_k,
+                                            settings[k].top_p, sampling, &state);
+                same = t == tokens[i];
+                history[n++] = t;
+                spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = &t, .count = 1, .logits = logits}, 1);
+            }
+            if (!same && ++wrong <= 3) printf("  sampling %zu, seed %llu: the session's tokens are not the reference's\n",
+                                              k, (unsigned long long)seed);
+        }
+    }
+    CHECK(!wrong, "sampling: %d of %zu draws differ from the reference", wrong, 3 * (sizeof settings / sizeof *settings));
+    /* min_p 1 keeps the most likely alone: the greedy tokens */
+    /* stop strings: the greedy tokens' text, cut at a piece of it */
+    const uint32_t *prompts[] = {prompt};
+    uint32_t greedy[32], made = 0, again[32], made_again = 0;
+    spingalett_session_rewind(s, 0, 0);
+    spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = &P, .tokens = greedy, .made = &made,
+                                .count = count);
+    char text[1024], stop[8] = "";
+    int64_t len = spingalett_detokenize(.tokenizer = tok, .tokens = greedy, .count = made, .text = text, .capacity = sizeof text);
+    uint32_t expect = 0;
+    for (int64_t at = len / 2; at + 3 <= len && !stop[0]; at++) {
+        memcpy(stop, text + at, 3);
+        stop[3] = '\0';
+        /* the first token after which the text holds it */
+        char part[1024];
+        for (expect = 1; expect <= made; expect++) {
+            spingalett_detokenize(.tokenizer = tok, .tokens = greedy, .count = expect, .text = part, .capacity = sizeof part);
+            if (strstr(part, stop)) break;
+        }
+        if (expect >= made || strlen(stop) < 3 || strchr(stop, 0xEF)) stop[0] = '\0';
+    }
+    const char *stops[] = {"no such text", stop};
+    SpingalettSampling cut = {.tokenizer = tok, .stop_strings = stops, .stop_string_count = 2};
+    spingalett_session_rewind(s, 0, 0);
+    spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = &P, .tokens = again,
+                                .made = &made_again, .count = count, .sampling = &cut);
+    CHECK(stop[0] && made_again == expect && !memcmp(again, greedy, made_again * sizeof(uint32_t)),
+          "stop strings: \"%s\" ends the generation after %u tokens (%u expected of %u)", stop, made_again, expect, made);
+    free(logits);
+    spingalett_session_free(s);
+    spingalett_model_free(m);
+    spingalett_tokenizer_free(tok);
+    printf("  sampling: penalties, min_p, top_k and top_p as the reference draws them; stop strings\n");
+}
+
 static void generate_batched(void) {
     const uint32_t T = 12, V = 19, B = 4, count = 8;
     lcg_state = 950;
@@ -6705,6 +6866,309 @@ static void tokenizer_cases(const char *name, const char *file, const char *expe
     spingalett_tokenizer_free(tok);
 }
 
+/* ------------------------------------------------------------------------- graphs of operators */
+
+/* A tensor of Tests/Data/graph_cases.bin (Tests/make_graph_tests.py), pointing into the file's bytes. */
+typedef struct {
+    char name[128];
+    SpingalettTensor t;
+    uint64_t bytes;
+} CaseTensor;
+
+static bool case_tensors(const uint8_t *file, const uint8_t **p, const uint8_t *end, CaseTensor *out, uint32_t *count,
+                         uint32_t most) {
+    if (end - *p < 4) return false;
+    memcpy(count, *p, 4);
+    *p += 4;
+    if (*count > most) return false;
+    for (uint32_t k = 0; k < *count; k++) {
+        CaseTensor *c = &out[k];
+        memset(c, 0, sizeof *c);
+        uint16_t len;
+        if (end - *p < 2) return false;
+        memcpy(&len, *p, 2);
+        *p += 2;
+        if (len >= sizeof c->name || end - *p < len + 2) return false;
+        memcpy(c->name, *p, len);
+        *p += len;
+        c->t.name = c->name;
+        c->t.dtype = (SpingalettDType)(*p)[0];
+        c->t.rank = (*p)[1];
+        *p += 2;
+        if (c->t.rank > SPINGALETT_MAX_RANK || end - *p < 8 * (ptrdiff_t)c->t.rank + 8) return false;
+        memcpy(c->t.shape, *p, 8 * (size_t)c->t.rank);
+        *p += 8 * (size_t)c->t.rank;
+        memcpy(&c->bytes, *p, 8);
+        *p += 8;
+        *p += (8 - (size_t)(*p - file) % 8) % 8;      /* (the values at offsets of multiples of 8) */
+        if (*p > end || (uint64_t)(end - *p) < c->bytes) return false;
+        c->t.data = (void *)*p;
+        *p += c->bytes;
+    }
+    return true;
+}
+
+static float case_float(const SpingalettTensor *t, uint64_t i) {
+    if (t->dtype != SPINGALETT_DTYPE_FLOAT16) return ((const float *)t->data)[i];
+    const uint16_t h = ((const uint16_t *)t->data)[i];
+    const int e = (h >> 10) & 31, f = h & 1023;
+    const float v = e == 31 ? (f ? NAN : INFINITY) : e ? ldexpf((float)(f | 1024), e - 25) : ldexpf((float)f, -24);
+    return h & 0x8000 ? -v : v;
+}
+
+/* Every case of Tests/Data/graph_cases.bin: ONNX's conformance tests of single operators, each graph run on its
+   inputs against the reference's outputs (floats within the case's tolerances, integers and booleans exactly),
+   on one thread and on four, which give the same bits. */
+static void operator_cases(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/graph_cases.bin", SPINGALETT_TEST_DATA_DIR);
+    size_t size = 0;
+    uint8_t *file = read_all(path, &size);
+    CHECK(file && size >= 12 && !memcmp(file, "SGCASES1", 8), "%s: no cases", path);
+    if (!file || size < 12) { free(file); return; }
+    uint32_t cases;
+    memcpy(&cases, file + 8, 4);
+    const uint8_t *p = file + 12, *end = file + size;
+    enum { MOST = 32 };
+    CaseTensor *ins = calloc(MOST, sizeof(CaseTensor)), *refs = calloc(MOST, sizeof(CaseTensor));
+    SpingalettTensor outs[MOST], again[MOST];
+    void *first[MOST] = {0};
+    int wrong = 0, run = 0;
+    const ComputeMode mode = spingalett_get_compute_mode();
+    const unsigned threads = spingalett_get_num_threads();
+    for (uint32_t c = 0; c < cases; c++) {
+        uint16_t len;
+        char name[160];
+        uint32_t model_len, nin, nout;
+        float rtol, atol;
+        bool parsed = end - p >= 2;
+        if (parsed) { memcpy(&len, p, 2); p += 2; parsed = len < sizeof name && end - p >= len + 4; }
+        if (parsed) {
+            memcpy(name, p, len);
+            name[len] = '\0';
+            p += len;
+            memcpy(&model_len, p, 4);
+            p += 4;
+            parsed = (uint64_t)(end - p) >= (uint64_t)model_len + 8;
+        }
+        const uint8_t *model = p;
+        if (parsed) {
+            p += model_len;
+            memcpy(&rtol, p, 4);
+            memcpy(&atol, p + 4, 4);
+            p += 8;
+            parsed = case_tensors(file, &p, end, ins, &nin, MOST) && case_tensors(file, &p, end, refs, &nout, MOST);
+        }
+        CHECK(parsed, "graph_cases.bin: case %u malformed", c);
+        if (!parsed) break;
+        run++;
+        SpingalettGraph *g = spingalett_graph_open(.data = model, .size = model_len);
+        bool ok = g != NULL;
+        const char *why = ok ? "" : spingalett_last_error_message();
+        /* one thread first, then four: the same bits */
+        for (int pass = 0; ok && pass < 2; pass++) {
+            spingalett_set_compute_mode(pass ? SPINGALETT_COMPUTE_OPENMP : SPINGALETT_COMPUTE_SINGLE_THREADED);
+            if (pass) spingalett_set_num_threads(4);
+            SpingalettTensor inputs[MOST];
+            for (uint32_t k = 0; k < nin; k++) inputs[k] = ins[k].t;
+            SpingalettTensor *o = pass ? again : outs;
+            for (uint32_t k = 0; k < nout; k++) {
+                memset(&o[k], 0, sizeof o[k]);
+                o[k].name = refs[k].name;
+            }
+            ok = spingalett_graph_run(.graph = g, .inputs = inputs, .input_count = nin, .outputs = o, .output_count = nout);
+            if (!ok) { why = spingalett_last_error_message(); break; }
+            for (uint32_t k = 0; ok && k < nout; k++) {
+                const SpingalettTensor *got = &o[k], *ref = &refs[k].t;
+                ok = got->dtype == ref->dtype && got->rank == ref->rank;
+                uint64_t count = 1;
+                for (uint32_t d = 0; ok && d < ref->rank; d++) {
+                    ok = got->shape[d] == ref->shape[d];
+                    count *= (uint64_t)ref->shape[d];
+                }
+                if (!ok) { why = "an output of another type or shape"; break; }
+                const size_t bytes = (size_t)refs[k].bytes;
+                if (pass) {
+                    ok = !bytes || !memcmp(first[k], got->data, bytes);
+                    if (!ok) why = "other bits on four threads";
+                    free(first[k]);
+                    first[k] = NULL;
+                    continue;
+                }
+                if (ref->dtype == SPINGALETT_DTYPE_FLOAT32 || ref->dtype == SPINGALETT_DTYPE_FLOAT16) {
+                    for (uint64_t i = 0; ok && i < count; i++) {
+                        const float a = case_float(got, i), b = case_float(ref, i);
+                        ok = (isnan(a) && isnan(b)) || a == b || fabsf(a - b) <= atol + rtol * fabsf(b);
+                    }
+                } else {
+                    ok = !bytes || !memcmp(got->data, ref->data, bytes);
+                }
+                if (!ok) why = "outputs other than the reference's";
+                first[k] = malloc(bytes ? bytes : 1);
+                if (bytes) memcpy(first[k], got->data, bytes);
+            }
+        }
+        for (uint32_t k = 0; k < nout; k++) { free(first[k]); first[k] = NULL; }
+        spingalett_set_compute_mode(mode);
+        spingalett_set_num_threads(threads);
+        if (!ok && ++wrong <= 8) printf("  %s: %s\n", name, why);
+        spingalett_graph_free(g);
+    }
+    CHECK(!wrong, "%d of %d operator cases fail", wrong, run);
+    printf("  %d of ONNX's conformance cases\n", run);
+    free(ins);
+    free(refs);
+    free(file);
+}
+
+/* Every case of Tests/Data/chat_cases.txt (Tests/make_chat_tests.py): a template of Tests/Data/chat rendering a
+   conversation to transformers' text, or failing with its error. Messages of roles and texts go as
+   SpingalettChatMessage, others in the variables' JSON; the text is also measured, and cut short by a small buffer. */
+static void chat_cases(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/chat_cases.txt", SPINGALETT_TEST_DATA_DIR);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "%s: no cases", path);
+    if (!f) return;
+    enum { LINE = 1 << 18, MESSAGES = 16 };
+    char *line = malloc(LINE), *variables = malloc(LINE), *want = malloc(LINE), *got = malloc(LINE);
+    char *template = NULL, name[64] = "";
+    char *roles[MESSAGES], *contents[MESSAGES];
+    for (int k = 0; k < MESSAGES; k++) roles[k] = malloc(256), contents[k] = malloc(4096);
+    SpingalettChatMessage messages[MESSAGES];
+    int cases = 0, wrong = 0, templates = 0, errors = 0;
+    unsigned add = 0;
+    unsigned long long time = 0;
+    uint32_t count = 0;
+    while (fgets(line, LINE, f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == 'T') {
+            snprintf(name, sizeof name, "%s", line + 2);
+            snprintf(path, sizeof path, "%s/chat/%s.jinja", SPINGALETT_TEST_DATA_DIR, name);
+            free(template);
+            size_t size = 0;
+            uint8_t *bytes = read_all(path, &size);
+            template = bytes ? (char *)realloc(bytes, size + 1) : NULL;
+            if (template) template[size] = '\0';
+            CHECK(template, "%s: cannot read", path);
+            templates++;
+        } else if (line[0] == 'C') {
+            int used = 0;
+            if (sscanf(line + 2, "%u %llu %n", &add, &time, &used) != 2) break;
+            variables[unhex(line + 2 + used, variables)] = '\0';
+            count = 0;
+        } else if (line[0] == 'M' && count < MESSAGES) {
+            char *space = strchr(line + 2, ' ');
+            if (!space) break;
+            *space = '\0';
+            roles[count][unhex(line + 2, roles[count])] = '\0';
+            contents[count][unhex(space + 1, contents[count])] = '\0';
+            messages[count].role = roles[count];
+            messages[count].content = contents[count];
+            count++;
+        } else if ((line[0] == 'E' || line[0] == 'X') && template) {
+            const size_t wn = unhex(line + 2, want);
+            want[wn] = '\0';
+            cases++;
+            spingalett_clear_error();
+            int64_t n = spingalett_chat_render(.chat_template = template, .messages = messages, .count = count,
+                                               .add_generation_prompt = add != 0, .variables = variables, .time = time,
+                                               .text = got, .capacity = LINE);
+            int64_t measured = spingalett_chat_render(.chat_template = template, .messages = messages, .count = count,
+                                                      .add_generation_prompt = add != 0, .variables = variables,
+                                                      .time = time);
+            bool ok;
+            if (line[0] == 'E') {
+                ok = n == (int64_t)wn && measured == n && !memcmp(got, want, wn) && got[wn] == '\0';
+                if (ok && wn > 1) {             /* a small buffer: the first bytes, a NUL, the whole length */
+                    char few[4] = "xyz";
+                    ok = spingalett_chat_render(.chat_template = template, .messages = messages, .count = count,
+                                                .add_generation_prompt = add != 0, .variables = variables, .time = time,
+                                                .text = few, .capacity = 2) == n && few[0] == want[0] && few[1] == '\0';
+                }
+                if (!ok && ++wrong <= 4) {
+                    size_t at = 0;
+                    while (n > 0 && at < wn && at < (size_t)n && got[at] == want[at]) at++;
+                    printf("  %s case %d: %s\n    renders %lld bytes, %zu expected; from byte %zu: \"%.80s\" against \"%.80s\"\n",
+                           name, cases, n < 0 ? spingalett_last_error_message() : "", (long long)n, wn, at,
+                           n > 0 ? got + at : "", want + at);
+                }
+            } else {
+                errors++;
+                const char *message = spingalett_last_error_message();
+                ok = n == -1 && measured == -1 && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+                     strstr(message, want) != NULL;
+                if (!ok && ++wrong <= 4)
+                    printf("  %s case %d: expected the error \"%s\", got %lld \"%s\"\n", name, cases, want,
+                           (long long)n, n < 0 ? message : got);
+            }
+        }
+    }
+    CHECK(cases >= 192 && !wrong, "chat templates: %d of %d cases render otherwise than transformers", wrong, cases);
+    printf("  %d templates, %d conversations (%d errors)\n", templates, cases, errors);
+    fclose(f);
+    free(template);
+    for (int k = 0; k < MESSAGES; k++) free(roles[k]), free(contents[k]);
+    free(line); free(variables); free(want); free(got);
+}
+
+/* A GGUF file's template and its tokens, a directory's tokenizer_config.json, and the API's errors. */
+static void chat_api(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/gguf_qwen2.gguf", SPINGALETT_TEST_DATA_DIR);
+    SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+    const char *t = spingalett_tokenizer_chat_template(tok);
+    CHECK(tok && t && strstr(t, "<|im_start|>"), "gguf_qwen2.gguf: its chat template");
+    SpingalettChatMessage hello[] = {{"system", "Be brief."}, {"user", "Hi"}};
+    char text[512];
+    int64_t n = spingalett_chat_render(.tokenizer = tok, .messages = hello, .count = 2, .add_generation_prompt = true,
+                                       .text = text, .capacity = sizeof text);
+    CHECK(n > 0 && !strcmp(text, "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
+                                 "<|im_start|>assistant\n"), "gguf_qwen2.gguf renders \"%s\" (%lld)", text, (long long)n);
+    spingalett_tokenizer_free(tok);
+    snprintf(path, sizeof path, "%s/hf_llama", SPINGALETT_TEST_DATA_DIR);
+    tok = spingalett_tokenizer_load(path);
+    t = spingalett_tokenizer_chat_template(tok);
+    n = spingalett_chat_render(.tokenizer = tok, .messages = hello + 1, .count = 1, .add_generation_prompt = true,
+                               .text = text, .capacity = sizeof text);
+    CHECK(tok && t && n > 0 && strstr(text, "Hi"), "hf_llama: the template of its tokenizer_config.json (%lld: %s)",
+          (long long)n, n < 0 ? spingalett_last_error_message() : text);
+    spingalett_tokenizer_free(tok);
+    spingalett_clear_error();
+    CHECK(spingalett_chat_render(.messages = hello, .count = 2) == -1 && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "no template");
+    static const struct { const char *template, *error; } bad[] = {
+        {"{% if %}", "unexpected"}, {"{{ x", "not closed"}, {"{% for x in y %}", "endfor"},
+        {"{{ raise_exception('stop: ' ~ 1) }}", "stop: 1"}, {"{{ 'a' + 1 }}", "can only concatenate str (not \"int\") to str"},
+        {"{{ x | nosuchfilter }}", "no filter named 'nosuchfilter'"}, {"{% include 'x' %}", "'include' is not supported"},
+        {"{{ 1 // 0 }}", "division"}, {"{{ undefined_function() }}", "'undefined_function' is undefined"},
+    };
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        spingalett_clear_error();
+        n = spingalett_chat_render(.chat_template = bad[k].template);
+        CHECK(n == -1 && strstr(spingalett_last_error_message(), bad[k].error), "\"%s\": %s", bad[k].template,
+              spingalett_last_error_message());
+    }
+    n = spingalett_chat_render(.chat_template = "{{ 'x' }}", .variables = "[1]");
+    CHECK(n == -1 && strstr(spingalett_last_error_message(), "object"), "variables that are no object");
+    /* the values Python prints */
+    static const struct { const char *template, *text; } shown[] = {
+        {"{{ [1, 2.5, 'a', none, true] }}", "[1, 2.5, 'a', None, True]"}, {"{{ {'a': [1e20, 1e-5]} | tojson }}", "{\"a\": [1e+20, 1e-05]}"},
+        {"{{ 'abc'[::-1] ~ 'héllo'[1:3] }}", "cbaél"}, {"{{ ' x '.strip() }}|{{ 'a,b,,c'.split(',') }}", "x|['a', 'b', '', 'c']"},
+        {"{% set ns = namespace(n=0) %}{% for i in range(5) if i is odd %}{% set ns.n = ns.n + i %}{% endfor %}{{ ns.n }}", "4"},
+        {"{% for k, v in {'a': 1, 'b': 2}.items() %}{{ k }}={{ v }}{% if not loop.last %},{% endif %}{% endfor %}", "a=1,b=2"},
+        {"{% macro greet(name, end='!') %}hi {{ name }}{{ end }}{% endmacro %}{{ greet('you') }} {{ greet('x', end='?') }}", "hi you! hi x?"},
+        {"{{ 7 // 2 }} {{ -7 // 2 }} {{ 7 % -3 }} {{ 2 ** 10 }} {{ 1 / 4 }}", "3 -4 -2 1024 0.25"},
+        {"  {%- if true %}\n  a\n  {%- endif %}\nb", "  ab"}, {"{% if true %}\n  x\n{% endif %}\ny", "  x\ny"},
+        {"{{ {'a': 1, 'b': [True, None]} | tojson(indent=2) }}", "{\n  \"a\": 1,\n  \"b\": [\n    true,\n    null\n  ]\n}"},
+    };
+    for (size_t k = 0; k < sizeof shown / sizeof *shown; k++) {
+        n = spingalett_chat_render(.chat_template = shown[k].template, .text = text, .capacity = sizeof text);
+        CHECK(n >= 0 && !strcmp(text, shown[k].text), "\"%s\" renders \"%s\", not \"%s\" (%s)", shown[k].template,
+              n >= 0 ? text : "", shown[k].text, n < 0 ? spingalett_last_error_message() : "");
+    }
+}
+
 /* The tokens a tokenizer names, the errors of calls and of malformed files. */
 static void tokenizer_api(void) {
     char path[512];
@@ -6846,13 +7310,15 @@ static void pretrained_model(const char *name, bool tokenizer) {
 /* GGUF files as deployment models (spingalett_model_open()), their tensors as the files store them: the logits of a
    window against PyTorch's (LLaMA's permuted queries and keys, Qwen2's biases, GPT-2's positions, Qwen3's normalized
    queries and keys, LLaMA 3's scaled rotary embeddings, Gemma 3's scaled embeddings, normalized outputs and windows
-   of their own rotary base; the matrices of fifteen types computed in their blocks, near
+   of their own rotary base, SmolLM3's layers without rotary embeddings, OLMo 2's normalizations, Phi-3's fused
+   matrices and LongRoPE, GLM-4's half-turned heads; the matrices of fifteen types computed in their blocks, near
    the logits of their dequantized weights), and a session's logits batched prediction's, bit for bit. */
 static void gguf_deployment(void) {
     static const struct { const char *file, *logits; } cases[] = {
         {"gguf_llama.gguf", "hf_llama"}, {"gguf_qwen2.gguf", "hf_qwen2"}, {"gguf_gpt2.gguf", "hf_gpt2"},
         {"gguf_qwen3.gguf", "hf_qwen3"}, {"gguf_llama3.gguf", "hf_llama3"}, {"gguf_gemma3.gguf", "hf_gemma3"},
-        {"gguf_quant.gguf", "gguf_quant"}};
+        {"gguf_smollm3.gguf", "gguf_smollm3"}, {"gguf_olmo2.gguf", "gguf_olmo2"}, {"gguf_phi3.gguf", "gguf_phi3"},
+        {"gguf_glm4.gguf", "gguf_glm4"}, {"gguf_quant.gguf", "gguf_quant"}};
     for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
         char path[512];
         snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, cases[k].logits);
@@ -9318,6 +9784,15 @@ int main(int argc, char **argv) {
         }
         tokenizer_api();
     }
+    if (!*only || !strcmp(only, "operators")) {
+        printf("[graphs of operators]\n");
+        operator_cases();
+    }
+    if (!*only || !strcmp(only, "chat")) {
+        printf("[chat templates]\n");
+        chat_cases();
+        chat_api();
+    }
     if (!*only || !strcmp(only, "pretrained")) {
         printf("[pretrained language models]\n");
         pretrained_model("hf_llama", true);
@@ -9386,6 +9861,7 @@ int main(int argc, char **argv) {
         for (int m = 0; m < 3; m++) generator_mode(cm[m]);
         generate_cached();
         generate_batched();
+        generate_sampling();
     }
     if (!*only || !strcmp(only, "predict")) {
         printf("[batched inference]\n");

@@ -1,0 +1,623 @@
+# ONNX's conformance cases of single operators that Tests/Data/graph_cases.bin leaves out (622; 1262 kept), written by Tests/make_graph_tests.py
+test_adagrad: graph: the operator Adagrad (ai.onnx.preview.training, opset 0) is not supported
+test_adagrad_multiple: graph: the operator Adagrad (ai.onnx.preview.training, opset 0) is not supported
+test_adam: graph: the operator Adam (ai.onnx.preview.training, opset 0) is not supported
+test_adam_multiple: graph: the operator Adam (ai.onnx.preview.training, opset 0) is not supported
+test_add_int16: a type graphs do not hold
+test_add_uint16: a type graphs do not hold
+test_add_uint32: a type graphs do not hold
+test_add_uint64: a type graphs do not hold
+test_affine_grid_2d: graph: the operator AffineGrid (ONNX's domain, opset 20) is not supported
+test_affine_grid_2d_expanded: graph: the operator If (ONNX's domain, opset 20) is not supported
+test_affine_grid_2d_align_corners: graph: the operator AffineGrid (ONNX's domain, opset 20) is not supported
+test_affine_grid_2d_align_corners_expanded: graph: the operator If (ONNX's domain, opset 20) is not supported
+test_affine_grid_3d: graph: the operator AffineGrid (ONNX's domain, opset 20) is not supported
+test_affine_grid_3d_expanded: graph: the operator If (ONNX's domain, opset 20) is not supported
+test_affine_grid_3d_align_corners: graph: the operator AffineGrid (ONNX's domain, opset 20) is not supported
+test_affine_grid_3d_align_corners_expanded: graph: the operator If (ONNX's domain, opset 20) is not supported
+test_ai_onnx_ml_array_feature_extractor: graph: the operator ArrayFeatureExtractor (ai.onnx.ml, opset 0) is not supported
+test_ai_onnx_ml_binarizer: graph: the operator Binarizer (ai.onnx.ml, opset 0) is not supported
+test_ai_onnx_ml_label_encoder_string_int: graph: the input 'X' is of ONNX's type 8, which graphs do not take
+test_ai_onnx_ml_label_encoder_string_int_no_default: graph: the input 'X' is of ONNX's type 8, which graphs do not take
+test_ai_onnx_ml_label_encoder_tensor_mapping: graph: the input 'X' is of ONNX's type 8, which graphs do not take
+test_ai_onnx_ml_label_encoder_tensor_value_only_mapping: graph: the input 'X' is of ONNX's type 8, which graphs do not take
+test_ai_onnx_ml_tree_ensemble_single_tree: graph: the operator TreeEnsemble (ai.onnx.ml, opset 0) is not supported
+test_ai_onnx_ml_tree_ensemble_set_membership: graph: the operator TreeEnsemble (ai.onnx.ml, opset 0) is not supported
+test_attention_4d_causal_bf16: a type graphs do not hold
+test_attention_4d_causal_bf16_expanded: a type graphs do not hold
+test_attention_4d_padded_kv_bf16: a type graphs do not hold
+test_attention_4d_padded_kv_bf16_expanded: a type graphs do not hold
+test_attention_4d_causal_padded_kv_bf16: a type graphs do not hold
+test_attention_4d_causal_padded_kv_bf16_expanded: a type graphs do not hold
+test_attention_4d_attn_mask_causal_bf16: a type graphs do not hold
+test_attention_4d_attn_mask_causal_bf16_expanded: a type graphs do not hold
+test_attention_3d_causal_bf16: a type graphs do not hold
+test_attention_3d_causal_bf16_expanded: a type graphs do not hold
+test_averagepool_3d_default: passes; left out for its size (750708 bytes)
+test_batchnorm_example_training_mode: graph: the node 'BatchNormalization' (BatchNormalization): training mode
+test_batchnorm_epsilon_training_mode: graph: the node 'BatchNormalization' (BatchNormalization): training mode
+test_bernoulli: graph: the operator Bernoulli (ONNX's domain, opset 22) is not supported
+test_bernoulli_expanded: graph: the operator RandomUniformLike (ONNX's domain, opset 22) is not supported
+test_bernoulli_double: graph: the operator Bernoulli (ONNX's domain, opset 22) is not supported
+test_bernoulli_double_expanded: graph: the operator RandomUniformLike (ONNX's domain, opset 22) is not supported
+test_bernoulli_seed: graph: the operator Bernoulli (ONNX's domain, opset 22) is not supported
+test_bernoulli_seed_expanded: graph: the operator RandomUniformLike (ONNX's domain, opset 22) is not supported
+test_bitcast_float32_to_int32: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_int32_to_float32: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_float64_to_int64: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_int64_to_float64: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_uint32_to_int32: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_2d_float32_to_int32: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_int8_to_uint8: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_scalar_float32_to_int32: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_uint16_to_int16: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitcast_bool_to_uint8: graph: the operator BitCast (ONNX's domain, opset 26) is not supported
+test_bitshift_right_uint16: a type graphs do not hold
+test_bitshift_right_uint32: a type graphs do not hold
+test_bitshift_right_uint64: a type graphs do not hold
+test_bitshift_left_uint16: a type graphs do not hold
+test_bitshift_left_uint32: a type graphs do not hold
+test_bitshift_left_uint64: a type graphs do not hold
+test_bitshift_right_int16: a type graphs do not hold
+test_bitshift_left_int16: a type graphs do not hold
+test_bitwise_and_i16_3d: a type graphs do not hold
+test_bitwise_and_ui64_bcast_3v1d: a type graphs do not hold
+test_bitwise_not_3d: a type graphs do not hold
+test_bitwise_or_ui64_bcast_3v1d: a type graphs do not hold
+test_bitwise_xor_i16_3d: a type graphs do not hold
+test_bitwise_xor_ui64_bcast_3v1d: a type graphs do not hold
+test_cast_FLOAT_to_FLOAT16: a type graphs do not hold
+test_cast_FLOAT_to_DOUBLE: a type graphs do not hold
+test_cast_FLOAT16_to_FLOAT: a type graphs do not hold
+test_cast_FLOAT16_to_DOUBLE: a type graphs do not hold
+test_cast_DOUBLE_to_FLOAT: a type graphs do not hold
+test_cast_DOUBLE_to_FLOAT16: a type graphs do not hold
+test_cast_FLOAT_to_BFLOAT16: a type graphs do not hold
+test_cast_BFLOAT16_to_FLOAT: a type graphs do not hold
+test_cast_FLOAT_to_FLOAT8E4M3FN: a type graphs do not hold
+test_cast_FLOAT16_to_FLOAT8E4M3FN: a type graphs do not hold
+test_cast_FLOAT_to_FLOAT8E4M3FNUZ: a type graphs do not hold
+test_cast_FLOAT16_to_FLOAT8E4M3FNUZ: a type graphs do not hold
+test_cast_FLOAT8E4M3FN_to_FLOAT: graph: the input 'input' is of ONNX's type 17, which graphs do not take
+test_cast_FLOAT8E4M3FN_to_FLOAT16: graph: the input 'input' is of ONNX's type 17, which graphs do not take
+test_cast_FLOAT8E4M3FNUZ_to_FLOAT: graph: the input 'input' is of ONNX's type 18, which graphs do not take
+test_cast_FLOAT8E4M3FNUZ_to_FLOAT16: graph: the input 'input' is of ONNX's type 18, which graphs do not take
+test_cast_FLOAT_to_FLOAT8E5M2: a type graphs do not hold
+test_cast_FLOAT16_to_FLOAT8E5M2: a type graphs do not hold
+test_cast_FLOAT_to_FLOAT8E5M2FNUZ: a type graphs do not hold
+test_cast_FLOAT16_to_FLOAT8E5M2FNUZ: a type graphs do not hold
+test_cast_FLOAT8E5M2_to_FLOAT: graph: the input 'input' is of ONNX's type 19, which graphs do not take
+test_cast_FLOAT8E5M2_to_FLOAT16: graph: the input 'input' is of ONNX's type 19, which graphs do not take
+test_cast_FLOAT8E5M2FNUZ_to_FLOAT: graph: the input 'input' is of ONNX's type 20, which graphs do not take
+test_cast_FLOAT8E5M2FNUZ_to_FLOAT16: graph: the input 'input' is of ONNX's type 20, which graphs do not take
+test_cast_FLOAT_to_UINT4: a type graphs do not hold
+test_cast_FLOAT16_to_UINT4: a type graphs do not hold
+test_cast_FLOAT_to_INT4: a type graphs do not hold
+test_cast_FLOAT16_to_INT4: a type graphs do not hold
+test_cast_UINT4_to_FLOAT: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_cast_UINT4_to_FLOAT16: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_cast_UINT4_to_UINT8: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_cast_INT4_to_FLOAT: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_cast_INT4_to_FLOAT16: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_cast_INT4_to_INT8: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_cast_FLOAT4E2M1_to_FLOAT: graph: the input 'input' is of ONNX's type 23, which graphs do not take
+test_cast_FLOAT4E2M1_to_FLOAT16: graph: the input 'input' is of ONNX's type 23, which graphs do not take
+test_cast_FLOAT_to_FLOAT4E2M1: a type graphs do not hold
+test_cast_FLOAT16_to_FLOAT4E2M1: a type graphs do not hold
+test_cast_FLOAT_to_UINT2: a type graphs do not hold
+test_cast_FLOAT16_to_UINT2: a type graphs do not hold
+test_cast_FLOAT_to_INT2: a type graphs do not hold
+test_cast_FLOAT16_to_INT2: a type graphs do not hold
+test_cast_UINT2_to_FLOAT: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_cast_UINT2_to_FLOAT16: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_cast_UINT2_to_UINT8: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_cast_INT2_to_FLOAT: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_cast_INT2_to_FLOAT16: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_cast_INT2_to_INT8: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_cast_no_saturate_FLOAT_to_FLOAT8E4M3FN: a type graphs do not hold
+test_cast_no_saturate_FLOAT_to_FLOAT8E4M3FNUZ: a type graphs do not hold
+test_cast_no_saturate_FLOAT_to_FLOAT8E5M2: a type graphs do not hold
+test_cast_no_saturate_FLOAT_to_FLOAT8E5M2FNUZ: a type graphs do not hold
+test_cast_no_saturate_FLOAT16_to_FLOAT8E4M3FN: a type graphs do not hold
+test_cast_no_saturate_FLOAT16_to_FLOAT8E4M3FNUZ: a type graphs do not hold
+test_cast_no_saturate_FLOAT16_to_FLOAT8E5M2: a type graphs do not hold
+test_cast_no_saturate_FLOAT16_to_FLOAT8E5M2FNUZ: a type graphs do not hold
+test_cast_e8m0_FLOAT_to_FLOAT8E8M0: a type graphs do not hold
+test_cast_e8m0_FLOAT16_to_FLOAT8E8M0: a type graphs do not hold
+test_cast_e8m0_FLOAT8E8M0_to_FLOAT: graph: the input 'input' is of ONNX's type 24, which graphs do not take
+test_cast_e8m0_FLOAT8E8M0_to_FLOAT16: graph: the input 'input' is of ONNX's type 24, which graphs do not take
+test_castlike_FLOAT_to_FLOAT16: a type graphs do not hold
+test_castlike_FLOAT_to_FLOAT16_expanded: a type graphs do not hold
+test_castlike_FLOAT_to_DOUBLE: a type graphs do not hold
+test_castlike_FLOAT_to_DOUBLE_expanded: a type graphs do not hold
+test_castlike_FLOAT16_to_FLOAT: a type graphs do not hold
+test_castlike_FLOAT16_to_FLOAT_expanded: a type graphs do not hold
+test_castlike_FLOAT16_to_DOUBLE: a type graphs do not hold
+test_castlike_FLOAT16_to_DOUBLE_expanded: a type graphs do not hold
+test_castlike_DOUBLE_to_FLOAT: a type graphs do not hold
+test_castlike_DOUBLE_to_FLOAT_expanded: a type graphs do not hold
+test_castlike_DOUBLE_to_FLOAT16: a type graphs do not hold
+test_castlike_DOUBLE_to_FLOAT16_expanded: a type graphs do not hold
+test_castlike_FLOAT_to_BFLOAT16: a type graphs do not hold
+test_castlike_FLOAT_to_BFLOAT16_expanded: a type graphs do not hold
+test_castlike_BFLOAT16_to_FLOAT: a type graphs do not hold
+test_castlike_BFLOAT16_to_FLOAT_expanded: a type graphs do not hold
+test_castlike_FLOAT_to_FLOAT8E4M3FN: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT_to_FLOAT8E4M3FN_expanded: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E4M3FN: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E4M3FN_expanded: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT_to_FLOAT8E4M3FNUZ: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT_to_FLOAT8E4M3FNUZ_expanded: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E4M3FNUZ: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E4M3FNUZ_expanded: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT8E4M3FN_to_FLOAT: graph: the input 'input' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT8E4M3FN_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT8E4M3FN_to_FLOAT16: graph: the input 'input' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT8E4M3FN_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 17, which graphs do not take
+test_castlike_FLOAT8E4M3FNUZ_to_FLOAT: graph: the input 'input' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT8E4M3FNUZ_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT8E4M3FNUZ_to_FLOAT16: graph: the input 'input' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT8E4M3FNUZ_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 18, which graphs do not take
+test_castlike_FLOAT_to_FLOAT8E5M2: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT_to_FLOAT8E5M2_expanded: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E5M2: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E5M2_expanded: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT_to_FLOAT8E5M2FNUZ: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT_to_FLOAT8E5M2FNUZ_expanded: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E5M2FNUZ: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT8E5M2FNUZ_expanded: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT8E5M2_to_FLOAT: graph: the input 'input' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT8E5M2_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT8E5M2_to_FLOAT16: graph: the input 'input' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT8E5M2_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 19, which graphs do not take
+test_castlike_FLOAT8E5M2FNUZ_to_FLOAT: graph: the input 'input' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT8E5M2FNUZ_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT8E5M2FNUZ_to_FLOAT16: graph: the input 'input' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT8E5M2FNUZ_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 20, which graphs do not take
+test_castlike_FLOAT_to_UINT4: graph: the input 'like' is of ONNX's type 21, which graphs do not take
+test_castlike_FLOAT_to_UINT4_expanded: graph: the input 'like' is of ONNX's type 21, which graphs do not take
+test_castlike_FLOAT16_to_UINT4: graph: the input 'like' is of ONNX's type 21, which graphs do not take
+test_castlike_FLOAT16_to_UINT4_expanded: graph: the input 'like' is of ONNX's type 21, which graphs do not take
+test_castlike_FLOAT_to_INT4: graph: the input 'like' is of ONNX's type 22, which graphs do not take
+test_castlike_FLOAT_to_INT4_expanded: graph: the input 'like' is of ONNX's type 22, which graphs do not take
+test_castlike_FLOAT16_to_INT4: graph: the input 'like' is of ONNX's type 22, which graphs do not take
+test_castlike_FLOAT16_to_INT4_expanded: graph: the input 'like' is of ONNX's type 22, which graphs do not take
+test_castlike_UINT4_to_FLOAT: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_castlike_UINT4_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_castlike_UINT4_to_FLOAT16: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_castlike_UINT4_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_castlike_UINT4_to_UINT8: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_castlike_UINT4_to_UINT8_expanded: graph: the input 'input' is of ONNX's type 21, which graphs do not take
+test_castlike_INT4_to_FLOAT: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_castlike_INT4_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_castlike_INT4_to_FLOAT16: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_castlike_INT4_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_castlike_INT4_to_INT8: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_castlike_INT4_to_INT8_expanded: graph: the input 'input' is of ONNX's type 22, which graphs do not take
+test_castlike_FLOAT4E2M1_to_FLOAT: graph: the input 'input' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT4E2M1_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT4E2M1_to_FLOAT16: graph: the input 'input' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT4E2M1_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT_to_FLOAT4E2M1: graph: the input 'like' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT_to_FLOAT4E2M1_expanded: graph: the input 'like' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT4E2M1: graph: the input 'like' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT16_to_FLOAT4E2M1_expanded: graph: the input 'like' is of ONNX's type 23, which graphs do not take
+test_castlike_FLOAT_to_UINT2: graph: the input 'like' is of ONNX's type 25, which graphs do not take
+test_castlike_FLOAT_to_UINT2_expanded: graph: the input 'like' is of ONNX's type 25, which graphs do not take
+test_castlike_FLOAT16_to_UINT2: graph: the input 'like' is of ONNX's type 25, which graphs do not take
+test_castlike_FLOAT16_to_UINT2_expanded: graph: the input 'like' is of ONNX's type 25, which graphs do not take
+test_castlike_FLOAT_to_INT2: graph: the input 'like' is of ONNX's type 26, which graphs do not take
+test_castlike_FLOAT_to_INT2_expanded: graph: the input 'like' is of ONNX's type 26, which graphs do not take
+test_castlike_FLOAT16_to_INT2: graph: the input 'like' is of ONNX's type 26, which graphs do not take
+test_castlike_FLOAT16_to_INT2_expanded: graph: the input 'like' is of ONNX's type 26, which graphs do not take
+test_castlike_UINT2_to_FLOAT: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_castlike_UINT2_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_castlike_UINT2_to_FLOAT16: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_castlike_UINT2_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_castlike_UINT2_to_UINT8: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_castlike_UINT2_to_UINT8_expanded: graph: the input 'input' is of ONNX's type 25, which graphs do not take
+test_castlike_INT2_to_FLOAT: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_castlike_INT2_to_FLOAT_expanded: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_castlike_INT2_to_FLOAT16: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_castlike_INT2_to_FLOAT16_expanded: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_castlike_INT2_to_INT8: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_castlike_INT2_to_INT8_expanded: graph: the input 'input' is of ONNX's type 26, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FN: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FN_expanded: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FNUZ: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FNUZ_expanded: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2_expanded: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2FNUZ: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2FNUZ_expanded: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FN: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FN_expanded: graph: the input 'like' is of ONNX's type 17, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FNUZ: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FNUZ_expanded: graph: the input 'like' is of ONNX's type 18, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2_expanded: graph: the input 'like' is of ONNX's type 19, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2FNUZ: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2FNUZ_expanded: graph: the input 'like' is of ONNX's type 20, which graphs do not take
+test_celu_bfloat16: a type graphs do not hold
+test_celu_bfloat16_expanded: a type graphs do not hold
+test_center_crop_pad_crop: graph: the operator CenterCropPad (ONNX's domain, opset 18) is not supported
+test_center_crop_pad_pad: graph: the operator CenterCropPad (ONNX's domain, opset 18) is not supported
+test_center_crop_pad_crop_and_pad: graph: the operator CenterCropPad (ONNX's domain, opset 18) is not supported
+test_center_crop_pad_crop_axes_hwc: graph: the operator CenterCropPad (ONNX's domain, opset 18) is not supported
+test_center_crop_pad_crop_negative_axes_hwc: graph: the operator CenterCropPad (ONNX's domain, opset 18) is not supported
+test_center_crop_pad_crop_axes_chw: graph: the operator CenterCropPad (ONNX's domain, opset 18) is not supported
+test_col2im: graph: the operator Col2Im (ONNX's domain, opset 18) is not supported
+test_col2im_strides: graph: the operator Col2Im (ONNX's domain, opset 18) is not supported
+test_col2im_pads: graph: the operator Col2Im (ONNX's domain, opset 18) is not supported
+test_col2im_dilations: graph: the operator Col2Im (ONNX's domain, opset 18) is not supported
+test_col2im_5d: graph: the operator Col2Im (ONNX's domain, opset 18) is not supported
+test_compress_bfloat16: a type graphs do not hold
+test_convinteger_without_padding: graph: the operator ConvInteger (ONNX's domain, opset 10) is not supported
+test_convinteger_with_padding: graph: the operator ConvInteger (ONNX's domain, opset 10) is not supported
+test_basic_deform_conv_with_padding: graph: the operator DeformConv (ONNX's domain, opset 22) is not supported
+test_basic_deform_conv_without_padding: graph: the operator DeformConv (ONNX's domain, opset 22) is not supported
+test_deform_conv_with_mask_bias: graph: the operator DeformConv (ONNX's domain, opset 22) is not supported
+test_deform_conv_with_multiple_offset_groups: graph: the operator DeformConv (ONNX's domain, opset 22) is not supported
+test_dequantizelinear_e4m3fn: graph: the input 'x' is of ONNX's type 17, which graphs do not take
+test_dequantizelinear_e4m3fn_float16: graph: the input 'x' is of ONNX's type 17, which graphs do not take
+test_dequantizelinear_e4m3fn_zero_point: graph: the input 'x' is of ONNX's type 17, which graphs do not take
+test_dequantizelinear_e5m2: graph: the input 'x' is of ONNX's type 19, which graphs do not take
+test_dequantizelinear_uint16: a type graphs do not hold
+test_dequantizelinear_int16: a type graphs do not hold
+test_dequantizelinear_uint4: graph: the input 'x' is of ONNX's type 21, which graphs do not take
+test_dequantizelinear_int4: graph: the input 'x' is of ONNX's type 22, which graphs do not take
+test_dequantizelinear_uint2: graph: the input 'x' is of ONNX's type 25, which graphs do not take
+test_dequantizelinear_int2: graph: the input 'x' is of ONNX's type 26, which graphs do not take
+test_dequantizelinear_float4e2m1: graph: the input 'x' is of ONNX's type 23, which graphs do not take
+test_det_2d: graph: the operator Det (ONNX's domain, opset 22) is not supported
+test_det_nd: graph: the operator Det (ONNX's domain, opset 22) is not supported
+test_dft_opset19: graph: the operator DFT (ONNX's domain, opset 19) is not supported
+test_dft_axis_opset19: graph: the operator DFT (ONNX's domain, opset 19) is not supported
+test_dft_inverse_opset19: graph: the operator DFT (ONNX's domain, opset 19) is not supported
+test_dft_rfft_opset19: graph: the operator DFT (ONNX's domain, opset 19) is not supported
+test_dft_irfft_opset19: graph: the operator DFT (ONNX's domain, opset 19) is not supported
+test_dft: graph: the operator DFT (ONNX's domain, opset 20) is not supported
+test_dft_axis: graph: the operator DFT (ONNX's domain, opset 20) is not supported
+test_dft_inverse: graph: the operator DFT (ONNX's domain, opset 20) is not supported
+test_dft_rfft: graph: the operator DFT (ONNX's domain, opset 20) is not supported
+test_dft_irfft: graph: the operator DFT (ONNX's domain, opset 20) is not supported
+test_div_int16: a type graphs do not hold
+test_div_uint16: a type graphs do not hold
+test_div_uint32: a type graphs do not hold
+test_div_uint64: a type graphs do not hold
+test_training_dropout_default: outputs differ from the reference: y
+test_training_dropout_default_mask: outputs differ from the reference: y, z
+test_training_dropout: outputs differ from the reference: y
+test_training_dropout_mask: outputs differ from the reference: y, z
+test_einsum_batch_matmul_bfloat16: a type graphs do not hold
+test_einsum_sum_bfloat16: a type graphs do not hold
+test_einsum_transpose_bfloat16: a type graphs do not hold
+test_equal_int16: a type graphs do not hold
+test_equal_uint16: a type graphs do not hold
+test_equal_uint32: a type graphs do not hold
+test_equal_uint64: a type graphs do not hold
+test_equal_string: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_equal_string_broadcast: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_flexattention: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_scaled: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_gqa: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_diff_head_sizes: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_score_mod: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_prob_mod: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_fp16: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_double: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_causal_mask: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_soft_cap: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_flexattention_relative_positional: graph: the operator FlexAttention (ai.onnx.preview, opset 26) is not supported
+test_greater_int16: a type graphs do not hold
+test_greater_uint16: a type graphs do not hold
+test_greater_uint32: a type graphs do not hold
+test_greater_uint64: a type graphs do not hold
+test_greater_equal_int16: a type graphs do not hold
+test_greater_equal_int16_expanded: a type graphs do not hold
+test_greater_equal_uint16: a type graphs do not hold
+test_greater_equal_uint16_expanded: a type graphs do not hold
+test_greater_equal_uint32: a type graphs do not hold
+test_greater_equal_uint32_expanded: a type graphs do not hold
+test_greater_equal_uint64: a type graphs do not hold
+test_greater_equal_uint64_expanded: a type graphs do not hold
+test_gridsample: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_zeros_padding: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_border_padding: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_reflection_padding: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_bilinear: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_aligncorners_true: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_nearest: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_bicubic: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_nearest_align_corners_0_additional_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_nearest_align_corners_1_additional_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_bilinear_align_corners_0_additional_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_bilinear_align_corners_1_additional_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_bicubic_align_corners_0_additional_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_bicubic_align_corners_1_additional_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_volumetric_nearest_align_corners_0: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_volumetric_nearest_align_corners_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_volumetric_bilinear_align_corners_0: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gridsample_volumetric_bilinear_align_corners_1: graph: the operator GridSample (ONNX's domain, opset 22) is not supported
+test_gru_defaults: graph: the operator GRU (ONNX's domain, opset 22) is not supported
+test_gru_with_initial_bias: graph: the operator GRU (ONNX's domain, opset 22) is not supported
+test_gru_seq_length: graph: the operator GRU (ONNX's domain, opset 22) is not supported
+test_gru_batchwise: graph: the operator GRU (ONNX's domain, opset 22) is not supported
+test_gru_reverse: graph: the operator GRU (ONNX's domain, opset 22) is not supported
+test_gru_bidirectional: graph: the operator GRU (ONNX's domain, opset 22) is not supported
+test_identity_sequence: graph: the input 'x' is of ONNX's type 0, which graphs do not take
+test_identity_opt: graph: the input 'opt_in' is of ONNX's type 0, which graphs do not take
+test_if: graph: the operator If (ONNX's domain, opset 11) is not supported
+test_if_seq: graph: the operator If (ONNX's domain, opset 13) is not supported
+test_if_opt: graph: the operator If (ONNX's domain, opset 16) is not supported
+test_image_decoder_decode_jpeg_rgb: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_jpeg_grayscale: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_jpeg_bgr: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_jpeg2k_rgb: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_bmp_rgb: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_png_rgb: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_tiff_rgb: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_webp_rgb: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_image_decoder_decode_pnm_rgb: graph: the operator ImageDecoder (ONNX's domain, opset 20) is not supported
+test_less_int16: a type graphs do not hold
+test_less_uint16: a type graphs do not hold
+test_less_uint32: a type graphs do not hold
+test_less_uint64: a type graphs do not hold
+test_less_equal_int16: a type graphs do not hold
+test_less_equal_int16_expanded: a type graphs do not hold
+test_less_equal_uint16: a type graphs do not hold
+test_less_equal_uint16_expanded: a type graphs do not hold
+test_less_equal_uint32: a type graphs do not hold
+test_less_equal_uint32_expanded: a type graphs do not hold
+test_less_equal_uint64: a type graphs do not hold
+test_less_equal_uint64_expanded: a type graphs do not hold
+test_linear_attention_linear_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_gated_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_gated_per_head_decay_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_delta_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_gated_delta_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_gated_delta_beta_scalar_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_gated_delta_gqa_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_gated_delta_mqa_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_decode_step_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_prefill_with_past_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_no_past_explicit_zeros_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_explicit_scale_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_fp16_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_linear_attention_linear_t1_no_past_expanded: graph: the operator Scan (ONNX's domain, opset 27) is not supported
+test_loop11: graph: the operator Loop (ONNX's domain, opset 11) is not supported
+test_loop13_seq: graph: the input 'seq_empty' is of ONNX's type 0, which graphs do not take
+test_loop16_seq_none: graph: the input 'opt_seq' is of ONNX's type 0, which graphs do not take
+test_lppool_3d_default: passes; left out for its size (750708 bytes)
+test_lstm_defaults: graph: the operator LSTM (ONNX's domain, opset 22) is not supported
+test_lstm_with_initial_bias: graph: the operator LSTM (ONNX's domain, opset 22) is not supported
+test_lstm_with_peepholes: graph: the operator LSTM (ONNX's domain, opset 22) is not supported
+test_lstm_batchwise: graph: the operator LSTM (ONNX's domain, opset 22) is not supported
+test_lstm_reverse: graph: the operator LSTM (ONNX's domain, opset 22) is not supported
+test_lstm_bidirectional: graph: the operator LSTM (ONNX's domain, opset 22) is not supported
+test_max_int16: a type graphs do not hold
+test_max_uint16: a type graphs do not hold
+test_max_uint32: a type graphs do not hold
+test_max_uint64: a type graphs do not hold
+test_maxpool_with_argmax_2d_precomputed_strides: graph: the node 'MaxPool' (MaxPool): indices in column-major order
+test_maxpool_3d_default: passes; left out for its size (750708 bytes)
+test_maxunpool_export_without_output_shape: graph: the operator MaxUnpool (ONNX's domain, opset 22) is not supported
+test_maxunpool_export_with_output_shape: graph: the operator MaxUnpool (ONNX's domain, opset 22) is not supported
+test_melweightmatrix: graph: the operator MelWeightMatrix (ONNX's domain, opset 17) is not supported
+test_min_int16: a type graphs do not hold
+test_min_uint16: a type graphs do not hold
+test_min_uint32: a type graphs do not hold
+test_min_uint64: a type graphs do not hold
+test_mod_mixed_sign_int16: a type graphs do not hold
+test_mod_uint16: a type graphs do not hold
+test_mod_uint32: a type graphs do not hold
+test_mod_uint64: a type graphs do not hold
+test_momentum: graph: the operator Momentum (ai.onnx.preview.training, opset 0) is not supported
+test_nesterov_momentum: graph: the operator Momentum (ai.onnx.preview.training, opset 0) is not supported
+test_momentum_multiple: graph: the operator Momentum (ai.onnx.preview.training, opset 0) is not supported
+test_mul_int16: a type graphs do not hold
+test_mul_uint16: a type graphs do not hold
+test_mul_uint32: a type graphs do not hold
+test_mul_uint64: a type graphs do not hold
+test_nllloss_NC: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2_reduction_mean: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2_reduction_sum: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2_with_weight: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2_with_weight_reduction_mean: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2_with_weight_reduction_sum: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2_with_weight_reduction_sum_ii: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2_no_weight_reduction_mean_ii: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1_weight: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1_ii: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1_weight_ii: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2d3d4d5_mean_weight: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2d3d4d5_none_no_weight: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1_mean_weight_negative_ii: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2d3_none_no_weight_negative_ii: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nllloss_NCd1d2d3_sum_weight_high_ii: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 22) is not supported
+test_nonmaxsuppression_suppress_by_IOU: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_suppress_by_IOU_and_scores: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_flipped_coordinates: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_limit_output_size: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_single_box: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_identical_boxes: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_center_point_box_format: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_two_classes: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_two_batches: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_nonmaxsuppression_iou_threshold_boundary: graph: the operator NonMaxSuppression (ONNX's domain, opset 11) is not supported
+test_onehot_with_bfloat16_values: a type graphs do not hold
+test_optional_get_element_optional_tensor: graph: the input 'optional_input' is of ONNX's type 0, which graphs do not take
+test_optional_get_element_tensor: graph: the operator OptionalGetElement (ONNX's domain, opset 28) is not supported
+test_optional_get_element_optional_sequence: graph: the input 'optional_input' is of ONNX's type 0, which graphs do not take
+test_optional_get_element_sequence: graph: the input 'optional_input' is of ONNX's type 0, which graphs do not take
+test_optional_has_element_tensor_input: graph: the input 'optional_input' is of ONNX's type 0, which graphs do not take
+test_optional_has_element_optional_input: graph: the input 'optional_input' is of ONNX's type 0, which graphs do not take
+test_optional_has_element_empty_no_input_name_tensor_input: graph: the operator OptionalHasElement (ONNX's domain, opset 28) is not supported
+test_optional_has_element_empty_no_input_tensor_input: graph: the operator OptionalHasElement (ONNX's domain, opset 28) is not supported
+test_optional_has_element_empty_optional_input: graph: the input 'optional_input' is of ONNX's type 0, which graphs do not take
+test_optional_has_element_empty_no_input_name_optional_input: graph: the operator OptionalHasElement (ONNX's domain, opset 28) is not supported
+test_optional_has_element_empty_no_input_optional_input: graph: the operator OptionalHasElement (ONNX's domain, opset 28) is not supported
+test_pow_types_float32_uint64: a type graphs do not hold
+test_pow_types_float32_uint32: a type graphs do not hold
+test_qlinearconv: graph: the operator QLinearConv (ONNX's domain, opset 10) is not supported
+test_quantizelinear_e4m3fn: graph: the input 'y_zero_point' is of ONNX's type 17, which graphs do not take
+test_quantizelinear_e5m2: graph: the input 'y_zero_point' is of ONNX's type 19, which graphs do not take
+test_quantizelinear_uint16: a type graphs do not hold
+test_quantizelinear_int16: a type graphs do not hold
+test_quantizelinear_uint4: graph: the input 'y_zero_point' is of ONNX's type 21, which graphs do not take
+test_quantizelinear_int4: graph: the input 'y_zero_point' is of ONNX's type 22, which graphs do not take
+test_quantizelinear_uint2: graph: the input 'y_zero_point' is of ONNX's type 25, which graphs do not take
+test_quantizelinear_int2: graph: the input 'y_zero_point' is of ONNX's type 26, which graphs do not take
+test_quantizelinear_float4e2m1: graph: the input 'y_zero_point' is of ONNX's type 23, which graphs do not take
+test_quantizelinear_blocked_symmetric: a type graphs do not hold
+test_range_float_type_positive_delta_expanded: graph: the operator Loop (ONNX's domain, opset 27) is not supported
+test_range_float16_type_positive_delta_expanded: graph: the operator Loop (ONNX's domain, opset 27) is not supported
+test_range_bfloat16_type_positive_delta: a type graphs do not hold
+test_range_bfloat16_type_positive_delta_expanded: graph: the operator Loop (ONNX's domain, opset 27) is not supported
+test_range_int32_type_negative_delta_expanded: graph: the operator Loop (ONNX's domain, opset 27) is not supported
+test_regex_full_match_basic: graph: the input 'X' is of ONNX's type 8, which graphs do not take
+test_regex_full_match_email_domain: graph: the input 'X' is of ONNX's type 8, which graphs do not take
+test_regex_full_match_empty: graph: the input 'X' is of ONNX's type 8, which graphs do not take
+test_resize_downsample_scales_linear_antialias: graph: the node 'Resize' (Resize): antialiased downsampling
+test_resize_downsample_sizes_linear_antialias: graph: the node 'Resize' (Resize): antialiased downsampling
+test_resize_downsample_scales_cubic_antialias: graph: the node 'Resize' (Resize): antialiased downsampling
+test_resize_downsample_sizes_cubic_antialias: graph: the node 'Resize' (Resize): antialiased downsampling
+test_reversesequence_bfloat16: a type graphs do not hold
+test_simple_rnn_defaults: graph: the operator RNN (ONNX's domain, opset 22) is not supported
+test_simple_rnn_with_initial_bias: graph: the operator RNN (ONNX's domain, opset 22) is not supported
+test_rnn_seq_length: graph: the operator RNN (ONNX's domain, opset 22) is not supported
+test_simple_rnn_batchwise: graph: the operator RNN (ONNX's domain, opset 22) is not supported
+test_simple_rnn_reverse: graph: the operator RNN (ONNX's domain, opset 22) is not supported
+test_simple_rnn_bidirectional: graph: the operator RNN (ONNX's domain, opset 22) is not supported
+test_roialign_aligned_false: graph: the operator RoiAlign (ONNX's domain, opset 22) is not supported
+test_roialign_aligned_true: graph: the operator RoiAlign (ONNX's domain, opset 22) is not supported
+test_roialign_mode_max: graph: the operator RoiAlign (ONNX's domain, opset 22) is not supported
+test_scan_sum: graph: the operator Scan (ONNX's domain, opset 8) is not supported
+test_scan9_sum: graph: the operator Scan (ONNX's domain, opset 9) is not supported
+test_scan9_multi_state: graph: the operator Scan (ONNX's domain, opset 9) is not supported
+test_scan9_scalar: graph: the operator Scan (ONNX's domain, opset 9) is not supported
+test_sequence_map_identity_1_sequence: graph: the input 'x' is of ONNX's type 0, which graphs do not take
+test_sequence_map_identity_1_sequence_expanded: graph: the input 'x' is of ONNX's type 0, which graphs do not take
+test_sequence_map_identity_2_sequences: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_identity_2_sequences_expanded: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_identity_1_sequence_1_tensor: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_identity_1_sequence_1_tensor_expanded: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_add_2_sequences: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_add_2_sequences_expanded: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_add_1_sequence_1_tensor: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_add_1_sequence_1_tensor_expanded: graph: the input 'x0' is of ONNX's type 0, which graphs do not take
+test_sequence_map_extract_shapes: graph: the input 'in_seq' is of ONNX's type 0, which graphs do not take
+test_sequence_map_extract_shapes_expanded: graph: the input 'in_seq' is of ONNX's type 0, which graphs do not take
+test_sequence_insert_at_back: graph: the input 'sequence' is of ONNX's type 0, which graphs do not take
+test_sequence_insert_at_front: graph: the input 'sequence' is of ONNX's type 0, which graphs do not take
+test_sce_none: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_none_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_none_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_none_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_none_weights: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_none_weights_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_none_weights_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_none_weights_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_sum: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_sum_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_sum_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_sum_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_3d: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_3d_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_3d_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_3d_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_3d: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_3d_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_3d_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_3d_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_3d: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_3d_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_3d_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_3d_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_4d: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_4d_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_4d_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_weight_ii_4d_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_4d: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_4d_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_4d_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_mean_no_weight_ii_4d_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_mean_weight: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_mean_weight_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_mean_weight_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_mean_weight_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_none_no_weight: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_none_no_weight_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_none_no_weight_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3d4d5_none_no_weight_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1_mean_weight_negative_ii: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1_mean_weight_negative_ii_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1_mean_weight_negative_ii_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1_mean_weight_negative_ii_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_none_no_weight_negative_ii: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_none_no_weight_negative_ii_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_none_no_weight_negative_ii_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_none_no_weight_negative_ii_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_sum_weight_high_ii: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_sum_weight_high_ii_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_sum_weight_high_ii_log_prob: graph: the operator SoftmaxCrossEntropyLoss (ONNX's domain, opset 13) is not supported
+test_sce_NCd1d2d3_sum_weight_high_ii_log_prob_expanded: graph: the operator NegativeLogLikelihoodLoss (ONNX's domain, opset 13) is not supported
+test_split_to_sequence_1: graph: the operator SplitToSequence (ONNX's domain, opset 24) is not supported
+test_split_to_sequence_2: graph: the operator SplitToSequence (ONNX's domain, opset 24) is not supported
+test_split_to_sequence_nokeepdims: graph: the operator SplitToSequence (ONNX's domain, opset 24) is not supported
+test_stft: graph: the operator STFT (ONNX's domain, opset 17) is not supported
+test_stft_with_window: graph: the operator STFT (ONNX's domain, opset 17) is not supported
+test_string_concat: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_concat_broadcasting: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_concat_zero_dimensional: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_concat_empty_string: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_concat_utf8: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_split_basic: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_split_maxsplit: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_split_consecutive_delimiters: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_split_empty_string_delimiter: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_split_no_delimiter: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_string_split_empty_tensor: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_strnormalizer_nostopwords_nochangecase: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_strnormalizer_export_monday_casesensintive_nochangecase: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_strnormalizer_export_monday_casesensintive_lower: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_strnormalizer_export_monday_casesensintive_upper: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_strnormalizer_export_monday_empty_output: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_strnormalizer_export_monday_insensintive_upper_twodim: graph: the input 'x' is of ONNX's type 8, which graphs do not take
+test_sub_int16: a type graphs do not hold
+test_sub_uint16: a type graphs do not hold
+test_sub_uint32: a type graphs do not hold
+test_sub_uint64: a type graphs do not hold
+test_tfidfvectorizer_tf_only_bigrams_skip0: graph: the operator TfIdfVectorizer (ONNX's domain, opset 9) is not supported
+test_tfidfvectorizer_tf_batch_onlybigrams_skip0: graph: the operator TfIdfVectorizer (ONNX's domain, opset 9) is not supported
+test_tfidfvectorizer_tf_onlybigrams_levelempty: graph: the operator TfIdfVectorizer (ONNX's domain, opset 9) is not supported
+test_tfidfvectorizer_tf_onlybigrams_skip5: graph: the operator TfIdfVectorizer (ONNX's domain, opset 9) is not supported
+test_tfidfvectorizer_tf_batch_onlybigrams_skip5: graph: the operator TfIdfVectorizer (ONNX's domain, opset 9) is not supported
+test_tfidfvectorizer_tf_uniandbigrams_skip5: graph: the operator TfIdfVectorizer (ONNX's domain, opset 9) is not supported
+test_tfidfvectorizer_tf_batch_uniandbigrams_skip5: graph: the operator TfIdfVectorizer (ONNX's domain, opset 9) is not supported
+test_top_k_uint64: a type graphs do not hold
+test_unique_sorted_without_axis: graph: the operator Unique (ONNX's domain, opset 28) is not supported
+test_unique_not_sorted_without_axis: graph: the operator Unique (ONNX's domain, opset 28) is not supported
+test_unique_sorted_with_axis: graph: the operator Unique (ONNX's domain, opset 28) is not supported
+test_unique_sorted_with_axis_3d: graph: the operator Unique (ONNX's domain, opset 28) is not supported
+test_unique_sorted_with_negative_axis: graph: the operator Unique (ONNX's domain, opset 28) is not supported
+test_unique_length_1: graph: the operator Unique (ONNX's domain, opset 28) is not supported
+test_unique_bfloat16_sorted_without_axis: graph: the operator Unique (ONNX's domain, opset 28) is not supported

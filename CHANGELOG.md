@@ -7,6 +7,102 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-21
+
+"Graphs of operators": any model built of ONNX's operators runs as it is, not only the library's layers. A graph holds
+values over tensors of up to eight axes with symbolic sizes and nodes of 155 operators with ONNX's semantics; ONNX
+files open as graphs and save as `.slett` files of format 11; constants fold, repeated nodes go and chains fuse into
+the library's kernels (products by constant matrices with their bias and activation, attention in blocks of 64
+queries, layer and RMS normalization, GELU and SiLU written out, convolutions with their batch normalization and
+activation), and every operator sums in a fixed order, so a graph gives the same bits on any number of threads. ONNX's
+1262 conformance cases of single operators, whole models against PyTorch (ResNet-50, ViT-B/16, BERT-base, GPT-2,
+CLIP's text encoder, Whisper's encoder, Stable Diffusion's VAE decoder, a UNet of SDXL's architecture: within 1e-5,
+at 0.63 to 0.94 times PyTorch's speed on the CPU) and transformers.js's ONNX files against ONNX Runtime check it.
+Language models reach programs on the runtime alone: tokenizers, chat templates, sampling as llama.cpp offers it,
+streams of tokens and four more GGUF families. The layer models, their benchmarks and GGUF's sessions are no slower
+than 1.4's (Examples/Benchmark.c's CPU workloads and llama-bench's prompts and generation, interleaved).
+
+### Added
+- **Graphs of operators** (`docs/Graphs.md`): any model built of ONNX's operators runs as a graph: values (inputs,
+  constants, what nodes compute), tensors of up to eight axes whose sizes are numbers or named symbols, several named
+  inputs and outputs, nodes of 155 operators with ONNX's semantics (opsets 7 to 28): element-wise arithmetic,
+  comparisons, logic, bitwise operators and functions with broadcasting, MatMul, Gemm, Einsum, convolutions and
+  transposed ones of one to three spatial axes, pooling, the normalizations, reductions, TopK, CumSum, shapes and
+  data (Reshape to ScatterND), Resize in every mode, quantization, opset 23's Attention and RotaryEmbedding, opset
+  27's LinearAttention and CausalConvWithState, SwiGLU. `spingalett_graph_open()` reads ONNX files (external data
+  files beside them) and `.slett` files of the new format 11, which `spingalett_graph_save()` writes;
+  `spingalett_graph_run()` takes the inputs by name or in order (`SpingalettTensor`) and gives the outputs;
+  `spingalett_graph_input()` and `_output()` describe them (`SpingalettTensorInfo`), `spingalett_graph_node_op()`
+  the nodes; in the runtime too. Floats compute in single precision (float16 and bfloat16 widened, outputs narrowed
+  back), integers in their types, with IEEE arithmetic (no reassociation or reciprocals). When a graph opens,
+  constants fold, dead nodes and common subexpressions go, and fusions make operators of the library's own: Linear
+  (a product by a constant matrix packed once for the row kernel of language models, its bias and GELU, SiLU, ReLU,
+  sigmoid or tanh in the epilogue), FusedAttention (Q K^T, scale, a causal Where, mask, softmax or PyTorch's safe
+  softmax and V in blocks of 64 queries, the heads' transposes taken in), LayerNormalization and RMSNormalization,
+  Gelu and Swish from their written-out forms, a convolution's batch normalization folded into its filters and its
+  activation in its epilogue (`SPINGALETT_GRAPH_FUSE=0` leaves them out); convolutions run on the library's
+  channels-last kernels; tensors take blocks of a pool kept between runs. Every operator sums in a fixed order: the same bits on any
+  number of threads. The new `operators` group runs ONNX's 1262 conformance cases of single operators that hold the
+  library's types (Tests/make_graph_tests.py) on one and four threads; `Tests/check_graph_models.py` compares whole
+  models exported by `torch.onnx` with PyTorch, which they match within 1e-5: on six performance cores of an
+  i7-12650H ResNet-50 runs in 24.4 ms (PyTorch 2.14: 21.5), BERT-base in 97 (81), GPT-2 in 45 (36), ViT-B/16 in 81
+  (63), CLIP's text encoder in 46 (29), Whisper's encoder in 84 (68), Stable Diffusion's VAE decoder in 1201 (1046)
+  and a UNet of SDXL's architecture in 36.8 (34.6); `Tests/check_graph_files.py` compares ONNX files of other tools
+  with ONNX Runtime (transformers.js's MiniLM, distilgpt2, ViT in float16, DETR: within 1e-5, float16 2.2e-4).
+  `SPINGALETT_GRAPH_PROFILE=1` prints the time of each operator.
+  Python: `Graph.load()`, `Graph.from_bytes()`, `Graph.from_torch()`, `Graph.run()`, `Graph.save()`; C++:
+  `spingalett::Graph`; `Examples/Runtime/RunGraph.c` times a graph on random inputs.
+- **Chat templates**: `spingalett_chat_render()` (`SpingalettChatArgs`, `SpingalettChatMessage`) renders a conversation
+  with a language model's Jinja chat template as Hugging Face's transformers renders it (`apply_chat_template()`:
+  jinja2's sandbox with trim_blocks and lstrip_blocks, loop controls, its `tojson`, `raise_exception()` and
+  `strftime_now()`), and `spingalett_tokenizer_chat_template()` gives a tokenizer's: a GGUF file's
+  `tokenizer.chat_template`, a directory's `chat_template.jinja` or `tokenizer_config.json`'s `chat_template`. The
+  renderer (`Spingalett.Chat.c`, in the runtime too) has the part of Jinja templates use: statements (`if`, `for` with
+  its conditions, unpacking, `loop` and loop controls, `set` of names, namespaces' attributes and blocks, macros,
+  `generation`), Python's values and operators, slices, the methods of strings and dicts, 30 filters and 25 tests;
+  messages come as roles and texts, or with tool calls and parts in a JSON object of variables that also carries tools,
+  documents and the flags templates read (`enable_thinking`). The new `chat` group renders 12 conversations with the
+  templates of Qwen2.5, Qwen3, Llama 3.2, Gemma 2 and 3, SmolLM2 and 3, Phi-3.5 and Phi-4 mini, Mistral 7B v0.3,
+  DeepSeek-R1's distillations, Granite 3.3, OLMo 2, GLM-4 (two) and Falcon 3 to transformers' text byte for byte, or
+  to their errors (192 cases, `Tests/make_chat_tests.py`). Python: `Tokenizer.chat_template`,
+  `Tokenizer.apply_chat_template(messages, add_generation_prompt, tools, **variables)` and `render_chat_template()`.
+- **`Examples/Runtime/Chat.c`**: a chat with a GGUF model in the terminal on the runtime alone: the model's chat
+  template renders the conversation every turn, the session keeps the tokens it shares with the turn before and
+  is fed the rest, the reply streams as it is drawn (min-p, top-p, temperature, a repeat penalty), and ends at EOS or
+  a token that ends turns in the common templates.
+- **Streams of tokens**: `SpingalettSampling.on_token` (`SpingalettTokenCallback`) is called with each token
+  `spingalett_session_generate()` and `spingalett_generate()` draw, as they draw it; false ends the sequence.
+  Python's `generate()` methods take `on_token`.
+- **SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files**: `spingalett_model_open()` opens the architectures `smollm3`
+  (every fourth layer without rotary embeddings), `olmo2` (the attention's and the MLP's outputs normalized and not
+  their inputs, queries and keys normalized over all heads as layers of their own; OLMo 3's windows), `phi3` (Phi-3
+  and Phi-3.5: queries, keys and values in one matrix, the gate and up in one, LongRoPE's short or long factors by
+  the window and its magnitude of the rotations, which scales the scores) and `glm4` (half of each head turned, in
+  llama.cpp's adjacent pairs, the outputs normalized); rotary embeddings on part of a head where the file's
+  `rope.dimension_count` says so. The `pretrained` group compares each with transformers' model (within 3.2e-6).
+- **Sampling as llama.cpp offers it**: `SpingalettSampling`, given to `spingalett_session_generate()` and
+  `spingalett_generate()` through their new `sampling` field (which takes a word of their reserved space): min-p
+  (after the temperature, top-k and top-p, as transformers applies it), llama.cpp's repeat, frequency and presence
+  penalties over a window of the last tokens of the prompt and those generated (64 by default, or all), and stop
+  strings, which end a sequence at the token whose text completes one (decoded by the tokenizer given). The `gen`
+  group checks every option against a reference that sorts every token, on the logits of the same session; Python's
+  `generate()` methods take them as keyword arguments, and the Rust, .NET, Java and PHP bindings know the field.
+- **Tokenizers in the runtime**: `libspingalett-runtime` holds the tokenizers (`spingalett_tokenizer_load()` and the
+  rest, declared now in `Spingalett.Runtime.h`), GGUF vocabularies included, so that a program that serves a
+  language model needs the runtime alone; its tests check them on the expectations of JSON and GGUF tokenizers.
+
+### Changed
+- **Products by large matrices read them once**: `spingalett_conv_rows()`, the row kernel of float linear layers in
+  sessions, takes its tiles panel by panel when the filters outnumber the rows (row block by row block otherwise), so
+  that a panel of filters is read from memory once and not once a block of rows: the same sums; GPT-2's logits of 64
+  tokens take 12.7 ms instead of 26.6, and the prompt of a float32 Qwen2.5-0.5B 1.5% less.
+- **Draws sort only what they reach**: a draw sorted every token of the vocabulary by probability (152,000 for
+  Qwen2.5) for every token it drew; it now sorts them a part at a time, the most likely first, as far as top-k, top-p,
+  min-p and the draw itself reach, and sums the probabilities of a draw without top-k in the order of the tokens. A
+  session of Qwen2.5-0.5B-Instruct (Q4_K_M) draws 128 tokens at temperature 0.8 and top-p 0.95 at 104.9 tokens a
+  second instead of 42.0 (the most likely tokens: 113.9), on six performance cores of an i7-12650H. The tokens of a
+  draw without top-k may differ from 1.4's where a draw falls within rounding of two tokens' boundary.
+
 ## [1.4.1] - 2026-10-21
 
 1.4.0's code, published: the release run of the tag v1.4.0 failed in one job, the x86-64 Python wheel's build, so
@@ -1649,7 +1745,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/pka-human/Spingalett/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/pka-human/Spingalett/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/pka-human/Spingalett/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pka-human/Spingalett/compare/v1.2.0...v1.3.0

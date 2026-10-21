@@ -130,6 +130,13 @@ int main(void) {
     FIELD(SpingalettGenerateArgs, top_k); FIELD(SpingalettGenerateArgs, top_p); FIELD(SpingalettGenerateArgs, seed);
     FIELD(SpingalettGenerateArgs, stop_tokens); FIELD(SpingalettGenerateArgs, stop_count);
 
+    FIELD(SpingalettGenerateArgs, sampling); FIELD(SpingalettSessionGenerateArgs, sampling);
+    SIZE(SpingalettSampling); FIELD(SpingalettSampling, reserved);
+    FIELD(SpingalettSampling, min_p); FIELD(SpingalettSampling, repetition_penalty);
+    FIELD(SpingalettSampling, frequency_penalty); FIELD(SpingalettSampling, presence_penalty);
+    FIELD(SpingalettSampling, penalty_window); FIELD(SpingalettSampling, tokenizer);
+    FIELD(SpingalettSampling, stop_strings); FIELD(SpingalettSampling, stop_string_count);
+    FIELD(SpingalettSampling, on_token); FIELD(SpingalettSampling, user);
     SIZE(SpingalettModelOpenArgs); FIELD(SpingalettModelOpenArgs, reserved);
     FIELD(SpingalettModelOpenArgs, path); FIELD(SpingalettModelOpenArgs, context);
     SIZE(SpingalettSessionOptions); FIELD(SpingalettSessionOptions, reserved);
@@ -149,6 +156,11 @@ int main(void) {
     FIELD(SpingalettTokenizerInfo, vocabulary); FIELD(SpingalettTokenizerInfo, added); FIELD(SpingalettTokenizerInfo, bos);
     FIELD(SpingalettTokenizerInfo, eos); FIELD(SpingalettTokenizerInfo, pad); FIELD(SpingalettTokenizerInfo, unk);
 
+    SIZE(SpingalettChatMessage); FIELD(SpingalettChatMessage, role); FIELD(SpingalettChatMessage, content);
+    SIZE(SpingalettChatArgs); FIELD(SpingalettChatArgs, reserved);
+    FIELD(SpingalettChatArgs, tokenizer); FIELD(SpingalettChatArgs, chat_template); FIELD(SpingalettChatArgs, messages);
+    FIELD(SpingalettChatArgs, count); FIELD(SpingalettChatArgs, add_generation_prompt); FIELD(SpingalettChatArgs, variables);
+    FIELD(SpingalettChatArgs, time); FIELD(SpingalettChatArgs, text); FIELD(SpingalettChatArgs, capacity);
     SIZE(SpingalettTokenizeArgs); FIELD(SpingalettTokenizeArgs, reserved);
     FIELD(SpingalettTokenizeArgs, tokenizer); FIELD(SpingalettTokenizeArgs, text); FIELD(SpingalettTokenizeArgs, length);
     FIELD(SpingalettTokenizeArgs, tokens); FIELD(SpingalettTokenizeArgs, capacity); FIELD(SpingalettTokenizeArgs, special);
@@ -160,6 +172,18 @@ int main(void) {
 
     SIZE(SpingalettPretrainedArgs); FIELD(SpingalettPretrainedArgs, reserved);
     FIELD(SpingalettPretrainedArgs, path); FIELD(SpingalettPretrainedArgs, context);
+
+    SIZE(SpingalettGraphOpenArgs); FIELD(SpingalettGraphOpenArgs, reserved);
+    FIELD(SpingalettGraphOpenArgs, path); FIELD(SpingalettGraphOpenArgs, data); FIELD(SpingalettGraphOpenArgs, size);
+    SIZE(SpingalettTensorInfo); FIELD(SpingalettTensorInfo, reserved);
+    FIELD(SpingalettTensorInfo, name); FIELD(SpingalettTensorInfo, dtype); FIELD(SpingalettTensorInfo, rank);
+    FIELD(SpingalettTensorInfo, shape); FIELD(SpingalettTensorInfo, symbols);
+    SIZE(SpingalettTensor); FIELD(SpingalettTensor, reserved);
+    FIELD(SpingalettTensor, name); FIELD(SpingalettTensor, dtype); FIELD(SpingalettTensor, rank);
+    FIELD(SpingalettTensor, shape); FIELD(SpingalettTensor, data);
+    SIZE(SpingalettGraphRunArgs); FIELD(SpingalettGraphRunArgs, reserved);
+    FIELD(SpingalettGraphRunArgs, graph); FIELD(SpingalettGraphRunArgs, inputs); FIELD(SpingalettGraphRunArgs, input_count);
+    FIELD(SpingalettGraphRunArgs, outputs); FIELD(SpingalettGraphRunArgs, output_count);
 
     SIZE(PredictArgs); FIELD(PredictArgs, reserved);
     FIELD(PredictArgs, net); FIELD(PredictArgs, inputs); FIELD(PredictArgs, device_inputs);

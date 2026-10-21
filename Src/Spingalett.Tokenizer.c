@@ -39,6 +39,7 @@
  */
 
 #include "Spingalett.Private.h"
+#include "Spingalett.Chat.h"
 #include "Spingalett.Json.h"
 #include "Spingalett.Tokenizer.h"
 #include "Spingalett.Unicode.h"
@@ -347,6 +348,7 @@ struct SpingalettTokenizer {
     uint32_t before[4], after[4];   /* the template of a single text */
     uint32_t before_count, after_count;
     uint32_t bos, eos, pad;
+    char *chat_template;            /* (NULL: none) */
 };
 
 static const char *tok_str(const SpingalettTokenizer *t, uint32_t off) { return t->pool + off; }
@@ -542,6 +544,7 @@ void spingalett_tokenizer_free(SpingalettTokenizer *t) {
     free_steps(t->dec, t->dec_count);
     free(t->prefix);
     free(t->suffix);
+    free(t->chat_template);
     free(t);
 }
 
@@ -2011,6 +2014,17 @@ static void read_config(SpingalettTokenizer *t, const char *text, size_t size) {
     if ((id = named_token(&l, spingalett_json_member(&j, SPG_JSON_ROOT, "bos_token"))) != NONE) t->bos = id;
     if ((id = named_token(&l, spingalett_json_member(&j, SPG_JSON_ROOT, "eos_token"))) != NONE) t->eos = id;
     if ((id = named_token(&l, spingalett_json_member(&j, SPG_JSON_ROOT, "pad_token"))) != NONE) t->pad = id;
+    /* the chat template: a string, or a list of named ones of which "default" is the template */
+    uint32_t chat = spingalett_json_member(&j, SPG_JSON_ROOT, "chat_template");
+    if (j.values[chat].type == SPG_JSON_ARRAY) {
+        uint32_t found = 0;
+        for (uint32_t e = spingalett_json_first(&j, chat); e && e < j.values[chat].next; e = j.values[e].next)
+            if (spingalett_json_is(&j, spingalett_json_member(&j, e, "name"), "default"))
+                found = spingalett_json_member(&j, e, "template");
+        chat = found;
+    }
+    if (chat && j.values[chat].type == SPG_JSON_STRING && !t->chat_template)
+        t->chat_template = spingalett_json_strdup(&j, chat, NULL);
     spingalett_json_free(&j);
 }
 
@@ -2084,6 +2098,23 @@ SpingalettTokenizer *spingalett_tokenizer_load(const char *path) {
             t = load_json((const char *)file.data, file.size, (const char *)config.data, config.size);
             spingalett_file_close(&config);
             spingalett_file_close(&file);
+            /* a chat_template.jinja file, as transformers saves templates now, is the template */
+            snprintf(joined, n + 32, "%s/chat_template.jinja", path);
+            SpgFileView jinja;
+            probe = t ? fopen(joined, "rb") : NULL;
+            if (probe) {
+                fclose(probe);
+                if (spingalett_file_open(&jinja, joined)) {
+                    char *text = (char *)malloc(jinja.size + 1);
+                    if (text) {
+                        memcpy(text, jinja.data, jinja.size);
+                        text[jinja.size] = '\0';
+                        free(t->chat_template);
+                        t->chat_template = text;
+                    }
+                    spingalett_file_close(&jinja);
+                }
+            }
         }
     } else if (spingalett_file_open(&file, path)) {
         t = spingalett_tokenizer_from_memory(file.data, file.size);
@@ -2261,10 +2292,65 @@ SpingalettTokenizer *spingalett_tokenizer_build(const SpgTokenizerSpec *spec) {
         t->split_marks = marks_split(t);
         if (spec->add_bos && t->bos != NONE) t->before[t->before_count++] = t->bos;
         if (spec->add_eos && t->eos != NONE) t->after[t->after_count++] = t->eos;
+        if (spec->chat_template) {
+            t->chat_template = (char *)malloc((size_t)spec->chat_template_length + 1u);
+            if (t->chat_template) {
+                memcpy(t->chat_template, spec->chat_template, spec->chat_template_length);
+                t->chat_template[spec->chat_template_length] = '\0';
+            }
+        }
         return t;
     }
     set_error(error[0] && strcmp(error, "out of memory") ? SPINGALETT_ERR_INVALID : SPINGALETT_ERR_ALLOC,
               error[0] ? error : "GGUF: out of memory");
     spingalett_tokenizer_free(t);
     return NULL;
+}
+
+/* ------------------------------------------------------------------------- chat templates */
+
+const char *spingalett_tokenizer_chat_template(const SpingalettTokenizer *t) {
+    return t ? t->chat_template : NULL;
+}
+
+int64_t spingalett_chat_render_args(SpingalettChatArgs args) {
+    const char *source = args.chat_template ? args.chat_template : args.tokenizer ? args.tokenizer->chat_template : NULL;
+    if (!source) {
+        set_error(SPINGALETT_ERR_INVALID, args.tokenizer ? "chat template: the tokenizer has none"
+                                                         : "chat template: neither a template nor a tokenizer");
+        return -1;
+    }
+    if (args.count && !args.messages) {
+        set_error(SPINGALETT_ERR_INVALID, "chat template: messages is NULL");
+        return -1;
+    }
+    if (args.text == NULL && args.capacity) {
+        set_error(SPINGALETT_ERR_INVALID, "chat template: text is NULL");
+        return -1;
+    }
+    const char **roles = (const char **)malloc(((size_t)args.count + 1u) * 2u * sizeof(char *));
+    if (!roles) {
+        set_error(SPINGALETT_ERR_ALLOC, "chat template: out of memory");
+        return -1;
+    }
+    const char **contents = roles + args.count + 1;
+    for (uint32_t k = 0; k < args.count; k++) {
+        roles[k] = args.messages[k].role ? args.messages[k].role : "";
+        contents[k] = args.messages[k].content;
+    }
+    const SpingalettTokenizer *t = args.tokenizer;
+    SpgChatRender chat = {source, roles, contents, args.count, args.add_generation_prompt,
+                          t && t->bos != NONE ? spingalett_tokenizer_token(t, t->bos) : NULL,
+                          t && t->eos != NONE ? spingalett_tokenizer_token(t, t->eos) : NULL, args.variables, args.time};
+    char *text = NULL;
+    const int64_t size = spingalett_chat_text(&chat, &text);
+    free(roles);
+    if (size < 0) return -1;
+    if (args.capacity) {
+        const size_t n = (size_t)size < args.capacity - 1u ? (size_t)size : args.capacity - 1u;
+        memcpy(args.text, text, n);
+        args.text[n] = '\0';
+    }
+    free(text);
+    return size;
 }

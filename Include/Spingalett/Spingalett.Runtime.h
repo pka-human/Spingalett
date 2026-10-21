@@ -176,6 +176,7 @@ SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettM
  * activations, and attention's exponentials are libm's).
  */
 typedef struct SpingalettSession SpingalettSession;
+typedef struct SpingalettTokenizer SpingalettTokenizer;
 
 typedef struct {
     uint32_t max_length;            /* tokens a sequence holds at most: the model's window at most; 0 for it */
@@ -217,6 +218,33 @@ SPINGALETT_API bool spingalett_session_rewind(SpingalettSession *session, uint32
    serves several continuations. */
 SPINGALETT_API bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
 
+/* A token drawn for sequence `sequence` (spingalett_session_generate(), spingalett_generate()). */
+typedef bool (*SpingalettTokenCallback)(void *user, uint32_t sequence, uint32_t token);
+
+/* More of llama.cpp's ways of drawing tokens, for spingalett_session_generate() and spingalett_generate(): the
+   penalties apply to the logits before the draw (and before the most likely token is taken at temperature 0), in
+   llama.cpp's way; min_p after the temperature, top_k and top_p, as transformers applies it. */
+typedef struct {
+    float min_p;                    /* draws only among tokens at least min_p times as likely as the most likely (0:
+                                       all) */
+    float repetition_penalty;       /* llama.cpp's repeat_penalty: the logits of the tokens of the window divided by it
+                                       (multiplied when they are not positive); 0 or 1: none */
+    float frequency_penalty;        /* subtracted from their logits for each time they occur in the window */
+    float presence_penalty;         /* subtracted once from the logits of those that occur in it */
+    uint32_t penalty_window;        /* the last tokens the penalties look at, of the prompt and those generated (0:
+                                       64, llama.cpp's; UINT32_MAX: all) */
+    const SpingalettTokenizer *tokenizer;   /* decodes the tokens for stop_strings */
+    const char *const *stop_strings;        /* [stop_string_count] texts that end a sequence's generation once the
+                                               text of the tokens it generated holds one (the token that completes it
+                                               is its last) */
+    uint32_t stop_string_count;
+    SpingalettTokenCallback on_token;       /* called with each token as it is drawn, in the order of the draws (a
+                                               stream of text); false ends that sequence's generation (the token is
+                                               its last) */
+    void *user;                     /* on_token's first argument */
+    uint64_t reserved[SPINGALETT_RESERVED - 2];
+} SpingalettSampling;
+
 typedef struct {
     SpingalettSession *session;
     uint32_t sequences;             /* sequences 0 .. sequences - 1 of the session generate (0: 1) */
@@ -234,7 +262,8 @@ typedef struct {
     uint64_t seed;                  /* sequence b draws from a generator seeded with seed + b */
     const uint32_t *stop_tokens;    /* [stop_count] tokens that end a sequence's generation once generated */
     uint32_t stop_count;
-    uint64_t reserved[SPINGALETT_RESERVED];
+    const SpingalettSampling *sampling;     /* min-p, penalties of repeated tokens, stop strings (NULL: none) */
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettSessionGenerateArgs;
 
 /* Continues several sequences together, a token each per step, the steps' rows computed at once, each
@@ -245,6 +274,215 @@ typedef struct {
    sequences wrote together, 0 on error. */
 #define spingalett_session_generate(...) spingalett_session_generate_args((SpingalettSessionGenerateArgs){__VA_ARGS__})
 SPINGALETT_API uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
+
+/*
+ * Tokenizers of language models: the byte-pair encodings of Hugging Face's tokenizer.json files (GPT-2's
+ * byte-level BPE and tiktoken's encodings as LLaMA 3, Qwen2 and SmolLM use them; SentencePiece's BPE with
+ * byte fallback as LLaMA 2, Mistral and Phi-3 use it) and of GGUF files' vocabularies (the BPE of merges
+ * of their "gpt2" model, by the pre-tokenizer they name; SentencePiece's BPE of scores of their "llama"
+ * model, as llama.cpp and sentencepiece encode). A text is encoded as Hugging Face's tokenizers
+ * library encodes it: the added tokens found in it, the rest normalized (NFC, prepended and replaced
+ * strings), cut into pieces by the pre-tokenizers (byte-level, the regular expressions of GPT-2, cl100k
+ * and o200k, digits, Metaspace, splits on strings) and each piece merged pair by pair in the order of the
+ * merges, in time n log n of the piece's length. Decoding reverses it (byte-level, byte fallback,
+ * Metaspace, replacements, stripping). Other models (WordPiece, Unigram) and patterns are refused, naming
+ * what is missing. A tokenizer is read-only once loaded: threads may share it.
+ */
+
+/* An id no token has. */
+#define SPINGALETT_NO_TOKEN UINT32_MAX
+
+typedef struct {
+    uint32_t vocabulary;            /* token ids: the largest one + 1 (the model's tokens and the added ones) */
+    uint32_t added;                 /* added tokens (special ones, such as "<|endoftext|>", and others) */
+    uint32_t bos, eos;              /* the tokens beginning and ending a text (SPINGALETT_NO_TOKEN when unknown):
+                                       tokenizer_config.json's bos_token and eos_token, a GGUF file's ids, else
+                                       the template's tokens or special tokens named so ("<s>", "</s>",
+                                       "<|endoftext|>") */
+    uint32_t pad, unk;              /* padding, and the token of what the vocabulary lacks */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettTokenizerInfo;
+
+/* Reads a tokenizer.json file, a model directory holding one (its tokenizer_config.json, when there is
+   one, names the BOS and EOS tokens) or a GGUF file's vocabulary. NULL on error. */
+SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
+/* The bytes of a tokenizer.json file, or of a GGUF file, in memory; they are not kept. */
+SPINGALETT_API SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
+SPINGALETT_API void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
+SPINGALETT_API SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
+/* The token of an id as the vocabulary writes it (in UTF-8: byte-level vocabularies write a space as U+0120,
+   SentencePiece's as U+2581; "<|im_start|>"), valid while the tokenizer lives; NULL for an id of no token. */
+SPINGALETT_API const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
+/* The id of a token as the vocabulary writes it (added tokens first), SPINGALETT_NO_TOKEN when none. */
+SPINGALETT_API uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
+
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const char *text;               /* UTF-8 (other bytes are an error) */
+    size_t length;                  /* its bytes; 0: up to its NUL */
+    uint32_t *tokens;               /* [capacity] receives the ids, or NULL with capacity 0 to count them */
+    size_t capacity;
+    bool special;                   /* special tokens written in the text ("<|im_start|>") become their ids;
+                                       otherwise they are text like any other (the default, so that text
+                                       from users cannot forge them). Added tokens that are not special
+                                       are always found. */
+    bool add_special;               /* the tokens the tokenizer adds around a text (LLaMA's BOS), as Hugging
+                                       Face's encode(add_special_tokens=True) */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettTokenizeArgs;
+
+/* Encodes a text. Returns its number of tokens, also when that exceeds capacity (the first capacity are
+   written: call again with room for all), -1 on error. */
+#define spingalett_tokenize(...) spingalett_tokenize_args((SpingalettTokenizeArgs){__VA_ARGS__})
+SPINGALETT_API int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
+
+typedef struct {
+    const SpingalettTokenizer *tokenizer;
+    const uint32_t *tokens;         /* [count] */
+    size_t count;
+    char *text;                     /* [capacity] receives the UTF-8 text and a NUL (NULL with capacity 0 to
+                                       measure it); bytes that are no UTF-8, as a lone byte of a character
+                                       split between tokens, become U+FFFD */
+    size_t capacity;
+    bool skip_special;              /* leaves special tokens out */
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettDetokenizeArgs;
+
+/* Decodes tokens into text. Returns the text's bytes, also when they exceed capacity - 1 (the first
+   capacity - 1 are written, with a NUL), -1 on error (ids of no token among them). */
+#define spingalett_detokenize(...) spingalett_detokenize_args((SpingalettDetokenizeArgs){__VA_ARGS__})
+SPINGALETT_API int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+
+/*
+ * Chat templates: the Jinja templates with which language models turn a conversation into the text they were
+ * trained on, rendered as Hugging Face's transformers renders them (apply_chat_template(): trim_blocks and
+ * lstrip_blocks, loop controls, tojson, raise_exception() and strftime_now()), the templates of today's families
+ * among them (Qwen2.5 and Qwen3, Llama 3.x, Gemma 2 and 3, SmolLM, Phi, Mistral, DeepSeek, Granite, OLMo, GLM,
+ * Falcon) with their tools and flags. A tokenizer has the template of its GGUF file (tokenizer.chat_template) or of
+ * its directory (chat_template.jinja, or tokenizer_config.json's chat_template).
+ */
+
+/* A message of a conversation. */
+typedef struct {
+    const char *role;               /* "system", "user", "assistant", "tool", ... */
+    const char *content;            /* its text (NULL: none) */
+} SpingalettChatMessage;
+
+/* The tokenizer's chat template (UTF-8, valid while the tokenizer lives), NULL when it has none. */
+SPINGALETT_API const char *spingalett_tokenizer_chat_template(const SpingalettTokenizer *tokenizer);
+
+typedef struct {
+    const SpingalettTokenizer *tokenizer;   /* its template, and its BOS and EOS tokens as bos_token and eos_token
+                                               (NULL: chat_template alone) */
+    const char *chat_template;      /* a template of one's own (NULL: the tokenizer's) */
+    const SpingalettChatMessage *messages;  /* [count]: the template's messages, each a role and a content */
+    uint32_t count;
+    bool add_generation_prompt;     /* the text that opens the assistant's reply after the messages */
+    const char *variables;          /* a JSON object of more variables (NULL: none): tools, documents, flags the
+                                       template reads (enable_thinking), messages with tool calls or parts (which
+                                       replace messages[]), special tokens of one's own */
+    uint64_t time;                  /* the time strftime_now() formats (local time), seconds since 1970 (0: now) */
+    char *text;                     /* [capacity] receives the UTF-8 text and a NUL (NULL with capacity 0 to
+                                       measure it) */
+    size_t capacity;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettChatArgs;
+
+/* Renders a conversation with a chat template. Returns the text's bytes, also when they exceed capacity - 1 (the
+   first capacity - 1 are written, with a NUL), -1 on error: the template's raise_exception() (its message is the
+   error's: "Conversation roles must alternate ..."), what Python would refuse (a string added to a list), or a
+   part of Jinja the renderer does not have, named. */
+#define spingalett_chat_render(...) spingalett_chat_render_args((SpingalettChatArgs){__VA_ARGS__})
+SPINGALETT_API int64_t spingalett_chat_render_args(SpingalettChatArgs args);
+
+/*
+ * Graphs of operators (docs/Graphs.md): models as graphs of 155 operators over tensors of up to eight axes, their
+ * sizes numbers or named symbols (a batch, a sequence's tokens), several named inputs and outputs: ONNX files, read
+ * one operator to one, and `.slett` files of format 11, which spingalett_graph_save() writes. The operators are
+ * ONNX's, with ONNX's semantics (opsets 7 to 28: broadcasting, attributes, opset 23's attention and rotary
+ * embeddings), computed on the CPU in single precision for floats (float16 and bfloat16 constants and inputs widened,
+ * outputs narrowed back) and in their own types for integers and booleans, every operator summing in fixed orders:
+ * the same bits on any number of threads, in SPINGALETT_COMPUTE_OPENMP's threads. When a graph opens, constants are
+ * folded, what no output needs and repeated nodes are left out, and chains of operators are fused into the library's
+ * kernels (products by constant matrices with their bias and activation, attention, GELU, a convolution's
+ * activation). A graph runs one call at a time (calls from several threads wait for each other); its outputs live in
+ * its memory until its next run. With SPINGALETT_GRAPH_PROFILE=1 in the environment, a graph prints the time of each
+ * operator when it is freed.
+ */
+typedef struct SpingalettGraph SpingalettGraph;
+
+/* Element types of graphs' tensors (ONNX's TensorProto codes). */
+typedef enum {
+    SPINGALETT_DTYPE_UNDEFINED = 0,
+    SPINGALETT_DTYPE_FLOAT32 = 1,
+    SPINGALETT_DTYPE_UINT8 = 2,
+    SPINGALETT_DTYPE_INT8 = 3,
+    SPINGALETT_DTYPE_INT32 = 6,
+    SPINGALETT_DTYPE_INT64 = 7,
+    SPINGALETT_DTYPE_BOOL = 9,                  /* one byte, 0 or 1 */
+    SPINGALETT_DTYPE_FLOAT16 = 10,
+    SPINGALETT_DTYPE_BFLOAT16 = 16
+} SpingalettDType;
+
+/* Most axes of a graph's tensors. */
+#define SPINGALETT_MAX_RANK 8
+
+typedef struct {
+    const char *path;               /* an ONNX file (its external data files beside it) or a .slett file of format 11 */
+    const void *data;               /* or its bytes (path NULL), copied: they need not outlive the call */
+    size_t size;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettGraphOpenArgs;
+
+/* Opens a graph; NULL with the error set (an operator the library does not have is named, with the file's opset). */
+#define spingalett_graph_open(...) spingalett_graph_open_args((SpingalettGraphOpenArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettGraph *spingalett_graph_open_args(SpingalettGraphOpenArgs args);
+SPINGALETT_API void spingalett_graph_free(SpingalettGraph *graph);
+
+/* A graph's input or output as it declares it. */
+typedef struct {
+    const char *name;               /* valid while the graph lives */
+    SpingalettDType dtype;
+    uint32_t rank;
+    int64_t shape[SPINGALETT_MAX_RANK];         /* sizes; -1 where a symbol, or nothing, gives it */
+    const char *symbols[SPINGALETT_MAX_RANK];   /* the symbols' names (NULL for numbers and unknown sizes) */
+    uint64_t reserved[4];
+} SpingalettTensorInfo;
+
+SPINGALETT_API uint32_t spingalett_graph_input_count(const SpingalettGraph *graph);
+SPINGALETT_API uint32_t spingalett_graph_output_count(const SpingalettGraph *graph);
+/* Input or output i (all zeros past the last). */
+SPINGALETT_API SpingalettTensorInfo spingalett_graph_input(const SpingalettGraph *graph, uint32_t i);
+SPINGALETT_API SpingalettTensorInfo spingalett_graph_output(const SpingalettGraph *graph, uint32_t i);
+
+/* A tensor given to or taken from a run, row-major. */
+typedef struct {
+    const char *name;               /* the graph's input or output (NULL: the graph's inputs, or outputs, in order) */
+    SpingalettDType dtype;          /* inputs: its type (FLOAT32 for a graph's float16 or bfloat16 input is widened) */
+    uint32_t rank;
+    int64_t shape[SPINGALETT_MAX_RANK];
+    void *data;                     /* inputs: the values (read only, aligned for their type); outputs: set by the
+                                       run, in the graph's memory until its next run or its end */
+    uint64_t reserved[4];
+} SpingalettTensor;
+
+typedef struct {
+    SpingalettGraph *graph;
+    const SpingalettTensor *inputs; /* [input_count]: every input of the graph */
+    uint32_t input_count;
+    SpingalettTensor *outputs;      /* [output_count]: the outputs wanted; their type, rank, shape and data set */
+    uint32_t output_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettGraphRunArgs;
+
+/* Runs a graph: false with the error set (a shape the graph refuses, a name it lacks, a node that fails: named). */
+#define spingalett_graph_run(...) spingalett_graph_run_args((SpingalettGraphRunArgs){__VA_ARGS__})
+SPINGALETT_API bool spingalett_graph_run_args(SpingalettGraphRunArgs args);
+/* Writes a graph as a .slett file of format 11 (its constants as the graph holds them). */
+SPINGALETT_API bool spingalett_graph_save(const SpingalettGraph *graph, const char *path);
+/* The graph's nodes, and node i's operator (its ONNX name; NULL past the last). */
+SPINGALETT_API uint32_t spingalett_graph_node_count(const SpingalettGraph *graph);
+SPINGALETT_API const char *spingalett_graph_node_op(const SpingalettGraph *graph, uint32_t i);
 
 #ifdef __cplusplus
 }

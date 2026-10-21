@@ -107,6 +107,13 @@ onnx = sg.Network.from_onnx("model.onnx")
 lm = sg.Network.from_torch(my_gpt, torch.randint(0, 50257, (1, 256)))   # attention, RMS norm, SwiGLU ... as layers
 logits = lm.forward(tokens.astype(np.float32))      # tokens: (samples, 256) ids; logits: (samples, 256 x 50257)
 
+# any ONNX model as it is, as a graph of operators (NCHW images and all), or a PyTorch module through torch.onnx
+graph = sg.Graph.load("model.onnx")                       # or a .slett file of format 11
+print(graph.inputs, graph.outputs, graph.operators)
+outs = graph.run({"image": np.zeros((1, 3, 224, 224), np.float32)})       # a dict of arrays, by output name
+vision = sg.Graph.from_torch(model, torch.rand(1, 3, 32, 32), input_names=["image"])
+vision.save("model.slett")
+
 # a pretrained language model and its tokenizer, from a Hugging Face directory or a GGUF file, read by the C library
 lm = sg.Network.from_pretrained("models/SmolLM2-135M", context=512)       # or "SmolLM2-135M.Q4_K_M.gguf"
 tok = sg.Tokenizer("models/SmolLM2-135M")
@@ -189,6 +196,8 @@ with sg.Network.load("xor.slett") as net:
 | `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding, groups, epsilon, input_layers)` per layer (normalizations after a dense or convolution layer are folded into it); image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |
 | `model.session(max_length=0, sequences=1)` / `Session(model, ...)` | a causal language model run a token at a time with a key-value cache: `feed(tokens, sequence=0, all=False)` (the next token's logits, or every fed token's), `feed_many([(sequence, tokens), ...])` (several sequences in one pass), `rewind(length, sequence=0)`, `copy(source, target)`, `length(sequence=0)`, `vocabulary`, `generate(prompts, count, temperature=0, top_k=0, top_p=0, seed=0, stop=())` (sequences advanced together, sequence b drawing with seed + b); the logits are `predict()`'s for each position bit for bit; `Network.generate()` runs one on the CPU |
+| `Graph.load(path)`, `Graph.from_bytes(data)`, `Graph.from_torch(module, *inputs, input_names=None, opset=18, **export_args)` | a graph of operators (docs/Graphs.md): an ONNX file (external data files beside it) or a `.slett` file of format 11, or a module exported by `torch.onnx` (its dynamo exporter) in memory; constants folded and chains fused into the library's kernels when it opens |
+| `graph.inputs`, `graph.outputs`, `graph.operators`, `graph.run(inputs, outputs=None)`, `graph.save(path)` | `TensorInfo(name, dtype, shape)` with a symbol's name (`"batch"`) or `None` where no number gives a size; the nodes' operators after the fusions; `run` takes a dict of arrays by name (or a list in the inputs' order; float64 becomes float32) and returns copies of the outputs by name (all, or those named); the graph computes on the threads of `set_compute_mode(ComputeMode.OPENMP)`, the same bits on any number |
 | `set_compute_mode`, `set_num_threads`, `seed`, `set_verbose`, `set_log_level`, `set_log_callback` | process-wide settings; `ComputeMode.CUDA` (NVIDIA) and `ComputeMode.VULKAN` train and predict on the GPU |
 | `DeviceData(values)` | a data set in the GPU's memory (rows of float32, an array `(n, ...)` flattened to a row a sample), copied there once; `train()`, `validation_data`, `forward()` and `evaluate()` take it in place of an array (inputs, targets or both), and with the GPU modes gather, augment and smooth their batches on the device; `len(d)`, `d.shape`, `d.numpy(first=0, count=None)`, `close()` or a `with` block |
 | `set_gpu_precision(Precision.BFLOAT16)`, `get_gpu_precision()` | the GPU's matrix products in bfloat16 on its matrix units, or `FLOAT32` (the default); returns whether the GPU multiplies in that precision |
@@ -203,4 +212,5 @@ Library errors raise `SpingalettError`, whose `code` is an `ErrorCode`. The bind
 that the library can serve them (`library_version()`), because they mirror its struct layouts: the
 same major version and at least their own minor one (before 1.0, the same major.minor version). A
 `Network` is not thread-safe: use one per thread. A `Model` is read-only and can be shared between
-threads; a `Session` is used by one thread at a time, and any number of them may share a model.
+threads; a `Session` is used by one thread at a time, and any number of them may share a model. A `Graph` runs one
+call at a time (calls from several threads wait for each other).

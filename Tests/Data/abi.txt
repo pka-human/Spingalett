@@ -1,4 +1,4 @@
-# The ABI of Spingalett 1.4.0, written by Tests/check_abi.py update: later releases keep every
+# The ABI of Spingalett 1.5.0, written by Tests/check_abi.py update: later releases keep every
 # entry (layouts on 64-bit platforms). Recorded again at each release, with what it added.
 enum SPINGALETT_INIT_RANDOM 0
 enum SPINGALETT_INIT_XAVIER 1
@@ -241,29 +241,7 @@ field SpingalettGenerateArgs.top_p offset 44 size 4
 field SpingalettGenerateArgs.seed offset 48 size 8
 field SpingalettGenerateArgs.stop_tokens offset 56 size 8
 field SpingalettGenerateArgs.stop_count offset 64 size 4
-constant SPINGALETT_NO_TOKEN 4294967295
-struct SpingalettTokenizerInfo size 88
-field SpingalettTokenizerInfo.vocabulary offset 0 size 4
-field SpingalettTokenizerInfo.added offset 4 size 4
-field SpingalettTokenizerInfo.bos offset 8 size 4
-field SpingalettTokenizerInfo.eos offset 12 size 4
-field SpingalettTokenizerInfo.pad offset 16 size 4
-field SpingalettTokenizerInfo.unk offset 20 size 4
-struct SpingalettTokenizeArgs size 112
-field SpingalettTokenizeArgs.tokenizer offset 0 size 8
-field SpingalettTokenizeArgs.text offset 8 size 8
-field SpingalettTokenizeArgs.length offset 16 size 8
-field SpingalettTokenizeArgs.tokens offset 24 size 8
-field SpingalettTokenizeArgs.capacity offset 32 size 8
-field SpingalettTokenizeArgs.special offset 40 size 1
-field SpingalettTokenizeArgs.add_special offset 41 size 1
-struct SpingalettDetokenizeArgs size 112
-field SpingalettDetokenizeArgs.tokenizer offset 0 size 8
-field SpingalettDetokenizeArgs.tokens offset 8 size 8
-field SpingalettDetokenizeArgs.count offset 16 size 8
-field SpingalettDetokenizeArgs.text offset 24 size 8
-field SpingalettDetokenizeArgs.capacity offset 32 size 8
-field SpingalettDetokenizeArgs.skip_special offset 40 size 1
+field SpingalettGenerateArgs.sampling offset 72 size 8
 struct SpingalettPretrainedArgs size 80
 field SpingalettPretrainedArgs.path offset 0 size 8
 field SpingalettPretrainedArgs.context offset 8 size 4
@@ -341,6 +319,17 @@ field SpingalettSessionFeed.tokens offset 8 size 8
 field SpingalettSessionFeed.count offset 16 size 4
 field SpingalettSessionFeed.logits offset 24 size 8
 field SpingalettSessionFeed.all offset 32 size 1
+struct SpingalettSampling size 112
+field SpingalettSampling.min_p offset 0 size 4
+field SpingalettSampling.repetition_penalty offset 4 size 4
+field SpingalettSampling.frequency_penalty offset 8 size 4
+field SpingalettSampling.presence_penalty offset 12 size 4
+field SpingalettSampling.penalty_window offset 16 size 4
+field SpingalettSampling.tokenizer offset 24 size 8
+field SpingalettSampling.stop_strings offset 32 size 8
+field SpingalettSampling.stop_string_count offset 40 size 4
+field SpingalettSampling.on_token offset 48 size 8
+field SpingalettSampling.user offset 56 size 8
 struct SpingalettSessionGenerateArgs size 152
 field SpingalettSessionGenerateArgs.session offset 0 size 8
 field SpingalettSessionGenerateArgs.sequences offset 8 size 4
@@ -355,6 +344,75 @@ field SpingalettSessionGenerateArgs.top_p offset 60 size 4
 field SpingalettSessionGenerateArgs.seed offset 64 size 8
 field SpingalettSessionGenerateArgs.stop_tokens offset 72 size 8
 field SpingalettSessionGenerateArgs.stop_count offset 80 size 4
+field SpingalettSessionGenerateArgs.sampling offset 88 size 8
+constant SPINGALETT_NO_TOKEN 4294967295
+struct SpingalettTokenizerInfo size 88
+field SpingalettTokenizerInfo.vocabulary offset 0 size 4
+field SpingalettTokenizerInfo.added offset 4 size 4
+field SpingalettTokenizerInfo.bos offset 8 size 4
+field SpingalettTokenizerInfo.eos offset 12 size 4
+field SpingalettTokenizerInfo.pad offset 16 size 4
+field SpingalettTokenizerInfo.unk offset 20 size 4
+struct SpingalettTokenizeArgs size 112
+field SpingalettTokenizeArgs.tokenizer offset 0 size 8
+field SpingalettTokenizeArgs.text offset 8 size 8
+field SpingalettTokenizeArgs.length offset 16 size 8
+field SpingalettTokenizeArgs.tokens offset 24 size 8
+field SpingalettTokenizeArgs.capacity offset 32 size 8
+field SpingalettTokenizeArgs.special offset 40 size 1
+field SpingalettTokenizeArgs.add_special offset 41 size 1
+struct SpingalettDetokenizeArgs size 112
+field SpingalettDetokenizeArgs.tokenizer offset 0 size 8
+field SpingalettDetokenizeArgs.tokens offset 8 size 8
+field SpingalettDetokenizeArgs.count offset 16 size 8
+field SpingalettDetokenizeArgs.text offset 24 size 8
+field SpingalettDetokenizeArgs.capacity offset 32 size 8
+field SpingalettDetokenizeArgs.skip_special offset 40 size 1
+struct SpingalettChatMessage size 16
+field SpingalettChatMessage.role offset 0 size 8
+field SpingalettChatMessage.content offset 8 size 8
+struct SpingalettChatArgs size 128
+field SpingalettChatArgs.tokenizer offset 0 size 8
+field SpingalettChatArgs.chat_template offset 8 size 8
+field SpingalettChatArgs.messages offset 16 size 8
+field SpingalettChatArgs.count offset 24 size 4
+field SpingalettChatArgs.add_generation_prompt offset 28 size 1
+field SpingalettChatArgs.variables offset 32 size 8
+field SpingalettChatArgs.time offset 40 size 8
+field SpingalettChatArgs.text offset 48 size 8
+field SpingalettChatArgs.capacity offset 56 size 8
+enum SPINGALETT_DTYPE_UNDEFINED 0
+enum SPINGALETT_DTYPE_FLOAT32 1
+enum SPINGALETT_DTYPE_UINT8 2
+enum SPINGALETT_DTYPE_INT8 3
+enum SPINGALETT_DTYPE_INT32 6
+enum SPINGALETT_DTYPE_INT64 7
+enum SPINGALETT_DTYPE_BOOL 9
+enum SPINGALETT_DTYPE_FLOAT16 10
+enum SPINGALETT_DTYPE_BFLOAT16 16
+constant SPINGALETT_MAX_RANK 8
+struct SpingalettGraphOpenArgs size 88
+field SpingalettGraphOpenArgs.path offset 0 size 8
+field SpingalettGraphOpenArgs.data offset 8 size 8
+field SpingalettGraphOpenArgs.size offset 16 size 8
+struct SpingalettTensorInfo size 176
+field SpingalettTensorInfo.name offset 0 size 8
+field SpingalettTensorInfo.dtype offset 8 size 4
+field SpingalettTensorInfo.rank offset 12 size 4
+field SpingalettTensorInfo.shape offset 16 size 64
+field SpingalettTensorInfo.symbols offset 80 size 64
+struct SpingalettTensor size 120
+field SpingalettTensor.name offset 0 size 8
+field SpingalettTensor.dtype offset 8 size 4
+field SpingalettTensor.rank offset 12 size 4
+field SpingalettTensor.shape offset 16 size 64
+field SpingalettTensor.data offset 80 size 8
+struct SpingalettGraphRunArgs size 104
+field SpingalettGraphRunArgs.graph offset 0 size 8
+field SpingalettGraphRunArgs.inputs offset 8 size 8
+field SpingalettGraphRunArgs.input_count offset 16 size 4
+field SpingalettGraphRunArgs.outputs offset 24 size 8
+field SpingalettGraphRunArgs.output_count offset 32 size 4
 constant SPINGALETT_MAX_INPUTS 16
 constant SPINGALETT_RESERVED 8
 constant SPINGALETT_OK 0
@@ -511,14 +569,6 @@ function spingalett_import_onnx SpingalettNetwork *spingalett_import_onnx(const 
 function spingalett_import_onnx_from_memory SpingalettNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
 function spingalett_load_pytorch bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const char *const *modules, uint32_t module_count);
 function spingalett_load_pytorch_from_memory bool spingalett_load_pytorch_from_memory(SpingalettNetwork *net, const void *data, size_t size, const char *const *modules, uint32_t module_count);
-function spingalett_tokenizer_load SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
-function spingalett_tokenizer_from_memory SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
-function spingalett_tokenizer_free void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
-function spingalett_tokenizer_info SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
-function spingalett_tokenizer_token const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
-function spingalett_tokenizer_id uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
-function spingalett_tokenize_args int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
-function spingalett_detokenize_args int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
 function spingalett_load_pretrained_args SpingalettNetwork *spingalett_load_pretrained_args(SpingalettPretrainedArgs args);
 function spingalett_model_from_network SpingalettModel *spingalett_model_from_network(const SpingalettNetwork *net, SpingalettPrecisionMode precision);
 function spingalett_export_c_header bool spingalett_export_c_header(const SpingalettNetwork *net, const char *path, const char *name, SpingalettPrecisionMode precision);
@@ -576,6 +626,26 @@ function spingalett_session_feed bool spingalett_session_feed(SpingalettSession 
 function spingalett_session_rewind bool spingalett_session_rewind(SpingalettSession *session, uint32_t sequence, uint32_t length);
 function spingalett_session_copy bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
 function spingalett_session_generate_args uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args);
+function spingalett_tokenizer_load SpingalettTokenizer *spingalett_tokenizer_load(const char *path);
+function spingalett_tokenizer_from_memory SpingalettTokenizer *spingalett_tokenizer_from_memory(const void *data, size_t size);
+function spingalett_tokenizer_free void spingalett_tokenizer_free(SpingalettTokenizer *tokenizer);
+function spingalett_tokenizer_info SpingalettTokenizerInfo spingalett_tokenizer_info(const SpingalettTokenizer *tokenizer);
+function spingalett_tokenizer_token const char *spingalett_tokenizer_token(const SpingalettTokenizer *tokenizer, uint32_t id);
+function spingalett_tokenizer_id uint32_t spingalett_tokenizer_id(const SpingalettTokenizer *tokenizer, const char *token);
+function spingalett_tokenize_args int64_t spingalett_tokenize_args(SpingalettTokenizeArgs args);
+function spingalett_detokenize_args int64_t spingalett_detokenize_args(SpingalettDetokenizeArgs args);
+function spingalett_tokenizer_chat_template const char *spingalett_tokenizer_chat_template(const SpingalettTokenizer *tokenizer);
+function spingalett_chat_render_args int64_t spingalett_chat_render_args(SpingalettChatArgs args);
+function spingalett_graph_open_args SpingalettGraph *spingalett_graph_open_args(SpingalettGraphOpenArgs args);
+function spingalett_graph_free void spingalett_graph_free(SpingalettGraph *graph);
+function spingalett_graph_input_count uint32_t spingalett_graph_input_count(const SpingalettGraph *graph);
+function spingalett_graph_output_count uint32_t spingalett_graph_output_count(const SpingalettGraph *graph);
+function spingalett_graph_input SpingalettTensorInfo spingalett_graph_input(const SpingalettGraph *graph, uint32_t i);
+function spingalett_graph_output SpingalettTensorInfo spingalett_graph_output(const SpingalettGraph *graph, uint32_t i);
+function spingalett_graph_run_args bool spingalett_graph_run_args(SpingalettGraphRunArgs args);
+function spingalett_graph_save bool spingalett_graph_save(const SpingalettGraph *graph, const char *path);
+function spingalett_graph_node_count uint32_t spingalett_graph_node_count(const SpingalettGraph *graph);
+function spingalett_graph_node_op const char *spingalett_graph_node_op(const SpingalettGraph *graph, uint32_t i);
 function spingalett_model_init int spingalett_model_init(SpingalettModel *model, const void *image, size_t size);
 function spingalett_model_run int spingalett_model_run(const SpingalettModel *model, const float *input, float *output, void *workspace);
 function spingalett_model_layer bool spingalett_model_layer(const SpingalettModel *model, uint32_t index, SpingalettLayerInfo *info);

@@ -554,14 +554,29 @@ float    rng_next_float(void);
 
 /* The next token of text generation from a row of V logits (Spingalett.Session.c): the most likely
    (temperature 0: the first of equals), or a draw from the softmax of the logits divided by the
-   temperature among the top_k most likely and the most likely whose probabilities add up to top_p, from a
-   splitmix64 generator (*state) in an order fixed by the logits. candidates holds V. */
+   temperature among the top_k most likely, the most likely whose probabilities add up to top_p, and those at
+   least min_p times as likely as the most likely, from a splitmix64 generator (*state) in an order fixed by the
+   logits (the probabilities in the order of the tokens; their order sorted as far as the draw goes). candidates
+   holds V. */
 typedef struct {
     float p;
     uint32_t token;
 } SpingalettCandidate;
-uint32_t spingalett_next_token(const float *logits, uint32_t V, float temperature, uint32_t top_k, float top_p,
-                               SpingalettCandidate *candidates, uint64_t *state);
+typedef struct {
+    float temperature;
+    uint32_t top_k;
+    float top_p, min_p;
+} SpgDraw;
+uint32_t spingalett_next_token(const float *logits, uint32_t V, const SpgDraw *draw, SpingalettCandidate *candidates,
+                               uint64_t *state);
+/* The tokens the penalties of s look back on (0: s has none). */
+uint32_t spingalett_penalty_window(const SpingalettSampling *s);
+/* s's penalties (llama.cpp's repeat, frequency and presence penalties) on a row of V logits, for the last tokens
+   of a then b (spingalett_penalty_window() of them; scratch holds as many). */
+void spingalett_penalize(float *logits, uint32_t V, const SpingalettSampling *s, const uint32_t *a, uint32_t na,
+                         const uint32_t *b, uint32_t nb, uint32_t *scratch);
+/* Whether the newest of `made` generated tokens completed one of s's stop strings. */
+bool spingalett_stop_string(const SpingalettSampling *s, const uint32_t *generated, uint32_t made);
 /* Whether spingalett_session_new() runs the model (a causal language model); sets no error. */
 bool spingalett_session_runs(const SpingalettModel *model);
 #if !defined(SPINGALETT_RUNTIME)

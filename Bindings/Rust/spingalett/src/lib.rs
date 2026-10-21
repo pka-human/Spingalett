@@ -120,7 +120,7 @@ c_enum!(
     Init { Random = 0, Xavier = 1, He = 2, Zeros = 3, LeCun = 4 }
 );
 
-/// The library's version ("1.4.1").
+/// The library's version ("1.5.0").
 pub fn version() -> String {
     unsafe { CStr::from_ptr(sys::spingalett_version()).to_string_lossy().into_owned() }
 }
@@ -646,7 +646,8 @@ impl Network {
             seed: sampling.seed,
             stop_tokens: if sampling.stop.is_empty() { ptr::null() } else { sampling.stop.as_ptr() },
             stop_count: sampling.stop.len() as u32,
-            reserved: [0; sys::RESERVED],
+            sampling: ptr::null(),
+            reserved: [0; sys::RESERVED - 1],
         };
         let made = checked("generate", || unsafe { sys::spingalett_generate_args(args) })?;
         tokens.truncate(made as usize);

@@ -8,7 +8,7 @@ Hugging Face's form and GGUF files, with the logits a PyTorch reference computes
 
 - hf_llama/: LLaMA with grouped-query attention (4 query heads, 2 key and value heads), rotary embeddings
   of base 500000, weights in bfloat16 in two shards and model.safetensors.index.json, LLaMA 3's form of
-  tokenizer (tokenizer_llama3.json) and a tokenizer_config.json;
+  tokenizer (tokenizer_llama3.json) and a tokenizer_config.json with Llama 3.2's chat template;
 - hf_qwen2/: Qwen2 with the biases of its queries, keys and values, one key and value head, tied embeddings
   (no lm_head), float16, Qwen2's form of tokenizer;
 - hf_mistral/: Mistral with a sliding window (16 tokens) and a head size (8) other than the width over the
@@ -30,7 +30,8 @@ GGUF files, written by the small writer below as llama.cpp's converter writes th
 
 - gguf_llama.gguf: hf_llama's weights (queries and keys permuted into llama.cpp's order, matrices in
   bfloat16, vectors in float32) and its tokenizer as a vocabulary of the "gpt2" model ("llama-bpe");
-- gguf_qwen2.gguf: hf_qwen2's (float16, its biases, no output.weight) and its tokenizer ("qwen2");
+- gguf_qwen2.gguf: hf_qwen2's (float16, its biases, no output.weight) and its tokenizer ("qwen2"), with Qwen2.5's
+  chat template;
 - gguf_gpt2.gguf: hf_gpt2's (its Conv1D matrices transposed to [out][in], learned positions), no vocabulary;
 - gguf_qwen3.gguf: hf_qwen3's (float16, attn_q_norm and attn_k_norm), architecture "qwen3";
 - gguf_llama3.gguf: hf_llama3's (bfloat16, queries and keys permuted) with rope_freqs.weight, the factors llama.cpp's
@@ -425,9 +426,10 @@ def llama_metadata(cfg, name, arch="llama"):
                    (f"{arch}.rope.dimension_count", GGUF_UINT32, cfg.get("head_dim", cfg["hidden_size"] // H))]
 
 
-def vocabulary_metadata(tokenizer_json, pre, bos, eos):
+def vocabulary_metadata(tokenizer_json, pre, bos, eos, chat=None):
     """A tokenizer.json of byte-level BPE as the vocabulary of GGUF's "gpt2" model: tokens by id, the added ones control
-    tokens (special) or user-defined ones, the merges as "a b" strings."""
+    tokens (special) or user-defined ones, the merges as "a b" strings; with chat, the chat template of
+    Tests/Data/chat/CHAT.jinja."""
     tok = json.load(open(os.path.join(DATA, tokenizer_json), encoding="utf-8"))
     vocab = {i: t for t, i in tok["model"]["vocab"].items()}
     types = {i: 1 for i in vocab}
@@ -443,7 +445,13 @@ def vocabulary_metadata(tokenizer_json, pre, bos, eos):
         meta.append(("tokenizer.ggml.bos_token_id", GGUF_UINT32, bos))
     meta.append(("tokenizer.ggml.eos_token_id", GGUF_UINT32, eos))
     meta.append(("tokenizer.ggml.add_bos_token", GGUF_BOOL, bos is not None))
+    if chat:
+        meta.append(("tokenizer.chat_template", GGUF_STRING, chat_template(chat)))
     return meta
+
+
+def chat_template(name):
+    return open(os.path.join(DATA, "chat", name + ".jinja"), encoding="utf-8").read()
 
 
 def tensor_bytes(w, kind):
@@ -703,6 +711,112 @@ def gemma3():
           f"{logits.max():.2f}]")
 
 
+def family(name, model, arch, metadata, parts, permuted=(), fused=(), extra=()):
+    """A tiny model of transformers, its GGUF file gguf_NAME.gguf as llama.cpp's converter writes it (the tensors of
+    `permuted` in llama.cpp's order of a head's rows, `fused` a part of several matrices of the state dict, `extra`
+    tensors of its own), and its logits by transformers in gguf_NAME.bin."""
+    with torch.no_grad():
+        for key, p in model.named_parameters():
+            p.copy_(torch.randn(p.shape) * (0.3 if "norm" in key else 0.2))
+            if "norm" in key:
+                p.add_(1.0)
+    cfg = model.config
+    tokens = list(range(3, 3 + T))
+    with torch.no_grad():
+        logits = model(torch.tensor(tokens)[None]).logits[0].numpy().astype(np.float32)
+    with open(os.path.join(DATA, f"gguf_{name}.bin"), "wb") as f:
+        f.write(b"SPGT" + struct.pack("<3I", 1, T, T * cfg.vocab_size))
+        f.write(np.array(tokens, dtype=np.float32).tobytes() + logits.tobytes())
+    tensors = []
+    for key, value in sorted(model.state_dict().items()):
+        w = value.to(torch.float32).numpy()
+        if key == "model.embed_tokens.weight":
+            gname = "token_embd.weight"
+        elif key == "model.norm.weight":
+            gname = "output_norm.weight"
+        elif key == "lm_head.weight":
+            if cfg.tie_word_embeddings:
+                continue
+            gname = "output.weight"
+        else:
+            layer, part = key[len("model.layers."):].split(".", 1)
+            part, suffix = part.rsplit(".", 1)
+            if part not in parts:
+                continue
+            gname = f"blk.{layer}.{parts[part]}.{suffix}"
+            heads = permuted.get(part) if isinstance(permuted, dict) else None
+            if heads:
+                w = permute(w, heads)
+        tensors.append((gname, list(w.shape[::-1]), "F32", w.astype("<f4").tobytes()))
+    for gname, w in extra:
+        tensors.append((gname, list(w.shape[::-1]), "F32", w.astype("<f4").tobytes()))
+    a = arch
+    head = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+    meta = [("general.architecture", GGUF_STRING, a), ("general.alignment", GGUF_UINT32, 32),
+            (f"{a}.context_length", GGUF_UINT32, cfg.max_position_embeddings),
+            (f"{a}.embedding_length", GGUF_UINT32, cfg.hidden_size), (f"{a}.block_count", GGUF_UINT32, cfg.num_hidden_layers),
+            (f"{a}.feed_forward_length", GGUF_UINT32, cfg.intermediate_size),
+            (f"{a}.attention.head_count", GGUF_UINT32, cfg.num_attention_heads),
+            (f"{a}.attention.head_count_kv", GGUF_UINT32, cfg.num_key_value_heads),
+            (f"{a}.attention.key_length", GGUF_UINT32, head), (f"{a}.attention.value_length", GGUF_UINT32, head),
+            (f"{a}.attention.layer_norm_rms_epsilon", GGUF_FLOAT32, cfg.rms_norm_eps),
+            (f"{a}.rope.freq_base", GGUF_FLOAT32, float(cfg.rope_parameters["rope_theta"]))] + metadata
+    size = gguf_file(os.path.join(DATA, f"gguf_{name}.gguf"), meta, tensors)
+    print(f"gguf_{name}.gguf: {len(tensors)} tensors, {size} bytes, logits in [{logits.min():.2f}, {logits.max():.2f}]")
+
+
+LLAMA_PARTS = {"input_layernorm": "attn_norm", "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
+               "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output", "post_attention_layernorm": "ffn_norm",
+               "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
+
+
+def families():
+    """SmolLM3 (every fourth layer without rotary embeddings), OLMo 2 (no normalized inputs, its outputs normalized,
+    queries and keys normalized over all heads), Phi-3 (queries, keys and values in one matrix, the gate and up in
+    one, LongRoPE's short factors and magnitude) and GLM-4 (half of each head turned in adjacent pairs, the outputs
+    normalized, biases) by transformers."""
+    import transformers
+    torch.manual_seed(2028)
+    small = dict(vocab_size=64, hidden_size=32, intermediate_size=48, num_attention_heads=4, num_key_value_heads=2,
+                 max_position_embeddings=64, rms_norm_eps=1e-6, pad_token_id=0)
+    model = transformers.SmolLM3ForCausalLM(transformers.SmolLM3Config(
+        **small, num_hidden_layers=4, tie_word_embeddings=True, no_rope_layer_interval=4,
+        rope_parameters={"rope_type": "default", "rope_theta": 50000.0})).eval()
+    family("smollm3", model, "smollm3", [], LLAMA_PARTS, permuted={"self_attn.q_proj": 4, "self_attn.k_proj": 2})
+    model = transformers.Olmo2ForCausalLM(transformers.Olmo2Config(**small, num_hidden_layers=2,
+                                                                   tie_word_embeddings=False)).eval()
+    family("olmo2", model, "olmo2", [], {"self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
+                                         "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output",
+                                         "self_attn.q_norm": "attn_q_norm", "self_attn.k_norm": "attn_k_norm",
+                                         "post_attention_layernorm": "post_attention_norm",
+                                         "post_feedforward_layernorm": "post_ffw_norm", "mlp.gate_proj": "ffn_gate",
+                                         "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"})
+    half = 32 // 4 // 2
+    short, long = [1.0 + 0.25 * i for i in range(half)], [2.0 + 0.5 * i for i in range(half)]
+    config = transformers.Phi3Config(**{**small, "max_position_embeddings": 256}, num_hidden_layers=2,
+                                     tie_word_embeddings=False, original_max_position_embeddings=64,
+                                     rope_parameters={"rope_type": "longrope", "rope_theta": 10000.0, "short_factor": short,
+                                                      "long_factor": long, "original_max_position_embeddings": 64})
+    model = transformers.Phi3ForCausalLM(config).eval()
+    magnitude = math.sqrt(1 + math.log(256 / 64) / math.log(64))
+    family("phi3", model, "phi3", [("phi3.rope.dimension_count", GGUF_UINT32, 8),
+                                   ("phi3.rope.scaling.original_context_length", GGUF_UINT32, 64),
+                                   ("phi3.rope.scaling.attn_factor", GGUF_FLOAT32, magnitude),
+                                   ("phi3.attention.sliding_window", GGUF_UINT32, 0)],
+           {"input_layernorm": "attn_norm", "self_attn.qkv_proj": "attn_qkv", "self_attn.o_proj": "attn_output",
+            "post_attention_layernorm": "ffn_norm", "mlp.gate_up_proj": "ffn_up", "mlp.down_proj": "ffn_down"},
+           extra=[("rope_factors_long.weight", np.array(long, np.float32)),
+                  ("rope_factors_short.weight", np.array(short, np.float32))])
+    model = transformers.Glm4ForCausalLM(transformers.Glm4Config(
+        **small, num_hidden_layers=2, head_dim=8, tie_word_embeddings=False, attention_bias=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5})).eval()
+    family("glm4", model, "glm4", [("glm4.rope.dimension_count", GGUF_UINT32, 4)],
+           {"input_layernorm": "attn_norm", "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
+            "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output",
+            "post_self_attn_layernorm": "post_attention_norm", "post_attention_layernorm": "ffn_norm",
+            "post_mlp_layernorm": "post_ffw_norm", "mlp.gate_up_proj": "ffn_up", "mlp.down_proj": "ffn_down"})
+
+
 def main():
     gen = torch.Generator().manual_seed(2024)
     llama = {"architectures": ["LlamaForCausalLM"], "model_type": "llama", "vocab_size": 425, "hidden_size": 16,
@@ -711,7 +825,8 @@ def main():
              "tie_word_embeddings": False, "torch_dtype": "bfloat16", "rope_scaling": None}
     llama_sd = llama_weights(llama, torch.bfloat16, False, False, gen)
     write("hf_llama", llama, llama_sd, ref_llama, "tokenizer_llama3.json",
-          shards=2, tokenizer_config={"bos_token": "<|begin_of_text|>", "eos_token": "<|eot_id|>"})
+          shards=2, tokenizer_config={"bos_token": "<|begin_of_text|>", "eos_token": "<|eot_id|>",
+                                      "chat_template": chat_template("llama3.2")})
     qwen2 = {"architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2", "vocab_size": 423, "hidden_size": 16,
              "intermediate_size": 24, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1,
              "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "max_position_embeddings": 32, "hidden_act": "silu",
@@ -729,7 +844,7 @@ def main():
     gpt2_sd = gpt2_weights(gpt2, gen)
     write("hf_gpt2", gpt2, gpt2_sd, ref_gpt2, "tokenizer_gpt2.json")
     gguf_from_hf("gguf_llama.gguf", "llama", llama, llama_sd, "BF16", ("tokenizer_llama3.json", "llama-bpe", 420, 424))
-    gguf_from_hf("gguf_qwen2.gguf", "qwen2", qwen2, qwen2_sd, "F16", ("tokenizer_qwen2.json", "qwen2", None, 420))
+    gguf_from_hf("gguf_qwen2.gguf", "qwen2", qwen2, qwen2_sd, "F16", ("tokenizer_qwen2.json", "qwen2", None, 420, "qwen2.5"))
     gguf_from_hf("gguf_gpt2.gguf", "gpt2", gpt2, gpt2_sd, "F32")
     gguf_quantized()
     gguf_sentencepiece()
@@ -751,6 +866,7 @@ def main():
     gguf_from_hf("gguf_qwen3.gguf", "qwen3", qwen3, qwen3_sd, "F16")
     gguf_from_hf("gguf_llama3.gguf", "llama", llama3, llama3_sd, "BF16")
     gemma3()
+    families()
     try:                                    # transformers' models, where it is installed: the reference's own check
         import transformers
         for name in ("hf_qwen3", "hf_llama3", "hf_llama", "hf_qwen2"):

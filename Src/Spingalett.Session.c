@@ -28,6 +28,7 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <float.h>
 #include <string.h>
 #include <math.h>
 
@@ -795,36 +796,158 @@ static uint64_t splitmix64(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
-uint32_t spingalett_next_token(const float *logits, uint32_t V, float temperature, uint32_t top_k, float top_p,
-                               SpingalettCandidate *c, uint64_t *state) {
+/* Sorts the next part of the candidates c[sorted .. V): those of probability at least *threshold (lowered 256 times
+   until some are), or all that are left once it is past the smallest normal float. Every candidate of a part is more
+   likely than every one after it, so the parts in their order are the order of all. The new end of the sorted part. */
+static uint32_t sort_more(SpingalettCandidate *c, uint32_t sorted, uint32_t V, float *threshold) {
+    while (sorted < V) {
+        uint32_t m = sorted;
+        if (*threshold >= FLT_MIN) {
+            for (uint32_t v = sorted; v < V; v++)
+                if (c[v].p >= *threshold) {
+                    const SpingalettCandidate t = c[m];
+                    c[m++] = c[v];
+                    c[v] = t;
+                }
+            *threshold *= 1.0f / 256.0f;
+        } else {
+            m = V;
+        }
+        if (m > sorted) {
+            qsort(c + sorted, m - sorted, sizeof *c, by_probability);
+            return m;
+        }
+    }
+    return V;
+}
+
+uint32_t spingalett_next_token(const float *logits, uint32_t V, const SpgDraw *d, SpingalettCandidate *c,
+                               uint64_t *state) {
     uint32_t best = 0;
     for (uint32_t v = 1; v < V; v++)
         if (logits[v] > logits[best]) best = v;
-    if (!(temperature > 0.0f)) return best;
-    const double inv = 1.0 / temperature, top = logits[best];
-    for (uint32_t v = 0; v < V; v++) c[v] = (SpingalettCandidate){(float)exp(((double)logits[v] - top) * inv), v};
-    qsort(c, V, sizeof *c, by_probability);
-    uint32_t kept = top_k && top_k < V ? top_k : V;
+    if (!(d->temperature > 0.0f)) return best;
+    const double inv = 1.0 / d->temperature, top = logits[best];
     double total = 0.0;
-    for (uint32_t k = 0; k < kept; k++) total += c[k].p;
-    if (top_p > 0.0f && top_p < 1.0f) {
+    for (uint32_t v = 0; v < V; v++) {
+        c[v] = (SpingalettCandidate){(float)exp(((double)logits[v] - top) * inv), v};
+        total += c[v].p;
+    }
+    /* the candidates in order of probability as far as the draw needs them, sorted a part at a time from the most
+       likely (of probability 1) down */
+    uint32_t sorted = 0, kept = V;
+    float threshold = 1.0f / 256.0f;
+    if (d->top_k && d->top_k < V) {
+        kept = d->top_k;
+        while (sorted < kept) sorted = sort_more(c, sorted, V, &threshold);
+        total = 0.0;
+        for (uint32_t k = 0; k < kept; k++) total += c[k].p;
+    }
+    if (d->top_p > 0.0f && d->top_p < 1.0f) {
         double sum = 0.0;
         for (uint32_t k = 0; k < kept; k++) {
+            while (k >= sorted) sorted = sort_more(c, sorted, V, &threshold);
             sum += c[k].p;
-            if (sum >= top_p * total) {
+            if (sum >= d->top_p * total) {
                 kept = k + 1u;
                 total = sum;
                 break;
             }
         }
     }
+    if (d->min_p > 0.0f) {
+        /* the most likely has probability 1: the others need min_p */
+        uint32_t k = 1;
+        for (; k < kept; k++) {
+            while (k >= sorted) sorted = sort_more(c, sorted, V, &threshold);
+            if (c[k].p < d->min_p) break;
+        }
+        if (k < kept) {
+            kept = k;
+            total = 0.0;
+            for (uint32_t j = 0; j < kept; j++) total += c[j].p;
+        }
+    }
     const double u = (double)(splitmix64(state) >> 11) * (1.0 / 9007199254740992.0) * total;
     double sum = 0.0;
     for (uint32_t k = 0; k < kept; k++) {
+        while (k >= sorted) sorted = sort_more(c, sorted, V, &threshold);
         sum += c[k].p;
         if (u < sum) return c[k].token;
     }
+    while (sorted < kept) sorted = sort_more(c, sorted, V, &threshold);
     return c[kept - 1u].token;
+}
+
+static int by_token(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+uint32_t spingalett_penalty_window(const SpingalettSampling *s) {
+    if (!s || ((s->repetition_penalty == 0.0f || s->repetition_penalty == 1.0f) && s->frequency_penalty == 0.0f &&
+               s->presence_penalty == 0.0f))
+        return 0;
+    return s->penalty_window ? s->penalty_window : 64u;
+}
+
+void spingalett_penalize(float *logits, uint32_t V, const SpingalettSampling *s, const uint32_t *a, uint32_t na,
+                         const uint32_t *b, uint32_t nb, uint32_t *scratch) {
+    const uint32_t window = spingalett_penalty_window(s);
+    if (!window) return;
+    /* the window's last tokens, sorted so that each token's occurrences lie together */
+    const uint64_t all = (uint64_t)na + nb;
+    const uint32_t n = all < window ? (uint32_t)all : window;
+    for (uint32_t k = 0; k < n; k++) {
+        const uint64_t at = all - n + k;
+        scratch[k] = at < na ? a[at] : b[at - na];
+    }
+    qsort(scratch, n, sizeof *scratch, by_token);
+    const float rep = s->repetition_penalty == 0.0f ? 1.0f : s->repetition_penalty;
+    for (uint32_t k = 0; k < n;) {
+        uint32_t e = k + 1u;
+        while (e < n && scratch[e] == scratch[k]) e++;
+        const uint32_t t = scratch[k];
+        if (t < V) {
+            float l = logits[t];
+            if (rep != 1.0f) l = l <= 0.0f ? l * rep : l / rep;
+            logits[t] = l - (float)(e - k) * s->frequency_penalty - s->presence_penalty;
+        }
+        k = e;
+    }
+}
+
+bool spingalett_stop_string(const SpingalettSampling *s, const uint32_t *generated, uint32_t made) {
+    if (!s || !s->stop_string_count || !s->stop_strings || !s->tokenizer || !made) return false;
+    size_t longest = 0;
+    for (uint32_t k = 0; k < s->stop_string_count; k++)
+        if (s->stop_strings[k] && strlen(s->stop_strings[k]) > longest) longest = strlen(s->stop_strings[k]);
+    if (!longest) return false;
+    /* the text of the last tokens (each gives a byte at least, and two more cover a character they split), with and
+       without the newest one: a stop string the newest completed is in the first and not in the second */
+    const uint32_t tail = (uint64_t)made < (uint64_t)longest + 3u ? made : (uint32_t)longest + 3u;
+    const uint32_t *from = generated + made - tail;
+    bool stop = false;
+    char *with = NULL, *without = NULL;
+    for (int pass = 0; pass < 2; pass++) {
+        const size_t count = pass ? tail - 1u : tail;
+        int64_t n = spingalett_detokenize(.tokenizer = s->tokenizer, .tokens = from, .count = count);
+        char *text = n >= 0 ? (char *)malloc((size_t)n + 1u) : NULL;
+        if (text && spingalett_detokenize(.tokenizer = s->tokenizer, .tokens = from, .count = count, .text = text,
+                                          .capacity = (size_t)n + 1u) != n) {
+            free(text);
+            text = NULL;
+        }
+        if (pass) without = text;
+        else with = text;
+    }
+    for (uint32_t k = 0; with && k < s->stop_string_count && !stop; k++) {
+        const char *x = s->stop_strings[k];
+        stop = x && *x && strstr(with, x) && !(without && strstr(without, x));
+    }
+    free(with);
+    free(without);
+    return stop;
 }
 
 uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args) {
@@ -846,7 +969,13 @@ uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args) {
     uint64_t *state = (uint64_t *)malloc((size_t)B * sizeof(uint64_t));
     uint32_t *made = (uint32_t *)calloc(B, sizeof(uint32_t)), *next = (uint32_t *)malloc((size_t)B * sizeof(uint32_t));
     bool *going = (bool *)malloc((size_t)B * sizeof(bool));
-    ok = logits && c && feeds && state && made && next && going;
+    /* the penalties' window of tokens, which may reach every token of a prompt and those generated */
+    uint32_t span = spingalett_penalty_window(args.sampling), longest = 0;
+    for (uint32_t b = 0; b < B; b++) longest = args.prompt_lengths[b] > longest ? args.prompt_lengths[b] : longest;
+    if ((uint64_t)span > (uint64_t)longest + args.count) span = longest + args.count;
+    uint32_t *window = (uint32_t *)malloc(((size_t)span + 1u) * sizeof(uint32_t));
+    const SpgDraw draw = {args.temperature, args.top_k, args.top_p, args.sampling ? args.sampling->min_p : 0.0f};
+    ok = logits && c && feeds && state && made && next && going && window;
     if (ok) {
         for (uint32_t b = 0; b < B; b++) {
             feeds[b] = (SpingalettSessionFeed){.sequence = b, .tokens = args.prompts[b], .count = args.prompt_lengths[b],
@@ -865,12 +994,17 @@ uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args) {
         any = false;
         for (uint32_t b = 0; b < B; b++) {
             if (!going[b]) continue;
-            const float *row = logits + (size_t)b * V;
-            const uint32_t token = spingalett_next_token(row, V, args.temperature, args.top_k, args.top_p, c, &state[b]);
-            args.tokens[(size_t)b * args.count + made[b]++] = token;
+            float *row = logits + (size_t)b * V;
+            uint32_t *generated = args.tokens + (size_t)b * args.count;
+            spingalett_penalize(row, V, args.sampling, args.prompts[b], args.prompt_lengths[b], generated, made[b], window);
+            const uint32_t token = spingalett_next_token(row, V, &draw, c, &state[b]);
+            generated[made[b]++] = token;
             total++;
             bool stop = made[b] == args.count || s->length[b] == s->max_length;
             for (uint32_t k = 0; k < args.stop_count && !stop; k++) stop = args.stop_tokens[k] == token;
+            stop = stop || spingalett_stop_string(args.sampling, generated, made[b]);
+            if (args.sampling && args.sampling->on_token && !args.sampling->on_token(args.sampling->user, b, token))
+                stop = true;
             going[b] = !stop;
             any = any || going[b];
             if (s->length[b] == s->max_length) continue;
@@ -881,6 +1015,6 @@ uint32_t spingalett_session_generate_args(SpingalettSessionGenerateArgs args) {
         if (n) ok = spingalett_session_feed(s, feeds, n);
     }
     if (ok && args.made) memcpy(args.made, made, (size_t)B * sizeof(uint32_t));
-    free(logits); free(c); free(feeds); free(state); free(made); free(next); free(going);
+    free(logits); free(c); free(feeds); free(state); free(made); free(next); free(going); free(window);
     return ok ? total : 0;
 }
