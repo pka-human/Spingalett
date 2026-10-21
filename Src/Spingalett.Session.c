@@ -388,11 +388,23 @@ bool spingalett_session_copy(SpingalettSession *s, uint32_t from, uint32_t to) {
 
 /* ------------------------------------------------------------------------- passes */
 
+/* Values of row-wise passes (normalizations, sums and products of layers, activations) from which a pass's rows
+   are split between its team: a prompt's are millions (SiLU's exponentials among them), a token's few. */
+#define ROWS_PARALLEL_VALUES ((uint64_t)1 << 15)
+
+/* Whether the team splits a row-wise pass of `rows` rows of C values, and the first row of piece t of `pieces`. */
+static bool rows_split(const SpingalettSession *s, uint32_t rows, uint32_t C) {
+    return s->team > 1 && rows > 1 && (uint64_t)rows * C >= ROWS_PARALLEL_VALUES;
+}
+static uint32_t piece_row(uint32_t rows, int64_t pieces, int64_t t) {
+    return (uint32_t)((uint64_t)rows * (uint64_t)t / (uint64_t)pieces);
+}
+
 /* The activation of `rows` rows of C values at positions pos[], as batched prediction applies it to a
    whole sample of `cells` cells. Element-wise activations give a value the same wherever it lies; sigmoid
    and tanh take a vector path for the groups of 8 values the sample holds whole from its first on, and
    the scalar one for the rest (apply_activation_bulk()), so each value takes the path of its place. */
-static void activate_rows(float *y, uint32_t rows, uint32_t C, const uint32_t *pos, uint32_t cells,
+static void activate_some(float *y, uint32_t rows, uint32_t C, const uint32_t *pos, uint32_t cells,
                           ActivationFunction act) {
     if (act == ACT_NONE) return;
     if (act != ACT_SIGMOID && act != ACT_TANH) {
@@ -418,6 +430,45 @@ static void activate_rows(float *y, uint32_t rows, uint32_t C, const uint32_t *p
             c += n;
         }
     }
+}
+
+/* activate_some() on the rows, split between the team when they are many. */
+static void activate_rows(const SpingalettSession *s, float *y, uint32_t rows, uint32_t C, const uint32_t *pos,
+                          ActivationFunction act) {
+    if (act == ACT_NONE) return;
+    const bool split = rows_split(s, rows, C);
+    const int64_t pieces = split ? s->team : 1;
+    SPINGALETT_PARALLEL_FOR_THREADS(s->team, split,
+        for (int64_t t = 0; t < pieces; t++) {
+            const uint32_t r0 = piece_row(rows, pieces, t), r1 = piece_row(rows, pieces, t + 1);
+            activate_some(y + (size_t)r0 * C, r1 - r0, C, pos + r0, s->cells, act);
+        }
+    );
+}
+
+/* A normalization, sum or product of layers on rows split between the team: each row computed as the engine
+   computes a cell (spingalett_predict_layer() and spingalett_predict_combine() on a sample of the rows). */
+static void split_rows(const SpingalettSession *s, const uint8_t *image, const SlettLayer *L, const float *const *x,
+                       const uint32_t *channels, float *y, uint32_t rows) {
+    const int64_t pieces = s->team;
+    const float *gamma = (const float *)(const void *)(image + L->weights);
+    const float *beta = (const float *)(const void *)(image + L->biases);
+    SPINGALETT_PARALLEL_FOR_THREADS(s->team, true,
+        for (int64_t t = 0; t < pieces; t++) {
+            const uint32_t r0 = piece_row(rows, pieces, t), n = piece_row(rows, pieces, t + 1) - r0;
+            float *ys = y + (size_t)r0 * L->out_c;
+            if (L->type == LAYER_RMS_NORM) {
+                spingalett_engine_rms_norm(x[0] + (size_t)r0 * L->in_c, n, L->out_c, gamma, L->eps, ys, NULL);
+            } else if (L->type == LAYER_LAYER_NORM) {
+                spingalett_engine_layer_norm(x[0] + (size_t)r0 * L->in_c, n, L->out_c, gamma, beta, L->eps, ys, NULL);
+            } else {
+                const float *xs[SPINGALETT_MAX_INPUTS];
+                for (uint32_t k = 0; k < L->input_count; k++) xs[k] = x[k] + (size_t)r0 * channels[k];
+                if (L->type == LAYER_ADD) spingalett_engine_add(xs, L->input_count, ys, n * L->out_c);
+                else spingalett_engine_multiply(xs, L->input_count, ys, n * L->out_c);
+            }
+        }
+    );
 }
 
 
@@ -463,9 +514,33 @@ static void session_int_linear(SpingalettSession *s, const SlettLayer *L, const 
     );
 }
 
+/* The keys a query at position p attends to, and the work of one of its heads in units of a key (a query's own
+   costs as many as 16 keys). */
+static uint32_t attended(const Cache *c, uint32_t p) {
+    return c->window && p + 1u > c->window ? c->window : p + 1u;
+}
+#define QUERY_WORK 16u
+
+/* The first query head (row r head h: item r heads + h) of piece t of `pieces` pieces of about equal work: the rows of
+   a prompt attend to more keys the later they stand, so that pieces of as many heads would leave the threads of the
+   first rows waiting for those of the last. */
+static int64_t attention_piece(const SpingalettSession *s, const Cache *c, uint32_t rows, uint64_t total, int64_t pieces,
+                               int64_t t) {
+    if (t >= pieces) return (int64_t)rows * c->heads;
+    const uint64_t target = total * (uint64_t)t / (uint64_t)pieces;
+    uint64_t sum = 0;
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint64_t each = attended(c, s->row_position[r]) + QUERY_WORK, row = each * c->heads;
+        if (sum + row > target) return (int64_t)r * c->heads + (int64_t)((target - sum + each - 1u) / each);
+        sum += row;
+    }
+    return (int64_t)rows * c->heads;
+}
+
 /* Attention on `rows` rows (row r of the pass, or the picked row r): their keys and values kept first,
    then each query over the keys of its sequence up to its own position (with a window, the last `window` of
-   them). Every key is live: tokens are 0 or more, so that a layer ignoring padding finds none. */
+   them), the query heads split between the threads in pieces of equal work. Every key is live: tokens are 0 or
+   more, so that a layer ignoring padding finds none. */
 static void session_attention(SpingalettSession *s, const Cache *c, const float *x, float *y, uint32_t rows,
                               ComputeMode mode) {
     const uint32_t heads = c->heads, kv = c->kv, head = c->head, half = c->rot / 2u, group = heads / kv;
@@ -487,23 +562,29 @@ static void session_attention(SpingalettSession *s, const Cache *c, const float 
         }
     }
     const float scale = c->scale;
-    uint64_t work = 0;
-    for (uint32_t r = 0; r < rows; r++) work += (uint64_t)(s->row_position[r] + 1u) * head * heads * 2u;
-    SPINGALETT_PARALLEL_FOR_THREADS(s->team, s->team > 1 && spingalett_use_omp(mode, work),
-        for (int64_t it = 0; it < (int64_t)rows * heads; it++) {
-            const uint32_t r = (uint32_t)(it / heads), h = (uint32_t)(it % heads), g = h / group;
-            const uint32_t p = s->row_position[r];
-            const float *q = x + (size_t)r * C + (size_t)h * head;
-            if (prepared) {
-                float *ready = s->queries + (size_t)spingalett_thread_num() * s->query_floats;
-                spingalett_engine_head(q, ready, head, c->gq, c->eps, rot, c->table ? c->table + (size_t)p * half : NULL,
-                                       sines ? sines + (size_t)p * half : NULL);
-                q = ready;
+    uint64_t total = 0;
+    for (uint32_t r = 0; r < rows; r++) total += (uint64_t)(attended(c, s->row_position[r]) + QUERY_WORK) * heads;
+    const bool threads = s->team > 1 && spingalett_use_omp(mode, total * head * 2u);
+    const int64_t pieces = threads ? s->team : 1;
+    SPINGALETT_PARALLEL_FOR_THREADS(s->team, threads,
+        for (int64_t t = 0; t < pieces; t++) {
+            const int64_t end = attention_piece(s, c, rows, total, pieces, t + 1);
+            for (int64_t it = attention_piece(s, c, rows, total, pieces, t); it < end; it++) {
+                const uint32_t r = (uint32_t)(it / heads), h = (uint32_t)(it % heads), g = h / group;
+                const uint32_t p = s->row_position[r];
+                const float *q = x + (size_t)r * C + (size_t)h * head;
+                if (prepared) {
+                    float *ready = s->queries + (size_t)spingalett_thread_num() * s->query_floats;
+                    spingalett_engine_head(q, ready, head, c->gq, c->eps, rot,
+                                           c->table ? c->table + (size_t)p * half : NULL,
+                                           sines ? sines + (size_t)p * half : NULL);
+                    q = ready;
+                }
+                const uint32_t keys = attended(c, p);
+                spingalett_attend_blocks(q, c->keys + ((size_t)s->row_sequence[r] * kv + g) * c->key_floats,
+                                         c->values + s->row_sequence[r] * sequence + (size_t)g * head, per, p + 1u - keys,
+                                         keys, head, scale, y + (size_t)r * out_c + (size_t)h * head);
             }
-            const uint32_t first = c->window && p + 1u > c->window ? p + 1u - c->window : 0u;
-            spingalett_attend_blocks(q, c->keys + ((size_t)s->row_sequence[r] * kv + g) * c->key_floats,
-                                     c->values + s->row_sequence[r] * sequence + (size_t)g * head, per, first, p + 1u - first,
-                                     head, scale, y + (size_t)r * out_c + (size_t)h * head);
         }
     );
 }
@@ -530,6 +611,9 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
         spingalett_block_layer(image, L, x[0], y, rows, w->blockq, s->team);
     } else if (L->type == LAYER_CONV2D && rows <= INT_ROWS) {
         session_int_linear(s, L, prep, x[0], y, rows, mode);
+    } else if ((L->type == LAYER_RMS_NORM || L->type == LAYER_LAYER_NORM || L->type == LAYER_ADD ||
+                L->type == LAYER_MULTIPLY) && rows_split(s, rows, L->out_c)) {
+        split_rows(s, image, L, x, channels, y, rows);
     } else {
         /* batched prediction's pass on a sample of `rows` cells, the activation after it */
         SlettLayer R = *L;
@@ -546,7 +630,7 @@ static void session_layer(SpingalettSession *s, uint32_t index, const SlettLayer
             spingalett_predict_layer(image, &R, prep, false, NULL, 0, x[0], NULL, y, 1, w, mode);
         }
     }
-    activate_rows(y, rows, L->out_c, pos, s->cells, L->activation);
+    activate_rows(s, y, rows, L->out_c, pos, L->activation);
 }
 
 /* Grows *buffer to hold floats. */
