@@ -23,6 +23,7 @@ typedef struct {
                                        head size); normalizations, additions and products: 0 (their input's) */
     uint32_t vocabulary;            /* embedding: rows of its table */
     bool positions;                 /* embedding: a learned vector a cell */
+    float embed_scale;              /* embedding (format 10): its vectors times this (0: as they are) */
     uint32_t heads, kv_heads, window;               /* attention */
     float theta;                    /* attention: the rotary embeddings' base, 0 for none */
     bool causal;

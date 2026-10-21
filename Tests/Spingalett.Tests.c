@@ -6845,12 +6845,14 @@ static void pretrained_model(const char *name, bool tokenizer) {
 
 /* GGUF files as deployment models (spingalett_model_open()), their tensors as the files store them: the logits of a
    window against PyTorch's (LLaMA's permuted queries and keys, Qwen2's biases, GPT-2's positions, Qwen3's normalized
-   queries and keys, LLaMA 3's scaled rotary embeddings; the matrices of fifteen types computed in their blocks, near
+   queries and keys, LLaMA 3's scaled rotary embeddings, Gemma 3's scaled embeddings, normalized outputs and windows
+   of their own rotary base; the matrices of fifteen types computed in their blocks, near
    the logits of their dequantized weights), and a session's logits batched prediction's, bit for bit. */
 static void gguf_deployment(void) {
     static const struct { const char *file, *logits; } cases[] = {
         {"gguf_llama.gguf", "hf_llama"}, {"gguf_qwen2.gguf", "hf_qwen2"}, {"gguf_gpt2.gguf", "hf_gpt2"},
-        {"gguf_qwen3.gguf", "hf_qwen3"}, {"gguf_llama3.gguf", "hf_llama3"}, {"gguf_quant.gguf", "gguf_quant"}};
+        {"gguf_qwen3.gguf", "hf_qwen3"}, {"gguf_llama3.gguf", "hf_llama3"}, {"gguf_gemma3.gguf", "hf_gemma3"},
+        {"gguf_quant.gguf", "gguf_quant"}};
     for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
         char path[512];
         snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, cases[k].logits);

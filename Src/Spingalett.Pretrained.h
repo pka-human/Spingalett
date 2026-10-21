@@ -28,6 +28,7 @@ typedef enum {
     SPG_PART_UP, SPG_PART_UP_BIAS,              /* GPT-2's MLP: down(act(up x)) */
     SPG_PART_DOWN, SPG_PART_DOWN_BIAS,
     SPG_PART_Q_NORM, SPG_PART_K_NORM,           /* Qwen3's normalization of each head's queries and keys, [head size] */
+    SPG_PART_ATTN_POST_NORM, SPG_PART_FFN_POST_NORM,    /* Gemma's normalizations of the attention's and MLP's outputs */
     SPG_PART_COUNT
 } SpgPart;
 
@@ -48,7 +49,14 @@ typedef struct {
     uint32_t window;                /* a sliding window (Mistral's): the keys of the last `window` tokens (0: all) */
     ActivationFunction act;         /* GPT-2's MLP */
     bool qk_norm;                   /* each head's queries and keys normalized (Qwen3: SPG_PART_Q_NORM, _K_NORM) */
-    const float *freqs;             /* rotary frequencies of the model's own (head_size / 2: LLaMA 3's scaling), or NULL */
+    const float *freqs;             /* rotary frequencies of the model's own (head_size / 2: LLaMA 3's scaling), or NULL;
+                                       with a window pattern, of the layers attending to every key */
+    ActivationFunction gate;        /* a gated MLP's gate: SiLU (SwiGLU), Gemma's GELU in its tanh form */
+    float embed_scale;              /* the embeddings' vectors times this (Gemma: the square root of the width), 0: 1 */
+    bool post_norms;                /* the attention's and the MLP's outputs normalized before their additions (Gemma) */
+    uint32_t window_pattern;        /* with a window, of every `window_pattern` layers the last attends to every key
+                                       (Gemma 3: 6); 0: every layer windowed */
+    float theta_local;              /* the rotary base of the windowed layers of a pattern (0: theta) */
 } SpgTransformer;
 
 /* Where a format's tensors come from. */

@@ -77,6 +77,8 @@ typedef struct {
                                                        keys (RMS, eps; the queries' and keys' gammas its weights) */
     bool freqs;                                     /* version 10: an attention's rotary frequencies are its own
                                                        (rotary / 2 floats, its scales section) */
+    float embed_scale;                              /* version 10: an embedding's vectors times this (0: as they
+                                                       are; Gemma's square root of the width) */
 } SlettLayer;
 
 typedef struct {
@@ -333,7 +335,7 @@ void spingalett_engine_attend(const float *q, const float *keys, size_t key_stri
                               size_t value_stride, uint32_t count, uint32_t head, float scale, const float *tokens,
                               float *o);
 /* An embedding of one sample: a row of L's table (in its precision, as floats) for every input value, zeros
-   for values outside it, plus the position's vector with positions. */
+   for values outside it, times its scale (format 10), plus the position's vector with positions. */
 void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);
 /* The same for one cell: token (an input value) at `position`. */
 void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float token, uint32_t position, float *y);

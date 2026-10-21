@@ -577,6 +577,14 @@ class _Model(Structure):
 _ModelPtr = POINTER(_Model)
 
 
+class _ModelOpenArgs(Structure):
+    _fields_ = [
+        ("path", c_char_p),
+        ("context", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 class _SessionOptions(Structure):
     _fields_ = [
         ("max_length", c_uint32),
@@ -838,6 +846,7 @@ _free_memory = _bind("spingalett_free", None, [c_void_p])
 _export_c_header = _bind("spingalett_export_c_header", c_bool, [_NetPtr, c_char_p, c_char_p, c_int])
 _model_from_network = _bind("spingalett_model_from_network", _ModelPtr, [_NetPtr, c_int])
 _model_load = _bind("spingalett_model_load", _ModelPtr, [c_char_p])
+_model_open = _bind("spingalett_model_open_args", _ModelPtr, [_ModelOpenArgs])
 _model_from_memory = _bind("spingalett_model_from_memory", _ModelPtr, [c_char_p, c_size_t])
 _model_free = _bind("spingalett_model_free", None, [_ModelPtr])
 _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
@@ -2371,9 +2380,11 @@ class Model:
         return model
 
     @classmethod
-    def load(cls, path) -> "Model":
-        """Read a .slett file; files of older format versions are converted in their precision."""
-        return cls._wrap(_call(_model_load, _encode_path(path)))
+    def load(cls, path, context: int = 0) -> "Model":
+        """Read a .slett file (files of older format versions are converted in their precision), or a language
+        model's GGUF file: its network with the file's tensors as they are stored (the quantized types as block
+        precisions), a window of `context` tokens (0: the model's positions, 4096 at most)."""
+        return cls._wrap(_call(_model_open, _ModelOpenArgs(_encode_path(path), int(context))))
 
     @classmethod
     def from_bytes(cls, data) -> "Model":

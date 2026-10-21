@@ -130,6 +130,8 @@ int main(void) {
     FIELD(SpingalettGenerateArgs, top_k); FIELD(SpingalettGenerateArgs, top_p); FIELD(SpingalettGenerateArgs, seed);
     FIELD(SpingalettGenerateArgs, stop_tokens); FIELD(SpingalettGenerateArgs, stop_count);
 
+    SIZE(SpingalettModelOpenArgs); FIELD(SpingalettModelOpenArgs, reserved);
+    FIELD(SpingalettModelOpenArgs, path); FIELD(SpingalettModelOpenArgs, context);
     SIZE(SpingalettSessionOptions); FIELD(SpingalettSessionOptions, reserved);
     FIELD(SpingalettSessionOptions, max_length); FIELD(SpingalettSessionOptions, sequences);
     SIZE(SpingalettSessionFeed); FIELD(SpingalettSessionFeed, reserved);

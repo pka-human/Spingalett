@@ -172,6 +172,12 @@ void spingalett_set_log_level(SpingalettLogLevel level);
 void spingalett_set_verbose(bool enabled);
 bool spingalett_get_verbose(void);
 SpingalettModel *spingalett_model_load(const char *path);
+typedef struct {
+    const char *path;
+    uint32_t context;
+    uint64_t reserved[8];
+} SpingalettModelOpenArgs;
+SpingalettModel *spingalett_model_open_args(SpingalettModelOpenArgs args);
 SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
 void spingalett_model_free(SpingalettModel *model);
 bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count,

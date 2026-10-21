@@ -18,7 +18,7 @@ MIRRORS = {
     "SpingalettTargetSet": sg._TargetSet, "DatasetReaderOptions": sg._DatasetReaderOptions, "SpingalettDatasetPosition": sg._DatasetPosition,
     "SpingalettModel": sg._Model, "SpingalettLayerInfo": sg._LayerInfo,
     "SpingalettTokenReaderOptions": sg._TokenReaderOptions, "SpingalettGenerateArgs": sg._GenerateArgs,
-    "SpingalettSessionOptions": sg._SessionOptions, "SpingalettSessionFeed": sg._SessionFeed,
+    "SpingalettModelOpenArgs": sg._ModelOpenArgs, "SpingalettSessionOptions": sg._SessionOptions, "SpingalettSessionFeed": sg._SessionFeed,
     "SpingalettSessionGenerateArgs": sg._SessionGenerateArgs,
     "SpingalettTokenizerInfo": sg._TokenizerInfo, "SpingalettTokenizeArgs": sg._TokenizeArgs,
     "SpingalettDetokenizeArgs": sg._DetokenizeArgs, "SpingalettPretrainedArgs": sg._PretrainedArgs,

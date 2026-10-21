@@ -249,6 +249,7 @@ static uint16_t image_version(const SpgImageBuilder *b) {
         if ((b->layers[i].rows && spingalett_precision_is_block(s->precision)) || b->layers[i].gammas ||
             b->layers[i].freqs || s->rotary || s->score_scale != 0.0f)
             return 10u;
+        if (s->embed_scale != 0.0f) return 10u;
         if (s->tied || s->window) version = 9u;
     }
     return version;
@@ -377,7 +378,11 @@ uint8_t *spingalett_image_layout(SpgImageBuilder *b, size_t *size) {
             memcpy(&bits, &s->score_scale, 4);
             slett_put32(t + 56, bits);
         }
-        if (s->type == LAYER_EMBEDDING) slett_put32(t + 76, s->positions ? 1u : 0u);
+        if (s->type == LAYER_EMBEDDING) {
+            slett_put32(t + 76, s->positions ? 1u : 0u);
+            memcpy(&bits, &s->embed_scale, 4);
+            slett_put32(t + 108, bits);                     /* (format 10) */
+        }
         if (s->type == LAYER_CONV2D && s->tied) slett_put32(t + 104, s->tied);
         slett_put32(t + 80, s->input_count);
         slett_put32(t + 84, s->inputs[0]);

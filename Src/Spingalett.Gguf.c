@@ -335,6 +335,7 @@ static void gguf_part_name(SpgPart part, uint32_t block, char *name, size_t cap)
         [SPG_PART_UP] = "ffn_up.weight", [SPG_PART_UP_BIAS] = "ffn_up.bias",
         [SPG_PART_DOWN] = "ffn_down.weight", [SPG_PART_DOWN_BIAS] = "ffn_down.bias",
         [SPG_PART_Q_NORM] = "attn_q_norm.weight", [SPG_PART_K_NORM] = "attn_k_norm.weight",
+        [SPG_PART_ATTN_POST_NORM] = "post_attention_norm.weight", [SPG_PART_FFN_POST_NORM] = "post_ffw_norm.weight",
     };
     if (part <= SPG_PART_HEAD) snprintf(name, cap, "%s", names[part]);
     else snprintf(name, cap, "blk.%u.%s", block, names[part]);
@@ -434,8 +435,9 @@ static bool gguf_describe(const Gguf *g, uint32_t context, bool networks, SpgTra
     memset(t, 0, sizeof *t);
     *freqs = NULL;
     const bool gpt2 = !strcmp(arch, "gpt2"), qwen2 = !strcmp(arch, "qwen2"), qwen3 = !strcmp(arch, "qwen3");
-    if (!gpt2 && !qwen2 && !qwen3 && strcmp(arch, "llama")) {
-        snprintf(msg, cap, "GGUF: the architecture '%s' is not supported (llama, qwen2, qwen3 and gpt2 are)",
+    const bool gemma3 = !strcmp(arch, "gemma3");
+    if (!gpt2 && !qwen2 && !qwen3 && !gemma3 && strcmp(arch, "llama")) {
+        snprintf(msg, cap, "GGUF: the architecture '%s' is not supported (llama, qwen2, qwen3, gemma3 and gpt2 are)",
                  arch[0] ? arch : "(none)");
         return false;
     }
@@ -452,7 +454,17 @@ static bool gguf_describe(const Gguf *g, uint32_t context, bool networks, SpgTra
     t->theta = kv_float(g, ARCH_KEY("rope.freq_base"), 10000.0f);
     t->window = kv_u32(g, ARCH_KEY("attention.sliding_window"), 0);
     t->act = ACT_GELU_TANH;
-    t->qk_norm = qwen3;
+    t->qk_norm = qwen3 || gemma3;
+    t->gate = gemma3 ? ACT_GELU_TANH : ACT_SILU;
+    if (gemma3) {
+        /* Gemma 3: embeddings times the square root of the width, normalized outputs, of every six layers five
+           attending through a window with a rotary base of their own (llama.cpp's defaults where the file has none) */
+        t->embed_scale = sqrtf((float)t->width);
+        t->post_norms = true;
+        t->window_pattern = kv_u32(g, ARCH_KEY("attention.sliding_window_pattern"), 6);
+        t->theta_local = kv_float(g, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
+    }
+    const float softcap = kv_float(g, ARCH_KEY("final_logit_softcapping"), 0.0f);
     const uint32_t positions = kv_u32(g, ARCH_KEY("context_length"), 0);
     const uint32_t most = networks ? 2048u : 4096u;
     t->context = context ? context : gpt2 ? positions : positions && positions < most ? positions : most;
@@ -469,8 +481,9 @@ static bool gguf_describe(const Gguf *g, uint32_t context, bool networks, SpgTra
     const char *problem = !embed ? "the file has no token_embd.weight"
                         : gpt2 && context > positions ? "the context exceeds GPT-2's positions"
                         : !gpt2 && rotary != t->head_size ? "rotary embeddings on part of a head are not supported"
-                        : networks && t->qk_norm ? "Qwen3's normalized queries and keys run as a model "
-                                                   "(spingalett_model_load()), not yet as a network"
+                        : networks && (t->qk_norm || t->post_norms)
+                          ? "Qwen3's and Gemma 3's layers run as a model (spingalett_model_load()), not yet as a network"
+                        : softcap != 0.0f ? "soft-capped logits are not supported"
                         : networks && scaled ? "scaled rotary embeddings run as a model (spingalett_model_load()), not "
                                                "yet as a network"
                         : scaled && !factors && !linear ? "this scaling of the rotary embeddings is not supported "
@@ -482,7 +495,7 @@ static bool gguf_describe(const Gguf *g, uint32_t context, bool networks, SpgTra
         snprintf(msg, cap, "GGUF: %s", problem);
         return false;
     }
-    *permuted = !gpt2 && !qwen2 && !qwen3;
+    *permuted = !gpt2 && !qwen2 && !qwen3 && !gemma3;          /* (llama.cpp rotates adjacent pairs of LLaMA alone) */
     if (!gpt2 && scaled) {
         /* each pair's frequency theta^(-2 i / head) divided by its factor (llama.cpp's ggml_rope_ext()), or by the
            linear scaling's */
@@ -612,7 +625,7 @@ static void copy_floats(float *dst, const GgufTensor *t, uint64_t n, bool permut
 /* The layers of a LLaMA-like or GPT-2 block's linear maps: the queries', keys' and values' in one layer when their
    tensors share a type (else three, concatenated), the attention, its output's and the MLP's. */
 typedef struct {
-    uint32_t attn_norm, q, k, v, qkv, attention, o, ffn_norm, gate, up, down;
+    uint32_t attn_norm, q, k, v, qkv, attention, o, attn_post, ffn_norm, gate, up, down, ffn_post;
     const GgufTensor *tq, *tk, *tv, *tqkv, *to, *tgate, *tup, *tdown;
 } ImageBlock;
 
@@ -677,13 +690,18 @@ uint8_t *spingalett_gguf_image(const uint8_t *data, size_t size, uint32_t contex
             (void)part_tensor(&w, SPG_PART_Q_NORM, b, hd, 0, false);
             (void)part_tensor(&w, SPG_PART_K_NORM, b, hd, 0, false);
         }
+        if (t.post_norms) {
+            (void)part_tensor(&w, SPG_PART_ATTN_POST_NORM, b, W, 0, false);
+            (void)part_tensor(&w, SPG_PART_FFN_POST_NORM, b, W, 0, false);
+        }
     }
     (void)part_tensor(&w, SPG_PART_NORM, 0, W, 0, false);
     if (w.error[0]) goto done;
 
     const LayerType norm = gpt2 ? LAYER_LAYER_NORM : LAYER_RMS_NORM;
     const uint32_t e = add(&w, SPEC(.type = LAYER_EMBEDDING, .precision = tensor_precision(embed->type), INPUTS(0),
-                                    .channels = (uint32_t)W, .vocabulary = (uint32_t)V, .positions = gpt2));
+                                    .channels = (uint32_t)W, .vocabulary = (uint32_t)V, .positions = gpt2,
+                                    .embed_scale = t.embed_scale));
     uint32_t x = e;
     for (uint32_t b = 0; b < t.layers; b++) {
         ImageBlock *k = &blocks[b];
@@ -703,20 +721,26 @@ uint8_t *spingalett_gguf_image(const uint8_t *data, size_t size, uint32_t contex
                                 .channels = (uint32_t)KV));
             k->qkv = add(&w, SPEC(.type = LAYER_CONCAT, INPUTS(k->q, k->k, k->v)));
         }
+        /* with a pattern of windows, the last layer of each pattern attends to every key, with the frequencies of the
+           model, the others through the window with their own base */
+        const bool windowed = t.window && (!t.window_pattern || b % t.window_pattern < t.window_pattern - 1u);
+        const float theta = gpt2 ? 0.0f : windowed && t.window_pattern && t.theta_local > 0.0f ? t.theta_local : t.theta;
         k->attention = add(&w, SPEC(.type = LAYER_ATTENTION, INPUTS(k->qkv), .channels = (uint32_t)Q, .heads = t.heads,
-                                    .kv_heads = t.kv_heads, .theta = gpt2 ? 0.0f : t.theta, .causal = true,
-                                    .window = t.window, .qk_norm = t.qk_norm, .eps = t.qk_norm ? t.eps : 0.0f,
-                                    .freqs = t.freqs != NULL));
+                                    .kv_heads = t.kv_heads, .theta = theta, .causal = true,
+                                    .window = windowed ? t.window : 0u, .qk_norm = t.qk_norm, .eps = t.qk_norm ? t.eps : 0.0f,
+                                    .freqs = t.freqs != NULL && !(windowed && t.window_pattern)));
         k->o = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->to->type), INPUTS(k->attention),
                             .channels = (uint32_t)W));
-        x = add(&w, SPEC(.type = LAYER_ADD, INPUTS(x, k->o)));
+        uint32_t attended = k->o;
+        if (t.post_norms) attended = k->attn_post = add(&w, SPEC(.type = norm, INPUTS(k->o), .eps = t.eps));
+        x = add(&w, SPEC(.type = LAYER_ADD, INPUTS(x, attended)));
         k->ffn_norm = add(&w, SPEC(.type = norm, INPUTS(x), .eps = t.eps));
         uint32_t mlp;
         if (gpt2) {
             mlp = k->up = add(&w, SPEC(.type = LAYER_CONV2D, .activation = t.act, .precision = tensor_precision(k->tup->type),
                                        INPUTS(k->ffn_norm), .channels = (uint32_t)F));
         } else {
-            k->gate = add(&w, SPEC(.type = LAYER_CONV2D, .activation = ACT_SILU, .precision = tensor_precision(k->tgate->type),
+            k->gate = add(&w, SPEC(.type = LAYER_CONV2D, .activation = t.gate, .precision = tensor_precision(k->tgate->type),
                                    INPUTS(k->ffn_norm), .channels = (uint32_t)F));
             k->up = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tup->type), INPUTS(k->ffn_norm),
                                  .channels = (uint32_t)F));
@@ -724,7 +748,9 @@ uint8_t *spingalett_gguf_image(const uint8_t *data, size_t size, uint32_t contex
         }
         k->down = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tdown->type), INPUTS(mlp),
                                .channels = (uint32_t)W));
-        x = add(&w, SPEC(.type = LAYER_ADD, INPUTS(x, k->down)));
+        uint32_t fed = k->down;
+        if (t.post_norms) fed = k->ffn_post = add(&w, SPEC(.type = norm, INPUTS(k->down), .eps = t.eps));
+        x = add(&w, SPEC(.type = LAYER_ADD, INPUTS(x, fed)));
     }
     const uint32_t final_norm = add(&w, SPEC(.type = norm, INPUTS(x), .eps = t.eps));
     const uint32_t logits = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision((head ? head : embed)->type),
@@ -781,7 +807,12 @@ uint8_t *spingalett_gguf_image(const uint8_t *data, size_t size, uint32_t contex
             VECTOR(SPG_PART_Q_NORM, b, hd, gammas, false);
             VECTOR(SPG_PART_K_NORM, b, hd, gammas + hd, false);
         }
-        if (t.freqs) memcpy(spingalett_image_scales(w.b, image, k->attention), t.freqs, (size_t)(hd / 2u) * sizeof(float));
+        float *freqs_at = spingalett_image_scales(w.b, image, k->attention);
+        if (t.freqs && freqs_at) memcpy(freqs_at, t.freqs, (size_t)(hd / 2u) * sizeof(float));
+        if (t.post_norms) {
+            VECTOR(SPG_PART_ATTN_POST_NORM, b, W, (float *)(void *)WEIGHTS(k->attn_post), false);
+            VECTOR(SPG_PART_FFN_POST_NORM, b, W, (float *)(void *)WEIGHTS(k->ffn_post), false);
+        }
         copy_rows(WEIGHTS(k->o), k->to, W, false, 0);
         VECTOR(SPG_PART_O_BIAS, b, W, BIASES(k->o), false);
         VECTOR(SPG_PART_FFN_NORM, b, W, (float *)(void *)WEIGHTS(k->ffn_norm), false);

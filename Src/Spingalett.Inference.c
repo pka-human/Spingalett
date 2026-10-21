@@ -1694,6 +1694,10 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
         layer->positions = (layer->mode & 1u) != 0;
         layer->mode = 0;
         if (version >= 9u) layer->token_offset = slett_get32(e + 104);     /* the first of its input's values */
+        if (version >= 10u) {                                               /* the vectors' scale */
+            const uint32_t scale = slett_get32(e + 108);
+            memcpy(&layer->embed_scale, &scale, 4);
+        }
     }
     if (version >= 9u && (layer->type == LAYER_DENSE || layer->type == LAYER_CONV2D))
         layer->tied = slett_get32(e + 104);     /* the embedding whose table are its weights */
@@ -1833,6 +1837,7 @@ static bool shape_ok(const SlettLayer *L, uint16_t version) {
     }
     if (L->type == LAYER_EMBEDDING)          /* a row of the table a value: h x (w c) cells, or (version 9) a range */
         return windowless && L->eps == 0.0f && L->momentum == 0.0f && L->vocabulary != 0 && L->out_h == L->in_h &&
+               L->embed_scale >= 0.0f && L->embed_scale <= FLT_MAX &&
                (((uint64_t)L->out_w == (uint64_t)L->in_w * L->in_c && L->token_offset == 0) ||
                 (L->in_h == 1 && (uint64_t)L->token_offset + L->out_w <= (uint64_t)L->in_w * L->in_c));
     if (L->type == LAYER_ADD || L->type == LAYER_CONCAT || L->type == LAYER_GLOBAL_AVG_POOL ||
@@ -2889,6 +2894,8 @@ void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float to
     const uint32_t d = L->out_c;
     if (token >= 0.0f && token < (float)L->rows) decode_row(image, L, (uint32_t)token, y);
     else memset(y, 0, (size_t)d * sizeof(float));
+    if (L->embed_scale != 0.0f)
+        for (uint32_t c = 0; c < d; c++) y[c] *= L->embed_scale;
     if (L->positions) {
         const float *at = (const float *)(const void *)(image + L->biases) + (size_t)position * d;
         for (uint32_t c = 0; c < d; c++) y[c] += at[c];

@@ -993,6 +993,20 @@ for path, bin_name in [("hf_llama", "hf_llama"), ("hf_qwen2", "hf_qwen2"), ("hf_
         scale = max(1.0, float(np.abs(logits).max()))
         check(lm.loss == sg.Loss.SPARSE_CROSS_ENTROPY and np.abs(got - logits).max() < 1e-4 * scale,
               f"Network.from_pretrained({path}): {np.abs(got - logits).max():.2e} from PyTorch")
+# GGUF files as deployment models (Qwen3's normalized queries and keys, LLaMA 3's rotary frequencies, matrices of
+# fifteen types computed in their blocks), a session's logits batched prediction's
+for path, bin_name, tolerance in [("gguf_qwen3.gguf", "hf_qwen3", 1e-4), ("gguf_llama3.gguf", "hf_llama3", 1e-4),
+                                  ("gguf_gemma3.gguf", "hf_gemma3", 1e-4),
+                                  ("gguf_quant.gguf", "gguf_quant", 0.03)]:
+    tokens, logits = window(bin_name)
+    with sg.Model.load(os.path.join(data_dir, path), context=len(tokens)) as model:
+        got = model.predict(tokens[None, :])[0]
+        error = np.abs(got - logits).max() if tolerance < 1e-3 else \
+            np.sqrt(((got - logits) ** 2).sum() / (logits ** 2).sum())
+        with model.session() as s:
+            fed = s.feed(tokens.astype(int).tolist(), all=True)
+        check(error < tolerance and np.array_equal(np.asarray(fed).reshape(-1), got),
+              f"Model.load({path}): {error:.2e} from PyTorch, or the session's logits differ")
 with sg.Tokenizer(os.path.join(data_dir, "hf_llama")) as tok:
     tokens, _ = window("hf_llama")
     check(tok.encode("The quick brown fox jumps over the lazy dog, it's 1234 times!")[:len(tokens)] == tokens.astype(int).tolist()

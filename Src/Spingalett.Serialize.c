@@ -628,6 +628,12 @@ static NeuralNetwork *network_of_image(const uint8_t *p, const SlettInfo *info) 
             a.epsilon = e.eps;
             a.momentum = e.momentum;
         } else if (e.type == LAYER_EMBEDDING) {
+            if (e.embed_scale != 0.0f) {
+                free_network(net);
+                set_error(SPINGALETT_ERR_INVALID, "load: an embedding of scaled vectors (format 10) runs as a model, not "
+                          "yet as a network");
+                return NULL;
+            }
             a.neurons_amount = e.out_c;
             a.vocabulary = e.vocabulary;
             a.positions = e.positions;

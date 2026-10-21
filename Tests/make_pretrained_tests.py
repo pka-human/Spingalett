@@ -18,7 +18,9 @@ Hugging Face's form and GGUF files, with the logits a PyTorch reference computes
 - hf_qwen3/: Qwen3 with each head's queries and keys RMS-normalized, a head size (12) other than the width over
   the heads, tied embeddings, float16, without a tokenizer;
 - hf_llama3/: LLaMA with LLaMA 3's scaled rotary embeddings (rope_scaling of rope_type "llama3", its original
-  context short enough that the window sees every regime of its frequencies), bfloat16, without a tokenizer.
+  context short enough that the window sees every regime of its frequencies), bfloat16, without a tokenizer;
+- hf_gemma3/: Gemma 3 by transformers (seven layers: five windowed of four tokens and of their own rotary base, one
+  attending to every key with linear scaling of its frequencies, one windowed), its logits transformers'.
 
 NAME.bin holds "SPGT", then as 32-bit little-endian integers 1, the tokens and the logits a window has (T
 and T x vocabulary), then the tokens (as floats) and the logits. The tokens are those the directory's
@@ -33,6 +35,8 @@ GGUF files, written by the small writer below as llama.cpp's converter writes th
 - gguf_qwen3.gguf: hf_qwen3's (float16, attn_q_norm and attn_k_norm), architecture "qwen3";
 - gguf_llama3.gguf: hf_llama3's (bfloat16, queries and keys permuted) with rope_freqs.weight, the factors llama.cpp's
   converter computes;
+- gguf_gemma3.gguf: hf_gemma3's (float32, its normalizations' weights plus 1 as llama.cpp's converter stores them),
+  architecture "gemma3";
 - gguf_quant.gguf (version 2): a LLaMA of width 256 whose sixteen matrices are random blocks of fifteen
   types, from F32 to the k-quants and IQ4_NL, IQ4_XS; gguf_quant.bin the logits of its weights as
   llama.cpp's formulas dequantize them (the numpy functions below, checked against the gguf package's
@@ -641,6 +645,64 @@ CORPUS_SPM = [
 ] * 20
 
 
+def gemma3():
+    """Gemma 3 by transformers, its GGUF file as llama.cpp's converter writes it, and its logits by transformers."""
+    import transformers
+    torch.manual_seed(2027)
+    cfg = transformers.Gemma3TextConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=7, num_attention_heads=2,
+        num_key_value_heads=1, head_dim=16, sliding_window=4, max_position_embeddings=64, query_pre_attn_scalar=16,
+        rms_norm_eps=1e-6, tie_word_embeddings=True,
+        rope_parameters={"sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                         "full_attention": {"rope_type": "linear", "factor": 8.0, "rope_theta": 1000000.0}})
+    model = transformers.Gemma3ForCausalLM(cfg).eval()
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            p.copy_(torch.randn(p.shape) * (0.3 if "norm" in name else 0.2))
+    d = os.path.join(DATA, "hf_gemma3")
+    shutil.rmtree(d, ignore_errors=True)
+    model.save_pretrained(d, safe_serialization=True)
+    tokens = list(range(3, 3 + T))
+    with torch.no_grad():
+        logits = model(torch.tensor(tokens)[None]).logits[0].numpy().astype(np.float32)
+    with open(os.path.join(DATA, "hf_gemma3.bin"), "wb") as f:
+        f.write(b"SPGT" + struct.pack("<3I", 1, T, T * cfg.vocab_size))
+        f.write(np.array(tokens, dtype=np.float32).tobytes() + logits.tobytes())
+    parts = {"input_layernorm": "attn_norm", "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
+             "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output", "self_attn.q_norm": "attn_q_norm",
+             "self_attn.k_norm": "attn_k_norm", "post_attention_layernorm": "post_attention_norm",
+             "pre_feedforward_layernorm": "ffn_norm", "post_feedforward_layernorm": "post_ffw_norm",
+             "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
+    tensors = []
+    for key, value in sorted(model.state_dict().items()):
+        w = value.to(torch.float32).numpy()
+        if key == "model.embed_tokens.weight":
+            name = "token_embd.weight"
+        elif key == "model.norm.weight":
+            name = "output_norm.weight"
+        elif key == "lm_head.weight":
+            continue                                        # tied
+        else:
+            layer, part = key[len("model.layers."):].split(".", 1)
+            part, suffix = part.rsplit(".", 1)
+            name = f"blk.{layer}.{parts[part]}.{suffix}"
+        if name.endswith("norm.weight"):                    # Gemma3RMSNorm's (1 + w), as the converter stores it
+            w = w + 1.0
+        tensors.append((name, list(w.shape[::-1]), "F32", w.astype("<f4").tobytes()))
+    a = "gemma3"
+    metadata = [("general.architecture", GGUF_STRING, a), ("general.alignment", GGUF_UINT32, 32),
+                (f"{a}.context_length", GGUF_UINT32, 64), (f"{a}.embedding_length", GGUF_UINT32, 32),
+                (f"{a}.block_count", GGUF_UINT32, 7), (f"{a}.feed_forward_length", GGUF_UINT32, 48),
+                (f"{a}.attention.head_count", GGUF_UINT32, 2), (f"{a}.attention.head_count_kv", GGUF_UINT32, 1),
+                (f"{a}.attention.key_length", GGUF_UINT32, 16), (f"{a}.attention.value_length", GGUF_UINT32, 16),
+                (f"{a}.attention.layer_norm_rms_epsilon", GGUF_FLOAT32, 1e-6), (f"{a}.rope.freq_base", GGUF_FLOAT32, 1e6),
+                (f"{a}.rope.freq_base_swa", GGUF_FLOAT32, 1e4), (f"{a}.attention.sliding_window", GGUF_UINT32, 4),
+                (f"{a}.rope.scaling.type", GGUF_STRING, "linear"), (f"{a}.rope.scaling.factor", GGUF_FLOAT32, 8.0)]
+    size = gguf_file(os.path.join(DATA, "gguf_gemma3.gguf"), metadata, tensors)
+    print(f"hf_gemma3, gguf_gemma3.gguf: {len(tensors)} tensors, {size} bytes, logits in [{logits.min():.2f}, "
+          f"{logits.max():.2f}]")
+
+
 def main():
     gen = torch.Generator().manual_seed(2024)
     llama = {"architectures": ["LlamaForCausalLM"], "model_type": "llama", "vocab_size": 425, "hidden_size": 16,
@@ -688,6 +750,7 @@ def main():
     write("hf_llama3", llama3, llama3_sd, ref_llama)
     gguf_from_hf("gguf_qwen3.gguf", "qwen3", qwen3, qwen3_sd, "F16")
     gguf_from_hf("gguf_llama3.gguf", "llama", llama3, llama3_sd, "BF16")
+    gemma3()
     try:                                    # transformers' models, where it is installed: the reference's own check
         import transformers
         for name in ("hf_qwen3", "hf_llama3", "hf_llama", "hf_qwen2"):
