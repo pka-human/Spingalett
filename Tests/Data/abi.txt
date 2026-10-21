@@ -1,4 +1,4 @@
-# The ABI of Spingalett 1.3.0, written by Tests/check_abi.py update: later releases keep every
+# The ABI of Spingalett 1.4.0, written by Tests/check_abi.py update: later releases keep every
 # entry (layouts on 64-bit platforms). Recorded again at each release, with what it added.
 enum SPINGALETT_INIT_RANDOM 0
 enum SPINGALETT_INIT_XAVIER 1
@@ -312,6 +312,10 @@ field SpingalettTokenReaderOptions.token_bytes offset 4 size 4
 field SpingalettTokenReaderOptions.stride offset 8 size 4
 field SpingalettTokenReaderOptions.offset offset 16 size 8
 field SpingalettTokenReaderOptions.shuffle offset 24 size 1
+struct SpingalettDatasetPosition size 88
+field SpingalettDatasetPosition.seed offset 0 size 8
+field SpingalettDatasetPosition.pass offset 8 size 8
+field SpingalettDatasetPosition.position offset 16 size 8
 enum SPINGALETT_LOG_DEBUG 0
 enum SPINGALETT_LOG_INFO 1
 enum SPINGALETT_LOG_WARNING 2
@@ -325,6 +329,9 @@ enum SPINGALETT_COMPUTE_VULKAN 4
 struct SpingalettEvalMetrics size 72
 field SpingalettEvalMetrics.loss offset 0 size 4
 field SpingalettEvalMetrics.accuracy offset 4 size 4
+struct SpingalettModelOpenArgs size 80
+field SpingalettModelOpenArgs.path offset 0 size 8
+field SpingalettModelOpenArgs.context offset 8 size 4
 struct SpingalettSessionOptions size 72
 field SpingalettSessionOptions.max_length offset 0 size 4
 field SpingalettSessionOptions.sequences offset 4 size 4
@@ -391,6 +398,18 @@ enum SPINGALETT_PRECISION_BFLOAT16 2
 enum SPINGALETT_PRECISION_INT8 3
 enum SPINGALETT_PRECISION_INT4 4
 enum SPINGALETT_PRECISION_INT2 5
+enum SPINGALETT_PRECISION_Q8_0 6
+enum SPINGALETT_PRECISION_Q4_0 7
+enum SPINGALETT_PRECISION_Q4_1 8
+enum SPINGALETT_PRECISION_Q5_0 9
+enum SPINGALETT_PRECISION_Q5_1 10
+enum SPINGALETT_PRECISION_Q2_K 11
+enum SPINGALETT_PRECISION_Q3_K 12
+enum SPINGALETT_PRECISION_Q4_K 13
+enum SPINGALETT_PRECISION_Q5_K 14
+enum SPINGALETT_PRECISION_Q6_K 15
+enum SPINGALETT_PRECISION_IQ4_NL 16
+enum SPINGALETT_PRECISION_IQ4_XS 17
 struct SpingalettModel size 136
 field SpingalettModel.input_size offset 0 size 4
 field SpingalettModel.output_size offset 4 size 4
@@ -486,6 +505,8 @@ function spingalett_load SpingalettNetwork *spingalett_load(const char *filename
 function spingalett_save_to_memory void *spingalett_save_to_memory(const SpingalettNetwork *net, SpingalettPrecisionMode precision, bool save_optimizer, size_t *size);
 function spingalett_load_from_memory SpingalettNetwork *spingalett_load_from_memory(const void *data, size_t size);
 function spingalett_free void spingalett_free(void *ptr);
+function spingalett_save_checkpoint bool spingalett_save_checkpoint(SpingalettNetwork *net, const char *path);
+function spingalett_load_checkpoint SpingalettNetwork *spingalett_load_checkpoint(const char *path);
 function spingalett_import_onnx SpingalettNetwork *spingalett_import_onnx(const char *path);
 function spingalett_import_onnx_from_memory SpingalettNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
 function spingalett_load_pytorch bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const char *const *modules, uint32_t module_count);
@@ -523,6 +544,8 @@ function spingalett_dataset_target_set_size uint32_t spingalett_dataset_target_s
 function spingalett_dataset_close void spingalett_dataset_close(SpingalettDatasetReader *reader);
 function spingalett_dataset_info SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDatasetReader *reader);
 function spingalett_dataset_read uint32_t spingalett_dataset_read(SpingalettDatasetReader *reader, float *inputs, float *targets, uint32_t max_samples);
+function spingalett_dataset_get_position bool spingalett_dataset_get_position(const SpingalettDatasetReader *reader, SpingalettDatasetPosition *position);
+function spingalett_dataset_set_position bool spingalett_dataset_set_position(SpingalettDatasetReader *reader, const SpingalettDatasetPosition *position);
 function spingalett_dataset_generator uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader);
 function spingalett_print_network void spingalett_print_network(const SpingalettNetwork *net);
 function spingalett_network_free void spingalett_network_free(SpingalettNetwork *net);
@@ -540,6 +563,7 @@ function spingalett_set_log_level void spingalett_set_log_level(SpingalettLogLev
 function spingalett_set_verbose void spingalett_set_verbose(bool enabled);
 function spingalett_get_verbose bool spingalett_get_verbose(void);
 function spingalett_model_load SpingalettModel *spingalett_model_load(const char *path);
+function spingalett_model_open_args SpingalettModel *spingalett_model_open_args(SpingalettModelOpenArgs args);
 function spingalett_model_from_memory SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
 function spingalett_model_free void spingalett_model_free(SpingalettModel *model);
 function spingalett_model_predict bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count, float *outputs);

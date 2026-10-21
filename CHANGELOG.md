@@ -7,7 +7,40 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-21
+
+"GGUF on the CPU": language models' GGUF files run as llama.cpp's users have them, faster than llama.cpp on the
+same processor. `spingalett_model_open()` makes a deployment model of a GGUF file of LLaMA 1 to 3.x, Mistral,
+Qwen2 and 2.5, Qwen3, Gemma 3 or GPT-2 with its tensors as the file stores them: GGUF's quantization types are
+block precisions of `.slett` format 10 (Q8_0 to IQ4_XS, quantized byte for byte as llama.cpp's quantizers do),
+computed in their blocks by AVX2 and VNNI kernels with the engine's bits (chosen at run time in the packages),
+with the attention of today's families (normalized queries and keys, rotary frequencies of their own, scaled
+embeddings). On the six performance cores of an i7-12650H prompts of 512 tokens run 1.6 to 2.9 times as fast as
+llama.cpp's on seven files of Qwen2.5, Qwen3, Llama 3.2 and Gemma 3, and generation 1.00 to 1.10 times as fast
+(README, **Performance**). Training runs resume from checkpoints to the bits of a run that never stopped. Programs
+of 1.3 build and run unchanged; files of 1.3 load unchanged.
+
 ### Added
+- **GGUF files run as they are stored**: `spingalett_model_open()` (`SpingalettModelOpenArgs`: the path and the
+  window), and `spingalett_model_load()` on a GGUF file, make the deployment model of a language model's GGUF
+  file directly, its tensors copied into the model's `.slett` image as the file stores them (the quantized types
+  as block precisions, below; F16, BF16 and F32 as FP16, BFLOAT16 and FLOAT32), without the float network of
+  `spingalett_load_pretrained()`: a 1B model of 800 MB takes 800 MB and opens in under a second. The
+  architectures `llama` (LLaMA 1 to 3.x, with LLaMA 3's rotary frequencies of `rope_freqs.weight` and linear
+  scaling; Mistral), `qwen2`, `qwen3`, `gemma3` and `gpt2`; queries', keys' and values' tensors of different types
+  (Q4_K_M keeps `attn_v` in Q6_K in half the layers) become layers of their own, concatenated. On
+  Qwen2.5-0.5B-Instruct (Q4_0, Q4_K_M, Q8_0), Llama-3.2-1B-Instruct (Q4_K_M), Qwen3-0.6B (Q8_0) and Gemma-3-1B-it
+  (Q4_K_M) the most likely token of every position of a prompt is llama.cpp's; the `pretrained` group checks
+  tiny LLaMA, LLaMA 3, Qwen2, Qwen3, Gemma 3 and GPT-2 checkpoints, converted as llama.cpp's converter writes them,
+  against PyTorch and transformers (within 3e-6). The runtime opens GGUF files too (`Spingalett.Gguf.c`,
+  `Spingalett.Image.c`: images written layer by layer), Python's `Model.load(path, context=0)` and PHP's
+  `Model::load($path, $context)` take the window, and `ModelTool convert model.gguf model.slett --context N`
+  writes the model as a `.slett` file (`ModelTool info` describes either, with every kind of layer named).
+- **The attention of today's language models** in `.slett` format 10, in the engine, batched prediction and
+  sessions: each head's queries and keys RMS-normalized before their rotation (Qwen3's and Gemma 3's `q_norm` and
+  `k_norm`), rotary frequencies of the layer's own (LLaMA 3's and linear scaling), part of a head rotated, a scale
+  of the scores; embeddings that scale their vectors (Gemma's square root of the width). Networks
+  (`spingalett_load()`, training, the GPU) refuse them by name for now.
 - **Block precisions**, GGUF's quantization types as deployment precisions (`.slett` format 10):
   `SPINGALETT_PRECISION_Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, the k-quants `Q2_K` to `Q6_K`, `IQ4_NL` and
   `IQ4_XS`, for dense layers, linear layers and embeddings, each row stored as llama.cpp stores a row of the
@@ -19,7 +52,13 @@ All notable changes to this project are documented in this file. The format foll
   give the same bits on any number of threads (the `model` group: dense layers of every type within the bound
   of the inputs' quantization, and language models in every type whose engine, batched and session logits are
   equal). `spingalett_load()` reads such files with the weights decoded as llama.cpp's `dequantize_row_*()`
-  decodes them. In every binding, and `ModelTool` and `RunModel` name them.
+  decodes them. In every binding, and `ModelTool` and `RunModel` name them. With AVX2 their kernels run a
+  token's rows eight at a time against its codes (dpbusd with VNNI; the k-quants' sub-blocks scaled in 16 bits,
+  dpwssd), the codes taken into registers as they are read and the next rows prefetched, and a prompt's tokens in
+  groups of eight with each row's codes broadcast against a group's, the sums exact in the lanes: the bits of
+  the engine's reference, which the `model` group compares. x86-64 builds for a baseline (the release packages
+  and wheels) carry these kernels for AVX2, AVX-VNNI and AVX-512 VNNI, and sessions' attention for AVX2, and
+  choose them at run time, with the same bits.
 - **Checkpoints of training runs**: `spingalett_save_checkpoint()` and `spingalett_load_checkpoint()` (in
   Python `Network.save_checkpoint()` and `Network.load_checkpoint()`) keep a network, its optimizer state
   and the state of the `spingalett_train()` run that trained it, as its last epoch left it: the seeds of
@@ -49,6 +88,21 @@ All notable changes to this project are documented in this file. The format foll
   (pull request 11).
 
 ### Changed
+- **Sessions' attention in vectors**: a session keeps each head's keys transposed in blocks of eight positions,
+  sums eight scores side by side (each over the head's values in their order, as the engine sums one) and
+  computes the online softmax's exponentials eight at a time, the logits still batched prediction's bits.
+  Attention's exponentials are the engine's own `expf` (glibc's algorithm in double without fused multiply-adds,
+  which the WebAssembly engine already computes), so that its results are the same on every platform (glibc on
+  processors with FMA differs on 2 of the 2^32 floats; other C libraries on more).
+- **Prompts of sessions on many threads**: a prompt's attention is split between the threads in pieces of equal
+  work (a causal prompt's last rows attend to the most keys), its normalizations, sums and products of layers and
+  activations are split between them by rows (they ran on the calling thread alone: SiLU through libm's `expf` on
+  2.5 million values a layer of Qwen2.5-0.5B), the block precisions' tiles take two groups of eight tokens a pass
+  (each row's codes broadcast once for both), and attention with AVX2 sums the scores of four blocks of keys side
+  by side and keeps a slice of the head's output in registers across them. The logits are the same bits. On the six
+  performance cores of an i7-12650H a prompt of 512 tokens of Qwen2.5-0.5B-Instruct in Q4_0 takes 1,462 tokens a
+  second instead of 808, in Q4_K_M 1,384, against llama.cpp's 866 and 476; generation is llama.cpp's speed or
+  faster on every file measured (README, **Performance**).
 - **The order of an epoch** in `spingalett_train()` on arrays is drawn from a seed the run draws once
   and the epoch's number, as data set readers draw their passes, instead of shuffling the previous
   epoch's order with the library's generator: any epoch's order is known without the epochs before it,
@@ -57,6 +111,13 @@ All notable changes to this project are documented in this file. The format foll
   value of the generator for its orders instead of one for each sample of each epoch. The speed is the
   same (the MLP of `Examples/Benchmark.c`, mini-batches of 64: 21,060 and 21,174 samples/s on one
   thread, 51,844 and 51,540 on eight, medians of six runs each on an i7-12650H).
+- **`Examples/Pretrained.c`** opens GGUF files with `spingalett_model_open()`, makes a directory's network a
+  model, and continues the prompt in a session (the prompt fed at once, then a token at a time).
+
+### Fixed
+- `ModelTool info` read the names of the kinds of layers after global pooling (transposed convolutions and the
+  layers of 1.2) out of its table (1.2 on), and with `RunModel` the names of GELU, its tanh form and SiLU (SiLU
+  printed as "fp16"); `RunModel` the names of the layers of 1.2 too.
 
 ## [1.3.0] - 2026-10-15
 
@@ -1583,7 +1644,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/pka-human/Spingalett/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pka-human/Spingalett/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/pka-human/Spingalett/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/pka-human/Spingalett/compare/v1.0.0...v1.1.0

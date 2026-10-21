@@ -35,7 +35,9 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Import.c` | What the importers share: files mapped into memory, tensors decoded and reordered to channels-last in one pass |
 | `Src/Spingalett.Tokenizer.c`, `Src/Spingalett.Json.c` | Tokenizers of `tokenizer.json` files (BPE; the pre-tokenizers' expressions matched by hand over `Spingalett.Unicode.h`, written by `Src/make_unicode.py`); the JSON reader they and the checkpoints' files share |
 | `Src/Spingalett.Pretrained.c`, `.h` | Language models from Hugging Face's directories (`config.json`, safetensors through `Torch.c`): the transformer built from hyper-parameters, its tensors read from a source each format provides |
-| `Src/Spingalett.Gguf.c` | GGUF files: metadata, llama.cpp's dequantization (compiled in IEEE order, like `Inference.c`), the queries' and keys' rows put back in Hugging Face's order, vocabularies for `Tokenizer.c` |
+| `Src/Spingalett.Gguf.c` | GGUF files: metadata, the families' hyper-parameters (`gguf_describe()`), a language model's `.slett` image built from the file's tensors as stored (`spingalett_gguf_image()`, which `spingalett_model_open()` runs), the float network of `spingalett_load_pretrained()`, the queries' and keys' rows put back in Hugging Face's order, vocabularies for `Tokenizer.c` |
+| `Src/Spingalett.Image.c`, `Src/Spingalett.Quantize.c` | `.slett` images written layer by layer without a network (the plan of the outputs' buffers); GGUF's quantizers, ggml's reference ones byte for byte |
+| `Src/Spingalett.Blocks.c`, `Src/Spingalett.Attention.c` | Layers of block precisions over many rows (a token's rows eight at a time, a prompt's tokens in transposed groups against unpacked tiles; AVX2, AVX-VNNI, AVX-512 VNNI, recompiled through `Src/Kernels/` for dispatch), and sessions' attention over keys kept transposed in blocks of eight: both give the engine's bits |
 | `Src/Kernels/` | Files that recompile a kernel source with other instruction sets for run-time dispatch |
 | `Src/Spingalett.Training.c`, `Batch.c`, `Conv.c`, `Norm.c` | Training loop, batched forward/backward over the graph, convolution (and transposed convolution: the convolution passes swapped) and normalization (batch, layer, RMS) layers |
 | `Src/Spingalett.Transformer.c`, `Generate.c` | Embeddings and attention over batches on the CPU (blocked products a thread per sample and group of heads, the backward pass recomputing the probabilities); text generation |
@@ -104,10 +106,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   joins `SPINGALETT_STRICT_FP` in `CMakeLists.txt`); epilogues use `spingalett_int_output()` so every path rounds
   alike. On the GPU integer models compute in the CPU's order (`iquant`, `ipass`, `precise`, CUDA's `mul.rn` and
   `add.rn`): `spingalett_model_predict()` gives `spingalett_model_run()`'s bits there too.
-- **Formats.** `.slett` versions 3 to 9 stay loadable; the writer picks the lowest version that
+- **Formats.** `.slett` versions 3 to 10 stay loadable; the writer picks the lowest version that
   can hold the network (chains 3 to 5, graphs 6, transposed convolutions, upsampling and layer
   normalization 7, embeddings, attention, RMS normalization, products of layers, GELU and SiLU, the
-  sparse cross-entropy 8, layers tied to an embedding 9). Any change to the format updates `docs/ModelFormat.md` and adds a version.
+  sparse cross-entropy 8, layers tied to an embedding 9, block precisions and format 10's attention 10). Any change to the format updates `docs/ModelFormat.md` and adds a version.
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.
@@ -206,13 +208,19 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   resumed call. A training feature that keeps state across epochs or steps (a counter, a seed, a schedule's
   memory) joins it, or resumed runs drift. An epoch's order and a reader's pass are functions of a seed and
   their number, never of the epochs before: nothing replays the past.
+- **Block precisions give the engine's bits.** A layer of a GGUF type quantizes its input in blocks as
+  `spingalett_quantize_blocks()` does and sums each block in integers, the blocks' float terms added in their
+  order (`spingalett_block_dot()`): every kernel of `Blocks.c` (and of the GPU, when it has some) must give that
+  sum's bits on any number of threads (`model` compares every type with the engine, and the language models'
+  engine, batched and session logits). The integers' order is free; the floats' is not.
 - **Sessions give batched prediction's bits.** A session's row equals what `spingalett_model_predict()`
   gives its position in the whole window, whatever rows it is computed with (`model`, `gen` and
   `runtime.library` compare with `memcmp`): the float linear layers sum on `spingalett_conv_rows()` in
   the order of `spingalett_conv_direct_forward()`'s kernel for a pointwise convolution (a change to one is
   a change to the other), the integer ones of a language model quantize each token alone
   (`SlettLayer.cells`, in the engine and in `Model.c` alike), attention goes through
-  `spingalett_engine_attend()`, and sigmoid and tanh take the vector or scalar path of the row's place in
+  `spingalett_attend_blocks()` (the engine's `spingalett_engine_attend()` in vectors: a change to one is a change
+  to the other), and sigmoid and tanh take the vector or scalar path of the row's place in
   a whole sample (`activate_rows()`). A layer that mixes positions in a new way keeps sessions from
   running the model (`session_model()`), or needs its own pass.
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
@@ -235,6 +243,10 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
 - A parallel region whose `if` clause is false still costs about 0.2 us: loops that are often too
   small for threads use `SPINGALETT_PARALLEL_FOR(cond, for ...)` (`Spingalett.Private.h`), which runs
   them as plain code then. Integer kernels need far more work than float ones before threads pay.
+- gprofng's clock profiles lose most of the main thread's samples, and threads asleep in OpenMP's barriers
+  take no time at all: with `OMP_WAIT_POLICY=active` idle threads spin in libgomp and show what waits (a
+  session's prompt once spent half its time with five threads waiting on the main one's SiLU), and `time`'s
+  user over real time gives the threads' use. `-h cycles,on,insts,on` gives a kernel's IPC.
 - A change to a kernel that must keep its results (most of them) is checked by hashing the weights
   after an epoch, or the saved files, against a build of the previous commit, and with a profile
   (`gprofng collect app` works with AVX-512, Valgrind does not; Release builds are stripped, so

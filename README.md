@@ -25,7 +25,9 @@ accelerators; results are the same bits on one thread and many. Networks are dec
 designated initializers and all parameters live in flat contiguous arrays. For deployment, a trained network becomes a read-only
 model in FP32, FP16, BF16, INT8, INT4 or INT2 that runs with integer kernels where the weights are
 integers, in place from memory, a compiled-in array or flash, on desktops and on microcontrollers
-alike; programs that only run models link the runtime, a library of that part alone. Models come in
+alike; programs that only run models link the runtime, a library of that part alone. Language models'
+GGUF files (LLaMA 1 to 3.x, Mistral, Qwen2 to Qwen3, Gemma 3, GPT-2) run as they are stored, their
+quantized types computed in their blocks, faster than llama.cpp on the same processor. Models come in
 from ONNX files and PyTorch weights (GPT-2 and LLaMA-like checkpoints in Python), and bindings for
 Python (wheels with the library inside), C++, Rust, .NET, Go, Java and PHP are included, and for
 JavaScript the inference engine in WebAssembly, which runs models in Node and in browsers.
@@ -56,7 +58,7 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Architectures | Chains of layers, or directed acyclic graphs: any layer reads any earlier ones (residual networks, Inception- and DenseNet-style branches, U-Nets), trained and run with outputs sharing memory at inference |
 | Activations | Sigmoid, ReLU, Leaky ReLU, Tanh, FOO52, GELU (erf and tanh forms), SiLU, Softmax (output layer), None |
 | Losses | Mean squared error, cross-entropy (softmax or sigmoid outputs), sparse cross-entropy over class indices (a language model's next tokens), label smoothing |
-| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens) with a key-value cache (sessions of deployment models: each token computed once, several sequences generated together), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) and GGUF files (dequantized from 15 types) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
+| Language models | GPT- and LLaMA-style networks, training on windows of token files (nanoGPT's and llm.c's `.bin`), text generation (greedy, temperature, top-k, top-p, stop tokens) with a key-value cache (sessions of deployment models: each token computed once, several sequences generated together), tokenizers of Hugging Face's `tokenizer.json` files (byte-level BPE, tiktoken's encodings, SentencePiece's BPE) in C, GGUF files run as they are stored (LLaMA 1 to 3.x with LLaMA 3's scaled rotary embeddings, Mistral, Qwen2 and 2.5, Qwen3, Gemma 3, GPT-2; Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K to Q6_K, IQ4_NL, IQ4_XS computed in their blocks), Hugging Face checkpoints of LLaMA, Mistral, Qwen2 and GPT-2 (safetensors, sharded) in C, GPT-2 and LLaMA-like checkpoints from PyTorch state dicts (Python); flash attention on the matrix units in bfloat16 |
 | Optimizers | SGD, Momentum, RMSProp, Adam, AdamW; L2 or decoupled weight decay |
 | Training | Per-sample, full-batch and mini-batch strategies; gradient accumulation over mini-batches; in-memory arrays or a data generator; image augmentation (random shifts, mirror images); validation with early stopping and best-weight restore |
 | Custom loops | Public forward / backward / optimizer-step API with custom losses and gradient accumulation |
@@ -65,9 +67,9 @@ JavaScript the inference engine in WebAssembly, which runs models in Node and in
 | Learning-rate schedules | Cosine decay, linear warm-up, step decay, warm-up + cosine, linear decay, warm-up + linear decay, or a custom callback; by epoch or by optimizer step |
 | Initialization | Uniform, Glorot (Xavier), He and LeCun normal |
 | Inference | Per-sample `spingalett_forward()`, batched `spingalett_predict()`, `spingalett_evaluate()` (loss and accuracy), `spingalett_generate()`, sessions of language models (`spingalett_session_feed()`) |
-| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
+| Deployment | Read-only models, dense and convolutional, in FP32, FP16, BF16, INT8, INT4 or INT2 with per-row scales, and language models' layers in GGUF's block types (llama.cpp's quantizers, byte for byte) and int8 x int8 kernels (AVX-512 VNNI, AVX-VNNI, AVX2, SSE2, NEON with or without the dot product extension, Arm DSP; INT4 and INT2 decoded in registers), batch normalization folded into the layer before it; run in place from memory or flash; C header export; the runtime, a library of the models alone (no training code, a quarter of the size); a standalone engine for microcontrollers (one C file, no heap), and in WebAssembly for Node and browsers (an npm package, the native engine's results) |
 | Backends | Built-in matrix kernels (AVX-512, AVX2/FMA, AVX, NEON, portable C; on x86-64 chosen at run time), single-threaded or OpenMP; OpenBLAS; a GPU for training, `spingalett_predict()` and `spingalett_evaluate()`, deterministic, in single precision or bfloat16 on its matrix units: NVIDIA GPUs (Ampere and later) through CUDA with the library's own kernels, any GPU through Vulkan compute (NVIDIA, AMD, Intel; Apple through MoltenVK) |
-| Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4 or INT2, optional optimizer state, CRC-32 checksums; to and from memory; versioned format; checkpoints of training runs, which a stopped run carries on from to the bits of one that never stopped |
+| Serialization | `.slett` model files in FP32, FP16, BF16, INT8, INT4, INT2 or GGUF's block types, optional optimizer state, CRC-32 checksums; to and from memory; versioned format; checkpoints of training runs, which a stopped run carries on from to the bits of one that never stopped |
 | Introspection | Layer descriptions and parameter copies by layer through accessor functions (the network is an opaque handle) |
 | Interoperability | ONNX import (`spingalett_import_onnx()`, `ModelTool import`) of CNNs, MLPs and transformers, PyTorch weights from `torch.save` and safetensors files, `Network.from_torch()` in Python |
 | Bindings | Python (ctypes + NumPy; wheels with the library inside, typed), C++23 (`Spingalett.hpp`), Rust, .NET (C#), Go, Java (the foreign function and memory API), PHP (the FFI extension); JavaScript and TypeScript for the inference engine in WebAssembly |
@@ -147,7 +149,7 @@ repository can use `add_subdirectory()` instead. Both provide the target `Spinga
 and `Spingalett::runtime` for the runtime, which carry the include paths:
 
 ```cmake
-find_package(Spingalett 1.3 REQUIRED)         # or: add_subdirectory(external/Spingalett)
+find_package(Spingalett 1.4 REQUIRED)         # or: add_subdirectory(external/Spingalett)
 target_link_libraries(my_app PRIVATE Spingalett::spingalett)    # or Spingalett::runtime
 ```
 
@@ -163,8 +165,8 @@ pip install spingalett                    # Python: wheels with the library insi
 brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
 scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
 nix build github:pka-human/Spingalett     # the flake's package; nix develop: a shell to build it in
-sudo apt install ./spingalett_1.3.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
-docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.3.0     # the library, tools and Python, CUDA and Vulkan
+sudo apt install ./spingalett_1.4.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.4.0     # the library, tools and Python, CUDA and Vulkan
 ```
 
 The `.deb` and `.rpm` packages are assets of each [release](https://github.com/pka-human/Spingalett/releases),
@@ -731,6 +733,51 @@ SpingalettTokenizer *tok = spingalett_tokenizer_load("SmolLM2-135M.Q4_K_M.gguf")
   BOS of `.add_special`. The GGUF vocabularies of SmolLM2, Qwen2.5 and TinyStories give the ids of
   the `tokenizer.json` files they were converted from (TinyStories' finds its special tokens in the
   normalized text, which llama.cpp does not: with `.special` those differ).
+
+### GGUF models as they are stored
+
+`spingalett_model_open()` (and `spingalett_model_load()`, which takes the defaults) makes a deployment model
+of a GGUF file directly: its tensors go into the model's `.slett` image as the file stores them, so a 1B model
+of 800 MB takes 800 MB and loads in well under a second, and the quantized types are precisions the kernels
+compute with (format 10's block precisions, below). Sessions then run it a token at a time:
+
+```c
+SpingalettModel *model = spingalett_model_open(.path = "Llama-3.2-1B-Instruct-Q4_K_M.gguf", .context = 4096);
+SpingalettTokenizer *tok = spingalett_tokenizer_load("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+SpingalettSession *s = spingalett_session_new(model, NULL);
+float *logits = malloc(spingalett_session_vocabulary(s) * sizeof(float));
+spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = prompt, .count = n, .logits = logits}, 1);
+/* pick the next token of logits, feed it, and so on (Examples/Pretrained.c) */
+```
+
+- The architectures are `llama` (LLaMA 1 to 3.x, with LLaMA 3's frequencies of `rope_freqs.weight`, and linear
+  scaling; Mistral), `qwen2`, `qwen3` (queries and keys normalized in each head), `gemma3` (embeddings scaled
+  by the square root of the width, normalized outputs of the attention and the MLP, five layers of six attending
+  through a window with a rotary base of their own) and `gpt2`. Their attention is format 10's: each head's
+  queries and keys normalized, rotary frequencies of the layer's own, part of a head rotated, a scale of the
+  scores. A queries', keys' or values' tensor of another type than the others (Q4_K_M keeps `attn_v` in Q6_K in
+  half the layers) becomes a layer of its own, concatenated.
+- `.context`, the model's window, is the most tokens a session's sequence holds (0: the model's positions, 4096
+  at most); sessions allocate their keys and values for it. `ModelTool convert model.gguf model.slett --context
+  N` writes the model's image as a `.slett` file, which the engine, the runtime and every binding open.
+- Checked against llama.cpp on Qwen2.5-0.5B-Instruct (Q4_0, Q4_K_M, Q8_0), Llama-3.2-1B-Instruct (Q4_K_M),
+  Qwen3-0.6B (Q8_0) and Gemma-3-1B-it (Q4_K_M): the same most likely token at every position of a prompt,
+  logits a few percent apart, as both are from the logits of float weights (each quantizes the activations
+  its own way); and in the `pretrained` group against PyTorch and transformers on tiny LLaMA, LLaMA 3, Qwen2,
+  Qwen3, Gemma 3 and GPT-2 checkpoints converted as llama.cpp's converter writes them.
+- The runtime opens GGUF files too; Python's `Model.load(path, context=...)` and PHP's `Model::load()` take the
+  window.
+
+**Block precisions.** `SPINGALETT_PRECISION_Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K` to `Q6_K`, `IQ4_NL` and
+`IQ4_XS` are GGUF's types as precisions of dense layers, linear layers and embeddings, each row stored as
+llama.cpp stores it (docs/ModelFormat.md, **Block precisions**). A network saved in one (or made a model in one)
+is quantized as llama.cpp's quantizers do without an importance matrix, byte for byte. Such a layer quantizes its
+input to 8 bits in blocks of the type's size and sums each block's sub-blocks in integers, scaled by their integer
+scales, the blocks' terms then added in float in their order: the engine, batched prediction, sessions and the
+runtime give the same bits on any number of threads. On x86-64 a token's rows go eight at a time against its
+codes, the next rows prefetched; a prompt's tokens go in groups of eight, the codes of each row broadcast against
+a group's (dpbusd with VNNI); packages built for a baseline choose these kernels for AVX2, AVX-VNNI or AVX-512
+VNNI at run time. The engine computes them in C on any processor, microcontrollers included.
 
 ### Importing models: ONNX and PyTorch
 
@@ -1533,8 +1580,8 @@ RunModel model.slett                        the layers, then the time of one sam
 RunModel model.slett inputs.f32 out.f32     the outputs of raw float samples (classes without out.f32)
 ```
 
-The runtime reads `.slett` files of format versions 3 to 7, everything Spingalett 0.5 and later
-writes. Files of versions 1 and 2 (0.4 and earlier) hold networks rather than images; it refuses
+The runtime reads `.slett` files of format versions 3 to 10, everything Spingalett 0.5 and later
+writes, and language models' GGUF files. Files of versions 1 and 2 (0.4 and earlier) hold networks rather than images; it refuses
 them with `SPINGALETT_ERR_FORMAT_VERSION`, and `ModelTool convert` rewrites them.
 
 | | Library | Runtime | Engine |
@@ -1776,8 +1823,8 @@ uses its built-in kernels (no BLAS library); PyTorch 2.14.1 is the CPU build fro
 oneDNN). Against 0.9, measured in the same runs, 0.10 trains the convolutional networks 13 to 19%
 faster and runs them 15 to 27% faster, and leaves the fully connected network as it was; 0.11 to 0.13
 leave all of them as they were on the CPU (within 4% of the release before, either way, in
-interleaved runs), and 1.2 and 1.3 leave them as the release before did (within 3% either way, in
-interleaved runs). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style network, new in
+interleaved runs), and 1.2, 1.3 and 1.4 leave them as the release before did (within 3% either way, in
+interleaved runs; 1.4 against 1.3 on one thread and on six performance cores). The U-Net, new in 0.13, is measured with 0.13, the MobileNet-style network, new in
 0.14, with 0.14, the GPT, whose training 1.3 made 1.4 times as fast on one thread and 3.2 times on
 eight, with 1.3:
 
@@ -1953,6 +2000,28 @@ On the Cascade Lake VM where 0.6 was measured, on one thread, the baseline packa
 | SSE2 kernels (0.5) | 3,700 | 3,200 | 9,000 |
 | AVX-512 kernels chosen at run time (0.6) | 18,200 | 11,400 | 45,000 |
 
+Language models' GGUF files as they are stored (`spingalett_model_open()`), against llama.cpp on the same
+files: a session fed a prompt of 512 tokens at once, then 128 tokens one at a time from an empty sequence, as
+`llama-bench -p 512 -n 128` measures them (llama.cpp at commit 1242be6 of 2026-10-21, built with GCC 16 for the
+native processor, its CPU backend with OpenMP), tokens per second on the six performance cores of the i7-12650H
+(both pinned to them), medians of three interleaved runs:
+
+| Model, type | Prompt of 512: Spingalett | llama.cpp | Generation of 128: Spingalett | llama.cpp |
+|---|---:|---:|---:|---:|
+| Qwen2.5-0.5B-Instruct, Q4_0 | 1,462 | 866 | 130.9 | 130.2 |
+| Qwen2.5-0.5B-Instruct, Q4_K_M | 1,384 | 476 | 119.9 | 109.3 |
+| Qwen2.5-0.5B-Instruct, Q8_0 | 1,320 | 563 | 94.8 | 93.2 |
+| Qwen3-0.6B, Q8_0 | 811 | 413 | 80.2 | 77.5 |
+| Llama-3.2-1B-Instruct, Q4_K_M | 478 | 292 | 60.1 | 59.3 |
+| Llama-3.2-1B-Instruct, Q8_0 | 541 | 210 | 43.1 | 42.9 |
+| Gemma-3-1B-it, Q4_K_M | 635 | 219 | 58.9 | 56.4 |
+
+Prompts run on the integer tiles of the block precisions (two groups of eight tokens against four rows a pass)
+and on attention split between the threads by its work; generation reads the weights at the memory's speed,
+where both libraries are bound. The x86-64 packages, built for a baseline, choose the same kernels at run time
+and run as fast (Qwen2.5-0.5B Q4_K_M, medians of five interleaved runs: 1,431 and 118.7 tokens a second against
+the native build's 1,441 and 118.8).
+
 `Examples/MNIST.c` trains a 784-256-128-10 network with dropout (AdamW, cosine schedule,
 mini-batches of 128) on 55,000 images, keeps the epoch with the best accuracy on the other 5,000
 and reaches 98.2% test accuracy after 10 epochs, which take a few seconds with OpenMP on the same
@@ -2011,7 +2080,8 @@ what 1.0 gave, and only 2.0 may take anything away.
   per release that adds some), so that the loader refuses a library older than the program needs.
   The test `api.abi` compares every release with the one before.
 - **Files:** every 1.x loads the `.slett` files 1.0 loads (formats 1 to 7; the engine runs 3 to 7;
-  1.2 adds format 8 for transformers, 1.3 format 9 for the training features of language models)
+  1.2 adds format 8 for transformers, 1.3 format 9 for the training features of language models, 1.4
+  format 10 for GGUF's block precisions and today's attention)
   and `.slettd` files of formats 1 and 2, and writes the oldest format that holds what it saves; a
   later format only adds kinds of layers or coders, so a 1.0 engine runs every model of a later 1.x
   that uses only what it knows.
@@ -2026,8 +2096,8 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.3.0. Its API (prefixed names, structs that can grow, zero as every
-field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 9, `.slettd` 2)
+Spingalett is at version 1.4.0. Its API (prefixed names, structs that can grow, zero as every
+field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 10, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and
 remain loadable.
@@ -2045,26 +2115,28 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
   (tied embeddings, recomputation, accumulation, padding, sliding windows, cross-attention), ONNX
   import of transformers, the engine in WebAssembly, bindings for PHP; ahead of PyTorch where 1.2 was
   not (the GPT in bfloat16 on CUDA, transformers' training on the CPU)
-- 1.4: the language models of today from GGUF files computed as they are stored (Q4_0 to Q8_0, the
-  k-quants, IQ4), scaled and partial rotary embeddings, QK-norm, Gemma's blocks, architectures as
-  descriptions, `.slett` format 10 for language models (grouped quantization, GGUF's block types,
-  the tokenizer and chat template in the file), the runtime reading GGUF and `.slett` language models
-  with their tokenizers and chat templates; checkpoints
-  that resume a training run exactly. The aim: any GGUF of a common architecture, faster than llama.cpp,
-  and a command-line program on the runtime (SaLaM) in a repository of its own
-- 1.5: mixture of experts (Mixtral, Qwen3 MoE, gpt-oss), experts kept on the host, speculative decoding
-- 1.6: hybrid models with linear attention and state spaces (Qwen3.5, Qwen3-Next, Mamba-2), vision
+- 1.4 (released): GGUF files run as they are stored (LLaMA 1 to 3.x, Mistral, Qwen2 to Qwen3, Gemma 3,
+  GPT-2), GGUF's quantization types as block precisions of `.slett` format 10 with AVX2 and VNNI kernels,
+  the attention of today's families; faster than llama.cpp on the CPU (prompts 1.6 to 2.9 times as fast);
+  checkpoints that resume a training run exactly
+- 1.5: language models on the GPU and in programs: GGUF's block types on CUDA and Vulkan, NEON kernels,
+  the other dense families (Phi, Gemma 2, OLMo 2, GLM-4, SmolLM3), the runtime reading tokenizers,
+  generation as llama.cpp offers it (min-p, penalties, stop strings, chat templates). The aim: any GGUF
+  of a common architecture, faster than llama.cpp, and a command-line program on the runtime (SaLaM) in a
+  repository of its own
+- 1.6: mixture of experts (Mixtral, Qwen3 MoE, gpt-oss), experts kept on the host, speculative decoding
+- 1.7: hybrid models with linear attention and state spaces (Qwen3.5, Qwen3-Next, Mamba-2), vision
   encoders
-- 1.7: beyond neural networks: gradient-boosted trees and random forests (deterministic histogram
+- 1.8: beyond neural networks: gradient-boosted trees and random forests (deterministic histogram
   training on the CPU and GPU, trees in the engine and the runtime, imports from XGBoost, LightGBM and
   scikit-learn), linear models, k-means, PCA, scikit-learn-style estimators in Python
-- 1.8: learning from rewards: reinforcement learning for games, robots, control and decisions (PPO,
+- 1.9: learning from rewards: reinforcement learning for games, robots, control and decisions (PPO,
   SAC, DQN, several agents and self-play, tree search; environments stepped by the program or its own
   loop, rewards in named terms), bandits, learning from logs, language models tuned by GRPO and DPO with
   low-rank adapters, and evolution (genetic algorithms with crossover and mutation over any genome,
   several objectives, evolution strategies, evolved topologies, population-based training), seeded
   throughout
-- 1.9 to 2.0: Arm and Apple (NEON training, Metal), training across several GPUs, multi-head latent
+- 1.10 to 2.0: Arm and Apple (NEON training, Metal), training across several GPUs, multi-head latent
   attention, FP16 products with loss scaling
 
 ## Contributing
