@@ -109,28 +109,28 @@ in version 5 and 112 bytes in versions 6 to 10:
 | 10 | 1 | versions 4 to 10: kind of layer `i + 1`: 0 dense, 1 convolution, 2 max pooling, 3 average pooling, 4 batch normalization (versions 5 to 10), 5 addition, 6 concatenation, 7 global average pooling (versions 6 to 10), 8 transposed convolution, 9 upsampling, 10 layer normalization (versions 7 to 10), 11 embedding, 12 attention, 13 RMS normalization, 14 multiplication (versions 8 to 10); version 3: reserved, 0 |
 | 11 | 1 | reserved, 0 |
 | 12 | 4 | dropout rate of layer `i + 1`, a float in [0, 1) (used only when training) |
-| 16 | 8 | offset of the weights; 0 for kinds without parameters (pooling, addition, concatenation) |
-| 24 | 8 | offset of the row scales (batch normalization: of its running statistics); 0 for FLOAT32, FP16 and BFLOAT16 dense and convolution layers, and for kinds without parameters |
+| 16 | 8 | offset of the weights; 0 for kinds without parameters (pooling, addition, concatenation); version 10: an attention's gammas of its queries' and keys' normalization (flag bit 2) |
+| 24 | 8 | offset of the row scales (batch normalization: of its running statistics); 0 for FLOAT32, FP16 and BFLOAT16 dense and convolution layers, and for kinds without parameters; version 10: an attention's rotary frequencies (flag bit 3) |
 | 32 | 8 | offset of the biases; 0 for kinds without parameters |
 | 40 | 8 | offset of the optimizer state; 0 when the file has none, and for kinds without parameters |
 | 48 | 2 | versions 4 to 10: output height of layer `i + 1` |
 | 50 | 2 | versions 4 to 10: output width of layer `i + 1` |
-| 52 | 2 | versions 4 to 10: kernel height (window rows) |
+| 52 | 2 | versions 4 to 10: kernel height (window rows); version 10: an attention's dimensions of a head rotated (0: all) |
 | 54 | 2 | versions 4 to 10: kernel width (window columns) |
-| 56 | 2 | versions 4 to 10: vertical stride |
+| 56 | 2 | versions 4 to 10: vertical stride (version 10: with offset 58, an attention's scale of its scores, a float, 0: `1 / sqrt(head)`) |
 | 58 | 2 | versions 4 to 10: horizontal stride |
 | 60 | 2 | versions 4 to 10: padding at the top and at the bottom |
 | 62 | 2 | versions 4 to 10: padding on the left and on the right |
 | 64 | 4 | versions 5 to 10: convolution groups `g` (at least 1, dividing `in_c` and `out_c`; also of transposed convolutions); versions 8 to 10: an attention's heads, an embedding's vocabulary (the rows of its table); 0 for other kinds |
-| 68 | 4 | versions 5 to 10: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); 0 for other kinds |
+| 68 | 4 | versions 5 to 10: the epsilon of batch (and layer, and RMS) normalization, a float in (0, 1); version 10: of an attention's normalization of its queries and keys (flag bit 2); 0 for other kinds |
 | 72 | 4 | versions 5 to 10: batch normalization's momentum, a float in [0, 1] (used only when training); version 9: an attention's sliding window `w`, an integer (0: every key); 0 for other kinds |
-| 76 | 4 | versions 7 to 10: upsampling mode, 0 nearest or 1 bilinear; versions 8 to 10: attention's flags (bit 0: causal; version 9: bit 1, padding ignored, with bits 16 to 31 the index of the embedding whose tokens tell it; other bits 0), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
+| 76 | 4 | versions 7 to 10: upsampling mode, 0 nearest or 1 bilinear; versions 8 to 10: attention's flags (bit 0: causal; version 9: bit 1, padding ignored, with bits 16 to 31 the index of the embedding whose tokens tell it; version 10: bit 2, the queries and keys normalized, bit 3, rotary frequencies of its own; other bits 0), an embedding's flags (bit 0: positions); 0 for other kinds; versions 5 and 6: reserved, 0 |
 | 80 | 4 | versions 6 to 10: `k`, the number of layers the entry reads, 1 to 16 (more than 1 only for additions, concatenations and multiplications; version 9: 2 for cross-attention) |
 | 84 | 4 | versions 6 to 10: the first of them, a layer index from 0 (the network's input) to `i` |
 | 88 | 8 | versions 6 to 10: offset of the input list, `k` 32-bit layer indices (the first equal to the one above, all from 0 to `i`), when `k` is 2 or more; 0 otherwise |
 | 96 | 8 | versions 6 to 10: byte offset of the layer's output among the activations (a multiple of 16); 0 for the last layer |
 | 104 | 4 | versions 8 to 10: an attention's key and value heads (at least 1, dividing its heads); version 9 also: a dense or convolution layer's tied embedding, the index of an embedding layer before it whose table are its weights (0: weights of its own), an embedding's token offset, the first of its input's values it reads; 0 for other kinds; versions 6 and 7: reserved, 0 |
-| 108 | 4 | versions 8 to 10: an attention's base of the rotary position embeddings, a float at least 0 (0: none); 0 for other kinds; versions 6 and 7: reserved, 0 |
+| 108 | 4 | versions 8 to 10: an attention's base of the rotary position embeddings, a float at least 0 (0: none); version 10: an embedding's scale of its vectors, a float at least 0 (0: none); 0 for other kinds; versions 6 and 7: reserved, 0 |
 
 The input shape of entry `i` is the output shape of entry `i - 1` in versions 4 and 5, and the
 output shape of its first input in versions 6 to 10 (the input layer's shape from the header when that is
@@ -191,6 +191,12 @@ layer 0): `in_h x in_w x in_c` with `in_c = in / (in_h * in_w)`; the output chan
   layer other than the network's input, the keys and values of its own cells (`2 kv_heads x head` channels,
   the key heads' then the value heads'), the first input a layer too; neither causal, nor windowed, nor
   rotary (offset 108 0), and its padding that of the second input's cells.
+  Version 10: with flag bit 2 each head's queries and keys are RMS-normalized before their rotation (Qwen3's and
+  Gemma 3's `q_norm` and `k_norm`): the weights section holds `2 head` floats, the queries' gammas then the keys',
+  and offset 68 the epsilon; with flag bit 3 the scales section holds `rot / 2` floats, the rotation's frequencies
+  (LLaMA 3's, linear scaling's), in place of `theta^(-2 i / rot)`; offset 52 the dimensions rotated `rot` (even, at
+  most the head; 0: the head), offset 56 a float scale of the scores (0: `1 / sqrt(head)`). None of these apply to
+  cross-attention.
 - RMS normalization (version 8): as layer normalization without beta (no biases section).
 - Multiplication (version 8): as addition, `k` inputs of the entry's output shape.
 - A dense layer or convolution tied to an embedding (version 9, offset 104 the embedding's layer index `t`,
@@ -309,7 +315,9 @@ rows, row length, precision, weights or scales differ from its own, or is a conv
 or an attention's flags have bits other than those above, bit 1 without an embedding, or an embedding that
 reads another layer than the input or has another number of cells than its keys, or a cross-attention reads the
 network's input or keys and values of other channels, or is causal, windowed or rotary, or an embedding's range
-lies beyond its input or its input has several rows;
+lies beyond its input or its input has several rows; in version 10, when an attention's sections or fields of
+version 10 disagree with its flags, its rotated dimensions are odd or more than its head, or a scale is negative or
+not finite;
 and in versions 6 to 10, when an entry reads a layer that is not before it,
 more than 16 layers, several layers without being an addition, concatenation, multiplication or (version 9)
 cross-attention, or
@@ -413,7 +421,8 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   (the sum in channel order), then `y = x * r * gamma[c]`.
 - An embedding copies, for each input value `t` (version 9: of its range), row `t` of its table (decoded as
   the weights of a dense layer are) when `0 <= t < vocabulary` (`t` taken as an integer), zeros otherwise,
-  then adds the position's vector of its cell when it has them.
+  multiplies it by its scale when it has one (version 10: Gemma's square root of the width), then adds the
+  position's vector of its cell when it has them.
 - Attention computes, for each query head `h` (reading key and value head `g = h / (heads /
   kv_heads)`) and each cell `i`, the scores `s_j = (q_i . k_j) / sqrt(head)` over the cells `j` (up to
   `i` when causal) in order, each dot product summed in order, and `y = (sum_j exp(s_j - m) v_j) /
@@ -421,7 +430,11 @@ outputs, not all of them). Each output takes its units times 4 bytes, rounded up
   by `exp(m_old - m_new)` when it grows. With a rotary base `theta > 0`, queries and keys are first
   rotated: for `i` below `half = head / 2`, `x'_i = x_i cos - x_(i + half) sin` and `x'_(i + half) =
   x_(i + half) cos + x_i sin` with the angle `p theta^(-2 i / head)` of the cell's position `p`, its
-  cosine and sine computed in double and rounded to float. With a sliding window `w > 0` (version 9), cell
+  cosine and sine computed in double and rounded to float (version 10: the first `rot` values, pairs `i` and
+  `i + rot / 2`, with the frequencies of the scales section when it has them, after each head's normalization with
+  its gammas when it has one; the scores times the layer's own scale when it has one). The exponentials are
+  computed as glibc's `expf` computes them: in double, `exp(x) = 2^(k / 32) 2^(r / 32)` of Arm's optimized
+  routines, without fused multiply-adds, rounded to float once. With a sliding window `w > 0` (version 9), cell
   `i` reads the keys `j` with `j + w > i`, and `j < i + w` when not causal (a window of at least the cells is
   no window). Ignoring padding (version 9), the keys whose tokens are negative (not 0 or more) are left out
   of the sums as if they were not there; a query left without a key gives zeros. Cross-attention (version 9)

@@ -286,6 +286,16 @@ static inline __m256i products(__m256i u, __m256i x, bool wide) {
 #endif
 }
 
+/* acc + products(u, x, wide), the products added by dpbusd itself where there is one. */
+static inline __m256i accumulate(__m256i acc, __m256i u, __m256i x, bool wide) {
+#if defined(BLOCK_VNNI)
+    (void)wide;
+    return BLOCK_VNNI(acc, u, x);
+#else
+    return _mm256_add_epi32(acc, products(u, x, wide));
+#endif
+}
+
 /* The sums of four accumulators: lane r of the result is the total of a_r. */
 static inline __m128i reduce4(__m256i a0, __m256i a1, __m256i a2, __m256i a3) {
     const __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(a0, a1), _mm256_hadd_epi32(a2, a3));
@@ -805,10 +815,10 @@ static inline __attribute__((always_inline)) void tile_of(const PrecisionMode p,
                     memcpy(&w1, u + C + k, 4);
                     memcpy(&w2, u + 2u * C + k, 4);
                     memcpy(&w3, u + 3u * C + k, 4);
-                    a0 = _mm256_add_epi32(a0, products(_mm256_set1_epi32(w0), x, t.wide));
-                    a1 = _mm256_add_epi32(a1, products(_mm256_set1_epi32(w1), x, t.wide));
-                    a2 = _mm256_add_epi32(a2, products(_mm256_set1_epi32(w2), x, t.wide));
-                    a3 = _mm256_add_epi32(a3, products(_mm256_set1_epi32(w3), x, t.wide));
+                    a0 = accumulate(a0, _mm256_set1_epi32(w0), x, t.wide);
+                    a1 = accumulate(a1, _mm256_set1_epi32(w1), x, t.wide);
+                    a2 = accumulate(a2, _mm256_set1_epi32(w2), x, t.wide);
+                    a3 = accumulate(a3, _mm256_set1_epi32(w3), x, t.wide);
                 }
                 const __m256i Xb = _mm256_add_epi32(_mm256_loadu_si256((const __m256i *)(const void *)X),
                                                     _mm256_loadu_si256((const __m256i *)(const void *)(X + GROUP)));
@@ -831,10 +841,10 @@ static inline __attribute__((always_inline)) void tile_of(const PrecisionMode p,
                         memcpy(&w1, u + C + k, 4);
                         memcpy(&w2, u + 2u * C + k, 4);
                         memcpy(&w3, u + 3u * C + k, 4);
-                        a0 = _mm256_add_epi32(a0, products(_mm256_set1_epi32(w0), x, t.wide));
-                        a1 = _mm256_add_epi32(a1, products(_mm256_set1_epi32(w1), x, t.wide));
-                        a2 = _mm256_add_epi32(a2, products(_mm256_set1_epi32(w2), x, t.wide));
-                        a3 = _mm256_add_epi32(a3, products(_mm256_set1_epi32(w3), x, t.wide));
+                        a0 = accumulate(a0, _mm256_set1_epi32(w0), x, t.wide);
+                        a1 = accumulate(a1, _mm256_set1_epi32(w1), x, t.wide);
+                        a2 = accumulate(a2, _mm256_set1_epi32(w2), x, t.wide);
+                        a3 = accumulate(a3, _mm256_set1_epi32(w3), x, t.wide);
                     }
                     __m256i Xs = _mm256_loadu_si256((const __m256i *)(const void *)(X + (size_t)sb * (t.sub / 16u) * GROUP));
                     if (t.sub == 32u)
