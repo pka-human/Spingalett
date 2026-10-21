@@ -12,7 +12,7 @@ Copyright (c) 2026 pka_human (pka_human@proton.me)
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>CS1591</NoWarn>
     <PackageId>Spingalett</PackageId>
-    <Version>1.4.1</Version>
+    <Version>1.5.0</Version>
     <Authors>pka_human</Authors>
     <Description>Neural networks in C for .NET: training on the CPU and the GPU (CUDA, Vulkan), transformers and text generation, INT8 to INT2 deployment models.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

@@ -169,8 +169,8 @@ pip install spingalett                    # Python: wheels with the library insi
 brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
 scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
 nix build github:pka-human/Spingalett     # the flake's package; nix develop: a shell to build it in
-sudo apt install ./spingalett_1.4.1_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
-docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.4.1     # the library, tools and Python, CUDA and Vulkan
+sudo apt install ./spingalett_1.5.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.5.0     # the library, tools and Python, CUDA and Vulkan
 ```
 
 The `.deb` and `.rpm` packages are assets of each [release](https://github.com/pka-human/Spingalett/releases),
@@ -884,9 +884,9 @@ Convolutions run on the library's channels-last kernels. Floats compute in singl
 widened), integers in their types; every operator sums in a fixed order, so a graph gives the same bits on any
 number of threads. ONNX's 1262 conformance cases of single operators that hold these types pass (the `operators`
 group), and whole models exported by `torch.onnx` with random weights match PyTorch within 1e-5
-(`Tests/check_graph_models.py`): on six performance cores of an i7-12650H, ResNet-50 runs in 24.5 ms (PyTorch: 21.1),
-BERT-base on two sequences of 128 tokens in 97 (80), GPT-2 on 64 tokens in 42 (35) and a UNet of SDXL's
-architecture in 34.7 (33.9). Control flow (If, Loop, Scan), sequences and strings are not graphs' operators;
+(`Tests/check_graph_models.py`): on six performance cores of an i7-12650H, ResNet-50 runs in 24.4 ms (PyTorch: 21.5),
+BERT-base on two sequences of 128 tokens in 97 (81), GPT-2 on 64 tokens in 45 (36) and a UNet of SDXL's
+architecture in 36.8 (34.6); transformers.js's ONNX files match ONNX Runtime (`Tests/check_graph_files.py`). Control flow (If, Loop, Scan), sequences and strings are not graphs' operators;
 `Examples/Runtime/RunGraph.c` prints a graph's inputs, outputs and operators and times it, and
 `SPINGALETT_GRAPH_PROFILE=1` prints the time of each operator.
 
@@ -2143,8 +2143,8 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.4.1. Its API (prefixed names, structs that can grow, zero as every
-field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 10, `.slettd` 2)
+Spingalett is at version 1.5.0. Its API (prefixed names, structs that can grow, zero as every
+field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 11, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and
 remain loadable.
@@ -2166,7 +2166,7 @@ Planned work, roughly in order (details in [ROADMAP.md](ROADMAP.md)):
   GPT-2), GGUF's quantization types as block precisions of `.slett` format 10 with AVX2 and VNNI kernels,
   the attention of today's families; faster than llama.cpp on the CPU (prompts 1.6 to 2.9 times as fast);
   checkpoints that resume a training run exactly
-- 1.5: graphs of operators: any ONNX model run as it is, in the runtime too (155 operators with ONNX's
+- 1.5 (released): graphs of operators: any ONNX model run as it is, in the runtime too (155 operators with ONNX's
   semantics, `.slett` format 11, fusions into the library's kernels, the same bits on any number of threads), checked
   on ONNX's conformance cases and on whole models against PyTorch; language models in programs (tokenizers in the
   runtime, chat templates, sampling as llama.cpp offers it, SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files)

@@ -26,6 +26,7 @@ against PyTorch on the same machine.
 | 1.2 | "Transformers": embeddings, multi-head attention (grouped-query, causal, rotary), RMS normalization, products of layers, GELU and SiLU, the sparse cross-entropy, `.slett` format 8, in training on the CPU and both GPU backends, the engine, deployment models and the runtime; token files, text generation, GPT-2 and LLaMA checkpoints in Python, a character-level GPT example; on CUDA flash attention on the tensor cores, register-tiled attention in single precision, GELU and SiLU in the products' epilogues, the weights' bfloat16 copy for sequences and images, block order kept in L2: ahead of PyTorch at its fastest (`torch.compile` with `max-autotune`) in every workload but the GPT in bfloat16 (0.91 times in training); bindings for Rust, .NET, Go and Java; Debian and RPM packages, AUR, Homebrew, Scoop, Nix, a container image, conda |
 | 1.3 | "Language models in production": sessions with a key-value cache on the CPU and both GPU backends (batched generation, sliding windows), deployment models predicting on the GPU (integer ones to the CPU's bits) and weight-only INT8, INT4 and INT2 decoding, tokenizers and Hugging Face and GGUF checkpoints in C and every binding, tied embeddings, activation recomputation, gradient accumulation, schedules by step, padding, sliding windows and cross-attention in training, ONNX import of transformers, the engine in WebAssembly (npm), PHP bindings; ahead of PyTorch where 1.2 was not: the GPT in bfloat16 on CUDA ahead of `torch.compile` (1.02 times in training, 1.05 in inference), transformers' training on the CPU (linear layers' weight gradients on the dense products in slots of tokens, GELU and SiLU in vectors, element-wise passes in pieces: the GPT 1.05 times as fast as PyTorch on one thread and 1.64 times on eight), and on Vulkan flash attention on cooperative matrices and register-tiled attention in single precision (the GPT trained 3.1 times as fast in bfloat16 and 1.9 times in single precision, there within 5% of CUDA) |
 | 1.4 | "GGUF on the CPU": language models' GGUF files run as they are stored (`spingalett_model_open()`: LLaMA 1 to 3.x, Mistral, Qwen2 and 2.5, Qwen3, Gemma 3, GPT-2), GGUF's quantization types as block precisions of `.slett` format 10 (Q8_0 to IQ4_XS, quantized byte for byte as llama.cpp's quantizers do), computed in their blocks by AVX2 and VNNI kernels with the engine's bits, the attention of today's families (normalized queries and keys, rotary frequencies of their own, embeddings' scales), sessions' attention in vectors, prompts split between the threads by their work; on an i7-12650H faster than llama.cpp on the same files (prompts 1.6 to 2.9 times as fast, generation 1.00 to 1.10 times); checkpoints of training runs that resume to the bits of an uninterrupted run, positions of data set readers |
+| 1.5 | "Graphs of operators": any ONNX model run as it is (`spingalett_graph_open()`, `spingalett_graph_run()`, in the runtime, Python and C++): 155 operators with ONNX's semantics over tensors of up to eight axes with symbolic sizes, `.slett` format 11, constants folded, common subexpressions, fusions into the library's kernels (products by constant matrices with their epilogues, attention in blocks, layer and RMS normalization, GELU and SiLU written out, convolutions with their batch normalization and activation), the same bits on any number of threads; ONNX's 1262 conformance cases, whole models against PyTorch and ONNX files of other tools against ONNX Runtime; language models in programs (tokenizers in the runtime, chat templates, sampling as llama.cpp offers it, SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF, a chat on the runtime alone) |
 
 ## Every model: graphs of operators
 
@@ -51,7 +52,7 @@ processing of 512 tokens, generation of 128, at 1 and 8 threads, on CUDA and on 
 family checked on real checkpoints (the logits of a prompt against transformers', the tokens of greedy generation
 against llama.cpp's). **SaLaM** (below), a program of its own on the runtime, serves them.
 
-## 1.5: graphs of operators (done on dev/1.5)
+## 1.5: graphs of operators (released)
 
 The foundation, on the CPU, with the language-model work of 1.5 that needed no new format.
 
@@ -76,8 +77,10 @@ The foundation, on the CPU, with the language-model work of 1.5 that needed no n
 - **Checked**: ONNX's 1262 conformance cases of single operators that hold the library's types (the `operators`
   group, on one and four threads, under the sanitizers of GCC and Clang); whole models exported from PyTorch against
   PyTorch (`Tests/check_graph_models.py`): ResNet-50, ViT-B/16, BERT-base, GPT-2, CLIP's text encoder, Whisper's
-  encoder, Stable Diffusion's VAE decoder, a UNet of SDXL's architecture, within 1e-5 and at 0.6 to 0.98 times
-  PyTorch's speed. The layer models and their benchmarks are untouched and no slower.
+  encoder, Stable Diffusion's VAE decoder, a UNet of SDXL's architecture, within 1e-5 and at 0.63 to 0.94 times
+  PyTorch's speed; transformers.js's ONNX files against ONNX Runtime (`Tests/check_graph_files.py`). The layer
+  models and their benchmarks are untouched and no slower (Examples/Benchmark.c's CPU workloads and GGUF sessions
+  measured against 1.4).
 - **Language models in programs**: the tokenizers in the runtime; chat templates (the Jinja of
   `tokenizer.chat_template` rendered as transformers renders it); sampling as llama.cpp offers it (min-p, repeat,
   frequency and presence penalties, stop strings, a stream of tokens) and draws that sort only what they reach;

@@ -91,21 +91,29 @@ open with the operator and the file's opset named. Tests/Data/graph_cases.txt li
 ## What happens when a graph opens
 
 The nodes are put in an order that runs each after what it reads (files are usually in one), constants are folded
-(nodes whose inputs are all constants run once, their outputs kept when they hold at most 2^26 values), and nodes
-that no output needs are left out. Then chains of nodes whose intermediate values nothing else reads are fused into
-operators of the library's own (`Src/Spingalett.IRFuse.c`), which do the same work in fewer passes over memory:
+(nodes whose inputs are all constants run once, their outputs kept when they hold at most 2^26 values), nodes that no
+output needs are left out, and nodes of one operator on the same inputs with the same attributes become one. Then
+chains of nodes whose intermediate values nothing else reads are fused into operators of the library's own or of
+ONNX's (`Src/Spingalett.IRFuse.c`), which do the same work in fewer passes over memory:
 
+- **LayerNormalization and RMSNormalization** from their forms written out over the last axis (ReduceMean, Sub,
+  Pow, Sqrt, Div or Reciprocal, a scale and a bias), as exporters before opset 17 write them;
 - **Gelu and Swish** from the forms exporters write out: `x * 0.5 * (1 + Erf(x / sqrt 2))`, its tanh approximation,
   `x * Sigmoid(x)` and `x * Sigmoid(1.702 x)` (CLIP's quick GELU);
 - **Linear**: a MatMul by a constant matrix, an Add of a constant row and an activation (ReLU, sigmoid, tanh, GELU,
-  SiLU), each after the first optional: the matrix is packed once for the library's row kernel and the bias and
-  activation applied while each tile is in cache. A MatMul or Gemm by a constant matrix packs it once too;
+  SiLU), each after the first optional, or a Gemm by a constant matrix and row and such an activation: the matrix is
+  packed once for the library's row kernel and the bias and activation applied while each tile is in cache. An
+  activation after a Reshape of the product goes into the epilogue too. A MatMul or Gemm by a constant matrix packs
+  it once as it is;
 - **FusedAttention**: MatMul of the queries and the transposed keys (each scaled by a constant or not), a scaling,
-  an Add of a mask, Softmax over the keys (or PyTorch's safe softmax, Where(IsNaN(p), 0, p)) and MatMul by the
-  values, computed in blocks of 64 queries without the scores of all of them in memory; when the heads' transposes
-  surround it, (B, S, H, D) to (B, H, S, D) and back, they are taken in;
-- **Conv**: a convolution followed by an activation applies it in the convolution's epilogue.
+  a Where keeping scores (the others a large negative: a causal mask), an Add of a mask, Softmax over the keys (or
+  PyTorch's safe softmax, Where(IsNaN(p), 0, p)) and MatMul by the values, Casts to float among them, computed in
+  blocks of 64 queries without the scores of all of them in memory; when the heads' transposes surround it,
+  (B, S, H, D) to (B, H, S, D) and back, they are taken in;
+- **Conv**: a channel's Mul and Add of constants and an inference BatchNormalization after a convolution are
+  folded into new filters and a bias, and an activation after it is applied in the convolution's epilogue.
 
+`SPINGALETT_GRAPH_FUSE=0` in the environment leaves the fusions out (to compare with).
 `spingalett_graph_node_count()` and `spingalett_graph_node_op()` (Python: `Graph.operators`) give the nodes that
 remain. A saved graph keeps its fusions; its constants are written as the source held them (float16 stays 16 bits).
 
@@ -133,11 +141,28 @@ performance cores of an i7-12650H (medians of interleaved runs, `Tests/check_gra
 
 | Model | Graph | PyTorch |
 |---|---:|---:|
-| ResNet-50, one image of 224 x 224 | 24.5 ms | 21.1 ms |
-| ViT-B/16, one image | 79 ms | 61 ms |
-| BERT-base, two sequences of 128 tokens | 97 ms | 80 ms |
-| GPT-2, 64 tokens | 42 ms | 35 ms |
-| CLIP ViT-L/14's text encoder, 77 tokens | 45 ms | 29 ms |
-| Whisper's encoder (tiny), 30 s | 81 ms | 65 ms |
-| Stable Diffusion's VAE decoder, 32 x 32 latents | 1127 ms | 987 ms |
-| A UNet of SDXL's architecture (fewer channels and layers), 32 x 32 latents | 34.7 ms | 33.9 ms |
+| ResNet-50, one image of 224 x 224 | 24.4 ms | 21.5 ms |
+| ViT-B/16, one image | 80.9 ms | 63.0 ms |
+| BERT-base, two sequences of 128 tokens | 97.3 ms | 81.2 ms |
+| GPT-2, 64 tokens | 45.3 ms | 36.1 ms |
+| CLIP ViT-L/14's text encoder, 77 tokens | 46.1 ms | 29.2 ms |
+| Whisper's encoder (tiny), 30 s | 83.7 ms | 68.2 ms |
+| Stable Diffusion's VAE decoder, 32 x 32 latents | 1201 ms | 1046 ms |
+| A UNet of SDXL's architecture (fewer channels and layers), 32 x 32 latents | 36.8 ms | 34.6 ms |
+
+ONNX files as transformers.js publishes them (Xenova's exports, opsets 11 to 14, their GELU, layer normalization
+and attention written out), against ONNX Runtime 1.31 on the same cores (`Tests/check_graph_files.py`, ONNX
+Runtime in a process of its own; outputs within 1e-5 of its own, the float16 file's within 2.2e-4, the quantized
+one's within 2.6e-2, where one of 49,152 dynamically quantized values rounds the other way):
+
+| File | Graph | ONNX Runtime |
+|---|---:|---:|
+| all-MiniLM-L6-v2, two sequences of 64 tokens | 8.1 ms | 6.1 ms |
+| all-MiniLM-L6-v2, quantized (MatMulInteger) | 16.6 ms | 3.3 ms |
+| distilgpt2's decoder, 64 tokens | 35.1 ms | 19.1 ms |
+| ViT-B/16 in float16 | 92.4 ms | 60.3 ms |
+| DETR-ResNet-50, 480 x 640 | 160.9 ms | 100.9 ms |
+
+Convolutions transpose their input to channels last and their output back (1.6 keeps activations channels-last
+between them), and products of 8-bit integers sum 16-bit rows without the library's integer tile kernels: the
+largest gaps above.

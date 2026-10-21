@@ -7,6 +7,21 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-21
+
+"Graphs of operators": any model built of ONNX's operators runs as it is, not only the library's layers. A graph holds
+values over tensors of up to eight axes with symbolic sizes and nodes of 155 operators with ONNX's semantics; ONNX
+files open as graphs and save as `.slett` files of format 11; constants fold, repeated nodes go and chains fuse into
+the library's kernels (products by constant matrices with their bias and activation, attention in blocks of 64
+queries, layer and RMS normalization, GELU and SiLU written out, convolutions with their batch normalization and
+activation), and every operator sums in a fixed order, so a graph gives the same bits on any number of threads. ONNX's
+1262 conformance cases of single operators, whole models against PyTorch (ResNet-50, ViT-B/16, BERT-base, GPT-2,
+CLIP's text encoder, Whisper's encoder, Stable Diffusion's VAE decoder, a UNet of SDXL's architecture: within 1e-5,
+at 0.63 to 0.94 times PyTorch's speed on the CPU) and transformers.js's ONNX files against ONNX Runtime check it.
+Language models reach programs on the runtime alone: tokenizers, chat templates, sampling as llama.cpp offers it,
+streams of tokens and four more GGUF families. The layer models, their benchmarks and GGUF's sessions are no slower
+than 1.4's (Examples/Benchmark.c's CPU workloads and llama-bench's prompts and generation, interleaved).
+
 ### Added
 - **Graphs of operators** (`docs/Graphs.md`): any model built of ONNX's operators runs as a graph: values (inputs,
   constants, what nodes compute), tensors of up to eight axes whose sizes are numbers or named symbols, several named
@@ -19,18 +34,22 @@ All notable changes to this project are documented in this file. The format foll
   `spingalett_graph_run()` takes the inputs by name or in order (`SpingalettTensor`) and gives the outputs;
   `spingalett_graph_input()` and `_output()` describe them (`SpingalettTensorInfo`), `spingalett_graph_node_op()`
   the nodes; in the runtime too. Floats compute in single precision (float16 and bfloat16 widened, outputs narrowed
-  back), integers in their types. When a graph opens, constants fold, dead nodes and common subexpressions go, and
-  fusions make operators of the library's own: Linear (a product by a constant matrix packed once for the row kernel
-  of language models, its bias and GELU, SiLU, ReLU, sigmoid or tanh in the epilogue), FusedAttention (Q K^T, scale,
-  mask, softmax or PyTorch's safe softmax and V in blocks of 64 queries, the heads' transposes taken in), Gelu and
-  Swish from their written-out forms, a convolution's activation; convolutions run on the library's channels-last
-  kernels; tensors take blocks of a pool kept between runs. Every operator sums in a fixed order: the same bits on any
+  back), integers in their types, with IEEE arithmetic (no reassociation or reciprocals). When a graph opens,
+  constants fold, dead nodes and common subexpressions go, and fusions make operators of the library's own: Linear
+  (a product by a constant matrix packed once for the row kernel of language models, its bias and GELU, SiLU, ReLU,
+  sigmoid or tanh in the epilogue), FusedAttention (Q K^T, scale, a causal Where, mask, softmax or PyTorch's safe
+  softmax and V in blocks of 64 queries, the heads' transposes taken in), LayerNormalization and RMSNormalization,
+  Gelu and Swish from their written-out forms, a convolution's batch normalization folded into its filters and its
+  activation in its epilogue (`SPINGALETT_GRAPH_FUSE=0` leaves them out); convolutions run on the library's
+  channels-last kernels; tensors take blocks of a pool kept between runs. Every operator sums in a fixed order: the same bits on any
   number of threads. The new `operators` group runs ONNX's 1262 conformance cases of single operators that hold the
   library's types (Tests/make_graph_tests.py) on one and four threads; `Tests/check_graph_models.py` compares whole
   models exported by `torch.onnx` with PyTorch, which they match within 1e-5: on six performance cores of an
-  i7-12650H ResNet-50 runs in 24.5 ms (PyTorch 2.14: 21.1), BERT-base in 97 (80), GPT-2 in 42 (35), ViT-B/16 in 79
-  (61), CLIP's text encoder in 45 (29), Whisper's encoder in 81 (65), Stable Diffusion's VAE decoder in 1127 (987)
-  and a UNet of SDXL's architecture in 34.7 (33.9). `SPINGALETT_GRAPH_PROFILE=1` prints the time of each operator.
+  i7-12650H ResNet-50 runs in 24.4 ms (PyTorch 2.14: 21.5), BERT-base in 97 (81), GPT-2 in 45 (36), ViT-B/16 in 81
+  (63), CLIP's text encoder in 46 (29), Whisper's encoder in 84 (68), Stable Diffusion's VAE decoder in 1201 (1046)
+  and a UNet of SDXL's architecture in 36.8 (34.6); `Tests/check_graph_files.py` compares ONNX files of other tools
+  with ONNX Runtime (transformers.js's MiniLM, distilgpt2, ViT in float16, DETR: within 1e-5, float16 2.2e-4).
+  `SPINGALETT_GRAPH_PROFILE=1` prints the time of each operator.
   Python: `Graph.load()`, `Graph.from_bytes()`, `Graph.from_torch()`, `Graph.run()`, `Graph.save()`; C++:
   `spingalett::Graph`; `Examples/Runtime/RunGraph.c` times a graph on random inputs.
 - **Chat templates**: `spingalett_chat_render()` (`SpingalettChatArgs`, `SpingalettChatMessage`) renders a conversation
@@ -1726,7 +1745,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/pka-human/Spingalett/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/pka-human/Spingalett/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/pka-human/Spingalett/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pka-human/Spingalett/compare/v1.2.0...v1.3.0
