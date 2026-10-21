@@ -391,7 +391,9 @@ pub struct GenerateArgs {
     pub seed: u64,
     pub stop_tokens: *const u32,
     pub stop_count: u32,
-    pub reserved: [u64; RESERVED],
+    /// SpingalettSampling (min-p, penalties, stop strings), or null
+    pub sampling: *const core::ffi::c_void,
+    pub reserved: [u64; RESERVED - 1],
 }
 
 #[repr(C)]

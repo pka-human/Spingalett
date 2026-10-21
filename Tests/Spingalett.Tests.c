@@ -6256,6 +6256,167 @@ static void generate_cached(void) {
 /* Batched generation: sequences of prompts of different lengths advanced together give the tokens each
    gives alone with its seed (seed + b), greedy and drawn, with a stop token, in FP32 and INT8; a sequence
    that fills its session stops after the token its last position predicts. */
+/* The draws of SpingalettSampling, specified again in full: llama.cpp's penalties on the window of the prompt and
+   the tokens generated, the temperature's probabilities (their total in the order of the tokens), top_k, top_p and
+   min_p on the order of all of them, sorted whole, a splitmix64 draw. */
+static uint64_t ref_splitmix(uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+typedef struct {
+    float p;
+    uint32_t token;
+} RefCandidate;
+
+static int ref_order(const void *a, const void *b) {
+    const RefCandidate *x = a, *y = b;
+    if (x->p != y->p) return x->p > y->p ? -1 : 1;
+    return x->token < y->token ? -1 : x->token > y->token;
+}
+
+static uint32_t ref_draw(float *logits, uint32_t V, const uint32_t *history, uint32_t n, float temperature, uint32_t top_k,
+                         float top_p, const SpingalettSampling *s, uint64_t *state) {
+    uint32_t window = s->penalty_window ? s->penalty_window : 64u;
+    const uint32_t from = n > window ? n - window : 0u;
+    for (uint32_t t = 0; t < V; t++) {
+        uint32_t count = 0;
+        for (uint32_t k = from; k < n; k++) count += history[k] == t;
+        if (!count) continue;
+        const float rep = s->repetition_penalty == 0.0f ? 1.0f : s->repetition_penalty;
+        float l = logits[t];
+        if (rep != 1.0f) l = l <= 0.0f ? l * rep : l / rep;
+        logits[t] = l - (float)count * s->frequency_penalty - s->presence_penalty;
+    }
+    uint32_t best = 0;
+    for (uint32_t v = 1; v < V; v++)
+        if (logits[v] > logits[best]) best = v;
+    if (!(temperature > 0.0f)) return best;
+    RefCandidate *c = malloc(V * sizeof *c);
+    double total = 0.0;
+    for (uint32_t v = 0; v < V; v++) {
+        c[v] = (RefCandidate){(float)exp(((double)logits[v] - logits[best]) * (1.0 / temperature)), v};
+        total += c[v].p;
+    }
+    qsort(c, V, sizeof *c, ref_order);
+    uint32_t kept = V;
+    if (top_k && top_k < V) {
+        kept = top_k;
+        total = 0.0;
+        for (uint32_t k = 0; k < kept; k++) total += c[k].p;
+    }
+    if (top_p > 0.0f && top_p < 1.0f) {
+        double sum = 0.0;
+        for (uint32_t k = 0; k < kept; k++)
+            if ((sum += c[k].p) >= top_p * total) { kept = k + 1u; total = sum; break; }
+    }
+    if (s->min_p > 0.0f) {
+        uint32_t k = 1;
+        while (k < kept && c[k].p >= s->min_p) k++;
+        if (k < kept) {
+            kept = k;
+            total = 0.0;
+            for (uint32_t j = 0; j < kept; j++) total += c[j].p;
+        }
+    }
+    const double u = (double)(ref_splitmix(state) >> 11) * (1.0 / 9007199254740992.0) * total;
+    double sum = 0.0;
+    uint32_t token = c[kept - 1u].token;
+    for (uint32_t k = 0; k < kept; k++)
+        if (u < (sum += c[k].p)) { token = c[k].token; break; }
+    free(c);
+    return token;
+}
+
+/* spingalett_session_generate() with SpingalettSampling against ref_draw() on the logits of the same session fed
+   token by token, at temperatures that spread the probabilities over many of the sampler's sorted parts; and stop
+   strings, which end the generation at the token that completes one. */
+static void generate_sampling(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/gguf_qwen2.gguf", SPINGALETT_TEST_DATA_DIR);
+    SpingalettModel *m = spingalett_model_open(.path = path);
+    SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+    SpingalettSession *s = m ? spingalett_session_new(m, &(SpingalettSessionOptions){.max_length = 32}) : NULL;
+    CHECK(s && tok, "%s: a session and a tokenizer", path);
+    if (!s || !tok) { spingalett_session_free(s); spingalett_model_free(m); spingalett_tokenizer_free(tok); return; }
+    const uint32_t V = spingalett_session_vocabulary(s), count = 20;
+    static const uint32_t prompt[] = {39, 68, 75, 75, 78, 266, 302, 75, 67, 39, 68};
+    const uint32_t P = sizeof prompt / sizeof *prompt;
+    static const struct { float temperature; uint32_t top_k; float top_p; SpingalettSampling s; } settings[] = {
+        {0.9f, 0, 0.0f, {0}}, {0.05f, 0, 0.0f, {0}}, {0.7f, 0, 0.9f, {0}}, {1.2f, 40, 0.0f, {.min_p = 0.05f}},
+        {0.08f, 0, 0.0f, {.min_p = 0.001f}}, {0.0f, 0, 0.0f, {.repetition_penalty = 1.3f, .frequency_penalty = 0.2f,
+                                                             .presence_penalty = 0.5f, .penalty_window = 16}},
+        {1.0f, 0, 0.95f, {.repetition_penalty = 1.1f, .penalty_window = UINT32_MAX}}, {1.5f, 0, 0.0f, {.min_p = 1.0f}},
+    };
+    int wrong = 0;
+    float *logits = malloc(V * sizeof(float));
+    uint32_t history[64], tokens[32];
+    for (size_t k = 0; k < sizeof settings / sizeof *settings; k++) {
+        const SpingalettSampling *sampling = &settings[k].s;
+        for (uint64_t seed = 1; seed <= 3; seed++) {
+            const uint32_t *prompts[] = {prompt};
+            uint32_t made = 0;
+            spingalett_session_rewind(s, 0, 0);
+            spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = &P, .tokens = tokens,
+                                        .made = &made, .count = count, .temperature = settings[k].temperature,
+                                        .top_k = settings[k].top_k, .top_p = settings[k].top_p, .seed = seed,
+                                        .sampling = sampling);
+            /* the reference: the same session fed a token at a time */
+            spingalett_session_rewind(s, 0, 0);
+            memcpy(history, prompt, sizeof prompt);
+            uint32_t n = P;
+            uint64_t state = seed;
+            bool same = made == count;
+            spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = prompt, .count = P, .logits = logits}, 1);
+            for (uint32_t i = 0; i < count && same; i++) {
+                const uint32_t t = ref_draw(logits, V, history, n, settings[k].temperature, settings[k].top_k,
+                                            settings[k].top_p, sampling, &state);
+                same = t == tokens[i];
+                history[n++] = t;
+                spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = &t, .count = 1, .logits = logits}, 1);
+            }
+            if (!same && ++wrong <= 3) printf("  sampling %zu, seed %llu: the session's tokens are not the reference's\n",
+                                              k, (unsigned long long)seed);
+        }
+    }
+    CHECK(!wrong, "sampling: %d of %zu draws differ from the reference", wrong, 3 * (sizeof settings / sizeof *settings));
+    /* min_p 1 keeps the most likely alone: the greedy tokens */
+    /* stop strings: the greedy tokens' text, cut at a piece of it */
+    const uint32_t *prompts[] = {prompt};
+    uint32_t greedy[32], made = 0, again[32], made_again = 0;
+    spingalett_session_rewind(s, 0, 0);
+    spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = &P, .tokens = greedy, .made = &made,
+                                .count = count);
+    char text[1024], stop[8] = "";
+    int64_t len = spingalett_detokenize(.tokenizer = tok, .tokens = greedy, .count = made, .text = text, .capacity = sizeof text);
+    uint32_t expect = 0;
+    for (int64_t at = len / 2; at + 3 <= len && !stop[0]; at++) {
+        memcpy(stop, text + at, 3);
+        stop[3] = '\0';
+        /* the first token after which the text holds it */
+        char part[1024];
+        for (expect = 1; expect <= made; expect++) {
+            spingalett_detokenize(.tokenizer = tok, .tokens = greedy, .count = expect, .text = part, .capacity = sizeof part);
+            if (strstr(part, stop)) break;
+        }
+        if (expect >= made || strlen(stop) < 3 || strchr(stop, 0xEF)) stop[0] = '\0';
+    }
+    const char *stops[] = {"no such text", stop};
+    SpingalettSampling cut = {.tokenizer = tok, .stop_strings = stops, .stop_string_count = 2};
+    spingalett_session_rewind(s, 0, 0);
+    spingalett_session_generate(.session = s, .prompts = prompts, .prompt_lengths = &P, .tokens = again,
+                                .made = &made_again, .count = count, .sampling = &cut);
+    CHECK(stop[0] && made_again == expect && !memcmp(again, greedy, made_again * sizeof(uint32_t)),
+          "stop strings: \"%s\" ends the generation after %u tokens (%u expected of %u)", stop, made_again, expect, made);
+    free(logits);
+    spingalett_session_free(s);
+    spingalett_model_free(m);
+    spingalett_tokenizer_free(tok);
+    printf("  sampling: penalties, min_p, top_k and top_p as the reference draws them; stop strings\n");
+}
+
 static void generate_batched(void) {
     const uint32_t T = 12, V = 19, B = 4, count = 8;
     lcg_state = 950;
@@ -9539,6 +9700,7 @@ int main(int argc, char **argv) {
         for (int m = 0; m < 3; m++) generator_mode(cm[m]);
         generate_cached();
         generate_batched();
+        generate_sampling();
     }
     if (!*only || !strcmp(only, "predict")) {
         printf("[batched inference]\n");

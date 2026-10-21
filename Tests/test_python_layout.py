@@ -21,7 +21,7 @@ MIRRORS = {
     "SpingalettModelOpenArgs": sg._ModelOpenArgs, "SpingalettSessionOptions": sg._SessionOptions, "SpingalettSessionFeed": sg._SessionFeed,
     "SpingalettSessionGenerateArgs": sg._SessionGenerateArgs,
     "SpingalettTokenizerInfo": sg._TokenizerInfo, "SpingalettTokenizeArgs": sg._TokenizeArgs,
-    "SpingalettChatMessage": sg._ChatMessage, "SpingalettChatArgs": sg._ChatArgs,
+    "SpingalettChatMessage": sg._ChatMessage, "SpingalettChatArgs": sg._ChatArgs, "SpingalettSampling": sg._Sampling,
     "SpingalettDetokenizeArgs": sg._DetokenizeArgs, "SpingalettPretrainedArgs": sg._PretrainedArgs,
 }
 

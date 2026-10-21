@@ -610,7 +610,8 @@ typedef struct {
     uint64_t seed;                  /* the draws' generator; 0: one draw of the library's (spingalett_seed) */
     const uint32_t *stop_tokens;    /* [stop_count] tokens that end the generation once generated, or NULL */
     uint32_t stop_count;
-    uint64_t reserved[SPINGALETT_RESERVED];
+    const SpingalettSampling *sampling;     /* min-p, penalties of repeated tokens, stop strings (NULL: none) */
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettGenerateArgs;
 
 /* Continues the prompt a token at a time: the network predicts on the window of the last context tokens

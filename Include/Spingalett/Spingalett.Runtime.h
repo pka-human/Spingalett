@@ -176,6 +176,7 @@ SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettM
  * activations, and attention's exponentials are libm's).
  */
 typedef struct SpingalettSession SpingalettSession;
+typedef struct SpingalettTokenizer SpingalettTokenizer;
 
 typedef struct {
     uint32_t max_length;            /* tokens a sequence holds at most: the model's window at most; 0 for it */
@@ -217,6 +218,26 @@ SPINGALETT_API bool spingalett_session_rewind(SpingalettSession *session, uint32
    serves several continuations. */
 SPINGALETT_API bool spingalett_session_copy(SpingalettSession *session, uint32_t from, uint32_t to);
 
+/* More of llama.cpp's ways of drawing tokens, for spingalett_session_generate() and spingalett_generate(): the
+   penalties apply to the logits before the draw (and before the most likely token is taken at temperature 0), in
+   llama.cpp's way; min_p after the temperature, top_k and top_p, as transformers applies it. */
+typedef struct {
+    float min_p;                    /* draws only among tokens at least min_p times as likely as the most likely (0:
+                                       all) */
+    float repetition_penalty;       /* llama.cpp's repeat_penalty: the logits of the tokens of the window divided by it
+                                       (multiplied when they are not positive); 0 or 1: none */
+    float frequency_penalty;        /* subtracted from their logits for each time they occur in the window */
+    float presence_penalty;         /* subtracted once from the logits of those that occur in it */
+    uint32_t penalty_window;        /* the last tokens the penalties look at, of the prompt and those generated (0:
+                                       64, llama.cpp's; UINT32_MAX: all) */
+    const SpingalettTokenizer *tokenizer;   /* decodes the tokens for stop_strings */
+    const char *const *stop_strings;        /* [stop_string_count] texts that end a sequence's generation once the
+                                               text of the tokens it generated holds one (the token that completes it
+                                               is its last) */
+    uint32_t stop_string_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettSampling;
+
 typedef struct {
     SpingalettSession *session;
     uint32_t sequences;             /* sequences 0 .. sequences - 1 of the session generate (0: 1) */
@@ -234,7 +255,8 @@ typedef struct {
     uint64_t seed;                  /* sequence b draws from a generator seeded with seed + b */
     const uint32_t *stop_tokens;    /* [stop_count] tokens that end a sequence's generation once generated */
     uint32_t stop_count;
-    uint64_t reserved[SPINGALETT_RESERVED];
+    const SpingalettSampling *sampling;     /* min-p, penalties of repeated tokens, stop strings (NULL: none) */
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettSessionGenerateArgs;
 
 /* Continues several sequences together, a token each per step, the steps' rows computed at once, each
@@ -259,7 +281,6 @@ SPINGALETT_API uint32_t spingalett_session_generate_args(SpingalettSessionGenera
  * Metaspace, replacements, stripping). Other models (WordPiece, Unigram) and patterns are refused, naming
  * what is missing. A tokenizer is read-only once loaded: threads may share it.
  */
-typedef struct SpingalettTokenizer SpingalettTokenizer;
 
 /* An id no token has. */
 #define SPINGALETT_NO_TOKEN UINT32_MAX

@@ -223,7 +223,8 @@ public unsafe struct GenerateArgs
     public ulong seed;
     public nint stop_tokens;
     public uint stop_count;
-    public fixed ulong reserved[Const.Reserved];
+    public nint sampling;           // SpingalettSampling (min-p, penalties, stop strings), or 0
+    public fixed ulong reserved[Const.Reserved - 1];
 }
 
 [StructLayout(LayoutKind.Sequential)]

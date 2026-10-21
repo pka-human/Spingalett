@@ -646,7 +646,8 @@ impl Network {
             seed: sampling.seed,
             stop_tokens: if sampling.stop.is_empty() { ptr::null() } else { sampling.stop.as_ptr() },
             stop_count: sampling.stop.len() as u32,
-            reserved: [0; sys::RESERVED],
+            sampling: ptr::null(),
+            reserved: [0; sys::RESERVED - 1],
         };
         let made = checked("generate", || unsafe { sys::spingalett_generate_args(args) })?;
         tokens.truncate(made as usize);

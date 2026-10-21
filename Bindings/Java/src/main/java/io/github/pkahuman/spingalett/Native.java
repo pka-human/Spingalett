@@ -96,7 +96,8 @@ final class Native {
     static final StructLayout SAVE_ARGS = struct(a("net"), a("filename"), b("do_not_save_optimizer"), i("precision"),
             reserved(RESERVED));
     static final StructLayout GENERATE_ARGS = struct(a("net"), a("prompt"), i("prompt_length"), a("tokens"), i("count"),
-            f("temperature"), i("top_k"), f("top_p"), l("seed"), a("stop_tokens"), i("stop_count"), reserved(RESERVED));
+            f("temperature"), i("top_k"), f("top_p"), l("seed"), a("stop_tokens"), i("stop_count"), a("sampling"),
+            reserved(RESERVED - 1));
     static final StructLayout TOKEN_READER_OPTIONS = struct(i("context"), i("token_bytes"), i("stride"), l("offset"),
             b("shuffle"), reserved(RESERVED));
     static final StructLayout DATASET_INFO = struct(i("count"), i("input_size"), i("target_size"), i("input_encoding"),

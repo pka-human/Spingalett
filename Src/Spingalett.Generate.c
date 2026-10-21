@@ -8,8 +8,9 @@
  * at a time. The window holds the last context tokens from its first position on; the positions after
  * them hold no token (-1, which an embedding reads as zeros), which a causal model's earlier positions
  * never see. The next token is the most likely one, or a draw from the softmax of the logits divided by
- * the temperature, among the top_k most likely and the most likely whose probabilities add up to
- * top_p (spingalett_next_token()). Draws come from a splitmix64 generator seeded once, in an order fixed
+ * the temperature, among the top_k most likely, the most likely whose probabilities add up to top_p and those
+ * min_p times as likely as the most likely, after llama.cpp's penalties of repeated tokens (SpingalettSampling,
+ * spingalett_next_token()). Draws come from a splitmix64 generator seeded once, in an order fixed
  * by the logits: the same tokens for the same logits.
  *
  * A causal model runs as its deployment model of single precision, which the network keeps until its
@@ -49,16 +50,25 @@ void spingalett_generate_release(NeuralNetwork *net) {
     model_free(atomic_exchange(&net->generate_model, NULL));
 }
 
-static bool is_stop(const SpingalettGenerateArgs *a, uint32_t token) {
+static bool is_stop(const SpingalettGenerateArgs *a, uint32_t token, uint32_t made) {
     for (uint32_t k = 0; k < a->stop_count; k++)
         if (a->stop_tokens[k] == token) return true;
-    return false;
+    return spingalett_stop_string(a->sampling, a->tokens, made);
+}
+
+/* The next token of a row of logits of the sequence seq[0 .. length): the penalties of its last tokens, then the
+   draw. scratch holds the penalties' window. */
+static uint32_t next_token(const SpingalettGenerateArgs *a, float *logits, uint32_t V, const uint32_t *seq,
+                           uint32_t length, SpingalettCandidate *c, uint32_t *scratch, uint64_t *state) {
+    spingalett_penalize(logits, V, a->sampling, seq, length, NULL, 0, scratch);
+    const SpgDraw draw = {a->temperature, a->top_k, a->top_p, a->sampling ? a->sampling->min_p : 0.0f};
+    return spingalett_next_token(logits, V, &draw, c, state);
 }
 
 /* With a session of the network's deployment model: false (*made untouched) when the model is no causal
    language model, which the prediction over the window then runs. seq: [prompt_length + count]. */
 static bool generate_cached(NeuralNetwork *net, SpingalettGenerateArgs *a, uint32_t T, uint32_t V, uint32_t *seq,
-                            SpingalettCandidate *c, uint64_t *state, bool *ok, uint32_t *made) {
+                            SpingalettCandidate *c, uint32_t *scratch, uint64_t *state, bool *ok, uint32_t *made) {
     /* the model the network keeps when it was made from these parameters (the call takes it, so that
        concurrent calls make their own), else a new one */
     spingalett_network_sync(net);
@@ -112,10 +122,10 @@ static bool generate_cached(NeuralNetwork *net, SpingalettGenerateArgs *a, uint3
             break;
         }
         fed = n;
-        const uint32_t token = spingalett_next_token(logits, V, a->temperature, a->top_k, a->top_p, c, state);
+        const uint32_t token = next_token(a, logits, V, seq, length, c, scratch, state);
         seq[length++] = token;
         a->tokens[(*made)++] = token;
-        if (is_stop(a, token)) break;
+        if (is_stop(a, token, *made)) break;
     }
     free(logits);
     /* (kept on a GPU, whose session costs its model's way to the device; on the CPU made again) */
@@ -145,10 +155,12 @@ uint32_t spingalett_generate_args(SpingalettGenerateArgs args) {
         return 0;
     }
     const uint32_t total = args.prompt_length + args.count;
+    const uint32_t window = spingalett_penalty_window(args.sampling);
     uint32_t *seq = (uint32_t *)malloc((size_t)total * sizeof(uint32_t));
+    uint32_t *scratch = (uint32_t *)malloc(((size_t)(window < total ? window : total) + 1u) * sizeof(uint32_t));
     SpingalettCandidate *c = (SpingalettCandidate *)malloc((size_t)V * sizeof(SpingalettCandidate));
-    if (!seq || !c) {
-        free(seq); free(c);
+    if (!seq || !c || !scratch) {
+        free(seq); free(c); free(scratch);
         set_error(SPINGALETT_ERR_ALLOC, "spingalett_generate: out of memory");
         return 0;
     }
@@ -157,7 +169,7 @@ uint32_t spingalett_generate_args(SpingalettGenerateArgs args) {
     uint32_t made = 0;
     bool ok = true;
     /* through a session (on the GPU in its compute modes); when no session runs the network, over the window */
-    if (!generate_cached(net, &args, T, V, seq, c, &state, &ok, &made)) {
+    if (!generate_cached(net, &args, T, V, seq, c, scratch, &state, &ok, &made)) {
         float *window = (float *)malloc((size_t)T * sizeof(float)), *logits = (float *)malloc((size_t)out * sizeof(float));
         ok = window && logits;
         if (!ok) set_error(SPINGALETT_ERR_ALLOC, "spingalett_generate: out of memory");
@@ -168,14 +180,13 @@ uint32_t spingalett_generate_args(SpingalettGenerateArgs args) {
             if (!(ok = spingalett_predict_args((SpingalettPredictArgs){.net = net, .inputs = window, .sample_count = 1,
                                                                        .outputs = logits})))
                 break;
-            const uint32_t token = spingalett_next_token(logits + (size_t)(n - 1u) * V, V, args.temperature, args.top_k,
-                                                         args.top_p, c, &state);
+            const uint32_t token = next_token(&args, logits + (size_t)(n - 1u) * V, V, seq, length, c, scratch, &state);
             seq[length++] = token;
             args.tokens[made++] = token;
-            if (is_stop(&args, token)) break;
+            if (is_stop(&args, token, made)) break;
         }
         free(window); free(logits);
     }
-    free(seq); free(c);
+    free(seq); free(c); free(scratch);
     return ok ? made : 0;
 }

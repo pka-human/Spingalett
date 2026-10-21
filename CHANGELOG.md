@@ -22,9 +22,24 @@ All notable changes to this project are documented in this file. The format foll
   DeepSeek-R1's distillations, Granite 3.3, OLMo 2, GLM-4 (two) and Falcon 3 to transformers' text byte for byte, or
   to their errors (192 cases, `Tests/make_chat_tests.py`). Python: `Tokenizer.chat_template`,
   `Tokenizer.apply_chat_template(messages, add_generation_prompt, tools, **variables)` and `render_chat_template()`.
+- **Sampling as llama.cpp offers it**: `SpingalettSampling`, given to `spingalett_session_generate()` and
+  `spingalett_generate()` through their new `sampling` field (which takes a word of their reserved space): min-p
+  (after the temperature, top-k and top-p, as transformers applies it), llama.cpp's repeat, frequency and presence
+  penalties over a window of the last tokens of the prompt and those generated (64 by default, or all), and stop
+  strings, which end a sequence at the token whose text completes one (decoded by the tokenizer given). The `gen`
+  group checks every option against a reference that sorts every token, on the logits of the same session; Python's
+  `generate()` methods take them as keyword arguments, and the Rust, .NET, Java and PHP bindings know the field.
 - **Tokenizers in the runtime**: `libspingalett-runtime` holds the tokenizers (`spingalett_tokenizer_load()` and the
   rest, declared now in `Spingalett.Runtime.h`), GGUF vocabularies included, so that a program that serves a
   language model needs the runtime alone; its tests check them on the expectations of JSON and GGUF tokenizers.
+
+### Changed
+- **Draws sort only what they reach**: a draw sorted every token of the vocabulary by probability (152,000 for
+  Qwen2.5) for every token it drew; it now sorts them a part at a time, the most likely first, as far as top-k, top-p,
+  min-p and the draw itself reach, and sums the probabilities of a draw without top-k in the order of the tokens. A
+  session of Qwen2.5-0.5B-Instruct (Q4_K_M) draws 128 tokens at temperature 0.8 and top-p 0.95 at 104.9 tokens a
+  second instead of 42.0 (the most likely tokens: 113.9), on six performance cores of an i7-12650H. The tokens of a
+  draw without top-k may differ from 1.4's where a draw falls within rounding of two tokens' boundary.
 
 ## [1.4.0] - 2026-10-21
 

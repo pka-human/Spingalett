@@ -264,7 +264,7 @@ fn layout_matches_c() {
     fields!("SpingalettGenerateArgs", sys::GenerateArgs, [
         net = "net", prompt = "prompt", prompt_length = "prompt_length", tokens = "tokens", count = "count",
         temperature = "temperature", top_k = "top_k", top_p = "top_p", seed = "seed", stop_tokens = "stop_tokens",
-        stop_count = "stop_count", reserved = "reserved",
+        stop_count = "stop_count", sampling = "sampling", reserved = "reserved",
     ]);
     fields!("SpingalettTokenReaderOptions", sys::TokenReaderOptions, [
         context = "context", token_bytes = "token_bytes", stride = "stride", offset = "offset", shuffle = "shuffle",
