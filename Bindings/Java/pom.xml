@@ -8,7 +8,7 @@ Copyright (c) 2026 pka_human (pka_human@proton.me)
   <modelVersion>4.0.0</modelVersion>
   <groupId>io.github.pka-human</groupId>
   <artifactId>spingalett</artifactId>
-  <version>1.4.0</version>
+  <version>1.4.1</version>
   <name>Spingalett</name>
   <description>Neural networks in C for Java (the foreign function and memory API): training on the CPU and the GPU (CUDA, Vulkan), transformers and text generation, INT8 to INT2 deployment models</description>
   <url>https://github.com/pka-human/Spingalett</url>

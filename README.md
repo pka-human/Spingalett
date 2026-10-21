@@ -169,8 +169,8 @@ pip install spingalett                    # Python: wheels with the library insi
 brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
 scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
 nix build github:pka-human/Spingalett     # the flake's package; nix develop: a shell to build it in
-sudo apt install ./spingalett_1.4.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
-docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.4.0     # the library, tools and Python, CUDA and Vulkan
+sudo apt install ./spingalett_1.4.1_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.4.1     # the library, tools and Python, CUDA and Vulkan
 ```
 
 The `.deb` and `.rpm` packages are assets of each [release](https://github.com/pka-human/Spingalett/releases),
@@ -2143,7 +2143,7 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.4.0. Its API (prefixed names, structs that can grow, zero as every
+Spingalett is at version 1.4.1. Its API (prefixed names, structs that can grow, zero as every
 field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 10, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and

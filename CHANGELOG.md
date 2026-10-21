@@ -84,6 +84,11 @@ All notable changes to this project are documented in this file. The format foll
   second instead of 42.0 (the most likely tokens: 113.9), on six performance cores of an i7-12650H. The tokens of a
   draw without top-k may differ from 1.4's where a draw falls within rounding of two tokens' boundary.
 
+## [1.4.1] - 2026-10-21
+
+1.4.0's code, published: the release run of the tag v1.4.0 failed in one job, the x86-64 Python wheel's build, so
+its packages, release files and wheels were never published. 1.4.1 changes nothing but the version.
+
 ## [1.4.0] - 2026-10-21
 
 "GGUF on the CPU": language models' GGUF files run as llama.cpp's users have them, faster than llama.cpp on the
@@ -1721,7 +1726,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/pka-human/Spingalett/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/pka-human/Spingalett/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/pka-human/Spingalett/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/pka-human/Spingalett/compare/v1.1.0...v1.2.0
