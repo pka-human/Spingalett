@@ -63,58 +63,129 @@ void SPINGALETT_ATTEND_VARIANT(const float *q, const float *blocks, const float 
 #  define ATTEND_FUNCTION static void attend_here
 #endif
 
+#if defined(ATTEND_AVX2)
+/* The keys a span takes: four blocks, whose scores are summed side by side (four sums over the head's values at
+   once, each in the order of the values). */
+#define SPAN (4u * SPG_KEY_BLOCK)
+
+/* The scores of keys lane0 .. lane0 + n - 1 of the span of blocks from kb into scores[], times scale. */
+static inline __attribute__((always_inline)) void span_scores(const float *q, const float *kb, uint32_t head, uint32_t lane0,
+                                                              uint32_t n, float scale, float *scores) {
+    const uint32_t blocks = (lane0 + n + SPG_KEY_BLOCK - 1u) / SPG_KEY_BLOCK;
+    const size_t step = (size_t)head * SPG_KEY_BLOCK;
+    const __m256 sc = _mm256_set1_ps(scale);
+    if (blocks == 4u) {
+        __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+        for (uint32_t d = 0; d < head; d++) {
+            const __m256 qd = _mm256_set1_ps(q[d]);
+            const float *k = kb + (size_t)d * SPG_KEY_BLOCK;
+            s0 = _mm256_add_ps(s0, _mm256_mul_ps(qd, _mm256_loadu_ps(k)));
+            s1 = _mm256_add_ps(s1, _mm256_mul_ps(qd, _mm256_loadu_ps(k + step)));
+            s2 = _mm256_add_ps(s2, _mm256_mul_ps(qd, _mm256_loadu_ps(k + 2u * step)));
+            s3 = _mm256_add_ps(s3, _mm256_mul_ps(qd, _mm256_loadu_ps(k + 3u * step)));
+        }
+        _mm256_storeu_ps(scores, _mm256_mul_ps(s0, sc));
+        _mm256_storeu_ps(scores + 8, _mm256_mul_ps(s1, sc));
+        _mm256_storeu_ps(scores + 16, _mm256_mul_ps(s2, sc));
+        _mm256_storeu_ps(scores + 24, _mm256_mul_ps(s3, sc));
+        return;
+    }
+    for (uint32_t b = 0; b < blocks; b++) {
+        __m256 sv = _mm256_setzero_ps();
+        for (uint32_t d = 0; d < head; d++)
+            sv = _mm256_add_ps(sv, _mm256_mul_ps(_mm256_set1_ps(q[d]), _mm256_loadu_ps(kb + b * step + (size_t)d * SPG_KEY_BLOCK)));
+        _mm256_storeu_ps(scores + 8u * b, _mm256_mul_ps(sv, sc));
+    }
+}
+
+/* Keys i0 .. i1 - 1 of a span added to o[0 .. 8 V - 1] (V vectors, in registers): per key o r where the running
+   maximum grew (`grow`), then o + w v, as the engine adds them. */
+#define VALUES_OF(V) \
+static inline __attribute__((always_inline)) void values##V(float *o, const float *v, size_t stride, uint32_t i0, uint32_t i1, \
+                                                            const float *r, const float *w, const bool *grows, bool grow) { \
+    __m256 a[V]; \
+    for (uint32_t k = 0; k < (V); k++) a[k] = _mm256_loadu_ps(o + 8u * k); \
+    for (uint32_t i = i0; i < i1; i++, v += stride) { \
+        if (grow && grows[i]) { \
+            const __m256 ri = _mm256_set1_ps(r[i]); \
+            for (uint32_t k = 0; k < (V); k++) a[k] = _mm256_mul_ps(a[k], ri); \
+        } \
+        const __m256 wi = _mm256_set1_ps(w[i]); \
+        for (uint32_t k = 0; k < (V); k++) a[k] = _mm256_add_ps(a[k], _mm256_mul_ps(wi, _mm256_loadu_ps(v + 8u * k))); \
+    } \
+    for (uint32_t k = 0; k < (V); k++) _mm256_storeu_ps(o + 8u * k, a[k]); \
+}
+VALUES_OF(8)
+VALUES_OF(1)
+#undef VALUES_OF
+#endif
+
 ATTEND_FUNCTION(const float *q, const float *blocks, const float *values, size_t value_stride, uint32_t first,
                 uint32_t count, uint32_t head, float scale, float *o) {
     float m = -FLT_MAX, sum = 0.0f;
     memset(o, 0, (size_t)head * sizeof(float));
-    for (uint32_t p = first, end = first + count; p < end;) {
-        /* the keys of one block from p on: their scores side by side */
-        const uint32_t lane0 = p % SPG_KEY_BLOCK, n = SPG_KEY_BLOCK - lane0 < end - p ? SPG_KEY_BLOCK - lane0 : end - p;
-        const float *kb = blocks + (size_t)(p / SPG_KEY_BLOCK) * head * SPG_KEY_BLOCK;
-        float scores[SPG_KEY_BLOCK], r[SPG_KEY_BLOCK], w[SPG_KEY_BLOCK];
-        bool grows[SPG_KEY_BLOCK];
 #if defined(ATTEND_AVX2)
-        __m256 sv = _mm256_setzero_ps();
-        for (uint32_t d = 0; d < head; d++)
-            sv = _mm256_add_ps(sv, _mm256_mul_ps(_mm256_set1_ps(q[d]), _mm256_loadu_ps(kb + (size_t)d * SPG_KEY_BLOCK)));
-        _mm256_storeu_ps(scores, _mm256_mul_ps(sv, _mm256_set1_ps(scale)));
-#else
-        for (uint32_t i = lane0; i < lane0 + n; i++) {
-            float score = 0.0f;
-            for (uint32_t d = 0; d < head; d++) score += q[d] * kb[(size_t)d * SPG_KEY_BLOCK + i];
-            scores[i] = score * scale;
-        }
-#endif
+    for (uint32_t p = first, end = first + count; p < end;) {
+        /* the keys of up to four blocks from p on: their scores side by side */
+        const uint32_t lane0 = p % SPG_KEY_BLOCK, n = SPAN - lane0 < end - p ? SPAN - lane0 : end - p;
+        float scores[SPAN], ra[SPAN] = {0}, wa[SPAN] = {0}, r[SPAN], w[SPAN];
+        bool grows[SPAN], grow = false;
+        span_scores(q, blocks + (size_t)(p / SPG_KEY_BLOCK) * head * SPG_KEY_BLOCK, head, lane0, n, scale, scores);
         /* the running maximum key by key, the arguments of the exponentials (0 for the lanes outside the keys) */
-        float ra[SPG_KEY_BLOCK] = {0}, wa[SPG_KEY_BLOCK] = {0};
         for (uint32_t i = lane0; i < lane0 + n; i++) {
             grows[i] = scores[i] > m;
             if (grows[i]) {
                 ra[i] = m - scores[i];
                 m = scores[i];
+                grow = true;
             }
             wa[i] = scores[i] - m;
         }
-#if defined(ATTEND_AVX2)
-        _mm256_storeu_ps(r, expf8(_mm256_loadu_ps(ra)));
-        _mm256_storeu_ps(w, expf8(_mm256_loadu_ps(wa)));
-#else
-        for (uint32_t i = lane0; i < lane0 + n; i++) {
-            r[i] = grows[i] ? spingalett_expf(ra[i]) : 1.0f;
-            w[i] = spingalett_expf(wa[i]);
+        for (uint32_t k = lane0 / 8u * 8u; k < lane0 + n; k += 8u) {
+            _mm256_storeu_ps(w + k, expf8(_mm256_loadu_ps(wa + k)));
+            if (grow) _mm256_storeu_ps(r + k, expf8(_mm256_loadu_ps(ra + k)));
         }
-#endif
         for (uint32_t i = lane0; i < lane0 + n; i++) {
-            const float *v = values + (size_t)(p + i - lane0) * value_stride;
-            if (grows[i]) {
-                sum *= r[i];
-                for (uint32_t d = 0; d < head; d++) o[d] *= r[i];
-            }
+            if (grows[i]) sum *= r[i];
             sum += w[i];
-            for (uint32_t d = 0; d < head; d++) o[d] += w[i] * v[d];
+        }
+        /* the weighted values, a slice of the head at a time kept in registers across the keys */
+        const float *v0 = values + (size_t)p * value_stride - (size_t)lane0 * value_stride;
+        uint32_t d = 0;
+        for (; d + 64u <= head; d += 64u) values8(o + d, v0 + d + (size_t)lane0 * value_stride, value_stride, lane0, lane0 + n,
+                                                  r, w, grows, grow);
+        for (; d + 8u <= head; d += 8u) values1(o + d, v0 + d + (size_t)lane0 * value_stride, value_stride, lane0, lane0 + n,
+                                                r, w, grows, grow);
+        for (; d < head; d++)
+            for (uint32_t i = lane0; i < lane0 + n; i++) {
+                if (grows[i]) o[d] *= r[i];
+                o[d] += w[i] * v0[(size_t)i * value_stride + d];
+            }
+        p += n;
+    }
+#else
+    for (uint32_t p = first, end = first + count; p < end;) {
+        /* the keys of one block from p on, key by key */
+        const uint32_t lane0 = p % SPG_KEY_BLOCK, n = SPG_KEY_BLOCK - lane0 < end - p ? SPG_KEY_BLOCK - lane0 : end - p;
+        const float *kb = blocks + (size_t)(p / SPG_KEY_BLOCK) * head * SPG_KEY_BLOCK;
+        for (uint32_t i = lane0; i < lane0 + n; i++) {
+            float score = 0.0f;
+            for (uint32_t d = 0; d < head; d++) score += q[d] * kb[(size_t)d * SPG_KEY_BLOCK + i];
+            score *= scale;
+            const float *v = values + (size_t)(p + i - lane0) * value_stride;
+            if (score > m) {
+                const float r = spingalett_expf(m - score);
+                m = score;
+                sum *= r;
+                for (uint32_t d = 0; d < head; d++) o[d] *= r;
+            }
+            const float w = spingalett_expf(score - m);
+            sum += w;
+            for (uint32_t d = 0; d < head; d++) o[d] += w * v[d];
         }
         p += n;
     }
+#endif
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     for (uint32_t d = 0; d < head; d++) o[d] *= inv;
 }
