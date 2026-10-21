@@ -1754,7 +1754,7 @@ See [Bindings/Python/README.md](Bindings/Python/README.md) for the full API.
 ## C++
 
 `Spingalett/Spingalett.hpp` is a header-only C++23 interface over the same library: the library's
-objects as move-only owners (`spingalett::Network`, `Model`, `Dataset`, `DeviceData`), data as
+objects as move-only owners (`spingalett::Network`, `Model`, `Graph`, `Tokenizer`, `Dataset`, `DeviceData`), data as
 `std::span`, errors as `std::expected<T, spingalett::Error>` (the library's code and message; nothing
 throws), scoped enums, and a fluent `Builder` that makes the network in `build()`:
 

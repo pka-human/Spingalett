@@ -5,7 +5,7 @@
 
 /*
  * C++ interface to Spingalett, header-only (C++23): the library's objects as move-only owners
- * (Network, Model, Dataset, DeviceData), data as std::span, errors as std::expected<T, Error> (the
+ * (Network, Model, Graph, Tokenizer, Dataset, DeviceData), data as std::span, errors as std::expected<T, Error> (the
  * library's code and message; nothing throws), scoped enums, and networks built by a fluent Builder
  * that adds its layers when build() is called:
  *
@@ -307,6 +307,82 @@ private:
         return per && values % per == 0 ? static_cast<std::uint32_t>(values / per) : 0u;
     }
     SpingalettModel *m_ = nullptr;
+};
+
+/* ---------------------------------------------------------------- graphs of operators */
+
+/* A graph of operators (SpingalettGraph, docs/Graphs.md): an ONNX file or a .slett file of format 11, run with ONNX's
+   semantics. run() takes the inputs as SpingalettTensor (by name, or in order with null names) and gives the outputs
+   as SpingalettTensor views of the graph's memory, valid until its next run. */
+class Graph {
+public:
+    Graph(Graph &&other) noexcept : g_(std::exchange(other.g_, nullptr)) {}
+    Graph &operator=(Graph &&other) noexcept {
+        if (this != &other) {
+            spingalett_graph_free(g_);
+            g_ = std::exchange(other.g_, nullptr);
+        }
+        return *this;
+    }
+    Graph(const Graph &) = delete;
+    Graph &operator=(const Graph &) = delete;
+    ~Graph() { spingalett_graph_free(g_); }
+
+    static Result<Graph> load(const std::string &path) {
+        spingalett_clear_error();
+        SpingalettGraph *g = spingalett_graph_open(.path = path.c_str());
+        if (!g) return failure("cannot open the graph");
+        return Graph(g);
+    }
+    /* the bytes of an ONNX or .slett file, copied */
+    static Result<Graph> from_bytes(std::span<const std::byte> data) {
+        spingalett_clear_error();
+        SpingalettGraph *g = spingalett_graph_open(.data = data.data(), .size = data.size());
+        if (!g) return failure("invalid graph");
+        return Graph(g);
+    }
+
+    std::vector<SpingalettTensorInfo> inputs() const {
+        std::vector<SpingalettTensorInfo> v;
+        for (std::uint32_t i = 0; i < spingalett_graph_input_count(g_); i++) v.push_back(spingalett_graph_input(g_, i));
+        return v;
+    }
+    std::vector<SpingalettTensorInfo> outputs() const {
+        std::vector<SpingalettTensorInfo> v;
+        for (std::uint32_t i = 0; i < spingalett_graph_output_count(g_); i++) v.push_back(spingalett_graph_output(g_, i));
+        return v;
+    }
+    /* the nodes' operators, in the order they run */
+    std::vector<std::string> operators() const {
+        std::vector<std::string> v;
+        for (std::uint32_t i = 0; i < spingalett_graph_node_count(g_); i++) v.emplace_back(spingalett_graph_node_op(g_, i));
+        return v;
+    }
+    /* every output, in the graph's order (or those named) */
+    Result<std::vector<SpingalettTensor>> run(std::span<const SpingalettTensor> inputs,
+                                              std::span<const char *const> names = {}) {
+        std::vector<SpingalettTensor> out(names.empty() ? spingalett_graph_output_count(g_) : names.size());
+        for (std::size_t k = 0; k < names.size(); k++) out[k].name = names[k];
+        spingalett_clear_error();
+        SpingalettGraphRunArgs args{};
+        args.graph = g_;
+        args.inputs = inputs.data();
+        args.input_count = static_cast<std::uint32_t>(inputs.size());
+        args.outputs = out.data();
+        args.output_count = static_cast<std::uint32_t>(out.size());
+        if (!spingalett_graph_run_args(args)) return failure();
+        return out;
+    }
+    Result<void> save(const std::string &path) const {
+        spingalett_clear_error();
+        if (!spingalett_graph_save(g_, path.c_str())) return failure();
+        return {};
+    }
+    SpingalettGraph *raw() const { return g_; }
+
+private:
+    explicit Graph(SpingalettGraph *g) : g_(g) {}
+    SpingalettGraph *g_ = nullptr;
 };
 
 /* ---------------------------------------------------------------- tokenizers */

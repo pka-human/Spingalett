@@ -31,8 +31,8 @@ All notable changes to this project are documented in this file. The format foll
   i7-12650H ResNet-50 runs in 24.5 ms (PyTorch 2.14: 21.1), BERT-base in 97 (80), GPT-2 in 42 (35), ViT-B/16 in 79
   (61), CLIP's text encoder in 45 (29), Whisper's encoder in 81 (65), Stable Diffusion's VAE decoder in 1127 (987)
   and a UNet of SDXL's architecture in 34.7 (33.9). `SPINGALETT_GRAPH_PROFILE=1` prints the time of each operator.
-  Python: `Graph.load()`, `Graph.from_bytes()`, `Graph.from_torch()`, `Graph.run()`, `Graph.save()`;
-  `Examples/Runtime/RunGraph.c` times a graph on random inputs.
+  Python: `Graph.load()`, `Graph.from_bytes()`, `Graph.from_torch()`, `Graph.run()`, `Graph.save()`; C++:
+  `spingalett::Graph`; `Examples/Runtime/RunGraph.c` times a graph on random inputs.
 - **Chat templates**: `spingalett_chat_render()` (`SpingalettChatArgs`, `SpingalettChatMessage`) renders a conversation
   with a language model's Jinja chat template as Hugging Face's transformers renders it (`apply_chat_template()`:
   jinja2's sandbox with trim_blocks and lstrip_blocks, loop controls, its `tojson`, `raise_exception()` and

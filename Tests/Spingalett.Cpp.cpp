@@ -155,6 +155,30 @@ int main() {
                                     : "Network::from_pretrained() of a GGUF file: PyTorch's logits");
     }
 
+    /* a graph of operators: the runtime's small model, its argmax of the reference's inputs */
+    sg::Result<sg::Graph> graph = sg::Graph::load(data + "/graph_small.onnx");
+    check(graph && graph->inputs().size() == 1 && graph->outputs().size() == 2 && graph->operators().size() == 3,
+          "Graph::load(), its inputs, outputs and fused operators");
+    if (graph) {
+        const float x[2 * 4] = {0.5f, -1.0f, 2.0f, 0.25f, -0.75f, 1.5f, 0.0f, -2.0f};
+        SpingalettTensor in{};
+        in.name = "x";
+        in.dtype = SPINGALETT_DTYPE_FLOAT32;
+        in.rank = 2;
+        in.shape[0] = 2;
+        in.shape[1] = 4;
+        in.data = const_cast<float *>(x);
+        sg::Result<std::vector<SpingalettTensor>> out = graph->run(std::span<const SpingalettTensor>(&in, 1));
+        bool sums = out && out->size() == 2 && (*out)[0].rank == 2 && (*out)[0].shape[0] == 2 && (*out)[0].shape[1] == 3;
+        for (int r = 0; sums && r < 2; r++) {
+            const float *p = static_cast<const float *>((*out)[0].data) + 3 * r;
+            sums = std::fabs(p[0] + p[1] + p[2] - 1.0f) < 1e-5f;
+        }
+        check(sums, "Graph::run(): rows of probabilities");
+        in.shape[1] = 5;
+        check(!graph->run(std::span<const SpingalettTensor>(&in, 1)), "a wrong shape is an error");
+    }
+
     /* errors are values */
     check(!sg::Tokenizer::load("no/such/tokenizer.json") && !sg::Network::from_pretrained("no/such/model"),
           "a missing tokenizer or model is an error");
