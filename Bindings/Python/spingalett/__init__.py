@@ -35,7 +35,7 @@ import os
 import sys
 from ctypes import (CFUNCTYPE, POINTER, Structure, c_bool, c_char_p, c_float, c_int,
                     c_size_t, c_uint32, c_uint64, c_void_p)
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -53,7 +53,7 @@ __all__ = [
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
-    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer", "render_chat_template",
+    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer", "render_chat_template", "Graph", "TensorInfo",
 ]
 
 
@@ -746,6 +746,48 @@ class _ChatArgs(Structure):
     ]
 
 
+class _GraphOpenArgs(Structure):
+    _fields_ = [
+        ("path", c_char_p),
+        ("data", c_void_p),
+        ("size", c_size_t),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
+class _TensorInfo(Structure):
+    _fields_ = [
+        ("name", c_char_p),
+        ("dtype", c_int),
+        ("rank", c_uint32),
+        ("shape", ctypes.c_int64 * 8),
+        ("symbols", c_char_p * 8),
+        ("reserved", c_uint64 * 4),
+    ]
+
+
+class _Tensor(Structure):
+    _fields_ = [
+        ("name", c_char_p),
+        ("dtype", c_int),
+        ("rank", c_uint32),
+        ("shape", ctypes.c_int64 * 8),
+        ("data", c_void_p),
+        ("reserved", c_uint64 * 4),
+    ]
+
+
+class _GraphRunArgs(Structure):
+    _fields_ = [
+        ("graph", c_void_p),
+        ("inputs", POINTER(_Tensor)),
+        ("input_count", c_uint32),
+        ("outputs", POINTER(_Tensor)),
+        ("output_count", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 class _PretrainedArgs(Structure):
     _fields_ = [
         ("path", c_char_p),
@@ -949,6 +991,18 @@ _load_pretrained = _bind_optional("spingalett_load_pretrained_args", _NetPtr, [_
 # 1.5: chat templates
 _chat_render = _bind_optional("spingalett_chat_render_args", ctypes.c_int64, [_ChatArgs])
 _tokenizer_chat_template = _bind_optional("spingalett_tokenizer_chat_template", c_char_p, [c_void_p])
+
+# 1.5: graphs of operators
+_graph_open = _bind_optional("spingalett_graph_open_args", c_void_p, [_GraphOpenArgs])
+_graph_free = _bind_optional("spingalett_graph_free", None, [c_void_p])
+_graph_input_count = _bind_optional("spingalett_graph_input_count", c_uint32, [c_void_p])
+_graph_output_count = _bind_optional("spingalett_graph_output_count", c_uint32, [c_void_p])
+_graph_input = _bind_optional("spingalett_graph_input", _TensorInfo, [c_void_p, c_uint32])
+_graph_output = _bind_optional("spingalett_graph_output", _TensorInfo, [c_void_p, c_uint32])
+_graph_run = _bind_optional("spingalett_graph_run_args", c_bool, [_GraphRunArgs])
+_graph_save = _bind_optional("spingalett_graph_save", c_bool, [c_void_p, c_char_p])
+_graph_node_count = _bind_optional("spingalett_graph_node_count", c_uint32, [c_void_p])
+_graph_node_op = _bind_optional("spingalett_graph_node_op", c_char_p, [c_void_p, c_uint32])
 
 # 1.4: checkpoints of training runs
 _save_checkpoint = _bind_optional("spingalett_save_checkpoint", c_bool, [_NetPtr, c_char_p])
@@ -2983,6 +3037,162 @@ def render_chat_template(chat_template: str, messages, add_generation_prompt: bo
     """A conversation rendered by a chat template of one's own, as :meth:`Tokenizer.apply_chat_template` renders it
     (``bos_token`` and ``eos_token`` among ``variables`` where the template reads them)."""
     return _render_chat(None, chat_template, messages, add_generation_prompt, tools, time, variables)
+
+
+# --------------------------------------------------------------------------- graphs of operators
+
+# SpingalettDType codes (ONNX's) and numpy's types; bfloat16, which numpy lacks, comes out as float32
+_DTYPES = {1: np.dtype(np.float32), 2: np.dtype(np.uint8), 3: np.dtype(np.int8), 6: np.dtype(np.int32),
+           7: np.dtype(np.int64), 9: np.dtype(np.bool_), 10: np.dtype(np.float16), 16: np.dtype(np.float32)}
+_DTYPE_CODES = {np.dtype(np.float32): 1, np.dtype(np.uint8): 2, np.dtype(np.int8): 3, np.dtype(np.int32): 6,
+                np.dtype(np.int64): 7, np.dtype(np.bool_): 9, np.dtype(np.float16): 10}
+
+
+class TensorInfo(NamedTuple):
+    """A graph's input or output as it declares it: its numpy type, and its shape with a symbol's name (str) or None
+    where no number gives a size."""
+    name: str
+    dtype: np.dtype
+    shape: Tuple[Union[int, str, None], ...]
+
+
+def _tensor_info(info: _TensorInfo) -> TensorInfo:
+    shape = tuple(int(info.shape[k]) if info.shape[k] >= 0 else
+                  (info.symbols[k].decode() if info.symbols[k] else None) for k in range(info.rank))
+    return TensorInfo(info.name.decode(), _DTYPES.get(int(info.dtype), np.dtype(np.float32)), shape)
+
+
+class Graph:
+    """A graph of operators: an ONNX model (opset 7 and later; its external data files beside it) or a .slett file
+    of format 11, run on the CPU with ONNX's semantics. Floats compute in single precision; integers and booleans
+    keep their types. Open one with :meth:`Graph.load` or :meth:`Graph.from_bytes`; :meth:`run` takes the inputs by
+    name (a dict) or in order (a list) and returns the outputs by name."""
+
+    def __init__(self):
+        raise TypeError("use Graph.load or Graph.from_bytes")
+
+    @classmethod
+    def _wrap(cls, ptr) -> "Graph":
+        if not ptr:
+            raise SpingalettError(-1, "could not open the graph")
+        graph = cls.__new__(cls)
+        graph._ptr = ptr
+        return graph
+
+    @classmethod
+    def load(cls, path) -> "Graph":
+        """Open an ONNX file or a .slett file of format 11."""
+        fn = _require(_graph_open, "Graph", "1.5")
+        return cls._wrap(_call(fn, _GraphOpenArgs(path=_encode_path(path))))
+
+    @classmethod
+    def from_bytes(cls, data) -> "Graph":
+        """Open a graph from the bytes of an ONNX or .slett file (copied)."""
+        fn = _require(_graph_open, "Graph", "1.5")
+        data = bytes(data)
+        buffer = ctypes.create_string_buffer(data, len(data))
+        return cls._wrap(_call(fn, _GraphOpenArgs(data=ctypes.cast(buffer, c_void_p), size=len(data))))
+
+    def _handle(self):
+        if not getattr(self, "_ptr", None):
+            raise SpingalettError(-1, "the graph is closed")
+        return self._ptr
+
+    @property
+    def inputs(self) -> List[TensorInfo]:
+        h = self._handle()
+        return [_tensor_info(_graph_input(h, i)) for i in range(_graph_input_count(h))]
+
+    @property
+    def outputs(self) -> List[TensorInfo]:
+        h = self._handle()
+        return [_tensor_info(_graph_output(h, i)) for i in range(_graph_output_count(h))]
+
+    @property
+    def operators(self) -> List[str]:
+        """The operators of the graph's nodes, in the order they run (after constants were folded and what no output
+        needs was left out)."""
+        h = self._handle()
+        return [_graph_node_op(h, i).decode() for i in range(_graph_node_count(h))]
+
+    def run(self, inputs, outputs=None) -> Dict[str, np.ndarray]:
+        """Run the graph: `inputs` a dict of the inputs' names and arrays, or a list in the graph's order; `outputs`
+        the names wanted (None: all). Returns copies of the outputs by name."""
+        h = self._handle()
+        infos = self.inputs
+        if isinstance(inputs, dict):
+            pairs = list(inputs.items())
+        else:
+            pairs = [(infos[k].name if k < len(infos) else None, value) for k, value in enumerate(inputs)]
+        arrays, tensors = [], (_Tensor * max(len(pairs), 1))()
+        for k, (name, value) in enumerate(pairs):
+            arr = np.asarray(value)
+            if not arr.flags.c_contiguous:
+                arr = np.ascontiguousarray(arr)     # (which would make a scalar an array of one value)
+            if arr.dtype == np.float64:
+                arr = arr.astype(np.float32)
+            code = _DTYPE_CODES.get(arr.dtype)
+            if code is None:
+                raise TypeError(f"input {name!r}: numpy type {arr.dtype} has no graph type")
+            if arr.ndim > 8:
+                raise ValueError(f"input {name!r}: more than eight axes")
+            arrays.append(arr)
+            t = tensors[k]
+            t.name = name.encode() if name is not None else None
+            t.dtype = code
+            t.rank = arr.ndim
+            for d in range(arr.ndim):
+                t.shape[d] = arr.shape[d]
+            t.data = arr.ctypes.data_as(c_void_p)
+        names = [o.name for o in self.outputs] if outputs is None else list(outputs)
+        outs = (_Tensor * max(len(names), 1))()
+        encoded = [n.encode() for n in names]
+        for k, n in enumerate(encoded):
+            outs[k].name = n
+        _call(_graph_run, _GraphRunArgs(graph=h, inputs=tensors, input_count=len(pairs), outputs=outs,
+                                        output_count=len(names)))
+        result = {}
+        for k, name in enumerate(names):
+            t = outs[k]
+            shape = tuple(int(t.shape[d]) for d in range(t.rank))
+            count = int(np.prod(shape)) if shape else 1
+            if int(t.dtype) == 16:      # bfloat16: its bits widened to float32
+                raw = np.ctypeslib.as_array(ctypes.cast(t.data, POINTER(ctypes.c_uint16)), (count,)) if count else \
+                    np.zeros(0, np.uint16)
+                arr = (raw.astype(np.uint32) << 16).view(np.float32).reshape(shape)
+            else:
+                dtype = _DTYPES.get(int(t.dtype))
+                if dtype is None:
+                    raise SpingalettError(-1, f"output {name!r} of an unknown type {int(t.dtype)}")
+                if count and t.data:
+                    buf = (ctypes.c_char * (count * dtype.itemsize)).from_address(t.data)
+                    arr = np.frombuffer(buf, dtype=dtype).reshape(shape).copy()
+                else:
+                    arr = np.zeros(shape, dtype=dtype)
+            result[name] = arr
+        return result
+
+    def save(self, path) -> None:
+        """Write the graph as a .slett file of format 11 (constants as the source held them: float16 stays 16 bits)."""
+        if not _call(_graph_save, self._handle(), _encode_path(path)):
+            raise SpingalettError(-1, "could not save the graph")
+
+    def close(self) -> None:
+        if getattr(self, "_ptr", None):
+            _graph_free(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 # --------------------------------------------------------------------------- language models from PyTorch

@@ -395,6 +395,92 @@ typedef struct {
 #define spingalett_chat_render(...) spingalett_chat_render_args((SpingalettChatArgs){__VA_ARGS__})
 SPINGALETT_API int64_t spingalett_chat_render_args(SpingalettChatArgs args);
 
+/*
+ * Graphs of operators: models as graphs of about a hundred operators over tensors of up to eight axes, their sizes
+ * numbers or named symbols (a batch, a sequence's tokens), several named inputs and outputs: ONNX files, read one
+ * operator to one, and `.slett` files of format 11, which spingalett_graph_save() writes (docs/Graphs.md). The
+ * operators are ONNX's, with ONNX's semantics (broadcasting, attributes, opset 23's attention, rotary embeddings and
+ * RMS normalization), computed on the CPU in single precision for floats (float16 and bfloat16 constants and inputs
+ * widened, outputs narrowed back) and in their own types for integers and booleans, every operator summing in fixed
+ * orders: the same bits on any number of threads. Products and convolutions run on the library's matrix kernels.
+ * Constants are folded when a graph opens, and what no output needs is left out. A graph runs one call at a time
+ * (calls from several threads wait for each other); its outputs live in its memory until its next run.
+ */
+typedef struct SpingalettGraph SpingalettGraph;
+
+/* Element types of graphs' tensors (ONNX's TensorProto codes). */
+typedef enum {
+    SPINGALETT_DTYPE_UNDEFINED = 0,
+    SPINGALETT_DTYPE_FLOAT32 = 1,
+    SPINGALETT_DTYPE_UINT8 = 2,
+    SPINGALETT_DTYPE_INT8 = 3,
+    SPINGALETT_DTYPE_INT32 = 6,
+    SPINGALETT_DTYPE_INT64 = 7,
+    SPINGALETT_DTYPE_BOOL = 9,                  /* one byte, 0 or 1 */
+    SPINGALETT_DTYPE_FLOAT16 = 10,
+    SPINGALETT_DTYPE_BFLOAT16 = 16
+} SpingalettDType;
+
+/* Most axes of a graph's tensors. */
+#define SPINGALETT_MAX_RANK 8
+
+typedef struct {
+    const char *path;               /* an ONNX file (its external data files beside it) or a .slett file of format 11 */
+    const void *data;               /* or its bytes (path NULL), which need not outlive the call */
+    size_t size;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettGraphOpenArgs;
+
+/* Opens a graph; NULL with the error set (an operator the library does not have is named, with the file's opset). */
+#define spingalett_graph_open(...) spingalett_graph_open_args((SpingalettGraphOpenArgs){__VA_ARGS__})
+SPINGALETT_API SpingalettGraph *spingalett_graph_open_args(SpingalettGraphOpenArgs args);
+SPINGALETT_API void spingalett_graph_free(SpingalettGraph *graph);
+
+/* A graph's input or output as it declares it. */
+typedef struct {
+    const char *name;               /* valid while the graph lives */
+    SpingalettDType dtype;
+    uint32_t rank;
+    int64_t shape[SPINGALETT_MAX_RANK];         /* sizes; -1 where a symbol, or nothing, gives it */
+    const char *symbols[SPINGALETT_MAX_RANK];   /* the symbols' names (NULL for numbers and unknown sizes) */
+    uint64_t reserved[4];
+} SpingalettTensorInfo;
+
+SPINGALETT_API uint32_t spingalett_graph_input_count(const SpingalettGraph *graph);
+SPINGALETT_API uint32_t spingalett_graph_output_count(const SpingalettGraph *graph);
+/* Input or output i (all zeros past the last). */
+SPINGALETT_API SpingalettTensorInfo spingalett_graph_input(const SpingalettGraph *graph, uint32_t i);
+SPINGALETT_API SpingalettTensorInfo spingalett_graph_output(const SpingalettGraph *graph, uint32_t i);
+
+/* A tensor given to or taken from a run, row-major. */
+typedef struct {
+    const char *name;               /* the graph's input or output (NULL: the graph's inputs, or outputs, in order) */
+    SpingalettDType dtype;          /* inputs: its type (FLOAT32 for a graph's float16 or bfloat16 input is widened) */
+    uint32_t rank;
+    int64_t shape[SPINGALETT_MAX_RANK];
+    void *data;                     /* inputs: the values (read only); outputs: set by the run, in the graph's memory
+                                       until its next run or its end */
+    uint64_t reserved[4];
+} SpingalettTensor;
+
+typedef struct {
+    SpingalettGraph *graph;
+    const SpingalettTensor *inputs; /* [input_count]: every input of the graph */
+    uint32_t input_count;
+    SpingalettTensor *outputs;      /* [output_count]: the outputs wanted; their type, rank, shape and data set */
+    uint32_t output_count;
+    uint64_t reserved[SPINGALETT_RESERVED];
+} SpingalettGraphRunArgs;
+
+/* Runs a graph: false with the error set (a shape the graph refuses, a name it lacks, a node that fails: named). */
+#define spingalett_graph_run(...) spingalett_graph_run_args((SpingalettGraphRunArgs){__VA_ARGS__})
+SPINGALETT_API bool spingalett_graph_run_args(SpingalettGraphRunArgs args);
+/* Writes a graph as a .slett file of format 11 (its constants as the graph holds them). */
+SPINGALETT_API bool spingalett_graph_save(const SpingalettGraph *graph, const char *path);
+/* The graph's nodes, and node i's operator (its ONNX name; NULL past the last). */
+SPINGALETT_API uint32_t spingalett_graph_node_count(const SpingalettGraph *graph);
+SPINGALETT_API const char *spingalett_graph_node_op(const SpingalettGraph *graph, uint32_t i);
+
 #ifdef __cplusplus
 }
 #endif

@@ -157,5 +157,15 @@ SPINGALETT_1.4 {
 SPINGALETT_1.5 {
     global:
         spingalett_chat_render_args;
+        spingalett_graph_free;
+        spingalett_graph_input;
+        spingalett_graph_input_count;
+        spingalett_graph_node_count;
+        spingalett_graph_node_op;
+        spingalett_graph_open_args;
+        spingalett_graph_output;
+        spingalett_graph_output_count;
+        spingalett_graph_run_args;
+        spingalett_graph_save;
         spingalett_tokenizer_chat_template;
 } SPINGALETT_1.4;

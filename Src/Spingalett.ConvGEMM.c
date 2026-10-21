@@ -647,6 +647,11 @@ void CONV_NAME(spingalett_conv_rows)(const float *x, size_t ldx, uint32_t rows, 
         first[s] = items;
         items += (int64_t)blocks[s] * ((panels + widths[s] - 1) / widths[s]);
     }
+    /* filters larger than the rows go panel by panel (the row blocks of a panel one after the other, so that the
+       panel is read from memory once), rows larger than the filters row block by row block; each tile is the same
+       sum either way */
+    const bool by_panel = (uint64_t)N > rows;
+    const uint32_t row_blocks = full / MR;
     (void)threads; (void)parallel; (void)heights; (void)starts; (void)first;
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads) if(parallel && items > 1)
@@ -654,7 +659,8 @@ void CONV_NAME(spingalett_conv_rows)(const float *x, size_t ldx, uint32_t rows, 
     for (int64_t it = 0; it < items; it++) {
         uint32_t row, height, q, width;
         if (it < tile_items) {
-            row = (uint32_t)(it / panels) * MR, height = MR, q = (uint32_t)(it % panels), width = 1;
+            if (by_panel) row = (uint32_t)(it % row_blocks) * MR, height = MR, q = (uint32_t)(it / row_blocks), width = 1;
+            else row = (uint32_t)(it / panels) * MR, height = MR, q = (uint32_t)(it % panels), width = 1;
         } else {
             uint32_t s = 0;
             while (s + 1 < count && it >= first[s + 1]) s++;

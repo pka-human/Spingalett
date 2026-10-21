@@ -601,7 +601,7 @@ if(BUILD_TESTS)
         endif()
     endif()
 
-    foreach(group grad conv norm graph transformer onnx tokenizer chat pretrained equiv cont optim sched dropout gen predict valid step data resume io model gpu cuda xor)
+    foreach(group grad conv norm graph transformer onnx operators tokenizer chat pretrained equiv cont optim sched dropout gen predict valid step data resume io model gpu cuda xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

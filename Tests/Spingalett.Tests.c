@@ -6866,6 +6866,159 @@ static void tokenizer_cases(const char *name, const char *file, const char *expe
     spingalett_tokenizer_free(tok);
 }
 
+/* ------------------------------------------------------------------------- graphs of operators */
+
+/* A tensor of Tests/Data/graph_cases.bin (Tests/make_graph_tests.py), pointing into the file's bytes. */
+typedef struct {
+    char name[128];
+    SpingalettTensor t;
+    uint64_t bytes;
+} CaseTensor;
+
+static bool case_tensors(const uint8_t **p, const uint8_t *end, CaseTensor *out, uint32_t *count, uint32_t most) {
+    if (end - *p < 4) return false;
+    memcpy(count, *p, 4);
+    *p += 4;
+    if (*count > most) return false;
+    for (uint32_t k = 0; k < *count; k++) {
+        CaseTensor *c = &out[k];
+        memset(c, 0, sizeof *c);
+        uint16_t len;
+        if (end - *p < 2) return false;
+        memcpy(&len, *p, 2);
+        *p += 2;
+        if (len >= sizeof c->name || end - *p < len + 2) return false;
+        memcpy(c->name, *p, len);
+        *p += len;
+        c->t.name = c->name;
+        c->t.dtype = (SpingalettDType)(*p)[0];
+        c->t.rank = (*p)[1];
+        *p += 2;
+        if (c->t.rank > SPINGALETT_MAX_RANK || end - *p < 8 * (ptrdiff_t)c->t.rank + 8) return false;
+        memcpy(c->t.shape, *p, 8 * (size_t)c->t.rank);
+        *p += 8 * (size_t)c->t.rank;
+        memcpy(&c->bytes, *p, 8);
+        *p += 8;
+        if ((uint64_t)(end - *p) < c->bytes) return false;
+        c->t.data = (void *)*p;
+        *p += c->bytes;
+    }
+    return true;
+}
+
+static float case_float(const SpingalettTensor *t, uint64_t i) {
+    if (t->dtype != SPINGALETT_DTYPE_FLOAT16) return ((const float *)t->data)[i];
+    const uint16_t h = ((const uint16_t *)t->data)[i];
+    const int e = (h >> 10) & 31, f = h & 1023;
+    const float v = e == 31 ? (f ? NAN : INFINITY) : e ? ldexpf((float)(f | 1024), e - 25) : ldexpf((float)f, -24);
+    return h & 0x8000 ? -v : v;
+}
+
+/* Every case of Tests/Data/graph_cases.bin: ONNX's conformance tests of single operators, each graph run on its
+   inputs against the reference's outputs (floats within the case's tolerances, integers and booleans exactly),
+   on one thread and on four, which give the same bits. */
+static void operator_cases(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/graph_cases.bin", SPINGALETT_TEST_DATA_DIR);
+    size_t size = 0;
+    uint8_t *file = read_all(path, &size);
+    CHECK(file && size >= 12 && !memcmp(file, "SGCASES1", 8), "%s: no cases", path);
+    if (!file || size < 12) { free(file); return; }
+    uint32_t cases;
+    memcpy(&cases, file + 8, 4);
+    const uint8_t *p = file + 12, *end = file + size;
+    enum { MOST = 32 };
+    CaseTensor *ins = calloc(MOST, sizeof(CaseTensor)), *refs = calloc(MOST, sizeof(CaseTensor));
+    SpingalettTensor outs[MOST], again[MOST];
+    void *first[MOST] = {0};
+    int wrong = 0, run = 0;
+    const ComputeMode mode = spingalett_get_compute_mode();
+    const unsigned threads = spingalett_get_num_threads();
+    for (uint32_t c = 0; c < cases; c++) {
+        uint16_t len;
+        char name[160];
+        uint32_t model_len, nin, nout;
+        float rtol, atol;
+        bool parsed = end - p >= 2;
+        if (parsed) { memcpy(&len, p, 2); p += 2; parsed = len < sizeof name && end - p >= len + 4; }
+        if (parsed) {
+            memcpy(name, p, len);
+            name[len] = '\0';
+            p += len;
+            memcpy(&model_len, p, 4);
+            p += 4;
+            parsed = (uint64_t)(end - p) >= (uint64_t)model_len + 8;
+        }
+        const uint8_t *model = p;
+        if (parsed) {
+            p += model_len;
+            memcpy(&rtol, p, 4);
+            memcpy(&atol, p + 4, 4);
+            p += 8;
+            parsed = case_tensors(&p, end, ins, &nin, MOST) && case_tensors(&p, end, refs, &nout, MOST);
+        }
+        CHECK(parsed, "graph_cases.bin: case %u malformed", c);
+        if (!parsed) break;
+        run++;
+        SpingalettGraph *g = spingalett_graph_open(.data = model, .size = model_len);
+        bool ok = g != NULL;
+        const char *why = ok ? "" : spingalett_last_error_message();
+        /* one thread first, then four: the same bits */
+        for (int pass = 0; ok && pass < 2; pass++) {
+            spingalett_set_compute_mode(pass ? SPINGALETT_COMPUTE_OPENMP : SPINGALETT_COMPUTE_SINGLE_THREADED);
+            if (pass) spingalett_set_num_threads(4);
+            SpingalettTensor inputs[MOST];
+            for (uint32_t k = 0; k < nin; k++) inputs[k] = ins[k].t;
+            SpingalettTensor *o = pass ? again : outs;
+            for (uint32_t k = 0; k < nout; k++) {
+                memset(&o[k], 0, sizeof o[k]);
+                o[k].name = refs[k].name;
+            }
+            ok = spingalett_graph_run(.graph = g, .inputs = inputs, .input_count = nin, .outputs = o, .output_count = nout);
+            if (!ok) { why = spingalett_last_error_message(); break; }
+            for (uint32_t k = 0; ok && k < nout; k++) {
+                const SpingalettTensor *got = &o[k], *ref = &refs[k].t;
+                ok = got->dtype == ref->dtype && got->rank == ref->rank;
+                uint64_t count = 1;
+                for (uint32_t d = 0; ok && d < ref->rank; d++) {
+                    ok = got->shape[d] == ref->shape[d];
+                    count *= (uint64_t)ref->shape[d];
+                }
+                if (!ok) { why = "an output of another type or shape"; break; }
+                const size_t bytes = (size_t)refs[k].bytes;
+                if (pass) {
+                    ok = !bytes || !memcmp(first[k], got->data, bytes);
+                    if (!ok) why = "other bits on four threads";
+                    free(first[k]);
+                    first[k] = NULL;
+                    continue;
+                }
+                if (ref->dtype == SPINGALETT_DTYPE_FLOAT32 || ref->dtype == SPINGALETT_DTYPE_FLOAT16) {
+                    for (uint64_t i = 0; ok && i < count; i++) {
+                        const float a = case_float(got, i), b = case_float(ref, i);
+                        ok = (isnan(a) && isnan(b)) || a == b || fabsf(a - b) <= atol + rtol * fabsf(b);
+                    }
+                } else {
+                    ok = !bytes || !memcmp(got->data, ref->data, bytes);
+                }
+                if (!ok) why = "outputs other than the reference's";
+                first[k] = malloc(bytes ? bytes : 1);
+                if (bytes) memcpy(first[k], got->data, bytes);
+            }
+        }
+        for (uint32_t k = 0; k < nout; k++) { free(first[k]); first[k] = NULL; }
+        spingalett_set_compute_mode(mode);
+        spingalett_set_num_threads(threads);
+        if (!ok && ++wrong <= 8) printf("  %s: %s\n", name, why);
+        spingalett_graph_free(g);
+    }
+    CHECK(!wrong, "%d of %d operator cases fail", wrong, run);
+    printf("  %d of ONNX's conformance cases\n", run);
+    free(ins);
+    free(refs);
+    free(file);
+}
+
 /* Every case of Tests/Data/chat_cases.txt (Tests/make_chat_tests.py): a template of Tests/Data/chat rendering a
    conversation to transformers' text, or failing with its error. Messages of roles and texts go as
    SpingalettChatMessage, others in the variables' JSON; the text is also measured, and cut short by a small buffer. */
@@ -9628,6 +9781,10 @@ int main(int argc, char **argv) {
             tokenizer_cases(label, file, expectations, 100);
         }
         tokenizer_api();
+    }
+    if (!*only || !strcmp(only, "operators")) {
+        printf("[graphs of operators]\n");
+        operator_cases();
     }
     if (!*only || !strcmp(only, "chat")) {
         printf("[chat templates]\n");
