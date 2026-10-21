@@ -45,7 +45,9 @@ static const char *precision_name(PrecisionMode p) {
 }
 
 static const char *activation_name(ActivationFunction a) {
-    static const char *names[] = {"none", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax"};
+    static const char *names[] = {"none", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax", "gelu",
+                                  "gelu tanh", "silu"};
+    _Static_assert(sizeof names / sizeof *names == ACT_COUNT, "a name for every activation");
     return (unsigned)a < ACT_COUNT ? names[a] : "?";
 }
 
