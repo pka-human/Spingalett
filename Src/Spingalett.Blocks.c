@@ -48,10 +48,13 @@
 #define MANY_ITEMS 16u
 
 /* The scratch of a layer of n inputs a cell over `items` cells: the cells quantized (slett_block_input_bytes()), and
-   for the kernel of many items the cells transposed in groups of GROUP (codes, scales and sums of every 16 codes
-   lane by lane) and, for each thread, four rows of the weights unpacked. */
+   for the kernel of many items the cells transposed in groups of GROUP, an even number of them (codes, scales and
+   sums of every 16 codes lane by lane), and, for each thread, four rows of the weights unpacked. */
+static uint64_t transposed_groups(uint64_t items) {
+    return (items + 2u * GROUP - 1u) / (2u * GROUP) * 2u;
+}
 static uint64_t transposed_bytes(uint64_t items, uint32_t n) {
-    const uint64_t groups = (items + GROUP - 1u) / GROUP;
+    const uint64_t groups = transposed_groups(items);
     return slett_align(groups * GROUP * n) + slett_align(groups * GROUP * (n / 32u) * 4u) +
            slett_align(groups * GROUP * (n / 16u) * 4u);
 }
@@ -713,7 +716,8 @@ static void rows_by_four(PrecisionMode p, const uint8_t *weights, size_t row, co
 
 /* The quantized items transposed in groups of GROUP: group g's codes k .. k + 3 of item t at x + (g C + 8 k) + 4 t
    (32 bytes a step of four codes), its blocks' scales at dx + (g blocks + b) GROUP + t, its sums of 16 codes at
-   X + (g (C / 16) + i) GROUP + t. Items past the last are zeros. */
+   X + (g (C / 16) + i) GROUP + t. Items past the last are zeros, and so is a group past the last that makes their number
+   even. */
 typedef struct {
     int8_t *x;
     float *dx;
@@ -723,7 +727,7 @@ typedef struct {
 static void transpose_group(const Quantized *q, uint64_t items, uint32_t g, const Transposed *t) {
     const uint32_t C = q->C, blocks = C / q->S, per = C / 16u;
     const uint64_t first = (uint64_t)g * GROUP;
-    const uint32_t count = items - first < GROUP ? (uint32_t)(items - first) : GROUP;
+    const uint32_t count = first >= items ? 0u : items - first < GROUP ? (uint32_t)(items - first) : GROUP;
     int8_t *x = t->x + (size_t)g * GROUP * C;
     for (uint32_t k = 0; k < C; k += 32u) {
         /* eight items' 32 codes, four at a time across the items: an 8 x 8 transposition of 4-byte words */
@@ -776,8 +780,8 @@ static Tile tile_at(uint8_t *base, uint32_t n) {
 }
 
 /* Rows j .. j + 3 for every group of items: y[i OC + j + r] = bias[j + r] + the row's dot product with item i, the
-   items of a group in a vector's lanes (each row's four codes broadcast against the items' four), each lane's float sum
-   in the reference's order. Compiled once for each type. */
+   items of a group in a vector's lanes (each row's four codes broadcast against the four of two groups' items), each
+   lane's float sum in the reference's order. Compiled once for each type. */
 static inline __attribute__((always_inline)) void tile_of(const PrecisionMode p, const uint8_t *weights, size_t row,
                                                           const float *bias, uint32_t j, const Transposed *xt, uint32_t C,
                                                           uint64_t items, float *y, uint32_t OC, const Tile *tl) {
@@ -804,104 +808,162 @@ static inline __attribute__((always_inline)) void tile_of(const PrecisionMode p,
         }
     const uint64_t groups = (items + GROUP - 1u) / GROUP;
     const __m256i offset = _mm256_set1_epi32(t.offset);
-    for (uint64_t g = 0; g < groups; g++) {
-        const int8_t *xg = xt->x + (size_t)g * GROUP * C;
-        __m256 f0 = _mm256_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
+    const size_t gx = (size_t)GROUP * C, gX = (size_t)GROUP * per;
+    for (uint64_t g = 0; g < groups; g += 2u) {
+        /* groups g and g + 1 (zeros past the last) side by side: each row's codes broadcast once for both */
+        const int8_t *xg = xt->x + (size_t)g * gx;
+        __m256 f0 = _mm256_setzero_ps(), f1 = f0, f2 = f0, f3 = f0, h0 = f0, h1 = f0, h2 = f0, h3 = f0;
         for (uint32_t b = 0; b < blocks; b++) {
-            const int8_t *xb = xg + 8u * (size_t)b * S;
-            const int32_t *X = xt->X + ((size_t)g * per + (size_t)b * (S / 16u)) * GROUP;
-            __m256i i10, i11, i12, i13, i20, i21, i22, i23;
+            const int8_t *xa = xg + 8u * (size_t)b * S, *xc = xa + gx;
+            const int32_t *Xa = xt->X + ((size_t)g * per + (size_t)b * (S / 16u)) * GROUP, *Xc = Xa + gX;
+            /* row r's I1 for group g in i1r and for g + 1 in k1r, its I2 in i2r and k2r */
+            __m256i i10, i11, i12, i13, i20, i21, i22, i23, k10, k11, k12, k13, k20, k21, k22, k23;
             if (S == 32u) {
                 const uint8_t *u = tl->u + (size_t)b * 32u;
-                __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+                __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0, c0 = a0, c1 = a0, c2 = a0, c3 = a0;
                 for (uint32_t k = 0; k < 32u; k += 4u) {
-                    const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xb + 8u * k));
+                    const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xa + 8u * k));
+                    const __m256i z = _mm256_loadu_si256((const __m256i *)(const void *)(xc + 8u * k));
                     int32_t w0, w1, w2, w3;
                     memcpy(&w0, u + k, 4);
                     memcpy(&w1, u + C + k, 4);
                     memcpy(&w2, u + 2u * C + k, 4);
                     memcpy(&w3, u + 3u * C + k, 4);
-                    a0 = accumulate(a0, _mm256_set1_epi32(w0), x, t.wide);
-                    a1 = accumulate(a1, _mm256_set1_epi32(w1), x, t.wide);
-                    a2 = accumulate(a2, _mm256_set1_epi32(w2), x, t.wide);
-                    a3 = accumulate(a3, _mm256_set1_epi32(w3), x, t.wide);
+                    const __m256i v0 = _mm256_set1_epi32(w0), v1 = _mm256_set1_epi32(w1);
+                    const __m256i v2 = _mm256_set1_epi32(w2), v3 = _mm256_set1_epi32(w3);
+                    a0 = accumulate(a0, v0, x, t.wide);
+                    c0 = accumulate(c0, v0, z, t.wide);
+                    a1 = accumulate(a1, v1, x, t.wide);
+                    c1 = accumulate(c1, v1, z, t.wide);
+                    a2 = accumulate(a2, v2, x, t.wide);
+                    c2 = accumulate(c2, v2, z, t.wide);
+                    a3 = accumulate(a3, v3, x, t.wide);
+                    c3 = accumulate(c3, v3, z, t.wide);
                 }
-                const __m256i Xb = _mm256_add_epi32(_mm256_loadu_si256((const __m256i *)(const void *)X),
-                                                    _mm256_loadu_si256((const __m256i *)(const void *)(X + GROUP)));
-                const __m256i o = _mm256_mullo_epi32(offset, Xb);
-                i10 = t.offset ? _mm256_sub_epi32(a0, o) : a0;
-                i11 = t.offset ? _mm256_sub_epi32(a1, o) : a1;
-                i12 = t.offset ? _mm256_sub_epi32(a2, o) : a2;
-                i13 = t.offset ? _mm256_sub_epi32(a3, o) : a3;
-                i20 = i21 = i22 = i23 = Xb;
+                const __m256i Sa = _mm256_add_epi32(_mm256_loadu_si256((const __m256i *)(const void *)Xa),
+                                                    _mm256_loadu_si256((const __m256i *)(const void *)(Xa + GROUP)));
+                const __m256i Sc = _mm256_add_epi32(_mm256_loadu_si256((const __m256i *)(const void *)Xc),
+                                                    _mm256_loadu_si256((const __m256i *)(const void *)(Xc + GROUP)));
+                if (t.offset) {
+                    const __m256i oa = _mm256_mullo_epi32(offset, Sa), oc = _mm256_mullo_epi32(offset, Sc);
+                    a0 = _mm256_sub_epi32(a0, oa);
+                    a1 = _mm256_sub_epi32(a1, oa);
+                    a2 = _mm256_sub_epi32(a2, oa);
+                    a3 = _mm256_sub_epi32(a3, oa);
+                    c0 = _mm256_sub_epi32(c0, oc);
+                    c1 = _mm256_sub_epi32(c1, oc);
+                    c2 = _mm256_sub_epi32(c2, oc);
+                    c3 = _mm256_sub_epi32(c3, oc);
+                }
+                i10 = a0, i11 = a1, i12 = a2, i13 = a3, k10 = c0, k11 = c1, k12 = c2, k13 = c3;
+                i20 = i21 = i22 = i23 = Sa;
+                k20 = k21 = k22 = k23 = Sc;
             } else {
                 i10 = i11 = i12 = i13 = i20 = i21 = i22 = i23 = _mm256_setzero_si256();
+                k10 = k11 = k12 = k13 = k20 = k21 = k22 = k23 = i10;
                 for (uint32_t sb = 0; sb < subs; sb++) {
                     const uint32_t k0 = sb * t.sub;
                     const uint8_t *u = tl->u + (size_t)b * S + k0;
-                    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+                    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0, c0 = a0, c1 = a0, c2 = a0, c3 = a0;
                     for (uint32_t k = 0; k < t.sub; k += 4u) {
-                        const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xb + 8u * (k0 + k)));
+                        const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xa + 8u * (k0 + k)));
+                        const __m256i z = _mm256_loadu_si256((const __m256i *)(const void *)(xc + 8u * (k0 + k)));
                         int32_t w0, w1, w2, w3;
                         memcpy(&w0, u + k, 4);
                         memcpy(&w1, u + C + k, 4);
                         memcpy(&w2, u + 2u * C + k, 4);
                         memcpy(&w3, u + 3u * C + k, 4);
-                        a0 = accumulate(a0, _mm256_set1_epi32(w0), x, t.wide);
-                        a1 = accumulate(a1, _mm256_set1_epi32(w1), x, t.wide);
-                        a2 = accumulate(a2, _mm256_set1_epi32(w2), x, t.wide);
-                        a3 = accumulate(a3, _mm256_set1_epi32(w3), x, t.wide);
+                        const __m256i v0 = _mm256_set1_epi32(w0), v1 = _mm256_set1_epi32(w1);
+                        const __m256i v2 = _mm256_set1_epi32(w2), v3 = _mm256_set1_epi32(w3);
+                        a0 = accumulate(a0, v0, x, t.wide);
+                        c0 = accumulate(c0, v0, z, t.wide);
+                        a1 = accumulate(a1, v1, x, t.wide);
+                        c1 = accumulate(c1, v1, z, t.wide);
+                        a2 = accumulate(a2, v2, x, t.wide);
+                        c2 = accumulate(c2, v2, z, t.wide);
+                        a3 = accumulate(a3, v3, x, t.wide);
+                        c3 = accumulate(c3, v3, z, t.wide);
                     }
-                    __m256i Xs = _mm256_loadu_si256((const __m256i *)(const void *)(X + (size_t)sb * (t.sub / 16u) * GROUP));
-                    if (t.sub == 32u)
-                        Xs = _mm256_add_epi32(Xs, _mm256_loadu_si256((const __m256i *)(const void *)(X + ((size_t)sb * 2u + 1u) *
-                                                                                                         GROUP)));
+                    const size_t at = (size_t)sb * (t.sub / 16u) * GROUP;
+                    __m256i Sa = _mm256_loadu_si256((const __m256i *)(const void *)(Xa + at));
+                    __m256i Sc = _mm256_loadu_si256((const __m256i *)(const void *)(Xc + at));
+                    if (t.sub == 32u) {
+                        Sa = _mm256_add_epi32(Sa, _mm256_loadu_si256((const __m256i *)(const void *)(Xa + at + GROUP)));
+                        Sc = _mm256_add_epi32(Sc, _mm256_loadu_si256((const __m256i *)(const void *)(Xc + at + GROUP)));
+                    }
                     if (t.offset) {
-                        const __m256i o = _mm256_mullo_epi32(offset, Xs);
-                        a0 = _mm256_sub_epi32(a0, o);
-                        a1 = _mm256_sub_epi32(a1, o);
-                        a2 = _mm256_sub_epi32(a2, o);
-                        a3 = _mm256_sub_epi32(a3, o);
+                        const __m256i oa = _mm256_mullo_epi32(offset, Sa), oc = _mm256_mullo_epi32(offset, Sc);
+                        a0 = _mm256_sub_epi32(a0, oa);
+                        a1 = _mm256_sub_epi32(a1, oa);
+                        a2 = _mm256_sub_epi32(a2, oa);
+                        a3 = _mm256_sub_epi32(a3, oa);
+                        c0 = _mm256_sub_epi32(c0, oc);
+                        c1 = _mm256_sub_epi32(c1, oc);
+                        c2 = _mm256_sub_epi32(c2, oc);
+                        c3 = _mm256_sub_epi32(c3, oc);
                     }
                     const int16_t *sc = tl->sc + (size_t)b * subs + sb, *mn = tl->mn + (size_t)b * subs + sb;
                     const size_t rs = (size_t)blocks * subs;
-                    i10 = _mm256_add_epi32(i10, _mm256_mullo_epi32(a0, _mm256_set1_epi32(sc[0])));
-                    i11 = _mm256_add_epi32(i11, _mm256_mullo_epi32(a1, _mm256_set1_epi32(sc[rs])));
-                    i12 = _mm256_add_epi32(i12, _mm256_mullo_epi32(a2, _mm256_set1_epi32(sc[2u * rs])));
-                    i13 = _mm256_add_epi32(i13, _mm256_mullo_epi32(a3, _mm256_set1_epi32(sc[3u * rs])));
+                    const __m256i s0 = _mm256_set1_epi32(sc[0]), s1 = _mm256_set1_epi32(sc[rs]);
+                    const __m256i s2 = _mm256_set1_epi32(sc[2u * rs]), s3 = _mm256_set1_epi32(sc[3u * rs]);
+                    i10 = _mm256_add_epi32(i10, _mm256_mullo_epi32(a0, s0));
+                    i11 = _mm256_add_epi32(i11, _mm256_mullo_epi32(a1, s1));
+                    i12 = _mm256_add_epi32(i12, _mm256_mullo_epi32(a2, s2));
+                    i13 = _mm256_add_epi32(i13, _mm256_mullo_epi32(a3, s3));
+                    k10 = _mm256_add_epi32(k10, _mm256_mullo_epi32(c0, s0));
+                    k11 = _mm256_add_epi32(k11, _mm256_mullo_epi32(c1, s1));
+                    k12 = _mm256_add_epi32(k12, _mm256_mullo_epi32(c2, s2));
+                    k13 = _mm256_add_epi32(k13, _mm256_mullo_epi32(c3, s3));
                     if (t.mins) {
-                        i20 = _mm256_add_epi32(i20, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[0])));
-                        i21 = _mm256_add_epi32(i21, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[rs])));
-                        i22 = _mm256_add_epi32(i22, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[2u * rs])));
-                        i23 = _mm256_add_epi32(i23, _mm256_mullo_epi32(Xs, _mm256_set1_epi32(mn[3u * rs])));
+                        const __m256i m0 = _mm256_set1_epi32(mn[0]), m1 = _mm256_set1_epi32(mn[rs]);
+                        const __m256i m2 = _mm256_set1_epi32(mn[2u * rs]), m3 = _mm256_set1_epi32(mn[3u * rs]);
+                        i20 = _mm256_add_epi32(i20, _mm256_mullo_epi32(Sa, m0));
+                        i21 = _mm256_add_epi32(i21, _mm256_mullo_epi32(Sa, m1));
+                        i22 = _mm256_add_epi32(i22, _mm256_mullo_epi32(Sa, m2));
+                        i23 = _mm256_add_epi32(i23, _mm256_mullo_epi32(Sa, m3));
+                        k20 = _mm256_add_epi32(k20, _mm256_mullo_epi32(Sc, m0));
+                        k21 = _mm256_add_epi32(k21, _mm256_mullo_epi32(Sc, m1));
+                        k22 = _mm256_add_epi32(k22, _mm256_mullo_epi32(Sc, m2));
+                        k23 = _mm256_add_epi32(k23, _mm256_mullo_epi32(Sc, m3));
                     }
                 }
             }
-            const __m256 dx = _mm256_loadu_ps(xt->dx + ((size_t)g * blocks + b) * GROUP);
-#define TILE_TERM(r) do { \
+            const __m256 dxa = _mm256_loadu_ps(xt->dx + ((size_t)g * blocks + b) * GROUP);
+            const __m256 dxc = _mm256_loadu_ps(xt->dx + ((size_t)(g + 1u) * blocks + b) * GROUP);
+#define TILE_TERM(f, r, i1, i2, dx) do { \
                 __m256 term = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(tl->d[(size_t)(r) * blocks + b]), dx), \
-                                            _mm256_cvtepi32_ps(i1##r)); \
+                                            _mm256_cvtepi32_ps(i1)); \
                 if (t.mins) \
                     term = _mm256_add_ps(term, _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(tl->m[(size_t)(r) * blocks + b]), dx), \
-                                                             _mm256_cvtepi32_ps(i2##r))); \
-                f##r = _mm256_add_ps(f##r, term); \
+                                                             _mm256_cvtepi32_ps(i2))); \
+                f = _mm256_add_ps(f, term); \
             } while (0)
-            TILE_TERM(0);
-            TILE_TERM(1);
-            TILE_TERM(2);
-            TILE_TERM(3);
+            TILE_TERM(f0, 0, i10, i20, dxa);
+            TILE_TERM(f1, 1, i11, i21, dxa);
+            TILE_TERM(f2, 2, i12, i22, dxa);
+            TILE_TERM(f3, 3, i13, i23, dxa);
+            TILE_TERM(h0, 0, k10, k20, dxc);
+            TILE_TERM(h1, 1, k11, k21, dxc);
+            TILE_TERM(h2, 2, k12, k22, dxc);
+            TILE_TERM(h3, 3, k13, k23, dxc);
 #undef TILE_TERM
         }
-        /* the four rows' sums of the group's items, item by item */
-        float out[4][GROUP];
-        _mm256_storeu_ps(out[0], f0);
-        _mm256_storeu_ps(out[1], f1);
-        _mm256_storeu_ps(out[2], f2);
-        _mm256_storeu_ps(out[3], f3);
-        const uint64_t first = g * GROUP;
-        const uint32_t count = items - first < GROUP ? (uint32_t)(items - first) : GROUP;
-        for (uint32_t i = 0; i < count; i++)
-            for (uint32_t r = 0; r < 4u; r++) y[(first + i) * OC + j + r] = bias[j + r] + out[r][i];
+        /* the four rows' sums of the groups' items, item by item */
+        float out[2][4][GROUP];
+        _mm256_storeu_ps(out[0][0], f0);
+        _mm256_storeu_ps(out[0][1], f1);
+        _mm256_storeu_ps(out[0][2], f2);
+        _mm256_storeu_ps(out[0][3], f3);
+        _mm256_storeu_ps(out[1][0], h0);
+        _mm256_storeu_ps(out[1][1], h1);
+        _mm256_storeu_ps(out[1][2], h2);
+        _mm256_storeu_ps(out[1][3], h3);
+        for (uint32_t e = 0; e < 2u && g + e < groups; e++) {
+            const uint64_t first = (g + e) * GROUP;
+            const uint32_t count = items - first < GROUP ? (uint32_t)(items - first) : GROUP;
+            for (uint32_t i = 0; i < count; i++)
+                for (uint32_t r = 0; r < 4u; r++) y[(first + i) * OC + j + r] = bias[j + r] + out[e][r][i];
+        }
     }
 }
 
@@ -1027,7 +1089,7 @@ LAYER_FUNCTION(const uint8_t *image, const SlettLayer *L, const float *x, float 
 #if defined(BLOCK_AVX2)
     if (items >= MANY_ITEMS) {
         /* the items transposed in groups, then four rows at a time against all of them */
-        const uint64_t groups = (items + GROUP - 1u) / GROUP;
+        const uint64_t groups = transposed_groups(items);
         uint8_t *at = scratch + slett_block_input_bytes(n);
         const Transposed xt = {(int8_t *)at, (float *)(void *)(at + slett_align(groups * GROUP * C)),
                                (int32_t *)(void *)(at + slett_align(groups * GROUP * C) + slett_align(groups * GROUP * (C / 32u) * 4u))};
