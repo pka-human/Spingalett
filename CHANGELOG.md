@@ -7,6 +7,25 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+- **Chat templates**: `spingalett_chat_render()` (`SpingalettChatArgs`, `SpingalettChatMessage`) renders a conversation
+  with a language model's Jinja chat template as Hugging Face's transformers renders it (`apply_chat_template()`:
+  jinja2's sandbox with trim_blocks and lstrip_blocks, loop controls, its `tojson`, `raise_exception()` and
+  `strftime_now()`), and `spingalett_tokenizer_chat_template()` gives a tokenizer's: a GGUF file's
+  `tokenizer.chat_template`, a directory's `chat_template.jinja` or `tokenizer_config.json`'s `chat_template`. The
+  renderer (`Spingalett.Chat.c`, in the runtime too) has the part of Jinja templates use: statements (`if`, `for` with
+  its conditions, unpacking, `loop` and loop controls, `set` of names, namespaces' attributes and blocks, macros,
+  `generation`), Python's values and operators, slices, the methods of strings and dicts, 30 filters and 25 tests;
+  messages come as roles and texts, or with tool calls and parts in a JSON object of variables that also carries tools,
+  documents and the flags templates read (`enable_thinking`). The new `chat` group renders 12 conversations with the
+  templates of Qwen2.5, Qwen3, Llama 3.2, Gemma 2 and 3, SmolLM2 and 3, Phi-3.5 and Phi-4 mini, Mistral 7B v0.3,
+  DeepSeek-R1's distillations, Granite 3.3, OLMo 2, GLM-4 (two) and Falcon 3 to transformers' text byte for byte, or
+  to their errors (192 cases, `Tests/make_chat_tests.py`). Python: `Tokenizer.chat_template`,
+  `Tokenizer.apply_chat_template(messages, add_generation_prompt, tools, **variables)` and `render_chat_template()`.
+- **Tokenizers in the runtime**: `libspingalett-runtime` holds the tokenizers (`spingalett_tokenizer_load()` and the
+  rest, declared now in `Spingalett.Runtime.h`), GGUF vocabularies included, so that a program that serves a
+  language model needs the runtime alone; its tests check them on the expectations of JSON and GGUF tokenizers.
+
 ## [1.4.0] - 2026-10-21
 
 "GGUF on the CPU": language models' GGUF files run as llama.cpp's users have them, faster than llama.cpp on the

@@ -6705,6 +6705,154 @@ static void tokenizer_cases(const char *name, const char *file, const char *expe
     spingalett_tokenizer_free(tok);
 }
 
+/* Every case of Tests/Data/chat_cases.txt (Tests/make_chat_tests.py): a template of Tests/Data/chat rendering a
+   conversation to transformers' text, or failing with its error. Messages of roles and texts go as
+   SpingalettChatMessage, others in the variables' JSON; the text is also measured, and cut short by a small buffer. */
+static void chat_cases(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/chat_cases.txt", SPINGALETT_TEST_DATA_DIR);
+    FILE *f = fopen(path, "r");
+    CHECK(f, "%s: no cases", path);
+    if (!f) return;
+    enum { LINE = 1 << 18, MESSAGES = 16 };
+    char *line = malloc(LINE), *variables = malloc(LINE), *want = malloc(LINE), *got = malloc(LINE);
+    char *template = NULL, name[64] = "";
+    char *roles[MESSAGES], *contents[MESSAGES];
+    for (int k = 0; k < MESSAGES; k++) roles[k] = malloc(256), contents[k] = malloc(4096);
+    SpingalettChatMessage messages[MESSAGES];
+    int cases = 0, wrong = 0, templates = 0, errors = 0;
+    unsigned add = 0;
+    unsigned long long time = 0;
+    uint32_t count = 0;
+    while (fgets(line, LINE, f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == 'T') {
+            snprintf(name, sizeof name, "%s", line + 2);
+            snprintf(path, sizeof path, "%s/chat/%s.jinja", SPINGALETT_TEST_DATA_DIR, name);
+            free(template);
+            size_t size = 0;
+            uint8_t *bytes = read_all(path, &size);
+            template = bytes ? (char *)realloc(bytes, size + 1) : NULL;
+            if (template) template[size] = '\0';
+            CHECK(template, "%s: cannot read", path);
+            templates++;
+        } else if (line[0] == 'C') {
+            int used = 0;
+            if (sscanf(line + 2, "%u %llu %n", &add, &time, &used) != 2) break;
+            variables[unhex(line + 2 + used, variables)] = '\0';
+            count = 0;
+        } else if (line[0] == 'M' && count < MESSAGES) {
+            char *space = strchr(line + 2, ' ');
+            if (!space) break;
+            *space = '\0';
+            roles[count][unhex(line + 2, roles[count])] = '\0';
+            contents[count][unhex(space + 1, contents[count])] = '\0';
+            messages[count].role = roles[count];
+            messages[count].content = contents[count];
+            count++;
+        } else if ((line[0] == 'E' || line[0] == 'X') && template) {
+            const size_t wn = unhex(line + 2, want);
+            want[wn] = '\0';
+            cases++;
+            spingalett_clear_error();
+            int64_t n = spingalett_chat_render(.chat_template = template, .messages = messages, .count = count,
+                                               .add_generation_prompt = add != 0, .variables = variables, .time = time,
+                                               .text = got, .capacity = LINE);
+            int64_t measured = spingalett_chat_render(.chat_template = template, .messages = messages, .count = count,
+                                                      .add_generation_prompt = add != 0, .variables = variables,
+                                                      .time = time);
+            bool ok;
+            if (line[0] == 'E') {
+                ok = n == (int64_t)wn && measured == n && !memcmp(got, want, wn) && got[wn] == '\0';
+                if (ok && wn > 1) {             /* a small buffer: the first bytes, a NUL, the whole length */
+                    char few[4] = "xyz";
+                    ok = spingalett_chat_render(.chat_template = template, .messages = messages, .count = count,
+                                                .add_generation_prompt = add != 0, .variables = variables, .time = time,
+                                                .text = few, .capacity = 2) == n && few[0] == want[0] && few[1] == '\0';
+                }
+                if (!ok && ++wrong <= 4) {
+                    size_t at = 0;
+                    while (n > 0 && at < wn && at < (size_t)n && got[at] == want[at]) at++;
+                    printf("  %s case %d: %s\n    renders %lld bytes, %zu expected; from byte %zu: \"%.80s\" against \"%.80s\"\n",
+                           name, cases, n < 0 ? spingalett_last_error_message() : "", (long long)n, wn, at,
+                           n > 0 ? got + at : "", want + at);
+                }
+            } else {
+                errors++;
+                const char *message = spingalett_last_error_message();
+                ok = n == -1 && measured == -1 && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+                     strstr(message, want) != NULL;
+                if (!ok && ++wrong <= 4)
+                    printf("  %s case %d: expected the error \"%s\", got %lld \"%s\"\n", name, cases, want,
+                           (long long)n, n < 0 ? message : got);
+            }
+        }
+    }
+    CHECK(cases >= 192 && !wrong, "chat templates: %d of %d cases render otherwise than transformers", wrong, cases);
+    printf("  %d templates, %d conversations (%d errors)\n", templates, cases, errors);
+    fclose(f);
+    free(template);
+    for (int k = 0; k < MESSAGES; k++) free(roles[k]), free(contents[k]);
+    free(line); free(variables); free(want); free(got);
+}
+
+/* A GGUF file's template and its tokens, a directory's tokenizer_config.json, and the API's errors. */
+static void chat_api(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/gguf_qwen2.gguf", SPINGALETT_TEST_DATA_DIR);
+    SpingalettTokenizer *tok = spingalett_tokenizer_load(path);
+    const char *t = spingalett_tokenizer_chat_template(tok);
+    CHECK(tok && t && strstr(t, "<|im_start|>"), "gguf_qwen2.gguf: its chat template");
+    SpingalettChatMessage hello[] = {{"system", "Be brief."}, {"user", "Hi"}};
+    char text[512];
+    int64_t n = spingalett_chat_render(.tokenizer = tok, .messages = hello, .count = 2, .add_generation_prompt = true,
+                                       .text = text, .capacity = sizeof text);
+    CHECK(n > 0 && !strcmp(text, "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
+                                 "<|im_start|>assistant\n"), "gguf_qwen2.gguf renders \"%s\" (%lld)", text, (long long)n);
+    spingalett_tokenizer_free(tok);
+    snprintf(path, sizeof path, "%s/hf_llama", SPINGALETT_TEST_DATA_DIR);
+    tok = spingalett_tokenizer_load(path);
+    t = spingalett_tokenizer_chat_template(tok);
+    n = spingalett_chat_render(.tokenizer = tok, .messages = hello + 1, .count = 1, .add_generation_prompt = true,
+                               .text = text, .capacity = sizeof text);
+    CHECK(tok && t && n > 0 && strstr(text, "Hi"), "hf_llama: the template of its tokenizer_config.json (%lld: %s)",
+          (long long)n, n < 0 ? spingalett_last_error_message() : text);
+    spingalett_tokenizer_free(tok);
+    spingalett_clear_error();
+    CHECK(spingalett_chat_render(.messages = hello, .count = 2) == -1 && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "no template");
+    static const struct { const char *template, *error; } bad[] = {
+        {"{% if %}", "unexpected"}, {"{{ x", "not closed"}, {"{% for x in y %}", "endfor"},
+        {"{{ raise_exception('stop: ' ~ 1) }}", "stop: 1"}, {"{{ 'a' + 1 }}", "can only concatenate str (not \"int\") to str"},
+        {"{{ x | nosuchfilter }}", "no filter named 'nosuchfilter'"}, {"{% include 'x' %}", "'include' is not supported"},
+        {"{{ 1 // 0 }}", "division"}, {"{{ undefined_function() }}", "'undefined_function' is undefined"},
+    };
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        spingalett_clear_error();
+        n = spingalett_chat_render(.chat_template = bad[k].template);
+        CHECK(n == -1 && strstr(spingalett_last_error_message(), bad[k].error), "\"%s\": %s", bad[k].template,
+              spingalett_last_error_message());
+    }
+    n = spingalett_chat_render(.chat_template = "{{ 'x' }}", .variables = "[1]");
+    CHECK(n == -1 && strstr(spingalett_last_error_message(), "object"), "variables that are no object");
+    /* the values Python prints */
+    static const struct { const char *template, *text; } shown[] = {
+        {"{{ [1, 2.5, 'a', none, true] }}", "[1, 2.5, 'a', None, True]"}, {"{{ {'a': [1e20, 1e-5]} | tojson }}", "{\"a\": [1e+20, 1e-05]}"},
+        {"{{ 'abc'[::-1] ~ 'héllo'[1:3] }}", "cbaél"}, {"{{ ' x '.strip() }}|{{ 'a,b,,c'.split(',') }}", "x|['a', 'b', '', 'c']"},
+        {"{% set ns = namespace(n=0) %}{% for i in range(5) if i is odd %}{% set ns.n = ns.n + i %}{% endfor %}{{ ns.n }}", "4"},
+        {"{% for k, v in {'a': 1, 'b': 2}.items() %}{{ k }}={{ v }}{% if not loop.last %},{% endif %}{% endfor %}", "a=1,b=2"},
+        {"{% macro greet(name, end='!') %}hi {{ name }}{{ end }}{% endmacro %}{{ greet('you') }} {{ greet('x', end='?') }}", "hi you! hi x?"},
+        {"{{ 7 // 2 }} {{ -7 // 2 }} {{ 7 % -3 }} {{ 2 ** 10 }} {{ 1 / 4 }}", "3 -4 -2 1024 0.25"},
+        {"  {%- if true %}\n  a\n  {%- endif %}\nb", "  ab"}, {"{% if true %}\n  x\n{% endif %}\ny", "  x\ny"},
+        {"{{ {'a': 1, 'b': [True, None]} | tojson(indent=2) }}", "{\n  \"a\": 1,\n  \"b\": [\n    true,\n    null\n  ]\n}"},
+    };
+    for (size_t k = 0; k < sizeof shown / sizeof *shown; k++) {
+        n = spingalett_chat_render(.chat_template = shown[k].template, .text = text, .capacity = sizeof text);
+        CHECK(n >= 0 && !strcmp(text, shown[k].text), "\"%s\" renders \"%s\", not \"%s\" (%s)", shown[k].template,
+              n >= 0 ? text : "", shown[k].text, n < 0 ? spingalett_last_error_message() : "");
+    }
+}
+
 /* The tokens a tokenizer names, the errors of calls and of malformed files. */
 static void tokenizer_api(void) {
     char path[512];
@@ -9317,6 +9465,11 @@ int main(int argc, char **argv) {
             tokenizer_cases(label, file, expectations, 100);
         }
         tokenizer_api();
+    }
+    if (!*only || !strcmp(only, "chat")) {
+        printf("[chat templates]\n");
+        chat_cases();
+        chat_api();
     }
     if (!*only || !strcmp(only, "pretrained")) {
         printf("[pretrained language models]\n");

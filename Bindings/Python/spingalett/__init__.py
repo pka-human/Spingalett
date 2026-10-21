@@ -30,6 +30,7 @@ import ctypes
 import ctypes.util
 import dataclasses
 import enum
+import json
 import os
 import sys
 from ctypes import (CFUNCTYPE, POINTER, Structure, c_bool, c_char_p, c_float, c_int,
@@ -52,7 +53,7 @@ __all__ = [
     "set_compute_mode", "get_compute_mode", "set_num_threads", "get_num_threads", "cpu_kernels", "gpu_device", "cuda_device",
     "set_gpu_precision", "get_gpu_precision",
     "seed", "set_verbose", "set_log_level", "set_log_callback", "library_path", "library_version",
-    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer",
+    "gpt2_from_state_dict", "llama_from_state_dict", "Tokenizer", "render_chat_template",
 ]
 
 
@@ -708,6 +709,25 @@ class _DetokenizeArgs(Structure):
     ]
 
 
+class _ChatMessage(Structure):
+    _fields_ = [("role", c_char_p), ("content", c_char_p)]
+
+
+class _ChatArgs(Structure):
+    _fields_ = [
+        ("tokenizer", c_void_p),
+        ("chat_template", c_char_p),
+        ("messages", POINTER(_ChatMessage)),
+        ("count", c_uint32),
+        ("add_generation_prompt", c_bool),
+        ("variables", c_char_p),
+        ("time", c_uint64),
+        ("text", c_void_p),
+        ("capacity", c_size_t),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
+
+
 class _PretrainedArgs(Structure):
     _fields_ = [
         ("path", c_char_p),
@@ -907,6 +927,10 @@ _tokenizer_id = _bind_optional("spingalett_tokenizer_id", c_uint32, [c_void_p, c
 _tokenize = _bind_optional("spingalett_tokenize_args", ctypes.c_int64, [_TokenizeArgs])
 _detokenize = _bind_optional("spingalett_detokenize_args", ctypes.c_int64, [_DetokenizeArgs])
 _load_pretrained = _bind_optional("spingalett_load_pretrained_args", _NetPtr, [_PretrainedArgs])
+
+# 1.5: chat templates
+_chat_render = _bind_optional("spingalett_chat_render_args", ctypes.c_int64, [_ChatArgs])
+_tokenizer_chat_template = _bind_optional("spingalett_tokenizer_chat_template", c_char_p, [c_void_p])
 
 # 1.4: checkpoints of training runs
 _save_checkpoint = _bind_optional("spingalett_save_checkpoint", c_bool, [_NetPtr, c_char_p])
@@ -2813,6 +2837,22 @@ class Tokenizer:
         i = _tokenizer_id(self._handle, token.encode("utf-8"))
         return None if i == NO_TOKEN else int(i)
 
+    @property
+    def chat_template(self) -> Optional[str]:
+        """The chat template of the tokenizer's GGUF file or directory (``chat_template.jinja`` or
+        ``tokenizer_config.json``'s), None when it has none."""
+        s = _call(_require(_tokenizer_chat_template, "Tokenizer.chat_template", "1.5"), self._handle)
+        return s.decode("utf-8") if s is not None else None
+
+    def apply_chat_template(self, messages, add_generation_prompt: bool = False, tools=None,
+                            chat_template: Optional[str] = None, time: int = 0, **variables) -> str:
+        """A conversation as the text the model was trained on, rendered by its chat template (or ``chat_template``) as
+        transformers' ``apply_chat_template(tokenize=False)`` renders it: ``messages`` a list of dicts (role and content,
+        tool calls, parts), ``tools`` the functions' JSON schemas, ``variables`` what else the template reads
+        (``enable_thinking=False``); ``bos_token`` and ``eos_token`` are the tokenizer's. ``time``: the seconds since
+        1970 strftime_now() formats (0: now)."""
+        return _render_chat(self._handle, chat_template, messages, add_generation_prompt, tools, time, variables)
+
     def _info(self) -> _TokenizerInfo:
         return _tokenizer_info(self._handle)
 
@@ -2852,6 +2892,34 @@ class Tokenizer:
         if not getattr(self, "_ptr", None):
             return "Tokenizer(closed)"
         return f"Tokenizer(vocabulary={self.vocabulary}, bos={self.bos}, eos={self.eos})"
+
+
+def _render_chat(handle, template, messages, add_generation_prompt, tools, time, variables) -> str:
+    values = dict(variables)
+    values["messages"] = list(messages)
+    if tools is not None:
+        values["tools"] = list(tools)
+    data = json.dumps(values, ensure_ascii=False).encode("utf-8")
+    source = template.encode("utf-8") if template is not None else None
+    capacity = 4096
+    while True:
+        buffer = ctypes.create_string_buffer(capacity)
+        args = _ChatArgs(tokenizer=handle, chat_template=source, messages=None, count=0,
+                         add_generation_prompt=add_generation_prompt, variables=data, time=int(time),
+                         text=ctypes.cast(buffer, c_void_p), capacity=capacity)
+        size = _call(_require(_chat_render, "apply_chat_template", "1.5"), args)
+        if size < 0:
+            raise SpingalettError(-1, "could not render the chat template")
+        if size < capacity:
+            return buffer.raw[:size].decode("utf-8")
+        capacity = int(size) + 1
+
+
+def render_chat_template(chat_template: str, messages, add_generation_prompt: bool = False, tools=None, time: int = 0,
+                         **variables) -> str:
+    """A conversation rendered by a chat template of one's own, as :meth:`Tokenizer.apply_chat_template` renders it
+    (``bos_token`` and ``eos_token`` among ``variables`` where the template reads them)."""
+    return _render_chat(None, chat_template, messages, add_generation_prompt, tools, time, variables)
 
 
 # --------------------------------------------------------------------------- language models from PyTorch

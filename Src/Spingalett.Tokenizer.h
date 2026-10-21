@@ -31,6 +31,8 @@ typedef struct {
     uint32_t bos, eos, unk, pad;    /* SPINGALETT_NO_TOKEN when absent */
     bool add_space_prefix;          /* "llama": a space before the text (and after each special token) */
     bool add_bos, add_eos;          /* the template of add_special */
+    const char *chat_template;      /* tokenizer.chat_template (not NUL-terminated), or NULL */
+    uint32_t chat_template_length;
 } SpgTokenizerSpec;
 
 /* NULL with the error set when the vocabulary cannot be used. */

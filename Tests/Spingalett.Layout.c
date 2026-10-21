@@ -149,6 +149,11 @@ int main(void) {
     FIELD(SpingalettTokenizerInfo, vocabulary); FIELD(SpingalettTokenizerInfo, added); FIELD(SpingalettTokenizerInfo, bos);
     FIELD(SpingalettTokenizerInfo, eos); FIELD(SpingalettTokenizerInfo, pad); FIELD(SpingalettTokenizerInfo, unk);
 
+    SIZE(SpingalettChatMessage); FIELD(SpingalettChatMessage, role); FIELD(SpingalettChatMessage, content);
+    SIZE(SpingalettChatArgs); FIELD(SpingalettChatArgs, reserved);
+    FIELD(SpingalettChatArgs, tokenizer); FIELD(SpingalettChatArgs, chat_template); FIELD(SpingalettChatArgs, messages);
+    FIELD(SpingalettChatArgs, count); FIELD(SpingalettChatArgs, add_generation_prompt); FIELD(SpingalettChatArgs, variables);
+    FIELD(SpingalettChatArgs, time); FIELD(SpingalettChatArgs, text); FIELD(SpingalettChatArgs, capacity);
     SIZE(SpingalettTokenizeArgs); FIELD(SpingalettTokenizeArgs, reserved);
     FIELD(SpingalettTokenizeArgs, tokenizer); FIELD(SpingalettTokenizeArgs, text); FIELD(SpingalettTokenizeArgs, length);
     FIELD(SpingalettTokenizeArgs, tokens); FIELD(SpingalettTokenizeArgs, capacity); FIELD(SpingalettTokenizeArgs, special);

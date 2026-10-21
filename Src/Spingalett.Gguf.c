@@ -849,7 +849,6 @@ done:
 #undef SPEC
 #undef INPUTS
 
-#if !defined(SPINGALETT_RUNTIME)
 /* ------------------------------------------------------------------------- the vocabulary */
 
 /* The strings of an array of strings, NULL when the key is missing or holds anything else. */
@@ -917,6 +916,11 @@ SpingalettTokenizer *spingalett_gguf_tokenizer(const uint8_t *data, size_t size)
     spec.add_space_prefix = kv_u32(&g, "tokenizer.ggml.add_space_prefix", spm) != 0;
     spec.add_bos = kv_u32(&g, "tokenizer.ggml.add_bos_token", spm) != 0;
     spec.add_eos = kv_u32(&g, "tokenizer.ggml.add_eos_token", 0) != 0;
+    const Kv *chat = find_kv(&g, "tokenizer.chat_template");
+    if (chat && chat->type == GGUF_STRING && slett_get64(chat->value) < (1u << 24)) {
+        spec.chat_template = (const char *)chat->value + 8;
+        spec.chat_template_length = (uint32_t)slett_get64(chat->value);
+    }
     SpingalettTokenizer *tok = NULL;
     if (!tokens) set_error(SPINGALETT_ERR_INVALID, "GGUF: the file has no vocabulary (tokenizer.ggml.tokens)");
     else tok = spingalett_tokenizer_build(&spec);
@@ -927,4 +931,3 @@ SpingalettTokenizer *spingalett_gguf_tokenizer(const uint8_t *data, size_t size)
     gguf_free(&g);
     return tok;
 }
-#endif

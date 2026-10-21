@@ -8,7 +8,7 @@ Hugging Face's form and GGUF files, with the logits a PyTorch reference computes
 
 - hf_llama/: LLaMA with grouped-query attention (4 query heads, 2 key and value heads), rotary embeddings
   of base 500000, weights in bfloat16 in two shards and model.safetensors.index.json, LLaMA 3's form of
-  tokenizer (tokenizer_llama3.json) and a tokenizer_config.json;
+  tokenizer (tokenizer_llama3.json) and a tokenizer_config.json with Llama 3.2's chat template;
 - hf_qwen2/: Qwen2 with the biases of its queries, keys and values, one key and value head, tied embeddings
   (no lm_head), float16, Qwen2's form of tokenizer;
 - hf_mistral/: Mistral with a sliding window (16 tokens) and a head size (8) other than the width over the
@@ -30,7 +30,8 @@ GGUF files, written by the small writer below as llama.cpp's converter writes th
 
 - gguf_llama.gguf: hf_llama's weights (queries and keys permuted into llama.cpp's order, matrices in
   bfloat16, vectors in float32) and its tokenizer as a vocabulary of the "gpt2" model ("llama-bpe");
-- gguf_qwen2.gguf: hf_qwen2's (float16, its biases, no output.weight) and its tokenizer ("qwen2");
+- gguf_qwen2.gguf: hf_qwen2's (float16, its biases, no output.weight) and its tokenizer ("qwen2"), with Qwen2.5's
+  chat template;
 - gguf_gpt2.gguf: hf_gpt2's (its Conv1D matrices transposed to [out][in], learned positions), no vocabulary;
 - gguf_qwen3.gguf: hf_qwen3's (float16, attn_q_norm and attn_k_norm), architecture "qwen3";
 - gguf_llama3.gguf: hf_llama3's (bfloat16, queries and keys permuted) with rope_freqs.weight, the factors llama.cpp's
@@ -425,9 +426,10 @@ def llama_metadata(cfg, name, arch="llama"):
                    (f"{arch}.rope.dimension_count", GGUF_UINT32, cfg.get("head_dim", cfg["hidden_size"] // H))]
 
 
-def vocabulary_metadata(tokenizer_json, pre, bos, eos):
+def vocabulary_metadata(tokenizer_json, pre, bos, eos, chat=None):
     """A tokenizer.json of byte-level BPE as the vocabulary of GGUF's "gpt2" model: tokens by id, the added ones control
-    tokens (special) or user-defined ones, the merges as "a b" strings."""
+    tokens (special) or user-defined ones, the merges as "a b" strings; with chat, the chat template of
+    Tests/Data/chat/CHAT.jinja."""
     tok = json.load(open(os.path.join(DATA, tokenizer_json), encoding="utf-8"))
     vocab = {i: t for t, i in tok["model"]["vocab"].items()}
     types = {i: 1 for i in vocab}
@@ -443,7 +445,13 @@ def vocabulary_metadata(tokenizer_json, pre, bos, eos):
         meta.append(("tokenizer.ggml.bos_token_id", GGUF_UINT32, bos))
     meta.append(("tokenizer.ggml.eos_token_id", GGUF_UINT32, eos))
     meta.append(("tokenizer.ggml.add_bos_token", GGUF_BOOL, bos is not None))
+    if chat:
+        meta.append(("tokenizer.chat_template", GGUF_STRING, chat_template(chat)))
     return meta
+
+
+def chat_template(name):
+    return open(os.path.join(DATA, "chat", name + ".jinja"), encoding="utf-8").read()
 
 
 def tensor_bytes(w, kind):
@@ -711,7 +719,8 @@ def main():
              "tie_word_embeddings": False, "torch_dtype": "bfloat16", "rope_scaling": None}
     llama_sd = llama_weights(llama, torch.bfloat16, False, False, gen)
     write("hf_llama", llama, llama_sd, ref_llama, "tokenizer_llama3.json",
-          shards=2, tokenizer_config={"bos_token": "<|begin_of_text|>", "eos_token": "<|eot_id|>"})
+          shards=2, tokenizer_config={"bos_token": "<|begin_of_text|>", "eos_token": "<|eot_id|>",
+                                      "chat_template": chat_template("llama3.2")})
     qwen2 = {"architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2", "vocab_size": 423, "hidden_size": 16,
              "intermediate_size": 24, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1,
              "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "max_position_embeddings": 32, "hidden_act": "silu",
@@ -729,7 +738,7 @@ def main():
     gpt2_sd = gpt2_weights(gpt2, gen)
     write("hf_gpt2", gpt2, gpt2_sd, ref_gpt2, "tokenizer_gpt2.json")
     gguf_from_hf("gguf_llama.gguf", "llama", llama, llama_sd, "BF16", ("tokenizer_llama3.json", "llama-bpe", 420, 424))
-    gguf_from_hf("gguf_qwen2.gguf", "qwen2", qwen2, qwen2_sd, "F16", ("tokenizer_qwen2.json", "qwen2", None, 420))
+    gguf_from_hf("gguf_qwen2.gguf", "qwen2", qwen2, qwen2_sd, "F16", ("tokenizer_qwen2.json", "qwen2", None, 420, "qwen2.5"))
     gguf_from_hf("gguf_gpt2.gguf", "gpt2", gpt2, gpt2_sd, "F32")
     gguf_quantized()
     gguf_sentencepiece()
