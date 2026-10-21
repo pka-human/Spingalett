@@ -12,7 +12,11 @@ namespace Spingalett;
 public enum Activation { None = 0, Sigmoid = 1, Relu = 2, Tanh = 3, LeakyRelu = 4, Foo52 = 5, Softmax = 6, Gelu = 7, GeluTanh = 8, Silu = 9 }
 public enum Loss { Mse = 0, CrossEntropy = 1, SparseCrossEntropy = 2 }
 public enum ComputeMode { SingleThreaded = 0, OpenMp = 1, OpenBlas = 2, Cuda = 3, Vulkan = 4 }
-public enum Precision { Float32 = 0, Fp16 = 1, BFloat16 = 2, Int8 = 3, Int4 = 4, Int2 = 5 }
+public enum Precision {
+    Float32 = 0, Fp16 = 1, BFloat16 = 2, Int8 = 3, Int4 = 4, Int2 = 5,
+    // GGUF's block types (format 10): language models' layers
+    Q8_0 = 6, Q4_0 = 7, Q4_1 = 8, Q5_0 = 9, Q5_1 = 10, Q2K = 11, Q3K = 12, Q4K = 13, Q5K = 14, Q6K = 15, IQ4NL = 16, IQ4XS = 17
+}
 public enum Optimizer { Sgd = 0, Momentum = 1, RmsProp = 2, Adam = 3, AdamW = 4 }
 public enum Strategy { Sample = 0, FullBatch = 1, SmallBatch = 2 }
 public enum Init { Random = 0, Xavier = 1, He = 2, Zeros = 3, LeCun = 4 }

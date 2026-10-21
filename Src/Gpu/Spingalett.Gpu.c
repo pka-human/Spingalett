@@ -487,7 +487,7 @@ static void image(SpgGpuNet *g, const Item *it, void *at, bool down) {
     }
     if (it->kind == ITEM_TABLE) {               /* an attention's rotary embeddings, as the CPU's */
         const LayerShape *s = &g->net->shapes[it->layer];
-        spingalett_engine_rope_table(s->height * s->width, s->channels / s->heads, s->theta, (float *)at);
+        spingalett_engine_rope_table(s->height * s->width, s->channels / s->heads, s->theta, NULL, (float *)at);
         return;
     }
     float *base = (float *)at;

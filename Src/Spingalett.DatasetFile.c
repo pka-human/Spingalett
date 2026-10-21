@@ -1612,6 +1612,7 @@ struct SpingalettDatasetReader {
     FILE *file;
     ValueForm forms[2];                 /* inputs, targets */
     uint64_t requested, taken;          /* requests issued; chunks handed to the caller */
+    uint64_t served;                    /* samples of the current pass the caller holds (positions) */
     Slot *slots, **jobs;
     uint32_t slot_count;
     Slot *current;                      /* the chunk being read */
@@ -1821,6 +1822,7 @@ static bool reader_take(SpingalettDatasetReader *r) {
     }
     bool ok = s->state == SLOT_READY;
     uint64_t q = r->taken++;
+    if (q % r->layout.chunk_count == 0) r->served = 0;        /* the pass's first chunk: a new pass */
     r->current = s;
     reader_request(r);
     if (r->thread) spg_unlock(r->signal);
@@ -2180,6 +2182,7 @@ uint32_t spingalett_dataset_read(SpingalettDatasetReader *r, float *inputs, floa
             if (r->current && r->taken % chunks == 0) {
                 if (done > 0) break;
                 r->pass_done = true;
+                r->served = 0;            /* the reader stands at the start of the next pass */
                 reader_release(r);
                 return 0;
             }
@@ -2196,11 +2199,148 @@ uint32_t spingalett_dataset_read(SpingalettDatasetReader *r, float *inputs, floa
                             r->rows_order + r->row, n, dst);
         }
         r->row += n;
+        r->served += n;
         done += n;
     }
     return done;
 }
 
+/* ------------------------------------------------------------------ positions */
+
+/* A reader's place is its seed, the pass it stands in and how many of that pass's samples it has
+   served: the order of a pass, and of the samples within each of its chunks, is drawn from the seed
+   and the pass or chunk number alone. A pass read out but whose end has not yet been reported (a
+   read of 0) is the pass with all its samples served; once reported, the reader stands at the start
+   of the pass after it. */
+bool spingalett_dataset_get_position(const SpingalettDatasetReader *r, SpingalettDatasetPosition *out) {
+    if (!r || !out) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_dataset_get_position: NULL argument");
+        return false;
+    }
+    memset(out, 0, sizeof *out);
+    out->seed = r->seed;
+    if (r->in_memory) {
+        /* `order` holds pass r->pass - 1; with its end reported the reader stands on the next pass */
+        out->pass = r->pass_done ? r->pass : r->pass - 1;
+        out->position = r->pass_done ? 0 : r->next;
+        return true;
+    }
+    const uint64_t chunks = r->layout.chunk_count;
+    if (chunks == 0) return fail(SPINGALETT_ERR_INVALID, "spingalett_dataset_get_position: a reader without chunks");
+    /* the chunk being read, when it is a pass's last one, still belongs to that pass */
+    out->pass = r->taken / chunks - (r->current && r->taken % chunks == 0 ? 1u : 0u);
+    out->position = r->served;
+    return true;
+}
+
+bool spingalett_dataset_set_position(SpingalettDatasetReader *r, const SpingalettDatasetPosition *p) {
+    if (!r || !p) {
+        set_error(SPINGALETT_ERR_INVALID, "spingalett_dataset_set_position: NULL argument");
+        return false;
+    }
+    if (p->position > r->count) {
+        char message[192];
+        snprintf(message, sizeof message, "spingalett_dataset_set_position: sample %llu of a pass of %u",
+                 (unsigned long long)p->position, r->count);
+        return fail(SPINGALETT_ERR_INVALID, message);
+    }
+    r->seed = p->seed;
+    if (r->in_memory) {
+        pass_order(r, p->pass, r->count);       /* the pass's order, as the reader drew it */
+        r->pass = p->pass + 1;
+        r->next = (uint32_t)p->position;
+        r->pass_done = false;
+        return true;
+    }
+
+    /* What the decoding thread holds belongs to the old place: it stops, every slot goes back to the
+       queue, the reader is moved, and the thread starts again. */
+    const Layout *L = &r->layout;
+    const uint32_t chunks = L->chunk_count;
+    if (chunks == 0 || p->pass > (UINT64_MAX - r->count) / chunks) {
+        char message[192];
+        snprintf(message, sizeof message, "spingalett_dataset_set_position: pass %llu of a file of %u chunks",
+                 (unsigned long long)p->pass, (unsigned)chunks);
+        return fail(SPINGALETT_ERR_INVALID, message);
+    }
+    const bool had_thread = r->thread != NULL;
+    stop_thread(r);
+    for (uint32_t s = 0; s < r->slot_count; s++) r->slots[s].state = SLOT_FREE;
+    r->current = NULL;
+    r->row = r->rows = 0;
+    r->pass_done = r->failed = false;
+    bool ok = true;
+    if (p->position == r->count) {
+        /* the pass read out and its end still to report: the slot of its last chunk, held with no rows
+           left, is what a read reports the end from */
+        r->taken = r->requested = (p->pass + 1) * (uint64_t)chunks;
+        r->served = r->count;
+        r->current = &r->slots[(r->taken - 1) % r->slot_count];
+    } else {
+        /* the walk of the pass's order finds the chunk the sample lies in, and its row there */
+        pass_order(r, p->pass, chunks);
+        uint64_t served = 0;
+        uint32_t j = 0;
+        while (j < chunks && served + chunk_rows(L, r->order[j]) <= p->position) served += chunk_rows(L, r->order[j++]);
+        const uint64_t q = p->pass * (uint64_t)chunks + j;              /* the chunk's place in the queue */
+        const uint32_t row = (uint32_t)(p->position - served);
+        r->taken = r->requested = q;                                    /* the next read takes chunk q */
+        r->served = served;
+        if (row > 0) {
+            /* inside the chunk: it is read and decoded here, and the rest of its rows come next */
+            Slot *s = &r->slots[q % r->slot_count];
+            s->chunk = r->order[j];
+            ok = slot_read(r, s) && slot_decode(r, s);
+            if (ok) {
+                s->state = SLOT_READY;
+                r->taken = r->requested = q + 1;
+                r->current = s;
+                r->rows = chunk_rows(L, s->chunk);
+                r->row = row;
+                r->served += row;
+                for (uint32_t i = 0; i < r->rows; i++) r->rows_order[i] = i;
+                if (r->shuffle) shuffle_u32(r, 2 * q + 1, r->rows_order, r->rows);
+            }
+        }
+    }
+    if (had_thread) {
+        r->stop = false;
+        r->thread = spg_thread_start(reader_thread, r);
+    }
+    return ok;
+}
+
+/* What spingalett_dataset_generator() read on this thread since a training run began to watch, and the
+   place it moves the next reader it reads to (spingalett_generator_watch()). */
+static _Thread_local struct {
+    GeneratorWatch seen;
+    SpingalettDatasetPosition at;
+} watch;
+
+void spingalett_generator_watch(const SpingalettDatasetPosition *at) {
+    memset(&watch, 0, sizeof watch);
+    if (at) {
+        watch.seen.pending = true;
+        watch.at = *at;
+    }
+}
+
+GeneratorWatch spingalett_generator_watched(void) {
+    return watch.seen;
+}
+
 uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader) {
-    return spingalett_dataset_read((SpingalettDatasetReader *)reader, inputs, targets, requested);
+    SpingalettDatasetReader *r = (SpingalettDatasetReader *)reader;
+    if (r && watch.seen.pending) {
+        watch.seen.pending = false;
+        if (!spingalett_dataset_set_position(r, &watch.at)) {
+            watch.seen.failed = true;
+            return 0;
+        }
+    }
+    if (r && r != watch.seen.reader) {
+        watch.seen.several |= watch.seen.reader != NULL;
+        watch.seen.reader = r;
+    }
+    return spingalett_dataset_read(r, inputs, targets, requested);
 }

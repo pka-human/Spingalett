@@ -38,7 +38,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -115,6 +115,19 @@ class Precision(enum.IntEnum):
     INT8 = 3
     INT4 = 4
     INT2 = 5
+    # GGUF's block types (format 10): language models' layers, blocks of 32 or super-blocks of 256 weights
+    Q8_0 = 6
+    Q4_0 = 7
+    Q4_1 = 8
+    Q5_0 = 9
+    Q5_1 = 10
+    Q2_K = 11
+    Q3_K = 12
+    Q4_K = 13
+    Q5_K = 14
+    Q6_K = 15
+    IQ4_NL = 16
+    IQ4_XS = 17
 
 
 class LayerType(enum.IntEnum):
@@ -499,6 +512,12 @@ class _DatasetReaderOptions(Structure):
     _fields_ = [("shuffle", c_bool), ("in_memory", c_bool), ("no_prefetch", c_bool), ("target_set", c_uint32), ("reserved", c_uint64 * _RESERVED)]
 
 
+class _DatasetPosition(Structure):
+    """SpingalettDatasetPosition (1.4): where a reader stands; the readers of train_from_file() and
+    train_from_tokens() live inside the call, and checkpoints hold their positions."""
+    _fields_ = [("seed", c_uint64), ("pass", c_uint64), ("position", c_uint64), ("reserved", c_uint64 * _RESERVED)]
+
+
 class _TokenReaderOptions(Structure):
     _fields_ = [
         ("context", c_uint32),
@@ -556,6 +575,14 @@ class _Model(Structure):
 
 
 _ModelPtr = POINTER(_Model)
+
+
+class _ModelOpenArgs(Structure):
+    _fields_ = [
+        ("path", c_char_p),
+        ("context", c_uint32),
+        ("reserved", c_uint64 * _RESERVED),
+    ]
 
 
 class _SessionOptions(Structure):
@@ -819,6 +846,7 @@ _free_memory = _bind("spingalett_free", None, [c_void_p])
 _export_c_header = _bind("spingalett_export_c_header", c_bool, [_NetPtr, c_char_p, c_char_p, c_int])
 _model_from_network = _bind("spingalett_model_from_network", _ModelPtr, [_NetPtr, c_int])
 _model_load = _bind("spingalett_model_load", _ModelPtr, [c_char_p])
+_model_open = _bind("spingalett_model_open_args", _ModelPtr, [_ModelOpenArgs])
 _model_from_memory = _bind("spingalett_model_from_memory", _ModelPtr, [c_char_p, c_size_t])
 _model_free = _bind("spingalett_model_free", None, [_ModelPtr])
 _model_layer = _bind("spingalett_model_layer", c_bool, [_ModelPtr, c_uint32, POINTER(_LayerInfo)])
@@ -880,10 +908,14 @@ _tokenize = _bind_optional("spingalett_tokenize_args", ctypes.c_int64, [_Tokeniz
 _detokenize = _bind_optional("spingalett_detokenize_args", ctypes.c_int64, [_DetokenizeArgs])
 _load_pretrained = _bind_optional("spingalett_load_pretrained_args", _NetPtr, [_PretrainedArgs])
 
+# 1.4: checkpoints of training runs
+_save_checkpoint = _bind_optional("spingalett_save_checkpoint", c_bool, [_NetPtr, c_char_p])
+_load_checkpoint = _bind_optional("spingalett_load_checkpoint", _NetPtr, [c_char_p])
 
-def _require(fn, what: str):
+
+def _require(fn, what: str, version: str = "1.3"):
     if fn is None:
-        raise SpingalettError(-1, f"{what} needs Spingalett 1.3 or later (the library is {_LIBRARY_VERSION})")
+        raise SpingalettError(-1, f"{what} needs Spingalett {version} or later (the library is {_LIBRARY_VERSION})")
     return fn
 
 
@@ -1538,6 +1570,20 @@ class Network:
             raise SpingalettError(-1, f"could not load {path!s}")
         return cls._wrap(ptr)
 
+    @classmethod
+    def load_checkpoint(cls, path) -> "Network":
+        """Load a checkpoint written by :meth:`save_checkpoint` or by an autosave in FLOAT32 with the optimizer
+        state: the network, its optimizer state and the state of the training run, which the next
+        :meth:`train` (or ``train_from_file``, ``train_from_tokens``, ``train_from_generator``) carries on when
+        given the run's arguments again, ``epochs`` counting all the run's epochs. A run stopped at an epoch's
+        end and carried on so trains the same bits as one that never stopped; the reader of
+        ``train_from_file`` or ``train_from_tokens`` resumes where the run's stood. A .slett model loads
+        without a run's state."""
+        ptr = _call(_require(_load_checkpoint, "Network.load_checkpoint", "1.4"), _encode_path(path))
+        if not ptr:
+            raise SpingalettError(-1, f"could not load {path!s}")
+        return cls._wrap(ptr)
+
     # ---- lifetime
     def close(self) -> None:
         ptr = getattr(self, "_ptr", None)
@@ -2148,6 +2194,12 @@ class Network:
         """Save to ``path`` (".slett" is appended when there is no extension)."""
         _call(_save, _SaveArgs(self._ptr, _encode_path(path), not save_optimizer, int(precision)))
 
+    def save_checkpoint(self, path) -> None:
+        """Save a checkpoint to ``path``, as given: the network, its optimizer state and the state of the
+        training run as its last epoch left it (see :meth:`load_checkpoint`). Call it from the training
+        callback, or after training."""
+        _call(_require(_save_checkpoint, "Network.save_checkpoint", "1.4"), self._net, _encode_path(path))
+
     def to_bytes(self, precision: Precision = Precision.FLOAT32, save_optimizer: bool = False) -> bytes:
         """The .slett file :meth:`save` would write, as bytes."""
         size = c_size_t()
@@ -2328,9 +2380,11 @@ class Model:
         return model
 
     @classmethod
-    def load(cls, path) -> "Model":
-        """Read a .slett file; files of older format versions are converted in their precision."""
-        return cls._wrap(_call(_model_load, _encode_path(path)))
+    def load(cls, path, context: int = 0) -> "Model":
+        """Read a .slett file (files of older format versions are converted in their precision), or a language
+        model's GGUF file: its network with the file's tensors as they are stored (the quantized types as block
+        precisions), a window of `context` tokens (0: the model's positions, 4096 at most)."""
+        return cls._wrap(_call(_model_open, _ModelOpenArgs(_encode_path(path), int(context))))
 
     @classmethod
     def from_bytes(cls, data) -> "Model":

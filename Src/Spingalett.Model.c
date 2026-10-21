@@ -10,6 +10,8 @@
  */
 
 #include "Spingalett.Model.h"
+#include "Spingalett.Blocks.h"
+#include "Spingalett.Pretrained.h"
 #if !defined(SPINGALETT_RUNTIME)
 #include "Spingalett.Gpu.h"
 #endif
@@ -110,14 +112,33 @@ SpingalettModel *spingalett_model_from_memory(const void *data, size_t size) {
     return model_from_buffer(copy, size);
 }
 
-SpingalettModel *spingalett_model_load(const char *path) {
-    if (!path) {
+SpingalettModel *spingalett_model_open_args(SpingalettModelOpenArgs args) {
+    if (!args.path) {
         set_error(SPINGALETT_ERR_INVALID, "model: path is NULL");
         return NULL;
     }
-    size_t size = 0;
-    void *data = spingalett_read_file(path, &size);
-    return data ? model_from_buffer(data, size) : NULL;
+    /* a GGUF file mapped while its image is made, its tensors copied into it */
+    SpgFileView file;
+    if (!spingalett_file_open(&file, args.path)) return NULL;
+    if (file.size >= 4 && !memcmp(file.data, "GGUF", 4)) {
+        size_t size = 0;
+        uint8_t *image = spingalett_gguf_image(file.data, file.size, args.context, &size);
+        spingalett_file_close(&file);
+        return image ? adopt_image(image, size) : NULL;
+    }
+    void *data = spingalett_aligned_alloc(file.size);
+    if (data) memcpy(data, file.data, file.size);
+    const size_t size = file.size;
+    spingalett_file_close(&file);
+    if (!data) {
+        set_error(SPINGALETT_ERR_ALLOC, "model: allocation failed");
+        return NULL;
+    }
+    return model_from_buffer(data, size);
+}
+
+SpingalettModel *spingalett_model_load(const char *path) {
+    return spingalett_model_open(.path = path);
 }
 
 void spingalett_model_free(SpingalettModel *model) {
@@ -140,6 +161,7 @@ void spingalett_predict_workspace_free(PredictWorkspace *w) {
     spingalett_aligned_free(w->window);
     spingalett_aligned_free(w->conv);
     spingalett_aligned_free(w->norm);
+    spingalett_aligned_free(w->blockq);
     spingalett_aligned_free(w->tile);
     spingalett_gemm_scratch_free(w->gemm);
     free(w);
@@ -380,6 +402,7 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
     w->sessions = sessions;
     uint32_t int_inputs = 0, int_window = 0, norm_channels = 0, transposed_window = 0, scales = 1;
     size_t conv_floats = 0, tile_x = 0, tile_acc = 0;
+    uint64_t block_bytes = 0;
     bool has_float = false, ok = true;
     for (uint32_t i = 0; i < model->layer_count; i++) {
         SlettLayer L;
@@ -405,6 +428,11 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
             continue;
         }
         if (L.rows == 0 || L.type == LAYER_BATCH_NORM || L.type == LAYER_LAYER_NORM) continue;      /* pooling, normalizations */
+        if (slett_block_layer(&L)) {
+            const uint64_t need = spingalett_block_scratch(&L, (uint64_t)chunk * (L.inputs / L.row_len), w->threads);
+            if (need > block_bytes) block_bytes = need;
+            continue;
+        }
         bool conv = L.type == LAYER_CONV2D;
         if (spingalett_precision_is_int(L.precision)) {
             if (L.inputs > int_inputs) int_inputs = L.inputs;
@@ -456,6 +484,11 @@ PredictWorkspace *spingalett_predict_workspace_create(const SpingalettModel *mod
                must have some */
             if (ok) memset(w->tile, 0, (size_t)w->threads * w->tile_stride);
         }
+    }
+    if (ok && block_bytes) {
+        ok = block_bytes <= SIZE_MAX;
+        w->blockq = ok ? (uint8_t *)workspace_alloc(w, (size_t)block_bytes) : NULL;
+        ok = w->blockq != NULL;
     }
     if (ok && conv_floats) {
         w->conv = (float *)workspace_alloc(w, conv_floats * sizeof(float));
@@ -689,12 +722,15 @@ void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const P
                     SlettAttention a;
                     spingalett_engine_attention_of(image, L, input ? input + (size_t)s * input_size : NULL, &a);
                     if (kv) a.kv_input = kv + (size_t)s * a.kcells * 2u * a.kv * a.head;  /* (cross-attention) */
-                    /* (no scratch without rotary embeddings: the window may not exist) */
+                    /* (no scratch without rotary embeddings or normalized heads: the window may not exist) */
                     float *scratch = NULL, *table = NULL;
-                    if (L->theta > 0.0f) {
+                    if (slett_attention_prepared(L))
                         scratch = (float *)(void *)(w->window + (size_t)spingalett_thread_num() * w->window_stride);
+                    if (L->theta > 0.0f) {
                         table = scratch + (size_t)a.cells * a.kv * a.head + a.head;
-                        spingalett_engine_rope_table(a.cells, a.head, L->theta, table);
+                        spingalett_engine_rope_table(a.cells, a.rot, L->theta,
+                                                     L->freqs ? (const float *)(const void *)(image + L->scales) : NULL,
+                                                     table);
                     }
                     spingalett_engine_attention(&a, xs, table, ys, scratch);
                 } else {
@@ -739,6 +775,17 @@ void spingalett_predict_layer(const uint8_t *image, const SlettLayer *L, const P
                 spingalett_engine_activate(ys, out, L->activation);
             }
         );
+        return;
+    }
+    if (slett_block_layer(L)) {
+        /* a dense or linear layer: every cell of every sample through the block kernels */
+        const uint64_t items = (uint64_t)n * (in / L->row_len);
+        int threads = 1;
+#if defined(_OPENMP)
+        if (use_omp_int(mode, items * L->row_len * L->rows)) threads = omp_get_max_threads();
+#endif
+        spingalett_block_layer(image, L, x, y, items, w->blockq, threads);
+        activate_samples(y, n, out, L->activation, mode);
         return;
     }
     if (L->type != LAYER_DENSE) {

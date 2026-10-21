@@ -9,7 +9,7 @@
  * cross-backend comparisons then pass trivially.
  *
  *   Spingalett.Tests [group]     groups: grad conv norm graph onnx tokenizer pretrained equiv cont optim sched
- *                                dropout gen predict valid step data io model xor
+ *                                dropout gen predict valid step data resume io model xor
  *                                (default: all)
  *
  * Numerical gradients come from central differences of an independently computed loss; analytic
@@ -31,6 +31,10 @@
 #endif
 
 static int failures = 0;
+/* The precisions of a scale a row, which the tests of 1.3 and before take one by one (the block precisions of
+   format 10 have tests of their own). */
+#define ROW_PRECISIONS (PRECISION_INT2 + 1)
+
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static unsigned lcg_state = 12345;
@@ -2387,6 +2391,825 @@ static void dataset_files_v2(void) {
 }
 
 
+/* ---------------- the place a reader stands in: stopping a run and carrying it on */
+
+/* Readers of one stream: the same file, the same options, so that a position taken from one belongs
+   to the others, and all of them draw the same seed (the library's generator reseeded before each
+   open). kind 0 is a file of tokens, 1 a streaming .slettd reader, 2 an in-memory one. */
+typedef struct {
+    int kind;
+    const char *path;
+    SpingalettTokenReaderOptions tokens;
+    DatasetReaderOptions reader;
+} PositionSource;
+
+static SpingalettDatasetReader *open_positions(const PositionSource *src, uint64_t seed) {
+    spingalett_seed(seed);
+    return src->kind == 0 ? spingalett_dataset_open_tokens(src->path, &src->tokens)
+                          : spingalett_dataset_open_ex(src->path, &src->reader);
+}
+
+static bool same_position(const SpingalettDatasetPosition *a, const SpingalettDatasetPosition *b) {
+    return a->seed == b->seed && a->pass == b->pass && a->position == b->position;
+}
+
+/* Writes want samples into x and y, in reads of at most batch. A read of 0 ends a pass and the next
+   one starts the pass after it; two of them in a row is a reader that stops short of the run. */
+static bool read_samples(SpingalettDatasetReader *r, uint64_t want, uint32_t in, uint32_t out, float *x, float *y,
+                         uint32_t batch) {
+    uint64_t done = 0;
+    uint32_t zeros = 0;
+    while (done < want) {
+        uint32_t ask = (uint32_t)(want - done < batch ? want - done : batch);
+        uint32_t got = spingalett_dataset_read(r, x + (size_t)done * in, y + (size_t)done * out, ask);
+        if (got == 0) {
+            if (++zeros > 1) return false;
+            continue;
+        }
+        zeros = 0;
+        done += got;
+    }
+    return true;
+}
+
+/* The samples after a position, read as the stream continues, then read again after the same reader
+   is moved back to it and after a freshly opened one is moved there; both compared with the run of
+   a reader that never left the stream, so that a resumed run that lost or repeated samples shows.
+   *pos holds the position (and *info the reader's shape) either way, for callers that compare the
+   positions of readers that differ only in how their chunks get decoded. */
+static bool position_round_trip(const PositionSource *src, uint64_t seed, uint64_t before, uint64_t after,
+                                uint32_t batch, SpingalettDatasetPosition *pos, SpingalettDatasetInfo *info) {
+    bool ok = false;
+    memset(pos, 0, sizeof *pos);
+    SpingalettDatasetReader *r = open_positions(src, seed), *ref = open_positions(src, seed), *fresh = NULL;
+    *info = spingalett_dataset_info(r);
+    const uint32_t in = info->input_size, tg = info->target_size;
+    const size_t span = (size_t)(before + after);
+    float *rx = malloc(span * in * sizeof(float)), *ry = malloc(span * tg * sizeof(float));
+    float *ax = malloc(span * in * sizeof(float)), *ay = malloc(span * tg * sizeof(float));
+    float *bx = malloc((size_t)after * in * sizeof(float)), *by = malloc((size_t)after * tg * sizeof(float));
+    ok = r && ref && in && tg && rx && ry && ax && ay && bx && by;
+    if (ok) ok = read_samples(ref, span, in, tg, rx, ry, batch);
+    /* the run before the position, and the run that follows it, of the reader itself */
+    if (ok) ok = read_samples(r, before, in, tg, ax, ay, batch) &&
+                 spingalett_dataset_get_position(r, pos) && pos->position <= info->count &&
+                 read_samples(r, after, in, tg, ax + (size_t)before * in, ay + (size_t)before * tg, batch);
+    if (ok) {
+        ok = !memcmp(ax, rx, span * in * sizeof(float)) && !memcmp(ay, ry, span * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: the stream itself differs from the reference\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+
+    /* the same reader, moved back to where it stood */
+    if (ok) {
+        memset(bx, 0, (size_t)after * in * sizeof(float));
+        memset(by, 0, (size_t)after * tg * sizeof(float));
+        SpingalettDatasetPosition here = {0};
+        ok = spingalett_dataset_set_position(r, pos);
+        if (ok) ok = spingalett_dataset_get_position(r, &here) && same_position(pos, &here);
+        if (ok) ok = read_samples(r, after, in, tg, bx, by, batch) &&
+                     !memcmp(bx, ax + (size_t)before * in, (size_t)after * in * sizeof(float)) &&
+                     !memcmp(by, ay + (size_t)before * tg, (size_t)after * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: resuming the reader itself differs\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+
+    /* a reader of the same file and options, opened now and moved to that position */
+    if (ok) {
+        fresh = open_positions(src, seed + 1234);     /* its own draw, until the position sets it */
+        memset(bx, 0, (size_t)after * in * sizeof(float));
+        memset(by, 0, (size_t)after * tg * sizeof(float));
+        ok = spingalett_dataset_set_position(fresh, pos) &&
+             read_samples(fresh, after, in, tg, bx, by, batch) &&
+             !memcmp(bx, ax + (size_t)before * in, (size_t)after * in * sizeof(float)) &&
+             !memcmp(by, ay + (size_t)before * tg, (size_t)after * tg * sizeof(float));
+        if (!ok) printf("    position %llu of pass %llu: a freshly opened reader differs\n",
+                        (unsigned long long)pos->position, (unsigned long long)pos->pass);
+    }
+    spingalett_dataset_close(fresh);
+    spingalett_dataset_close(ref);
+    spingalett_dataset_close(r);
+    free(rx); free(ry); free(ax); free(ay); free(bx); free(by);
+    return ok;
+}
+
+/* The place of a stream after before samples: a pass whose every sample the caller holds is still
+   that pass, with its end not yet reported by a read of 0. */
+static void expect_position(uint64_t before, uint32_t count, uint64_t *pass, uint64_t *position) {
+    if (!count) {
+        *pass = *position = 0;
+        return;
+    }
+    *pass = before / count;
+    *position = before % count;
+    if (*position == 0 && before > 0) {
+        (*pass)--;
+        *position = count;
+    }
+}
+
+static void dataset_positions(void) {
+    ComputeMode mode = spingalett_get_compute_mode();
+
+    /* ---- positions of the reader itself, and of NULL: refused, and the reader untouched */
+    {
+        const char *path = "spingalett_test_pos_null.slettd";
+        SpingalettDataset d = {0};
+        make_ds(&d, 8, 240, 16);
+        for (uint32_t i = 0; i < d.count; i++)
+            for (uint32_t k = 0; k < 240; k++) d.inputs[(size_t)i * 240 + k] = (float)(i * 240 + k) / 7.0f;
+        DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32, .target_encoding = DATASET_ENCODING_FLOAT32,
+                                 .no_compression = true};
+        CHECK(spingalett_save_dataset(&d, path, &so), "positions: the file of the NULL checks");
+        spingalett_dataset_free(&d);
+        SpingalettDatasetReader *r = spingalett_dataset_open(path, true);
+        SpingalettDatasetPosition p = {0};
+        CHECK(!spingalett_dataset_get_position(NULL, &p) && !spingalett_dataset_get_position(r, NULL) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "positions: get of NULL");
+        CHECK(spingalett_dataset_get_position(r, &p) && p.pass == 0 && p.position == 0, "positions: a reader just opened");
+        CHECK(!spingalett_dataset_set_position(NULL, &p) && !spingalett_dataset_set_position(r, NULL) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "positions: set of NULL");
+        float x[240], y[16];
+        uint64_t bad = p.position;
+        p.position = UINT64_MAX;
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a sample beyond the pass accepted");
+        p.position = UINT32_MAX;                     /* the count is well under it here */
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a sample of 2^32 accepted");
+        p.position = bad;
+        p.pass = UINT64_MAX;
+        CHECK(!spingalett_dataset_set_position(r, &p) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+              "positions: a pass that overflows the chunk queue accepted");
+        p.pass = 0;
+        CHECK(spingalett_dataset_read(r, x, y, 1) == 1, "positions: a reader of refused positions still serves");
+        spingalett_dataset_close(r);
+        remove(path);
+    }
+
+    /* ---- files of tokens: windows of uint16 (nanoGPT) and of uint32 behind a header (llm.c) */
+    const char *tpaths[] = {"spingalett_test_pos_tokens.bin", "spingalett_test_pos_tokens_llmc.bin"};
+    const uint32_t ntok = 400, tctx = 8, tstride = 3;
+    for (int file = 0; file < 2; file++) {
+        FILE *f = fopen(tpaths[file], "wb");
+        if (!f) { CHECK(false, "positions: cannot write %s", tpaths[file]); return; }
+        if (file) {
+            uint32_t header[256] = {20240520u, 2u, ntok};
+            fwrite(header, sizeof header, 1, f);
+        }
+        for (uint32_t i = 0; i < ntok; i++) {
+            const uint32_t t = (i * 6151u + 11u) % 65000u;
+            const uint8_t b[4] = {(uint8_t)t, (uint8_t)(t >> 8), (uint8_t)(t >> 16), (uint8_t)(t >> 24)};
+            fwrite(b, 1, file ? 4 : 2, f);
+        }
+        fclose(f);
+    }
+    const uint32_t tcount = (ntok - tctx - 1) / tstride + 1;
+    const uint64_t tcases[][2] = {
+        {0, 17}, {1, 23}, {tcount / 2, 9}, {tcount - 5, 9}, {tcount, 12},
+        {tcount + 1, 30}, {2 * tcount, 7}, {2 * tcount + tcount / 3, 25},
+    };
+    for (int file = 0; file < 2; file++)
+        for (int shuffled = 1; shuffled >= 0; shuffled--)
+            for (size_t k = 0; k < sizeof tcases / sizeof *tcases; k++) {
+                PositionSource src = {.kind = 0, .path = tpaths[file],
+                                      .tokens = {.context = tctx, .stride = tstride, .shuffle = shuffled}};
+                SpingalettDatasetPosition pos = {0};
+                SpingalettDatasetInfo info = {0};
+                bool ok = position_round_trip(&src, 21 + 5 * (uint64_t)k, tcases[k][0], tcases[k][1], 5, &pos, &info);
+                CHECK(ok, "positions: tokens %d shuffle %d at %llu samples (pass %llu, position %llu of %u)", file, shuffled,
+                      (unsigned long long)tcases[k][0], (unsigned long long)pos.pass, (unsigned long long)pos.position,
+                      info.count);
+            }
+
+    /* ---- streaming readers: several chunks, of which one thread decodes ahead, none decodes ahead,
+           and the caller's OpenMP threads decode together */
+    const char *spath = "spingalett_test_pos.slettd";
+    {
+        SpingalettDataset d = {0};
+        make_ds(&d, 3072, 240, 16);
+        lcg_state = 9;
+        for (uint32_t i = 0; i < d.count; i++) {
+            for (uint32_t k = 0; k < 240; k++) d.inputs[(size_t)i * 240 + k] = frand();
+            for (uint32_t k = 0; k < 16; k++) d.targets[(size_t)i * 16 + k] = (float)((i + k) % 16) / 16.0f;
+            d.targets[(size_t)i * 16 + i % 16] = 1.0f;
+        }
+        DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32, .target_encoding = DATASET_ENCODING_FLOAT32,
+                                 .no_compression = true};
+        CHECK(spingalett_save_dataset(&d, spath, &so), "positions: saving the streaming file");
+        spingalett_dataset_free(&d);
+    }
+    SpingalettDatasetReader *probe = spingalett_dataset_open(spath, false);
+    SpingalettDatasetInfo sinfo = spingalett_dataset_info(probe);
+    spingalett_dataset_close(probe);
+    const uint32_t chunks = sinfo.chunk_count, ccount = sinfo.count;
+    CHECK(chunks > 1 && ccount % chunks == 0, "positions: the streaming file holds %u chunks of %u samples", chunks,
+          ccount / chunks);
+    const uint32_t crows = ccount / chunks;
+    /* the same stream through the library's in-memory path (every sample held, not read by chunks) */
+    const uint64_t memcases[] = {1300, ccount, 2 * (uint64_t)ccount + crows};
+    for (size_t k = 0; k < sizeof memcases / sizeof *memcases; k++) {
+        PositionSource src = {.kind = 2, .path = spath, .reader = {.shuffle = true, .in_memory = true}};
+        SpingalettDatasetPosition pos = {0};
+        SpingalettDatasetInfo info = {0};
+        bool ok = position_round_trip(&src, 33, memcases[k], 400, 60, &pos, &info);
+        uint64_t pass, position;
+        expect_position(memcases[k], info.count, &pass, &position);
+        ok = ok && pos.pass == pass && pos.position == position;
+        CHECK(ok, "positions: the in-memory reader at %llu samples (pass %llu, position %llu of %u, want %llu/%llu)",
+              (unsigned long long)memcases[k], (unsigned long long)pos.pass, (unsigned long long)pos.position, info.count,
+              (unsigned long long)pass, (unsigned long long)position);
+    }
+    struct { uint64_t before; uint64_t after; } cases[] = {
+        {0, 25}, {1, 40}, {crows - 3, 60}, {crows, 60}, {crows + 1, 30}, {2 * crows, 200},
+        {ccount - 4, 30}, {ccount, 150}, {ccount + 1, 60}, {ccount + crows, 20}, {ccount / 2, 1030},
+        {2 * ccount, 44}, {2 * ccount - 2, 500}, {2 * ccount + 1, 80},
+    };
+    /* a position of one decoding scheme resumes the same samples of another: the same seed, the same
+       stream, chunks decoded by a thread, by none, or by all of the caller's threads together */
+    static const ComputeMode open_modes[3] = {COMPUTE_SINGLE_THREADED, COMPUTE_SINGLE_THREADED, COMPUTE_OPENMP};
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        SpingalettDatasetPosition first = {0};
+        uint64_t pass, position;
+        expect_position(cases[k].before, ccount, &pass, &position);
+        for (int v = 0; v < 3; v++) {
+            spingalett_set_compute_mode(open_modes[v]);
+            PositionSource src = {.kind = 1, .path = spath, .reader = {.shuffle = true, .no_prefetch = v == 1}};
+            SpingalettDatasetPosition pos = {0};
+            SpingalettDatasetInfo info = {0};
+            bool ok = position_round_trip(&src, 51 + 7 * (uint64_t)k, cases[k].before, cases[k].after, 64, &pos, &info);
+            ok = ok && pos.pass == pass && pos.position == position;
+            if (v == 0) first = pos;
+            else ok = ok && same_position(&pos, &first);
+            spingalett_set_compute_mode(mode);
+            CHECK(ok, "positions: streaming %d at %llu samples (pass %llu position %llu of %u, want %llu/%llu, %u chunks)",
+                  v, (unsigned long long)cases[k].before, (unsigned long long)pos.pass,
+                  (unsigned long long)pos.position, info.count, (unsigned long long)pass,
+                  (unsigned long long)position, info.chunk_count);
+        }
+    }
+    /* a pass in file order, resumed at places that are its own since nothing shuffles it */
+    static const uint64_t passes[] = {0, 1, 2, 1};
+    for (size_t k = 0; k < 4; k++) {
+        const uint64_t before = passes[k] * (uint64_t)ccount + 1 + 97 * (uint64_t)k;
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        PositionSource src = {.kind = 1, .path = spath, .reader = {.shuffle = false}};
+        SpingalettDatasetPosition pos = {0};
+        SpingalettDatasetInfo info = {0};
+        bool ok = position_round_trip(&src, 5 + 3 * (uint64_t)k, before, 130 + 11 * (uint64_t)k, 97, &pos, &info);
+        uint64_t pass, position;
+        expect_position(before, info.count, &pass, &position);
+        ok = ok && pos.pass == pass && pos.position == position;
+        spingalett_set_compute_mode(mode);
+        CHECK(ok, "positions: in order at %llu samples (pass %llu, position %llu, want %llu/%llu)",
+              (unsigned long long)before, (unsigned long long)pos.pass, (unsigned long long)pos.position,
+              (unsigned long long)pass, (unsigned long long)position);
+    }
+    remove(spath);
+    for (int file = 0; file < 2; file++) remove(tpaths[file]);
+    printf("  positions: %u token windows and %u samples of %u chunks resume where they stood\n", tcount, ccount, chunks);
+}
+
+/* ---------------- checkpoints: a run stopped at an epoch's end and carried on */
+
+/* What a run's callback logs: every epoch's loss, and the epoch of the run with the epochs of the
+   run — what a learning-rate schedule is given, so that a resumed call that counted only its own
+   epochs or its own total shows at once. stop_at interrupts the run after that many epochs, which is
+   where its checkpoint is written. */
+typedef struct {
+    float loss[64];
+    size_t epoch[64], total[64];
+    uint32_t count, stop_at;
+    bool draw;                  /* the callback draws from the library's generator, as building a network does */
+    const char *checkpoint;     /* written by the callback at stop_at */
+} RunLog;
+
+static bool log_run_epoch(NeuralNetwork *net, const TrainProgress *p, void *data) {
+    RunLog *l = (RunLog *)data;
+    if (l->draw) {
+        NeuralNetwork *other = new_spingalett(.loss_func = LOSS_MSE);
+        layer(.net = other, .neurons_amount = 5);
+        layer(.net = other, .neurons_amount = 7, .act_func = ACT_TANH);
+        free_network(other);
+    }
+    if (l->count < sizeof l->loss / sizeof l->loss[0]) {
+        l->loss[l->count] = p->train_loss;
+        l->epoch[l->count] = p->epoch;
+        l->total[l->count] = p->epochs;
+    }
+    l->count++;
+    const bool stop = l->stop_at != 0 && l->count == l->stop_at;
+    if (stop && l->checkpoint && !spingalett_save_checkpoint(net, l->checkpoint)) l->count += 1000;
+    return stop;
+}
+
+/* The entries of two runs' logs that differ in any bit, plus a count that differs. */
+static uint32_t log_diff(const RunLog *a, const RunLog *b) {
+    uint32_t d = a->count != b->count ? 1u : 0u;
+    for (uint32_t i = 0; i < a->count && i < b->count; i++) {
+        if (memcmp(&a->loss[i], &b->loss[i], sizeof(float))) d++;
+        if (a->epoch[i] != b->epoch[i] || a->total[i] != b->total[i]) d++;
+    }
+    return d;
+}
+
+/* Floats that differ in any bit. */
+static uint64_t bit_diff(const float *a, const float *b, uint64_t n) {
+    uint64_t d = 0;
+    for (uint64_t i = 0; i < n; i++) if (memcmp(a + i, b + i, sizeof(float))) d++;
+    return d;
+}
+
+/* As bit_diff, for the arrays a run makes when it needs them: one side without the other is a
+   difference, and neither side's absence one of none. */
+static uint64_t array_diff(const float *a, const float *b, uint64_t n) {
+    if (!a || !b) return a == b ? 0u : 1u;
+    return bit_diff(a, b, n);
+}
+
+static NeuralNetwork *resume_dense_net(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = 6);
+    layer(.net = net, .neurons_amount = 12, .act_func = ACT_RELU, .weight_initialization = WEIGHT_INITIALIZATION_HE,
+          .dropout_rate = 0.3f);
+    layer(.net = net, .neurons_amount = 8, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+    return net;
+}
+
+static NeuralNetwork *resume_conv_net(void) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_CROSS_ENTROPY);
+    layer(.net = net, .height = 8, .width = 8, .channels = 3);
+    conv2d(.net = net, .filters = 6, .kernel = 3, .padding = 1, .act_func = ACT_RELU,
+           .weight_initialization = WEIGHT_INITIALIZATION_HE, .dropout_rate = 0.25f);
+    max_pool2d(.net = net, .kernel = 2);
+    conv2d(.net = net, .filters = 5, .kernel = 3, .padding = 1, .act_func = ACT_SIGMOID);
+    batch_norm(.net = net, .act_func = ACT_TANH);
+    layer(.net = net, .neurons_amount = 3, .act_func = ACT_SOFTMAX);
+    return net;
+}
+
+/* A small language model over cells of token indices, what the windows of a token file train. */
+static NeuralNetwork *resume_lm_net(uint32_t cells, uint32_t vocab) {
+    NeuralNetwork *net = new_spingalett(.loss_func = LOSS_SPARSE_CROSS_ENTROPY);
+    layer(.net = net, .neurons_amount = cells);
+    embedding(.net = net, .vocabulary = vocab, .neurons_amount = 8, .positions = true,
+              .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    linear(.net = net, .neurons_amount = 24, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    attention(.net = net, .heads = 2, .kv_heads = 2, .causal = true);
+    linear(.net = net, .neurons_amount = vocab, .weight_initialization = WEIGHT_INITIALIZATION_LECUN);
+    return net;
+}
+
+static NeuralNetwork *resume_net(int which, uint32_t cells, uint32_t vocab) {
+    return which == 0 ? resume_dense_net() : which == 1 ? resume_conv_net() : resume_lm_net(cells, vocab);
+}
+
+/* A schedule of the whole run's epochs, so that a resumed run must know how many the run holds. */
+static float resume_lr(size_t epoch, size_t total_epochs, float initial_lr, void *data) {
+    (void)data;
+    return initial_lr * (float)(1.0 - 0.5 * (double)epoch / (double)(total_epochs ? total_epochs : 1));
+}
+
+/* The GPU's mode for the runs of resume_case() (COMPUTE_SINGLE_THREADED: the CPU, by thread count). */
+static ComputeMode resume_gpu = COMPUTE_SINGLE_THREADED;
+
+static void resume_compute(uint32_t threads) {
+    if (resume_gpu != COMPUTE_SINGLE_THREADED) {
+        spingalett_set_compute_mode(resume_gpu);
+        return;
+    }
+    spingalett_set_compute_mode(threads > 1 ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+    spingalett_set_num_threads(threads);
+}
+
+/* n tokens of a file of nanoGPT's shape (uint16, little-endian), each below vocab. */
+static bool write_token_file(const char *path, uint32_t n, uint32_t vocab) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = true;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t t = (i * 37u + 5u) % vocab;
+        const uint8_t b[2] = {(uint8_t)t, (uint8_t)(t >> 8)};
+        ok = ok && fwrite(b, 1, 2, f) == 2;
+    }
+    fclose(f);
+    return ok;
+}
+
+/* A reader of the case's stream, drawn from the library's generator as the run's first one was;
+   NULL for a case that trains on arrays. */
+static SpingalettDatasetReader *resume_open(int source, const char *dspath, const char *tokpath, uint32_t cells) {
+    if (source == 3) {
+        const SpingalettTokenReaderOptions o = {.context = cells, .stride = 1, .shuffle = true};
+        return spingalett_dataset_open_tokens(tokpath, &o);
+    }
+    if (source == 0) return NULL;
+    const DatasetReaderOptions o = {.shuffle = true, .in_memory = source == 2};
+    return spingalett_dataset_open_ex(dspath, &o);
+}
+
+struct ResumeCase {
+    const char *name;
+    int net;            /* 0 dense, 1 convolutional, 2 a language model */
+    int source;         /* 0 arrays, 1 a streamed .slettd, 2 a .slettd kept in memory, 3 a token file */
+    bool augment, scheduler, validate, plateau, early_stop, restore_best, per_step, draw, autosave;
+    uint32_t accumulate;
+    OptimizerType opt;
+    uint32_t samples, batch, first, rest;
+    uint32_t threads[3];    /* the run that never stops, the run before the checkpoint, the one after it */
+};
+
+/* Trains the case's network for first + rest epochs without stopping, and the same run stopped after
+   `first` epochs, its checkpoint written (by the callback, or by the autosave), and carried on by the
+   train() after spingalett_load_checkpoint(), with the process's generator reseeded otherwise, its
+   reader opened afresh, on the case's third thread count. The parameters, the optimizer's moments, the
+   running statistics, the last step's gradients, the step count and every epoch's loss, epoch number
+   and total must come out the same bits, and so must the reports. */
+static void resume_case(const struct ResumeCase *c) {
+    const char *dspath = "spingalett_test_resume.slettd", *ckpath = "spingalett_test_resume.ckpt",
+               *tokpath = "spingalett_test_resume_tok.bin";
+    const uint32_t cells = 6, vocab = 64, ntok = 400;
+    const uint32_t in = c->net == 0 ? 6 : c->net == 1 ? 8u * 8u * 3u : cells;
+    const uint32_t out = c->net == 2 ? vocab : 3;
+    const size_t total = c->first + c->rest;
+    bool ok = true;
+
+    lcg_state = 90210;
+    float *x = NULL, *y = NULL, *vx = NULL, *vy = NULL;
+    if (c->source != 3) make_data(c->samples, in, out, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    if (c->validate) {
+        lcg_state = 4242;
+        make_data(24, in, out, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &vx, &vy);
+    }
+    if (c->source == 1 || c->source == 2) {           /* the same samples in a .slettd file */
+        SpingalettDataset d = {0};
+        make_ds(&d, c->samples, in, out);
+        memcpy(d.inputs, x, (size_t)c->samples * in * sizeof(float));
+        memcpy(d.targets, y, (size_t)c->samples * out * sizeof(float));
+        const DatasetSaveOptions so = {.input_encoding = DATASET_ENCODING_FLOAT32,
+                                       .target_encoding = DATASET_ENCODING_FLOAT32, .no_compression = true};
+        ok = ok && spingalett_save_dataset(&d, dspath, &so);
+        spingalett_dataset_free(&d);
+    }
+    if (c->source == 3) ok = ok && write_token_file(tokpath, ntok, vocab);
+    CHECK(ok, "resume: the data of %s", c->name);
+    if (!ok) return;
+
+    TrainArgs args = {0};
+    args.epochs = total;
+    args.learning_rate = 0.05f;
+    args.optimizer_type = c->opt;
+    args.training_strategy = STRATEGY_SMALL_BATCH;
+    args.batch_size = c->batch;
+    args.accumulation_steps = c->accumulate;
+    args.augment_shift = c->augment ? 1u : 0u;
+    args.augment_flip = c->augment;
+    args.callback = log_run_epoch;
+    args.callback_interval = 1;
+    args.early_stopping_min_delta = 1000.0f;      /* only the first epoch's value counts as an improvement */
+    args.restore_best_weights = c->restore_best;
+    SpingalettLRScheduleParams warmup = {.warmup_epochs = 5};
+    if (c->scheduler) args.lr_scheduler = resume_lr;
+    if (c->per_step) {
+        args.lr_scheduler = spingalett_lr_warmup_cosine;
+        args.lr_scheduler_data = &warmup;
+        args.lr_per_step = true;
+    }
+    if (c->validate) {
+        args.val_inputs = vx;
+        args.val_targets = vy;
+        args.val_count = 24;
+    }
+    if (c->plateau) { args.lr_plateau_patience = 1; args.lr_plateau_factor = 0.5f; args.lr_plateau_min_lr = 0.001f; }
+    if (c->early_stop) args.early_stopping_patience = 2;
+    if (c->source) {
+        args.training_mode = MODE_GENERATOR_FUNCTION;
+        args.generator = spingalett_dataset_generator;
+    } else {
+        args.inputs = x;
+        args.targets = y;
+        args.sample_count = c->samples;
+    }
+
+    /* the run that never stops */
+    RunLog cont = {.draw = c->draw}, stop = {.draw = c->draw};
+    resume_compute(c->threads[0]);
+    spingalett_seed(777);
+    SpingalettDatasetReader *rc = resume_open(c->source, dspath, tokpath, cells);
+    if (rc) args.sample_count = spingalett_dataset_info(rc).count;
+    NeuralNetwork *a = resume_net(c->net, cells, vocab);
+    args.net = a;
+    args.callback_data = &cont;
+    args.generator_data = rc;
+    TrainReport ra = train_struct_arguments(args);
+    const TrainStatus want = c->early_stop ? TRAIN_EARLY_STOPPED : TRAIN_COMPLETED;
+    CHECK(ra.status == want, "resume: the continuous run (%s): status %d", c->name, ra.status);
+
+    /* the same run, stopped at the checkpoint, as if the process ended there */
+    resume_compute(c->threads[1]);
+    spingalett_seed(777);
+    SpingalettDatasetReader *r1 = resume_open(c->source, dspath, tokpath, cells);
+    if (r1) args.sample_count = spingalett_dataset_info(r1).count;
+    NeuralNetwork *net = resume_net(c->net, cells, vocab);
+    args.net = net;
+    args.callback_data = &stop;
+    args.generator_data = r1;
+    stop.stop_at = c->first;
+    if (c->autosave) {
+        args.autosave_mode = AUTOSAVE_OVERWRITE;
+        args.autosave_interval = 1;
+        args.autosave_path = ckpath;
+    } else {
+        stop.checkpoint = ckpath;
+    }
+    TrainReport rb = train_struct_arguments(args);
+    args.autosave_mode = AUTOSAVE_OFF;
+    ok = rb.status == TRAIN_INTERRUPTED && rb.epochs_run == c->first && stop.count == c->first;
+    CHECK(ok, "resume: the run before the checkpoint (%s): status %d, %zu epochs", c->name, rb.status, rb.epochs_run);
+    free_network(net);
+    if (r1) spingalett_dataset_close(r1);
+    if (!ok) goto done;
+
+    resume_compute(c->threads[2]);
+    spingalett_seed(4242);                  /* a fresh process draws otherwise: the checkpoint decides */
+    SpingalettDatasetReader *r2 = resume_open(c->source, dspath, tokpath, cells);
+    if (r2) args.sample_count = spingalett_dataset_info(r2).count;
+    NeuralNetwork *back = spingalett_load_checkpoint(ckpath);
+    CHECK(back != NULL && back->run.resume, "resume: loading the checkpoint of %s", c->name);
+    if (!back) goto done;
+    args.net = back;
+    stop.stop_at = 0;                       /* the call given again runs the run to its end */
+    stop.checkpoint = NULL;
+    args.callback_data = &stop;
+    args.generator_data = r2;
+    TrainReport rd = train_struct_arguments(args);
+    CHECK(rd.status == ra.status && rd.epochs_run == cont.count - c->first && rd.best_epoch == ra.best_epoch &&
+          rd.restored_best == ra.restored_best && !memcmp(&rd.best_value, &ra.best_value, sizeof(float)) &&
+          (rd.epochs_run == 0 || !memcmp(&rd.train_loss, &ra.train_loss, sizeof(float))),
+          "resume: the run after it (%s: status %d, %zu epochs, %u logged, best %zu against %zu)", c->name, rd.status,
+          rd.epochs_run, cont.count, rd.best_epoch, ra.best_epoch);
+
+    /* the files of the two (which bring a GPU's parameters and moments back first) */
+    size_t sa = 0, sb = 0;
+    void *ia = spingalett_save_to_memory(a, PRECISION_FLOAT32, true, &sa);
+    void *ib = spingalett_save_to_memory(back, PRECISION_FLOAT32, true, &sb);
+    uint64_t d = log_diff(&cont, &stop) + (!ia || !ib || sa != sb || memcmp(ia, ib, sa) ? 1u : 0u);
+    spingalett_free(ia);
+    spingalett_free(ib);
+    const uint64_t w = back->total_weights, b = back->total_biases;
+    for (uint32_t i = 0; d && i < cont.count && i < stop.count; i++)
+        if (memcmp(&cont.loss[i], &stop.loss[i], sizeof(float)) || cont.epoch[i] != stop.epoch[i] ||
+            cont.total[i] != stop.total[i])
+            printf("    loss %u: epoch %zu of %zu %.9g against epoch %zu of %zu %.9g\n", i, cont.epoch[i],
+                   cont.total[i], (double)cont.loss[i], stop.epoch[i], stop.total[i], (double)stop.loss[i]);
+    d += array_diff(a->weights, back->weights, w);
+    d += array_diff(a->biases, back->biases, b);
+    d += array_diff(a->opt_m_weights, back->opt_m_weights, w);
+    d += array_diff(a->opt_v_weights, back->opt_v_weights, w);
+    d += array_diff(a->opt_m_biases, back->opt_m_biases, b);
+    d += array_diff(a->opt_v_biases, back->opt_v_biases, b);
+    d += array_diff(a->running_mean, back->running_mean, b);
+    d += array_diff(a->running_var, back->running_var, b);
+    if (rd.epochs_run && resume_gpu == COMPUTE_SINGLE_THREADED) {     /* (no gradients in a checkpoint, nor
+                                                                         brought back from a GPU) */
+        d += array_diff(a->grad_weights, back->grad_weights, w);
+        d += array_diff(a->grad_biases, back->grad_biases, b);
+    }
+    if (a->time_step != back->time_step || a->run.epochs != back->run.epochs || a->run.valid != back->run.valid) d++;
+    char where[48];
+    if (resume_gpu != COMPUTE_SINGLE_THREADED) snprintf(where, sizeof where, "the GPU");
+    else snprintf(where, sizeof where, "%u/%u/%u threads", c->threads[0], c->threads[1], c->threads[2]);
+    printf("  resume %-30s: %u+%u epochs on %s, %u losses, %llu weights: %llu differ\n", c->name, c->first, c->rest,
+           where, cont.count, (unsigned long long)w, (unsigned long long)d);
+    CHECK(d == 0, "resume: %s differs from the run that never stopped in %llu places", c->name, (unsigned long long)d);
+
+    free_network(back);
+    if (r2) spingalett_dataset_close(r2);
+done:
+    free_network(a);
+    if (rc) spingalett_dataset_close(rc);
+    free(x); free(y); free(vx); free(vy);
+    remove(ckpath);
+    if (c->source == 1 || c->source == 2) remove(dspath);
+    if (c->source == 3) remove(tokpath);
+}
+
+/* Reads a whole file; NULL when it cannot. */
+static uint8_t *read_all(const char *path, size_t *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    *size = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *bytes = (uint8_t *)malloc(*size ? *size : 1);
+    if (bytes && fread(bytes, 1, *size, f) != *size) { free(bytes); bytes = NULL; }
+    fclose(f);
+    return bytes;
+}
+
+static bool write_all(const char *path, const uint8_t *bytes, size_t size) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(bytes, 1, size, f) == size;
+    return fclose(f) == 0 && ok;
+}
+
+/* What checkpoints refuse, what a model file gives back, and the runs that follow a resumed one. */
+static void checkpoint_cases(void) {
+    const char *ckpath = "spingalett_test_ck.ckpt", *mpath = "spingalett_test_ck_model.slett";
+    const uint32_t N = 32;
+    lcg_state = 21;
+    float *x = NULL, *y = NULL;
+    make_data(N, 6, 3, LOSS_CROSS_ENTROPY, ACT_SOFTMAX, &x, &y);
+    const TrainArgs base = {.inputs = x, .targets = y, .sample_count = N, .epochs = 2, .learning_rate = 0.05f,
+                            .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH,
+                            .batch_size = 8};
+    resume_compute(1);
+
+    CHECK(!spingalett_save_checkpoint(NULL, ckpath) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID,
+          "checkpoints: a save of no network");
+    CHECK(!spingalett_load_checkpoint(NULL) && spingalett_last_error_code() == SPINGALETT_ERR_INVALID &&
+          !spingalett_load_checkpoint("spingalett_test_missing.ckpt") &&
+          spingalett_last_error_code() == SPINGALETT_ERR_FILE_IO, "checkpoints: a load of no file");
+
+    /* a run of 2 epochs: given again it has none left; a call of 3 runs one; the call after that is a run
+       of its own, which a network made the same way and trained by two calls also gives */
+    spingalett_seed(5);
+    NeuralNetwork *net = resume_dense_net();
+    TrainArgs args = base;
+    args.net = net;
+    train_struct_arguments(args);
+    CHECK(spingalett_save_checkpoint(net, ckpath), "checkpoints: the save of a run");
+    NeuralNetwork *held = spingalett_load_checkpoint(ckpath);
+    CHECK(held && held->run.resume && held->run.epochs == 2, "checkpoints: the run's state loaded");
+    if (held) {
+        args.net = held;
+        args.epochs = 1;
+        TrainReport r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_FAILED && held->run.resume, "checkpoints: a resumed run of fewer epochs than it ran");
+        args.epochs = 2;
+        r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_COMPLETED && r.epochs_run == 0 && held->time_step == net->time_step &&
+              !bit_diff(held->weights, net->weights, net->total_weights), "checkpoints: a run with no epochs left");
+        free_network(held);
+    }
+    held = spingalett_load_checkpoint(ckpath);
+    if (held) {
+        args.net = held;
+        args.epochs = 3;
+        TrainReport r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_COMPLETED && r.epochs_run == 1 && held->run.epochs == 3 && !held->run.resume,
+              "checkpoints: a resumed run ran %zu epochs", r.epochs_run);
+        /* the call after it trains as on the same network saved as a model: a run of its own */
+        CHECK(save_spingalett(.net = held, .filename = mpath), "checkpoints: the resumed network as a model");
+        NeuralNetwork *twin = spingalett_load(mpath);
+        if (twin) {
+            args.epochs = 2;
+            spingalett_seed(9);
+            TrainReport rh = train_struct_arguments(args);
+            args.net = twin;
+            spingalett_seed(9);
+            r = train_struct_arguments(args);
+            CHECK(rh.status == TRAIN_COMPLETED && rh.epochs_run == 2 && r.epochs_run == 2 && held->run.epochs == 2 &&
+                  held->time_step == twin->time_step && !bit_diff(held->weights, twin->weights, twin->total_weights),
+                  "checkpoints: the run after a resumed one is a run of its own");
+        }
+        free_network(twin);
+        free_network(held);
+    }
+
+    /* .reset_optimizer: a new run, not the checkpoint's */
+    held = spingalett_load_checkpoint(ckpath);
+    if (held) {
+        args = base;
+        args.net = held;
+        args.reset_optimizer = true;
+        TrainReport r = train_struct_arguments(args);
+        CHECK(r.status == TRAIN_COMPLETED && r.epochs_run == 2 && held->time_step == net->time_step &&
+              !held->run.resume, "checkpoints: reset_optimizer ran %zu epochs", r.epochs_run);
+        free_network(held);
+    }
+
+    /* a network that stepped since its run's last epoch (the step API) is written without the run */
+    SpingalettTrainer *tr = spingalett_trainer_new(net, 8);
+    const SpingalettOptimizerArgs adam = {.type = OPTIMIZER_ADAM, .learning_rate = 0.01f};
+    if (tr) spingalett_train_on_batch(tr, x, y, 8, &adam);
+    spingalett_trainer_free(tr);
+    CHECK(spingalett_save_checkpoint(net, ckpath), "checkpoints: the save of a network that stepped");
+    held = spingalett_load_checkpoint(ckpath);
+    CHECK(held && !held->run.resume && !held->run.valid && held->time_step == net->time_step,
+          "checkpoints: a network that stepped since its run");
+    free_network(held);
+
+    /* a model file is a checkpoint without a run; a checkpoint is a model, also to the runtime */
+    CHECK(save_spingalett(.net = net, .filename = mpath), "checkpoints: the save of a model");
+    held = spingalett_load_checkpoint(mpath);
+    CHECK(held && !held->run.valid && !held->run.resume, "checkpoints: a model loads without a run");
+    free_network(held);
+    args = base;
+    args.net = net;
+    train_struct_arguments(args);
+    CHECK(spingalett_save_checkpoint(net, ckpath), "checkpoints: the save of a second run");
+    NeuralNetwork *as_model = spingalett_load(ckpath);
+    CHECK(as_model && !bit_diff(as_model->weights, net->weights, net->total_weights) &&
+          as_model->time_step == net->time_step && !as_model->run.valid, "checkpoints: a checkpoint read as a model");
+    free_network(as_model);
+    SpingalettModel *dm = spingalett_model_load(ckpath);
+    CHECK(dm != NULL, "checkpoints: a checkpoint read as a deployment model");
+    spingalett_model_free(dm);
+
+    /* a record with a bit changed, one cut short, one with a byte more */
+    size_t size = 0;
+    uint8_t *bytes = read_all(ckpath, &size);
+    uint64_t image = 0;
+    if (bytes && size >= 32) memcpy(&image, bytes + 24, 8);
+    const bool whole = bytes && image >= 64 && image + 156 <= size;
+    CHECK(whole, "checkpoints: the image of the file (%llu of %zu bytes)", (unsigned long long)image, size);
+    if (whole) {
+        bytes[image + 48] ^= 0x10u;                  /* the dropout seed */
+        CHECK(write_all(ckpath, bytes, size) && !spingalett_load_checkpoint(ckpath) &&
+              spingalett_last_error_code() == SPINGALETT_ERR_INVALID, "checkpoints: a corrupt record accepted");
+        bytes[image + 48] ^= 0x10u;
+        CHECK(write_all(ckpath, bytes, size - 4) && !spingalett_load_checkpoint(ckpath),
+              "checkpoints: a record cut short accepted");
+        uint8_t *more = (uint8_t *)malloc(size + 1);
+        if (more) {
+            memcpy(more, bytes, size);
+            more[size] = 0;
+            CHECK(write_all(ckpath, more, size + 1) && !spingalett_load_checkpoint(ckpath),
+                  "checkpoints: a record with a byte more accepted");
+            free(more);
+        }
+        CHECK(write_all(ckpath, bytes, (size_t)image + 3) && !spingalett_load_checkpoint(ckpath),
+              "checkpoints: 3 bytes after a model accepted");
+        CHECK(write_all(ckpath, bytes, size) && (held = spingalett_load_checkpoint(ckpath)) && held->run.resume,
+              "checkpoints: the file put back");
+        free_network(held);
+    }
+    free(bytes);
+    remove(ckpath);
+    remove(mpath);
+    free_network(net);
+    free(x); free(y);
+}
+
+static void resume_runs(void) {
+    static const struct ResumeCase cases[] = {
+        {"dense adam dropout", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 5,
+         .threads = {4, 4, 4}},
+        {"dense sgd-momentum", 0, 0, .opt = OPTIMIZER_MOMENTUM, .samples = 64, .batch = 16, .first = 2, .rest = 4,
+         .threads = {4, 4, 4}},
+        {"dense adam, 1 thread", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 2, .rest = 3,
+         .threads = {1, 1, 1}},
+        {"dense adam, threads change", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 2,
+         .rest = 4, .threads = {4, 4, 1}},
+        {"dense adam, schedule of run", 0, 0, .scheduler = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 3, .rest = 4, .threads = {4, 4, 4}},
+        {"dense adam, schedule by step", 0, 0, .per_step = true, .opt = OPTIMIZER_ADAM, .samples = 60, .batch = 16,
+         .first = 2, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, accumulation", 0, 0, .accumulate = 2, .opt = OPTIMIZER_ADAM, .samples = 72, .batch = 8,
+         .first = 2, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, plateau", 0, 0, .scheduler = true, .validate = true, .plateau = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 2, .rest = 4, .threads = {4, 4, 4}},
+        {"dense adam, early stop", 0, 0, .early_stop = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 1, .rest = 5, .threads = {4, 4, 4}},
+        {"dense adam, stopped at the end", 0, 0, .early_stop = true, .restore_best = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 3, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, best before", 0, 0, .validate = true, .restore_best = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 3, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, best at the stop", 0, 0, .validate = true, .restore_best = true, .opt = OPTIMIZER_ADAM,
+         .samples = 64, .batch = 16, .first = 1, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, callback draws", 0, 0, .draw = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 2, .rest = 3, .threads = {4, 4, 4}},
+        {"dense adam, autosaved", 0, 0, .validate = true, .restore_best = true, .autosave = true,
+         .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 2, .threads = {4, 4, 4}},
+        {"conv adam dropout", 1, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 3,
+         .threads = {4, 4, 4}},
+        {"conv adam, augmented", 1, 0, .augment = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 2, .rest = 4, .threads = {4, 4, 4}},
+        {"conv sgd-momentum", 1, 0, .opt = OPTIMIZER_MOMENTUM, .samples = 64, .batch = 16, .first = 2, .rest = 2,
+         .threads = {4, 4, 4}},
+        {"conv reader, streamed", 1, 1, .opt = OPTIMIZER_ADAM, .samples = 1024, .batch = 128, .first = 2,
+         .rest = 2, .threads = {4, 4, 4}},
+        {"conv reader, augmented", 1, 1, .augment = true, .opt = OPTIMIZER_ADAM, .samples = 1024, .batch = 128,
+         .first = 2, .rest = 3, .threads = {4, 4, 1}},
+        {"conv reader, autosaved", 1, 1, .autosave = true, .opt = OPTIMIZER_ADAM, .samples = 1024, .batch = 128,
+         .first = 1, .rest = 2, .threads = {4, 4, 4}},
+        {"conv reader, in memory", 1, 2, .opt = OPTIMIZER_ADAMW, .samples = 1024, .batch = 128, .first = 3,
+         .rest = 2, .threads = {4, 1, 4}},
+        {"language model, tokens", 2, 3, .opt = OPTIMIZER_ADAM, .batch = 32, .first = 2, .rest = 3,
+         .threads = {4, 4, 4}},
+        {"language model, schedule", 2, 3, .scheduler = true, .opt = OPTIMIZER_SGD, .batch = 32, .first = 3,
+         .rest = 3, .threads = {4, 4, 4}},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) resume_case(&cases[i]);
+    checkpoint_cases();
+    resume_compute(4);
+    printf("  checkpoints: %u runs of two parts trained the bits of one that never stopped\n",
+           (unsigned)(sizeof cases / sizeof *cases));
+}
+
 /* ---------------------------------------------------------------- deployment models (format 3) */
 
 /* Fields of a .slett format 3 image, read as docs/ModelFormat.md describes them. */
@@ -2627,7 +3450,7 @@ static void model_shared(void) {
     for (size_t i = 0; i < (size_t)40 * 192; i++) x[i] = frand();
     ComputeMode mode = spingalett_get_compute_mode();
     spingalett_set_compute_mode(COMPUTE_OPENMP);
-    for (int p = 0; p < PRECISION_COUNT; p++) {
+    for (int p = 0; p < ROW_PRECISIONS; p++) {
         SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
         float *expect[SIZES], *y = malloc((size_t)40 * 5 * sizeof(float));
         bool same = m && y;
@@ -2785,7 +3608,7 @@ static void model_files(void) {
     if (v1) free_network(v1);
 
     /* NaN in, NaN out, in every precision */
-    for (int p = 0; p < PRECISION_COUNT; p++) {
+    for (int p = 0; p < ROW_PRECISIONS; p++) {
         SpingalettModel *m = spingalett_model_from_network(a, (PrecisionMode)p);
         float in[6] = {0.1f, NAN, 0.3f, 0, 0, 0}, out[3];
         CHECK(m && spingalett_model_run(m, in, out, NULL) == SPINGALETT_OK && isnan(out[0]), "files: NaN input, precision %d", p);
@@ -3108,7 +3931,7 @@ static void model_conv(void) {
     float *x = malloc((size_t)N * in * sizeof(float)), *ref = malloc((size_t)N * out * sizeof(float));
     float *one = malloc((size_t)N * out * sizeof(float)), *batch = malloc((size_t)N * out * sizeof(float));
     for (size_t i = 0; i < (size_t)N * in; i++) x[i] = frand() * 2 - 1;
-    for (int p = 0; p < PRECISION_COUNT; p++) {
+    for (int p = 0; p < ROW_PRECISIONS; p++) {
         SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
         CHECK(m && m->input_size == in && m->output_size == out && m->layer_count == 6, "conv model p=%d: fields", p);
         if (!m) continue;
@@ -3375,7 +4198,7 @@ static void norm_inference(ComputeMode mode) {
               "norm: model layers");
         spingalett_model_free(m);
     }
-    for (int prec = PRECISION_FP16; prec < PRECISION_COUNT; prec++) {
+    for (int prec = PRECISION_FP16; prec < ROW_PRECISIONS; prec++) {
         SpingalettModel *qm = spingalett_model_from_network(net, (PrecisionMode)prec);
         CHECK(qm != NULL, "norm: model in precision %d", prec);
         if (!qm) continue;
@@ -3589,7 +4412,7 @@ static void norm_learns(ComputeMode mode) {
     batch_norm(.net = net, .act_func = ACT_RELU);
     max_pool2d(.net = net, .kernel = 2);
     layer(.net = net, .neurons_amount = 2, .act_func = ACT_SOFTMAX, .weight_initialization = WEIGHT_INITIALIZATION_XAVIER);
-    train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 15, .learning_rate = 0.05f,
+    train(.net = net, .inputs = x, .targets = y, .sample_count = N, .epochs = 25, .learning_rate = 0.05f,
           .optimizer_type = OPTIMIZER_ADAM, .training_strategy = STRATEGY_SMALL_BATCH, .batch_size = 32);
     EvalMetrics m = evaluate(.net = net, .inputs = x, .targets = y, .sample_count = N);
     printf("  normalized conv learns bars mode=%d: accuracy %.1f%%, loss %.4f\n", mode, 100.0 * m.accuracy, m.loss);
@@ -3979,7 +4802,7 @@ static void graph_inference(ComputeMode mode) {
         }
         spingalett_free(img);
 
-        for (int pr = 0; pr < PRECISION_COUNT; pr++) {
+        for (int pr = 0; pr < ROW_PRECISIONS; pr++) {
             SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)pr);
             CHECK(m != NULL, "graph %d: no model in precision %d", which, pr);
             if (!m) continue;
@@ -4071,7 +4894,7 @@ static void graph_folding(void) {
     float y[18];
     for (int i = 0; i < 18; i++) y[i] = frand() * 2 - 1;
     predict(.net = net, .inputs = y, .sample_count = 1, .outputs = p);
-    for (int pr = 0; pr < PRECISION_COUNT; pr++) {
+    for (int pr = 0; pr < ROW_PRECISIONS; pr++) {
         m = spingalett_model_from_network(net, (PrecisionMode)pr);
         CHECK(m && m->layer_count == 2, "graph folding: a transposed convolution keeps %u layers", m ? m->layer_count : 0);
         if (m) {
@@ -4444,7 +5267,7 @@ static void tf_models(void) {
         spingalett_free(img);
         /* (random weights through several layers: quantization's error grows with depth) */
         const float tol[PRECISION_COUNT] = {2e-5f, 1e-2f, 6e-2f, 0.25f, 2.5f, 6.0f};
-        for (int p = 0; p < PRECISION_COUNT; p++) {
+        for (int p = 0; p < ROW_PRECISIONS; p++) {
             SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
             CHECK(m != NULL, "transformer models net %d: model of precision %d", which, p);
             if (!m) continue;
@@ -4908,7 +5731,7 @@ static void tf_token_quantization(void) {
             float *x = malloc((size_t)N * T * sizeof(float)), *y = malloc((size_t)N * T * V * sizeof(float));
             float *z = malloc((size_t)N * T * V * sizeof(float)), *r = malloc((size_t)N * T * V * sizeof(float));
             for (uint32_t i = 0; i < N * T; i++) x[i] = (float)((uint32_t)(frand() * 4096.0f) % V);
-            for (int p = PRECISION_INT8; p < PRECISION_COUNT; p++) {
+            for (int p = PRECISION_INT8; p < ROW_PRECISIONS; p++) {
                 SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
                 CHECK(m != NULL, "token quantization: model");
                 if (!m) continue;
@@ -5028,7 +5851,7 @@ static void session_equivalence(void) {
                 for (uint32_t t = 0; t < T; t++) x[s * T + t] = (float)(tok[s][t] = (uint32_t)(frand() * 4096.0f) % V);
             tok[2][3] = V + 4;                              /* a token outside the vocabulary: zeros */
             x[2 * T + 3] = (float)tok[2][3];
-            for (int p = 0; p < PRECISION_COUNT; p++)
+            for (int p = 0; p < ROW_PRECISIONS; p++)
                 for (int mode = 0; mode < 2; mode++) {
                     spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
                     SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
@@ -5076,6 +5899,146 @@ static void session_equivalence(void) {
         }
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     printf("  sessions: %d of %d models and modes give batched prediction's logits bit for bit\n", exact, runs);
+}
+
+static const char *const block_names[] = {"Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K",
+                                          "Q6_K", "IQ4_NL", "IQ4_XS"};
+
+/* Dense layers of the block precisions (inputs of 1 to 9 blocks, some of zeros): the engine's outputs against the
+   weights the file decodes to times the inputs, within what quantizing the inputs in blocks costs (half a block's
+   scale an input, times the weights' magnitudes), and batched prediction on one thread and many against the
+   engine, bit for bit. */
+static void block_kernels(PrecisionMode p) {
+    const uint32_t S = p >= PRECISION_Q2_K && p != PRECISION_IQ4_NL ? 256u : 32u, N = 7, n = 40;
+    static const uint32_t blocks[] = {1, 2, 3, 9};
+    lcg_state = 300 + p;
+    double worst = 0;
+    int exact = 1;
+    for (size_t t = 0; t < sizeof blocks / sizeof *blocks; t++) {
+        const uint32_t K = blocks[t] * S;
+        NeuralNetwork *net = new_spingalett(.loss_func = LOSS_MSE);
+        layer(net, K);
+        layer(net, N, ACT_NONE);
+        for (uint32_t j = 0; j < N; j++)
+            for (uint32_t k = 0; k < K; k++)
+                net->weights[(size_t)j * K + k] = j == 3 ? 0.0f : (frand() * 2 - 1) * powf(10.0f, (float)j - 3.0f) *
+                                                                     (k % 37 == 0 ? 6.0f : 1.0f);
+        for (uint32_t j = 0; j < N; j++) net->biases[j] = frand() - 0.5f;
+        SpingalettModel *m = spingalett_model_from_network(net, p);
+        SpingalettLayerInfo li;
+        CHECK(m && spingalett_model_layer(m, 0, &li) && li.precision == p && ((const uint8_t *)m->image)[6] == 10,
+              "blocks %s K=%u: no model of the precision (%s)", block_names[p - PRECISION_Q8_0], K,
+              spingalett_last_error_message());
+        NeuralNetwork *decoded = m ? spingalett_load_from_memory(m->image, m->image_size) : NULL;
+        CHECK(decoded, "blocks %s K=%u: the image does not load", block_names[p - PRECISION_Q8_0], K);
+        if (!m || !decoded) { spingalett_model_free(m); free_network(net); free_network(decoded); continue; }
+        float *x = malloc((size_t)n * K * sizeof(float)), *y = malloc((size_t)n * N * sizeof(float));
+        float *b = malloc((size_t)n * N * sizeof(float));
+        void *ws = malloc(m->workspace_size);           /* exact size: ASan catches overruns */
+        for (uint32_t s = 0; s < n; s++)
+            for (uint32_t k = 0; k < K; k++)
+                x[(size_t)s * K + k] = s % 5 == 4 || (s % 5 == 3 && k < S) ? 0.0f : (frand() * 2 - 1) * (k % 11 ? 1.0f : 9.0f);
+        for (uint32_t s = 0; s < n; s++) {
+            const float *xs = x + (size_t)s * K;
+            CHECK(spingalett_model_run(m, xs, y + (size_t)s * N, ws) == SPINGALETT_OK, "blocks: run failed");
+            for (uint32_t j = 0; j < N; j++) {
+                const float *w = decoded->weights + (size_t)j * K;
+                double ref = decoded->biases[j], bound = 1e-6 * fabs(ref);
+                for (uint32_t b0 = 0; b0 < K; b0 += S) {
+                    float amax = 0.0f;
+                    for (uint32_t k = b0; k < b0 + S; k++) amax = fmaxf(amax, fabsf(xs[k]));
+                    for (uint32_t k = b0; k < b0 + S; k++) {
+                        ref += (double)w[k] * xs[k];
+                        bound += fabs((double)w[k]) * (amax / 127.0 * 0.5 + 1e-6 * fabs(xs[k]));
+                    }
+                }
+                const double d = fabs((double)y[(size_t)s * N + j] - ref);
+                if (d > bound * 1.01 + 1e-30 && d / (bound + 1e-30) > worst) worst = d / (bound + 1e-30);
+            }
+        }
+        for (int mode = 0; mode < 2; mode++) {
+            spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+            memset(b, 0, (size_t)n * N * sizeof(float));
+            exact &= spingalett_model_predict(m, x, n, b) && !memcmp(b, y, (size_t)n * N * sizeof(float));
+        }
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        free(x); free(y); free(b); free(ws);
+        spingalett_model_free(m);
+        free_network(net);
+        free_network(decoded);
+    }
+    printf("  blocks %-6s: %s, predict %s\n", block_names[p - PRECISION_Q8_0], worst == 0 ? "within the quantization's bound"
+           : "OFF", exact ? "== run" : "DIFFERS");
+    CHECK(worst == 0 && exact, "blocks %s: outputs beyond the bound (%.2f x) or predict differs from run",
+          block_names[p - PRECISION_Q8_0], worst);
+}
+
+/* Language models (LLaMA-like, Mistral-like with a tied head) of width 256 in every block precision, on one thread
+   and many: batched prediction gives the engine's logits, sessions batched prediction's, bit for bit (a token at a
+   time, a prompt, two sequences at once); and the logits stay near those of the weights the file decodes to. */
+static void block_models(void) {
+    const uint32_t T = 12, V = 29, N = 2, d = 256;
+    int exact = 0, runs = 0;
+    for (int kind = 1; kind < 3; kind++) {
+        lcg_state = 900 + (unsigned)kind;
+        NeuralNetwork *net = lm_net(kind, T, V, d);
+        tf_init(net);
+        uint32_t tok[2][12];
+        float *x = malloc((size_t)N * T * sizeof(float)), *ref = malloc((size_t)N * T * V * sizeof(float));
+        float *got = malloc((size_t)N * T * V * sizeof(float)), *one = malloc((size_t)T * V * sizeof(float));
+        float *flt = malloc((size_t)N * T * V * sizeof(float));
+        for (uint32_t s = 0; s < N; s++)
+            for (uint32_t t = 0; t < T; t++) x[s * T + t] = (float)(tok[s][t] = (uint32_t)(frand() * 4096.0f) % V);
+        for (int p = PRECISION_Q8_0; p < PRECISION_COUNT; p++) {
+            const char *name = block_names[p - PRECISION_Q8_0];
+            SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
+            NeuralNetwork *decoded = m ? spingalett_load_from_memory(m->image, m->image_size) : NULL;
+            CHECK(m && decoded, "block model kind %d %s: no model (%s)", kind, name, spingalett_last_error_message());
+            if (!m || !decoded) { spingalett_model_free(m); free_network(decoded); continue; }
+            void *ws = malloc(m->workspace_size);
+            bool same = true;
+            for (uint32_t s = 0; s < N; s++) {
+                same = same && spingalett_model_run(m, x + (size_t)s * T, one, ws) == SPINGALETT_OK;
+                memcpy(ref + (size_t)s * T * V, one, (size_t)T * V * sizeof(float));
+            }
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            predict(.net = decoded, .inputs = x, .sample_count = N, .outputs = flt);
+            double err = 0, norm = 0;
+            for (size_t i = 0; i < (size_t)N * T * V; i++) {
+                err += (double)(ref[i] - flt[i]) * (ref[i] - flt[i]);
+                norm += (double)flt[i] * flt[i];
+            }
+            for (int mode = 0; mode < 2; mode++) {
+                spingalett_set_compute_mode(mode ? COMPUTE_OPENMP : COMPUTE_SINGLE_THREADED);
+                memset(got, 0, (size_t)N * T * V * sizeof(float));
+                same = same && spingalett_model_predict(m, x, N, got) && !memcmp(got, ref, (size_t)N * T * V * 4);
+                SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = N});
+                bool ok = s != NULL;
+                float *g0 = got, *g1 = got + (size_t)T * V;
+                memset(got, 0, (size_t)N * T * V * sizeof(float));
+                for (uint32_t t = 0; t < 4 && ok; t++) ok = feed_span(s, 0, tok[0], t, t + 1, false, g0, V);
+                SpingalettSessionFeed both[2] = {
+                    {.sequence = 1, .tokens = tok[1], .count = T, .logits = g1, .all = true},
+                    {.sequence = 0, .tokens = tok[0] + 4, .count = T - 4, .logits = g0 + (size_t)4 * V, .all = true}};
+                ok = ok && spingalett_session_feed(s, both, 2);
+                same = same && ok && !memcmp(got, ref, (size_t)N * T * V * 4);
+                spingalett_session_free(s);
+            }
+            spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+            const double rel = sqrt(err / norm);
+            const double limit = p == PRECISION_Q2_K || p == PRECISION_Q3_K ? 0.08 : 0.05;
+            CHECK(same, "block model kind %d %s: engine, predict and sessions differ", kind, name);
+            CHECK(rel < limit, "block model kind %d %s: logits %.3f from the decoded weights' (relative)", kind, name, rel);
+            exact += same && rel < limit, runs++;
+            free(ws);
+            spingalett_model_free(m);
+            free_network(decoded);
+        }
+        free(x); free(ref); free(got); free(one); free(flt);
+        free_network(net);
+    }
+    printf("  block models: %d of %d (two language models, twelve types) give the engine's logits in batches and "
+           "sessions\n", exact, runs);
 }
 
 /* What sessions refuse: models that are no causal language models, a window too long, and feeds, rewinds
@@ -5177,7 +6140,7 @@ static void session_shared(void) {
     for (uint32_t t = 0; t < T; t++) x[t] = (float)(tok[t] = (uint32_t)(frand() * 4096.0f) % V);
     ComputeMode mode = spingalett_get_compute_mode();
     spingalett_set_compute_mode(COMPUTE_OPENMP);
-    for (int p = 0; p < PRECISION_COUNT; p += 3) {
+    for (int p = 0; p < ROW_PRECISIONS; p += 3) {
         SpingalettModel *m = spingalett_model_from_network(net, (PrecisionMode)p);
         bool same = m && spingalett_model_predict(m, x, 1, expect);
         SpingalettModel bare;
@@ -5880,6 +6843,58 @@ static void pretrained_model(const char *name, bool tokenizer) {
     free(data);
 }
 
+/* GGUF files as deployment models (spingalett_model_open()), their tensors as the files store them: the logits of a
+   window against PyTorch's (LLaMA's permuted queries and keys, Qwen2's biases, GPT-2's positions, Qwen3's normalized
+   queries and keys, LLaMA 3's scaled rotary embeddings, Gemma 3's scaled embeddings, normalized outputs and windows
+   of their own rotary base; the matrices of fifteen types computed in their blocks, near
+   the logits of their dequantized weights), and a session's logits batched prediction's, bit for bit. */
+static void gguf_deployment(void) {
+    static const struct { const char *file, *logits; } cases[] = {
+        {"gguf_llama.gguf", "hf_llama"}, {"gguf_qwen2.gguf", "hf_qwen2"}, {"gguf_gpt2.gguf", "hf_gpt2"},
+        {"gguf_qwen3.gguf", "hf_qwen3"}, {"gguf_llama3.gguf", "hf_llama3"}, {"gguf_gemma3.gguf", "hf_gemma3"},
+        {"gguf_quant.gguf", "gguf_quant"}};
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s.bin", SPINGALETT_TEST_DATA_DIR, cases[k].logits);
+        long size = 0;
+        unsigned char *data = read_file(path, &size);
+        CHECK(data && size >= 16 && !memcmp(data, "SPGT", 4), "%s: no expected data", path);
+        if (!data) continue;
+        const uint32_t T = rd32(data + 8), out = rd32(data + 12), V = out / T;
+        const float *tokens = (const float *)(const void *)(data + 16), *expected = tokens + T;
+        snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, cases[k].file);
+        SpingalettModel *m = spingalett_model_open(.path = path, .context = T);
+        CHECK(m && m->input_size == T && m->output_size == out && m->loss == LOSS_SPARSE_CROSS_ENTROPY, "%s: %s",
+              cases[k].file, spingalett_last_error_message());
+        SpingalettSession *s = m ? spingalett_session_new(m, NULL) : NULL;
+        CHECK(s, "%s: no session (%s)", cases[k].file, spingalett_last_error_message());
+        if (!s) { spingalett_model_free(m); free(data); continue; }
+        float *y = malloc((size_t)out * sizeof(float)), *z = malloc((size_t)out * sizeof(float));
+        uint32_t ids[64];
+        for (uint32_t t = 0; t < T; t++) ids[t] = (uint32_t)tokens[t];
+        bool ok = spingalett_model_predict(m, tokens, 1, y) &&
+                  spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = ids, .count = T, .logits = z, .all = true}, 1);
+        double worst = 0.0, err = 0.0, norm = 0.0;
+        for (uint32_t i = 0; ok && i < out; i++) {
+            worst = fmax(worst, fabs((double)y[i] - expected[i]));
+            err += ((double)y[i] - expected[i]) * ((double)y[i] - expected[i]);
+            norm += (double)expected[i] * expected[i];
+        }
+        /* the quantized model's layers take its matrices' types, and its inputs quantized in their blocks */
+        const bool blocks = !strcmp(cases[k].logits, "gguf_quant");
+        const double rel = sqrt(err / norm);
+        CHECK(ok && (blocks ? rel < 0.03 : worst < 1e-4), "%s: logits differ from PyTorch's (%g, %.4f relative)",
+              cases[k].file, worst, rel);
+        CHECK(ok && !memcmp(y, z, (size_t)out * sizeof(float)), "%s: a session's logits differ from batched prediction's",
+              cases[k].file);
+        if (ok) printf("  %-20s a model of %u layers, %u x %u logits, |logits - PyTorch| %.1e (%.4f relative)\n",
+                       cases[k].file, m->layer_count, T, V, worst, rel);
+        free(y); free(z); free(data);
+        spingalett_session_free(s);
+        spingalett_model_free(m);
+    }
+}
+
 static void write_text(const char *path, const char *text) {
     FILE *f = fopen(path, "wb");
     if (f) { fputs(text, f); fclose(f); }
@@ -6140,6 +7155,8 @@ static void gguf_errors(void) {
 }
 
 /* ---- the GPU (COMPUTE_VULKAN, or COMPUTE_CUDA in the group "cuda") against the CPU ---- */
+
+static void gpu_resume(void);
 
 /* The compute mode of the GPU group's tests: gpu_mode, or COMPUTE_CUDA. */
 static ComputeMode gpu_mode = COMPUTE_VULKAN;
@@ -7108,6 +8125,26 @@ static void gpu_cross(uint32_t head, uint32_t kv, bool padding) {
     for (int r = 0; r < 4; r++) { free(pred[r]); free(step[r]); }
     free(x); free(t);
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+}
+
+/* Checkpoints of runs on the GPU: stopped, written, loaded and carried on there, to the bits of the run
+   that never stopped (its moments and parameters brought back for the checkpoint and sent again). */
+static void gpu_resume(void) {
+    static const struct ResumeCase cases[] = {
+        {"GPU dense adam dropout", 0, 0, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 2, .rest = 3},
+        {"GPU dense adam, best before", 0, 0, .validate = true, .restore_best = true, .scheduler = true,
+         .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16, .first = 3, .rest = 2},
+        {"GPU conv adam, augmented", 1, 0, .augment = true, .opt = OPTIMIZER_ADAM, .samples = 64, .batch = 16,
+         .first = 2, .rest = 2},
+        {"GPU conv reader, streamed", 1, 1, .opt = OPTIMIZER_ADAMW, .samples = 1024, .batch = 128, .first = 1,
+         .rest = 2},
+        {"GPU language model, tokens", 2, 3, .opt = OPTIMIZER_ADAM, .batch = 32, .first = 2, .rest = 2},
+    };
+    const ComputeMode mode = spingalett_get_compute_mode();
+    resume_gpu = gpu_mode;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) resume_case(&cases[i]);
+    resume_gpu = COMPUTE_SINGLE_THREADED;
+    spingalett_set_compute_mode(mode);
 }
 
 /* A session of a model with sliding windows on the GPU attends over the last keys of its cache as the CPU's does:
@@ -8107,7 +9144,8 @@ static bool write_floats(const char *dir, const char *name, const char *suffix, 
    language models NAME.sess, the logits of runtime_session(). The runtime must give the same bits
    (Spingalett.RuntimeTests.c). DIR/models.txt lists the names and the samples of each. */
 static int export_runtime_models(const char *dir) {
-    static const char *pnames[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
+    static const char *pnames[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2", "q8_0", "q4_0", "q4_1", "q5_0",
+                                   "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl", "iq4_xs"};
     char path[1024];
     snprintf(path, sizeof path, "%s/models.txt", dir);
     FILE *list = fopen(path, "w");
@@ -8288,6 +9326,7 @@ int main(int argc, char **argv) {
         pretrained_model("hf_gpt2", true);
         pretrained_errors();
         gguf_models();
+        gguf_deployment();
         gguf_errors();
     }
     if (!*only || !strcmp(only, "equiv")) {
@@ -8387,6 +9426,11 @@ int main(int argc, char **argv) {
         dataset_files();
         dataset_files_v2();
         token_files();
+        dataset_positions();
+    }
+    if (!*only || !strcmp(only, "resume")) {
+        printf("[checkpoints]\n");
+        resume_runs();
     }
     if (!*only || !strcmp(only, "io")) {
         printf("[save/load]\n");
@@ -8399,7 +9443,7 @@ int main(int argc, char **argv) {
     }
     if (!*only || !strcmp(only, "model")) {
         printf("[deployment models]\n");
-        for (int p = 0; p < PRECISION_COUNT; p++) model_kernels((PrecisionMode)p);
+        for (int p = 0; p < ROW_PRECISIONS; p++) model_kernels((PrecisionMode)p);
         model_inference(PRECISION_FLOAT32, 1e-5f);
         model_inference(PRECISION_FP16, 2e-3f);
         model_inference(PRECISION_BFLOAT16, 2e-2f);
@@ -8412,8 +9456,10 @@ int main(int argc, char **argv) {
         session_shared();
         model_validation();
         model_files();
-        for (int p = 0; p < PRECISION_COUNT; p++) model_conv_kernels((PrecisionMode)p);
+        for (int p = 0; p < ROW_PRECISIONS; p++) model_conv_kernels((PrecisionMode)p);
         model_conv();
+        for (int p = PRECISION_Q8_0; p < PRECISION_COUNT; p++) block_kernels((PrecisionMode)p);
+        block_models();
     }
     for (int backend = 0; backend < 2; backend++) {
         /* the group "gpu" on Vulkan, "cuda" on CUDA */
@@ -8465,6 +9511,7 @@ int main(int argc, char **argv) {
             gpu_cross(256, 2, true);
             tf_cross(gpu_mode);
             gpu_session_window();
+            gpu_resume();
             gpu_session(false);
             gpu_session(true);
             gpu_model_predict();

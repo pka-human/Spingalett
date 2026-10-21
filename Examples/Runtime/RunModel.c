@@ -51,19 +51,23 @@ static int fail(const char *what) {
 static void describe(const SpingalettModel *m) {
     static const char *kinds[] = {"dense", "convolution", "max pooling", "average pooling", "batch normalization",
                                   "addition", "concatenation", "global average pooling", "transposed convolution",
-                                  "upsampling", "layer normalization"};
-    static const char *precisions[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
-    static const char *activations[] = {"", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax"};
+                                  "upsampling", "layer normalization", "embedding", "attention", "RMS normalization",
+                                  "product"};
+    static const char *precisions[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2", "q8_0", "q4_0", "q4_1", "q5_0",
+                                       "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl", "iq4_xs"};
+    static const char *activations[] = {"", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax", "gelu",
+                                        "gelu tanh", "silu"};
     printf("%u inputs -> %u outputs, %u layers, %zu bytes, workspace %zu bytes\n", m->input_size, m->output_size,
            m->layer_count, m->image_size, m->workspace_size);
     for (uint32_t i = 0; i < m->layer_count; i++) {
         SpingalettLayerInfo l;
         if (!spingalett_model_layer(m, i, &l)) break;
-        printf("  %3u  %-22s %ux%ux%u", i + 1, (unsigned)l.type < LAYER_TYPE_COUNT ? kinds[l.type] : "?", l.height,
-               l.width, l.channels);
+        printf("  %3u  %-22s %ux%ux%u", i + 1, (unsigned)l.type < sizeof kinds / sizeof *kinds ? kinds[l.type] : "?",
+               l.height, l.width, l.channels);
         if (l.type == LAYER_DENSE || l.type == LAYER_CONV2D || l.type == LAYER_CONV_TRANSPOSE2D)
-            printf("  %s", (unsigned)l.precision < PRECISION_COUNT ? precisions[l.precision] : "?");
-        if ((unsigned)l.activation < ACT_COUNT && l.activation != ACT_NONE) printf("  %s", activations[l.activation]);
+            printf("  %s", (unsigned)l.precision < sizeof precisions / sizeof *precisions ? precisions[l.precision] : "?");
+        if ((unsigned)l.activation < sizeof activations / sizeof *activations && l.activation != ACT_NONE)
+            printf("  %s", activations[l.activation]);
         printf("\n");
     }
 }

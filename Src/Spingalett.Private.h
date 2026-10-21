@@ -209,10 +209,10 @@ bool spingalett_fused_norm(const NeuralNetwork *net, const uint32_t *uses, uint3
    caller's buffers) and the products whose normalization is fused take none (UINT64_MAX). Returns
    the floats per sample all outputs need. */
 uint64_t spingalett_plan_outputs(const NeuralNetwork *net, const uint32_t *uses, uint64_t *offsets);
-/* The same over `count` steps from a description of each: steps[s] is the output it computes,
-   reads[s] the outputs it reads (read_count[s] of them), sizes[t] the floats of output t (0: not
-   stored); output t is computed by step `producer[t]` or never. Generic so that deployment models
-   and model files share it. offsets of outputs that are not stored are UINT64_MAX. */
+/* The same over `count` steps from a description of each (Spingalett.Image.c): steps[s] is the output it
+   computes, reads[s] the outputs it reads (read_count[s] of them), sizes[t] the floats of output t (0: not
+   stored); output t is computed by step `producer[t]` or never. Generic so that deployment models, model files
+   and the images of language models' files share it. offsets of outputs that are not stored are UINT64_MAX. */
 uint64_t spingalett_plan_buffers(uint32_t outputs, const uint64_t *sizes, uint32_t count, const uint32_t *steps,
                                  const uint32_t *const *reads, const uint32_t *read_count, uint64_t align,
                                  uint64_t *offsets);
@@ -407,6 +407,10 @@ LayerArgs spingalett_describe_layer(NeuralNetwork *net, uint32_t l);
 /* The image of a deployment model: net with every batch normalization that directly follows a dense
    or convolution layer without activation folded into that layer, without optimizer state. */
 void *spingalett_save_deployment(const NeuralNetwork *net, PrecisionMode precision, size_t *size);
+/* A row of n weights (whole blocks) quantized in a block precision into dst, as llama.cpp's reference quantizers
+   (quantize_row_*_ref(), and of IQ4_NL and IQ4_XS quantize_iq4_nl() and quantize_iq4_xs() without an importance
+   matrix) choose the codes and scales (Spingalett.Quantize.c). */
+void spingalett_block_quantize(PrecisionMode p, const float *x, uint8_t *dst, uint32_t n);
 bool spingalett_has_dropout(const NeuralNetwork *net);
 /* dropout == NULL: inference. Otherwise hidden layers with a dropout rate are masked. */
 float *spingalett_forward_pass(NeuralNetwork *net, const float *input, ComputeMode mode,
@@ -426,7 +430,7 @@ void spingalett_log_quiet(int delta);
 
 /* ------------------------------------------------------------------------- importers (Import.c) */
 
-/* A file's bytes: mapped read-only where the platform allows, read into memory otherwise. */
+/* A file's bytes: mapped read-only where the platform allows, read into memory otherwise (Memory.c). */
 typedef struct {
     const uint8_t *data;
     size_t size;
@@ -436,7 +440,7 @@ typedef struct {
 bool spingalett_file_open(SpgFileView *f, const char *path);       /* false with the error set */
 void spingalett_file_close(SpgFileView *f);
 
-/* Element types of imported tensors (little-endian, at any alignment). */
+/* Element types of imported tensors (little-endian, at any alignment; Image.c decodes them). */
 enum { SPG_DTYPE_F32, SPG_DTYPE_F16, SPG_DTYPE_BF16, SPG_DTYPE_F64, SPG_DTYPE_I32, SPG_DTYPE_I64, SPG_DTYPE_OTHER };
 size_t spingalett_dtype_size(int dtype);                            /* 0 for SPG_DTYPE_OTHER */
 void spingalett_decode(float *dst, const uint8_t *src, int dtype, size_t n);
@@ -483,6 +487,11 @@ void  spingalett_aligned_free(void *ptr);
 /* Reads a whole file into a buffer aligned like spingalett_aligned_alloc (release with
    spingalett_aligned_free). NULL on error, with the error set. */
 void *spingalett_read_file(const char *path, size_t *size);
+#if !defined(SPINGALETT_RUNTIME)
+/* An autosave of spingalett_train(): a checkpoint in FLOAT32 with the optimizer state, a model otherwise,
+   under the name spingalett_save() would give it. */
+bool spingalett_autosave(const SpingalettSaveArgs *args);
+#endif
 
 /* One value through an activation (softmax, which needs the whole vector, leaves it as it is):
    spingalett_activate(), inline for the kernels' tails. */
@@ -566,7 +575,26 @@ float random_normal_weight(void);
 
 float spingalett_dot_product(const float *restrict a, const float *restrict b, uint64_t n);
 
-void spingalett_shuffle_indices(uint32_t *indices, uint32_t n);
+/* Writes a permutation of 0 to n - 1 into order, drawn from seed and index alone (Fisher and Yates'
+   shuffle over splitmix64): epoch e of a training run takes the run's seed and e, so that the order of
+   any epoch is known without the epochs before it (a run resumed from a checkpoint). */
+void spingalett_permutation(uint32_t *order, uint32_t n, uint64_t seed, uint64_t index);
+
+/* Forgets the state of the run that trained a network (net->run): a change of its layers, or its end. */
+void spingalett_run_reset(NeuralNetwork *net);
+/* The reader spingalett_dataset_generator() reads on the calling thread, as a training run sees it
+   (Training.c): a run cannot tell the function by its address, of which a program may be given
+   another than the library sees (a non-PIE executable linked to a library built by Clang).
+   spingalett_generator_watch() begins to watch, and moves the next reader read to *at first (NULL:
+   none); spingalett_generator_watched() tells what was read since. */
+typedef struct {
+    SpingalettDatasetReader *reader;    /* the reader read (NULL: none) */
+    bool several;                       /* more than one reader was read */
+    bool pending;                       /* the move to *at is still to come */
+    bool failed;                        /* the move failed, with the error set */
+} GeneratorWatch;
+void spingalett_generator_watch(const SpingalettDatasetPosition *at);
+GeneratorWatch spingalett_generator_watched(void);
 
 void spingalett_sgd_update(float *restrict W, const float *restrict gW, uint64_t n, float lr, float decay);
 void spingalett_momentum_update(float *restrict W, float *restrict mW, const float *restrict gW, uint64_t n,

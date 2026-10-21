@@ -53,3 +53,8 @@ SPINGALETT_1.3 {
         spingalett_session_rewind;
         spingalett_session_vocabulary;
 } SPINGALETT_1.2;
+
+SPINGALETT_1.4 {
+    global:
+        spingalett_model_open_args;
+} SPINGALETT_1.3;

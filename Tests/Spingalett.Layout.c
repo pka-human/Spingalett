@@ -111,6 +111,10 @@ int main(void) {
     FIELD(SpingalettDatasetInfo, channels); FIELD(SpingalettDatasetInfo, target_set_count);
     FIELD(SpingalettDatasetInfo, target_set);
 
+    SIZE(SpingalettDatasetPosition); FIELD(SpingalettDatasetPosition, reserved);
+    FIELD(SpingalettDatasetPosition, seed); FIELD(SpingalettDatasetPosition, pass);
+    FIELD(SpingalettDatasetPosition, position);
+
     SIZE(DatasetReaderOptions); FIELD(DatasetReaderOptions, reserved);
     FIELD(DatasetReaderOptions, shuffle); FIELD(DatasetReaderOptions, in_memory); FIELD(DatasetReaderOptions, no_prefetch);
     FIELD(DatasetReaderOptions, target_set);
@@ -126,6 +130,8 @@ int main(void) {
     FIELD(SpingalettGenerateArgs, top_k); FIELD(SpingalettGenerateArgs, top_p); FIELD(SpingalettGenerateArgs, seed);
     FIELD(SpingalettGenerateArgs, stop_tokens); FIELD(SpingalettGenerateArgs, stop_count);
 
+    SIZE(SpingalettModelOpenArgs); FIELD(SpingalettModelOpenArgs, reserved);
+    FIELD(SpingalettModelOpenArgs, path); FIELD(SpingalettModelOpenArgs, context);
     SIZE(SpingalettSessionOptions); FIELD(SpingalettSessionOptions, reserved);
     FIELD(SpingalettSessionOptions, max_length); FIELD(SpingalettSessionOptions, sequences);
     SIZE(SpingalettSessionFeed); FIELD(SpingalettSessionFeed, reserved);

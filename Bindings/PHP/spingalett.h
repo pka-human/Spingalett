@@ -69,6 +69,18 @@ typedef enum {
     SPINGALETT_PRECISION_INT8,
     SPINGALETT_PRECISION_INT4,
     SPINGALETT_PRECISION_INT2,
+    SPINGALETT_PRECISION_Q8_0,
+    SPINGALETT_PRECISION_Q4_0,
+    SPINGALETT_PRECISION_Q4_1,
+    SPINGALETT_PRECISION_Q5_0,
+    SPINGALETT_PRECISION_Q5_1,
+    SPINGALETT_PRECISION_Q2_K,
+    SPINGALETT_PRECISION_Q3_K,
+    SPINGALETT_PRECISION_Q4_K,
+    SPINGALETT_PRECISION_Q5_K,
+    SPINGALETT_PRECISION_Q6_K,
+    SPINGALETT_PRECISION_IQ4_NL,
+    SPINGALETT_PRECISION_IQ4_XS,
     SPINGALETT_PRECISION_COUNT
 } SpingalettPrecisionMode;
 
@@ -160,6 +172,12 @@ void spingalett_set_log_level(SpingalettLogLevel level);
 void spingalett_set_verbose(bool enabled);
 bool spingalett_get_verbose(void);
 SpingalettModel *spingalett_model_load(const char *path);
+typedef struct {
+    const char *path;
+    uint32_t context;
+    uint64_t reserved[8];
+} SpingalettModelOpenArgs;
+SpingalettModel *spingalett_model_open_args(SpingalettModelOpenArgs args);
 SpingalettModel *spingalett_model_from_memory(const void *data, size_t size);
 void spingalett_model_free(SpingalettModel *model);
 bool spingalett_model_predict(const SpingalettModel *model, const float *inputs, uint32_t count,
@@ -582,6 +600,8 @@ void *spingalett_save_to_memory(const SpingalettNetwork *net, SpingalettPrecisio
                                 bool save_optimizer, size_t *size);
 SpingalettNetwork *spingalett_load_from_memory(const void *data, size_t size);
 void spingalett_free(void *ptr);
+bool spingalett_save_checkpoint(SpingalettNetwork *net, const char *path);
+SpingalettNetwork *spingalett_load_checkpoint(const char *path);
 SpingalettNetwork *spingalett_import_onnx(const char *path);
 SpingalettNetwork *spingalett_import_onnx_from_memory(const void *data, size_t size);
 bool spingalett_load_pytorch(SpingalettNetwork *net, const char *path, const char *const *modules,
@@ -692,6 +712,14 @@ void spingalett_dataset_close(SpingalettDatasetReader *reader);
 SpingalettDatasetInfo spingalett_dataset_info(const SpingalettDatasetReader *reader);
 uint32_t spingalett_dataset_read(SpingalettDatasetReader *reader, float *inputs, float *targets,
                                  uint32_t max_samples);
+typedef struct {
+    uint64_t seed;
+    uint64_t pass;
+    uint64_t position;
+    uint64_t reserved[8];
+} SpingalettDatasetPosition;
+bool spingalett_dataset_get_position(const SpingalettDatasetReader *reader, SpingalettDatasetPosition *position);
+bool spingalett_dataset_set_position(SpingalettDatasetReader *reader, const SpingalettDatasetPosition *position);
 uint32_t spingalett_dataset_generator(float *inputs, float *targets, uint32_t requested, void *reader);
 
 void spingalett_print_network(const SpingalettNetwork *net);

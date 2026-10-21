@@ -34,6 +34,7 @@ static inline bool spingalett_precision_is_int(PrecisionMode p) {
     return p == PRECISION_INT8 || p == PRECISION_INT4 || p == PRECISION_INT2;
 }
 
+
 /* One entry of the layer table: entry i describes layer i + 1 and what feeds it, the output of layer
    i before version 6, of its inputs (the first gives the input shape) from version 6 on. */
 typedef struct {
@@ -68,10 +69,20 @@ typedef struct {
     bool cells;                                     /* an integer linear layer of a language model
                                                        (slett_token_linear()): each cell's channels
                                                        quantized with a scale of their own */
+    uint32_t rotary;                                /* version 10: an attention's dimensions of a head rotated (the
+                                                       head's when the file says 0); 0 without rotary embeddings */
+    float score_scale;                              /* version 10: an attention's scale of the scores (0: 1 /
+                                                       sqrt(head)) */
+    bool qk_norm;                                   /* version 10: an attention normalizes each head's queries and
+                                                       keys (RMS, eps; the queries' and keys' gammas its weights) */
+    bool freqs;                                     /* version 10: an attention's rotary frequencies are its own
+                                                       (rotary / 2 floats, its scales section) */
+    float embed_scale;                              /* version 10: an embedding's vectors times this (0: as they
+                                                       are; Gemma's square root of the width) */
 } SlettLayer;
 
 typedef struct {
-    uint32_t version;           /* 3 to 9 */
+    uint32_t version;           /* 3 to 10 */
     uint32_t layers;            /* including the input layer */
     LossFunction loss;
     uint8_t flags;
@@ -104,6 +115,56 @@ static inline ActivationFunction slett_act(uint32_t code) {
          : code < (uint32_t)ACT_COUNT ? (ActivationFunction)code : ACT_COUNT;
 }
 static inline uint64_t slett_align(uint64_t x) { return (x + SLETT_SECTION_ALIGN - 1) & ~(uint64_t)(SLETT_SECTION_ALIGN - 1); }
+
+/* The block precisions (format 10): GGUF's types, a row whole blocks of slett_block_values() weights in
+   slett_block_bytes() bytes each, laid out as llama.cpp lays them out (docs/ModelFormat.md). A layer of
+   such weights quantizes its input in blocks of as many values (spingalett_quantize_blocks()). */
+static inline bool spingalett_precision_is_block(PrecisionMode p) {
+    return p >= PRECISION_Q8_0 && p < PRECISION_COUNT;
+}
+static inline uint32_t slett_block_values(PrecisionMode p) {
+    return p >= PRECISION_Q2_K && p <= PRECISION_Q6_K ? 256u : p == PRECISION_IQ4_XS ? 256u : 32u;
+}
+static inline uint32_t slett_block_bytes(PrecisionMode p) {
+    switch (p) {
+        case PRECISION_Q8_0:   return 34u;     /* d, 32 signed bytes */
+        case PRECISION_Q4_0:   return 18u;     /* d, 16 bytes of codes */
+        case PRECISION_Q4_1:   return 20u;     /* d, m, 16 bytes */
+        case PRECISION_Q5_0:   return 22u;     /* d, 4 bytes of fifth bits, 16 bytes */
+        case PRECISION_Q5_1:   return 24u;     /* d, m, 4, 16 */
+        case PRECISION_Q2_K:   return 84u;     /* 16 bytes of scales and minima, 64 of codes, d, dmin */
+        case PRECISION_Q3_K:   return 110u;    /* 32 bytes of third bits, 64 of codes, 12 of scales, d */
+        case PRECISION_Q4_K:   return 144u;    /* d, dmin, 12 bytes of scales and minima, 128 of codes */
+        case PRECISION_Q5_K:   return 176u;    /* d, dmin, 12, 32 bytes of fifth bits, 128 */
+        case PRECISION_Q6_K:   return 210u;    /* 128 bytes of low bits, 64 of high bits, 16 scales, d */
+        case PRECISION_IQ4_NL: return 18u;     /* d, 16 bytes of codes */
+        case PRECISION_IQ4_XS: return 136u;    /* d, 2 + 4 bytes of scales, 128 of codes */
+        default:               return 0u;
+    }
+}
+/* Whether layer L multiplies weights of a block precision: a dense or linear layer (the precision byte of kinds
+   without parameters is the file's, which they do not use). */
+static inline bool slett_block_layer(const SlettLayer *L) {
+    return spingalett_precision_is_block(L->precision) && (L->type == LAYER_DENSE || L->type == LAYER_CONV2D);
+}
+/* Bytes of the quantized input of a block layer of n inputs (spingalett_quantize_blocks()): the codes, a
+   scale for every block of 32 at most, and a sum for every 16 codes. */
+static inline uint64_t slett_block_input_bytes(uint64_t n) {
+    return slett_align(n) + slett_align(n / 8u) + slett_align(n / 4u);
+}
+
+/* n weights (whole blocks) of a block precision as floats, as llama.cpp's dequantize_row_*() computes them. */
+void spingalett_block_decode(PrecisionMode p, const uint8_t *row, float *y, uint32_t n);
+/* n inputs (a multiple of block, 32 or 256) quantized a block at a time by spingalett_quantize_activations():
+   xq the codes, dx[b] block b's scale, sums[i] the sum of codes 16 i to 16 i + 15. */
+void spingalett_quantize_blocks(const float *x, uint32_t n, uint32_t block, int8_t *xq, float *dx, int32_t *sums);
+/* The dot product of a row of n weights of a block precision with an input quantized in its blocks, as every
+   kernel computes it: in each block, the integer sums of the codes' products in each of its sub-blocks, times
+   the sub-blocks' integer scales, added in integers (I1; and, of the types with minima, the minima times the
+   sub-blocks' sums of codes, I2); the block then adds (d dx) I1 (+ (m dx) I2) to a float sum, block after
+   block (docs/ModelFormat.md, **Block precisions**). */
+float spingalett_block_dot(PrecisionMode p, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *sums,
+                           uint32_t n);
 
 bool spingalett_host_is_little_endian(void);
 
@@ -217,12 +278,13 @@ void spingalett_engine_rms_norm(const float *x, uint32_t cells, uint32_t channel
                                 float *y, float *stats);
 /* y = x[0] x[1] ... over n values, the inputs multiplied in their order. */
 void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y, uint32_t n);
-/* The rotary position embeddings of `cells` positions and heads of `head` values: table[p * half + i] the
-   cosine and table[cells * half + p * half + i] the sine of p theta^(-2 i / head), for i below half = head
-   / 2, computed in double and rounded to float (alike on every platform that rounds double alike: the
-   same table for every backend). A vector's halves are paired: x'[i] = x[i] cos - x[i + half] sin,
-   x'[i + half] = x[i + half] cos + x[i] sin. */
-void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, float *table);
+/* The rotary position embeddings of `cells` positions over the first `rot` values of a head: table[p * half + i]
+   the cosine and table[cells * half + p * half + i] the sine of p f_i, for i below half = rot / 2, with f_i =
+   freqs[i] (format 10: frequencies of the layer's own, as LLaMA 3's and YaRN's scaling give them) or theta^(-2 i
+   / rot), computed in double and rounded to float (alike on every platform that rounds double alike: the same
+   table for every backend). A vector's halves of its first rot values are paired: x'[i] = x[i] cos - x[i + half]
+   sin, x'[i + half] = x[i + half] cos + x[i] sin; the values from rot on stay. */
+void spingalett_engine_rope_table(uint32_t cells, uint32_t rot, float theta, const float *freqs, float *table);
 /* An attention layer of one sample: `cells` cells (of queries), heads query heads and kv key and value heads of
    head values; causal; keys less than `window` cells away (0: all); ignoring padding, the keys' tokens (the
    network's inputs: a negative one marks a key left out), else NULL. Cross-attention: kv_input the keys and values
@@ -233,6 +295,10 @@ typedef struct {
     bool causal;
     const float *tokens;
     const float *kv_input;
+    uint32_t rot;               /* the values of a head the rotary embeddings rotate (0: none) */
+    const float *gq, *gk;       /* format 10: the gammas of the queries' and keys' RMS normalization (NULL: none) */
+    float eps;                  /* and its epsilon */
+    float scale;                /* the scores' scale */
 } SlettAttention;
 
 /* The attention of one sample, as the engine computes it: x of `cells` cells of (heads + 2 kv) x head
@@ -240,30 +306,49 @@ typedef struct {
    a->kv_input), y of cells x heads x head values; each query's scores in the order of the keys, its softmax online
    (the running maximum and sum, the values' weighted sum rescaled when the maximum grows), causal: the keys up
    to its cell, with a window those less than window cells away, the keys of padding left out (a query without a
-   key gives zeros). With a table (the rotary embeddings) the queries and keys are rotated first, in scratch of
-   slett_attention_floats() floats. */
+   key gives zeros). Each query head and key head is first normalized with gq and gk (RMS over the head's values,
+   spingalett_engine_rms_norm()), then rotated with the table (the rotary embeddings of a->rot values), in scratch
+   of slett_attention_floats() floats. */
 void spingalett_engine_attention(const SlettAttention *a, const float *x, const float *table, float *y, float *scratch);
 /* The attention of layer L for one sample of the network's inputs `input` (whose tokens a layer ignoring padding
    reads); a cross-attention's kv_input is the caller's to set. */
 void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, const float *input, SlettAttention *a);
-/* A head vector rotated by its position's angles (cosines and sines: the table's halves of its row). */
+/* A head vector rotated by its position's angles (cosines and sines: the table's halves of its row): its first
+   2 half values (in place when src is dst). */
 void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, const float *cosines,
                                    const float *sines);
+/* A query or key head of `head` values made ready for scores: normalized with gamma (format 10's QK
+   normalization, NULL: none) into dst, then its first rot values rotated by the angles of its position (rot 0:
+   none). */
+void spingalett_engine_head(const float *src, float *dst, uint32_t head, const float *gamma, float eps, uint32_t rot,
+                            const float *cosines, const float *sines);
+/* exp(x) rounded to float as glibc's expf computes it without fused multiply-adds (its table of 2^(i / 32) through
+   spingalett_exp2f_table()): attention's exponentials, the same on every platform. */
+float spingalett_expf(float x);
+const uint64_t *spingalett_exp2f_table(void);
 /* One query's attention over `count` keys and values (key j at keys + j key_stride, its value at values + j
    value_stride) as spingalett_engine_attention() computes it, into o[head]: the scores in the order of the
-   keys, times scale, the softmax online; with tokens, key j left out when tokens[j] is negative (padding), and
+   keys, times scale, the softmax online (spingalett_expf()); with tokens, key j left out when tokens[j] is negative (padding), and
    zeros when no key is left. Sessions (spingalett_session_feed()) attend over the keys they keep with it, so
    that their results are the engine's. */
 void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,
                               size_t value_stride, uint32_t count, uint32_t head, float scale, const float *tokens,
                               float *o);
 /* An embedding of one sample: a row of L's table (in its precision, as floats) for every input value, zeros
-   for values outside it, plus the position's vector with positions. */
+   for values outside it, times its scale (format 10), plus the position's vector with positions. */
 void spingalett_engine_embedding(const uint8_t *image, const SlettLayer *L, const float *x, float *y);
 /* The same for one cell: token (an input value) at `position`. */
 void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float token, uint32_t position, float *y);
-static inline uint64_t slett_attention_floats(uint32_t cells, uint32_t kv, uint32_t head, bool rope) {
-    return rope ? (uint64_t)cells * kv * head + (uint64_t)cells * head + head : 0u;
+/* Scratch of an attention whose queries and keys are prepared (rotated or normalized): the keys, the table, a
+   query. */
+static inline uint64_t slett_attention_floats(uint32_t cells, uint32_t kv, uint32_t head, bool prepared) {
+    return prepared ? (uint64_t)cells * kv * head + (uint64_t)cells * head + head : 0u;
+}
+/* Whether attention L prepares its queries and keys (rotary embeddings, or format 10's QK normalization), and the
+   scale of its scores. */
+static inline bool slett_attention_prepared(const SlettLayer *L) { return L->theta > 0.0f || L->qk_norm; }
+static inline float slett_attention_scale(const SlettLayer *L) {
+    return L->score_scale != 0.0f ? L->score_scale : 1.0f / sqrtf((float)(L->out_c / L->heads));
 }
 
 /* GELU, its tanh approximation and SiLU of one value. */
@@ -284,7 +369,8 @@ static inline float spingalett_engine_activate_one(float x, ActivationFunction a
 static inline uint64_t slett_conv_scratch(const SlettLayer *L) {
     if (L->type == LAYER_BATCH_NORM) return (uint64_t)L->out_c * 8u;
     if (L->type == LAYER_ATTENTION)
-        return 4u * slett_attention_floats(L->out_h * L->out_w, L->kv_heads, L->out_c / L->heads, L->theta > 0.0f);
+        return 4u * slett_attention_floats(L->out_h * L->out_w, L->kv_heads, L->out_c / L->heads,
+                                           slett_attention_prepared(L));
     if (L->type == LAYER_CONV_TRANSPOSE2D) return (uint64_t)L->row_len * 4u;     /* a window of its group */
     if (L->type != LAYER_CONV2D) return 0;
     if (!slett_conv_columns(L) && !slett_conv_depthwise(L)) {

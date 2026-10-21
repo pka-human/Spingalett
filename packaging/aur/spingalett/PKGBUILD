@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 pkgname=spingalett
-pkgver=1.3.0
+pkgver=1.4.0
 pkgrel=1
 pkgdesc="Neural networks in C: training on the CPU and GPUs (CUDA, Vulkan), transformers, deployment down to INT2"
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,7 @@ optdepends=('vulkan-icd-loader: training and inference on GPUs through Vulkan'
             'nvidia-utils: training and inference on NVIDIA GPUs through CUDA'
             'python-numpy: the Python bindings (Bindings/Python)')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/pka-human/Spingalett/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('6a0b2901638ece8178fc707b761ba37550909b7935d5c02efa2336f60b03f6ec')
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 build() {
     # the baseline instruction set, with the kernels of later ones chosen at run time; the CUDA kernels compiled

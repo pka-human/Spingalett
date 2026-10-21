@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 1.3.0 LANGUAGES C)
+project(Spingalett VERSION 1.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -220,7 +220,12 @@ if(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MAT
                    ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.ConvGEMM.AVX512.c
                    ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVX512.c
                    ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c)
-    target_compile_definitions(spingalett_build INTERFACE SPINGALETT_GEMM_DISPATCH SPINGALETT_INT8_DISPATCH)
+    target_sources(spingalett_build INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Blocks.AVX2.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Blocks.AVXVNNI.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Blocks.AVX512.c
+                   ${CMAKE_CURRENT_SOURCE_DIR}/Src/Kernels/Spingalett.Attention.AVX2.c)
+    target_compile_definitions(spingalett_build INTERFACE SPINGALETT_GEMM_DISPATCH SPINGALETT_INT8_DISPATCH
+                               SPINGALETT_BLOCK_DISPATCH)
     # -fno-lto: link-time optimization must not move code between instruction sets
     set_source_files_properties(Src/Kernels/Spingalett.GEMM.AVX2.c Src/Kernels/Spingalett.ConvGEMM.AVX2.c
         PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-fno-lto")
@@ -230,7 +235,14 @@ if(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MAT
         PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vnni;-mavx2;-mfma;-fno-lto")
     set_source_files_properties(Src/Kernels/Spingalett.Int8Tiles.AVXVNNI.c
         PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavxvnni;-fno-lto")
-    message(STATUS "Spingalett: GEMM kernels for AVX2 and AVX-512, INT8 kernels for AVX-512 VNNI and AVX-VNNI, chosen at run time")
+    # the block precisions' kernels and sessions' attention compute in IEEE order, as their portable code does
+    set_source_files_properties(Src/Kernels/Spingalett.Blocks.AVX2.c Src/Kernels/Spingalett.Attention.AVX2.c
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-fno-lto;-fno-associative-math;-fno-reciprocal-math;-ffp-contract=off")
+    set_source_files_properties(Src/Kernels/Spingalett.Blocks.AVXVNNI.c
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mavxvnni;-fno-lto;-fno-associative-math;-fno-reciprocal-math;-ffp-contract=off")
+    set_source_files_properties(Src/Kernels/Spingalett.Blocks.AVX512.c
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx2;-mfma;-mf16c;-fno-lto;-fno-associative-math;-fno-reciprocal-math;-ffp-contract=off")
+    message(STATUS "Spingalett: GEMM kernels for AVX2 and AVX-512, INT8 and block kernels for AVX-512 VNNI and AVX-VNNI, chosen at run time")
 elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
        AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # AArch64 Linux: batched INT8 kernels for the dot product instructions (ARMv8.2), where present
@@ -241,7 +253,7 @@ elseif(SPINGALETT_CPU_DISPATCH AND NOT _spg_native_flags AND CMAKE_C_COMPILER_ID
     message(STATUS "Spingalett: INT8 kernels for the ARM dot product instructions chosen at run time")
 endif()
 
-# The inference engine, batched model inference and sessions compute in IEEE order (no reassociation,
+# The inference engine, batched model inference, sessions and the block precisions' kernels compute in IEEE order (no reassociation,
 # reciprocals or contraction), so that they agree bit for bit and match the standalone engine; GGUF's
 # dequantization too, so that a quantized file gives llama.cpp's weights on every platform; and the host's
 # part of integer models on the GPU (batch normalization's coefficients), which must give the CPU's bits
@@ -249,7 +261,8 @@ endif()
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(SPINGALETT_STRICT_FP -fno-associative-math -fno-reciprocal-math -ffp-contract=off)
     set_source_files_properties(Src/Spingalett.Inference.c Src/Spingalett.Model.c Src/Spingalett.Session.c
-                                Src/Spingalett.Gguf.c Src/Gpu/Spingalett.GpuModel.c
+                                Src/Spingalett.Blocks.c Src/Spingalett.Attention.c Src/Spingalett.Gguf.c
+                                Src/Gpu/Spingalett.GpuModel.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
 endif()
 
@@ -588,7 +601,7 @@ if(BUILD_TESTS)
         endif()
     endif()
 
-    foreach(group grad conv norm graph transformer onnx tokenizer pretrained equiv cont optim sched dropout gen predict valid step data io model gpu cuda xor)
+    foreach(group grad conv norm graph transformer onnx tokenizer pretrained equiv cont optim sched dropout gen predict valid step data resume io model gpu cuda xor)
         add_test(NAME core.${group} COMMAND SpingalettTests ${group}
                  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endforeach()

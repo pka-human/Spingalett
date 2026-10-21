@@ -24,10 +24,12 @@
  */
 
 #include "Spingalett.Pretrained.h"
+#include "Spingalett.Image.h"
 #include "Spingalett.Tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ------------------------------------------------------------------------- the file */
 
@@ -42,9 +44,6 @@ enum {
     GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_IQ4_NL = 20,
     GGML_IQ4_XS = 23, GGML_BF16 = 30
 };
-
-/* The sixteen values of IQ4_NL's and IQ4_XS's 4-bit codes (kvalues_iq4nl). */
-static const int8_t iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 typedef struct {
     const char *key;
@@ -291,231 +290,36 @@ static bool kv_string(const Gguf *g, const char *key, char *out, size_t cap) {
 
 /* ------------------------------------------------------------------------- dequantization */
 
-static float half(const uint8_t *p) { return spingalett_fp16_to_float(slett_get16(p)); }
-
-/* The 6-bit scale and minimum j of a Q4_K or Q5_K super-block (get_scale_min_k4()). */
-static void scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
-    if (j < 4) {
-        *d = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
-        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+/* The block precision of a ggml type, PRECISION_COUNT for the others. */
+static PrecisionMode block_precision(uint32_t type) {
+    switch (type) {
+        case GGML_Q8_0: return PRECISION_Q8_0;
+        case GGML_Q4_0: return PRECISION_Q4_0;
+        case GGML_Q4_1: return PRECISION_Q4_1;
+        case GGML_Q5_0: return PRECISION_Q5_0;
+        case GGML_Q5_1: return PRECISION_Q5_1;
+        case GGML_Q2_K: return PRECISION_Q2_K;
+        case GGML_Q3_K: return PRECISION_Q3_K;
+        case GGML_Q4_K: return PRECISION_Q4_K;
+        case GGML_Q5_K: return PRECISION_Q5_K;
+        case GGML_Q6_K: return PRECISION_Q6_K;
+        case GGML_IQ4_NL: return PRECISION_IQ4_NL;
+        case GGML_IQ4_XS: return PRECISION_IQ4_XS;
+        default: return PRECISION_COUNT;
     }
 }
 
-/* n values (a multiple of the type's block) of a ggml type at x into y. */
+/* n values (a multiple of the type's block) of a ggml type at x into y, as llama.cpp's dequantize_row_*(). */
 static void dequantize(const uint8_t *x, uint32_t type, float *y, uint64_t n) {
     switch (type) {
         case GGML_F32: spingalett_decode(y, x, SPG_DTYPE_F32, (size_t)n); return;
         case GGML_F16: spingalett_decode(y, x, SPG_DTYPE_F16, (size_t)n); return;
         case GGML_BF16: spingalett_decode(y, x, SPG_DTYPE_BF16, (size_t)n); return;
-        default: break;
-    }
-    for (uint64_t i = 0; i < n;) {
-        switch (type) {
-            case GGML_Q4_0: {                   /* d, qs[16]: (q - 8) d */
-                const float d = half(x);
-                for (int j = 0; j < 16; j++) {
-                    y[j] = (float)((x[2 + j] & 0x0F) - 8) * d;
-                    y[j + 16] = (float)((x[2 + j] >> 4) - 8) * d;
-                }
-                x += 18; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q4_1: {                   /* d, m, qs[16]: q d + m */
-                const float d = half(x), m = half(x + 2);
-                for (int j = 0; j < 16; j++) {
-                    y[j] = (float)(x[4 + j] & 0x0F) * d + m;
-                    y[j + 16] = (float)(x[4 + j] >> 4) * d + m;
-                }
-                x += 20; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q5_0: {                   /* d, qh (32 fifth bits), qs[16]: (q - 16) d */
-                const float d = half(x);
-                const uint32_t qh = slett_get32(x + 2);
-                for (int j = 0; j < 16; j++) {
-                    const uint8_t h0 = (uint8_t)(((qh >> j) << 4) & 0x10), h1 = (uint8_t)((qh >> (j + 12)) & 0x10);
-                    y[j] = (float)(((x[6 + j] & 0x0F) | h0) - 16) * d;
-                    y[j + 16] = (float)(((x[6 + j] >> 4) | h1) - 16) * d;
-                }
-                x += 22; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q5_1: {                   /* d, m, qh, qs[16]: q d + m */
-                const float d = half(x), m = half(x + 2);
-                const uint32_t qh = slett_get32(x + 4);
-                for (int j = 0; j < 16; j++) {
-                    const uint8_t h0 = (uint8_t)(((qh >> j) << 4) & 0x10), h1 = (uint8_t)((qh >> (j + 12)) & 0x10);
-                    y[j] = (float)((x[8 + j] & 0x0F) | h0) * d + m;
-                    y[j + 16] = (float)((x[8 + j] >> 4) | h1) * d + m;
-                }
-                x += 24; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q8_0: {                   /* d, qs[32] signed: q d */
-                const float d = half(x);
-                for (int j = 0; j < 32; j++) y[j] = (float)(int8_t)x[2 + j] * d;
-                x += 34; y += 32; i += 32;
-                break;
-            }
-            case GGML_Q2_K: {                   /* scales[16] (4-bit scale and minimum), qs[64], d, dmin */
-                const uint8_t *sc = x, *q = x + 16;
-                const float d = half(x + 80), dmin = half(x + 82);
-                int is = 0;
-                for (int nb = 0; nb < 256; nb += 128) {
-                    int shift = 0;
-                    for (int j = 0; j < 4; j++) {
-                        uint8_t s = sc[is++];
-                        float dl = d * (float)(s & 0xF), ml = dmin * (float)(s >> 4);
-                        for (int l = 0; l < 16; l++) *y++ = dl * (float)((int8_t)((q[l] >> shift) & 3)) - ml;
-                        s = sc[is++];
-                        dl = d * (float)(s & 0xF);
-                        ml = dmin * (float)(s >> 4);
-                        for (int l = 0; l < 16; l++) *y++ = dl * (float)((int8_t)((q[l + 16] >> shift) & 3)) - ml;
-                        shift += 2;
-                    }
-                    q += 32;
-                }
-                x += 84; i += 256;
-                break;
-            }
-            case GGML_Q3_K: {                   /* hmask[32], qs[64], scales[12] (6-bit), d */
-                const uint8_t *hm = x, *q = x + 32;
-                const float d_all = half(x + 108);
-                /* the sixteen 6-bit scales, unpacked as llama.cpp's kmask1, kmask2 shuffle does */
-                uint32_t aux[4];
-                const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
-                aux[0] = slett_get32(x + 96); aux[1] = slett_get32(x + 100); aux[2] = slett_get32(x + 104);
-                const uint32_t tmp = aux[2];
-                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-                aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-                int8_t scales[16];
-                for (int k = 0; k < 16; k++) scales[k] = (int8_t)(uint8_t)(aux[k / 4] >> (8 * (k % 4)));
-                int is = 0;
-                uint8_t m = 1;
-                for (int nb = 0; nb < 256; nb += 128) {
-                    int shift = 0;
-                    for (int j = 0; j < 4; j++) {
-                        float dl = d_all * (float)(scales[is++] - 32);
-                        for (int l = 0; l < 16; l++)
-                            *y++ = dl * (float)((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
-                        dl = d_all * (float)(scales[is++] - 32);
-                        for (int l = 0; l < 16; l++)
-                            *y++ = dl * (float)((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
-                        shift += 2;
-                        m = (uint8_t)(m << 1);
-                    }
-                    q += 32;
-                }
-                x += 110; i += 256;
-                break;
-            }
-            case GGML_Q4_K: {                   /* d, dmin, scales[12], qs[128] */
-                const float d = half(x), dmin = half(x + 2);
-                const uint8_t *sc = x + 4, *q = x + 16;
-                int is = 0;
-                for (int j = 0; j < 256; j += 64) {
-                    uint8_t s, mn;
-                    scale_min_k4(is, sc, &s, &mn);
-                    const float d1 = d * s, m1 = dmin * mn;
-                    scale_min_k4(is + 1, sc, &s, &mn);
-                    const float d2 = d * s, m2 = dmin * mn;
-                    for (int l = 0; l < 32; l++) *y++ = d1 * (float)(q[l] & 0xF) - m1;
-                    for (int l = 0; l < 32; l++) *y++ = d2 * (float)(q[l] >> 4) - m2;
-                    q += 32;
-                    is += 2;
-                }
-                x += 144; i += 256;
-                break;
-            }
-            case GGML_Q5_K: {                   /* d, dmin, scales[12], qh[32], qs[128] */
-                const float d = half(x), dmin = half(x + 2);
-                const uint8_t *sc = x + 4, *qh = x + 16, *ql = x + 48;
-                int is = 0;
-                uint8_t u1 = 1, u2 = 2;
-                for (int j = 0; j < 256; j += 64) {
-                    uint8_t s, mn;
-                    scale_min_k4(is, sc, &s, &mn);
-                    const float d1 = d * s, m1 = dmin * mn;
-                    scale_min_k4(is + 1, sc, &s, &mn);
-                    const float d2 = d * s, m2 = dmin * mn;
-                    for (int l = 0; l < 32; l++) *y++ = d1 * (float)((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
-                    for (int l = 0; l < 32; l++) *y++ = d2 * (float)((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
-                    ql += 32;
-                    is += 2;
-                    u1 = (uint8_t)(u1 << 2);
-                    u2 = (uint8_t)(u2 << 2);
-                }
-                x += 176; i += 256;
-                break;
-            }
-            case GGML_Q6_K: {                   /* ql[128], qh[64], scales[16] signed, d */
-                const float d = half(x + 208);
-                const uint8_t *ql = x, *qh = x + 128;
-                const int8_t *sc = (const int8_t *)(x + 192);
-                for (int nb = 0; nb < 256; nb += 128) {
-                    for (int l = 0; l < 32; l++) {
-                        const int is = l / 16;
-                        const int8_t q1 = (int8_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                        const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                        const int8_t q3 = (int8_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                        const int8_t q4 = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                        y[l] = d * (float)sc[is] * (float)q1;
-                        y[l + 32] = d * (float)sc[is + 2] * (float)q2;
-                        y[l + 64] = d * (float)sc[is + 4] * (float)q3;
-                        y[l + 96] = d * (float)sc[is + 6] * (float)q4;
-                    }
-                    y += 128;
-                    ql += 64;
-                    qh += 32;
-                    sc += 8;
-                }
-                x += 210; i += 256;
-                break;
-            }
-            case GGML_IQ4_NL: {                 /* d, qs[16]: d times the code's value */
-                const float d = half(x);
-                for (int j = 0; j < 16; j++) {
-                    y[j] = d * (float)iq4_values[x[2 + j] & 0xF];
-                    y[j + 16] = d * (float)iq4_values[x[2 + j] >> 4];
-                }
-                x += 18; y += 32; i += 32;
-                break;
-            }
-            default: {                          /* GGML_IQ4_XS: d, scales_h, scales_l[4] (6-bit scales of 32 values), qs[128] */
-                const float d = half(x);
-                const uint16_t scales_h = slett_get16(x + 2);
-                const uint8_t *scales_l = x + 4, *qs = x + 8;
-                for (int ib = 0; ib < 8; ib++) {
-                    const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
-                    const float dl = d * (float)(ls - 32);
-                    for (int j = 0; j < 16; j++) {
-                        y[j] = dl * (float)iq4_values[qs[j] & 0xF];
-                        y[j + 16] = dl * (float)iq4_values[qs[j] >> 4];
-                    }
-                    y += 32;
-                    qs += 16;
-                }
-                x += 136; i += 256;
-                break;
-            }
-        }
+        default: spingalett_block_decode(block_precision(type), x, y, (uint32_t)n); return;
     }
 }
 
-/* ------------------------------------------------------------------------- the tensors of a network */
-
-typedef struct {
-    SpgTensorSource base;
-    const Gguf *g;
-    SpgArch arch;
-    bool permuted;                  /* LLaMA's queries and keys in llama.cpp's order */
-    uint32_t heads, kv_heads;
-} GgufSource;
+/* ------------------------------------------------------------------------- the tensors of a model */
 
 static void gguf_part_name(SpgPart part, uint32_t block, char *name, size_t cap) {
     static const char *const names[SPG_PART_COUNT] = {
@@ -530,6 +334,8 @@ static void gguf_part_name(SpgPart part, uint32_t block, char *name, size_t cap)
         [SPG_PART_GATE] = "ffn_gate.weight", [SPG_PART_GATE_BIAS] = "ffn_gate.bias",
         [SPG_PART_UP] = "ffn_up.weight", [SPG_PART_UP_BIAS] = "ffn_up.bias",
         [SPG_PART_DOWN] = "ffn_down.weight", [SPG_PART_DOWN_BIAS] = "ffn_down.bias",
+        [SPG_PART_Q_NORM] = "attn_q_norm.weight", [SPG_PART_K_NORM] = "attn_k_norm.weight",
+        [SPG_PART_ATTN_POST_NORM] = "post_attention_norm.weight", [SPG_PART_FFN_POST_NORM] = "post_ffw_norm.weight",
     };
     if (part <= SPG_PART_HEAD) snprintf(name, cap, "%s", names[part]);
     else snprintf(name, cap, "blk.%u.%s", block, names[part]);
@@ -541,6 +347,15 @@ static const GgufTensor *find_gguf_tensor(const Gguf *g, const char *name) {
         if (g->tensors[k].name_len == n && !memcmp(g->tensors[k].name, name, n)) return &g->tensors[k];
     return NULL;
 }
+
+#if !defined(SPINGALETT_RUNTIME)
+typedef struct {
+    SpgTensorSource base;
+    const Gguf *g;
+    SpgArch arch;
+    bool permuted;                  /* LLaMA's queries and keys in llama.cpp's order */
+    uint32_t heads, kv_heads;
+} GgufSource;
 
 static bool gguf_has(SpgTensorSource *s, SpgPart part, uint32_t block) {
     char name[64];
@@ -606,7 +421,103 @@ static bool gguf_read(SpgTensorSource *s, SpgPart part, uint32_t block, float *d
     }
     return true;
 }
+#endif
 
+/* The transformer a parsed file describes (its hyper-parameters, from its metadata), and whether its queries and
+   keys are in llama.cpp's order (LLaMA's); false with msg set when its architecture or a feature is not read.
+   *freqs receives LLaMA 3's rotary frequencies (rope_freqs.weight's factors) or a linear scaling's, head_size / 2
+   floats allocated, or NULL; `networks`: for spingalett_load_pretrained(), whose networks have neither those nor
+   the normalized queries and keys of Qwen3. */
+static bool gguf_describe(const Gguf *g, uint32_t context, bool networks, SpgTransformer *t, bool *permuted,
+                          float **freqs, char *msg, size_t cap) {
+    char arch[32] = "", key[96];
+    (void)kv_string(g, "general.architecture", arch, sizeof arch);
+    memset(t, 0, sizeof *t);
+    *freqs = NULL;
+    const bool gpt2 = !strcmp(arch, "gpt2"), qwen2 = !strcmp(arch, "qwen2"), qwen3 = !strcmp(arch, "qwen3");
+    const bool gemma3 = !strcmp(arch, "gemma3");
+    if (!gpt2 && !qwen2 && !qwen3 && !gemma3 && strcmp(arch, "llama")) {
+        snprintf(msg, cap, "GGUF: the architecture '%s' is not supported (llama, qwen2, qwen3, gemma3 and gpt2 are)",
+                 arch[0] ? arch : "(none)");
+        return false;
+    }
+#define ARCH_KEY(name) (snprintf(key, sizeof key, "%s." name, arch), key)
+    t->arch = gpt2 ? SPG_ARCH_GPT2 : SPG_ARCH_LLAMA;
+    t->width = kv_u32(g, ARCH_KEY("embedding_length"), 0);
+    t->layers = kv_u32(g, ARCH_KEY("block_count"), 0);
+    t->hidden = kv_u32(g, ARCH_KEY("feed_forward_length"), 0);
+    t->heads = kv_u32(g, ARCH_KEY("attention.head_count"), 0);
+    t->kv_heads = kv_u32(g, ARCH_KEY("attention.head_count_kv"), t->heads);
+    t->head_size = kv_u32(g, ARCH_KEY("attention.key_length"), t->heads ? t->width / t->heads : 0);
+    t->eps = gpt2 ? kv_float(g, ARCH_KEY("attention.layer_norm_epsilon"), 1e-5f)
+                  : kv_float(g, ARCH_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
+    t->theta = kv_float(g, ARCH_KEY("rope.freq_base"), 10000.0f);
+    t->window = kv_u32(g, ARCH_KEY("attention.sliding_window"), 0);
+    t->act = ACT_GELU_TANH;
+    t->qk_norm = qwen3 || gemma3;
+    t->gate = gemma3 ? ACT_GELU_TANH : ACT_SILU;
+    if (gemma3) {
+        /* Gemma 3: embeddings times the square root of the width, normalized outputs, of every six layers five
+           attending through a window with a rotary base of their own (llama.cpp's defaults where the file has none) */
+        t->embed_scale = sqrtf((float)t->width);
+        t->post_norms = true;
+        t->window_pattern = kv_u32(g, ARCH_KEY("attention.sliding_window_pattern"), 6);
+        t->theta_local = kv_float(g, ARCH_KEY("rope.freq_base_swa"), 10000.0f);
+    }
+    const float softcap = kv_float(g, ARCH_KEY("final_logit_softcapping"), 0.0f);
+    const uint32_t positions = kv_u32(g, ARCH_KEY("context_length"), 0);
+    const uint32_t most = networks ? 2048u : 4096u;
+    t->context = context ? context : gpt2 ? positions : positions && positions < most ? positions : most;
+    const uint32_t rotary = kv_u32(g, ARCH_KEY("rope.dimension_count"), t->head_size);
+    char scaling[32] = "none";
+    (void)kv_string(g, ARCH_KEY("rope.scaling.type"), scaling, sizeof scaling);
+    const float factor = kv_float(g, ARCH_KEY("rope.scaling.factor"), 1.0f);
+#undef ARCH_KEY
+    const GgufTensor *embed = find_gguf_tensor(g, "token_embd.weight");
+    const GgufTensor *factors = find_gguf_tensor(g, "rope_freqs.weight");
+    t->vocabulary = embed && embed->ndims == 2 && embed->dims[1] < (1u << 24) ? (uint32_t)embed->dims[1] : 0;
+    const bool linear = !strcmp(scaling, "linear") && factor != 1.0f, scaled = (strcmp(scaling, "none") && factor != 1.0f) ||
+                        factors;
+    const char *problem = !embed ? "the file has no token_embd.weight"
+                        : gpt2 && context > positions ? "the context exceeds GPT-2's positions"
+                        : !gpt2 && rotary != t->head_size ? "rotary embeddings on part of a head are not supported"
+                        : networks && (t->qk_norm || t->post_norms)
+                          ? "Qwen3's and Gemma 3's layers run as a model (spingalett_model_load()), not yet as a network"
+                        : softcap != 0.0f ? "soft-capped logits are not supported"
+                        : networks && scaled ? "scaled rotary embeddings run as a model (spingalett_model_load()), not "
+                                               "yet as a network"
+                        : scaled && !factors && !linear ? "this scaling of the rotary embeddings is not supported "
+                                                          "(LLaMA 3's frequencies and linear scaling are)"
+                        : factors && (factors->ndims != 1 || factors->dims[0] != t->head_size / 2u || !factors->data ||
+                                      (factors->type != GGML_F32 && factors->type != GGML_F16))
+                          ? "rope_freqs.weight is not the head's half of factors" : NULL;
+    if (problem) {
+        snprintf(msg, cap, "GGUF: %s", problem);
+        return false;
+    }
+    *permuted = !gpt2 && !qwen2 && !qwen3 && !gemma3;          /* (llama.cpp rotates adjacent pairs of LLaMA alone) */
+    if (!gpt2 && scaled) {
+        /* each pair's frequency theta^(-2 i / head) divided by its factor (llama.cpp's ggml_rope_ext()), or by the
+           linear scaling's */
+        const uint32_t half = t->head_size / 2u;
+        float *f = (float *)malloc((size_t)half * sizeof(float)), *ff = factors ? (float *)malloc((size_t)half * 4u) : NULL;
+        if (!f || (factors && !ff)) {
+            free(f);
+            free(ff);
+            snprintf(msg, cap, "GGUF: out of memory");
+            return false;
+        }
+        if (ff) dequantize(factors->data, factors->type, ff, half);
+        for (uint32_t i = 0; i < half; i++)
+            f[i] = (float)(pow((double)t->theta, -2.0 * (double)i / (double)t->head_size) / (ff ? (double)ff[i] : (double)factor));
+        free(ff);
+        *freqs = f;
+        t->freqs = f;
+    }
+    return true;
+}
+
+#if !defined(SPINGALETT_RUNTIME)
 NeuralNetwork *spingalett_gguf_network(const uint8_t *data, size_t size, uint32_t context) {
     Gguf g;
     char msg[240];
@@ -615,58 +526,330 @@ NeuralNetwork *spingalett_gguf_network(const uint8_t *data, size_t size, uint32_
         gguf_free(&g);
         return NULL;
     }
-    char arch[32] = "", key[96];
-    (void)kv_string(&g, "general.architecture", arch, sizeof arch);
     SpgTransformer t;
-    memset(&t, 0, sizeof t);
-    const bool gpt2 = !strcmp(arch, "gpt2"), qwen2 = !strcmp(arch, "qwen2");
-    if (!gpt2 && !qwen2 && strcmp(arch, "llama")) {
-        snprintf(msg, sizeof msg, "GGUF: the architecture '%s' is not supported (llama, qwen2 and gpt2 are)",
-                 arch[0] ? arch : "(none)");
-        set_error(SPINGALETT_ERR_INVALID, msg);
-        gguf_free(&g);
-        return NULL;
-    }
-#define ARCH_KEY(name) (snprintf(key, sizeof key, "%s." name, arch), key)
-    t.arch = gpt2 ? SPG_ARCH_GPT2 : SPG_ARCH_LLAMA;
-    t.width = kv_u32(&g, ARCH_KEY("embedding_length"), 0);
-    t.layers = kv_u32(&g, ARCH_KEY("block_count"), 0);
-    t.hidden = kv_u32(&g, ARCH_KEY("feed_forward_length"), 0);
-    t.heads = kv_u32(&g, ARCH_KEY("attention.head_count"), 0);
-    t.kv_heads = kv_u32(&g, ARCH_KEY("attention.head_count_kv"), t.heads);
-    t.head_size = kv_u32(&g, ARCH_KEY("attention.key_length"), t.heads ? t.width / t.heads : 0);
-    t.eps = gpt2 ? kv_float(&g, ARCH_KEY("attention.layer_norm_epsilon"), 1e-5f)
-                 : kv_float(&g, ARCH_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
-    t.theta = kv_float(&g, ARCH_KEY("rope.freq_base"), 10000.0f);
-    t.window = kv_u32(&g, ARCH_KEY("attention.sliding_window"), 0);
-    t.act = ACT_GELU_TANH;
-    const uint32_t positions = kv_u32(&g, ARCH_KEY("context_length"), 0);
-    t.context = context ? context : gpt2 ? positions : positions && positions < 2048 ? positions : 2048;
-    const uint32_t rotary = kv_u32(&g, ARCH_KEY("rope.dimension_count"), t.head_size);
-    char scaling[32] = "none";
-    (void)kv_string(&g, ARCH_KEY("rope.scaling.type"), scaling, sizeof scaling);
-    const float factor = kv_float(&g, ARCH_KEY("rope.scaling.factor"), 1.0f);
-#undef ARCH_KEY
-    const GgufTensor *embed = find_gguf_tensor(&g, "token_embd.weight");
-    t.vocabulary = embed && embed->ndims == 2 && embed->dims[1] < (1u << 24) ? (uint32_t)embed->dims[1] : 0;
-    const char *problem = !embed ? "the file has no token_embd.weight"
-                        : gpt2 && context > positions ? "the context exceeds GPT-2's positions"
-                        : !gpt2 && rotary != t.head_size ? "rotary embeddings on part of a head are not supported"
-                        : !gpt2 && ((strcmp(scaling, "none") && factor != 1.0f) || find_gguf_tensor(&g, "rope_freqs.weight"))
-                          ? "scaled rotary embeddings are not supported" : NULL;
+    bool permuted = false;
+    float *freqs = NULL;
     NeuralNetwork *net = NULL;
-    if (problem) {
-        snprintf(msg, sizeof msg, "GGUF: %s", problem);
+    if (!gguf_describe(&g, context, true, &t, &permuted, &freqs, msg, sizeof msg)) {
         set_error(SPINGALETT_ERR_INVALID, msg);
     } else {
         GgufSource src = {.base = {.has = gguf_has, .read = gguf_read}, .g = &g, .arch = t.arch,
-                          .permuted = !gpt2 && !qwen2, .heads = t.heads, .kv_heads = t.kv_heads};
+                          .permuted = permuted, .heads = t.heads, .kv_heads = t.kv_heads};
         net = spingalett_build_transformer(&t, &src.base);
     }
+    free(freqs);
     gguf_free(&g);
     return net;
 }
+#endif
 
+/* ------------------------------------------------------------------------- deployment models */
+
+/* The precision a tensor's type is stored in, PRECISION_COUNT for the types no layer computes with. */
+static PrecisionMode tensor_precision(uint32_t type) {
+    switch (type) {
+        case GGML_F32: return PRECISION_FLOAT32;
+        case GGML_F16: return PRECISION_FP16;
+        case GGML_BF16: return PRECISION_BFLOAT16;
+        default: return block_precision(type);
+    }
+}
+
+typedef struct {
+    const Gguf *g;
+    SpgImageBuilder *b;
+    uint8_t *image;
+    bool permuted;                  /* LLaMA's queries and keys in llama.cpp's order */
+    uint32_t heads, kv_heads, head;
+    char error[256];
+} ImageWriter;
+
+/* A part's tensor, of `cols` values a row and `rows` rows (0: a vector of cols values), of a type that is read; NULL
+   with the error set otherwise (optional parts: NULL without an error when the file lacks them). */
+static const GgufTensor *part_tensor(ImageWriter *w, SpgPart part, uint32_t block, uint64_t cols, uint64_t rows,
+                                     bool optional) {
+    char name[64];
+    gguf_part_name(part, block, name, sizeof name);
+    const GgufTensor *t = find_gguf_tensor(w->g, name);
+    if (!t) {
+        if (!optional && !w->error[0]) snprintf(w->error, sizeof w->error, "GGUF: the file has no %s", name);
+        return NULL;
+    }
+    const bool fits = rows ? t->ndims == 2 && t->dims[0] == cols && (t->dims[1] == rows ||
+                                                                      (part == SPG_PART_POSITIONS && t->dims[1] > rows))
+                           : t->ndims == 1 && t->dims[0] == cols;
+    if (!fits) {
+        if (!w->error[0])
+            snprintf(w->error, sizeof w->error, "GGUF: %s has shape [%llu, %llu], not [%llu, %llu]", name,
+                     (unsigned long long)t->dims[0], (unsigned long long)(t->ndims > 1 ? t->dims[1] : 1),
+                     (unsigned long long)cols, (unsigned long long)(rows ? rows : 1));
+        return NULL;
+    }
+    if (!t->data || tensor_precision(t->type) == PRECISION_COUNT || (!rows && t->type != GGML_F32 && t->type != GGML_F16 &&
+                                                                     t->type != GGML_BF16)) {
+        if (!w->error[0])
+            snprintf(w->error, sizeof w->error, "GGUF: %s is of the type %u, which is not read (F32, F16, BF16, Q4_0, "
+                     "Q4_1, Q5_0, Q5_1, Q8_0, Q2_K to Q6_K, IQ4_NL and IQ4_XS are; vectors F32, F16 and BF16)", name, t->type);
+        return NULL;
+    }
+    return t;
+}
+
+/* Row r of a tensor of LLaMA's queries or keys (heads of d rows) as Hugging Face orders them: llama.cpp's row h d +
+   2 i + j holds Hugging Face's h d + j d / 2 + i. */
+static uint64_t hf_row(uint64_t r, uint32_t d) {
+    const uint64_t h = r / d, within = r % d, j = within / (d / 2u), i = within % (d / 2u);
+    return h * d + 2u * i + j;
+}
+
+/* rows rows of tensor t into dst (its rows in Hugging Face's order with `permute`: heads of `head` rows). */
+static void copy_rows(uint8_t *dst, const GgufTensor *t, uint64_t rows, bool permute, uint32_t head) {
+    bool whole;
+    const uint64_t bytes = type_bytes(t->type, t->dims[0], &whole);
+    const int64_t n = (int64_t)rows;
+    SPINGALETT_PARALLEL_FOR(rows * bytes >= (1u << 22),
+        for (int64_t r = 0; r < n; r++)
+            memcpy(dst + (uint64_t)r * bytes, t->data + (permute ? hf_row((uint64_t)r, head) : (uint64_t)r) * bytes,
+                   (size_t)bytes);
+    );
+}
+
+/* n values of a vector tensor (F32, F16, BF16) into dst, in Hugging Face's order with `permute`. */
+static void copy_floats(float *dst, const GgufTensor *t, uint64_t n, bool permute, uint32_t head) {
+    for (uint64_t i = 0; i < n; i++) {
+        const uint64_t at = permute ? hf_row(i, head) : i;
+        dequantize(t->data + at * (t->type == GGML_F32 ? 4u : 2u), t->type, dst + i, 1);
+    }
+}
+
+/* The layers of a LLaMA-like or GPT-2 block's linear maps: the queries', keys' and values' in one layer when their
+   tensors share a type (else three, concatenated), the attention, its output's and the MLP's. */
+typedef struct {
+    uint32_t attn_norm, q, k, v, qkv, attention, o, attn_post, ffn_norm, gate, up, down, ffn_post;
+    const GgufTensor *tq, *tk, *tv, *tqkv, *to, *tgate, *tup, *tdown;
+} ImageBlock;
+
+static uint32_t add(ImageWriter *w, SpgLayerSpec spec) {
+    const uint32_t index = w->error[0] ? 0u : spingalett_image_layer(w->b, &spec);
+    if (!index && !w->error[0]) snprintf(w->error, sizeof w->error, "%s", spingalett_last_error_message());
+    return index;
+}
+
+#define SPEC(...) ((SpgLayerSpec){__VA_ARGS__})
+#define INPUTS(...) .input_count = sizeof((uint32_t[]){__VA_ARGS__}) / sizeof(uint32_t), .inputs = {__VA_ARGS__}
+
+uint8_t *spingalett_gguf_image(const uint8_t *data, size_t size, uint32_t context, size_t *image_size) {
+    Gguf g;
+    if (!gguf_parse(&g, data, size)) {
+        set_error(SPINGALETT_ERR_INVALID, g.error);
+        gguf_free(&g);
+        return NULL;
+    }
+    SpgTransformer t;
+    bool permuted = false;
+    float *freqs = NULL;
+    ImageWriter w = {.g = &g};
+    ImageBlock *blocks = NULL;
+    uint8_t *image = NULL;
+    if (!gguf_describe(&g, context, false, &t, &permuted, &freqs, w.error, sizeof w.error)) goto done;
+    const bool gpt2 = t.arch == SPG_ARCH_GPT2;
+    const uint64_t W = t.width, V = t.vocabulary, F = t.hidden, hd = t.head_size;
+    const uint64_t Q = (uint64_t)t.heads * hd, KV = (uint64_t)t.kv_heads * hd;
+    if (!W || !V || !F || !t.layers || !t.heads || !t.kv_heads || t.heads % t.kv_heads || !hd || (!gpt2 && hd % 2u) ||
+        W > (1u << 20) || F > (1u << 20) || Q + 2u * KV > (1u << 20)) {
+        snprintf(w.error, sizeof w.error, "GGUF: the model's hyper-parameters are invalid");
+        goto done;
+    }
+    w.permuted = permuted, w.heads = t.heads, w.kv_heads = t.kv_heads, w.head = (uint32_t)hd;
+    w.b = spingalett_image_new(t.context, LOSS_SPARSE_CROSS_ENTROPY);
+    blocks = (ImageBlock *)calloc(t.layers, sizeof(ImageBlock));
+    if (!w.b || !blocks) {
+        snprintf(w.error, sizeof w.error, "%s", w.b ? "GGUF: out of memory" : spingalett_last_error_message());
+        goto done;
+    }
+    /* the tensors where the hyper-parameters say, then the layers */
+    const GgufTensor *embed = part_tensor(&w, SPG_PART_EMBED, 0, W, V, false);
+    const GgufTensor *positions = gpt2 ? part_tensor(&w, SPG_PART_POSITIONS, 0, W, t.context, false) : NULL;
+    const GgufTensor *head = part_tensor(&w, SPG_PART_HEAD, 0, W, V, true);
+    for (uint32_t b = 0; b < t.layers && !w.error[0]; b++) {
+        ImageBlock *k = &blocks[b];
+        if (gpt2) {
+            k->tqkv = part_tensor(&w, SPG_PART_QKV, b, W, Q + 2u * KV, false);
+        } else {
+            k->tq = part_tensor(&w, SPG_PART_Q, b, W, Q, false);
+            k->tk = part_tensor(&w, SPG_PART_K, b, W, KV, false);
+            k->tv = part_tensor(&w, SPG_PART_V, b, W, KV, false);
+            k->tgate = part_tensor(&w, SPG_PART_GATE, b, W, F, false);
+        }
+        k->to = part_tensor(&w, SPG_PART_O, b, Q, W, false);
+        k->tup = part_tensor(&w, SPG_PART_UP, b, W, F, false);
+        k->tdown = part_tensor(&w, SPG_PART_DOWN, b, F, W, false);
+        (void)part_tensor(&w, SPG_PART_ATTN_NORM, b, W, 0, false);
+        (void)part_tensor(&w, SPG_PART_FFN_NORM, b, W, 0, false);
+        if (t.qk_norm) {
+            (void)part_tensor(&w, SPG_PART_Q_NORM, b, hd, 0, false);
+            (void)part_tensor(&w, SPG_PART_K_NORM, b, hd, 0, false);
+        }
+        if (t.post_norms) {
+            (void)part_tensor(&w, SPG_PART_ATTN_POST_NORM, b, W, 0, false);
+            (void)part_tensor(&w, SPG_PART_FFN_POST_NORM, b, W, 0, false);
+        }
+    }
+    (void)part_tensor(&w, SPG_PART_NORM, 0, W, 0, false);
+    if (w.error[0]) goto done;
+
+    const LayerType norm = gpt2 ? LAYER_LAYER_NORM : LAYER_RMS_NORM;
+    const uint32_t e = add(&w, SPEC(.type = LAYER_EMBEDDING, .precision = tensor_precision(embed->type), INPUTS(0),
+                                    .channels = (uint32_t)W, .vocabulary = (uint32_t)V, .positions = gpt2,
+                                    .embed_scale = t.embed_scale));
+    uint32_t x = e;
+    for (uint32_t b = 0; b < t.layers; b++) {
+        ImageBlock *k = &blocks[b];
+        k->attn_norm = add(&w, SPEC(.type = norm, INPUTS(x), .eps = t.eps));
+        if (gpt2) {
+            k->qkv = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tqkv->type), INPUTS(k->attn_norm),
+                                  .channels = (uint32_t)(Q + 2u * KV)));
+        } else if (k->tq->type == k->tk->type && k->tq->type == k->tv->type) {
+            k->qkv = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tq->type), INPUTS(k->attn_norm),
+                                  .channels = (uint32_t)(Q + 2u * KV)));
+        } else {
+            k->q = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tq->type), INPUTS(k->attn_norm),
+                                .channels = (uint32_t)Q));
+            k->k = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tk->type), INPUTS(k->attn_norm),
+                                .channels = (uint32_t)KV));
+            k->v = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tv->type), INPUTS(k->attn_norm),
+                                .channels = (uint32_t)KV));
+            k->qkv = add(&w, SPEC(.type = LAYER_CONCAT, INPUTS(k->q, k->k, k->v)));
+        }
+        /* with a pattern of windows, the last layer of each pattern attends to every key, with the frequencies of the
+           model, the others through the window with their own base */
+        const bool windowed = t.window && (!t.window_pattern || b % t.window_pattern < t.window_pattern - 1u);
+        const float theta = gpt2 ? 0.0f : windowed && t.window_pattern && t.theta_local > 0.0f ? t.theta_local : t.theta;
+        k->attention = add(&w, SPEC(.type = LAYER_ATTENTION, INPUTS(k->qkv), .channels = (uint32_t)Q, .heads = t.heads,
+                                    .kv_heads = t.kv_heads, .theta = theta, .causal = true,
+                                    .window = windowed ? t.window : 0u, .qk_norm = t.qk_norm, .eps = t.qk_norm ? t.eps : 0.0f,
+                                    .freqs = t.freqs != NULL && !(windowed && t.window_pattern)));
+        k->o = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->to->type), INPUTS(k->attention),
+                            .channels = (uint32_t)W));
+        uint32_t attended = k->o;
+        if (t.post_norms) attended = k->attn_post = add(&w, SPEC(.type = norm, INPUTS(k->o), .eps = t.eps));
+        x = add(&w, SPEC(.type = LAYER_ADD, INPUTS(x, attended)));
+        k->ffn_norm = add(&w, SPEC(.type = norm, INPUTS(x), .eps = t.eps));
+        uint32_t mlp;
+        if (gpt2) {
+            mlp = k->up = add(&w, SPEC(.type = LAYER_CONV2D, .activation = t.act, .precision = tensor_precision(k->tup->type),
+                                       INPUTS(k->ffn_norm), .channels = (uint32_t)F));
+        } else {
+            k->gate = add(&w, SPEC(.type = LAYER_CONV2D, .activation = t.gate, .precision = tensor_precision(k->tgate->type),
+                                   INPUTS(k->ffn_norm), .channels = (uint32_t)F));
+            k->up = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tup->type), INPUTS(k->ffn_norm),
+                                 .channels = (uint32_t)F));
+            mlp = add(&w, SPEC(.type = LAYER_MULTIPLY, INPUTS(k->gate, k->up)));
+        }
+        k->down = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision(k->tdown->type), INPUTS(mlp),
+                               .channels = (uint32_t)W));
+        uint32_t fed = k->down;
+        if (t.post_norms) fed = k->ffn_post = add(&w, SPEC(.type = norm, INPUTS(k->down), .eps = t.eps));
+        x = add(&w, SPEC(.type = LAYER_ADD, INPUTS(x, fed)));
+    }
+    const uint32_t final_norm = add(&w, SPEC(.type = norm, INPUTS(x), .eps = t.eps));
+    const uint32_t logits = add(&w, SPEC(.type = LAYER_CONV2D, .precision = tensor_precision((head ? head : embed)->type),
+                                         INPUTS(final_norm), .channels = (uint32_t)V, .tied = head ? 0u : e));
+    if (w.error[0]) goto done;
+    image = spingalett_image_layout(w.b, image_size);
+    if (!image) {
+        snprintf(w.error, sizeof w.error, "%s", spingalett_last_error_message());
+        goto done;
+    }
+
+    /* the parameters, tensor by tensor where the image holds them */
+#define WEIGHTS(layer) spingalett_image_weights(w.b, image, (layer), NULL, NULL)
+#define BIASES(layer) spingalett_image_biases(w.b, image, (layer))
+#define VECTOR(part, b, n, dst, permute) do { \
+        const GgufTensor *v_ = part_tensor(&w, (part), (b), (n), 0, true); \
+        if (v_) copy_floats((dst), v_, (n), (permute), (uint32_t)hd); \
+    } while (0)
+    copy_rows(WEIGHTS(e), embed, V, false, 0);
+    if (gpt2) {
+        bool whole;
+        float *at = BIASES(e);
+        for (uint32_t c = 0; c < t.context; c++)
+            dequantize(positions->data + (uint64_t)c * type_bytes(positions->type, W, &whole), positions->type,
+                       at + (uint64_t)c * W, W);
+    }
+    for (uint32_t b = 0; b < t.layers; b++) {
+        const ImageBlock *k = &blocks[b];
+        VECTOR(SPG_PART_ATTN_NORM, b, W, (float *)(void *)WEIGHTS(k->attn_norm), false);
+        if (gpt2) VECTOR(SPG_PART_ATTN_NORM_BIAS, b, W, BIASES(k->attn_norm), false);
+        if (gpt2) {
+            copy_rows(WEIGHTS(k->qkv), k->tqkv, Q + 2u * KV, false, 0);
+            VECTOR(SPG_PART_QKV_BIAS, b, Q + 2u * KV, BIASES(k->qkv), false);
+        } else {
+            /* the queries', keys' and values' rows (and biases), in one layer or three */
+            const bool fused = k->q == 0;
+            uint8_t *rows[3] = {WEIGHTS(fused ? k->qkv : k->q), NULL, NULL};
+            float *biases[3] = {BIASES(fused ? k->qkv : k->q), NULL, NULL};
+            bool whole;
+            const uint64_t qrow = type_bytes(k->tq->type, W, &whole), krow = type_bytes(k->tk->type, W, &whole);
+            rows[1] = fused ? rows[0] + Q * qrow : WEIGHTS(k->k);
+            rows[2] = fused ? rows[1] + KV * krow : WEIGHTS(k->v);
+            biases[1] = fused ? biases[0] + Q : BIASES(k->k);
+            biases[2] = fused ? biases[1] + KV : BIASES(k->v);
+            copy_rows(rows[0], k->tq, Q, w.permuted, (uint32_t)hd);
+            copy_rows(rows[1], k->tk, KV, w.permuted, (uint32_t)hd);
+            copy_rows(rows[2], k->tv, KV, false, 0);
+            VECTOR(SPG_PART_Q_BIAS, b, Q, biases[0], w.permuted);
+            VECTOR(SPG_PART_K_BIAS, b, KV, biases[1], w.permuted);
+            VECTOR(SPG_PART_V_BIAS, b, KV, biases[2], false);
+        }
+        if (t.qk_norm) {
+            float *gammas = (float *)(void *)WEIGHTS(k->attention);
+            VECTOR(SPG_PART_Q_NORM, b, hd, gammas, false);
+            VECTOR(SPG_PART_K_NORM, b, hd, gammas + hd, false);
+        }
+        float *freqs_at = spingalett_image_scales(w.b, image, k->attention);
+        if (t.freqs && freqs_at) memcpy(freqs_at, t.freqs, (size_t)(hd / 2u) * sizeof(float));
+        if (t.post_norms) {
+            VECTOR(SPG_PART_ATTN_POST_NORM, b, W, (float *)(void *)WEIGHTS(k->attn_post), false);
+            VECTOR(SPG_PART_FFN_POST_NORM, b, W, (float *)(void *)WEIGHTS(k->ffn_post), false);
+        }
+        copy_rows(WEIGHTS(k->o), k->to, W, false, 0);
+        VECTOR(SPG_PART_O_BIAS, b, W, BIASES(k->o), false);
+        VECTOR(SPG_PART_FFN_NORM, b, W, (float *)(void *)WEIGHTS(k->ffn_norm), false);
+        if (gpt2) VECTOR(SPG_PART_FFN_NORM_BIAS, b, W, BIASES(k->ffn_norm), false);
+        if (!gpt2) {
+            copy_rows(WEIGHTS(k->gate), k->tgate, F, false, 0);
+            VECTOR(SPG_PART_GATE_BIAS, b, F, BIASES(k->gate), false);
+        }
+        copy_rows(WEIGHTS(k->up), k->tup, F, false, 0);
+        VECTOR(SPG_PART_UP_BIAS, b, F, BIASES(k->up), false);
+        copy_rows(WEIGHTS(k->down), k->tdown, W, false, 0);
+        VECTOR(SPG_PART_DOWN_BIAS, b, W, BIASES(k->down), false);
+    }
+    VECTOR(SPG_PART_NORM, 0, W, (float *)(void *)WEIGHTS(final_norm), false);
+    if (gpt2) VECTOR(SPG_PART_NORM_BIAS, 0, W, BIASES(final_norm), false);
+    if (head) copy_rows(WEIGHTS(logits), head, V, false, 0);
+#undef WEIGHTS
+#undef BIASES
+#undef VECTOR
+    spingalett_image_seal(image, *image_size);
+done:
+    if (w.error[0]) {
+        spingalett_aligned_free(image);
+        image = NULL;
+        set_error(SPINGALETT_ERR_INVALID, w.error);
+    }
+    spingalett_image_free(w.b);
+    free(blocks);
+    free(freqs);
+    gguf_free(&g);
+    return image;
+}
+
+#undef SPEC
+#undef INPUTS
+
+#if !defined(SPINGALETT_RUNTIME)
 /* ------------------------------------------------------------------------- the vocabulary */
 
 /* The strings of an array of strings, NULL when the key is missing or holds anything else. */
@@ -744,3 +927,4 @@ SpingalettTokenizer *spingalett_gguf_tokenizer(const uint8_t *data, size_t size)
     gguf_free(&g);
     return tok;
 }
+#endif

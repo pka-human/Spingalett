@@ -23,12 +23,22 @@ final class Model
         $this->model = $model;
     }
 
-    /** A model from a .slett file. */
-    public static function load(string $path): self
+    /**
+     * A model from a .slett file, or a language model's GGUF file (its tensors as the file stores them, the
+     * quantized types as block precisions) with a window of $context tokens (0: the model's positions, 4096 at
+     * most).
+     */
+    public static function load(string $path, int $context = 0): self
     {
-        $model = Library::ffi()->spingalett_model_load($path);
+        $ffi = Library::ffi();
+        $args = $ffi->new('SpingalettModelOpenArgs');
+        $bytes = $ffi->new('char[' . (strlen($path) + 1) . ']');
+        \FFI::memcpy($bytes, $path . "\0", strlen($path) + 1);
+        $args->path = $ffi->cast('const char *', $bytes);
+        $args->context = $context;
+        $model = $ffi->spingalett_model_open_args($args);
         if (Native::isNull($model)) {
-            throw SpingalettException::last('spingalett_model_load failed');
+            throw SpingalettException::last('spingalett_model_open_args failed');
         }
         return new self($model);
     }

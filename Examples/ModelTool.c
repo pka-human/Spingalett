@@ -10,6 +10,10 @@
  *   ModelTool convert <in.slett> <out.slett> [--precision P] [--no-optimizer]
  *                                      rewrite (any format version) as format 3, keeping the
  *                                      optimizer state when the input has some
+ *   ModelTool convert <in.gguf> <out.slett> [--context N]
+ *                                      a language model's GGUF file as the .slett file of its model
+ *                                      (spingalett_model_open(): the tensors as the file stores them,
+ *                                      a window of N tokens, 4096 at most by default)
  *   ModelTool header <model.slett> <out.h> <name> [--precision P]
  *                                      C header with the model image, for firmware
  *   ModelTool eval <model.slett> <data.slettd | images labels> [--precision P]
@@ -20,7 +24,9 @@
  *                                      an ONNX model as a network (FLOAT32 unless P is given;
  *                                      its input is channels-last)
  *
- * P is fp32, fp16, bf16, int8, int4 or int2; by default the precision the model is stored in.
+ * P is fp32, fp16, bf16, int8, int4 or int2, or a block precision of GGUF's types (q8_0, q4_0, q4_1, q5_0, q5_1,
+ * q2_k, q3_k, q4_k, q5_k, q6_k, iq4_nl, iq4_xs: language models' layers); by default the precision the model is
+ * stored in (evaluate and bench without one compare fp32 to int2).
  */
 
 #include <Spingalett/Spingalett.Short.h>
@@ -33,18 +39,25 @@
 #endif
 
 static const char *precision_name(PrecisionMode p) {
-    static const char *names[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2"};
-    return (unsigned)p < PRECISION_COUNT ? names[p] : "?";
+    static const char *names[] = {"fp32", "fp16", "bf16", "int8", "int4", "int2", "q8_0", "q4_0", "q4_1", "q5_0",
+                                  "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl", "iq4_xs"};
+    return (unsigned)p < sizeof names / sizeof *names ? names[p] : "?";
 }
 
 static const char *activation_name(ActivationFunction a) {
-    static const char *names[] = {"none", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax"};
+    static const char *names[] = {"none", "sigmoid", "relu", "tanh", "leaky relu", "foo52", "softmax", "gelu",
+                                  "gelu tanh", "silu"};
+    _Static_assert(sizeof names / sizeof *names == ACT_COUNT, "a name for every activation");
     return (unsigned)a < ACT_COUNT ? names[a] : "?";
 }
 
 static bool parse_precision(const char *s, PrecisionMode *p) {
-    static const char *names[][2] = {{"fp32", "float32"}, {"fp16", "half"}, {"bf16", "bfloat16"}, {"int8", "i8"}, {"int4", "i4"}, {"int2", "ternary"}};
-    for (int i = 0; i < PRECISION_COUNT; i++)
+    static const char *names[][2] = {{"fp32", "float32"}, {"fp16", "half"}, {"bf16", "bfloat16"}, {"int8", "i8"},
+                                     {"int4", "i4"}, {"int2", "ternary"}, {"q8_0", "Q8_0"}, {"q4_0", "Q4_0"},
+                                     {"q4_1", "Q4_1"}, {"q5_0", "Q5_0"}, {"q5_1", "Q5_1"}, {"q2_k", "Q2_K"},
+                                     {"q3_k", "Q3_K"}, {"q4_k", "Q4_K"}, {"q5_k", "Q5_K"}, {"q6_k", "Q6_K"},
+                                     {"iq4_nl", "IQ4_NL"}, {"iq4_xs", "IQ4_XS"}};
+    for (int i = 0; i < (int)(sizeof names / sizeof *names) && i < PRECISION_COUNT; i++)
         if (!strcmp(s, names[i][0]) || !strcmp(s, names[i][1])) { *p = (PrecisionMode)i; return true; }
     return false;
 }
@@ -69,12 +82,21 @@ static int fail(const char *what) {
     return 1;
 }
 
-/* The model as stored, its network (float) and the precision of its first layer. */
+/* Whether a file is a GGUF file (whose model has no network here). */
+static bool is_gguf(const char *path) {
+    FILE *f = fopen(path, "rb");
+    char magic[4] = {0};
+    bool gguf = f && fread(magic, 1, 4, f) == 4 && !memcmp(magic, "GGUF", 4);
+    if (f) fclose(f);
+    return gguf;
+}
+
+/* The model as stored, its network (float; NULL for a GGUF file) and the precision of its first layer. */
 static bool open_model(const char *path, SpingalettModel **model, NeuralNetwork **net,
                        PrecisionMode *stored) {
     *model = spingalett_model_load(path);
-    *net = *model ? load_spingalett(path) : NULL;
-    if (!*model || !*net) {
+    *net = *model && !is_gguf(path) ? load_spingalett(path) : NULL;
+    if (!*model || (!*net && !is_gguf(path))) {
         spingalett_model_free(*model);
         return false;
     }
@@ -89,15 +111,18 @@ static int info(const char *path) {
     NeuralNetwork *net;
     PrecisionMode stored;
     if (!open_model(path, &m, &net, &stored)) return fail(path);
-    printf("%s\n  %u inputs, %u outputs, %u layers, %llu parameters\n  image %zu bytes, workspace %zu bytes\n",
-           path, m->input_size, m->output_size, m->layer_count,
-           (unsigned long long)spingalett_parameter_count(net), m->image_size, m->workspace_size);
-    SpingalettNetworkLayer input;
-    spingalett_network_layer(net, 0, &input);
-    if (input.height > 1 || input.width > 1)
-        printf("  input: %u x %u x %u\n", input.height, input.width, input.channels);
+    printf("%s\n  %u inputs, %u outputs, %u layers", path, m->input_size, m->output_size, m->layer_count);
+    if (net) printf(", %llu parameters", (unsigned long long)spingalett_parameter_count(net));
+    printf("\n  image %zu bytes, workspace %zu bytes\n", m->image_size, m->workspace_size);
+    if (net) {
+        SpingalettNetworkLayer input;
+        spingalett_network_layer(net, 0, &input);
+        if (input.height > 1 || input.width > 1)
+            printf("  input: %u x %u x %u\n", input.height, input.width, input.channels);
+    }
     static const char *const kinds[] = {"dense", "conv2d", "max_pool2d", "avg_pool2d", "batch_norm", "add", "concat",
-                                        "global_pool"};
+                                        "global_pool", "conv_t2d", "upsample", "layer_norm", "embedding", "attention",
+                                        "rms_norm", "multiply"};
     for (uint32_t i = 0; i < m->layer_count; i++) {
         SpingalettLayerInfo l;
         spingalett_model_layer(m, i, &l);
@@ -116,9 +141,10 @@ static int info(const char *path) {
         if (l.input_count != 1 || l.input_layers[0] != i)
             for (uint32_t k = 0, used = 0; k < l.input_count && used + 12 < sizeof from; k++)
                 used += (uint32_t)snprintf(from + used, sizeof from - used, "%s%u", k ? ", " : "  reads ", l.input_layers[k]);
-        bool parameterless = l.type != LAYER_DENSE && l.type != LAYER_CONV2D &&
-                             l.type != LAYER_BATCH_NORM;
-        printf("  layer %u: %-10s %7u -> %-7u %-10s %s%s%s\n", i + 1, kinds[l.type], l.inputs, l.outputs,
+        bool parameterless = l.type != LAYER_DENSE && l.type != LAYER_CONV2D && l.type != LAYER_CONV_TRANSPOSE2D &&
+                             l.type != LAYER_EMBEDDING && l.type != LAYER_BATCH_NORM;
+        printf("  layer %u: %-10s %7u -> %-7u %-10s %s%s%s\n", i + 1,
+               (unsigned)l.type < sizeof kinds / sizeof *kinds ? kinds[l.type] : "?", l.inputs, l.outputs,
                activation_name(l.activation), parameterless ? "-" : precision_name(l.precision), shape, from);
     }
     spingalett_model_free(m);
@@ -127,10 +153,26 @@ static int info(const char *path) {
 }
 
 static int convert(const char *in, const char *out, bool have_precision, PrecisionMode precision,
-                   bool optimizer) {
+                   bool optimizer, uint32_t context) {
     SpingalettModel *m;
     NeuralNetwork *net;
     PrecisionMode stored;
+    if (is_gguf(in)) {
+        /* the model's image is the .slett file */
+        if (have_precision) {
+            fprintf(stderr, "%s: a GGUF file converts in the types it stores, without --precision\n", in);
+            return 2;
+        }
+        m = spingalett_model_open(.path = in, .context = context);
+        if (!m) return fail(in);
+        FILE *f = fopen(out, "wb");
+        const bool ok = f && fwrite(m->image, 1, m->image_size, f) == m->image_size;
+        if (f && fclose(f) != 0) return fail(out);
+        printf("wrote %s (%u layers, a window of %u tokens, %zu bytes)\n", out, m->layer_count, m->input_size,
+               m->image_size);
+        spingalett_model_free(m);
+        return ok ? 0 : fail(out);
+    }
     if (!open_model(in, &m, &net, &stored)) return fail(in);
     spingalett_model_free(m);
     /* files saved without optimizer state record no optimizer steps */
@@ -182,7 +224,8 @@ static int eval(const char *path, const char *data, const char *labels, bool hav
     printf("%u samples\n  precision     bytes    accuracy      loss\n", d.count);
     int rc = 0;
     for (int p = 0; p < PRECISION_COUNT; p++) {
-        if (have_precision && p != (int)precision) continue;
+        /* (the block precisions, for language models, when asked for) */
+        if (have_precision ? p != (int)precision : p > PRECISION_INT2) continue;
         SpingalettModel *q = spingalett_model_from_network(net, (PrecisionMode)p);
         if (!q) { rc = fail(precision_name((PrecisionMode)p)); continue; }
         EvalMetrics e = spingalett_model_evaluate(q, d.inputs, d.targets, d.count);
@@ -206,7 +249,8 @@ static int bench(const char *path, bool have_precision, PrecisionMode precision)
     for (size_t i = 0; i < (size_t)n * in; i++) x[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
     printf("  precision     bytes   one sample     batched\n");
     for (int p = 0; p < PRECISION_COUNT; p++) {
-        if (have_precision && p != (int)precision) continue;
+        /* (the block precisions, for language models, when asked for) */
+        if (have_precision ? p != (int)precision : p > PRECISION_INT2) continue;
         SpingalettModel *q = spingalett_model_from_network(net, (PrecisionMode)p);
         if (!q) continue;
         void *ws = malloc(q->workspace_size);
@@ -254,11 +298,13 @@ static int usage(void) {
     fprintf(stderr,
         "usage: ModelTool info <model.slett>\n"
         "       ModelTool convert <in.slett> <out.slett> [--precision P] [--no-optimizer]\n"
+        "       ModelTool convert <in.gguf> <out.slett> [--context N]\n"
         "       ModelTool header <model.slett> <out.h> <name> [--precision P]\n"
         "       ModelTool eval <model.slett> <data.slettd | images labels> [--precision P]\n"
         "       ModelTool bench <model.slett> [--precision P]\n"
         "       ModelTool import <model.onnx> <out.slett> [--precision P]\n"
-        "P: fp32, fp16, bf16, int8, int4, int2 (default: as stored)\n");
+        "P: fp32, fp16, bf16, int8, int4, int2, q8_0, q4_0, q4_1, q5_0, q5_1, q2_k, q3_k, q4_k, q5_k, q6_k,\n"
+        "   iq4_nl, iq4_xs (default: as stored)\n");
     return 2;
 }
 
@@ -271,10 +317,13 @@ int main(int argc, char **argv) {
     int nargs = 0;
     bool have_precision = false, optimizer = true;
     PrecisionMode precision = PRECISION_FLOAT32;
+    uint32_t context = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--precision") && i + 1 < argc) {
             if (!parse_precision(argv[++i], &precision)) return usage();
             have_precision = true;
+        } else if (!strcmp(argv[i], "--context") && i + 1 < argc) {
+            context = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--no-optimizer")) {
             optimizer = false;
         } else if (nargs < 4) {
@@ -285,7 +334,8 @@ int main(int argc, char **argv) {
     }
     const char *cmd = argc > 1 ? argv[1] : "";
     if (!strcmp(cmd, "info") && nargs == 1) return info(args[0]);
-    if (!strcmp(cmd, "convert") && nargs == 2) return convert(args[0], args[1], have_precision, precision, optimizer);
+    if (!strcmp(cmd, "convert") && nargs == 2)
+        return convert(args[0], args[1], have_precision, precision, optimizer, context);
     if (!strcmp(cmd, "header") && nargs == 3) return header(args[0], args[1], args[2], have_precision, precision);
     if (!strcmp(cmd, "eval") && (nargs == 2 || nargs == 3)) return eval(args[0], args[1], nargs == 3 ? args[2] : NULL, have_precision, precision);
     if (!strcmp(cmd, "bench") && nargs == 1) return bench(args[0], have_precision, precision);

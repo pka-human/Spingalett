@@ -112,6 +112,10 @@ lm = sg.Network.from_pretrained("models/SmolLM2-135M", context=512)       # or "
 tok = sg.Tokenizer("models/SmolLM2-135M")
 prompt = tok.encode("<|im_start|>user\nWhat is a tokenizer?<|im_end|>\n<|im_start|>assistant\n", special=True)
 print(tok.decode(lm.generate(prompt, 64, temperature=0.7, top_p=0.9, stop=[tok.id("<|im_end|>")])))
+# a GGUF file as it is stored (its quantized types as block precisions), run by a session
+with sg.Model.load("Llama-3.2-1B-Instruct-Q4_K_M.gguf", context=4096) as model, model.session() as s:
+    tok = sg.Tokenizer("Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+    print(tok.decode(s.generate([tok.encode("The capital of France is", add_special=True)], 32)[0]))
 
 # a language model: GPT-2 from Hugging Face's weights (or nanoGPT's), trained further on a token file, sampled
 from transformers import GPT2LMHeadModel
@@ -177,9 +181,10 @@ with sg.Network.load("xor.slett") as net:
 | `accumulation_steps=k` (`TrainConfig`) | gradient accumulation: an optimizer step after every `k` mini-batches of `batch_size` samples, with the mean gradient of their samples (the memory of one mini-batch; the bits of one batch of `k x batch_size` samples computed in chunks of `batch_size`) |
 | `get_weights(i)`, `set_weights(i, w)`, `get_biases(i)`, `set_biases(i, b)` | weights `i` feed layer `i + 1`: shape `(out, in)` for a dense layer, `(filters, kernel_h, kernel_w, in_channels / groups)` for a convolution or a transposed one, gamma `(channels,)` for batch and layer normalization (beta are its biases), empty for pooling and upsampling |
 | `save(path, precision, save_optimizer)`, `Network.load(path)` | `.slett` files, shared with the C API |
+| `save_checkpoint(path)`, `Network.load_checkpoint(path)` | checkpoints of training runs: the network, its optimizer state and the run's state as its last epoch left it (seeds, Adam's corrections, epochs and steps, schedule, plateau, best epoch and its parameters, the reader's place). The training call after `load_checkpoint`, given the run's arguments again (`epochs` counting all the run's epochs), runs the epochs left to the bits of a run that never stopped, its reader (`train_from_file`, `train_from_tokens`) resumed where the run's stood. Autosaves in FLOAT32 with the optimizer state are checkpoints; checkpoints load as models too |
 | `to_bytes(precision, save_optimizer=False)`, `Network.from_bytes(data)` | the same files as `bytes` |
 | `to_model(precision=INT8)` | a `Model`: read-only, computes in its precision (integer kernels for INT8, INT4, INT2) |
-| `Model.load(path)`, `Model.from_bytes(data)`, `model.to_bytes()` | models from and to `.slett` files of any version |
+| `Model.load(path, context=0)`, `Model.from_bytes(data)`, `model.to_bytes()` | models from and to `.slett` files of any version; `load()` opens a language model's GGUF file too (`llama`, `qwen2`, `qwen3`, `gemma3`, `gpt2`), its tensors as the file stores them (the quantized types as the block precisions `Q8_0` to `IQ4_XS`), with a window of `context` tokens (0: the model's, 4096 at most) |
 | `model.predict(x)` / `model(x)`, `model.evaluate(x, y)` | 1-D input -> vector, 2-D batch -> matrix; `Metrics(loss, accuracy)` |
 | `model.layers`, `input_size`, `output_size`, `size`, `workspace_size` | `LayerInfo(inputs, outputs, activation, precision, type, shape, input_shape, kernel, stride, padding, groups, epsilon, input_layers)` per layer (normalizations after a dense or convolution layer are folded into it); image and C workspace bytes |
 | `export_c_header(path, name, precision=INT8)` | the model as a C header for the standalone engine (`Spingalett.Inference.h`) |

@@ -394,7 +394,9 @@ uint64_t spingalett_slett_row_bytes(PrecisionMode precision, uint32_t inputs) {
         case PRECISION_INT8:     return inputs;
         case PRECISION_INT4:     return ((uint64_t)inputs + 1u) / 2u;
         case PRECISION_INT2:     return ((uint64_t)inputs + 3u) / 4u;
-        default:                 return 0;
+        default:                 /* the block precisions: whole blocks only */
+            if (!spingalett_precision_is_block(precision) || inputs % slett_block_values(precision)) return 0;
+            return (uint64_t)inputs / slett_block_values(precision) * slett_block_bytes(precision);
     }
 }
 
@@ -1220,6 +1222,342 @@ float spingalett_quantize_activations(const float *x, uint32_t n, int8_t *q) {
     return amax / 127.0f;
 }
 
+/* ---- block precisions (format 10): GGUF's types, decoded and multiplied as the reference every faster kernel
+   gives the bits of. */
+
+/* The sixteen values of IQ4_NL's and IQ4_XS's 4-bit codes (llama.cpp's kvalues_iq4nl). */
+static const int8_t iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+static float block_half(const uint8_t *p) { return spingalett_fp16_to_float(slett_get16(p)); }
+
+/* The 6-bit scale and minimum j of a Q4_K or Q5_K super-block (llama.cpp's get_scale_min_k4()). */
+static void scale_min_k4(uint32_t j, const uint8_t *q, int32_t *d, int32_t *m) {
+    if (j < 4u) {
+        *d = q[j] & 63;
+        *m = q[j + 4u] & 63;
+    } else {
+        *d = (q[j + 4u] & 0xF) | ((q[j - 4u] >> 6) << 4);
+        *m = (q[j + 4u] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+/* Q3_K's sixteen 6-bit scales from their twelve bytes (the shuffle of llama.cpp's kmask1 and kmask2), less 32. */
+static void q3_scales(const uint8_t *packed, int32_t *scales) {
+    const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    aux[0] = slett_get32(packed);
+    aux[1] = slett_get32(packed + 4);
+    aux[2] = slett_get32(packed + 8);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    for (uint32_t k = 0; k < 16u; k++) scales[k] = (int32_t)((aux[k / 4u] >> (8u * (k % 4u))) & 0xFFu) - 32;
+}
+
+/* IQ4_XS's 6-bit scale of sub-block ib, less 32. */
+static int32_t iq4xs_scale(const uint8_t *block, uint32_t ib) {
+    const uint32_t high = slett_get16(block + 2), low = block[4u + ib / 2u];
+    return (int32_t)(((low >> (4u * (ib % 2u))) & 0xFu) | (((high >> (2u * ib)) & 3u) << 4)) - 32;
+}
+
+void spingalett_block_decode(PrecisionMode p, const uint8_t *x, float *y, uint32_t n) {
+    const uint32_t values = slett_block_values(p), bytes = slett_block_bytes(p);
+    for (uint32_t i = 0; i < n; i += values, x += bytes) {
+        switch (p) {
+            case PRECISION_Q4_0:
+            case PRECISION_IQ4_NL: {            /* d, qs[16]: (q - 8) d, or d times the code's value */
+                const float d = block_half(x);
+                for (uint32_t j = 0; j < 16u; j++) {
+                    const int lo = x[2 + j] & 0x0F, hi = x[2 + j] >> 4;
+                    y[j] = (float)(p == PRECISION_Q4_0 ? lo - 8 : iq4_values[lo]) * d;
+                    y[j + 16] = (float)(p == PRECISION_Q4_0 ? hi - 8 : iq4_values[hi]) * d;
+                }
+                y += 32;
+                break;
+            }
+            case PRECISION_Q4_1: {              /* d, m, qs[16]: q d + m */
+                const float d = block_half(x), m = block_half(x + 2);
+                for (uint32_t j = 0; j < 16u; j++) {
+                    y[j] = (float)(x[4 + j] & 0x0F) * d + m;
+                    y[j + 16] = (float)(x[4 + j] >> 4) * d + m;
+                }
+                y += 32;
+                break;
+            }
+            case PRECISION_Q5_0:                /* d, qh (32 fifth bits), qs[16]: (q - 16) d */
+            case PRECISION_Q5_1: {              /* d, m, qh, qs[16]: q d + m */
+                const bool one = p == PRECISION_Q5_1;
+                const float d = block_half(x), m = one ? block_half(x + 2) : 0.0f;
+                const uint32_t qh = slett_get32(x + (one ? 4 : 2));
+                const uint8_t *qs = x + (one ? 8 : 6);
+                for (uint32_t j = 0; j < 16u; j++) {
+                    const int lo = (qs[j] & 0x0F) | (int)(((qh >> j) & 1u) << 4);
+                    const int hi = (qs[j] >> 4) | (int)(((qh >> (j + 16u)) & 1u) << 4);
+                    y[j] = one ? (float)lo * d + m : (float)(lo - 16) * d;
+                    y[j + 16] = one ? (float)hi * d + m : (float)(hi - 16) * d;
+                }
+                y += 32;
+                break;
+            }
+            case PRECISION_Q8_0: {              /* d, qs[32] signed: q d */
+                const float d = block_half(x);
+                for (uint32_t j = 0; j < 32u; j++) y[j] = (float)(int8_t)x[2 + j] * d;
+                y += 32;
+                break;
+            }
+            case PRECISION_Q2_K: {              /* scales[16] (4-bit scale and minimum), qs[64], d, dmin */
+                const uint8_t *sc = x, *q = x + 16;
+                const float d = block_half(x + 80), dmin = block_half(x + 82);
+                uint32_t is = 0;
+                for (uint32_t nb = 0; nb < 256u; nb += 128u) {
+                    for (uint32_t shift = 0; shift < 8u; shift += 2u) {
+                        uint8_t s = sc[is++];
+                        float dl = d * (float)(s & 0xF), ml = dmin * (float)(s >> 4);
+                        for (uint32_t l = 0; l < 16u; l++) *y++ = dl * (float)((q[l] >> shift) & 3) - ml;
+                        s = sc[is++];
+                        dl = d * (float)(s & 0xF);
+                        ml = dmin * (float)(s >> 4);
+                        for (uint32_t l = 0; l < 16u; l++) *y++ = dl * (float)((q[l + 16] >> shift) & 3) - ml;
+                    }
+                    q += 32;
+                }
+                break;
+            }
+            case PRECISION_Q3_K: {              /* hmask[32], qs[64], scales[12] (6-bit), d */
+                const uint8_t *hm = x, *q = x + 32;
+                const float d_all = block_half(x + 108);
+                int32_t scales[16];
+                q3_scales(x + 96, scales);
+                uint32_t is = 0;
+                uint8_t m = 1;
+                for (uint32_t nb = 0; nb < 256u; nb += 128u) {
+                    for (uint32_t shift = 0; shift < 8u; shift += 2u) {
+                        float dl = d_all * (float)scales[is++];
+                        for (uint32_t l = 0; l < 16u; l++)
+                            *y++ = dl * (float)((int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                        dl = d_all * (float)scales[is++];
+                        for (uint32_t l = 0; l < 16u; l++)
+                            *y++ = dl * (float)((int)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                        m = (uint8_t)(m << 1);
+                    }
+                    q += 32;
+                }
+                break;
+            }
+            case PRECISION_Q4_K:                /* d, dmin, scales[12], qs[128] */
+            case PRECISION_Q5_K: {              /* d, dmin, scales[12], qh[32], qs[128] */
+                const bool five = p == PRECISION_Q5_K;
+                const float d = block_half(x), dmin = block_half(x + 2);
+                const uint8_t *sc = x + 4, *qh = x + 16, *q = x + (five ? 48 : 16);
+                for (uint32_t j = 0; j < 4u; j++) {
+                    int32_t s, mn;
+                    scale_min_k4(2u * j, sc, &s, &mn);
+                    const float d1 = d * (float)s, m1 = dmin * (float)mn;
+                    scale_min_k4(2u * j + 1u, sc, &s, &mn);
+                    const float d2 = d * (float)s, m2 = dmin * (float)mn;
+                    for (uint32_t l = 0; l < 32u; l++)
+                        *y++ = d1 * (float)((q[l] & 0xF) + (five && (qh[l] >> (2u * j) & 1u) ? 16 : 0)) - m1;
+                    for (uint32_t l = 0; l < 32u; l++)
+                        *y++ = d2 * (float)((q[l] >> 4) + (five && (qh[l] >> (2u * j + 1u) & 1u) ? 16 : 0)) - m2;
+                    q += 32;
+                }
+                break;
+            }
+            case PRECISION_Q6_K: {              /* ql[128], qh[64], scales[16] signed, d */
+                const float d = block_half(x + 208);
+                const uint8_t *ql = x, *qh = x + 128;
+                const int8_t *sc = (const int8_t *)(x + 192);
+                for (uint32_t nb = 0; nb < 256u; nb += 128u) {
+                    for (uint32_t l = 0; l < 32u; l++) {
+                        const uint32_t is = l / 16u;
+                        const int q1 = (int)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        const int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                        y[l] = d * (float)sc[is] * (float)q1;
+                        y[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                        y[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                        y[l + 96] = d * (float)sc[is + 6] * (float)q4;
+                    }
+                    y += 128;
+                    ql += 64;
+                    qh += 32;
+                    sc += 8;
+                }
+                break;
+            }
+            default: {                          /* IQ4_XS: d, scales_h, scales_l[4], qs[128] */
+                const float d = block_half(x);
+                const uint8_t *qs = x + 8;
+                for (uint32_t ib = 0; ib < 8u; ib++) {
+                    const float dl = d * (float)iq4xs_scale(x, ib);
+                    for (uint32_t j = 0; j < 16u; j++) {
+                        y[j] = dl * (float)iq4_values[qs[j] & 0xF];
+                        y[j + 16] = dl * (float)iq4_values[qs[j] >> 4];
+                    }
+                    y += 32;
+                    qs += 16;
+                }
+                break;
+            }
+        }
+    }
+}
+
+void spingalett_quantize_blocks(const float *x, uint32_t n, uint32_t block, int8_t *xq, float *dx, int32_t *sums) {
+    for (uint32_t b = 0; b < n / block; b++)
+        dx[b] = spingalett_quantize_activations(x + (size_t)b * block, block, xq + (size_t)b * block);
+    for (uint32_t i = 0; i < n / 16u; i++) {
+        int32_t s = 0;
+        for (uint32_t k = 0; k < 16u; k++) s += xq[16u * i + k];
+        sums[i] = s;
+    }
+}
+
+/* The sum of the products of a block of 32 4-bit codes (value j the low nibble of byte j, value j + 16 its high
+   one; with fifth bits, bit j of qh above value j's) with x: the codes less offset, or their values in IQ4_NL's
+   table. */
+static int32_t nibbles_dot(const uint8_t *qs, uint32_t qh, int offset, bool table, bool fifth, const int8_t *x) {
+    int32_t s = 0;
+    for (uint32_t j = 0; j < 16u; j++) {
+        int lo = qs[j] & 0x0F, hi = qs[j] >> 4;
+        if (fifth) {
+            lo |= (int)(((qh >> j) & 1u) << 4);
+            hi |= (int)(((qh >> (j + 16u)) & 1u) << 4);
+        }
+        if (table) lo = iq4_values[lo], hi = iq4_values[hi];
+        s += (lo - offset) * x[j] + (hi - offset) * x[j + 16];
+    }
+    return s;
+}
+
+float spingalett_block_dot(PrecisionMode p, const uint8_t *w, const int8_t *x, const float *dx, const int32_t *xs,
+                           uint32_t n) {
+    const uint32_t values = slett_block_values(p), bytes = slett_block_bytes(p);
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < n / values; b++, w += bytes, x += values, xs += values / 16u) {
+        int32_t i1 = 0, i2 = 0;             /* the integer sums: of the scaled codes' products, of the minima's */
+        float d, m = 0.0f;                  /* the block's scale, and its minimum's (0: a type without minima) */
+        bool mins = false;
+        switch (p) {
+            case PRECISION_Q8_0:
+                d = block_half(w);
+                for (uint32_t k = 0; k < 32u; k++) i1 += (int8_t)w[2 + k] * x[k];
+                break;
+            case PRECISION_Q4_0:
+            case PRECISION_IQ4_NL:
+                d = block_half(w);
+                i1 = nibbles_dot(w + 2, 0u, p == PRECISION_Q4_0 ? 8 : 0, p == PRECISION_IQ4_NL, false, x);
+                break;
+            case PRECISION_Q4_1:
+                d = block_half(w);
+                m = block_half(w + 2);
+                mins = true;
+                i1 = nibbles_dot(w + 4, 0u, 0, false, false, x);
+                i2 = xs[0] + xs[1];
+                break;
+            case PRECISION_Q5_0:
+                d = block_half(w);
+                i1 = nibbles_dot(w + 6, slett_get32(w + 2), 16, false, true, x);
+                break;
+            case PRECISION_Q5_1:
+                d = block_half(w);
+                m = block_half(w + 2);
+                mins = true;
+                i1 = nibbles_dot(w + 8, slett_get32(w + 4), 0, false, true, x);
+                i2 = xs[0] + xs[1];
+                break;
+            case PRECISION_Q2_K:
+            case PRECISION_Q3_K: {
+                /* sixteen sub-blocks of 16: value v = 128 h + 32 j + 16 part + l in bits 2 j of byte 32 h + 16 part + l */
+                const bool three = p == PRECISION_Q3_K;
+                const uint8_t *q = w + (three ? 32 : 16), *hm = w;
+                int32_t scales[16];
+                if (three) {
+                    d = block_half(w + 108);
+                    q3_scales(w + 96, scales);
+                } else {
+                    d = block_half(w + 80);
+                    m = -block_half(w + 82);
+                    mins = true;
+                }
+                for (uint32_t is = 0; is < 16u; is++) {
+                    const uint32_t h = is / 8u, j = (is % 8u) / 2u, part = is % 2u, shift = 2u * j;
+                    const uint8_t *qb = q + 32u * h + 16u * part;
+                    const int8_t *xb = x + 16u * is;
+                    int32_t s = 0;
+                    for (uint32_t l = 0; l < 16u; l++) {
+                        int code = (qb[l] >> shift) & 3;
+                        if (three) code -= (hm[16u * part + l] >> (4u * h + j)) & 1u ? 0 : 4;
+                        s += code * xb[l];
+                    }
+                    if (three) {
+                        i1 += scales[is] * s;
+                    } else {
+                        i1 += (w[is] & 0xF) * s;
+                        i2 += (w[is] >> 4) * xs[is];
+                    }
+                }
+                break;
+            }
+            case PRECISION_Q4_K:
+            case PRECISION_Q5_K: {
+                /* eight sub-blocks of 32: value 64 c + 32 half + l in the low (half 0) or high nibble of byte 32 c + l */
+                const bool five = p == PRECISION_Q5_K;
+                const uint8_t *qh = w + 16, *q = w + (five ? 48 : 16);
+                d = block_half(w);
+                m = -block_half(w + 2);
+                mins = true;
+                for (uint32_t j = 0; j < 8u; j++) {
+                    int32_t sc, mn, s = 0;
+                    scale_min_k4(j, w + 4, &sc, &mn);
+                    const uint8_t *qb = q + 32u * (j / 2u);
+                    const int8_t *xb = x + 32u * j;
+                    for (uint32_t l = 0; l < 32u; l++) {
+                        int code = j % 2u ? qb[l] >> 4 : qb[l] & 0xF;
+                        if (five) code |= (int)(((qh[l] >> j) & 1u) << 4);
+                        s += code * xb[l];
+                    }
+                    i1 += sc * s;
+                    i2 += mn * (xs[2u * j] + xs[2u * j + 1u]);
+                }
+                break;
+            }
+            case PRECISION_Q6_K: {
+                /* sixteen sub-blocks of 16 with a signed scale each: value 128 h + 32 g + l from byte 64 h + l (g even)
+                   or 64 h + 32 + l (g odd) of ql, its low nibble (g < 2) or high one, and bits 2 g of byte 32 h + l of qh */
+                const uint8_t *ql = w, *qh = w + 128;
+                const int8_t *sc = (const int8_t *)(w + 192);
+                d = block_half(w + 208);
+                for (uint32_t is = 0; is < 16u; is++) {
+                    const uint32_t h = is / 8u, g = (is % 8u) / 2u, l0 = 16u * (is % 2u);
+                    const uint8_t *lb = ql + 64u * h + 32u * (g % 2u), *hb = qh + 32u * h;
+                    const int8_t *xb = x + 16u * is;
+                    int32_t s = 0;
+                    for (uint32_t l = l0; l < l0 + 16u; l++) {
+                        const int low = g < 2u ? lb[l] & 0xF : lb[l] >> 4;
+                        s += ((int)((uint32_t)low | (((hb[l] >> (2u * g)) & 3u) << 4)) - 32) * xb[l - l0];
+                    }
+                    i1 += sc[is] * s;
+                }
+                break;
+            }
+            default: {                          /* IQ4_XS: eight sub-blocks of 32, IQ4_NL's codes */
+                d = block_half(w);
+                for (uint32_t ib = 0; ib < 8u; ib++)
+                    i1 += iq4xs_scale(w, ib) * nibbles_dot(w + 8u + 16u * ib, 0u, 0, true, false, x + 32u * ib);
+                break;
+            }
+        }
+        float t = (d * dx[b]) * (float)i1;
+        if (mins) t = t + (m * dx[b]) * (float)i2;
+        acc = acc + t;
+    }
+    return acc;
+}
+
 #if defined(SPINGALETT_INFERENCE_ONLY)
 static float activate_one(float x, ActivationFunction act) {
     switch (act) {
@@ -1340,11 +1678,26 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
             layer->window = slett_get32(e + 72);
             layer->momentum = 0.0f;
         }
+        /* version 10: bit 2 normalizes the queries and keys, bit 3 gives rotary frequencies of its own; the dimensions
+           rotated in the kernel's height, the scores' scale in the strides' bytes (fields of windows, 0 then) */
+        if (version >= 10u) {
+            layer->qk_norm = (layer->mode & 4u) != 0;
+            layer->freqs = (layer->mode & 8u) != 0;
+            layer->mode &= ~12u;
+            layer->rotary = layer->kernel_h;
+            const uint32_t scale = slett_get32(e + 56);
+            memcpy(&layer->score_scale, &scale, 4);
+            layer->kernel_h = layer->stride_h = layer->stride_w = 0;
+        }
     }
     if (version >= 8u && layer->type == LAYER_EMBEDDING) {
         layer->positions = (layer->mode & 1u) != 0;
         layer->mode = 0;
         if (version >= 9u) layer->token_offset = slett_get32(e + 104);     /* the first of its input's values */
+        if (version >= 10u) {                                               /* the vectors' scale */
+            const uint32_t scale = slett_get32(e + 108);
+            memcpy(&layer->embed_scale, &scale, 4);
+        }
     }
     if (version >= 9u && (layer->type == LAYER_DENSE || layer->type == LAYER_CONV2D))
         layer->tied = slett_get32(e + 104);     /* the embedding whose table are its weights */
@@ -1370,6 +1723,8 @@ void spingalett_slett_layer(const uint8_t *image, uint32_t index, SlettLayer *la
     }
     /* (embeddings exist from version 8 on) */
     layer->cells = version >= 8u && index > 0 && slett_token_linear(layer, entry_at(image, 0)[10] == LAYER_EMBEDDING);
+    if (layer->type == LAYER_ATTENTION && layer->theta > 0.0f && layer->rotary == 0 && layer->heads)
+        layer->rotary = layer->out_c / layer->heads;
 }
 
 uint64_t spingalett_slett_act_offset(const uint8_t *image, uint32_t j) {
@@ -1465,19 +1820,24 @@ static bool shape_ok(const SlettLayer *L, uint16_t version) {
                       L->pad_h == 0 && L->pad_w == 0;
     bool parameterless = L->weights == 0 && L->scales == 0 && L->biases == 0 && L->optimizer == 0;
     if (L->type == LAYER_ATTENTION) {
-        /* queries, keys and values of one head size in, the heads' results out; no parameters */
+        /* queries, keys and values of one head size in, the heads' results out; no parameters but (version 10) the
+           gammas of the queries' and keys' normalization (its epsilon) and rotary frequencies */
         const uint64_t heads = L->heads, kv = L->kv_heads;
-        if (!windowless || !parameterless || L->eps != 0.0f || L->momentum != 0.0f || heads == 0 || kv == 0 ||
-            heads % kv != 0 || L->out_h != L->in_h || L->out_w != L->in_w || L->out_c % heads != 0)
+        if (!windowless || L->biases != 0 || L->optimizer != 0 || (L->weights != 0) != L->qk_norm ||
+            (L->scales != 0) != L->freqs || (L->qk_norm ? !(L->eps > 0.0f && L->eps < 1.0f) : L->eps != 0.0f) ||
+            L->momentum != 0.0f || heads == 0 || kv == 0 || heads % kv != 0 || L->out_h != L->in_h ||
+            L->out_w != L->in_w || L->out_c % heads != 0 || !(L->score_scale >= 0.0f && L->score_scale <= FLT_MAX))
             return false;
         const uint64_t head = L->out_c / heads;
         if (L->input_count == 2)            /* cross-attention: queries in (the keys' and values' input checked apart) */
-            return L->in_c == heads * head && !L->causal && L->window == 0 && L->theta == 0.0f;
+            return L->in_c == heads * head && !L->causal && L->window == 0 && L->theta == 0.0f && !L->qk_norm &&
+                   !L->freqs && L->score_scale == 0.0f;
         return L->in_c == (heads + 2u * kv) * head && L->theta >= 0.0f && L->theta < FLT_MAX &&
-               (L->theta == 0.0f || head % 2u == 0);
+               (L->theta == 0.0f ? L->rotary == 0 && !L->freqs : L->rotary % 2u == 0 && L->rotary <= head);
     }
     if (L->type == LAYER_EMBEDDING)          /* a row of the table a value: h x (w c) cells, or (version 9) a range */
         return windowless && L->eps == 0.0f && L->momentum == 0.0f && L->vocabulary != 0 && L->out_h == L->in_h &&
+               L->embed_scale >= 0.0f && L->embed_scale <= FLT_MAX &&
                (((uint64_t)L->out_w == (uint64_t)L->in_w * L->in_c && L->token_offset == 0) ||
                 (L->in_h == 1 && (uint64_t)L->token_offset + L->out_w <= (uint64_t)L->in_w * L->in_c));
     if (L->type == LAYER_ADD || L->type == LAYER_CONCAT || L->type == LAYER_GLOBAL_AVG_POOL ||
@@ -1534,9 +1894,9 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
     if (!spingalett_host_is_little_endian())
         return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: the .slett format needs a little-endian host");
     if (size < 8 || memcmp(p, SLETT_MAGIC, 6) != 0)
-        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3 to 9 image");
+        return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: not a .slett format 3 to 10 image");
     uint16_t version = slett_get16(p + 6);
-    if (version < 3 || version > 9)
+    if (version < 3 || version > 10)
         return ENGINE_FAIL(SPINGALETT_ERR_FORMAT_VERSION, "model: unsupported format version");
     if (size < SLETT_HEADER_SIZE)
         return ENGINE_FAIL(SPINGALETT_ERR_FILE_IO, "model: image is truncated");
@@ -1577,6 +1937,7 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
                                     : i == 0 || L.inputs == prev_out;
         if (L.inputs == 0 || L.outputs == 0 || !linked ||
             (unsigned)L.activation >= ACT_COUNT || (unsigned)L.precision >= PRECISION_COUNT ||
+            (version < 10u && (unsigned)L.precision > PRECISION_INT2) ||
             !(L.dropout >= 0.0f && L.dropout < 1.0f) || (version >= 4 && !shape_ok(&L, version)))
             return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
         if (L.tied) {
@@ -1611,6 +1972,13 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
         bool is_int = weighted && !norm && !layer_norm && spingalett_precision_is_int(L.precision);
         if (is_int && !embedding && L.row_len > SLETT_MAX_INT_INPUTS)
             return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: integer layer has too many inputs per output");
+        /* version 10: the block precisions, of dense layers, embeddings and linear layers (1 x 1 convolutions of one
+           group), whose rows are whole blocks and who have no row scales */
+        const bool block = spingalett_precision_is_block(L.precision);
+        if (block && weighted &&
+            (version < 10u || !(L.type == LAYER_DENSE || embedding || (slett_conv_pointwise(&L) && L.groups == 1)) ||
+             L.scales != 0 || (!embedding && slett_block_input_bytes(L.inputs) > UINT32_MAX)))
+            return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: invalid layer table entry");
         if (weighted) {
             uint64_t row = spingalett_slett_row_bytes(L.precision, L.row_len);
             uint64_t elem = L.precision == PRECISION_FLOAT32 ? 4u : (L.precision <= PRECISION_BFLOAT16 ? 2u : 1u);
@@ -1633,8 +2001,17 @@ int spingalett_slett_validate(const uint8_t *p, size_t size, SlettInfo *info) {
             if (!ok)
                 return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: a section exceeds the image or is misaligned");
         }
+        if (L.type == LAYER_ATTENTION && (L.qk_norm || L.freqs)) {
+            /* version 10: the gammas of the queries' and keys' normalization, the rotary frequencies */
+            const uint64_t head = L.out_c / L.heads;
+            if ((L.qk_norm && !section_ok(L.weights, 8u * head, file_size, 4)) ||
+                (L.freqs && !section_ok(L.scales, (uint64_t)L.rotary / 2u * 4u, file_size, 4)))
+                return ENGINE_FAIL(SPINGALETT_ERR_INVALID, "model: a section exceeds the image or is misaligned");
+        }
         if (i + 2 < layers && L.outputs > info->max_width) info->max_width = L.outputs;
         if (is_int && !embedding && L.inputs > info->max_int_inputs) info->max_int_inputs = L.inputs;
+        if (block && weighted && !embedding && slett_block_input_bytes(L.inputs) > info->max_int_inputs)
+            info->max_int_inputs = (uint32_t)slett_block_input_bytes(L.inputs);
         if (slett_conv_scratch(&L) > info->conv_scratch) info->conv_scratch = slett_conv_scratch(&L);
         prev_out = L.outputs;
     }
@@ -2055,7 +2432,28 @@ void spingalett_engine_conv_transpose(const uint8_t *image, const SlettLayer *L,
 }
 
 /* A convolution on one sample: each output pixel is its filters' dot products with its window. */
+/* A dense layer or a linear one (a 1 x 1 convolution of one group) of a block precision on one sample: its input
+   quantized in the precision's blocks into the scratch at xq (slett_block_input_bytes()), then each cell's outputs,
+   the bias plus the row's dot product (spingalett_block_dot()); before activation. */
+static void block_rows(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq) {
+    const uint32_t n = L->inputs, C = L->row_len, S = slett_block_values(L->precision);
+    float *dx = (float *)(void *)((uint8_t *)xq + slett_align(n));
+    int32_t *sums = (int32_t *)(void *)((uint8_t *)dx + slett_align(n / 8u));
+    const float *bias = (const float *)(const void *)(image + L->biases);
+    const size_t row = (size_t)spingalett_slett_row_bytes(L->precision, C);
+    spingalett_quantize_blocks(x, n, S, xq, dx, sums);
+    for (uint32_t p = 0; p < n / C; p++)
+        for (uint32_t j = 0; j < L->rows; j++)
+            y[(size_t)p * L->rows + j] = bias[j] + spingalett_block_dot(L->precision, image + L->weights + j * row,
+                                                                        xq + (size_t)p * C, dx + (size_t)p * (C / S),
+                                                                        sums + (size_t)p * (C / 16u), C);
+}
+
 static void conv_forward(const uint8_t *image, const SlettLayer *L, const float *x, float *y, int8_t *xq, void *window) {
+    if (slett_block_layer(L)) {     /* (linear layers only) */
+        block_rows(image, L, x, y, xq);
+        return;
+    }
     if (slett_conv_columns(L)) {
         conv_forward_columns(image, L, x, y, xq, window);
         return;
@@ -2284,10 +2682,55 @@ void spingalett_engine_multiply(const float *const *x, uint32_t count, float *y,
         for (uint32_t i = 0; i < n; i++) y[i] *= x[k][i];
 }
 
-void spingalett_engine_rope_table(uint32_t cells, uint32_t head, float theta, float *table) {
-    const uint32_t half = head / 2u;
+/* expf as glibc's algorithm computes it (Arm's optimized routines, MIT, Copyright (c) 2017-2018 Arm Limited), in
+   double without fused multiply-adds, rounded to float once: attention's exponentials, alike on every platform and in
+   the vectors of Spingalett.Attention.c (glibc itself differs on 2 of the 2^32 floats where it fuses them). */
+static const uint64_t exp2f_table[32] = {
+    0x3ff0000000000000u, 0x3fefd9b0d3158574u, 0x3fefb5586cf9890fu, 0x3fef9301d0125b51u,
+    0x3fef72b83c7d517bu, 0x3fef54873168b9aau, 0x3fef387a6e756238u, 0x3fef1e9df51fdee1u,
+    0x3fef06fe0a31b715u, 0x3feef1a7373aa9cbu, 0x3feedea64c123422u, 0x3feece086061892du,
+    0x3feebfdad5362a27u, 0x3feeb42b569d4f82u, 0x3feeab07dd485429u, 0x3feea47eb03a5585u,
+    0x3feea09e667f3bcdu, 0x3fee9f75e8ec5f74u, 0x3feea11473eb0187u, 0x3feea589994cce13u,
+    0x3feeace5422aa0dbu, 0x3feeb737b0cdc5e5u, 0x3feec49182a3f090u, 0x3feed503b23e255du,
+    0x3feee89f995ad3adu, 0x3feeff76f2fb5e47u, 0x3fef199bdd85529cu, 0x3fef3720dcef9069u,
+    0x3fef5818dcfba487u, 0x3fef7c97337b9b5fu, 0x3fefa4afa2a490dau, 0x3fefd0765b6e4540u,
+};
+
+const uint64_t *spingalett_exp2f_table(void) { return exp2f_table; }
+
+float spingalett_expf(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const uint32_t abstop = (bits >> 20) & 0x7FFu;
+    if (abstop >= 0x42Bu) {                             /* |x| >= 88, or NaN */
+        if (bits == 0xFF800000u) return 0.0f;           /* -inf */
+        if (abstop >= 0x7F8u) return x + x;             /* +inf, NaN */
+        if (x > 0x1.62e42ep6f) return (float)(0x1p97 * 0x1p97);   /* overflow: inf */
+        if (x < -0x1.9fe368p6f) return 0.0f;            /* below half the smallest subnormal */
+        if (x < -0x1.9d1d9ep6f) return 0x1p-149f;       /* the smallest subnormal */
+    }
+    /* x 32 / ln 2 = k + r, k an integer and |r| <= 1/2; exp(x) = 2^(k/32) 2^(r/32), the second factor a cubic in r */
+    const double z = 0x1.71547652b82fep+5 * (double)x;
+    double kd = z + 0x1.8p52;                           /* the integer in its low bits */
+    uint64_t ki, t;
+    memcpy(&ki, &kd, 8);
+    kd -= 0x1.8p52;
+    const double r = z - kd;
+    t = exp2f_table[ki % 32u] + (ki << 47);
+    double s;
+    memcpy(&s, &t, 8);
+    const double c0 = 0x1.c6af84b912394p-5 / 32 / 32 / 32, c1 = 0x1.ebfce50fac4f3p-3 / 32 / 32;
+    const double c2 = 0x1.62e42ff0c52d6p-1 / 32;
+    const double p = c0 * r + c1, r2 = r * r;
+    double y = c2 * r + 1.0;
+    y = p * r2 + y;
+    return (float)(y * s);
+}
+
+void spingalett_engine_rope_table(uint32_t cells, uint32_t rot, float theta, const float *freqs, float *table) {
+    const uint32_t half = rot / 2u;
     for (uint32_t i = 0; i < half; i++) {
-        const double inv = pow((double)theta, -2.0 * (double)i / (double)head);
+        const double inv = freqs ? (double)freqs[i] : pow((double)theta, -2.0 * (double)i / (double)rot);
         for (uint32_t p = 0; p < cells; p++) {
             const double angle = (double)p * inv;
             table[(size_t)p * half + i] = (float)cos(angle);
@@ -2305,6 +2748,17 @@ void spingalett_engine_rope_rotate(const float *src, float *dst, uint32_t half, 
     }
 }
 
+void spingalett_engine_head(const float *src, float *dst, uint32_t head, const float *gamma, float eps, uint32_t rot,
+                            const float *cosines, const float *sines) {
+    if (gamma) spingalett_engine_rms_norm(src, 1, head, gamma, eps, dst, NULL);
+    if (rot) spingalett_engine_rope_rotate(gamma ? dst : src, dst, rot / 2u, cosines, sines);
+    if (gamma || !rot) {
+        if (!gamma && src != dst) memcpy(dst, src, (size_t)head * sizeof(float));
+        return;
+    }
+    if (src != dst) memcpy(dst + rot, src + rot, (size_t)(head - rot) * sizeof(float));
+}
+
 void spingalett_engine_attend(const float *q, const float *keys, size_t key_stride, const float *values,
                               size_t value_stride, uint32_t count, uint32_t head, float scale, const float *tokens,
                               float *o) {
@@ -2317,12 +2771,12 @@ void spingalett_engine_attend(const float *q, const float *keys, size_t key_stri
         for (uint32_t d = 0; d < head; d++) score += q[d] * k[d];
         score *= scale;
         if (score > m) {            /* a new maximum: what was summed so far scaled down to it */
-            const float r = expf(m - score);
+            const float r = spingalett_expf(m - score);
             sum *= r;
             for (uint32_t d = 0; d < head; d++) o[d] *= r;
             m = score;
         }
-        const float w = expf(score - m);
+        const float w = spingalett_expf(score - m);
         sum += w;
         for (uint32_t d = 0; d < head; d++) o[d] += w * v[d];
     }
@@ -2338,26 +2792,28 @@ void spingalett_engine_attention(const SlettAttention *a, const float *x, const 
     /* a cell's values of keys and values (and, in self-attention, of queries before them first) */
     const uint32_t C = (a->kv_input ? 2u * kv : heads + 2u * kv) * head, Cq = a->kv_input ? heads * head : C;
     const uint32_t kbase = a->kv_input ? 0u : heads;
-    const uint32_t out_c = heads * head, group = heads / kv, half = head / 2u;
-    const float scale = 1.0f / sqrtf((float)head);
-    float *keys = scratch, *q = table ? scratch + (size_t)kcells * kv * head : NULL;    /* (scratch: with a table) */
-    /* the keys rotated once (kv heads a cell, side by side), a query rotated as it is used */
-    if (table)
+    const uint32_t out_c = heads * head, group = heads / kv, rot = table ? a->rot : 0u, half = rot / 2u;
+    const float scale = a->scale;
+    /* (scratch: with a table, or normalized keys) */
+    const bool prepared = table || a->gk;
+    float *keys = scratch, *q = prepared ? scratch + (size_t)kcells * kv * head : NULL;
+    /* the keys normalized and rotated once (kv heads a cell, side by side), a query as it is used */
+    if (prepared)
         for (uint32_t p = 0; p < kcells; p++)
             for (uint32_t g = 0; g < kv; g++)
-                spingalett_engine_rope_rotate(kvx + (size_t)p * C + (size_t)(kbase + g) * head,
-                                              keys + ((size_t)p * kv + g) * head, half, table + (size_t)p * half,
-                                              table + (size_t)cells * half + (size_t)p * half);
+                spingalett_engine_head(kvx + (size_t)p * C + (size_t)(kbase + g) * head, keys + ((size_t)p * kv + g) * head,
+                                       head, a->gk, a->eps, rot, table ? table + (size_t)p * half : NULL,
+                                       table ? table + (size_t)cells * half + (size_t)p * half : NULL);
     for (uint32_t h = 0; h < heads; h++) {
         const uint32_t g = h / group;
-        /* key j of head g: rotated in the scratch, kv heads a cell, or in the input */
-        const float *k = table ? keys + (size_t)g * head : kvx + (size_t)(kbase + g) * head;
-        const size_t key_stride = table ? (size_t)kv * head : C;
+        /* key j of head g: prepared in the scratch, kv heads a cell, or in the input */
+        const float *k = prepared ? keys + (size_t)g * head : kvx + (size_t)(kbase + g) * head;
+        const size_t key_stride = prepared ? (size_t)kv * head : C;
         for (uint32_t i = 0; i < cells; i++) {
             const float *qi = x + (size_t)i * Cq + (size_t)h * head;
-            if (table) {
-                spingalett_engine_rope_rotate(qi, q, half, table + (size_t)i * half,
-                                              table + (size_t)cells * half + (size_t)i * half);
+            if (prepared) {
+                spingalett_engine_head(qi, q, head, a->gq, a->eps, rot, table ? table + (size_t)i * half : NULL,
+                                       table ? table + (size_t)cells * half + (size_t)i * half : NULL);
                 qi = q;
             }
             /* its keys: up to it when causal; with a window, less than window cells away */
@@ -2385,6 +2841,11 @@ void spingalett_engine_attention_of(const uint8_t *image, const SlettLayer *L, c
     a->causal = L->causal;
     a->tokens = NULL;
     a->kv_input = NULL;
+    a->rot = L->theta > 0.0f ? L->rotary : 0u;
+    a->gq = L->qk_norm ? (const float *)(const void *)(image + L->weights) : NULL;
+    a->gk = a->gq ? a->gq + a->head : NULL;
+    a->eps = L->eps;
+    a->scale = slett_attention_scale(L);
     if (L->mask && input) {             /* the keys' tokens: those of the embedding, from its first on */
         SlettLayer E;
         spingalett_slett_layer(image, L->mask - 1u, &E);
@@ -2417,11 +2878,14 @@ static void decode_row(const uint8_t *image, const SlettLayer *L, uint32_t row, 
                 out[k] = (float)(v >= 8 ? v - 16 : v) * scale;
             }
             break;
-        default:                        /* INT2: 1 is +1, 3 is -1 */
+        case PRECISION_INT2:            /* 1 is +1, 3 is -1 */
             for (uint32_t k = 0; k < n; k++) {
                 int v = (w[k / 4u] >> (2u * (k & 3u))) & 3;
                 out[k] = (float)(v == 1 ? 1 : v == 3 ? -1 : 0) * scale;
             }
+            break;
+        default:                        /* the block precisions */
+            spingalett_block_decode(L->precision, w, out, n);
             break;
     }
 }
@@ -2430,6 +2894,8 @@ void spingalett_engine_embed(const uint8_t *image, const SlettLayer *L, float to
     const uint32_t d = L->out_c;
     if (token >= 0.0f && token < (float)L->rows) decode_row(image, L, (uint32_t)token, y);
     else memset(y, 0, (size_t)d * sizeof(float));
+    if (L->embed_scale != 0.0f)
+        for (uint32_t c = 0; c < d; c++) y[c] *= L->embed_scale;
     if (L->positions) {
         const float *at = (const float *)(const void *)(image + L->biases) + (size_t)position * d;
         for (uint32_t c = 0; c < d; c++) y[c] += at[c];
@@ -2479,14 +2945,19 @@ static void layer_forward(const uint8_t *image, const SlettLayer *L, const float
             spingalett_engine_attention_of(image, L, input, &a);
             a.kv_input = kv;
             float *table = NULL, *scratch = (float *)window;
-            if (L->theta > 0.0f) {          /* the table after the rotated keys and the query */
+            if (L->theta > 0.0f) {          /* the table after the prepared keys and the query */
                 table = scratch + (size_t)a.cells * a.kv * a.head + a.head;
-                spingalett_engine_rope_table(a.cells, a.head, L->theta, table);
+                spingalett_engine_rope_table(a.cells, a.rot, L->theta,
+                                             L->freqs ? (const float *)(const void *)(image + L->scales) : NULL, table);
             }
             spingalett_engine_attention(&a, x, table, y, scratch);
             break;
         }
         default: {
+            if (slett_block_layer(L)) {
+                block_rows(image, L, x, y, xq);
+                break;
+            }
             bool is_int = spingalett_precision_is_int(L->precision);
             float x_scale = is_int ? spingalett_quantize_activations(x, L->inputs, xq) : 0.0f;
             int32_t xsum = is_int && L->precision != PRECISION_INT8

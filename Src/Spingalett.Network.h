@@ -82,6 +82,26 @@ struct SpingalettNetwork {
     uint64_t time_step;
     LossFunction loss_func;
 
+    /* The training run that last trained the network, as its last epoch left it: what a checkpoint
+       holds beside the parameters and the optimizer's moments (spingalett_save_checkpoint()), and what
+       the train() after spingalett_load_checkpoint() carries on (Training.c, run_capture()). */
+    struct {
+        bool valid;                 /* set at the end of every epoch of a run */
+        bool resume;                /* from a checkpoint: the next train() continues the run */
+        bool has_reader;            /* it read through spingalett_dataset_generator(): reader is where */
+        uint64_t time_step;         /* the network's steps then: one that stepped since is past it */
+        uint64_t epochs;            /* epochs of the run completed */
+        uint64_t steps, total_steps;            /* its optimizer steps, and those of all its epochs (0: unknown) */
+        uint64_t dropout_seed, augment_seed, order_seed;
+        float beta1_pow, beta2_pow;             /* Adam's corrections as its steps multiplied them */
+        float base_lr, lr_scale;                /* the schedule's last rate; the plateau's scale */
+        float best;                             /* the best monitored value (an infinity before one) */
+        uint64_t best_epoch, no_improvement, stale;
+        SpingalettDatasetPosition reader;
+        const float *best_params;   /* during a train(): the trainer's copy of best_epoch's parameters */
+        float *saved_best;          /* from a checkpoint: that copy, until the resumed train() takes it */
+    } run;
+
     float *dropout_rates;           /* per layer, applied to its outputs while training */
 
     /* batch normalization layers: the statistics inference uses, laid out like the biases (zeros

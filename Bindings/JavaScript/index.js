@@ -12,7 +12,7 @@
 const LAYER_TYPES = ['dense', 'conv2d', 'max_pool2d', 'avg_pool2d', 'batch_norm', 'add', 'concat', 'global_avg_pool',
     'conv_transpose2d', 'upsample', 'layer_norm', 'embedding', 'attention', 'rms_norm', 'multiply'];
 const ACTIVATIONS = ['none', 'sigmoid', 'relu', 'tanh', 'leaky_relu', 'foo52', 'softmax', 'gelu', 'gelu_tanh', 'silu'];
-const PRECISIONS = ['fp32', 'fp16', 'bf16', 'int8', 'int4', 'int2'];
+const PRECISIONS = ['fp32', 'fp16', 'bf16', 'int8', 'int4', 'int2', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'q2_k', 'q3_k', 'q4_k', 'q5_k', 'q6_k', 'iq4_nl', 'iq4_xs'];
 const LOSSES = ['mse', 'cross_entropy', 'sparse_cross_entropy'];
 const UPSAMPLE = ['nearest', 'bilinear'];
 
@@ -21,7 +21,7 @@ const ERRORS = {
     1: 'out of memory',
     2: 'invalid argument or model contents (a damaged image, a checksum mismatch or an unsupported layer)',
     3: 'the image is truncated',
-    4: 'unsupported .slett format version (this engine reads versions 3 to 9)',
+    4: 'unsupported .slett format version (this engine reads versions 3 to 10)',
 };
 
 /** An error of the engine; `code` is one of Spingalett.Inference.h's SPINGALETT_ERR_* codes. */
@@ -138,7 +138,7 @@ export class Engine {
     }
 
     /**
-     * Checks a .slett image (format version 3 to 9: header, layer table, bounds and CRC-32 checksums)
+     * Checks a .slett image (format version 3 to 10: header, layer table, bounds and CRC-32 checksums)
      * and opens it: the image is copied into the engine's memory, with the model's workspace.
      */
     loadModel(bytes) {
@@ -275,7 +275,7 @@ export class Model {
     get workspaceSize() { return this.#info.workspaceSize; }
     /** Bytes of the .slett image. */
     get imageSize() { return this.#info.imageSize; }
-    /** The image's .slett format version (3 to 9). */
+    /** The image's .slett format version (3 to 10). */
     get formatVersion() { return this.#info.formatVersion; }
 
     /** The weight layers (spingalett_model_layer()), first hidden layer first. */

@@ -510,7 +510,7 @@ static void deployment_benchmark(const float *inputs) {
     spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     printf("\n%-16s %14s %14s %14s\n", "deployment", "bytes", "one sample us", "batched/s");
     printf("%-16s %14s %14.1f\n", "forward()", "", latency(run_forward, net, inputs) * 1e6);
-    for (int p = 0; p < PRECISION_COUNT; p++) {
+    for (int p = 0; p <= PRECISION_INT2; p++) {
         SpingalettModel *model = spingalett_model_from_network(net, (PrecisionMode)p);
         if (!model) continue;
         RunContext ctx = {model, malloc(model->workspace_size), {0}};
