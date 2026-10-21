@@ -20,6 +20,10 @@
  * bytes with an offset of the type, their sub-blocks' integer scales and minima) and each row's four codes are
  * broadcast against a group's, the items' sums then exact in the lanes, without reductions. Each kernel is compiled
  * once for each type.
+ *
+ * Builds that are not tuned for the build machine (SPINGALETT_BLOCK_DISPATCH: x86-64) compile this file once more
+ * each through Kernels/Spingalett.Blocks.AVX2.c, .AVXVNNI.c and .AVX512.c, and run the best of them the processor
+ * has (every one of them gives the same bits).
  */
 
 #include "Spingalett.Blocks.h"
@@ -56,11 +60,13 @@ static uint64_t tile_bytes(uint32_t n) {
            2u * slett_align(4u * (uint64_t)(n / 16u) * 2u);
 }
 
+#if !defined(SPINGALETT_BLOCK_VARIANT)
 uint64_t spingalett_block_scratch(const SlettLayer *L, uint64_t items, int threads) {
     const uint64_t natural = slett_block_input_bytes(items * L->row_len);
     if (items < MANY_ITEMS) return natural;
     return natural + transposed_bytes(items, L->row_len) + (uint64_t)(threads > 1 ? threads : 1) * tile_bytes(L->row_len);
 }
+#endif
 
 /* An input quantized in blocks: item i's codes at xq + i C, its blocks' scales at dx + i C / S, its sums of 16
    codes at sums + i C / 16. */
@@ -993,8 +999,16 @@ static void rows_task(PrecisionMode p, const uint8_t *weights, size_t row, const
                                                            q->sums + i * (C / 16u), C);
 }
 
-void spingalett_block_layer(const uint8_t *image, const SlettLayer *L, const float *x, float *y, uint64_t items,
-                            uint8_t *scratch, int threads) {
+#if defined(SPINGALETT_BLOCK_VARIANT)
+void SPINGALETT_BLOCK_VARIANT(const uint8_t *image, const SlettLayer *L, const float *x, float *y, uint64_t items,
+                              uint8_t *scratch, int threads);
+#  define LAYER_FUNCTION void SPINGALETT_BLOCK_VARIANT
+#else
+#  define LAYER_FUNCTION static void layer_here
+#endif
+
+LAYER_FUNCTION(const uint8_t *image, const SlettLayer *L, const float *x, float *y, uint64_t items, uint8_t *scratch,
+               int threads) {
     const PrecisionMode p = L->precision;
     const uint32_t C = L->row_len, OC = L->rows, S = slett_block_values(p);
     const uint64_t n = items * C;
@@ -1043,3 +1057,50 @@ void spingalett_block_layer(const uint8_t *image, const SlettLayer *L, const flo
         }
     );
 }
+
+#if !defined(SPINGALETT_BLOCK_VARIANT)
+#if defined(SPINGALETT_BLOCK_DISPATCH) && !defined(BLOCK_AVX2) && !defined(SPINGALETT_PORTABLE_KERNELS) && \
+    (defined(__x86_64__) || defined(__i386__))
+#  include <cpuid.h>
+#  define BLOCK_DISPATCH_X86 1
+void spingalett_block_layer_avx2(const uint8_t *image, const SlettLayer *L, const float *x, float *y, uint64_t items,
+                                 uint8_t *scratch, int threads);
+void spingalett_block_layer_avxvnni(const uint8_t *image, const SlettLayer *L, const float *x, float *y,
+                                    uint64_t items, uint8_t *scratch, int threads);
+void spingalett_block_layer_avx512(const uint8_t *image, const SlettLayer *L, const float *x, float *y, uint64_t items,
+                                   uint8_t *scratch, int threads);
+
+/* The kernels this processor runs: 3 (AVX-VNNI), 2 (AVX-512 VNNI with 256-bit vectors), 1 (AVX2, FMA and F16C) or 0.
+   (Compilers do not all know AVX-VNNI or F16C by name: CPUID leaf 7, subleaf 1, EAX bit 4; leaf 1, ECX bit 29.) */
+static int block_kernels(void) {
+    static int kernels = -1;
+    if (kernels >= 0) return kernels;
+    __builtin_cpu_init();
+    unsigned a, b, c, d;
+    const bool f16c = __get_cpuid(1, &a, &b, &c, &d) && (c & (1u << 29));
+    int k = 0;
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && f16c) {
+        k = 1;
+        if (__builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512vl") &&
+            __builtin_cpu_supports("avx512bw"))
+            k = 2;
+        if (__get_cpuid_count(7, 1, &a, &b, &c, &d) && (a & (1u << 4))) k = 3;
+    }
+    kernels = k;
+    return k;
+}
+#endif
+
+void spingalett_block_layer(const uint8_t *image, const SlettLayer *L, const float *x, float *y, uint64_t items,
+                            uint8_t *scratch, int threads) {
+#if defined(BLOCK_DISPATCH_X86)
+    switch (block_kernels()) {
+        case 3: spingalett_block_layer_avxvnni(image, L, x, y, items, scratch, threads); return;
+        case 2: spingalett_block_layer_avx512(image, L, x, y, items, scratch, threads); return;
+        case 1: spingalett_block_layer_avx2(image, L, x, y, items, scratch, threads); return;
+        default: break;
+    }
+#endif
+    layer_here(image, L, x, y, items, scratch, threads);
+}
+#endif

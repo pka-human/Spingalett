@@ -9,6 +9,8 @@
  * the head's values in their order as the engine sums one; the online softmax then goes key after key as the
  * engine's does, its exponentials computed eight at a time by spingalett_expf()'s algorithm (in double, no fused
  * multiply-adds) and the weighted values added in vectors over the head (each value's sum in the order of the keys).
+ * Builds that are not tuned for the build machine (SPINGALETT_BLOCK_DISPATCH: x86-64) compile it once more for AVX2
+ * (Kernels/Spingalett.Attention.AVX2.c) and run that where the processor has it: the same bits.
  */
 
 #include "Spingalett.Attention.h"
@@ -53,8 +55,16 @@ static inline __m256 expf8(__m256 x) {
 }
 #endif
 
-void spingalett_attend_blocks(const float *q, const float *blocks, const float *values, size_t value_stride,
-                              uint32_t first, uint32_t count, uint32_t head, float scale, float *o) {
+#if defined(SPINGALETT_ATTEND_VARIANT)
+void SPINGALETT_ATTEND_VARIANT(const float *q, const float *blocks, const float *values, size_t value_stride,
+                               uint32_t first, uint32_t count, uint32_t head, float scale, float *o);
+#  define ATTEND_FUNCTION void SPINGALETT_ATTEND_VARIANT
+#else
+#  define ATTEND_FUNCTION static void attend_here
+#endif
+
+ATTEND_FUNCTION(const float *q, const float *blocks, const float *values, size_t value_stride, uint32_t first,
+                uint32_t count, uint32_t head, float scale, float *o) {
     float m = -FLT_MAX, sum = 0.0f;
     memset(o, 0, (size_t)head * sizeof(float));
     for (uint32_t p = first, end = first + count; p < end;) {
@@ -108,3 +118,28 @@ void spingalett_attend_blocks(const float *q, const float *blocks, const float *
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     for (uint32_t d = 0; d < head; d++) o[d] *= inv;
 }
+
+#if !defined(SPINGALETT_ATTEND_VARIANT)
+#if defined(SPINGALETT_BLOCK_DISPATCH) && !defined(ATTEND_AVX2) && !defined(SPINGALETT_PORTABLE_KERNELS) && \
+    (defined(__x86_64__) || defined(__i386__))
+#  define ATTEND_DISPATCH_X86 1
+void spingalett_attend_blocks_avx2(const float *q, const float *blocks, const float *values, size_t value_stride,
+                                   uint32_t first, uint32_t count, uint32_t head, float scale, float *o);
+#endif
+
+void spingalett_attend_blocks(const float *q, const float *blocks, const float *values, size_t value_stride,
+                              uint32_t first, uint32_t count, uint32_t head, float scale, float *o) {
+#if defined(ATTEND_DISPATCH_X86)
+    static int avx2 = -1;
+    if (avx2 < 0) {
+        __builtin_cpu_init();
+        avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    }
+    if (avx2) {
+        spingalett_attend_blocks_avx2(q, blocks, values, value_stride, first, count, head, scale, o);
+        return;
+    }
+#endif
+    attend_here(q, blocks, values, value_stride, first, count, head, scale, o);
+}
+#endif
