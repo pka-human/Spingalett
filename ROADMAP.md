@@ -5,6 +5,22 @@ worth doing; the [CHANGELOG](CHANGELOG.md) records what was actually done. Every
 project's rule: nothing gets slower, and new kernels are measured against the previous release and
 against PyTorch on the same machine.
 
+## What the work keeps in view
+
+- **Training as much as inference.** Spingalett was made to train efficiently, not only to run what others trained:
+  every kind of model the library runs it should also train, on the CPU and on the GPU, as fast as the heavyweights
+  or faster (the GPT on the CPU and in bfloat16 on CUDA already is), and in a program's own loop, a step at a time
+  in fixed memory.
+- **The GPU as much as the CPU.** Most work runs on GPUs. The library's own kernels (no cuDNN or cuBLAS) beat PyTorch
+  on dense and convolutional networks and `torch.compile` on the GPT by sound mathematics and algorithms and by
+  carrying nothing they do not need; every version that moves the CPU forward plans the GPU's side too, measured
+  against the strongest rival on the same card (`torch.compile`, llama.cpp's CUDA and Vulkan builds).
+- **Embedded in other programs.** A C library without dependencies, an engine without a heap and results that
+  repeat their bits are what a game engine (creatures' minds, opponents, the same decisions on every client of a
+  lockstep game, replays that replay), a robot (trained in simulation, run on the real machine, a failure replayed
+  in the simulation bit for bit) or a server can link. Trees (1.10) and learning from rewards (1.11) serve exactly
+  there.
+
 ## Done so far
 
 | Version | Highlights |
