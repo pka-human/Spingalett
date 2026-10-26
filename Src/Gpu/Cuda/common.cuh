@@ -84,9 +84,17 @@ DEVICE uint32_t to_bf16(float f) {
     return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
 }
 
-/* float16: to the nearest, ties to even, and back */
-DEVICE uint32_t to_half(float f) { return __builtin_bit_cast(uint16_t, (_Float16)f); }
-DEVICE float from_half(uint32_t h) { return (float)__builtin_bit_cast(_Float16, (uint16_t)h); }
+/* float16: to the nearest, ties to even, and back (the instructions: _Float16 is not every clang's on NVPTX) */
+DEVICE uint32_t to_half(float f) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+DEVICE float from_half(uint32_t h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"((unsigned short)h));
+    return f;
+}
 
 /* Value i of buffer x, whose push-constant word is w: bfloat16 where bit w of the kernel's HALF says so
    (half.glsl), else a float. */

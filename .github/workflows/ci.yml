@@ -38,7 +38,7 @@ jobs:
           cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }} $extra
 
       - name: Build
-        run: cmake --build Build --parallel
+        run: .github/scripts/build.sh Build --parallel
 
       - name: Test
         run: .github/scripts/ctest.sh --test-dir Build
@@ -105,7 +105,7 @@ jobs:
           "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
 
       - name: Build
-        run: cmake --build Build --parallel
+        run: .github/scripts/build.sh Build --parallel
 
       - name: Test
         run: LSAN_OPTIONS=suppressions=$PWD/Tests/lsan.supp .github/scripts/ctest.sh --test-dir Build
