@@ -1023,6 +1023,9 @@ bool ir_fuse(SpingalettGraph *g) {
     free(f.producer);
     free(f.uses);
     free(f.dead);
-    /* then the maps of convolutions channels last (Spingalett.IRLayout.c) */
+    /* the fused nodes' outputs again (inference before the fusions stops where an input is not declared, as at a mask
+       of attention; the fused node may not read it for its shape), then the maps of convolutions channels last
+       (Spingalett.IRLayout.c) */
+    if (ok) ir_infer_shapes(g);
     return ok && ir_layout(g);
 }

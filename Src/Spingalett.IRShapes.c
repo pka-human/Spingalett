@@ -511,6 +511,20 @@ static void infer(SpingalettGraph *g, uint32_t k) {
             declare(g, n, 0, &y);
             return;
         }
+        case IR_GatherND: {
+            /* indices' axes but the last, then data's past the batch's and the last index's */
+            const int64_t b = ir_attr_int(n, "batch_dims", 0);
+            if (n->input_count < 2 || !x->known || !in[1].known || !in[1].rank || b < 0) return;
+            const int64_t last = in[1].dims[in[1].rank - 1u];
+            if (last < 1 || b + last > (int64_t)x->rank || in[1].rank - 1u + x->rank - (uint32_t)(b + last) > IR_MAX_RANK)
+                return;
+            uint32_t j = 0;
+            for (uint32_t d = 0; d + 1u < in[1].rank; d++) y.dims[j] = in[1].dims[d], y.sym[j++] = in[1].sym[d];
+            for (uint32_t d = (uint32_t)(b + last); d < x->rank; d++) y.dims[j] = x->dims[d], y.sym[j++] = x->sym[d];
+            y.rank = (uint8_t)j;
+            declare(g, n, 0, &y);
+            return;
+        }
         case IR_Expand: {
             const int64_t ns = n->input_count > 1 ? const_ints(g, n->inputs[1], list, IR_MAX_RANK) : -1;
             if (!x->known || ns < 0) return;

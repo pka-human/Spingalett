@@ -2871,6 +2871,42 @@ static void release_after(SpingalettGraph *g, Plan *p, uint32_t k) {
     }
 }
 
+static void report_tensor(const IrTensor *t, bool half) {
+    fprintf(stderr, " %s[", half ? "bfloat16" : ir_dtype_name(t->dtype));
+    for (uint32_t d = 0; d < t->rank; d++) fprintf(stderr, "%s%lld", d ? "," : "", (long long)t->dims[d]);
+    fprintf(stderr, "]");
+}
+
+/* SPINGALETT_GRAPH_GPU_REPORT: 1 lists the operators the host ran (but for those of shapes), 2 with their inputs'
+   types and shapes, 3 every node in order, where it runs, its inputs and outputs as the device keeps them, the
+   inputs it rounds to bfloat16 (^) and those of sizes the graph does not declare (?). */
+static void report_plan(const SpingalettGraph *g, const Plan *p, char level) {
+    for (uint32_t s = 0; s < p->step_count; s++) {
+        const bool host = p->steps[s].kind == STEP_HOST;
+        const Piece *pc = host ? NULL : &p->pieces[p->steps[s].index];
+        for (uint32_t j = 0; j < (host ? 1u : pc->node_count); j++) {
+            const uint32_t k = host ? p->steps[s].index : pc->nodes[j];
+            const IrNode *n = &g->nodes[k];
+            if ((!host && level < '3') || shape_only((IrOp)n->op)) continue;
+            fprintf(stderr, "graph on the GPU: %s %s '%s'", host ? "on the host:" : level < '3' ? "" : "  device:",
+                    ir_op_name((IrOp)n->op), n->name);
+            for (uint32_t i = 0; i < n->input_count && level >= '2'; i++) {
+                const uint32_t v = n->inputs[i];
+                if (v == NONE) continue;
+                report_tensor(&g->tensors[v], !host && p->half[v]);
+                if (!host && p->half_maker[v] == k) fprintf(stderr, "^");
+                if (level >= '3' && !declared_count(g, v)) fprintf(stderr, "?");
+            }
+            if (level >= '3') {
+                fprintf(stderr, " ->");
+                for (uint32_t o = 0; o < n->output_count; o++)
+                    if (n->outputs[o] != NONE) report_tensor(&g->tensors[n->outputs[o]], !host && p->half[n->outputs[o]]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
 /* Runs the graph while making plan p of it (the run's inputs and constants bound in g->tensors). */
 static bool plan_run(SpingalettGraph *g, GpuGraph *gg, Plan *p) {
     for (uint32_t v = 0; v < g->value_count; v++)
@@ -2921,22 +2957,8 @@ static bool plan_run(SpingalettGraph *g, GpuGraph *gg, Plan *p) {
     ok = ok && piece_close(g, gg, p, want, count);
     free(want);
     p->host_only = !devices;
-    /* (SPINGALETT_GRAPH_GPU_REPORT: the operators the host ran, but for those of shapes) */
     const char *report = getenv("SPINGALETT_GRAPH_GPU_REPORT");
-    if (ok && report && *report && *report != '0')
-        for (uint32_t s = 0; s < p->step_count; s++)
-            if (p->steps[s].kind == STEP_HOST && !shape_only((IrOp)g->nodes[p->steps[s].index].op)) {
-                const IrNode *n = &g->nodes[p->steps[s].index];
-                fprintf(stderr, "graph on the GPU: on the host: %s '%s'", ir_op_name((IrOp)n->op), n->name);
-                for (uint32_t i = 0; i < n->input_count && *report == '2'; i++) {
-                    const IrTensor *t = n->inputs[i] == NONE ? NULL : &g->tensors[n->inputs[i]];
-                    if (!t) continue;
-                    fprintf(stderr, " %s[", ir_dtype_name(t->dtype));
-                    for (uint32_t d = 0; d < t->rank; d++) fprintf(stderr, "%s%lld", d ? "," : "", (long long)t->dims[d]);
-                    fprintf(stderr, "]");
-                }
-                fprintf(stderr, "\n");
-            }
+    if (ok && report && *report && *report != '0') report_plan(g, p, *report);
     if (ok) spingalett_log(LOG_DEBUG, "graph on the GPU: %u of %u nodes on the device, %u pieces", p->device_nodes,
                            g->node_count, p->piece_count);
     /* the plan's types and shapes, for the checks of replays */
