@@ -290,7 +290,8 @@ static bool grid_stride(SpgKernel kernel) {
         case SPG_KERNEL_eltwise: case SPG_KERNEL_eltwise_h: case SPG_KERNEL_combine: case SPG_KERNEL_combine_h:
         case SPG_KERNEL_pool: case SPG_KERNEL_pool_h: case SPG_KERNEL_upsample: case SPG_KERNEL_upsample_h:
         case SPG_KERNEL_wtrans: case SPG_KERNEL_optim: case SPG_KERNEL_optim_h: case SPG_KERNEL_rows: case SPG_KERNEL_rows_h:
-        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h: case SPG_KERNEL_gew:
+        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h: case SPG_KERNEL_gew: case SPG_KERNEL_gcopy:
+        case SPG_KERNEL_ggather:
             return true;
         default:
             return false;

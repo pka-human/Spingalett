@@ -273,6 +273,26 @@ enum {
     SPG_GEW_WHERE = 96
 };
 
+/* gcopy.comp: values copied through strides (Transpose, Slice, Concat, Split, Expand, Tile and Pad of graphs): value i
+   of the dispatch, at its coordinates over SPG_COPY_AXES axes (innermost last, sizes 1 before fewer), is
+   x[base + sum c[d] sx[d]] written to y[sum c[d] sy[d]] (strides in elements; x's may be negative, base keeping its
+   offsets from x's address, its lowest value read, at 0 and above). Spec: SIZE (bytes an element: 1, 4, 8 or 16). */
+#define SPG_COPY_AXES 6u
+typedef struct {
+    uint64_t y, x;
+    uint32_t total, base;
+    uint32_t dims[SPG_COPY_AXES];
+    int32_t sx[SPG_COPY_AXES], sy[SPG_COPY_AXES];
+} SpgCopyPush;
+
+/* ggather.comp: Gather of graphs: y[o][j][e] = x[o][idx[j]][e] over `outer` x count x inner values (an index below 0
+   counts from the axis's end; one outside it gives zeros). Spec: SIZE (bytes an element: 1, 4 or 8), the indices'
+   type (SPG_T_I32 or SPG_T_I64). */
+typedef struct {
+    uint64_t y, x, idx;
+    uint32_t total, inner, count, axis;
+} SpgGatherPush;
+
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
 #define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */
 

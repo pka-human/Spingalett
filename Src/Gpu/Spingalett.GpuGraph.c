@@ -325,6 +325,30 @@ static uint64_t out_at(const GCtx *c, uint32_t o) {
     return o < c->n->output_count ? address_of(c, c->n->outputs[o]) : 0;
 }
 
+static Range range_of(const GCtx *c, uint32_t v);
+
+/* The buffer holding a value on the device and the value's offset in it (fills and copies take buffers). */
+static const SpgGpuBuffer *buffer_of(const GCtx *c, uint32_t v, uint64_t *offset) {
+    if (c->g->values[v].kind == VALUE_CONST) {
+        *offset = 0;
+        return &c->gg->consts[v];
+    }
+    const Block *k = &c->p->blocks[c->p->block_of[v]];
+    *offset = k->at;
+    return &c->p->pieces[k->piece].memory;
+}
+
+/* Records output o filled with a 32-bit pattern (bytes: a multiple of four, from its start). */
+static void fill_output(GCtx *c, uint32_t o, uint64_t bytes, uint32_t value) {
+    const uint32_t v = c->n->outputs[o];
+    Access a = {0};
+    writes(&a, range_of(c, v));
+    need(c->r, &a);
+    uint64_t at;
+    const SpgGpuBuffer *b = buffer_of(c, v, &at);
+    spg_gpu_fill(c->r->c, b, (size_t)at, (size_t)(bytes & ~(uint64_t)3u), value);
+}
+
 static Range range_of(const GCtx *c, uint32_t v) {
     const uint64_t a = address_of(c, v);
     return (Range){a, a + bytes_of(&c->g->tensors[v])};
@@ -683,6 +707,673 @@ static bool op_clip(GCtx *c, IrTensor *const *in, IrTensor **out) {
     return true;
 }
 
+/* ------------------------------------------------------------------------- copies through strides */
+
+/* A list of integers from input i (read on the host as a parameter) or else from attribute attr: their count, -1 for
+   none, -2 for an input the host does not have. */
+static int64_t ints_of(GCtx *c, IrTensor *const *in, uint32_t i, const char *attr, int64_t *out, int64_t most) {
+    if (i < c->n->input_count && in[i]) {
+        const IrTensor *t = ask_param(c, in, i);
+        if (!t || (t->dtype != SPINGALETT_DTYPE_INT64 && t->dtype != SPINGALETT_DTYPE_INT32) || (int64_t)t->count > most)
+            return -2;
+        for (uint64_t k = 0; k < t->count; k++) out[k] = ir_get_int(t, k);
+        return (int64_t)t->count;
+    }
+    const IrAttr *a = attr ? ir_attr(c->n, attr) : NULL;
+    if (!a || a->type != ATTR_INTS) return -1;
+    if ((int64_t)a->count > most) return -2;
+    for (uint32_t k = 0; k < a->count; k++) out[k] = a->ints[k];
+    return a->count;
+}
+
+static bool axis_in(int64_t axis, uint32_t rank, uint32_t *out) {
+    if (axis < 0) axis += rank;
+    if (axis < 0 || axis >= (int64_t)rank) return false;
+    *out = (uint32_t)axis;
+    return true;
+}
+
+/* Row-major strides of a shape, in elements. */
+static void strides_of(uint32_t rank, const int64_t *dims, int64_t *s) {
+    int64_t st = 1;
+    for (uint32_t d = rank; d-- > 0;) {
+        s[d] = st;
+        st *= dims[d];
+    }
+}
+
+/* Records y[sum c sy] = x[sum c sx] over the coordinates c of dims (strides in elements of `size` bytes, x and y the
+   addresses of the first values): axes of size 1 dropped, neighbours merged where both run through them as one,
+   vectors of 16 bytes where the innermost axis is contiguous in both; dispatches over the outer axes where more than
+   SPG_COPY_AXES remain. */
+static void copy_strided(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const int64_t *dims, const int64_t *sx,
+                         const int64_t *sy, uint32_t size, Range ry, Range rx) {
+    int64_t d_[IR_MAX_RANK * 2], x_[IR_MAX_RANK * 2], y_[IR_MAX_RANK * 2];
+    uint32_t q = 0;
+    uint64_t total = 1;
+    for (uint32_t d = 0; d < rank; d++) {
+        total *= (uint64_t)dims[d];
+        if (dims[d] == 1) continue;
+        if (q > 0 && x_[q - 1] == sx[d] * dims[d] && y_[q - 1] == sy[d] * dims[d]) {
+            d_[q - 1] *= dims[d];
+            x_[q - 1] = sx[d];
+            y_[q - 1] = sy[d];
+        } else {
+            d_[q] = dims[d];
+            x_[q] = sx[d];
+            y_[q] = sy[d];
+            q++;
+        }
+    }
+    if (!total) return;
+    if (q == 0) {
+        d_[0] = 1;
+        x_[0] = y_[0] = 1;
+        q = 1;
+    }
+    /* sixteen bytes at a time */
+    if (x_[q - 1] == 1 && y_[q - 1] == 1 && ((uint64_t)d_[q - 1] * size) % 16u == 0 && x % 16u == 0 && y % 16u == 0) {
+        bool aligned = true;
+        for (uint32_t d = 0; d + 1 < q && aligned; d++)
+            aligned = ((x_[d] * (int64_t)size) % 16 == 0) && ((y_[d] * (int64_t)size) % 16 == 0);
+        if (aligned) {
+            const int64_t per = 16 / (int64_t)size;
+            d_[q - 1] /= per;
+            for (uint32_t d = 0; d + 1 < q; d++) {
+                x_[d] /= per;
+                y_[d] /= per;
+            }
+            size = 16;
+            total /= (uint64_t)per;
+        }
+    }
+    /* the outer axes beyond SPG_COPY_AXES: a dispatch each */
+    const uint32_t outer = q > SPG_COPY_AXES ? q - SPG_COPY_AXES : 0;
+    uint64_t runs = 1;
+    for (uint32_t d = 0; d < outer; d++) runs *= (uint64_t)d_[d];
+    Access a = {0};
+    reads(&a, rx);
+    writes(&a, ry);
+    need(c->r, &a);
+    const uint32_t spec[1] = {size};
+    for (uint64_t run = 0; run < runs; run++) {
+        int64_t ox = 0, oy = 0;
+        uint64_t r = run;
+        for (uint32_t d = outer; d-- > 0;) {
+            const int64_t k = (int64_t)(r % (uint64_t)d_[d]);
+            r /= (uint64_t)d_[d];
+            ox += k * x_[d];
+            oy += k * y_[d];
+        }
+        SpgCopyPush push;
+        memset(&push, 0, sizeof push);
+        push.y = y + (uint64_t)(oy * (int64_t)size);
+        push.total = (uint32_t)(total / runs);
+        const uint32_t lead = SPG_COPY_AXES - (q - outer);
+        /* (x's address that of its lowest value read, which negative strides put before the first) */
+        int64_t low = 0;
+        for (uint32_t d = outer; d < q; d++)
+            if (x_[d] < 0) low += (d_[d] - 1) * x_[d];
+        push.x = x + (uint64_t)((ox + low) * (int64_t)size);
+        push.base = (uint32_t)-low;
+        for (uint32_t d = 0; d < SPG_COPY_AXES; d++) {
+            push.dims[d] = d < lead ? 1u : (uint32_t)d_[outer + d - lead];
+            push.sx[d] = d < lead ? 0 : (int32_t)x_[outer + d - lead];
+            push.sy[d] = d < lead ? 0 : (int32_t)y_[outer + d - lead];
+        }
+        spg_gpu_dispatch(c->r->c, SPG_KERNEL_gcopy, spec, 1, &push, sizeof push, group_count(push.total, 256u), 1, 1);
+    }
+}
+
+/* Whether a copy of these strides fits gcopy's 32-bit offsets. */
+static bool copy_fits(uint64_t xcount, uint64_t ycount) {
+    return xcount < ((uint64_t)1 << 31) && ycount < ((uint64_t)1 << 31);
+}
+
+static uint32_t esize(const IrTensor *t) {
+    return (uint32_t)ir_dtype_size(t->dtype);
+}
+
+static bool op_transpose(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrTensor *x = in[0];
+    if (!x || !out[0] || !copy_fits(x->count, x->count)) return false;
+    const uint32_t R = x->rank;
+    int64_t perm[IR_MAX_RANK], dims[IR_MAX_RANK];
+    const IrAttr *a = ir_attr(c->n, "perm");
+    bool seen[IR_MAX_RANK] = {false};
+    for (uint32_t k = 0; k < R; k++) {
+        perm[k] = a && a->type == ATTR_INTS && a->count == R ? a->ints[k] : (int64_t)(R - 1 - k);
+        if (perm[k] < 0 || perm[k] >= (int64_t)R || seen[perm[k]]) return false;
+        seen[perm[k]] = true;
+        dims[k] = x->dims[perm[k]];
+    }
+    if (!c->record) return set_shape(out[0], x->dtype, R, dims);
+    int64_t xs[IR_MAX_RANK], sx[IR_MAX_RANK], sy[IR_MAX_RANK];
+    strides_of(R, x->dims, xs);
+    strides_of(R, dims, sy);
+    for (uint32_t k = 0; k < R; k++) sx[k] = xs[perm[k]];
+    copy_strided(c, out_at(c, 0), in_at(c, 0), R, dims, sx, sy, esize(x), range_of(c, c->n->outputs[0]),
+                 range_of(c, c->n->inputs[0]));
+    return true;
+}
+
+static bool op_slice(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrTensor *x = in[0];
+    if (!x || !out[0] || !copy_fits(x->count, x->count)) return false;
+    const uint32_t R = x->rank, n = c->n->input_count;
+    int64_t starts[IR_MAX_RANK], ends[IR_MAX_RANK], axes[IR_MAX_RANK], steps[IR_MAX_RANK];
+    const int64_t ns = ints_of(c, in, n > 1 ? 1u : 99u, "starts", starts, IR_MAX_RANK);
+    const int64_t ne = ints_of(c, in, n > 2 ? 2u : 99u, "ends", ends, IR_MAX_RANK);
+    int64_t na = ints_of(c, in, n > 3 ? 3u : 99u, "axes", axes, IR_MAX_RANK);
+    const int64_t nt = ints_of(c, in, n > 4 ? 4u : 99u, "steps", steps, IR_MAX_RANK);
+    if (ns < 0 || ne != ns || na == -2 || nt == -2) return false;
+    if (na < 0) {
+        for (int64_t k = 0; k < ns; k++) axes[k] = k;
+        na = ns;
+    }
+    if (na != ns || (nt >= 0 && nt != ns)) return false;
+    int64_t first[IR_MAX_RANK], step[IR_MAX_RANK], dims[IR_MAX_RANK];
+    for (uint32_t d = 0; d < R; d++) { first[d] = 0; step[d] = 1; dims[d] = x->dims[d]; }
+    for (int64_t k = 0; k < ns; k++) {
+        uint32_t a;
+        if (!axis_in(axes[k], R, &a)) return false;
+        const int64_t size = x->dims[a], st = nt >= 0 ? steps[k] : 1;
+        if (!st) return false;
+        int64_t s0 = starts[k], e = ends[k];
+        if (s0 < 0) s0 += size;
+        if (e < 0) e += size;
+        if (st > 0) {
+            s0 = s0 < 0 ? 0 : s0 > size ? size : s0;
+            e = e < 0 ? 0 : e > size ? size : e;
+            dims[a] = e > s0 ? (e - s0 + st - 1) / st : 0;
+        } else {
+            s0 = s0 < 0 ? -1 : s0 > size - 1 ? size - 1 : s0;
+            e = e < -1 ? -1 : e > size - 1 ? size - 1 : e;
+            dims[a] = s0 > e ? (s0 - e - st - 1) / -st : 0;
+        }
+        first[a] = s0;
+        step[a] = st;
+    }
+    if (!c->record) return set_shape(out[0], x->dtype, R, dims);
+    int64_t xs[IR_MAX_RANK], sx[IR_MAX_RANK], sy[IR_MAX_RANK], base = 0;
+    strides_of(R, x->dims, xs);
+    strides_of(R, dims, sy);
+    for (uint32_t d = 0; d < R; d++) {
+        if (dims[d]) base += first[d] * xs[d];
+        sx[d] = step[d] * xs[d];
+    }
+    copy_strided(c, out_at(c, 0), in_at(c, 0) + (uint64_t)(base * (int64_t)esize(x)), R, dims, sx, sy, esize(x),
+                 range_of(c, c->n->outputs[0]), range_of(c, c->n->inputs[0]));
+    return true;
+}
+
+static bool op_concat(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *first = NULL;
+    for (uint32_t k = 0; k < n->input_count && !first; k++) first = in[k];
+    if (!first || !out[0]) return false;
+    uint32_t axis;
+    if (!axis_in(ir_attr_int(n, "axis", 0), first->rank, &axis)) return false;
+    int64_t dims[IR_MAX_RANK];
+    for (uint32_t d = 0; d < first->rank; d++) dims[d] = first->dims[d];
+    dims[axis] = 0;
+    for (uint32_t k = 0; k < n->input_count; k++) {
+        if (!in[k]) continue;
+        if (in[k]->rank != first->rank || in[k]->dtype != first->dtype) return false;
+        for (uint32_t d = 0; d < first->rank; d++)
+            if (d != axis && in[k]->dims[d] != first->dims[d]) return false;
+        dims[axis] += in[k]->dims[axis];
+    }
+    if (!c->record) {
+        uint64_t total = 1;
+        for (uint32_t d = 0; d < first->rank; d++) total *= (uint64_t)dims[d];
+        return copy_fits(total, total) && set_shape(out[0], first->dtype, first->rank, dims);
+    }
+    int64_t sy[IR_MAX_RANK];
+    strides_of(first->rank, dims, sy);
+    int64_t at = 0;
+    for (uint32_t k = 0; k < n->input_count; k++) {
+        if (!in[k]) continue;
+        int64_t sx[IR_MAX_RANK];
+        strides_of(in[k]->rank, in[k]->dims, sx);
+        copy_strided(c, out_at(c, 0) + (uint64_t)(at * sy[axis] * (int64_t)esize(first)), in_at(c, k), first->rank,
+                     in[k]->dims, sx, sy, esize(first), range_of(c, n->outputs[0]), range_of(c, n->inputs[k]));
+        at += in[k]->dims[axis];
+    }
+    return true;
+}
+
+static bool op_split(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *x = in[0];
+    const uint32_t m = n->output_count;
+    if (!x || m > 64 || !copy_fits(x->count, x->count)) return false;
+    uint32_t axis;
+    if (!axis_in(ir_attr_int(n, "axis", 0), x->rank, &axis)) return false;
+    int64_t sizes[64];
+    int64_t ns = ints_of(c, in, n->input_count > 1 ? 1u : 99u, "split", sizes, 64);
+    if (ns == -2) return false;
+    const int64_t total = x->dims[axis];
+    if (ns < 0) {
+        const int64_t parts = (int64_t)m, each = (total + parts - 1) / parts;
+        for (int64_t k = 0; k < parts; k++) sizes[k] = k + 1 < parts ? each : total - each * (parts - 1);
+        ns = parts;
+    }
+    if (ns != (int64_t)m) return false;
+    int64_t sum = 0;
+    for (int64_t k = 0; k < ns; k++) {
+        if (sizes[k] < 0) return false;
+        sum += sizes[k];
+    }
+    if (sum != total) return false;
+    int64_t xs[IR_MAX_RANK];
+    strides_of(x->rank, x->dims, xs);
+    int64_t at = 0;
+    for (uint32_t k = 0; k < m; k++) {
+        int64_t dims[IR_MAX_RANK];
+        for (uint32_t d = 0; d < x->rank; d++) dims[d] = x->dims[d];
+        dims[axis] = sizes[k];
+        if (out[k]) {
+            if (!c->record) {
+                if (!set_shape(out[k], x->dtype, x->rank, dims)) return false;
+            } else {
+                int64_t sy[IR_MAX_RANK];
+                strides_of(x->rank, dims, sy);
+                copy_strided(c, out_at(c, k), in_at(c, 0) + (uint64_t)(at * xs[axis] * (int64_t)esize(x)), x->rank, dims,
+                             xs, sy, esize(x), range_of(c, n->outputs[k]), range_of(c, n->inputs[0]));
+            }
+        }
+        at += sizes[k];
+    }
+    return true;
+}
+
+/* x's strides over the axes of a shape it broadcasts to (0 where it does). */
+static void broadcast_strides(const IrTensor *t, uint32_t R, const int64_t *dims, int64_t *strides) {
+    int64_t st = 1;
+    for (uint32_t d = R; d-- > 0;) {
+        const int32_t td = (int32_t)d - (int32_t)(R - t->rank);
+        const int64_t size = td >= 0 ? t->dims[td] : 1;
+        strides[d] = size == 1 && dims[d] != 1 ? 0 : st;
+        if (td >= 0) st *= size;
+    }
+}
+
+static bool op_expand(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrTensor *x = in[0];
+    if (!x || !out[0] || c->n->input_count < 2) return false;
+    int64_t shape[IR_MAX_RANK];
+    const int64_t ns = ints_of(c, in, 1, NULL, shape, IR_MAX_RANK);
+    if (ns < 0) return false;
+    IrTensor want;
+    memset(&want, 0, sizeof want);
+    want.rank = (uint8_t)ns;
+    for (int64_t k = 0; k < ns; k++) want.dims[k] = shape[k];
+    IrTensor *pair[2] = {(IrTensor *)x, &want};
+    uint32_t R;
+    int64_t dims[IR_MAX_RANK];
+    if (!broadcast(pair, 2, &R, dims)) return false;
+    if (!c->record) {
+        uint64_t total = 1;
+        for (uint32_t d = 0; d < R; d++) total *= (uint64_t)dims[d];
+        return copy_fits(x->count, total) && set_shape(out[0], x->dtype, R, dims);
+    }
+    int64_t sx[IR_MAX_RANK], sy[IR_MAX_RANK];
+    broadcast_strides(x, R, dims, sx);
+    strides_of(R, dims, sy);
+    copy_strided(c, out_at(c, 0), in_at(c, 0), R, dims, sx, sy, esize(x), range_of(c, c->n->outputs[0]),
+                 range_of(c, c->n->inputs[0]));
+    return true;
+}
+
+static bool op_tile(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrTensor *x = in[0];
+    if (!x || !out[0] || c->n->input_count < 2) return false;
+    int64_t reps[IR_MAX_RANK];
+    if (ints_of(c, in, 1, NULL, reps, IR_MAX_RANK) != (int64_t)x->rank) return false;
+    const uint32_t R = x->rank;
+    int64_t dims[IR_MAX_RANK];
+    uint64_t total = 1;
+    for (uint32_t d = 0; d < R; d++) {
+        if (reps[d] < 0) return false;
+        dims[d] = x->dims[d] * reps[d];
+        total *= (uint64_t)dims[d];
+    }
+    if (!c->record) return copy_fits(x->count, total) && set_shape(out[0], x->dtype, R, dims);
+    /* (each axis as its repeats, outer, over the input's size) */
+    int64_t d2[2 * IR_MAX_RANK], sx[2 * IR_MAX_RANK], sy[2 * IR_MAX_RANK], xs[IR_MAX_RANK], ys[IR_MAX_RANK];
+    strides_of(R, x->dims, xs);
+    strides_of(R, dims, ys);
+    for (uint32_t d = 0; d < R; d++) {
+        d2[2 * d] = reps[d];
+        sx[2 * d] = 0;
+        sy[2 * d] = x->dims[d] * ys[d];
+        d2[2 * d + 1] = x->dims[d];
+        sx[2 * d + 1] = xs[d];
+        sy[2 * d + 1] = ys[d];
+    }
+    copy_strided(c, out_at(c, 0), in_at(c, 0), 2 * R, d2, sx, sy, esize(x), range_of(c, c->n->outputs[0]),
+                 range_of(c, c->n->inputs[0]));
+    return true;
+}
+
+/* Pad of the constant mode: the output filled with the value, the input copied inside it (negative pads crop). */
+static bool op_pad(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *x = in[0];
+    if (!x || !out[0] || esize(x) != 4u || !copy_fits(x->count, x->count)) return false;
+    const IrAttr *mode = ir_attr(n, "mode");
+    if (mode && mode->type == ATTR_STRING && strcmp(mode->s, "constant")) return false;
+    const uint32_t R = x->rank;
+    int64_t pads[2 * IR_MAX_RANK], axes[IR_MAX_RANK];
+    const int64_t np = ints_of(c, in, n->input_count > 1 ? 1u : 99u, "pads", pads, 2 * IR_MAX_RANK);
+    int64_t na = ints_of(c, in, n->input_count > 3 ? 3u : 99u, "axes", axes, IR_MAX_RANK);
+    if (np < 0 || na == -2) return false;
+    if (na < 0) {
+        for (uint32_t k = 0; k < R; k++) axes[k] = k;
+        na = R;
+    }
+    if (np != 2 * na) return false;
+    int64_t before[IR_MAX_RANK] = {0}, after[IR_MAX_RANK] = {0}, dims[IR_MAX_RANK];
+    for (int64_t k = 0; k < na; k++) {
+        uint32_t a;
+        if (!axis_in(axes[k], R, &a)) return false;
+        before[a] = pads[k];
+        after[a] = pads[na + k];
+    }
+    uint64_t total = 1;
+    for (uint32_t d = 0; d < R; d++) {
+        dims[d] = x->dims[d] + before[d] + after[d];
+        if (dims[d] < 0) return false;
+        total *= (uint64_t)dims[d];
+    }
+    uint32_t fill = 0;
+    if (n->input_count > 2 && in[2]) {
+        const IrTensor *v = ask_param(c, in, 2);
+        if (!v || v->dtype != x->dtype || v->count != 1) return false;
+        memcpy(&fill, v->data, 4);
+    } else if (ir_attr(n, "value")) {
+        const float v = ir_attr_float(n, "value", 0.0f);
+        if (x->dtype == F32) memcpy(&fill, &v, 4);
+        else fill = (uint32_t)(int32_t)v;
+    }
+    if (!c->record) return copy_fits(total, total) && set_shape(out[0], x->dtype, R, dims);
+    const Range ry = range_of(c, n->outputs[0]);
+    fill_output(c, 0, ry.hi - ry.lo, fill);
+    /* the input's part inside: from x's first kept value to y's place for it */
+    int64_t xs[IR_MAX_RANK], ys[IR_MAX_RANK], part[IR_MAX_RANK], ox = 0, oy = 0;
+    strides_of(R, x->dims, xs);
+    strides_of(R, dims, ys);
+    for (uint32_t d = 0; d < R; d++) {
+        const int64_t lo = before[d] < 0 ? -before[d] : 0, hi = x->dims[d] + (after[d] < 0 ? after[d] : 0);
+        part[d] = hi > lo ? hi - lo : 0;
+        ox += lo * xs[d];
+        oy += (before[d] > 0 ? before[d] : 0) * ys[d];
+    }
+    copy_strided(c, out_at(c, 0) + (uint64_t)oy * 4u, in_at(c, 0) + (uint64_t)ox * 4u, R, part, xs, ys, 4u, ry,
+                 range_of(c, n->inputs[0]));
+    return true;
+}
+
+/* Gather along an axis by indices of 32 or 64 bits (on the device, uploaded where the host has them). */
+static bool op_gather(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrTensor *x = in[0], *idx = in[1];
+    if (!x || !idx || !out[0] || (idx->dtype != SPINGALETT_DTYPE_INT64 && idx->dtype != SPINGALETT_DTYPE_INT32)) return false;
+    const uint32_t size = esize(x);
+    if (size != 1u && size != 4u && size != 8u) return false;
+    uint32_t axis;
+    if (!axis_in(ir_attr_int(c->n, "axis", 0), x->rank, &axis)) return false;
+    const uint32_t R = x->rank - 1u + idx->rank;
+    if (R > IR_MAX_RANK) return false;
+    int64_t dims[IR_MAX_RANK];
+    uint32_t k = 0;
+    uint64_t inner = 1;
+    for (uint32_t d = 0; d < axis; d++) dims[k++] = x->dims[d];
+    for (uint32_t d = 0; d < idx->rank; d++) dims[k++] = idx->dims[d];
+    for (uint32_t d = axis + 1; d < x->rank; d++) {
+        dims[k++] = x->dims[d];
+        inner *= (uint64_t)x->dims[d];
+    }
+    if (!c->record) return x->count < UINT32_MAX && x->count * idx->count / (x->dims[axis] ? (uint64_t)x->dims[axis] : 1u) <
+                           UINT32_MAX && set_shape(out[0], x->dtype, R, dims);
+    if (!out[0]->count) return true;
+    SpgGatherPush push = {out_at(c, 0), in_at(c, 0), in_at(c, 1), (uint32_t)out[0]->count, (uint32_t)inner,
+                          (uint32_t)idx->count, (uint32_t)x->dims[axis]};
+    const uint32_t spec[2] = {size, type_code(idx->dtype)};
+    Access a = {0};
+    reads(&a, range_of(c, c->n->inputs[0]));
+    reads(&a, range_of(c, c->n->inputs[1]));
+    writes(&a, range_of(c, c->n->outputs[0]));
+    dispatch(c, &a, SPG_KERNEL_ggather, spec, 2, &push, sizeof push, group_count(push.total, 256u), 1, 1);
+    return true;
+}
+
+/* ------------------------------------------------------------------------- products */
+
+/* Whether products multiply in bfloat16 on the matrix units (spingalett_set_gpu_precision()), for a product of this
+   size: those smaller than the units' blocks stay in single precision (as the networks' do). */
+static bool product_bf16(uint32_t M, uint32_t N, uint32_t K) {
+    return spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && K >= 32u && M >= 16u && N >= 16u;
+}
+
+/* Records C = A B through spg_gemm(): z products (A, B and C each z_a, z_b, z_c elements apart: 0 for one shared). */
+static void gemm(GCtx *c, SpgGemmPush *push, uint32_t amode, uint32_t bmode, uint32_t epi, uint32_t act, uint32_t z,
+                 Range ra, Range rb, Range rbias, Range rc) {
+    Access a = {0};
+    reads(&a, ra);
+    reads(&a, rb);
+    reads(&a, rbias);
+    writes(&a, rc);
+    if (epi == SPG_EPI_STORE && push->beta != 0.0f) reads(&a, rc);
+    need(c->r, &a);
+    SpgGemmMode m = {amode, bmode, epi, act, z, false, true, true, 0, (uint64_t)z * push->M * push->N,
+                     product_bf16(push->M, push->N, push->K), 0, false, false};
+    if (push->alpha == 0.0f && epi != SPG_EPI_STORE) push->alpha = 1.0f;
+    spg_gemm(c->r->c, push, &m);
+}
+
+/* The activations of the products' epilogues (ActivationFunction): those the kernels hold. */
+static bool epilogue_act(int64_t act) {
+    return act == SPINGALETT_ACT_NONE || act == SPINGALETT_ACT_RELU || act == SPINGALETT_ACT_LEAKY_RELU ||
+           act == SPINGALETT_ACT_SIGMOID || act == SPINGALETT_ACT_TANH || act == SPINGALETT_ACT_GELU ||
+           act == SPINGALETT_ACT_GELU_TANH || act == SPINGALETT_ACT_SILU;
+}
+
+/* Linear (fusions make it): X (..., K) times W (K x N, or N x K with trans_b), plus a bias, through an activation. */
+static bool op_linear(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *x = in[0], *w = in[1], *bias = n->input_count > 2 ? in[2] : NULL;
+    if (!x || !w || !out[0] || x->dtype != F32 || w->dtype != F32 || w->rank != 2 || !x->rank) return false;
+    const bool trans = ir_attr_int(n, "trans_b", 0) != 0;
+    const int64_t K = trans ? w->dims[1] : w->dims[0], N = trans ? w->dims[0] : w->dims[1];
+    const int64_t act = ir_attr_int(n, "activation", SPINGALETT_ACT_NONE);
+    if (x->dims[x->rank - 1] != K || !epilogue_act(act) || (bias && (bias->dtype != F32 || bias->count != (uint64_t)N)))
+        return false;
+    const uint64_t M = K ? x->count / (uint64_t)K : 0;
+    if (M > UINT32_MAX || N > UINT32_MAX || K > UINT32_MAX || !K) return false;
+    int64_t dims[IR_MAX_RANK];
+    for (uint32_t d = 0; d < x->rank; d++) dims[d] = d + 1 < x->rank ? x->dims[d] : N;
+    if (!c->record) return set_shape(out[0], F32, x->rank, dims);
+    SpgGemmPush push = {
+        .a = in_at(c, 0), .b = in_at(c, 1), .c = out_at(c, 0), .e0 = bias ? in_at(c, 2) : 0,
+        .M = (uint32_t)M, .N = (uint32_t)N, .K = (uint32_t)K, .lda = (uint32_t)K, .ldb = trans ? (uint32_t)K : (uint32_t)N,
+        .ldc = (uint32_t)N, .alpha = 1.0f, .flags = bias ? SPG_GEMM_BIAS : 0u,
+    };
+    const Range none = {0, 0};
+    gemm(c, &push, SPG_A_ROW, trans ? SPG_B_COL : SPG_B_ROW, SPG_EPI_BIAS_ACT, (uint32_t)act, 1,
+         range_of(c, n->inputs[0]), range_of(c, n->inputs[1]), bias ? range_of(c, n->inputs[2]) : none,
+         range_of(c, n->outputs[0]));
+    return true;
+}
+
+/* Gemm: alpha A' B' + beta C, A' and B' A and B or their transposes, C broadcast to the output (a bias of the columns
+   in the product's epilogue; else copied into the output, which the product adds to). */
+static bool op_gemm(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *A = in[0], *B = in[1], *C = n->input_count > 2 ? in[2] : NULL;
+    if (!A || !B || !out[0] || A->dtype != F32 || B->dtype != F32 || A->rank != 2 || B->rank != 2 ||
+        (C && (C->dtype != F32 || C->rank > 2)))
+        return false;
+    const bool ta = ir_attr_int(n, "transA", 0) != 0, tb = ir_attr_int(n, "transB", 0) != 0;
+    const float alpha = ir_attr_float(n, "alpha", 1.0f), beta = ir_attr_float(n, "beta", 1.0f);
+    const int64_t M = ta ? A->dims[1] : A->dims[0], K = ta ? A->dims[0] : A->dims[1];
+    const int64_t N = tb ? B->dims[0] : B->dims[1];
+    if ((tb ? B->dims[1] : B->dims[0]) != K || M > UINT32_MAX || N > UINT32_MAX || K > UINT32_MAX) return false;
+    const int64_t dims[2] = {M, N};
+    IrTensor y;
+    set_shape(&y, F32, 2, dims);
+    if (C) {
+        IrTensor *pair[2] = {&y, (IrTensor *)C};
+        uint32_t R;
+        int64_t bd[IR_MAX_RANK];
+        if (!broadcast(pair, 2, &R, bd) || bd[0] != M || bd[1] != N) return false;
+    }
+    /* a bias of the columns (C of N values, or of one) with beta 1 and alpha 1: the epilogue's */
+    const bool bias = C && beta == 1.0f && alpha == 1.0f && C->count == (uint64_t)N && (C->rank < 2 || C->dims[0] == 1);
+    /* (both transposed: the products have no such mode, A is transposed into scratch memory first) */
+    const bool both = ta && tb;
+    if (!c->record) {
+        if (both) c->scratch = (uint64_t)M * (uint64_t)K * 4u;
+        return set_shape(out[0], F32, 2, dims);
+    }
+    const Range none = {0, 0}, ry = range_of(c, n->outputs[0]);
+    const bool add = C && beta != 0.0f && !bias;
+    if (add) {
+        /* y = C broadcast, which the product adds to */
+        Gew e;
+        IrTensor *const one[1] = {(IrTensor *)C};
+        gew_layout(&e, &y, (const IrTensor *const *)one, 1u);
+        gew_dispatch(c, &e, SPG_GEW_COPY, type_code(F32) << 12 | type_code(F32), out_at(c, 0), in_at(c, 2), 0, 0, ry,
+                     range_of(c, n->inputs[2]), ry, ry);
+    }
+    if (!K) {
+        if (!add && !bias) fill_output(c, 0, ry.hi - ry.lo, 0);
+        if (!bias) return true;
+    }
+    uint64_t a = in_at(c, 0);
+    Range ra = range_of(c, n->inputs[0]);
+    if (both) {
+        const int64_t ad[2] = {M, K}, sx[2] = {1, M}, sy[2] = {K, 1};
+        const Range rs = {c->scratch, c->scratch + (uint64_t)M * (uint64_t)K * 4u};
+        copy_strided(c, c->scratch, a, 2, ad, sx, sy, 4u, rs, ra);
+        a = c->scratch;
+        ra = rs;
+    }
+    SpgGemmPush push = {
+        .a = a, .b = in_at(c, 1), .c = out_at(c, 0), .e0 = bias ? in_at(c, 2) : 0,
+        .M = (uint32_t)M, .N = (uint32_t)N, .K = (uint32_t)K, .lda = ta && !both ? (uint32_t)M : (uint32_t)K,
+        .ldb = tb ? (uint32_t)K : (uint32_t)N, .ldc = (uint32_t)N, .alpha = alpha, .beta = add ? beta : 0.0f,
+        .flags = bias ? SPG_GEMM_BIAS : 0u,
+    };
+    gemm(c, &push, ta && !both ? SPG_A_COL : SPG_A_ROW, tb ? SPG_B_COL : SPG_B_ROW,
+         bias ? SPG_EPI_BIAS_ACT : SPG_EPI_STORE, SPINGALETT_ACT_NONE, 1, ra, range_of(c, n->inputs[1]),
+         bias ? range_of(c, n->inputs[2]) : none, ry);
+    return true;
+}
+
+/* MatMul with numpy's broadcasting of the batches: one product when B has no batch (A's batches its rows), else a
+   product a batch (in the z of one dispatch where each operand's batches are evenly apart, or not there). */
+static bool op_matmul(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *A = in[0], *B = in[1];
+    if (!A || !B || !out[0] || A->dtype != F32 || B->dtype != F32 || !A->rank || !B->rank) return false;
+    /* vectors as matrices of one row (A) or column (B), the axis dropped from the output */
+    const int64_t M = A->rank > 1 ? A->dims[A->rank - 2] : 1, K = A->dims[A->rank - 1];
+    const int64_t KB = B->rank > 1 ? B->dims[B->rank - 2] : B->dims[0], N = B->rank > 1 ? B->dims[B->rank - 1] : 1;
+    if (K != KB || M > UINT32_MAX || N > UINT32_MAX || K > UINT32_MAX) return false;
+    IrTensor ba, bb;
+    memset(&ba, 0, sizeof ba);
+    memset(&bb, 0, sizeof bb);
+    ba.rank = A->rank > 2 ? (uint8_t)(A->rank - 2) : 0;
+    bb.rank = B->rank > 2 ? (uint8_t)(B->rank - 2) : 0;
+    for (uint32_t d = 0; d < ba.rank; d++) ba.dims[d] = A->dims[d];
+    for (uint32_t d = 0; d < bb.rank; d++) bb.dims[d] = B->dims[d];
+    IrTensor *pair[2] = {&ba, &bb};
+    uint32_t R;
+    int64_t bd[IR_MAX_RANK];
+    if (!broadcast(pair, 2, &R, bd)) return false;
+    int64_t dims[IR_MAX_RANK];
+    uint32_t rank = 0;
+    uint64_t batches = 1;
+    for (uint32_t d = 0; d < R; d++) {
+        dims[rank++] = bd[d];
+        batches *= (uint64_t)bd[d];
+    }
+    if (A->rank > 1) dims[rank++] = M;
+    if (B->rank > 1) dims[rank++] = N;
+    if (rank > IR_MAX_RANK) return false;
+    /* each operand's batch strides over the broadcast batches, merged into one where they run evenly */
+    int64_t sa[IR_MAX_RANK], sb[IR_MAX_RANK];
+    for (uint32_t k = 0; k < 2; k++) {
+        const IrTensor *t = k ? &bb : &ba;
+        int64_t *s = k ? sb : sa;
+        broadcast_strides(t, R, bd, s);
+        const int64_t matrix = k ? K * N : M * K;
+        for (uint32_t d = 0; d < R; d++) s[d] *= matrix;
+    }
+    /* the batches as one axis (z) where both operands' strides run evenly through them */
+    bool even = true;
+    for (uint32_t d = 0; d + 1 < R && even; d++) {
+        if (bd[d] == 1) continue;
+        even = sa[d] == sa[d + 1] * bd[d + 1] && sb[d] == sb[d + 1] * bd[d + 1];
+    }
+    if (!c->record) return (even || batches <= 4096u) && set_shape(out[0], F32, rank, dims);
+    const Range none = {0, 0};
+    const Range ra = range_of(c, n->inputs[0]), rb = range_of(c, n->inputs[1]), ry = range_of(c, n->outputs[0]);
+    if (!K) {
+        fill_output(c, 0, ry.hi - ry.lo, 0);
+        return true;
+    }
+    /* B shared by every batch, A's batches contiguous: one product of all of A's rows */
+    bool b_shared = true;
+    for (uint32_t d = 0; d < R; d++) b_shared = b_shared && sb[d] == 0;
+    if (b_shared && even && batches * (uint64_t)M <= UINT32_MAX) {
+        SpgGemmPush push = {.a = in_at(c, 0), .b = in_at(c, 1), .c = out_at(c, 0), .M = (uint32_t)(batches * (uint64_t)M),
+                            .N = (uint32_t)N, .K = (uint32_t)K, .lda = (uint32_t)K, .ldb = (uint32_t)N,
+                            .ldc = (uint32_t)N, .alpha = 1.0f};
+        /* (A's batches broadcast over B's absent ones would repeat rows: not this case, as B has none) */
+        bool a_full = true;
+        for (uint32_t d = 0; d < R; d++) a_full = a_full && (bd[d] == 1 || sa[d] != 0);
+        if (a_full) {
+            gemm(c, &push, SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, SPINGALETT_ACT_NONE, 1, ra, rb, none, ry);
+            return true;
+        }
+    }
+    /* a product a batch: in z where even (its strides those of the innermost batch axis of size above 1), else a
+       dispatch per batch */
+    int64_t za = 0, zb = 0;
+    for (uint32_t d = R; d-- > 0;)
+        if (bd[d] != 1) {
+            za = sa[d];
+            zb = sb[d];
+            break;
+        }
+    const uint64_t per = even ? batches : 1u;
+    for (uint64_t first = 0; first < batches; first += per) {
+        int64_t oa = 0, ob = 0;
+        uint64_t r = first;
+        for (uint32_t d = R; d-- > 0 && !even;) {
+            const int64_t k = (int64_t)(r % (uint64_t)bd[d]);
+            r /= (uint64_t)bd[d];
+            oa += k * sa[d];
+            ob += k * sb[d];
+        }
+        for (uint64_t z0 = 0; z0 < per; z0 += 65535u) {
+            const uint32_t z = (uint32_t)(per - z0 < 65535u ? per - z0 : 65535u);
+            SpgGemmPush push = {
+                .a = in_at(c, 0) + (uint64_t)(oa + (int64_t)z0 * za) * 4u,
+                .b = in_at(c, 1) + (uint64_t)(ob + (int64_t)z0 * zb) * 4u,
+                .c = out_at(c, 0) + (first + z0) * (uint64_t)(M * N) * 4u,
+                .M = (uint32_t)M, .N = (uint32_t)N, .K = (uint32_t)K, .lda = (uint32_t)K, .ldb = (uint32_t)N,
+                .ldc = (uint32_t)N, .a_group = (uint32_t)za, .b_group = (uint32_t)zb, .c_group = (uint32_t)(M * N),
+                .alpha = 1.0f,
+            };
+            gemm(c, &push, SPG_A_ROW, SPG_B_ROW, SPG_EPI_STORE, SPINGALETT_ACT_NONE, z, ra, rb, none, ry);
+        }
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------------- views */
 
 /* Reshape, Flatten, Squeeze, Unsqueeze and Identity of a value on the device: the CPU's kernel gives the shape (its
@@ -723,6 +1414,9 @@ static const GpuOp ops[IR_OP_COUNT] = {
     [IR_LessOrEqual] = op_elementwise, [IR_Greater] = op_elementwise, [IR_GreaterOrEqual] = op_elementwise,
     [IR_And] = op_elementwise, [IR_Or] = op_elementwise, [IR_Xor] = op_elementwise, [IR_Mod] = op_elementwise,
     [IR_Where] = op_elementwise, [IR_Cast] = op_cast, [IR_CastLike] = op_cast, [IR_Clip] = op_clip,
+    [IR_Transpose] = op_transpose, [IR_Slice] = op_slice, [IR_Concat] = op_concat, [IR_Split] = op_split,
+    [IR_Expand] = op_expand, [IR_Tile] = op_tile, [IR_Pad] = op_pad, [IR_Gather] = op_gather,
+    [IR_Linear] = op_linear, [IR_Gemm] = op_gemm, [IR_MatMul] = op_matmul,
 };
 
 /* The operators whose kernels read only their first input's shape: on the host, without its values. */
@@ -817,8 +1511,12 @@ static bool piece_run(SpingalettGraph *g, Plan *p, Piece *pc) {
         const Transfer *t = &pc->ups[k];
         if (t->bytes) memcpy((uint8_t *)pc->staging.mapped + t->stage, g->tensors[t->value].data, t->bytes);
     }
-    if (pc->commands && (!spg_gpu_submit(pc->commands) || !spg_gpu_wait(pc->commands)))
+    if (pc->commands && (!spg_gpu_submit(pc->commands) || !spg_gpu_wait(pc->commands))) {
+        for (uint32_t j = 0; j < pc->node_count; j++)
+            spingalett_log(LOG_DEBUG, "graph on the GPU: the failed piece's node %u: %s '%s'", j,
+                           ir_op_name((IrOp)g->nodes[pc->nodes[j]].op), g->nodes[pc->nodes[j]].name);
         return fail("graph on the GPU: the device failed to run a piece");
+    }
     downloaded(g, p, pc);
     return true;
 }
