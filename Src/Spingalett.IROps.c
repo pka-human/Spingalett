@@ -2530,8 +2530,9 @@ static bool k_cumsum(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
 
 /* Resize: each output axis's taps (input indices and weights) by the mode and the coordinate transformation, as
    onnx.reference computes them; the axes interpolated one inside the other, the last innermost. */
-static bool k_resize(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
-    if (n < 1 || m < 1 || !in[0]) return ir_fail(r, "an input and an output are needed");
+bool ir_resize_taps(IrRun *r, IrTensor *const *in, uint32_t n, IrResizeTaps *plan) {
+    memset(plan, 0, sizeof *plan);
+    if (n < 1 || !in[0]) return ir_fail(r, "an input and an output are needed");
     const IrTensor *X = in[0];
     if (X->dtype != F32 || !X->rank) return ir_fail(r, "an input of %s or no axes", ir_dtype_name(X->dtype));
     const uint32_t R = X->rank;
@@ -2607,7 +2608,11 @@ static bool k_resize(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
     for (uint32_t d = 0; d < R; d++) width[d] = scale[d] * (double)X->dims[d];
     if (ir_attr_int(r->node, "antialias", 0) && taps > 1)
         for (uint32_t d = 0; d < R; d++) if (on[d] && scale[d] < 1.0) return ir_fail(r, "antialiased downsampling");
-    if (!ir_output(r, out[0], F32, R, dims) || !out[0]->count) return r->error[0] ? false : true;
+    for (uint32_t d = 0; d < R; d++) plan->dims[d] = dims[d];
+    plan->extrapolation = extrapolation;
+    uint64_t count = 1;
+    for (uint32_t d = 0; d < R; d++) count *= (uint64_t)dims[d];
+    if (!count) return true;
     for (uint32_t d = 0; d < R; d++) if (!X->dims[d]) return ir_fail(r, "an empty input resized");
     /* the taps: T[d] per output index of axis d (index -1: the extrapolation value) */
     int T[IR_MAX_RANK];
@@ -2621,8 +2626,11 @@ static bool k_resize(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
     int64_t *tidx = (int64_t *)malloc(total * sizeof(int64_t) + 1);
     float *tw = (float *)malloc(total * sizeof(float) + 1);
     if (!tidx || !tw) { free(tidx); free(tw); return ir_fail(r, "out of memory"); }
-    int64_t *ti[IR_MAX_RANK];
-    float *twd[IR_MAX_RANK];
+    plan->index_memory = tidx;
+    plan->weight_memory = tw;
+    int64_t **ti = plan->index;
+    float **twd = plan->weight;
+    for (uint32_t d = 0; d < R; d++) plan->T[d] = T[d];
     size_t at = 0;
     for (uint32_t d = 0; d < R; d++) {
         ti[d] = tidx + at;
@@ -2651,8 +2659,6 @@ static bool k_resize(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
                     continue;
                 }
             } else {
-                free(tidx);
-                free(tw);
                 return ir_fail(r, "the coordinate transformation %s", ctm);
             }
             const double fl = floor(x), ratio = x == fl ? 1.0 : x - fl;
@@ -2691,6 +2697,31 @@ static bool k_resize(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
             }
         }
     }
+    return true;
+}
+
+void ir_resize_free(IrResizeTaps *taps) {
+    free(taps->index_memory);
+    free(taps->weight_memory);
+    taps->index_memory = NULL;
+    taps->weight_memory = NULL;
+}
+
+static bool k_resize(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
+    if (n < 1 || m < 1 || !in[0]) return ir_fail(r, "an input and an output are needed");
+    IrResizeTaps taps;
+    const bool planned = ir_resize_taps(r, in, n, &taps);
+    const IrTensor *X = in[0];
+    const uint32_t R = X->rank;
+    if (!planned || !ir_output(r, out[0], F32, R, taps.dims) || !out[0]->count) {
+        ir_resize_free(&taps);
+        return r->error[0] ? false : true;
+    }
+    const int64_t *dims = taps.dims;
+    const int *T = taps.T;
+    int64_t *const *ti = taps.index;
+    float *const *twd = taps.weight;
+    const float extrapolation = taps.extrapolation;
     int64_t xs[IR_MAX_RANK];
     int64_t st = 1;
     for (uint32_t d = R; d-- > 0;) { xs[d] = st; st *= X->dims[d]; }
@@ -2735,8 +2766,7 @@ static bool k_resize(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
                 if (outside || ti[L][ol * T[L]] < 0) yr[ol] = extrapolation;
         }
     );
-    free(tidx);
-    free(tw);
+    ir_resize_free(&taps);
     return true;
 }
 

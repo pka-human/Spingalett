@@ -215,6 +215,19 @@ typedef struct {
    outputs by ceil_mode for pooling. false with the error set. */
 bool ir_geometry(IrRun *r, const IrTensor *x, const int64_t *kernel, IrGeometry *g, bool ceil_mode);
 
+/* Resize's (and Upsample's) output shape and taps: for every axis d, T[d] taps of each output index (their input
+   indices, -1 for the extrapolation value, and their weights), in memory ir_resize_free() frees. */
+typedef struct {
+    int64_t dims[IR_MAX_RANK];
+    int T[IR_MAX_RANK];
+    int64_t *index[IR_MAX_RANK];
+    float *weight[IR_MAX_RANK];
+    float extrapolation;
+    void *index_memory, *weight_memory;
+} IrResizeTaps;
+bool ir_resize_taps(IrRun *r, IrTensor *const *in, uint32_t n, IrResizeTaps *plan);
+void ir_resize_free(IrResizeTaps *taps);
+
 /* Readers of the sources: a graph from ONNX bytes (dir: the directory of external data files, or NULL), and from a
    `.slett` image of format 11. NULL with the error set. */
 SpingalettGraph *ir_read_onnx(const uint8_t *data, size_t size, const char *dir);

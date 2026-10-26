@@ -41,9 +41,10 @@ typedef void (*SpingalettLogCallback)(SpingalettLogLevel level, const char *mess
 /* Where the library computes. Deployment models (spingalett_model_predict()) run on the CPU: on all its
    threads with SPINGALETT_COMPUTE_OPENMP, on one otherwise; in the full library's GPU modes those of
    float weights (FP32, FP16, BF16) and sessions run on the GPU, and so do integer ones whose every layer the
-   GPU computes as the CPU does (their outputs the CPU's to the bit), the others on all the CPU's threads. The
-   runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs single-threaded, with a warning, as in a full
-   library built without it; nor a GPU. */
+   GPU computes as the CPU does (their outputs the CPU's to the bit), the others on all the CPU's threads. Graphs of
+   operators run on the GPU in its modes, in the full library and in a runtime built with the GPU (its models
+   then on all the CPU's threads). The runtime has no OpenBLAS: there SPINGALETT_COMPUTE_OPENBLAS runs
+   single-threaded, with a warning, as in a full library built without it. */
 typedef enum {
     SPINGALETT_COMPUTE_SINGLE_THREADED,
     SPINGALETT_COMPUTE_OPENMP,
@@ -90,6 +91,33 @@ SPINGALETT_API bool spingalett_set_compute_mode(SpingalettComputeMode mode);
 /* Threads of SPINGALETT_COMPUTE_OPENMP; 0, the default, leaves OpenMP's (one per core). */
 SPINGALETT_API unsigned spingalett_get_num_threads(void);
 SPINGALETT_API void spingalett_set_num_threads(unsigned n);
+
+/* The name of the GPU that SPINGALETT_COMPUTE_VULKAN uses (opening the device on first call), or NULL when the
+   library was built without the Vulkan backend or no device is usable: Vulkan 1.2 with buffer device
+   addresses. The first discrete GPU is chosen, else an integrated one; the environment variable
+   SPINGALETT_GPU_DEVICE picks one by its index in the Vulkan device list. */
+SPINGALETT_API const char *spingalett_gpu_device(void);
+/* The name of the GPU that SPINGALETT_COMPUTE_CUDA uses (opening it on first call), or NULL when the library
+   was built without the CUDA backend or no device is usable: an NVIDIA GPU of compute capability 8.0 or
+   later (Ampere and newer) with a driver of CUDA 11.0 or later, which the library opens at run time.
+   SPINGALETT_CUDA_DEVICE picks one by its index in the driver's list. Networks and data sets on the GPU
+   stay on the backend they were made on: a data set made under SPINGALETT_COMPUTE_VULKAN is copied
+   through the host to train a network on CUDA, and the other way. */
+SPINGALETT_API const char *spingalett_cuda_device(void);
+/* Precision of the GPU's matrix products: SPINGALETT_PRECISION_FLOAT32 (the default: single precision, as on
+   the CPU) or SPINGALETT_PRECISION_BFLOAT16 (the operands rounded to bfloat16, which keeps 8 bits of mantissa, and
+   multiplied on the GPU's matrix units with the products added in single precision: faster; the
+   layers' outputs but the output layer's, the network's inputs among them, and their gradients are
+   kept in memory as bfloat16, the passes between products compute in single precision, and the
+   parameters, their gradients and the optimizer stay in single precision, as with PyTorch's
+   autocast). Devices without bfloat16
+   cooperative matrices keep single precision. Applies from the next spingalett_train(), spingalett_predict() or
+   spingalett_evaluate() call, or the next trainer; results stay deterministic. Returns whether the GPU
+   of the compute mode (SPINGALETT_COMPUTE_CUDA's, else SPINGALETT_COMPUTE_VULKAN's) multiplies in that
+   precision (false without a device, or for bfloat16 without its matrix units); other values are
+   ignored and return false. Graphs of operators multiply in it too, from their next run. */
+SPINGALETT_API bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
+SPINGALETT_API SpingalettPrecisionMode spingalett_get_gpu_precision(void);
 
 /* Messages go to the callback, or to stdout (stderr from SPINGALETT_LOG_WARNING on) without one;
    those below the level are dropped. */

@@ -385,6 +385,34 @@ static void graphs(const char *data_dir) {
         CHECK(!memcmp(outputs[1].data, want_k, rows * 8u), "the argmax");
         memcpy(first, outputs[0].data, rows * 3 * sizeof(float));
     }
+    /* on the GPUs the runtime has (every node its kernels take there with SPINGALETT_GRAPH_GPU_MIN=0, as ctest
+       runs this): the CPU's results up to rounding, the same bits run after run */
+    for (int backend = 0; backend < 2 && ok; backend++) {
+        const SpingalettComputeMode mode = backend ? SPINGALETT_COMPUTE_CUDA : SPINGALETT_COMPUTE_VULKAN;
+        const char *device = backend ? spingalett_cuda_device() : spingalett_gpu_device();
+        if (!device) continue;
+        const SpingalettComputeMode before = spingalett_get_compute_mode();
+        spingalett_set_compute_mode(mode);
+        SpingalettTensor y[2], z[2];
+        memset(y, 0, sizeof y);
+        memset(z, 0, sizeof z);
+        bool ran = spingalett_graph_run(.graph = g, .inputs = &input, .input_count = 1, .outputs = y, .output_count = 2);
+        float on_gpu[64];
+        if (ran) memcpy(on_gpu, y[0].data, rows * 3 * sizeof(float));
+        ran = ran && spingalett_graph_run(.graph = g, .inputs = &input, .input_count = 1, .outputs = z, .output_count = 2);
+        spingalett_set_compute_mode(before);
+        CHECK(ran, "run on %s: %s", device, spingalett_last_error_message());
+        if (!ran) continue;
+        float worst = 0.0f;
+        for (uint32_t i = 0; i < rows * 3; i++) {
+            const float d = fabsf(on_gpu[i] - first[i]);
+            if (d > worst) worst = d;
+        }
+        CHECK(worst < 1e-5f && !memcmp(y[1].data, want_k, rows * 8u), "on %s: the softmax %g from the CPU's, the argmax",
+              device, worst);
+        CHECK(!memcmp(z[0].data, on_gpu, rows * 3 * sizeof(float)), "on %s: other bits when run again", device);
+        printf("  on %s\n", device);
+    }
     /* through a file of format 11 */
     snprintf(saved, sizeof saved, "%s", "graph_small_saved.slett");
     CHECK(spingalett_graph_save(g, saved), "save: %s", spingalett_last_error_message());

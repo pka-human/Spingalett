@@ -349,6 +349,17 @@ typedef struct {
 #define SPG_GPOOL_LP      2u
 #define SPG_GPOOL_INCLUDE 4u        /* AveragePool: padding counted (count_include_pad) */
 
+/* gresize.comp: Resize of graphs through the taps of ir_resize_taps(): output value i at (o0, o1, o2, o3) (four axes,
+   sizes 1 before fewer) is the sum over every axis d's T[d] taps of the product of their weights times the input at
+   their indices (an index below 0: the extrapolation value); the taps a pair (index, weight bits) each, axis d's from
+   pair at[d] on, T[d] an output index. */
+typedef struct {
+    uint64_t x, y, taps;
+    uint32_t total, pad;
+    uint32_t dims[4], xs[4], T[4], at[4];
+    float extrapolation, pad2;
+} SpgResizePush;
+
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
 #define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */
 

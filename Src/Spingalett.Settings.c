@@ -5,6 +5,9 @@
 
 #include "Spingalett.Private.h"
 #include "Spingalett.Gpu.h"
+#if defined(SPINGALETT_HAS_VULKAN) || defined(SPINGALETT_HAS_CUDA)
+#include "Spingalett.Device.h"
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -19,9 +22,7 @@
 #endif
 
 static _Atomic ComputeMode s_compute_mode = COMPUTE_SINGLE_THREADED;
-#if !defined(SPINGALETT_RUNTIME)
 static _Atomic PrecisionMode s_gpu_precision = PRECISION_FLOAT32;
-#endif
 static _Atomic unsigned s_num_threads = 0;
 
 static _Atomic LogLevel s_log_level = LOG_INFO;
@@ -169,9 +170,30 @@ ComputeMode resolve_compute_mode(void) {
     }
 }
 
-/* The GPU: the full library's (the runtime computes on the CPU, and COMPUTE_VULKAN gives its models the
-   CPU's threads, as in the full library). */
-#if !defined(SPINGALETT_RUNTIME)
+/* The GPU: COMPUTE_CUDA's and COMPUTE_VULKAN's backends where the library has them (the full library, and the
+   runtime built with SPINGALETT_RUNTIME_GPU, whose models compute on the CPU's threads in those modes). */
+#if defined(SPINGALETT_HAS_VULKAN) || defined(SPINGALETT_HAS_CUDA)
+bool spingalett_gpu_select(ComputeMode mode) {
+    const SpgBackend backend = mode == COMPUTE_CUDA ? SPG_BACKEND_CUDA : SPG_BACKEND_VULKAN;
+    spg_gpu_use(backend);
+    return spg_gpu_built(backend) && spg_gpu_open();
+}
+
+const char *spingalett_gpu_name_of(ComputeMode mode) {
+    const SpgBackend saved = spg_gpu_using();
+    const char *name = spingalett_gpu_select(mode) ? spg_gpu_device_name() : NULL;
+    spg_gpu_use(saved);
+    return name;
+}
+
+bool spingalett_gpu_bf16_of(ComputeMode mode) {
+    const SpgBackend saved = spg_gpu_using();
+    const bool bf16 = spingalett_gpu_select(mode) && spg_gpu_mma_bf16();
+    spg_gpu_use(saved);
+    return bf16;
+}
+#endif
+
 bool spingalett_use_gpu(void) {
     const ComputeMode mode = spingalett_get_compute_mode();
     if (mode != COMPUTE_VULKAN && mode != COMPUTE_CUDA) return false;
@@ -219,4 +241,3 @@ bool spingalett_set_gpu_precision(PrecisionMode precision) {
 PrecisionMode spingalett_get_gpu_precision(void) {
     return atomic_load(&s_gpu_precision);
 }
-#endif

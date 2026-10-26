@@ -11,6 +11,8 @@
  *   --dim name=size                                 the size of a symbol of the inputs' shapes (1 when not given)
  *   --runs N                                        runs to time (5 by default; the median is printed)
  *   --threads N                                     at most N threads (all cores by default)
+ *   --cuda, --vulkan                                on the GPU, through CUDA or Vulkan (the CPU without one)
+ *   --bf16                                          the GPU's products in bfloat16 on its matrix units
  *   --save model.slett                              writes the graph as a .slett file of format 11
  *
  * Inputs are filled with values from a fixed generator: floats in [-1, 1), integers in [0, 100) (token ids and
@@ -80,6 +82,8 @@ int main(int argc, char **argv) {
     const char *dim_names[16];
     long long dim_sizes[16];
     int dims = 0, runs = 5;
+    SpingalettComputeMode mode = COMPUTE_OPENMP;
+    int bf16 = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dim") && i + 1 < argc && dims < 16) {
             char *eq = strchr(argv[++i], '=');
@@ -91,6 +95,12 @@ int main(int argc, char **argv) {
             runs = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             spingalett_set_num_threads((unsigned)atoi(argv[++i]));
+        } else if (!strcmp(argv[i], "--cuda")) {
+            mode = COMPUTE_CUDA;
+        } else if (!strcmp(argv[i], "--vulkan")) {
+            mode = COMPUTE_VULKAN;
+        } else if (!strcmp(argv[i], "--bf16")) {
+            bf16 = 1;
         } else if (!strcmp(argv[i], "--save") && i + 1 < argc) {
             save = argv[++i];
         } else if (!path) {
@@ -102,10 +112,15 @@ int main(int argc, char **argv) {
     }
     if (!path || runs < 1) {
         fprintf(stderr, "usage: RunGraph <model.onnx|model.slett> [--dim name=size] [--runs N] [--threads N] "
-                        "[--save model.slett]\n");
+                        "[--cuda | --vulkan] [--bf16] [--save model.slett]\n");
         return 2;
     }
-    spingalett_set_compute_mode(COMPUTE_OPENMP);
+    spingalett_set_compute_mode(mode);
+    if (mode != COMPUTE_OPENMP) {
+        const char *device = mode == COMPUTE_CUDA ? spingalett_cuda_device() : spingalett_gpu_device();
+        printf("GPU: %s\n", device ? device : "none (the CPU runs the graph)");
+        if (bf16 && !spingalett_set_gpu_precision(PRECISION_BFLOAT16)) printf("no bfloat16 on its matrix units\n");
+    }
     double t = now();
     SpingalettGraph *g = spingalett_graph_open(.path = path);
     if (!g) return fail(path);
@@ -184,7 +199,9 @@ int main(int argc, char **argv) {
         times[r] = now() - t;
     }
     qsort(times, (size_t)runs, sizeof(double), compare_doubles);
-    printf("run: %.2f ms (median of %d, %u threads)\n", times[runs / 2] * 1e3, runs, spingalett_get_num_threads());
+    if (mode == COMPUTE_OPENMP) printf("run: %.2f ms (median of %d, %u threads)\n", times[runs / 2] * 1e3, runs,
+                                       spingalett_get_num_threads());
+    else printf("run: %.2f ms (median of %d)\n", times[runs / 2] * 1e3, runs);
     if (save) {
         if (!spingalett_graph_save(g, save)) return fail(save);
         printf("saved %s\n", save);

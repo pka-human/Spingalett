@@ -38,6 +38,7 @@ SPG_CUDA_UNIT(gattn_d32, gattn, "-DD=32u")  /* FusedAttention: heads of up to 32
 SPG_CUDA_UNIT(gattn_d64, gattn, "-DD=64u")
 SPG_CUDA_UNIT(gattn_d128, gattn, "-DD=128u")
 SPG_CUDA_UNIT(gpool, gpool, "")             /* MaxPool, AveragePool and LpPool */
+SPG_CUDA_UNIT(gresize, gresize, "")         /* Resize */
 SPG_CUDA_UNIT(iquant, iquant, "")           /* integer models: their activations quantized, */
 SPG_CUDA_UNIT(ipass, ipass, "")             /* their other passes */
 /* integer models' linear layers in sessions: products of a few rows with their codes widened in registers, a unit of

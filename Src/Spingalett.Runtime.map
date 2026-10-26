@@ -13,8 +13,10 @@ SPINGALETT_1.0 {
         spingalett_clear_error;
         spingalett_cpu_kernels;
         spingalett_get_compute_mode;
+        spingalett_get_gpu_precision;
         spingalett_get_num_threads;
         spingalett_get_verbose;
+        spingalett_gpu_device;
         spingalett_last_error_code;
         spingalett_last_error_message;
         spingalett_model_evaluate;
@@ -26,6 +28,7 @@ SPINGALETT_1.0 {
         spingalett_model_predict;
         spingalett_model_run;
         spingalett_set_compute_mode;
+        spingalett_set_gpu_precision;
         spingalett_set_log_callback;
         spingalett_set_log_level;
         spingalett_set_num_threads;
@@ -35,8 +38,10 @@ SPINGALETT_1.0 {
         *;
 };
 
-/* the full library's versions that add no function of the runtime, so that its versions descend alike */
+/* the full library's versions (those that add no function of the runtime too, so that its versions descend alike) */
 SPINGALETT_1.1 {
+    global:
+        spingalett_cuda_device;
 } SPINGALETT_1.0;
 
 SPINGALETT_1.2 {

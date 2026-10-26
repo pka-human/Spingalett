@@ -30,7 +30,7 @@ endif()
 # The libraries: the full one, and the runtime next to it or alone (cmake/Runtime.cmake)
 # ------------------------------------------------------------------------------
 option(SPINGALETT_RUNTIME "Build the runtime library (deployment models, without training) next to the library" ON)
-option(SPINGALETT_RUNTIME_ONLY "Build only the runtime library: deployment models on the CPU, no training, importers or GPU backend" OFF)
+option(SPINGALETT_RUNTIME_ONLY "Build only the runtime library: deployment models on the CPU and graphs of operators, no training or importers" OFF)
 
 # Feature flags (populated below, used for config header)
 set(SPINGALETT_HAS_OPENMP OFF)
@@ -325,6 +325,11 @@ if(SPINGALETT_RUNTIME OR SPINGALETT_RUNTIME_ONLY)
     spingalett_runtime_library()
 endif()
 if(SPINGALETT_RUNTIME_ONLY)
+    if(SPINGALETT_RUNTIME_GPU)
+        include(cmake/Vulkan.cmake)
+        include(cmake/Cuda.cmake)
+        spingalett_runtime_gpu()
+    endif()
     spingalett_write_config()
     option(BUILD_EXAMPLE "Build examples" ON)
     option(BUILD_TESTS "Build the test suite" ON)
@@ -408,6 +413,7 @@ endif()
 # GPU backend (Vulkan compute)
 # ------------------------------------------------------------------------------
 include(cmake/Gpu.cmake)
+spingalett_runtime_gpu()
 
 spingalett_write_config()
 
