@@ -205,6 +205,16 @@ bool ir_run_node(SpingalettGraph *g, uint32_t index, IrTensor *tensors, bool par
 /* A constant's tensor: a view of its values. */
 IrTensor ir_const_tensor(const IrValue *v);
 
+/* The windows of a convolution or pooling over one to three spatial axes (as three, the first ones of size 1 for
+   fewer): sizes, kernel, strides, padding at the start and end, dilations, outputs. */
+typedef struct {
+    uint32_t spatial;               /* the input's spatial axes */
+    int64_t in[3], k[3], s[3], pb[3], pe[3], dil[3], out[3];
+} IrGeometry;
+/* The windows of node r->node over x (kernel_shape, or the weights' given), its strides, dilations, pads or auto_pad;
+   outputs by ceil_mode for pooling. false with the error set. */
+bool ir_geometry(IrRun *r, const IrTensor *x, const int64_t *kernel, IrGeometry *g, bool ceil_mode);
+
 /* Readers of the sources: a graph from ONNX bytes (dir: the directory of external data files, or NULL), and from a
    `.slett` image of format 11. NULL with the error set. */
 SpingalettGraph *ir_read_onnx(const uint8_t *data, size_t size, const char *dir);

@@ -450,7 +450,8 @@ static bool vkb_host_writes(void) {
 
 /* (a build whose glslc could not compile a kernel holds an empty module for it) */
 static bool vkb_kernel_built(SpgKernel kernel) {
-    if ((kernel == SPG_KERNEL_gew || kernel == SPG_KERNEL_gcopy || kernel == SPG_KERNEL_ggather) && !gpu.storage8)
+    if ((kernel == SPG_KERNEL_gew || kernel == SPG_KERNEL_gcopy || kernel == SPG_KERNEL_ggather ||
+         kernel == SPG_KERNEL_gattn) && !gpu.storage8)
         return false;               /* (they declare 8-bit storage) */
     return vkb_open() && kernel < SPG_KERNEL_COUNT && spg_kernel_spirv_size[kernel] > 20u;
 }

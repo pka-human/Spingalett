@@ -293,6 +293,62 @@ typedef struct {
     uint32_t total, inner, count, axis;
 } SpgGatherPush;
 
+/* grow.comp: operators of graphs over rows: row q of outer x inner (o = q / inner, i = q % inner) holds the len values
+   x[(o len + l) inner + i]; TPR threads take a row (1 where inner is above 1: neighbouring threads then read
+   neighbouring rows), each its values l = lane, lane + TPR, ... in order, their partial results combined in a fixed
+   tree. Reductions write a value a row to y (ArgMax and ArgMin an int64), the others a row of len values (LayerNorm
+   with its means and inverse deviations at aux, rows each). Spec: OP (SPG_ROW_*), TPR. */
+typedef struct {
+    uint64_t x, y, a, b, aux;
+    uint32_t outer, len, inner, rows;
+    uint32_t groups, cpg, pix, flags;       /* GroupNorm: groups, channels a group, values a channel */
+    float eps, pad;
+} SpgRowPush;
+enum {
+    SPG_ROW_SUM, SPG_ROW_MEAN, SPG_ROW_MAX, SPG_ROW_MIN, SPG_ROW_PROD, SPG_ROW_L1, SPG_ROW_L2, SPG_ROW_SUMSQ,
+    SPG_ROW_LOGSUMEXP, SPG_ROW_LOGSUM, SPG_ROW_ARGMAX, SPG_ROW_ARGMIN,
+    SPG_ROW_SOFTMAX = 16, SPG_ROW_LOGSOFTMAX, SPG_ROW_HARDMAX, SPG_ROW_LAYERNORM, SPG_ROW_RMSNORM, SPG_ROW_GROUPNORM
+};
+#define SPG_ROW_LAST     1u         /* ArgMax, ArgMin: the last of equal values */
+#define SPG_ROW_A_ONE    2u         /* LayerNorm, RMSNorm: one scale for every column (else a column each) */
+#define SPG_ROW_B        4u         /* LayerNorm: a bias (b), like the scale */
+#define SPG_ROW_B_ONE    8u
+#define SPG_ROW_STATS    16u        /* LayerNorm: the means and inverse deviations at aux */
+#define SPG_ROW_BY_GROUP 32u        /* GroupNorm: the scale and bias a group (opset 18), else a channel */
+
+/* gattn.comp: FusedAttention of graphs, softmax(Where(keep, scale Q K^T, fill) + mask) V in blocks of SPG_GATTN_ROWS
+   queries of a batch and head (block_y: batch heads + head), over tiles of keys, the softmax online. Q, K, V and Y are
+   rows of d values (a unit's head size D at most), their batches, heads and rows strides[] apart (elements: queries
+   0..2, keys 3..5, values 6..8, outputs 9..11); the mask (floats added, or booleans that leave keys out) and keep
+   (booleans: Where's condition) strides 12..15 and 16..19 over batch, head, query and key (0 where they broadcast),
+   a key's values strides[20] apart (K^T's columns, else 1). A row of no key gives zeros with SAFE, else NaN. Spec: none (a unit per D: gattn_d32, _d64, _d128). */
+typedef struct {
+    uint64_t q, k, v, y, mask, keep, strides;
+    uint32_t queries, keys, d, heads;
+    float scale, fill;
+    uint32_t flags, pad;
+} SpgGattnPush;
+#define SPG_GATTN_ROWS 64u
+#define SPG_GATTN_THREADS 128u
+#define SPG_GATTN_MASK  1u          /* floats added to the scores */
+#define SPG_GATTN_BOOL  2u          /* booleans: false leaves a key out */
+#define SPG_GATTN_KEEP  4u
+#define SPG_GATTN_SAFE  8u
+#define SPG_GATTN_VEC   16u         /* heads of exactly D values, rows and addresses in fours: loads of four */
+
+/* gpool.comp: MaxPool, AveragePool and LpPool of graphs over channels-first maps of up to three spatial axes (as three,
+   the first of size 1 for fewer): output value (row, o0, o1, o2) of rows (batch x channels) maps from its window. */
+typedef struct {
+    uint64_t x, y;
+    uint32_t rows, total;
+    uint32_t in[3], out[3], k[3], s[3], pb[3], pe[3], dil[3];
+    uint32_t flags;
+    float p;
+} SpgPoolGPush;
+#define SPG_GPOOL_MAX     1u
+#define SPG_GPOOL_LP      2u
+#define SPG_GPOOL_INCLUDE 4u        /* AveragePool: padding counted (count_include_pad) */
+
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
 #define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */
 

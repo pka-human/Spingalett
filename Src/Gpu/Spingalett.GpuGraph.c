@@ -32,6 +32,7 @@
 #include "Spingalett.GpuKernels.h"
 #include "Spingalett.Recorder.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -72,6 +73,9 @@ typedef struct {
     uint32_t node_count, node_cap;
     Span *free;                     /* its free memory, while planning */
     uint32_t free_count, free_cap;
+    SpgGpuBuffer params;            /* its nodes' parameter blocks (strides and the like, written when recorded) */
+    uint8_t *param_bytes;           /* (while recorded) */
+    uint64_t params_size, params_used;
 } Piece;
 
 typedef struct {
@@ -108,6 +112,7 @@ typedef struct {
     SpgBackend backend;
     Plan *plans[PLANS];
     SpgGpuBuffer *consts;           /* [value_count]: constants on the device (buffer NULL: not there) */
+    SpgGpuBuffer *prepared;         /* [node_count]: what a node's kernels made of its constants, once */
     SpgGpuArena **arenas;           /* their memory */
     uint32_t arena_count, arena_cap;
     uint64_t runs;
@@ -123,8 +128,11 @@ typedef struct {
     bool record;
     Recorder *r;
     uint32_t params;                /* planning: inputs read on the host (bits) */
+    uint32_t replaced;              /* planning: constant inputs the node reads as prepared() made them (bits) */
     uint32_t views;                 /* planning: outputs that are views of input 0 (bits) */
     uint64_t scratch;               /* planning: bytes asked for; recording: their address */
+    uint64_t param;                 /* planning: bytes of parameter blocks asked for (param_put()) */
+    Piece *piece;                   /* recording: the piece */
 } GCtx;
 
 /* A device node: planning (c->record false) checks that the kernels take it (false: the host runs it) and sets its
@@ -235,6 +243,8 @@ static void plan_free(Plan *p) {
         if (pc->commands) spg_gpu_commands_free(pc->commands);
         spg_gpu_buffer_free(&pc->memory);
         spg_gpu_buffer_free(&pc->staging);
+        spg_gpu_buffer_free(&pc->params);
+        free(pc->param_bytes);
         free(pc->ups);
         free(pc->downs);
         free(pc->nodes);
@@ -384,6 +394,49 @@ static bool set_shape(IrTensor *t, uint8_t dtype, uint32_t rank, const int64_t *
     t->staged = false;
     t->constant = false;
     return true;
+}
+
+/* What the node's kernels read in place of constant input i: `bytes` that fill() writes from the constant's values,
+   made once a graph and node (while the node is planned, on the device then); its address (0 when it could not be
+   made: memory ran out). The constant itself is not uploaded for the node. */
+static uint64_t prepared(GCtx *c, uint32_t i, uint64_t bytes, void (*fill)(void *dst, const IrTensor *src, const void *arg),
+                         const void *arg) {
+    GpuGraph *gg = c->gg;
+    SpgGpuBuffer *b = &gg->prepared[c->k];
+    if (!c->record && !b->buffer) {
+        SpgGpuBuffer stage;
+        if (!spg_gpu_buffer_create(&stage, bytes, true)) return 0;
+        fill(stage.mapped, &c->g->tensors[c->n->inputs[i]], arg);
+        SpgGpuCommands *cmd = NULL;
+        bool ok = spg_gpu_buffer_create(b, bytes, false);
+        if (ok) {
+            cmd = spg_gpu_commands_create();
+            ok = cmd && spg_gpu_record_begin(cmd);
+        }
+        if (ok) spg_gpu_copy(cmd, &stage, 0, b, 0, bytes);
+        ok = ok && spg_gpu_record_end(cmd) && spg_gpu_submit(cmd) && spg_gpu_wait(cmd);
+        if (cmd) spg_gpu_commands_free(cmd);
+        spg_gpu_buffer_free(&stage);
+        if (!ok) {
+            spg_gpu_buffer_free(b);
+            return 0;
+        }
+    }
+    if (!c->record) c->replaced |= 1u << i;
+    return b->address;
+}
+
+/* A block of parameters for a kernel: asked for while planned (bytes), written while recorded: its device address. */
+static uint64_t param_put(GCtx *c, const void *data, uint32_t bytes) {
+    if (!c->record) {
+        c->param += (bytes + 15u) & ~15u;
+        return 0;
+    }
+    Piece *pc = c->piece;
+    const uint64_t at = pc->params_used;
+    memcpy(pc->param_bytes + at, data, bytes);
+    pc->params_used += (bytes + 15u) & ~15u;
+    return pc->params.address + at;
 }
 
 /* Records a kernel after the barrier its reads and writes need. */
@@ -1148,6 +1201,511 @@ static bool op_gather(GCtx *c, IrTensor *const *in, IrTensor **out) {
     return true;
 }
 
+/* ------------------------------------------------------------------------- rows: reductions, softmax, normalizations */
+
+/* Records a grow dispatch over push's rows (outer x inner of len values): threads a row by their length (one where
+   the rows interleave: inner above 1). */
+static void row_dispatch(GCtx *c, SpgRowPush *push, uint32_t op, Range rx, Range ry, Range ra, Range rb, Range raux) {
+    uint32_t tpr = 1;
+    if (push->inner == 1u)
+        while (tpr < 256u && 4u * tpr * 2u <= push->len) tpr *= 2u;
+    push->rows = push->outer * push->inner;
+    /* (addresses lavapipe may load from whatever the branches: x's where there is nothing) */
+    if (!push->a) push->a = push->x;
+    if (!push->b) push->b = push->a;
+    if (!push->aux) push->aux = push->y;
+    Access a = {0};
+    reads(&a, rx);
+    reads(&a, ra);
+    reads(&a, rb);
+    writes(&a, ry);
+    writes(&a, raux);
+    const uint32_t spec[2] = {op, tpr};
+    dispatch(c, &a, SPG_KERNEL_grow, spec, 2, push, sizeof *push, group_count(push->rows, 256u / tpr), 1, 1);
+}
+
+/* The rows of a tensor over axes [first, end): outer x len x inner; false past 32 bits. */
+static bool rows_over(const IrTensor *x, uint32_t first, uint32_t end, SpgRowPush *push) {
+    uint64_t outer = 1, len = 1, inner = 1;
+    for (uint32_t d = 0; d < x->rank; d++) {
+        if (d < first) outer *= (uint64_t)x->dims[d];
+        else if (d < end) len *= (uint64_t)x->dims[d];
+        else inner *= (uint64_t)x->dims[d];
+    }
+    if (x->count >= UINT32_MAX || outer * inner >= UINT32_MAX) return false;
+    memset(push, 0, sizeof *push);
+    push->outer = (uint32_t)outer;
+    push->len = (uint32_t)len;
+    push->inner = (uint32_t)inner;
+    return true;
+}
+
+static uint32_t reduce_code(IrOp op) {
+    switch (op) {
+        case IR_ReduceSum: return SPG_ROW_SUM;
+        case IR_ReduceMean: return SPG_ROW_MEAN;
+        case IR_ReduceMax: return SPG_ROW_MAX;
+        case IR_ReduceMin: return SPG_ROW_MIN;
+        case IR_ReduceProd: return SPG_ROW_PROD;
+        case IR_ReduceL1: return SPG_ROW_L1;
+        case IR_ReduceL2: return SPG_ROW_L2;
+        case IR_ReduceSumSquare: return SPG_ROW_SUMSQ;
+        case IR_ReduceLogSumExp: return SPG_ROW_LOGSUMEXP;
+        case IR_ReduceLogSum: return SPG_ROW_LOGSUM;
+        default: return NONE;
+    }
+}
+
+/* The Reduce operators of floats over axes that are one block (the others by the host). */
+static bool op_reduce(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *x = in[0];
+    const uint32_t code = reduce_code((IrOp)n->op);
+    if (!x || !out[0] || x->dtype != F32 || code == NONE) return false;
+    int64_t axes[IR_MAX_RANK];
+    const int64_t na = ints_of(c, in, n->input_count > 1 ? 1u : 99u, "axes", axes, IR_MAX_RANK);
+    if (na == -2 || (na <= 0 && ir_attr_int(n, "noop_with_empty_axes", 0))) return false;
+    const bool keep = ir_attr_int(n, "keepdims", 1) != 0;
+    bool red[IR_MAX_RANK] = {false};
+    for (uint32_t d = 0; d < x->rank; d++) red[d] = na <= 0;
+    for (int64_t k = 0; k < na; k++) {
+        uint32_t a;
+        if (!axis_in(axes[k], x->rank, &a)) return false;
+        red[a] = true;
+    }
+    uint32_t first = x->rank, end = 0;
+    for (uint32_t d = 0; d < x->rank; d++)
+        if (red[d]) {
+            if (d < first) first = d;
+            end = d + 1;
+        }
+    if (first == x->rank) first = end = 0;
+    for (uint32_t d = first; d < end; d++)
+        if (!red[d] && x->dims[d] != 1) return false;
+    int64_t dims[IR_MAX_RANK];
+    uint32_t rank = 0;
+    for (uint32_t d = 0; d < x->rank; d++)
+        if (!red[d]) dims[rank++] = x->dims[d];
+        else if (keep) dims[rank++] = 1;
+    SpgRowPush push;
+    if (!rows_over(x, first, end, &push)) return false;
+    if (!c->record) return set_shape(out[0], F32, rank, dims);
+    push.x = in_at(c, 0);
+    push.y = out_at(c, 0);
+    const Range none = {0, 0};
+    row_dispatch(c, &push, code, range_of(c, n->inputs[0]), range_of(c, n->outputs[0]), none, none, none);
+    return true;
+}
+
+static bool op_arg(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *x = in[0];
+    if (!x || !out[0] || x->dtype != F32) return false;
+    uint32_t axis;
+    if (!axis_in(ir_attr_int(n, "axis", 0), x->rank, &axis) || !x->dims[axis]) return false;
+    const bool keep = ir_attr_int(n, "keepdims", 1) != 0, last = ir_attr_int(n, "select_last_index", 0) != 0;
+    int64_t dims[IR_MAX_RANK];
+    uint32_t rank = 0;
+    for (uint32_t d = 0; d < x->rank; d++)
+        if (d != axis || keep) dims[rank++] = d == axis ? 1 : x->dims[d];
+    SpgRowPush push;
+    if (!rows_over(x, axis, axis + 1, &push) || x->dims[axis] >= (1 << 24)) return false;
+    if (!c->record) return set_shape(out[0], SPINGALETT_DTYPE_INT64, rank, dims);
+    push.x = in_at(c, 0);
+    push.y = out_at(c, 0);
+    push.flags = last ? SPG_ROW_LAST : 0u;
+    const Range none = {0, 0};
+    row_dispatch(c, &push, n->op == IR_ArgMax ? SPG_ROW_ARGMAX : SPG_ROW_ARGMIN, range_of(c, n->inputs[0]),
+                 range_of(c, n->outputs[0]), none, none, none);
+    return true;
+}
+
+/* Softmax, LogSoftmax and Hardmax over an axis (before opset 13: over the axes from it on). */
+static bool op_softmax(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *x = in[0];
+    if (!x || !out[0] || x->dtype != F32) return false;
+    const bool old = c->g->opset < 13;
+    uint32_t axis;
+    if (!axis_in(ir_attr_int(n, "axis", old ? 1 : -1), x->rank ? x->rank : 1u, &axis)) return false;
+    SpgRowPush push;
+    if (!rows_over(x, axis, old ? x->rank : axis + 1, &push)) return false;
+    if (!c->record) return set_shape(out[0], F32, x->rank, x->dims);
+    if (!x->count) return true;
+    push.x = in_at(c, 0);
+    push.y = out_at(c, 0);
+    const Range none = {0, 0};
+    row_dispatch(c, &push, n->op == IR_LogSoftmax ? SPG_ROW_LOGSOFTMAX : n->op == IR_Hardmax ? SPG_ROW_HARDMAX
+                 : SPG_ROW_SOFTMAX, range_of(c, n->inputs[0]), range_of(c, n->outputs[0]), none, none, none);
+    return true;
+}
+
+/* LayerNormalization and RMSNormalization over the axes from `axis` on, a scale (and bias) of each of those values
+   or one for all; LayerNormalization's means and inverse deviations not asked for. */
+static bool op_layernorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const bool rms = n->op == IR_RMSNormalization;
+    const IrTensor *x = in[0], *sc = n->input_count > 1 ? in[1] : NULL, *bias = !rms && n->input_count > 2 ? in[2] : NULL;
+    if (!x || !sc || !out[0] || x->dtype != F32 || sc->dtype != F32 || (bias && bias->dtype != F32)) return false;
+    for (uint32_t o = 1; o < n->output_count; o++)
+        if (n->outputs[o] != NONE && (c->g->values[n->outputs[o]].last >= 0)) return false;
+    uint32_t axis;
+    if (!axis_in(ir_attr_int(n, "axis", -1), x->rank, &axis)) return false;
+    SpgRowPush push;
+    if (!rows_over(x, axis, x->rank, &push)) return false;
+    if ((sc->count != push.len && sc->count != 1) || (bias && bias->count != push.len && bias->count != 1)) return false;
+    if (!c->record) {
+        for (uint32_t o = 1; o < n->output_count; o++)
+            if (out[o]) {
+                int64_t md[IR_MAX_RANK];
+                for (uint32_t d = 0; d < x->rank; d++) md[d] = d < axis ? x->dims[d] : 1;
+                set_shape(out[o], F32, x->rank, md);
+            }
+        return set_shape(out[0], F32, x->rank, x->dims);
+    }
+    if (!x->count) return true;
+    push.x = in_at(c, 0);
+    push.y = out_at(c, 0);
+    push.a = in_at(c, 1);
+    push.b = bias ? in_at(c, 2) : 0;
+    push.eps = ir_attr_float(n, "epsilon", 1e-5f);
+    push.flags = (sc->count == 1 ? SPG_ROW_A_ONE : 0u) | (bias ? SPG_ROW_B : 0u) |
+                 (bias && bias->count == 1 ? SPG_ROW_B_ONE : 0u);
+    const Range none = {0, 0};
+    row_dispatch(c, &push, rms ? SPG_ROW_RMSNORM : SPG_ROW_LAYERNORM, range_of(c, n->inputs[0]),
+                 range_of(c, n->outputs[0]), range_of(c, n->inputs[1]), bias ? range_of(c, n->inputs[2]) : none, none);
+    return true;
+}
+
+/* GroupNormalization (a scale and bias a channel, or a group as opset 18 has them) and InstanceNormalization (a group
+   a channel). */
+static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *x = in[0], *sc = n->input_count > 1 ? in[1] : NULL, *bias = n->input_count > 2 ? in[2] : NULL;
+    if (!x || !sc || !bias || !out[0] || x->dtype != F32 || sc->dtype != F32 || bias->dtype != F32 || x->rank < 2)
+        return false;
+    const int64_t N = x->dims[0], C = x->dims[1];
+    const int64_t G = n->op == IR_InstanceNormalization ? C : ir_attr_int(n, "num_groups", 0);
+    if (G < 1 || C % G || (sc->count != (uint64_t)C && sc->count != (uint64_t)G) || bias->count != sc->count) return false;
+    if (x->count >= UINT32_MAX || !N || !C) return false;
+    const uint64_t pix = x->count / (uint64_t)(N * C);
+    if (!c->record) return set_shape(out[0], F32, x->rank, x->dims);
+    SpgRowPush push;
+    memset(&push, 0, sizeof push);
+    push.outer = (uint32_t)(N * G);
+    push.len = (uint32_t)((uint64_t)(C / G) * pix);
+    push.inner = 1;
+    push.groups = (uint32_t)G;
+    push.cpg = (uint32_t)(C / G);
+    push.pix = (uint32_t)(pix ? pix : 1u);
+    push.x = in_at(c, 0);
+    push.y = out_at(c, 0);
+    push.a = in_at(c, 1);
+    push.b = in_at(c, 2);
+    push.eps = ir_attr_float(n, "epsilon", 1e-5f);
+    push.flags = sc->count == (uint64_t)G && G != C ? SPG_ROW_BY_GROUP : 0u;
+    const Range none = {0, 0};
+    row_dispatch(c, &push, SPG_ROW_GROUPNORM, range_of(c, n->inputs[0]), range_of(c, n->outputs[0]),
+                 range_of(c, n->inputs[1]), range_of(c, n->inputs[2]), none);
+    return true;
+}
+
+/* ------------------------------------------------------------------------- convolutions and pooling */
+
+static bool epilogue_act(int64_t act);
+static bool product_bf16(uint32_t M, uint32_t N, uint32_t K);
+
+/* The windows of the node over x by the CPU's rules (ir_geometry()). */
+static bool windows_of(GCtx *c, const IrTensor *x, const int64_t *kernel, IrGeometry *g, bool ceil_mode) {
+    IrRun r;
+    memset(&r, 0, sizeof r);
+    r.g = c->g;
+    r.node = c->n;
+    r.index = c->k;
+    return ir_geometry(&r, x, kernel, g, ceil_mode);
+}
+
+/* OIHW filters as OHWI: [out][kh][kw][in a group] (prepared()). */
+typedef struct { uint64_t O, I, taps; } FilterShape;
+static void filters_ohwi(void *dst, const IrTensor *src, const void *arg) {
+    const FilterShape *f = (const FilterShape *)arg;
+    const float *w = (const float *)src->data;
+    float *t = (float *)dst;
+    for (uint64_t o = 0; o < f->O; o++)
+        for (uint64_t i = 0; i < f->I; i++)
+            for (uint64_t k = 0; k < f->taps; k++) t[(o * f->taps + k) * f->I + i] = w[(o * f->I + i) * f->taps + k];
+}
+
+/* Conv of one or two spatial axes (dilations 1) on the library's product over channels-last maps, its windows read
+   through a geometry (pointwise ones as rows): the input transposed into scratch memory channels last, the product
+   (its bias and the fused activation in its epilogue) into scratch, transposed back. */
+static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *X = in[0], *W = in[1], *Bias = n->input_count > 2 ? in[2] : NULL;
+    if (!X || !W || !out[0] || X->dtype != F32 || W->dtype != F32 || W->rank != X->rank || X->rank < 3 || X->rank > 4 ||
+        c->g->values[n->inputs[1]].kind != VALUE_CONST || (Bias && (Bias->dtype != F32 || Bias->count != (uint64_t)W->dims[0])))
+        return false;
+    const int64_t G = ir_attr_int(n, "group", 1), N = X->dims[0], C = X->dims[1], OC = W->dims[0];
+    const int64_t act = ir_attr_int(n, "activation", SPINGALETT_ACT_NONE);
+    if (G < 1 || C % G || OC % G || W->dims[1] != C / G || !epilogue_act(act)) return false;
+    IrGeometry geo;
+    if (!windows_of(c, X, W->dims + 2, &geo, false)) {
+        spingalett_clear_error();
+        return false;
+    }
+    if (geo.in[0] != 1 || geo.k[0] != 1 || geo.dil[1] != 1 || geo.dil[2] != 1) return false;
+    const int64_t h = geo.in[1], w = geo.in[2], oh = geo.out[1], ow = geo.out[2], kh = geo.k[1], kw = geo.k[2];
+    const int64_t CG = C / G, OG = OC / G, taps = kh * kw, K = taps * CG;
+    const uint64_t pixels = (uint64_t)N * (uint64_t)(oh * ow), xin = (uint64_t)N * (uint64_t)(h * w * C);
+    if (pixels * (uint64_t)OC >= ((uint64_t)1 << 31) || xin >= ((uint64_t)1 << 31)) return false;
+    const bool pointwise = taps == 1 && geo.s[1] == 1 && geo.s[2] == 1 && !geo.pb[1] && !geo.pb[2] && G == 1 &&
+                           oh == h && ow == w;
+    SpgConvGeometry info;
+    if (!pointwise && !spg_conv_geometry(NULL, &info, (uint32_t)h, (uint32_t)w, (uint32_t)C, (uint32_t)oh, (uint32_t)ow,
+                                         (uint32_t)OC, (uint32_t)G, (uint32_t)kh, (uint32_t)kw, (uint32_t)geo.s[1],
+                                         (uint32_t)geo.s[2], (uint32_t)geo.pb[1], (uint32_t)geo.pb[2]))
+        return false;
+    const FilterShape fs = {(uint64_t)OC, (uint64_t)CG, (uint64_t)taps};
+    const uint64_t wt = prepared(c, 1, (uint64_t)OC * (uint64_t)K * 4u, filters_ohwi, &fs);
+    if (!wt) return false;
+    int64_t dims[4] = {N, OC, oh, ow};
+    if (X->rank == 3) dims[2] = ow;
+    const uint64_t in_bytes = align_up(xin * 4u), out_bytes = align_up(pixels * (uint64_t)OC * 4u);
+    uint32_t *table = NULL;
+    if (!pointwise) {
+        table = (uint32_t *)calloc(info.size, sizeof(uint32_t));
+        if (!table) return false;
+        spg_conv_geometry(table, &info, (uint32_t)h, (uint32_t)w, (uint32_t)C, (uint32_t)oh, (uint32_t)ow, (uint32_t)OC,
+                          (uint32_t)G, (uint32_t)kh, (uint32_t)kw, (uint32_t)geo.s[1], (uint32_t)geo.s[2],
+                          (uint32_t)geo.pb[1], (uint32_t)geo.pb[2]);
+    }
+    const uint64_t geo_at = pointwise ? 0 : param_put(c, table, (uint32_t)(info.size * sizeof(uint32_t)));
+    free(table);
+    if (!c->record) {
+        c->scratch = in_bytes + out_bytes;
+        return set_shape(out[0], F32, X->rank, dims);
+    }
+    const uint64_t xs = c->scratch, ys = c->scratch + in_bytes;
+    const Range rxs = {xs, xs + xin * 4u}, rys = {ys, ys + pixels * (uint64_t)OC * 4u};
+    /* channels last: [N][pixels][C] from [N][C][pixels] */
+    const int64_t ip = h * w, op = oh * ow;
+    {
+        const int64_t d3[3] = {N, ip, C}, sx[3] = {C * ip, 1, ip}, sy[3] = {ip * C, C, 1};
+        copy_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, 4u, rxs, range_of(c, n->inputs[0]));
+    }
+    const Range none = {0, 0}, rw = {wt, wt + (uint64_t)OC * (uint64_t)K * 4u};
+    SpgGemmPush push = {
+        .a = xs, .b = wt, .c = ys, .e0 = Bias ? in_at(c, 2) : 0, .geo = geo_at, .M = (uint32_t)pixels,
+        .N = (uint32_t)(pointwise ? OC : OG), .K = (uint32_t)K, .lda = (uint32_t)C, .ldb = (uint32_t)K,
+        .ldc = (uint32_t)OC, .a_group = pointwise ? 0u : (uint32_t)CG, .b_group = pointwise ? 0u : (uint32_t)(OG * K),
+        .c_group = pointwise ? 0u : (uint32_t)OG, .alpha = 1.0f, .flags = Bias ? SPG_GEMM_BIAS : 0u,
+    };
+    Access a = {0};
+    reads(&a, rxs);
+    reads(&a, rw);
+    if (Bias) reads(&a, range_of(c, n->inputs[2]));
+    if (!pointwise) reads(&a, (Range){geo_at, geo_at + info.size * 4u});
+    writes(&a, rys);
+    need(c->r, &a);
+    SpgGemmMode m = {pointwise ? SPG_A_ROW : SPG_A_CONV, SPG_B_COL, SPG_EPI_BIAS_ACT, (uint32_t)act,
+                     pointwise ? 1u : (uint32_t)G, false, pointwise || (CG % 4 == 0 && C % 4 == 0), true, 0,
+                     pixels * (uint64_t)OC, product_bf16((uint32_t)pixels, (uint32_t)OG, (uint32_t)K), 0, false, false};
+    m.wide_a = CG % 8 == 0 && C % 8 == 0;
+    m.wide_b = true;
+    spg_gemm(c->r->c, &push, &m);
+    (void)none;
+    /* back to channels first */
+    {
+        const int64_t d3[3] = {N, OC, op}, sx[3] = {op * OC, 1, OC}, sy[3] = {OC * op, op, 1};
+        copy_strided(c, out_at(c, 0), ys, 3, d3, sx, sy, 4u, range_of(c, n->outputs[0]), rys);
+    }
+    return true;
+}
+
+/* MaxPool (without indices), AveragePool and LpPool over channels-first maps. */
+static bool op_pool(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *X = in[0];
+    if (!X || !out[0] || X->dtype != F32 || X->rank < 3 || X->rank > 5) return false;
+    if (n->output_count > 1 && n->outputs[1] != NONE) return false;
+    int64_t kernel[3];
+    const IrAttr *ks = ir_attr(n, "kernel_shape");
+    if (!ks || ks->type != ATTR_INTS || ks->count != X->rank - 2u) return false;
+    for (uint32_t k = 0; k < ks->count; k++) kernel[k] = ks->ints[k];
+    IrGeometry g;
+    if (!windows_of(c, X, kernel, &g, ir_attr_int(n, "ceil_mode", 0) != 0)) {
+        spingalett_clear_error();
+        return false;
+    }
+    int64_t dims[IR_MAX_RANK] = {X->dims[0], X->dims[1]};
+    for (uint32_t a = 0; a < g.spatial; a++) dims[2 + a] = g.out[3 - g.spatial + a];
+    uint64_t total = (uint64_t)X->dims[0] * (uint64_t)X->dims[1];
+    for (uint32_t a = 0; a < 3; a++) total *= (uint64_t)g.out[a];
+    if (total >= UINT32_MAX || X->count >= UINT32_MAX) return false;
+    if (!c->record) return set_shape(out[0], F32, X->rank, dims);
+    SpgPoolGPush push;
+    memset(&push, 0, sizeof push);
+    push.x = in_at(c, 0);
+    push.y = out_at(c, 0);
+    push.rows = (uint32_t)(X->dims[0] * X->dims[1]);
+    push.total = (uint32_t)total;
+    for (uint32_t a = 0; a < 3; a++) {
+        push.in[a] = (uint32_t)g.in[a];
+        push.out[a] = (uint32_t)g.out[a];
+        push.k[a] = (uint32_t)g.k[a];
+        push.s[a] = (uint32_t)g.s[a];
+        push.pb[a] = (uint32_t)g.pb[a];
+        push.pe[a] = (uint32_t)g.pe[a];
+        push.dil[a] = (uint32_t)g.dil[a];
+    }
+    push.flags = (n->op == IR_MaxPool ? SPG_GPOOL_MAX : 0u) | (n->op == IR_LpPool ? SPG_GPOOL_LP : 0u) |
+                 (ir_attr_int(n, "count_include_pad", 0) ? SPG_GPOOL_INCLUDE : 0u);
+    push.p = (float)ir_attr_int(n, "p", 2);
+    Access a = {0};
+    reads(&a, range_of(c, n->inputs[0]));
+    writes(&a, range_of(c, n->outputs[0]));
+    dispatch(c, &a, SPG_KERNEL_gpool, NULL, 0, &push, sizeof push, group_count(total, 256u), 1, 1);
+    return true;
+}
+
+/* GlobalAveragePool and GlobalMaxPool: rows of each map's values. */
+static bool op_global_pool(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *X = in[0];
+    if (!X || !out[0] || X->dtype != F32 || X->rank < 2) return false;
+    int64_t dims[IR_MAX_RANK];
+    for (uint32_t d = 0; d < X->rank; d++) dims[d] = d < 2 ? X->dims[d] : 1;
+    SpgRowPush push;
+    if (!rows_over(X, 2, X->rank, &push)) return false;
+    if (!c->record) return set_shape(out[0], F32, X->rank, dims);
+    push.x = in_at(c, 0);
+    push.y = out_at(c, 0);
+    const Range none = {0, 0};
+    row_dispatch(c, &push, n->op == IR_GlobalMaxPool ? SPG_ROW_MAX : SPG_ROW_MEAN, range_of(c, n->inputs[0]),
+                 range_of(c, n->outputs[0]), none, none, none);
+    return true;
+}
+
+/* ------------------------------------------------------------------------- attention */
+
+/* FusedAttention (fusions make it) through gattn, heads of up to 128 values (the values' as long as the queries'):
+   layout 0, Q (..., S, D) over up to two axes of batches broadcast between Q, K (..., D, T as K^T: the keys' rows its
+   columns), V (..., T, Dv) and the output (..., S, Dv); layout 1, Q (B, S, H, D), K and V (B, T, H or 1, D) and the
+   output (B, S, H, Dv). The mask and keep broadcast to the scores. */
+static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    const IrNode *n = c->n;
+    const IrTensor *Q = in[0], *K = in[1], *V = in[2];
+    const IrTensor *mask = n->input_count > 3 ? in[3] : NULL, *keep = n->input_count > 4 ? in[4] : NULL;
+    if (!Q || !K || !V || !out[0] || Q->dtype != F32 || K->dtype != F32 || V->dtype != F32 ||
+        (mask && mask->dtype != F32 && mask->dtype != BOOL) || (keep && keep->dtype != BOOL))
+        return false;
+    const bool layout1 = ir_attr_int(n, "layout", 0) == 1;
+    int64_t S, D, T, Dv, B = 1, H = 1;
+    uint32_t st[21] = {0};
+    int64_t odims[IR_MAX_RANK];
+    uint32_t orank;
+    int64_t bdims[2] = {1, 1};          /* the batches as (B, H) */
+    if (layout1) {
+        if (Q->rank != 4 || K->rank != 4 || V->rank != 4) return false;
+        B = Q->dims[0];
+        H = Q->dims[2];
+        S = Q->dims[1];
+        D = Q->dims[3];
+        T = K->dims[1];
+        Dv = V->dims[3];
+        const int64_t Hk = K->dims[2];
+        if (K->dims[0] != B || V->dims[0] != B || K->dims[3] != D || V->dims[1] != T || V->dims[2] != Hk ||
+            (Hk != H && Hk != 1))
+            return false;
+        const int64_t s[12] = {S * H * D, D, H * D, T * Hk * D, Hk == H ? D : 0, Hk * D,
+                               T * Hk * Dv, Hk == H ? Dv : 0, Hk * Dv, S * H * Dv, Dv, H * Dv};
+        for (uint32_t k = 0; k < 12; k++) st[k] = (uint32_t)s[k];
+        st[20] = 1;
+        odims[0] = B; odims[1] = S; odims[2] = H; odims[3] = Dv;
+        orank = 4;
+        bdims[0] = B;
+        bdims[1] = H;
+    } else {
+        if (Q->rank < 2 || K->rank < 2 || V->rank < 2) return false;
+        S = Q->dims[Q->rank - 2];
+        D = Q->dims[Q->rank - 1];
+        T = K->dims[K->rank - 1];
+        Dv = V->dims[V->rank - 1];
+        if (K->dims[K->rank - 2] != D || V->dims[V->rank - 2] != T) return false;
+        IrTensor bq, bk, bv;
+        memset(&bq, 0, sizeof bq);
+        memset(&bk, 0, sizeof bk);
+        memset(&bv, 0, sizeof bv);
+        bq.rank = Q->rank - 2;
+        bk.rank = K->rank - 2;
+        bv.rank = V->rank - 2;
+        for (uint32_t d = 0; d < bq.rank; d++) bq.dims[d] = Q->dims[d];
+        for (uint32_t d = 0; d < bk.rank; d++) bk.dims[d] = K->dims[d];
+        for (uint32_t d = 0; d < bv.rank; d++) bv.dims[d] = V->dims[d];
+        IrTensor *three[3] = {&bq, &bk, &bv};
+        uint32_t R;
+        int64_t bd[IR_MAX_RANK];
+        if (!broadcast(three, 3, &R, bd) || R > 2) return false;
+        for (uint32_t d = 0; d < R; d++) bdims[2 - R + d] = bd[d];
+        B = bdims[0];
+        H = bdims[1];
+        /* the operands' strides over (B, H), the keys' as rows: K^T's columns, T apart... the keys' values D apart */
+        int64_t sq[2] = {0, 0}, sk[2] = {0, 0}, sv[2] = {0, 0}, tmp[IR_MAX_RANK];
+        broadcast_strides(&bq, R, bd, tmp);
+        for (uint32_t d = 0; d < R; d++) sq[2 - R + d] = tmp[d] * S * D;
+        broadcast_strides(&bk, R, bd, tmp);
+        for (uint32_t d = 0; d < R; d++) sk[2 - R + d] = tmp[d] * D * T;
+        broadcast_strides(&bv, R, bd, tmp);
+        for (uint32_t d = 0; d < R; d++) sv[2 - R + d] = tmp[d] * T * Dv;
+        for (uint32_t d = 0; d < R; d++) odims[d] = bd[d];
+        odims[R] = S;
+        odims[R + 1] = Dv;
+        orank = R + 2;
+        /* (K is K^T: a key's values T apart, the keys 1) */
+        const int64_t s[12] = {sq[0], sq[1], D, sk[0], sk[1], 1, sv[0], sv[1], Dv, H * S * Dv, S * Dv, Dv};
+        for (uint32_t k = 0; k < 12; k++) st[k] = (uint32_t)s[k];
+        st[20] = (uint32_t)T;
+    }
+    if (Dv != D || D < 1 || D > 128 || B * H > 65535 || S >= (1 << 30) || T >= (1 << 30)) return false;
+    /* the masks' strides over (B, H, S, T) */
+    const int64_t full[4] = {B, H, S, T};
+    for (uint32_t k = 0; k < 2; k++) {
+        const IrTensor *m = k ? keep : mask;
+        if (!m) continue;
+        if (m->rank > 4) return false;
+        for (uint32_t d = 0; d < m->rank; d++) {
+            const int64_t want = full[4 - m->rank + d];
+            if (m->dims[d] != want && m->dims[d] != 1) return false;
+        }
+        int64_t ms[4];
+        broadcast_strides(m, 4, full, ms);
+        for (uint32_t d = 0; d < 4; d++) st[12 + 4 * k + d] = (uint32_t)ms[d];
+    }
+    if (!c->record) {
+        param_put(c, st, sizeof st);
+        return set_shape(out[0], F32, orank, odims);
+    }
+    if (!out[0]->count) return true;
+    const uint32_t unit = D <= 32 ? 32u : D <= 64 ? 64u : 128u;
+    SpgGattnPush push = {in_at(c, 0), in_at(c, 1), in_at(c, 2), out_at(c, 0), mask ? in_at(c, 3) : in_at(c, 0),
+                         keep ? in_at(c, 4) : in_at(c, 0), param_put(c, st, sizeof st), (uint32_t)S, (uint32_t)T,
+                         (uint32_t)D, (uint32_t)H, ir_attr_float(n, "scale", 1.0f), ir_attr_float(n, "fill", -INFINITY), 0, 0};
+    push.flags = (mask ? (mask->dtype == BOOL ? SPG_GATTN_BOOL : SPG_GATTN_MASK) : 0u) | (keep ? SPG_GATTN_KEEP : 0u) |
+                 (ir_attr_int(n, "safe", 0) ? SPG_GATTN_SAFE : 0u);
+    bool vec = (uint32_t)D == unit && push.q % 16u == 0 && push.k % 16u == 0 && push.v % 16u == 0 && push.y % 16u == 0;
+    for (uint32_t k = 0; k < 12 && vec; k++) vec = st[k] % 4u == 0;
+    vec = vec && st[20] == 1u;
+    if (vec) push.flags |= SPG_GATTN_VEC;
+    Access a = {0};
+    for (uint32_t i = 0; i < n->input_count && i < 5; i++)
+        if (n->inputs[i] != NONE) reads(&a, range_of(c, n->inputs[i]));
+    writes(&a, range_of(c, n->outputs[0]));
+    const uint32_t spec[1] = {unit};
+    dispatch(c, &a, SPG_KERNEL_gattn, spec, 1, &push, sizeof push, (uint32_t)((S + SPG_GATTN_ROWS - 1) / SPG_GATTN_ROWS),
+             (uint32_t)(B * H), 1);
+    return true;
+}
+
 /* ------------------------------------------------------------------------- products */
 
 /* Whether products multiply in bfloat16 on the matrix units (spingalett_set_gpu_precision()), for a product of this
@@ -1172,6 +1730,16 @@ static void gemm(GCtx *c, SpgGemmPush *push, uint32_t amode, uint32_t bmode, uin
     spg_gemm(c->r->c, push, &m);
 }
 
+/* A K x N matrix of floats as N x K (prepared()). */
+static void transposed(void *dst, const IrTensor *src, const void *arg) {
+    (void)arg;
+    const uint64_t K = (uint64_t)src->dims[0], N = (uint64_t)src->dims[1];
+    const float *w = (const float *)src->data;
+    float *t = (float *)dst;
+    for (uint64_t k = 0; k < K; k++)
+        for (uint64_t j = 0; j < N; j++) t[j * K + k] = w[k * N + j];
+}
+
 /* The activations of the products' epilogues (ActivationFunction): those the kernels hold. */
 static bool epilogue_act(int64_t act) {
     return act == SPINGALETT_ACT_NONE || act == SPINGALETT_ACT_RELU || act == SPINGALETT_ACT_LEAKY_RELU ||
@@ -1193,16 +1761,22 @@ static bool op_linear(GCtx *c, IrTensor *const *in, IrTensor **out) {
     if (M > UINT32_MAX || N > UINT32_MAX || K > UINT32_MAX || !K) return false;
     int64_t dims[IR_MAX_RANK];
     for (uint32_t d = 0; d < x->rank; d++) dims[d] = d + 1 < x->rank ? x->dims[d] : N;
+    /* constant weights as N x K, the layout of the products' forward kernels (made once) */
+    uint64_t wt = 0;
+    if (!trans && c->g->values[n->inputs[1]].kind == VALUE_CONST) {
+        wt = prepared(c, 1, (uint64_t)K * (uint64_t)N * 4u, transposed, NULL);
+        if (!wt) return false;
+    }
     if (!c->record) return set_shape(out[0], F32, x->rank, dims);
+    const bool col = trans || wt;
     SpgGemmPush push = {
-        .a = in_at(c, 0), .b = in_at(c, 1), .c = out_at(c, 0), .e0 = bias ? in_at(c, 2) : 0,
-        .M = (uint32_t)M, .N = (uint32_t)N, .K = (uint32_t)K, .lda = (uint32_t)K, .ldb = trans ? (uint32_t)K : (uint32_t)N,
+        .a = in_at(c, 0), .b = wt ? wt : in_at(c, 1), .c = out_at(c, 0), .e0 = bias ? in_at(c, 2) : 0,
+        .M = (uint32_t)M, .N = (uint32_t)N, .K = (uint32_t)K, .lda = (uint32_t)K, .ldb = col ? (uint32_t)K : (uint32_t)N,
         .ldc = (uint32_t)N, .alpha = 1.0f, .flags = bias ? SPG_GEMM_BIAS : 0u,
     };
-    const Range none = {0, 0};
-    gemm(c, &push, SPG_A_ROW, trans ? SPG_B_COL : SPG_B_ROW, SPG_EPI_BIAS_ACT, (uint32_t)act, 1,
-         range_of(c, n->inputs[0]), range_of(c, n->inputs[1]), bias ? range_of(c, n->inputs[2]) : none,
-         range_of(c, n->outputs[0]));
+    const Range none = {0, 0}, rw = wt ? (Range){wt, wt + (uint64_t)K * (uint64_t)N * 4u} : range_of(c, n->inputs[1]);
+    gemm(c, &push, SPG_A_ROW, col ? SPG_B_COL : SPG_B_ROW, SPG_EPI_BIAS_ACT, (uint32_t)act, 1, range_of(c, n->inputs[0]),
+         rw, bias ? range_of(c, n->inputs[2]) : none, range_of(c, n->outputs[0]));
     return true;
 }
 
@@ -1417,6 +1991,14 @@ static const GpuOp ops[IR_OP_COUNT] = {
     [IR_Transpose] = op_transpose, [IR_Slice] = op_slice, [IR_Concat] = op_concat, [IR_Split] = op_split,
     [IR_Expand] = op_expand, [IR_Tile] = op_tile, [IR_Pad] = op_pad, [IR_Gather] = op_gather,
     [IR_Linear] = op_linear, [IR_Gemm] = op_gemm, [IR_MatMul] = op_matmul,
+    [IR_ReduceSum] = op_reduce, [IR_ReduceMean] = op_reduce, [IR_ReduceMax] = op_reduce, [IR_ReduceMin] = op_reduce,
+    [IR_ReduceProd] = op_reduce, [IR_ReduceL1] = op_reduce, [IR_ReduceL2] = op_reduce,
+    [IR_ReduceSumSquare] = op_reduce, [IR_ReduceLogSumExp] = op_reduce, [IR_ReduceLogSum] = op_reduce,
+    [IR_ArgMax] = op_arg, [IR_ArgMin] = op_arg, [IR_Softmax] = op_softmax, [IR_LogSoftmax] = op_softmax,
+    [IR_Hardmax] = op_softmax, [IR_LayerNormalization] = op_layernorm, [IR_RMSNormalization] = op_layernorm,
+    [IR_GroupNormalization] = op_groupnorm, [IR_InstanceNormalization] = op_groupnorm,
+    [IR_FusedAttention] = op_attention, [IR_Conv] = op_conv, [IR_MaxPool] = op_pool, [IR_AveragePool] = op_pool,
+    [IR_LpPool] = op_pool, [IR_GlobalAveragePool] = op_global_pool, [IR_GlobalMaxPool] = op_global_pool,
 };
 
 /* The operators whose kernels read only their first input's shape: on the host, without its values. */
@@ -1542,12 +2124,17 @@ static bool piece_close(SpingalettGraph *g, GpuGraph *gg, Plan *p, const uint32_
         return fail("graph on the GPU: out of device memory");
     if (pc->staged && !spg_gpu_buffer_create(&pc->staging, pc->staged, true))
         return fail("graph on the GPU: out of memory");
+    if (pc->params_size) {
+        pc->param_bytes = (uint8_t *)calloc(1, pc->params_size);
+        if (!pc->param_bytes || !spg_gpu_buffer_create(&pc->params, pc->params_size, false))
+            return fail("graph on the GPU: out of memory");
+    }
     pc->commands = spg_gpu_commands_create();
     if (!pc->commands || !spg_gpu_record_begin(pc->commands)) return fail("graph on the GPU: no commands");
     Recorder r;
     memset(&r, 0, sizeof r);
     r.c = pc->commands;
-    GCtx c = {g, gg, p, 0, NULL, true, &r, 0, 0, 0};
+    GCtx c = {g, gg, p, 0, NULL, true, &r, 0, 0, 0, 0, 0, pc};
     uint32_t up = 0;
     for (uint32_t j = 0; j < pc->node_count; j++) {
         /* the uploads this node is the first to read */
@@ -1582,6 +2169,24 @@ static bool piece_close(SpingalettGraph *g, GpuGraph *gg, Plan *p, const uint32_
     }
     spg_gpu_barrier_host(pc->commands);
     if (!spg_gpu_record_end(pc->commands)) return fail("graph on the GPU: its commands could not be recorded");
+    if (pc->params_size) {
+        /* the parameter blocks, once (through memory the host fills) */
+        SpgGpuBuffer stage;
+        SpgGpuCommands *cmd = NULL;
+        bool ok = spg_gpu_buffer_create(&stage, pc->params_size, true);
+        if (ok) {
+            memcpy(stage.mapped, pc->param_bytes, pc->params_size);
+            cmd = spg_gpu_commands_create();
+            ok = cmd && spg_gpu_record_begin(cmd);
+        }
+        if (ok) spg_gpu_copy(cmd, &stage, 0, &pc->params, 0, pc->params_size);
+        ok = ok && spg_gpu_record_end(cmd) && spg_gpu_submit(cmd) && spg_gpu_wait(cmd);
+        if (cmd) spg_gpu_commands_free(cmd);
+        spg_gpu_buffer_free(&stage);
+        free(pc->param_bytes);
+        pc->param_bytes = NULL;
+        if (!ok) return fail("graph on the GPU: the parameters could not be uploaded");
+    }
     if (!add_step(p, STEP_PIECE, index)) return fail("graph on the GPU: out of memory");
     return piece_run(g, p, pc);
 }
@@ -1609,7 +2214,7 @@ static bool plan_device(SpingalettGraph *g, GpuGraph *gg, Plan *p, uint32_t k, G
     if (is_view((IrOp)n->op) && (n->inputs[0] == NONE || !has_device(p, n->inputs[0]))) return false;
     if (!device_input && !large && !is_view((IrOp)n->op)) {
         /* the outputs' sizes decide: planned to see them */
-        GCtx probe = {g, gg, p, k, n, false, NULL, 0, 0, 0};
+        GCtx probe = {g, gg, p, k, n, false, NULL, 0, 0, 0, 0, 0, NULL};
         IrTensor saved[32];
         IrTensor *in[32], *out[32];
         for (uint32_t i = 0; i < n->input_count; i++) in[i] = n->inputs[i] == NONE ? NULL : &g->tensors[n->inputs[i]];
@@ -1627,7 +2232,7 @@ static bool plan_device(SpingalettGraph *g, GpuGraph *gg, Plan *p, uint32_t k, G
     IrTensor *in[32], *out[32];
     for (uint32_t i = 0; i < n->input_count; i++) in[i] = n->inputs[i] == NONE ? NULL : &g->tensors[n->inputs[i]];
     for (uint32_t o = 0; o < n->output_count; o++) out[o] = n->outputs[o] == NONE ? NULL : &g->tensors[n->outputs[o]];
-    *c = (GCtx){g, gg, p, k, n, false, NULL, 0, 0, 0};
+    *c = (GCtx){g, gg, p, k, n, false, NULL, 0, 0, 0, 0, 0, NULL};
     IrTensor saved[32];
     for (uint32_t o = 0; o < n->output_count; o++)
         if (out[o]) saved[o] = *out[o];
@@ -1646,7 +2251,7 @@ static bool place_device(SpingalettGraph *g, Plan *p, uint32_t k, const GCtx *c)
     Piece *pc = &p->pieces[p->piece_count - 1u];
     for (uint32_t i = 0; i < n->input_count; i++) {
         const uint32_t v = n->inputs[i];
-        if (v == NONE || (c->params >> i & 1u)) continue;
+        if (v == NONE || ((c->params | c->replaced) >> i & 1u)) continue;
         if (g->values[v].kind == VALUE_CONST) {
             p->on[v] |= ON_DEVICE;
             continue;
@@ -1692,6 +2297,7 @@ static bool place_device(SpingalettGraph *g, Plan *p, uint32_t k, const GCtx *c)
     }
     if (!grow((void **)&pc->nodes, &pc->node_cap, pc->node_count, sizeof(uint32_t))) return false;
     pc->nodes[pc->node_count++] = k;
+    pc->params_size += c->param;
     if (c->scratch) piece_give(&p->pieces[p->piece_count - 1u], p->scratch[k].at, p->scratch[k].bytes);
     return true;
 }
@@ -1762,6 +2368,12 @@ static bool plan_run(SpingalettGraph *g, GpuGraph *gg, Plan *p) {
     ok = ok && piece_close(g, gg, p, want, count);
     free(want);
     p->host_only = !devices;
+    /* (SPINGALETT_GRAPH_GPU_REPORT: the operators the host ran, but for those of shapes) */
+    const char *report = getenv("SPINGALETT_GRAPH_GPU_REPORT");
+    if (ok && report && *report && *report != '0')
+        for (uint32_t s = 0; s < p->step_count; s++)
+            if (p->steps[s].kind == STEP_HOST && !shape_only((IrOp)g->nodes[p->steps[s].index].op))
+                fprintf(stderr, "graph on the GPU: on the host: %s\n", ir_op_name((IrOp)g->nodes[p->steps[s].index].op));
     if (ok) spingalett_log(LOG_DEBUG, "graph on the GPU: %u of %u nodes on the device, %u pieces", p->device_nodes,
                            g->node_count, p->piece_count);
     /* the plan's types and shapes, for the checks of replays */
@@ -1817,7 +2429,10 @@ static GpuGraph *gpu_of(SpingalettGraph *g) {
     gg = (GpuGraph *)calloc(1, sizeof *gg);
     if (!gg) return NULL;
     gg->consts = (SpgGpuBuffer *)calloc(g->value_count ? g->value_count : 1u, sizeof(SpgGpuBuffer));
-    if (!gg->consts) {
+    gg->prepared = (SpgGpuBuffer *)calloc(g->node_count ? g->node_count : 1u, sizeof(SpgGpuBuffer));
+    if (!gg->consts || !gg->prepared) {
+        free(gg->consts);
+        free(gg->prepared);
         free(gg);
         return NULL;
     }
@@ -1899,8 +2514,10 @@ void spingalett_gpu_graph_free(SpingalettGraph *g) {
     spg_gpu_use(gg->backend);
     for (uint32_t k = 0; k < PLANS; k++) plan_free(gg->plans[k]);
     for (uint32_t k = 0; k < gg->arena_count; k++) spg_gpu_arena_free(gg->arenas[k]);
+    for (uint32_t k = 0; k < g->node_count; k++) spg_gpu_buffer_free(&gg->prepared[k]);
     free(gg->arenas);
     free(gg->consts);
+    free(gg->prepared);
     free(gg);
     g->gpu = NULL;
     spg_gpu_use(saved);

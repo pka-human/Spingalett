@@ -1703,13 +1703,9 @@ static bool k_gemm(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, ui
 /* ------------------------------------------------------------------------- convolutions and pooling */
 
 /* The geometry of a convolution or pooling over one to three spatial axes, held as three (leading axes of size 1). */
-typedef struct {
-    uint32_t spatial;               /* the input's spatial axes */
-    int64_t in[3], k[3], s[3], pb[3], pe[3], dil[3], out[3];
-} Geometry;
+typedef IrGeometry Geometry;
 
-/* kernel_shape (or the weights'), strides, dilations, pads or auto_pad; outputs by ceil_mode for pooling. */
-static bool geometry(IrRun *r, const IrTensor *x, const int64_t *kernel, Geometry *g, bool ceil_mode) {
+bool ir_geometry(IrRun *r, const IrTensor *x, const int64_t *kernel, Geometry *g, bool ceil_mode) {
     const uint32_t S = x->rank - 2;
     if (x->rank < 3 || S > 3) return ir_fail(r, "an input of %u axes (one to three spatial ones expected)", x->rank);
     memset(g, 0, sizeof *g);
@@ -1853,7 +1849,7 @@ static bool k_conv(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, ui
     const int64_t group = ir_attr_int(r->node, "group", 1), N = X->dims[0], C = X->dims[1], OC = W->dims[0];
     if (group < 1 || C % group || OC % group || W->dims[1] != C / group) return ir_fail(r, "channels that do not fit the groups");
     Geometry g;
-    if (!geometry(r, X, W->dims + 2, &g, false)) return false;
+    if (!ir_geometry(r, X, W->dims + 2, &g, false)) return false;
     const int64_t act = ir_attr_int(r->node, "activation", ACT_NONE);
     if (act < 0 || act >= ACT_COUNT || act == ACT_SOFTMAX) return ir_fail(r, "the activation %lld", (long long)act);
     if (B && (B->dtype != F32 || B->count != (uint64_t)OC)) return ir_fail(r, "a bias of %llu values for %lld channels",
@@ -2064,7 +2060,7 @@ static bool k_pool(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, ui
     int64_t kernel[3];
     if (int_list(r->node, "kernel_shape", NULL, kernel, 3) != (int64_t)X->rank - 2) return ir_fail(r, "no kernel_shape");
     Geometry g;
-    if (!geometry(r, X, kernel, &g, ir_attr_int(r->node, "ceil_mode", 0) != 0)) return false;
+    if (!ir_geometry(r, X, kernel, &g, ir_attr_int(r->node, "ceil_mode", 0) != 0)) return false;
     const bool include = ir_attr_int(r->node, "count_include_pad", 0) != 0;
     const float p = lp ? (float)ir_attr_int(r->node, "p", 2) : 1.0f;
     const int64_t N = X->dims[0], C = X->dims[1];
