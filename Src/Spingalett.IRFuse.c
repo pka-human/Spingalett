@@ -362,12 +362,82 @@ static bool perm_is(const IrNode *n, unsigned digits) {
     return true;
 }
 
-/* The Transpose by perm computing v, read by nothing else, and its input. */
-static IrNode *transposed(const Fuse *f, uint32_t v, unsigned digits, uint32_t *x) {
-    IrNode *t = producer_of(f, v, IR_Transpose);
-    if (!t || !single(f, v) || !perm_is(t, digits)) return NULL;
-    *x = t->inputs[0];
-    return t;
+/* Whether v is the value src of four axes with its axes permuted by `want` (digits as perm_is() reads them), through a
+   chain of Reshapes and Transposes each read by nothing else (PyTorch's exports write K^T of heads as a Transpose, a
+   Reshape merging the batch and the heads, a Transpose of the last two axes and a Reshape splitting them again); the
+   chain's nodes, from v back, in chain (at most 8). The sizes are the graph's declared ones, numbers all. Axes are
+   tracked as runs of the source's axes of sizes other than 1: a Transpose permutes them, a Reshape merges neighbours
+   or splits a run where its source axes meet; axes of size 1, which may go anywhere, are matched last. */
+static bool permuted(const Fuse *f, uint32_t v, unsigned want, uint32_t *src, IrNode **chain, uint32_t *length) {
+    const SpingalettGraph *g = f->g;
+    uint32_t values[9] = {v}, count = 0;
+    while (count < 8) {
+        const uint32_t x = values[count];
+        if (!single(f, x) || f->producer[x] < 0 || f->dead[f->producer[x]]) break;
+        IrNode *n = &g->nodes[f->producer[x]];
+        if (n->op != IR_Transpose && n->op != IR_Reshape) break;
+        chain[count++] = n;
+        values[count] = n->inputs[0];
+    }
+    for (uint32_t i = count; i > 0; i--) {
+        /* the farthest value of four axes the chain from it makes v of: Q, K and V before their heads' transposes */
+        const IrValue *s0 = &g->values[values[i]];
+        if (!s0->declared || s0->rank != 4) continue;
+        bool ok = true;
+        for (uint32_t d = 0; d < 4; d++) ok = ok && s0->dims[d] > 0;
+        if (!ok) continue;
+        /* axes as runs of source axes: run[a] (runs[a] of them) */
+        uint8_t run[IR_MAX_RANK][4], runs[IR_MAX_RANK];
+        uint32_t rank = 4;
+        for (uint32_t a = 0; a < 4; a++) {
+            run[a][0] = (uint8_t)a;
+            runs[a] = s0->dims[a] != 1;
+        }
+        for (uint32_t j = i; ok && j > 0; j--) {
+            const IrNode *n = chain[j - 1];
+            const IrValue *y = &g->values[n->outputs[0]];
+            if (n->op == IR_Transpose) {
+                const IrAttr *pa = ir_attr(n, "perm");
+                ok = pa && pa->type == ATTR_INTS && pa->count == rank;
+                uint8_t r2[IR_MAX_RANK][4], n2[IR_MAX_RANK];
+                for (uint32_t a = 0; ok && a < rank; a++) {
+                    ok = pa->ints[a] >= 0 && pa->ints[a] < (int64_t)rank;
+                    if (ok) memcpy(r2[a], run[pa->ints[a]], 4), n2[a] = runs[pa->ints[a]];
+                }
+                if (ok) memcpy(run, r2, sizeof r2), memcpy(runs, n2, sizeof n2);
+            } else {
+                /* the source axes in order, grouped again by the new sizes */
+                uint8_t flat[4];
+                uint32_t total = 0;
+                for (uint32_t a = 0; a < rank; a++)
+                    for (uint32_t b = 0; b < runs[a]; b++) flat[total++] = run[a][b];
+                ok = y->declared && y->rank <= IR_MAX_RANK && y->rank > 0;
+                uint32_t at = 0;
+                for (uint32_t a = 0; ok && a < y->rank; a++) {
+                    int64_t size = 1;
+                    runs[a] = 0;
+                    while (size < y->dims[a] && at < total) {
+                        size *= s0->dims[flat[at]];
+                        run[a][runs[a]++] = flat[at++];
+                    }
+                    ok = size == y->dims[a];
+                }
+                ok = ok && at == total;
+                rank = y->rank;
+            }
+        }
+        if (!ok || rank != 4) continue;
+        /* each axis one source axis as wanted, or none where the wanted one is of size 1 */
+        for (uint32_t a = 0; a < 4 && ok; a++) {
+            const uint8_t w = (uint8_t)((want >> (12 - 4 * a)) & 15u);
+            ok = runs[a] == 1 ? run[a][0] == w : runs[a] == 0 && s0->dims[w] == 1;
+        }
+        if (!ok) continue;
+        *src = values[i];
+        *length = i;
+        return true;
+    }
+    return false;
 }
 
 /* The rank of a value where the graph says it: declared, or made by a Transpose's permutation or a Reshape to a
@@ -493,10 +563,12 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
         kt = base;
     } else ks = NULL;
     /* the transposes of heads around it (Q, K and V as (B, S, H, D), the output's back to that): taken in */
-    uint32_t vv = pv->inputs[1], y = pv->outputs[0], xq, xk, xv;
-    IrNode *tq = transposed(f, q, 0x0213, &xq), *tk = transposed(f, kt, 0x0231, &xk), *tv = transposed(f, vv, 0x0213, &xv);
+    uint32_t vv = pv->inputs[1], y = pv->outputs[0], xq, xk, xv, lq = 0, lk = 0, lv = 0;
+    IrNode *cq[8], *ck[8], *cv[8];
+    const bool heads = permuted(f, q, 0x0213, &xq, cq, &lq) && permuted(f, kt, 0x0231, &xk, ck, &lk) &&
+                       permuted(f, vv, 0x0213, &xv, cv, &lv);
     IrNode *ty = consumer_of(f, y, IR_Transpose, NULL);
-    const bool layout = tq && tk && tv && ty && perm_is(ty, 0x0213) && xv != xq && xk != xq;
+    const bool layout = heads && ty && perm_is(ty, 0x0213) && xv != xq && xk != xq;
     if (layout) {
         q = xq;
         kt = xk;
@@ -520,9 +592,9 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
     attrs[3].f = fill;
     if (!attrs[0].name || !attrs[1].name || !attrs[2].name || !attrs[3].name) return false;
     if (layout) {
-        kill(f, tq);
-        kill(f, tk);
-        kill(f, tv);
+        for (uint32_t j = 0; j < lq; j++) kill(f, cq[j]);
+        for (uint32_t j = 0; j < lk; j++) kill(f, ck[j]);
+        for (uint32_t j = 0; j < lv; j++) kill(f, cv[j]);
         kill(f, ty);
     }
     kill(f, qk);
