@@ -485,6 +485,18 @@ static void geometry(uint32_t *geo, uint32_t rh, uint32_t rw, uint32_t gh, uint3
     geo[5] = sh; geo[6] = sw; geo[7] = ph; geo[8] = pw;
 }
 
+size_t spg_conv_forward(uint32_t *geo, uint32_t h, uint32_t w, uint32_t in, uint32_t oh, uint32_t ow, uint32_t groups,
+                        uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw) {
+    const uint32_t CG = in / groups, taps = kh * kw;
+    if (kh > 255u || kw > 255u || CG > 65535u) return 0;
+    if (geo) {
+        geometry(geo, oh, ow, h, w, in, sh, sw, ph, pw);
+        for (uint32_t t = 0, k = 0; t < taps; t++)
+            for (uint32_t c = 0; c < CG; c++, k++) geo[SPG_GEO_HEADER + k] = (t / kw) | (t % kw) << 8 | c << 16;
+    }
+    return SPG_GEO_HEADER + (size_t)taps * CG;
+}
+
 bool spg_conv_geometry(uint32_t *geo, SpgConvGeometry *info, uint32_t h, uint32_t w, uint32_t in, uint32_t oh,
                        uint32_t ow, uint32_t out, uint32_t groups, uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw,
                        uint32_t ph, uint32_t pw) {

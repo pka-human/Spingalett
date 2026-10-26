@@ -98,9 +98,25 @@ struct uint4_ {
    its value c at c cs; zeros past the rows and the head's d values. Eight values a thread at a time, two loads of four
    where the rows are of exactly D contiguous values at 16 bytes (vec). */
 DEVICE void load_tile(const SpgGattnPush &p, uint16_t *tile, uint64_t base, uint32_t stride, uint32_t cs, uint32_t r0,
-                      uint32_t count, uint32_t rows, bool vec) {
+                      uint32_t count, uint32_t rows, bool vec, bool half) {
     for (uint32_t e = thread_x(); e < count * (D / 8u); e += 32u * WARPS) {
         const uint32_t row = e / (D / 8u), c = 8u * (e % (D / 8u)), pos = r0 + row;
+        if (half) {
+            /* (kept as bfloat16: as it is, sixteen bytes at once where the rows allow) */
+            uint4_ u = {0u, 0u, 0u, 0u};
+            if (vec) {
+                if (pos < rows) u = *(const uint4_ *)(H(base) + (uint64_t)pos * stride + c);
+            } else {
+                uint32_t w[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+                for (uint32_t k = 0; k < 8u; k++)
+                    if (pos < rows && c + k < p.d)
+                        w[k / 2u] |= (uint32_t)H(base)[(uint64_t)pos * stride + (uint64_t)(c + k) * cs] << (16u * (k & 1u));
+                u = uint4_{w[0], w[1], w[2], w[3]};
+            }
+            *(uint4_ *)(tile + row * SD + c) = u;
+            continue;
+        }
         float v[8];
         if (vec) {
             const float4_ zero = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -151,13 +167,15 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
     const uint32_t *st = U(p.strides);
     const uint32_t l = lane_id(), w = warp_id(), g = l >> 2, t = l & 3u;
     const uint32_t bh = block_y(), b = bh / p.heads, h = bh % p.heads, i0 = block_x() * ROWS, r0 = 16u * MT * w;
-    const uint64_t qb = p.q + 4ull * ((uint64_t)b * st[0] + (uint64_t)h * st[1]);
-    const uint64_t kb = p.k + 4ull * ((uint64_t)b * st[3] + (uint64_t)h * st[4]);
-    const uint64_t vb = p.v + 4ull * ((uint64_t)b * st[6] + (uint64_t)h * st[7]);
+    const bool hq = (p.flags & SPG_GATTN_HALF_Q) != 0u, hk = (p.flags & SPG_GATTN_HALF_K) != 0u;
+    const bool hv = (p.flags & SPG_GATTN_HALF_V) != 0u, hy = (p.flags & SPG_GATTN_HALF_Y) != 0u;
+    const uint64_t qb = p.q + (hq ? 2ull : 4ull) * ((uint64_t)b * st[0] + (uint64_t)h * st[1]);
+    const uint64_t kb = p.k + (hk ? 2ull : 4ull) * ((uint64_t)b * st[3] + (uint64_t)h * st[4]);
+    const uint64_t vb = p.v + (hv ? 2ull : 4ull) * ((uint64_t)b * st[6] + (uint64_t)h * st[7]);
     const uint64_t mbase = (uint64_t)b * st[12] + (uint64_t)h * st[13], wbase = (uint64_t)b * st[16] + (uint64_t)h * st[17];
     const bool vec = (p.flags & SPG_GATTN_VEC) != 0u, masked = (p.flags & (SPG_GATTN_MASK | SPG_GATTN_BOOL | SPG_GATTN_KEEP)) != 0u;
     const float NEG = -__builtin_inff(), scale = p.scale;
-    load_tile(p, sh.a, qb, st[2], 1u, i0, ROWS, p.queries, vec);
+    load_tile(p, sh.a, qb, st[2], 1u, i0, ROWS, p.queries, vec, hq);
     barrier();
     uint32_t qa[MT][KS][4];
 #pragma unroll
@@ -174,8 +192,8 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
     }
     for (uint32_t j0 = 0; j0 < p.keys; j0 += BT) {
         barrier();
-        load_tile(p, sh.t, kb, st[5], st[20], j0, BT, p.keys, vec);
-        load_tile(p, sh.u, vb, st[8], 1u, j0, BT, p.keys, vec);
+        load_tile(p, sh.t, kb, st[5], st[20], j0, BT, p.keys, vec, hk);
+        load_tile(p, sh.u, vb, st[8], 1u, j0, BT, p.keys, vec, hv);
         barrier();
         float sc[MT][NT][4];
 #pragma unroll
@@ -270,7 +288,7 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
         }
     }
     /* y = O / sum (a row of no key: zeros with SAFE, else NaN), this thread's columns 8 j + 2 t, + 1 of rows g, g + 8 */
-    const uint64_t yb = p.y + 4ull * ((uint64_t)b * st[9] + (uint64_t)h * st[10]);
+    const uint64_t yb = p.y + (hy ? 2ull : 4ull) * ((uint64_t)b * st[9] + (uint64_t)h * st[10]);
     const bool safe = (p.flags & SPG_GATTN_SAFE) != 0u;
 #pragma unroll
     for (uint32_t mt = 0; mt < MT; mt++) {
@@ -283,14 +301,22 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
             const float sum = l_[mt][hh];
             const float inv = sum > 0.0f ? 1.0f / sum : safe ? 0.0f : __builtin_nanf("");
             if (row >= p.queries) continue;
-            float *y = F(yb) + (uint64_t)row * st[11];
+            const uint64_t yr = (uint64_t)row * st[11];
 #pragma unroll
             for (uint32_t j = 0; j < DT; j++) {
                 const uint32_t c = 8u * j + 2u * t;
                 const float v0 = sum > 0.0f || !safe ? o[mt][j][2u * hh] * inv : 0.0f;
                 const float v1 = sum > 0.0f || !safe ? o[mt][j][2u * hh + 1u] * inv : 0.0f;
-                if (c < p.d) y[c] = v0;
-                if (c + 1u < p.d) y[c + 1u] = v1;
+                if (hy) {
+                    if (c + 1u < p.d && (yr + c) % 2u == 0u) ((uint32_t *)H(yb))[(yr + c) >> 1] = pack2(v0, v1);
+                    else {
+                        if (c < p.d) H(yb)[yr + c] = (uint16_t)to_bf16(v0);
+                        if (c + 1u < p.d) H(yb)[yr + c + 1u] = (uint16_t)to_bf16(v1);
+                    }
+                } else {
+                    if (c < p.d) F(yb)[yr + c] = v0;
+                    if (c + 1u < p.d) F(yb)[yr + c + 1u] = v1;
+                }
             }
         }
     }

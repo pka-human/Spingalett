@@ -38,6 +38,7 @@ layout(push_constant) uniform Push {
 #define T_I64  3u
 #define T_BOOL 4u
 #define T_I8   5u
+#define T_BF16 6u
 
 /* the codes of Spingalett.GpuPush.h's SPG_GEW_* */
 #define COPY 0u
@@ -103,6 +104,10 @@ float load(F32 x, uint i, uint type) {
     if (type == T_I32) return float(I32(x).v[i]);
     if (type == T_I64) {                    /* (the low word, signed: indices and masks) */
         return float(I32(x).v[2u * i]);
+    }
+    if (type == T_BF16) {                   /* (two a word: no 16-bit storage needed) */
+        const uint w = uint(I32(x).v[i >> 1u]);
+        return uintBitsToFloat((i & 1u) != 0u ? w & 0xFFFF0000u : w << 16u);
     }
     return x.v[i];
 }

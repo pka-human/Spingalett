@@ -260,7 +260,7 @@ typedef struct {
     uint32_t sa[SPG_GEW_AXES], sb[SPG_GEW_AXES], sc[SPG_GEW_AXES];
     float alpha, beta;
 } SpgGewPush;
-enum { SPG_T_F32, SPG_T_U8, SPG_T_I32, SPG_T_I64, SPG_T_BOOL, SPG_T_I8 };
+enum { SPG_T_F32, SPG_T_U8, SPG_T_I32, SPG_T_I64, SPG_T_BOOL, SPG_T_I8, SPG_T_BF16 };     /* (bfloat16: read only) */
 enum {
     SPG_GEW_COPY, SPG_GEW_NEG, SPG_GEW_ABS, SPG_GEW_EXP, SPG_GEW_LOG, SPG_GEW_SQRT, SPG_GEW_RECIPROCAL, SPG_GEW_SIGMOID,
     SPG_GEW_TANH, SPG_GEW_RELU, SPG_GEW_LEAKY, SPG_GEW_ELU, SPG_GEW_SELU, SPG_GEW_GELU, SPG_GEW_GELU_TANH, SPG_GEW_SILU,
@@ -276,7 +276,8 @@ enum {
 /* gcopy.comp: values copied through strides (Transpose, Slice, Concat, Split, Expand, Tile and Pad of graphs): value i
    of the dispatch, at its coordinates over SPG_COPY_AXES axes (innermost last, sizes 1 before fewer), is
    x[base + sum c[d] sx[d]] written to y[sum c[d] sy[d]] (strides in elements; x's may be negative, base keeping its
-   offsets from x's address, its lowest value read, at 0 and above). Spec: SIZE (bytes an element: 1, 4, 8 or 16). */
+   offsets from x's address, its lowest value read, at 0 and above). Spec: SIZE (bytes an element: 1, 2 (CUDA's), 4, 8 or
+   16). */
 #define SPG_COPY_AXES 6u
 typedef struct {
     uint64_t y, x;
@@ -321,6 +322,7 @@ enum {
 #define SPG_ROW_B_ONE    8u
 #define SPG_ROW_STATS    16u        /* LayerNorm: the means and inverse deviations at aux */
 #define SPG_ROW_BY_GROUP 32u        /* GroupNorm: the scale and bias a group (opset 18), else a channel */
+#define SPG_ROW_HALF_Y   64u        /* LayerNorm, RMSNorm, GroupNorm: y kept as bfloat16 (CUDA's) */
 
 /* gattn.comp: FusedAttention of graphs, softmax(Where(keep, scale Q K^T, fill) + mask) V in blocks of SPG_GATTN_ROWS
    queries of a batch and head (block_y: batch heads + head), over tiles of keys, the softmax online. Q, K, V and Y are
@@ -340,7 +342,11 @@ typedef struct {
 #define SPG_GATTN_BOOL  2u          /* booleans: false leaves a key out */
 #define SPG_GATTN_KEEP  4u
 #define SPG_GATTN_SAFE  8u
-#define SPG_GATTN_VEC   16u         /* heads of exactly D values, rows and addresses in fours: loads of four */
+#define SPG_GATTN_VEC   16u         /* heads of exactly D values, rows and addresses in eights: loads of eight */
+#define SPG_GATTN_HALF_Q 32u        /* gflash: queries, keys, values, the output kept as bfloat16 */
+#define SPG_GATTN_HALF_K 64u
+#define SPG_GATTN_HALF_V 128u
+#define SPG_GATTN_HALF_Y 256u
 
 /* gpool.comp: MaxPool, AveragePool and LpPool of graphs over channels-first maps of up to three spatial axes (as three,
    the first of size 1 for fewer): output value (row, o0, o1, o2) of rows (batch x channels) maps from its window. */

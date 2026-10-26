@@ -56,10 +56,11 @@ typedef struct {
 typedef struct { uint64_t lo, hi; } Span;
 
 /* A value copied between the host and a piece's memory, through its staging memory (an upload before the piece's
-   node `before` in its order: its memory is the value's from there on only). */
+   node `before` in its order: its memory is the value's from there on only; a download of one kept as bfloat16 through
+   its floats at `wide` - 1 in the piece's memory). */
 typedef struct {
     uint32_t value, before;
-    uint64_t stage, bytes;
+    uint64_t stage, bytes, wide;
 } Transfer;
 
 typedef struct {
@@ -105,6 +106,10 @@ typedef struct {
     uint8_t *on;                    /* [value_count]: ON_HOST, ON_DEVICE */
     uint32_t *block_of;             /* [value_count]: a value's block on the device (NONE: none) */
     uint64_t *offset;               /* [value_count]: a value's bytes from its block's start (views of part of one) */
+    uint8_t *half;                  /* [value_count]: a value kept as bfloat16 (its readers products on the matrix
+                                       units and attention, through copies and views) */
+    uint32_t *half_block;           /* [value_count]: the block of a value's copy rounded to bfloat16 (NONE: none) */
+    uint32_t *half_maker;           /* [value_count]: the node that makes it, the first of the products that read it */
     uint8_t **param;                /* [value_count]: the values of host values the device's nodes read as parameters */
     Scratch *scratch;               /* [node_count] */
 } Plan;
@@ -115,6 +120,8 @@ typedef struct {
     SpgGpuBuffer *consts;           /* [value_count]: constants on the device (buffer NULL: not there) */
     SpgGpuBuffer *prepared;         /* [2 node_count]: what a node's kernels made of its constants, once (the forms of
                                        single precision, then of bfloat16) */
+    uint32_t *reader_at, *readers;  /* [value_count + 1], [...]: the nodes reading each value (its inputs' places), the
+                                       graph's outputs as NONE */
     SpgGpuArena **arenas;           /* their memory */
     uint32_t arena_count, arena_cap;
     uint64_t runs;
@@ -135,7 +142,13 @@ typedef struct {
     uint64_t view_at[8];            /* planning: their bytes from input 0's start (as_view_at()) */
     uint64_t scratch;               /* planning: bytes asked for; recording: their address */
     uint64_t param;                 /* planning: bytes of parameter blocks asked for (param_put()) */
+    uint32_t halves;                /* planning: inputs whose copies rounded to bfloat16 the node reads (bits) */
+    uint32_t half_out;              /* planning: outputs the node can write as bfloat16 (bits) */
+    uint32_t half_force;            /* planning: outputs it writes so whatever their readers (copies of bfloat16) */
+    uint64_t half_count[4];         /* (their values: inputs 0 to 3) */
     Piece *piece;                   /* recording: the piece */
+    uint32_t half_ins;              /* planning: inputs it reads as bfloat16 where they are kept so (bits; views'
+                                       input 0 always) */
 } GCtx;
 
 /* A device node: planning (c->record false) checks that the kernels take it (false: the host runs it) and sets its
@@ -263,6 +276,9 @@ static void plan_free(Plan *p) {
     free(p->on);
     free(p->block_of);
     free(p->offset);
+    free(p->half);
+    free(p->half_block);
+    free(p->half_maker);
     if (p->param) {
         for (uint32_t v = 0; p->param && p->param[v] != (uint8_t *)p; v++) free(p->param[v]);
     }
@@ -297,16 +313,20 @@ static Plan *plan_new(const SpingalettGraph *g) {
     p->on = (uint8_t *)calloc(V, 1);
     p->block_of = (uint32_t *)malloc(V * sizeof(uint32_t));
     p->offset = (uint64_t *)calloc(V, sizeof(uint64_t));
+    p->half = (uint8_t *)calloc(V, 1);
+    p->half_block = (uint32_t *)malloc(V * sizeof(uint32_t));
+    p->half_maker = (uint32_t *)malloc(V * sizeof(uint32_t));
     /* (one past the values: the plan itself, which ends the list for plan_free()) */
     p->param = (uint8_t **)calloc(V + 1u, sizeof(uint8_t *));
     p->scratch = (Scratch *)calloc(N, sizeof(Scratch));
-    if (!p->meta || !p->on || !p->block_of || !p->offset || !p->param || !p->scratch) {
+    if (!p->meta || !p->on || !p->block_of || !p->offset || !p->half || !p->half_block || !p->half_maker || !p->param ||
+        !p->scratch) {
         if (p->param) p->param[V] = (uint8_t *)p;
         plan_free(p);
         return NULL;
     }
     p->param[g->value_count] = (uint8_t *)p;
-    for (uint32_t v = 0; v < g->value_count; v++) p->block_of[v] = NONE;
+    for (uint32_t v = 0; v < g->value_count; v++) p->block_of[v] = p->half_block[v] = p->half_maker[v] = NONE;
     const char *min = getenv("SPINGALETT_GRAPH_GPU_MIN");
     p->heavy = min && *min ? strtoull(min, NULL, 10) : HEAVY;
     return p;
@@ -367,9 +387,28 @@ static void fill_output(GCtx *c, uint32_t o, uint64_t bytes, uint32_t value) {
     spg_gpu_fill(c->r->c, b, (size_t)at, (size_t)(bytes & ~(uint64_t)3u), value);
 }
 
+/* Bytes a value takes on the device: its type's, or two a value kept as bfloat16. */
+static uint64_t stored_bytes(const Plan *p, const SpingalettGraph *g, uint32_t v) {
+    const IrTensor *t = &g->tensors[v];
+    return p->half[v] ? 2u * t->count : bytes_of(t);
+}
+
 static Range range_of(const GCtx *c, uint32_t v) {
     const uint64_t a = address_of(c, v);
-    return (Range){a, a + bytes_of(&c->g->tensors[v])};
+    return (Range){a, a + stored_bytes(c->p, c->g, v)};
+}
+
+/* Bytes of an element of input i as the device keeps it. */
+static uint32_t in_size(const GCtx *c, uint32_t i) {
+    const uint32_t v = c->n->inputs[i];
+    return c->p->half[v] ? 2u : (uint32_t)ir_dtype_size(c->g->tensors[v].dtype);
+}
+
+static bool half_in(const GCtx *c, uint32_t i) {
+    return i < c->n->input_count && c->n->inputs[i] != NONE && c->p->half[c->n->inputs[i]];
+}
+static bool half_output(const GCtx *c, uint32_t o) {
+    return o < c->n->output_count && c->n->outputs[o] != NONE && c->p->half[c->n->outputs[o]];
 }
 
 /* ------------------------------------------------------------------------- what device nodes ask while planned */
@@ -443,6 +482,30 @@ static uint64_t prepared_form(GCtx *c, uint32_t i, uint32_t form, uint64_t bytes
 static uint64_t prepared(GCtx *c, uint32_t i, uint64_t bytes, void (*fill)(void *dst, const IrTensor *src, const void *arg),
                          const void *arg) {
     return prepared_form(c, i, 0, bytes, fill, arg);
+}
+
+static void convert_strided(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const int64_t *dims, const int64_t *sx,
+                            const int64_t *sy, Range ry, Range rx);
+
+/* Input i's values rounded to bfloat16 (count of them, contiguous: the operands of products on the matrix units): one
+   copy a value, made by the first node that reads it so, in its piece, kept until the value's last reader. Its
+   address while recorded (0 while planned). */
+static uint64_t half_input(GCtx *c, uint32_t i, uint64_t count) {
+    if (!c->record) {
+        if (i < 4) {
+            c->halves |= 1u << i;
+            c->half_count[i] = count;
+        }
+        return 0;
+    }
+    const uint32_t v = c->n->inputs[i];
+    const Block *b = &c->p->blocks[c->p->half_block[v]];
+    const uint64_t at = c->p->pieces[b->piece].memory.address + b->at;
+    if (c->p->half_maker[v] == c->k) {
+        const int64_t flat[1] = {(int64_t)count}, one[1] = {1};
+        convert_strided(c, at, in_at(c, i), 1, flat, one, one, (Range){at, at + 2u * count}, range_of(c, v));
+    }
+    return at;
 }
 
 /* A block of parameters for a kernel: asked for while planned (bytes), written while recorded: its device address. */
@@ -939,7 +1002,11 @@ static bool op_transpose(GCtx *c, IrTensor *const *in, IrTensor **out) {
     /* (moving axes of size 1 only: a view) */
     const bool view = ir_moves_ones(x->dims, perm, R) && c->g->values[c->n->inputs[0]].kind != VALUE_CONST;
     if (!c->record) {
+        c->half_ins = 1u;
         if (view) as_view(c, 0);
+        /* (bfloat16 copied as such; floats rounded to it where the readers want it) */
+        else if (half_in(c, 0)) c->half_force |= 1u;
+        else if (x->dtype == F32) c->half_out |= 1u;
         return set_shape(out[0], x->dtype, R, dims);
     }
     if (view) return true;
@@ -947,8 +1014,12 @@ static bool op_transpose(GCtx *c, IrTensor *const *in, IrTensor **out) {
     strides_of(R, x->dims, xs);
     strides_of(R, dims, sy);
     for (uint32_t k = 0; k < R; k++) sx[k] = xs[perm[k]];
-    copy_strided(c, out_at(c, 0), in_at(c, 0), R, dims, sx, sy, esize(x), range_of(c, c->n->outputs[0]),
-                 range_of(c, c->n->inputs[0]));
+    if (half_output(c, 0) && !half_in(c, 0))
+        convert_strided(c, out_at(c, 0), in_at(c, 0), R, dims, sx, sy, range_of(c, c->n->outputs[0]),
+                        range_of(c, c->n->inputs[0]));
+    else
+        copy_strided(c, out_at(c, 0), in_at(c, 0), R, dims, sx, sy, in_size(c, 0), range_of(c, c->n->outputs[0]),
+                     range_of(c, c->n->inputs[0]));
     return true;
 }
 
@@ -1004,11 +1075,13 @@ static bool op_slice(GCtx *c, IrTensor *const *in, IrTensor **out) {
     if (a < R && step[a] != 1) run = false;
     for (uint32_t d = a + 1; d < R && run; d++) run = dims[d] == x->dims[d];
     if (!c->record) {
-        if (run) as_view_at(c, 0, (uint64_t)base * esize(x));
+        c->half_ins = 1u;
+        if (run) as_view_at(c, 0, (uint64_t)base * in_size(c, 0));
+        else if (half_in(c, 0)) c->half_force |= 1u;
         return set_shape(out[0], x->dtype, R, dims);
     }
     if (run) return true;
-    copy_strided(c, out_at(c, 0), in_at(c, 0) + (uint64_t)(base * (int64_t)esize(x)), R, dims, sx, sy, esize(x),
+    copy_strided(c, out_at(c, 0), in_at(c, 0) + (uint64_t)(base * (int64_t)in_size(c, 0)), R, dims, sx, sy, in_size(c, 0),
                  range_of(c, c->n->outputs[0]), range_of(c, c->n->inputs[0]));
     return true;
 }
@@ -1085,12 +1158,14 @@ static bool op_split(GCtx *c, IrTensor *const *in, IrTensor **out) {
         if (out[k]) {
             if (!c->record) {
                 if (!set_shape(out[k], x->dtype, x->rank, dims)) return false;
-                if (runs) as_view_at(c, k, (uint64_t)(at * xs[axis]) * esize(x));
+                c->half_ins = 1u;
+                if (runs) as_view_at(c, k, (uint64_t)(at * xs[axis]) * in_size(c, 0));
+                else if (half_in(c, 0) && k < 32) c->half_force |= 1u << k;
             } else if (!runs) {
                 int64_t sy[IR_MAX_RANK];
                 strides_of(x->rank, dims, sy);
-                copy_strided(c, out_at(c, k), in_at(c, 0) + (uint64_t)(at * xs[axis] * (int64_t)esize(x)), x->rank, dims,
-                             xs, sy, esize(x), range_of(c, n->outputs[k]), range_of(c, n->inputs[0]));
+                copy_strided(c, out_at(c, k), in_at(c, 0) + (uint64_t)(at * xs[axis] * (int64_t)in_size(c, 0)), x->rank,
+                             dims, xs, sy, in_size(c, 0), range_of(c, n->outputs[k]), range_of(c, n->inputs[0]));
             }
         }
         at += sizes[k];
@@ -1426,6 +1501,7 @@ static bool op_layernorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
     if (!rows_over(x, axis, x->rank, &push)) return false;
     if ((sc->count != push.len && sc->count != 1) || (bias && bias->count != push.len && bias->count != 1)) return false;
     if (!c->record) {
+        if (spg_gpu_using() == SPG_BACKEND_CUDA) c->half_out |= 1u;
         for (uint32_t o = 1; o < n->output_count; o++)
             if (out[o]) {
                 int64_t md[IR_MAX_RANK];
@@ -1441,7 +1517,7 @@ static bool op_layernorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
     push.b = bias ? in_at(c, 2) : 0;
     push.eps = ir_attr_float(n, "epsilon", 1e-5f);
     push.flags = (sc->count == 1 ? SPG_ROW_A_ONE : 0u) | (bias ? SPG_ROW_B : 0u) |
-                 (bias && bias->count == 1 ? SPG_ROW_B_ONE : 0u);
+                 (bias && bias->count == 1 ? SPG_ROW_B_ONE : 0u) | (half_output(c, 0) ? SPG_ROW_HALF_Y : 0u);
     const Range none = {0, 0};
     row_dispatch(c, &push, rms ? SPG_ROW_RMSNORM : SPG_ROW_LAYERNORM, range_of(c, n->inputs[0]),
                  range_of(c, n->outputs[0]), range_of(c, n->inputs[1]), bias ? range_of(c, n->inputs[2]) : none, none);
@@ -1464,7 +1540,10 @@ static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
         return false;
     if (x->count >= UINT32_MAX || !N || !C) return false;
     const uint64_t pix = x->count / (uint64_t)(N * C);
-    if (!c->record) return set_shape(out[0], F32, x->rank, x->dims);
+    if (!c->record) {
+        if (spg_gpu_using() == SPG_BACKEND_CUDA) c->half_out |= 1u;
+        return set_shape(out[0], F32, x->rank, x->dims);
+    }
     SpgRowPush push;
     memset(&push, 0, sizeof push);
     push.outer = (uint32_t)(N * G);
@@ -1478,7 +1557,7 @@ static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
     push.a = in_at(c, 1);
     push.b = in_at(c, 2);
     push.eps = ir_attr_float(n, "epsilon", 1e-5f);
-    push.flags = sc->count == (uint64_t)G && G != C ? SPG_ROW_BY_GROUP : 0u;
+    push.flags = (sc->count == (uint64_t)G && G != C ? SPG_ROW_BY_GROUP : 0u) | (half_output(c, 0) ? SPG_ROW_HALF_Y : 0u);
     push.act = (uint32_t)act;
     const Range none = {0, 0};
     row_dispatch(c, &push, cl ? SPG_ROW_GROUPNORM_LAST : SPG_ROW_GROUPNORM, range_of(c, n->inputs[0]), range_of(c, n->outputs[0]),
@@ -1544,13 +1623,13 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
     if (pixels * (uint64_t)OC >= ((uint64_t)1 << 31) || xin >= ((uint64_t)1 << 31)) return false;
     const bool pointwise = taps == 1 && geo.s[1] == 1 && geo.s[2] == 1 && !geo.pb[1] && !geo.pb[2] && G == 1 &&
                            oh == h && ow == w;
-    SpgConvGeometry info;
-    if (!pointwise && !spg_conv_geometry(NULL, &info, (uint32_t)h, (uint32_t)w, (uint32_t)C, (uint32_t)oh, (uint32_t)ow,
-                                         (uint32_t)OC, (uint32_t)G, (uint32_t)kh, (uint32_t)kw, (uint32_t)geo.s[1],
-                                         (uint32_t)geo.s[2], (uint32_t)geo.pb[1], (uint32_t)geo.pb[2]))
-        return false;
-    /* (in bfloat16: the filters' copy, the input rounded as it is transposed) */
-    const bool half = product_bf16((uint32_t)pixels, (uint32_t)OG, (uint32_t)K);
+    const size_t geo_size = pointwise ? 0 : spg_conv_forward(NULL, (uint32_t)h, (uint32_t)w, (uint32_t)C, (uint32_t)oh,
+                                                             (uint32_t)ow, (uint32_t)G, (uint32_t)kh, (uint32_t)kw,
+                                                             (uint32_t)geo.s[1], (uint32_t)geo.s[2], (uint32_t)geo.pb[1],
+                                                             (uint32_t)geo.pb[2]);
+    if (!pointwise && !geo_size) return false;
+    /* (in bfloat16: the filters' copy, the input rounded as it is transposed, or kept so) */
+    const bool half = (cl && half_in(c, 0)) || product_bf16((uint32_t)pixels, (uint32_t)OG, (uint32_t)K);
     const uint32_t width = half ? 2u : 4u;
     const FilterShape fs = {(uint64_t)OC, (uint64_t)CG, (uint64_t)taps, half};
     const uint64_t wt = prepared_form(c, 1, half ? 1u : 0u, (uint64_t)OC * (uint64_t)K * width, filters_ohwi, &fs);
@@ -1562,31 +1641,31 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
         dims[2] = X->rank == 3 ? OC : ow;
         dims[3] = OC;
     }
-    /* scratch: the input channels last (or rounded to bfloat16), the output before its transpose */
-    const uint64_t in_bytes = cl && !half ? 0 : align_up(xin * width), out_bytes = cl ? 0 : align_up(pixels * (uint64_t)OC * 4u);
+    /* scratch: the input channels last (rounded to bfloat16 or not), the output before its transpose; channels last
+       in bfloat16, the input's copy so rounded */
+    const uint64_t in_bytes = cl ? 0 : align_up(xin * width), out_bytes = cl ? 0 : align_up(pixels * (uint64_t)OC * 4u);
+    const uint64_t x16 = cl && half ? (half_in(c, 0) ? in_at(c, 0) : half_input(c, 0, xin)) : 0;
     uint32_t *table = NULL;
     if (!pointwise) {
-        table = (uint32_t *)calloc(info.size, sizeof(uint32_t));
+        table = (uint32_t *)calloc(geo_size, sizeof(uint32_t));
         if (!table) return false;
-        spg_conv_geometry(table, &info, (uint32_t)h, (uint32_t)w, (uint32_t)C, (uint32_t)oh, (uint32_t)ow, (uint32_t)OC,
-                          (uint32_t)G, (uint32_t)kh, (uint32_t)kw, (uint32_t)geo.s[1], (uint32_t)geo.s[2],
-                          (uint32_t)geo.pb[1], (uint32_t)geo.pb[2]);
+        spg_conv_forward(table, (uint32_t)h, (uint32_t)w, (uint32_t)C, (uint32_t)oh, (uint32_t)ow, (uint32_t)G,
+                         (uint32_t)kh, (uint32_t)kw, (uint32_t)geo.s[1], (uint32_t)geo.s[2], (uint32_t)geo.pb[1],
+                         (uint32_t)geo.pb[2]);
     }
-    const uint64_t geo_at = pointwise ? 0 : param_put(c, table, (uint32_t)(info.size * sizeof(uint32_t)));
+    const uint64_t geo_at = pointwise ? 0 : param_put(c, table, (uint32_t)(geo_size * sizeof(uint32_t)));
     free(table);
     if (!c->record) {
         c->scratch = in_bytes + out_bytes;
+        if (cl && half) c->half_out |= 1u, c->half_ins = 1u;
         return set_shape(out[0], F32, X->rank, dims);
     }
-    const uint64_t xs = cl && !half ? in_at(c, 0) : c->scratch, ys = cl ? out_at(c, 0) : c->scratch + in_bytes;
+    const uint64_t xs = cl ? (half ? x16 : in_at(c, 0)) : c->scratch, ys = cl ? out_at(c, 0) : c->scratch + in_bytes;
     const Range rxs = cl && !half ? range_of(c, n->inputs[0]) : (Range){xs, xs + xin * width};
     const Range rys = cl ? range_of(c, n->outputs[0]) : (Range){ys, ys + pixels * (uint64_t)OC * 4u};
     /* channels last: [N][pixels][C] from [N][C][pixels] (or as they are, rounded to bfloat16) */
     const int64_t ip = h * w, op = oh * ow;
-    if (cl && half) {
-        const int64_t flat[1] = {(int64_t)xin}, one[1] = {1};
-        convert_strided(c, xs, in_at(c, 0), 1, flat, one, one, rxs, range_of(c, n->inputs[0]));
-    } else if (!cl) {
+    if (!cl) {
         const int64_t d3[3] = {N, ip, C}, sx[3] = {C * ip, 1, ip}, sy[3] = {ip * C, C, 1};
         if (half) convert_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, rxs, range_of(c, n->inputs[0]));
         else copy_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, 4u, rxs, range_of(c, n->inputs[0]));
@@ -1602,12 +1681,12 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
     reads(&a, rxs);
     reads(&a, rw);
     if (Bias) reads(&a, range_of(c, n->inputs[2]));
-    if (!pointwise) reads(&a, (Range){geo_at, geo_at + info.size * 4u});
+    if (!pointwise) reads(&a, (Range){geo_at, geo_at + geo_size * 4u});
     writes(&a, rys);
     need(c->r, &a);
     SpgGemmMode m = {pointwise ? SPG_A_ROW : SPG_A_CONV, SPG_B_COL, SPG_EPI_BIAS_ACT, (uint32_t)act,
                      pointwise ? 1u : (uint32_t)G, false, pointwise || (CG % 4 == 0 && C % 4 == 0), true, 0,
-                     pixels * (uint64_t)OC, half, half ? 3u : 0u, false, false};
+                     pixels * (uint64_t)OC, half, half ? (half_output(c, 0) ? 7u : 3u) : 0u, false, false};
     m.wide_a = half && (pointwise || (CG % 8 == 0 && C % 8 == 0));
     m.wide_b = half;
     spg_gemm(c->r->c, &push, &m);
@@ -1651,7 +1730,7 @@ static bool op_pool(GCtx *c, IrTensor *const *in, IrTensor **out) {
         dims[2] = g.out[2];
         dims[3] = xc.dims[1];
     }
-    uint64_t total = (uint64_t)X->dims[0] * (uint64_t)X->dims[1];
+    uint64_t total = (uint64_t)X->dims[0] * (uint64_t)xc.dims[1];
     for (uint32_t a = 0; a < 3; a++) total *= (uint64_t)g.out[a];
     if (total >= UINT32_MAX || X->count >= UINT32_MAX) return false;
     if (!c->record) return set_shape(out[0], F32, X->rank, dims);
@@ -1942,7 +2021,12 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
         broadcast_strides(m, 4, full, ms);
         for (uint32_t d = 0; d < 4; d++) st[12 + 4 * k + d] = (uint32_t)ms[d];
     }
+    const bool flash = spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16() &&
+                       spg_gpu_kernel_built(SPG_KERNEL_gflash);
     if (!c->record) {
+        /* (inputs kept as bfloat16 only for gflash, which can write its output so) */
+        if ((half_in(c, 0) || half_in(c, 1) || half_in(c, 2)) && !flash) return false;
+        if (flash) c->half_out |= 1u, c->half_ins = 7u;
         param_put(c, st, sizeof st);
         return set_shape(out[0], F32, orank, odims);
     }
@@ -1954,9 +2038,11 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
     push.flags = (mask ? (mask->dtype == BOOL ? SPG_GATTN_BOOL : SPG_GATTN_MASK) : 0u) | (keep ? SPG_GATTN_KEEP : 0u) |
                  (ir_attr_int(n, "safe", 0) ? SPG_GATTN_SAFE : 0u);
     bool vec = (uint32_t)D == unit && push.q % 16u == 0 && push.k % 16u == 0 && push.v % 16u == 0 && push.y % 16u == 0;
-    for (uint32_t k = 0; k < 12 && vec; k++) vec = st[k] % 4u == 0;
+    for (uint32_t k = 0; k < 12 && vec; k++) vec = st[k] % 8u == 0;
     vec = vec && st[20] == 1u;
     if (vec) push.flags |= SPG_GATTN_VEC;
+    push.flags |= (half_in(c, 0) ? SPG_GATTN_HALF_Q : 0u) | (half_in(c, 1) ? SPG_GATTN_HALF_K : 0u) |
+                  (half_in(c, 2) ? SPG_GATTN_HALF_V : 0u) | (half_output(c, 0) ? SPG_GATTN_HALF_Y : 0u);
     Access a = {0};
     for (uint32_t i = 0; i < n->input_count && i < 5; i++)
         if (n->inputs[i] != NONE) reads(&a, range_of(c, n->inputs[i]));
@@ -1964,8 +2050,7 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
     const uint32_t spec[1] = {unit};
     /* in bfloat16 on the matrix units (gflash: blocks of 128 queries, of 32 for heads of 128), else in single
        precision (gattn) */
-    if (spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16() &&
-        spg_gpu_kernel_built(SPG_KERNEL_gflash)) {
+    if (flash) {
         /* (blocks of 64 queries where those of 128 would leave the device short of blocks) */
         const bool half_rows = unit <= 64u && (uint64_t)((S + 127) / 128) * (uint64_t)(B * H) < 64u;
         const uint32_t rows = unit > 64u ? 32u : half_rows ? 64u : 128u, spec2[2] = {unit, half_rows ? 1u : 2u};
@@ -2058,27 +2143,28 @@ static bool linear_product(GCtx *c, IrTensor *const *in, IrTensor **out, bool tr
     int64_t dims[IR_MAX_RANK];
     for (uint32_t d = 0; d < x->rank; d++) dims[d] = d + 1 < x->rank ? x->dims[d] : N;
     const bool constant = c->g->values[n->inputs[1]].kind == VALUE_CONST;
-    /* in bfloat16: the weights' copy as N x K, the input rounded into scratch memory */
-    if (constant && product_bf16((uint32_t)M, (uint32_t)N, (uint32_t)K)) {
+    /* in bfloat16: the weights' copy as N x K, the input as it is kept so, or its copy rounded; the output kept so
+       where its readers want it */
+    if (constant && (half_in(c, 0) || product_bf16((uint32_t)M, (uint32_t)N, (uint32_t)K))) {
         static const int as_is = 1;
         const uint64_t w16 = prepared_form(c, 1, 1, (uint64_t)K * (uint64_t)N * 2u, transposed_bf16,
                                            trans ? &as_is : NULL);
         if (!w16) return false;
+        const uint64_t a16 = half_in(c, 0) ? in_at(c, 0) : half_input(c, 0, M * (uint64_t)K);
         if (!c->record) {
-            c->scratch = M * (uint64_t)K * 2u;
+            c->half_out |= 1u;
+            c->half_ins = 1u;
             return set_shape(out[0], F32, x->rank, dims);
         }
-        const int64_t flat[1] = {(int64_t)(M * (uint64_t)K)}, one[1] = {1};
-        const Range r16 = {c->scratch, c->scratch + M * (uint64_t)K * 2u};
-        convert_strided(c, c->scratch, in_at(c, 0), 1, flat, one, one, r16, range_of(c, n->inputs[0]));
+        const Range r16 = {a16, a16 + M * (uint64_t)K * 2u};
         SpgGemmPush push = {
-            .a = c->scratch, .b = w16, .c = out_at(c, 0), .e0 = bias ? in_at(c, 2) : 0, .M = (uint32_t)M, .N = (uint32_t)N,
+            .a = a16, .b = w16, .c = out_at(c, 0), .e0 = bias ? in_at(c, 2) : 0, .M = (uint32_t)M, .N = (uint32_t)N,
             .K = (uint32_t)K, .lda = (uint32_t)K, .ldb = (uint32_t)K, .ldc = (uint32_t)N, .alpha = 1.0f,
             .flags = bias ? SPG_GEMM_BIAS : 0u,
         };
         const Range none = {0, 0}, rw = {w16, w16 + (uint64_t)K * (uint64_t)N * 2u};
         gemm_half(c, &push, SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, (uint32_t)act, 1, r16, rw,
-                  bias ? range_of(c, n->inputs[2]) : none, range_of(c, n->outputs[0]), 3u);
+                  bias ? range_of(c, n->inputs[2]) : none, range_of(c, n->outputs[0]), half_output(c, 0) ? 7u : 3u);
         return true;
     }
     /* constant weights as N x K, the layout of the products' forward kernels (made once) */
@@ -2443,7 +2529,9 @@ static bool piece_close(SpingalettGraph *g, GpuGraph *gg, Plan *p, const uint32_
         if (!grow((void **)&pc->downs, &pc->down_cap, pc->down_count, sizeof(Transfer)))
             return fail("graph on the GPU: out of memory");
         const uint64_t bytes = bytes_of(&g->tensors[want[k]]);
-        pc->downs[pc->down_count++] = (Transfer){want[k], pc->node_count, pc->staged, bytes};
+        /* (a value kept as bfloat16, which a node the host runs reads: widened first) */
+        const uint64_t wide = p->half[want[k]] ? piece_take(pc, bytes) + 1u : 0;
+        pc->downs[pc->down_count++] = (Transfer){want[k], pc->node_count, pc->staged, bytes, wide};
         pc->staged += align_up(bytes ? bytes : 1u);
     }
     if (!pc->node_count && !pc->up_count && !pc->down_count) {
@@ -2465,7 +2553,7 @@ static bool piece_close(SpingalettGraph *g, GpuGraph *gg, Plan *p, const uint32_
     Recorder r;
     memset(&r, 0, sizeof r);
     r.c = pc->commands;
-    GCtx c = {g, gg, p, 0, NULL, true, &r, 0, 0, 0, {0}, 0, 0, pc};
+    GCtx c = {g, gg, p, 0, NULL, true, &r, 0, 0, 0, {0}, 0, 0, 0, 0, 0, {0}, pc};
     uint32_t up = 0;
     for (uint32_t j = 0; j < pc->node_count; j++) {
         /* the uploads this node is the first to read */
@@ -2490,6 +2578,22 @@ static bool piece_close(SpingalettGraph *g, GpuGraph *gg, Plan *p, const uint32_
     for (uint32_t k = 0; k < pc->down_count; k++) {
         const Transfer *t = &pc->downs[k];
         Access a = {0};
+        if (t->wide) {
+            SpgGewPush push;
+            memset(&push, 0, sizeof push);
+            push.y = pc->memory.address + t->wide - 1u;
+            push.a = push.b = push.c = address_of(&c, t->value);
+            push.total = (uint32_t)g->tensors[t->value].count;
+            const uint32_t spec[3] = {SPG_GEW_COPY, SPG_T_BF16 | SPG_T_F32 << 12, 1u};
+            reads(&a, range_of(&c, t->value));
+            writes(&a, (Range){push.y, push.y + t->bytes});
+            dispatch(&c, &a, SPG_KERNEL_gew, spec, 3, &push, sizeof push, group_count(push.total, 256u), 1, 1);
+            memset(&a, 0, sizeof a);
+            reads(&a, (Range){push.y, push.y + t->bytes});
+            need(&r, &a);
+            spg_gpu_copy(pc->commands, &pc->memory, t->wide - 1u, &pc->staging, t->stage, t->bytes);
+            continue;
+        }
         reads(&a, range_of(&c, t->value));
         need(&r, &a);
         const uint32_t b = p->block_of[t->value];
@@ -2546,7 +2650,7 @@ static bool plan_device(SpingalettGraph *g, GpuGraph *gg, Plan *p, uint32_t k, G
     if (is_view((IrOp)n->op) && (n->inputs[0] == NONE || !has_device(p, n->inputs[0]))) return false;
     if (!device_input && !large && !is_view((IrOp)n->op)) {
         /* the outputs' sizes decide: planned to see them */
-        GCtx probe = {g, gg, p, k, n, false, NULL, 0, 0, 0, {0}, 0, 0, NULL};
+        GCtx probe = {g, gg, p, k, n, false, NULL, 0, 0, 0, {0}, 0, 0, 0, 0, 0, {0}, NULL};
         IrTensor saved[32];
         IrTensor *in[32], *out[32];
         for (uint32_t i = 0; i < n->input_count; i++) in[i] = n->inputs[i] == NONE ? NULL : &g->tensors[n->inputs[i]];
@@ -2564,14 +2668,119 @@ static bool plan_device(SpingalettGraph *g, GpuGraph *gg, Plan *p, uint32_t k, G
     IrTensor *in[32], *out[32];
     for (uint32_t i = 0; i < n->input_count; i++) in[i] = n->inputs[i] == NONE ? NULL : &g->tensors[n->inputs[i]];
     for (uint32_t o = 0; o < n->output_count; o++) out[o] = n->outputs[o] == NONE ? NULL : &g->tensors[n->outputs[o]];
-    *c = (GCtx){g, gg, p, k, n, false, NULL, 0, 0, 0, {0}, 0, 0, NULL};
+    *c = (GCtx){g, gg, p, k, n, false, NULL, 0, 0, 0, {0}, 0, 0, 0, 0, 0, {0}, NULL};
     IrTensor saved[32];
     for (uint32_t o = 0; o < n->output_count; o++)
         if (out[o]) saved[o] = *out[o];
-    if (!op(c, in, out)) {
+    bool ok = op(c, in, out);
+    /* (an input kept as bfloat16 that the node's kernels would read as floats: the host's, widened) */
+    for (uint32_t i = 0; ok && i < n->input_count; i++) {
+        const uint32_t v = n->inputs[i];
+        ok = v == NONE || !p->half[v] || (i < 32 && (c->half_ins >> i & 1u)) || (i == 0 && c->views);
+    }
+    if (!ok) {
         for (uint32_t o = 0; o < n->output_count; o++)
             if (out[o]) *out[o] = saved[o];
         return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- values kept as bfloat16 */
+
+/* Values the graph declares: their number of values (0 when a size is unknown). */
+static uint64_t declared_count(const SpingalettGraph *g, uint32_t v) {
+    const IrValue *x = &g->values[v];
+    if (!x->declared) return 0;
+    uint64_t count = 1;
+    for (uint32_t d = 0; d < x->rank; d++) {
+        if (x->dims[d] < 0) return 0;
+        count *= (uint64_t)x->dims[d];
+    }
+    return count;
+}
+
+/* Whether products run in bfloat16 on the matrix units with values kept as such between them (CUDA's kernels). */
+static bool half_values(void) {
+    return spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_using() == SPG_BACKEND_CUDA &&
+           spg_gpu_mma_bf16() && spg_gpu_kernel_built(SPG_KERNEL_gcvt) && spg_gpu_kernel_built(SPG_KERNEL_gflash);
+}
+
+/* Whether node n reads v (only as its input `slot`) as a product's A operand on the matrix units or as attention's
+   input in bfloat16, by the shapes the graph infers. */
+static bool half_reader(const SpingalettGraph *g, const IrNode *n, uint32_t v) {
+    uint32_t slot = NONE;
+    for (uint32_t i = 0; i < n->input_count; i++)
+        if (n->inputs[i] == v) {
+            if (slot != NONE) return false;
+            slot = i;
+        }
+    const uint64_t count = declared_count(g, v);
+    if (slot == NONE || !count) return false;
+    switch ((IrOp)n->op) {
+        case IR_Linear: case IR_Gemm: {
+            if (slot != 0 || n->input_count < 2 || g->values[n->inputs[1]].kind != VALUE_CONST) return false;
+            const IrValue *W = &g->values[n->inputs[1]];
+            bool trans;
+            if (n->op == IR_Gemm) {
+                if (ir_attr_int(n, "transA", 0) || ir_attr_float(n, "alpha", 1.0f) != 1.0f) return false;
+                if (n->input_count > 2 && n->inputs[2] != NONE) {
+                    const uint64_t cc = declared_count(g, n->inputs[2]);
+                    if (ir_attr_float(n, "beta", 1.0f) != 1.0f || !cc ||
+                        cc != (uint64_t)W->dims[ir_attr_int(n, "transB", 0) ? 0 : 1])
+                        return false;
+                }
+                trans = ir_attr_int(n, "transB", 0) != 0;
+            } else {
+                trans = ir_attr_int(n, "trans_b", 0) != 0;
+            }
+            if (W->rank != 2) return false;
+            const int64_t K = trans ? W->dims[1] : W->dims[0], N = trans ? W->dims[0] : W->dims[1];
+            return K > 0 && count % (uint64_t)K == 0 && product_bf16((uint32_t)(count / (uint64_t)K), (uint32_t)N, (uint32_t)K);
+        }
+        case IR_Conv: {
+            if (slot != 0 || !ir_attr_int(n, "channels_last", 0) || n->input_count < 2 ||
+                g->values[n->inputs[1]].kind != VALUE_CONST || n->outputs[0] == NONE)
+                return false;
+            const IrValue *W = &g->values[n->inputs[1]], *Y = &g->values[n->outputs[0]];
+            const uint64_t out_count = declared_count(g, n->outputs[0]);
+            const int64_t G = ir_attr_int(n, "group", 1), OC = W->dims[0];
+            if (!out_count || G < 1 || OC % G || !Y->rank) return false;
+            uint64_t K = (uint64_t)W->dims[1];
+            for (uint32_t d = 2; d < W->rank; d++) K *= (uint64_t)W->dims[d];
+            return product_bf16((uint32_t)(out_count / (uint64_t)OC), (uint32_t)(OC / G), (uint32_t)K);
+        }
+        case IR_FusedAttention: {
+            if (slot > 2 || n->input_count < 3) return false;
+            const IrValue *Q = &g->values[n->inputs[0]], *V = &g->values[n->inputs[2]];
+            if (!Q->declared || !V->declared || !Q->rank || !V->rank) return false;
+            const int64_t D = Q->dims[Q->rank - 1], Dv = V->dims[V->rank - 1];
+            return D > 0 && D <= 128 && D == Dv;
+        }
+        default:
+            return false;
+    }
+}
+
+/* Whether every reader of v reads it so (copies and views passing it on to such readers), none the graph's outputs. */
+static bool half_readers(const GpuGraph *gg, const SpingalettGraph *g, uint32_t v, uint32_t depth) {
+    if (depth > 8 || gg->reader_at[v] == gg->reader_at[v + 1]) return false;
+    for (uint32_t r = gg->reader_at[v]; r < gg->reader_at[v + 1]; r++) {
+        const uint32_t k = gg->readers[r];
+        if (k == NONE) return false;
+        const IrNode *n = &g->nodes[k];
+        switch ((IrOp)n->op) {
+            case IR_Reshape: case IR_Flatten: case IR_Squeeze: case IR_Unsqueeze: case IR_Identity: case IR_Transpose:
+            case IR_Slice: case IR_Split:
+                if (n->inputs[0] != v) return false;
+                for (uint32_t i = 1; i < n->input_count; i++)
+                    if (n->inputs[i] == v) return false;
+                for (uint32_t o = 0; o < n->output_count; o++)
+                    if (n->outputs[o] != NONE && !half_readers(gg, g, n->outputs[o], depth + 1)) return false;
+                break;
+            default:
+                if (!half_reader(g, n, v)) return false;
+        }
     }
     return true;
 }
@@ -2593,7 +2802,7 @@ static bool place_device(SpingalettGraph *g, Plan *p, uint32_t k, const GCtx *c)
         const uint64_t bytes = bytes_of(&g->tensors[v]);
         const uint32_t b = block_new(p, bytes);
         if (b == NONE || !grow((void **)&pc->ups, &pc->up_cap, pc->up_count, sizeof(Transfer))) return false;
-        pc->ups[pc->up_count++] = (Transfer){v, pc->node_count, pc->staged, bytes};
+        pc->ups[pc->up_count++] = (Transfer){v, pc->node_count, pc->staged, bytes, 0};
         pc->staged += align_up(bytes ? bytes : 1u);
         p->block_of[v] = b;
         p->on[v] |= ON_DEVICE;
@@ -2615,13 +2824,23 @@ static bool place_device(SpingalettGraph *g, Plan *p, uint32_t k, const GCtx *c)
             if (g->values[src].kind == VALUE_CONST) return false;
             p->block_of[v] = p->block_of[src];
             p->offset[v] = p->offset[src] + (o < 8 ? c->view_at[o] : 0);
+            p->half[v] = p->half[src];
             p->blocks[p->block_of[v]].refs++;
         } else {
-            const uint32_t b = block_new(p, bytes_of(&g->tensors[v]));
+            /* kept as bfloat16: a copy of such, or what its readers all read so */
+            p->half[v] = o < 32 && ((c->half_force >> o & 1u) ||
+                                    ((c->half_out >> o & 1u) && half_values() && half_readers(c->gg, g, v, 0)));
+            const uint32_t b = block_new(p, stored_bytes(p, g, v));
             if (b == NONE) return false;
             p->block_of[v] = b;
         }
         p->on[v] = ON_DEVICE;
+    }
+    for (uint32_t i = 0; i < 4 && i < n->input_count; i++) {
+        const uint32_t v = n->inputs[i];
+        if (!(c->halves >> i & 1u) || v == NONE || p->half_block[v] != NONE) continue;
+        if ((p->half_block[v] = block_new(p, 2u * c->half_count[i])) == NONE) return false;
+        p->half_maker[v] = k;
     }
     if (c->scratch) {
         Piece *cur = &p->pieces[p->piece_count - 1u];
@@ -2644,6 +2863,7 @@ static void release_after(SpingalettGraph *g, Plan *p, uint32_t k) {
         bool again = false;             /* (an input read twice by the node: once) */
         for (uint32_t j = 0; j < i && !again; j++) again = n->inputs[j] == v;
         if (!again && p->block_of[v] != NONE) block_drop(p, p->block_of[v]);
+        if (!again && p->half_block[v] != NONE) block_drop(p, p->half_block[v]);
     }
     for (uint32_t o = 0; o < n->output_count; o++) {
         const uint32_t v = n->outputs[o];
@@ -2779,6 +2999,40 @@ static GpuGraph *gpu_of(SpingalettGraph *g) {
         free(gg);
         return NULL;
     }
+    /* the readers of each value (the graph's outputs NONE), for the values kept as bfloat16 */
+    gg->reader_at = (uint32_t *)calloc(g->value_count + 2u, sizeof(uint32_t));
+    uint64_t total = g->output_count;
+    for (uint32_t k = 0; k < g->node_count; k++) total += g->nodes[k].input_count;
+    gg->readers = (uint32_t *)malloc((total ? total : 1u) * sizeof(uint32_t));
+    if (!gg->reader_at || !gg->readers) {
+        free(gg->reader_at);
+        free(gg->readers);
+        free(gg->consts);
+        free(gg->prepared);
+        free(gg);
+        return NULL;
+    }
+    for (uint32_t k = 0; k < g->node_count; k++)
+        for (uint32_t i = 0; i < g->nodes[k].input_count; i++)
+            if (g->nodes[k].inputs[i] != NONE) gg->reader_at[g->nodes[k].inputs[i] + 1u]++;
+    for (uint32_t o = 0; o < g->output_count; o++) gg->reader_at[g->outputs[o] + 1u]++;
+    for (uint32_t v = 0; v < g->value_count; v++) gg->reader_at[v + 1u] += gg->reader_at[v];
+    uint32_t *fill = (uint32_t *)calloc(g->value_count + 1u, sizeof(uint32_t));
+    if (!fill) {
+        free(gg->reader_at);
+        free(gg->readers);
+        free(gg->consts);
+        free(gg->prepared);
+        free(gg);
+        return NULL;
+    }
+    for (uint32_t k = 0; k < g->node_count; k++)
+        for (uint32_t i = 0; i < g->nodes[k].input_count; i++) {
+            const uint32_t v = g->nodes[k].inputs[i];
+            if (v != NONE) gg->readers[gg->reader_at[v] + fill[v]++] = k;
+        }
+    for (uint32_t o = 0; o < g->output_count; o++) gg->readers[gg->reader_at[g->outputs[o]] + fill[g->outputs[o]]++] = NONE;
+    free(fill);
     gg->backend = spg_gpu_using();
     g->gpu = gg;
     return gg;
@@ -2861,6 +3115,8 @@ void spingalett_gpu_graph_free(SpingalettGraph *g) {
     free(gg->arenas);
     free(gg->consts);
     free(gg->prepared);
+    free(gg->reader_at);
+    free(gg->readers);
     free(gg);
     g->gpu = NULL;
     spg_gpu_use(saved);

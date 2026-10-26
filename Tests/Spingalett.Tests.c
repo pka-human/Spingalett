@@ -6928,16 +6928,19 @@ static float case_float(const SpingalettTensor *t, uint64_t i) {
     return h & 0x8000 ? -v : v;
 }
 
-/* Every case of Tests/Data/graph_cases.bin: ONNX's conformance tests of single operators, each graph run on its
-   inputs against the reference's outputs (floats within the case's tolerances, integers and booleans exactly),
-   on one thread and on four, which give the same bits; with gpu (COMPUTE_CUDA or COMPUTE_VULKAN) on the GPU, twice
-   (the second run replays the first's plan), which give the same bits. */
-static void operator_cases(ComputeMode gpu) {
+/* Every case of Tests/Data/graph_cases.bin (ONNX's conformance tests of single operators) or graph_blocks.bin (small
+   networks, Tests/make_graph_tests.py), each graph run on its inputs against the reference's outputs (floats within
+   the case's tolerances, integers and booleans exactly), on one thread and on four, which give the same bits; with gpu
+   (COMPUTE_CUDA or COMPUTE_VULKAN) on the GPU, twice (the second run replays the first's plan), which give the same
+   bits; with bf16 there in bfloat16 (floats within 3% of the output's largest magnitude). */
+static void operator_cases(const char *name_of_file, ComputeMode gpu, bool bf16) {
     const bool on_gpu = gpu == COMPUTE_CUDA || gpu == COMPUTE_VULKAN;
     /* (on the GPU every node its kernels take, however small) */
     if (on_gpu) setenv_("SPINGALETT_GRAPH_GPU_MIN", "0");
+    const PrecisionMode precision = spingalett_get_gpu_precision();
+    if (bf16) spingalett_set_gpu_precision(PRECISION_BFLOAT16);
     char path[512];
-    snprintf(path, sizeof path, "%s/graph_cases.bin", SPINGALETT_TEST_DATA_DIR);
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, name_of_file);
     size_t size = 0;
     uint8_t *file = read_all(path, &size);
     CHECK(file && size >= 12 && !memcmp(file, "SGCASES1", 8), "%s: no cases", path);
@@ -7019,9 +7022,12 @@ static void operator_cases(ComputeMode gpu) {
                     continue;
                 }
                 if (ref->dtype == SPINGALETT_DTYPE_FLOAT32 || ref->dtype == SPINGALETT_DTYPE_FLOAT16) {
+                    float most = 0.0f;
+                    for (uint64_t i = 0; bf16 && i < count; i++) most = fmaxf(most, fabsf(case_float(ref, i)));
                     for (uint64_t i = 0; ok && i < count; i++) {
                         const float a = case_float(got, i), b = case_float(ref, i);
-                        ok = (isnan(a) && isnan(b)) || a == b || fabsf(a - b) <= atol + rtol * fabsf(b);
+                        ok = (isnan(a) && isnan(b)) || a == b ||
+                             fabsf(a - b) <= atol + (bf16 ? 0.03f * most : rtol * fabsf(b));
                     }
                 } else {
                     ok = !bytes || !memcmp(got->data, ref->data, bytes);
@@ -7038,11 +7044,19 @@ static void operator_cases(ComputeMode gpu) {
         spingalett_graph_free(g);
     }
     if (on_gpu) setenv_("SPINGALETT_GRAPH_GPU_MIN", "");
-    CHECK(!wrong, "%d of %d operator cases fail%s", wrong, run, on_gpu ? " on the GPU" : "");
-    printf("  %d of ONNX's conformance cases%s\n", run, on_gpu ? " on the GPU" : "");
+    spingalett_set_gpu_precision(precision);
+    CHECK(!wrong, "%d of %d cases of %s fail%s", wrong, run, name_of_file, on_gpu ? " on the GPU" : "");
+    printf("  %d cases of %s%s%s\n", run, name_of_file, on_gpu ? " on the GPU" : "", bf16 ? " in bfloat16" : "");
     free(ins);
     free(refs);
     free(file);
+}
+
+/* The cases of graphs on the GPU: ONNX's, then the blocks in single precision and in bfloat16. */
+static void graph_cases_gpu(ComputeMode gpu) {
+    operator_cases("graph_cases.bin", gpu, false);
+    operator_cases("graph_blocks.bin", gpu, false);
+    operator_cases("graph_blocks.bin", gpu, true);
 }
 
 /* Every case of Tests/Data/chat_cases.txt (Tests/make_chat_tests.py): a template of Tests/Data/chat rendering a
@@ -9810,7 +9824,8 @@ int main(int argc, char **argv) {
     }
     if (!*only || !strcmp(only, "operators")) {
         printf("[graphs of operators]\n");
-        operator_cases(COMPUTE_SINGLE_THREADED);
+        operator_cases("graph_cases.bin", COMPUTE_SINGLE_THREADED, false);
+        operator_cases("graph_blocks.bin", COMPUTE_SINGLE_THREADED, false);
     }
     if (!*only || !strcmp(only, "chat")) {
         printf("[chat templates]\n");
@@ -9967,7 +9982,7 @@ int main(int argc, char **argv) {
         const ComputeMode mode = backend ? COMPUTE_CUDA : COMPUTE_VULKAN;
         printf("[graphs of operators on the GPU, %s]\n", backend ? "CUDA" : "Vulkan");
         if (!(backend ? spingalett_cuda_device() : spingalett_gpu_device())) printf("  skipped: no device\n");
-        else operator_cases(mode);
+        else graph_cases_gpu(mode);
         spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
     }
     for (int backend = 0; backend < 2; backend++) {
@@ -10023,7 +10038,7 @@ int main(int argc, char **argv) {
             gpu_resume();
             gpu_session(false);
             gpu_session(true);
-            operator_cases(gpu_mode);
+            graph_cases_gpu(gpu_mode);
             gpu_model_predict();
             gpu_model_exact();
             for (int k = 0; k < 3; k++) gpu_session_int(k);

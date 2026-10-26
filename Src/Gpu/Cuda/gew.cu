@@ -16,6 +16,7 @@ DEVICE float load(uint64_t x, uint32_t i, uint32_t type) {
         case SPG_T_I8: return (float)((const signed char *)x)[i];
         case SPG_T_I32: return (float)((const int32_t *)x)[i];
         case SPG_T_I64: return (float)((const int64_t *)x)[i];
+        case SPG_T_BF16: return from_bf16(((const uint16_t *)x)[i]);
         default: return F(x)[i];
     }
 }

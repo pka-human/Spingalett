@@ -79,4 +79,7 @@ typedef struct {
 bool spg_conv_geometry(uint32_t *geo, SpgConvGeometry *info, uint32_t h, uint32_t w, uint32_t in, uint32_t oh,
                        uint32_t ow, uint32_t out, uint32_t groups, uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw,
                        uint32_t ph, uint32_t pw);
+/* The forward geometry alone (inference: any stride), unless geo is NULL; its uints, 0 when a tap does not fit. */
+size_t spg_conv_forward(uint32_t *geo, uint32_t h, uint32_t w, uint32_t in, uint32_t oh, uint32_t ow, uint32_t groups,
+                        uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw);
 

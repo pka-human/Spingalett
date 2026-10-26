@@ -3,7 +3,7 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
-/* gcopy.comp: values of graphs copied through strides, elements of SIZE bytes (spec 0: 1, 4, 8 or 16). 256 threads,
+/* gcopy.comp: values of graphs copied through strides, elements of SIZE bytes (spec 0: 1, 2, 4, 8 or 16). 256 threads,
    a grid-stride loop. */
 
 #include "common.cuh"
@@ -32,6 +32,7 @@ DEVICE void copy_all(const SpgCopyPush &p) {
 KERNEL(gcopy, SpgCopyPush) {
     switch (spec.v[0]) {
         case 1u: copy_all<uint8_t>(p); break;
+        case 2u: copy_all<uint16_t>(p); break;
         case 8u: copy_all<uint64_t>(p); break;
         case 16u: copy_all<int4_>(p); break;
         default: copy_all<uint32_t>(p); break;
