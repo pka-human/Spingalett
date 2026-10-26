@@ -1454,15 +1454,15 @@ static bool windows_of(GCtx *c, const IrTensor *x, const int64_t *kernel, IrGeom
 }
 
 /* OIHW filters as OHWI: [out][kh][kw][in a group] (prepared()), of floats or (half) bfloat16. */
-typedef struct { uint64_t O, I, taps; bool half; } FilterShape;
+typedef struct { uint64_t outs, ins, taps; bool half; } FilterShape;
 static void filters_ohwi(void *dst, const IrTensor *src, const void *arg) {
     const FilterShape *f = (const FilterShape *)arg;
     const float *w = (const float *)src->data;
-    for (uint64_t o = 0; o < f->O; o++)
-        for (uint64_t i = 0; i < f->I; i++)
+    for (uint64_t o = 0; o < f->outs; o++)
+        for (uint64_t i = 0; i < f->ins; i++)
             for (uint64_t k = 0; k < f->taps; k++) {
-                const uint64_t at = (o * f->taps + k) * f->I + i;
-                const float v = w[(o * f->I + i) * f->taps + k];
+                const uint64_t at = (o * f->taps + k) * f->ins + i;
+                const float v = w[(o * f->ins + i) * f->taps + k];
                 if (f->half) ((uint16_t *)dst)[at] = spingalett_float_to_bf16(v);
                 else ((float *)dst)[at] = v;
             }
