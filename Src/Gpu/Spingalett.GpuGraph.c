@@ -112,7 +112,8 @@ typedef struct {
     SpgBackend backend;
     Plan *plans[PLANS];
     SpgGpuBuffer *consts;           /* [value_count]: constants on the device (buffer NULL: not there) */
-    SpgGpuBuffer *prepared;         /* [node_count]: what a node's kernels made of its constants, once */
+    SpgGpuBuffer *prepared;         /* [2 node_count]: what a node's kernels made of its constants, once (the forms of
+                                       single precision, then of bfloat16) */
     SpgGpuArena **arenas;           /* their memory */
     uint32_t arena_count, arena_cap;
     uint64_t runs;
@@ -399,10 +400,10 @@ static bool set_shape(IrTensor *t, uint8_t dtype, uint32_t rank, const int64_t *
 /* What the node's kernels read in place of constant input i: `bytes` that fill() writes from the constant's values,
    made once a graph and node (while the node is planned, on the device then); its address (0 when it could not be
    made: memory ran out). The constant itself is not uploaded for the node. */
-static uint64_t prepared(GCtx *c, uint32_t i, uint64_t bytes, void (*fill)(void *dst, const IrTensor *src, const void *arg),
-                         const void *arg) {
+static uint64_t prepared_form(GCtx *c, uint32_t i, uint32_t form, uint64_t bytes,
+                              void (*fill)(void *dst, const IrTensor *src, const void *arg), const void *arg) {
     GpuGraph *gg = c->gg;
-    SpgGpuBuffer *b = &gg->prepared[c->k];
+    SpgGpuBuffer *b = &gg->prepared[2u * c->k + form];
     if (!c->record && !b->buffer) {
         SpgGpuBuffer stage;
         if (!spg_gpu_buffer_create(&stage, bytes, true)) return 0;
@@ -424,6 +425,11 @@ static uint64_t prepared(GCtx *c, uint32_t i, uint64_t bytes, void (*fill)(void 
     }
     if (!c->record) c->replaced |= 1u << i;
     return b->address;
+}
+
+static uint64_t prepared(GCtx *c, uint32_t i, uint64_t bytes, void (*fill)(void *dst, const IrTensor *src, const void *arg),
+                         const void *arg) {
+    return prepared_form(c, i, 0, bytes, fill, arg);
 }
 
 /* A block of parameters for a kernel: asked for while planned (bytes), written while recorded: its device address. */
@@ -799,8 +805,22 @@ static void strides_of(uint32_t rank, const int64_t *dims, int64_t *s) {
    addresses of the first values): axes of size 1 dropped, neighbours merged where both run through them as one,
    vectors of 16 bytes where the innermost axis is contiguous in both; dispatches over the outer axes where more than
    SPG_COPY_AXES remain. */
+static void copy_strided_as(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const int64_t *dims, const int64_t *sx,
+                            const int64_t *sy, uint32_t size, Range ry, Range rx, bool to_bf16);
+
 static void copy_strided(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const int64_t *dims, const int64_t *sx,
                          const int64_t *sy, uint32_t size, Range ry, Range rx) {
+    copy_strided_as(c, y, x, rank, dims, sx, sy, size, ry, rx, false);
+}
+
+/* The same of floats rounded to bfloat16 as they are written (gcvt): y's strides in its elements of two bytes. */
+static void convert_strided(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const int64_t *dims, const int64_t *sx,
+                            const int64_t *sy, Range ry, Range rx) {
+    copy_strided_as(c, y, x, rank, dims, sx, sy, 4u, ry, rx, true);
+}
+
+static void copy_strided_as(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const int64_t *dims, const int64_t *sx,
+                            const int64_t *sy, uint32_t size, Range ry, Range rx, bool to_bf16) {
     int64_t d_[IR_MAX_RANK * 2], x_[IR_MAX_RANK * 2], y_[IR_MAX_RANK * 2];
     uint32_t q = 0;
     uint64_t total = 1;
@@ -825,7 +845,8 @@ static void copy_strided(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const i
         q = 1;
     }
     /* sixteen bytes at a time */
-    if (x_[q - 1] == 1 && y_[q - 1] == 1 && ((uint64_t)d_[q - 1] * size) % 16u == 0 && x % 16u == 0 && y % 16u == 0) {
+    if (!to_bf16 && x_[q - 1] == 1 && y_[q - 1] == 1 && ((uint64_t)d_[q - 1] * size) % 16u == 0 && x % 16u == 0 &&
+        y % 16u == 0) {
         bool aligned = true;
         for (uint32_t d = 0; d + 1 < q && aligned; d++)
             aligned = ((x_[d] * (int64_t)size) % 16 == 0) && ((y_[d] * (int64_t)size) % 16 == 0);
@@ -869,12 +890,14 @@ static void copy_strided(GCtx *c, uint64_t y, uint64_t x, uint32_t rank, const i
             if (x_[d] < 0) low += (d_[d] - 1) * x_[d];
         push.x = x + (uint64_t)((ox + low) * (int64_t)size);
         push.base = (uint32_t)-low;
+        if (to_bf16) push.y = y + (uint64_t)(oy * 2);
         for (uint32_t d = 0; d < SPG_COPY_AXES; d++) {
             push.dims[d] = d < lead ? 1u : (uint32_t)d_[outer + d - lead];
             push.sx[d] = d < lead ? 0 : (int32_t)x_[outer + d - lead];
             push.sy[d] = d < lead ? 0 : (int32_t)y_[outer + d - lead];
         }
-        spg_gpu_dispatch(c->r->c, SPG_KERNEL_gcopy, spec, 1, &push, sizeof push, group_count(push.total, 256u), 1, 1);
+        spg_gpu_dispatch(c->r->c, to_bf16 ? SPG_KERNEL_gcvt : SPG_KERNEL_gcopy, spec, to_bf16 ? 0u : 1u, &push,
+                         sizeof push, group_count(push.total, 256u), 1, 1);
     }
 }
 
@@ -1425,15 +1448,19 @@ static bool windows_of(GCtx *c, const IrTensor *x, const int64_t *kernel, IrGeom
     return ir_geometry(&r, x, kernel, g, ceil_mode);
 }
 
-/* OIHW filters as OHWI: [out][kh][kw][in a group] (prepared()). */
-typedef struct { uint64_t O, I, taps; } FilterShape;
+/* OIHW filters as OHWI: [out][kh][kw][in a group] (prepared()), of floats or (half) bfloat16. */
+typedef struct { uint64_t O, I, taps; bool half; } FilterShape;
 static void filters_ohwi(void *dst, const IrTensor *src, const void *arg) {
     const FilterShape *f = (const FilterShape *)arg;
     const float *w = (const float *)src->data;
-    float *t = (float *)dst;
     for (uint64_t o = 0; o < f->O; o++)
         for (uint64_t i = 0; i < f->I; i++)
-            for (uint64_t k = 0; k < f->taps; k++) t[(o * f->taps + k) * f->I + i] = w[(o * f->I + i) * f->taps + k];
+            for (uint64_t k = 0; k < f->taps; k++) {
+                const uint64_t at = (o * f->taps + k) * f->I + i;
+                const float v = w[(o * f->I + i) * f->taps + k];
+                if (f->half) ((uint16_t *)dst)[at] = spingalett_float_to_bf16(v);
+                else ((float *)dst)[at] = v;
+            }
 }
 
 /* Conv of one or two spatial axes (dilations 1) on the library's product over channels-last maps, its windows read
@@ -1465,12 +1492,15 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
                                          (uint32_t)OC, (uint32_t)G, (uint32_t)kh, (uint32_t)kw, (uint32_t)geo.s[1],
                                          (uint32_t)geo.s[2], (uint32_t)geo.pb[1], (uint32_t)geo.pb[2]))
         return false;
-    const FilterShape fs = {(uint64_t)OC, (uint64_t)CG, (uint64_t)taps};
-    const uint64_t wt = prepared(c, 1, (uint64_t)OC * (uint64_t)K * 4u, filters_ohwi, &fs);
+    /* (in bfloat16: the filters' copy, the input rounded as it is transposed) */
+    const bool half = product_bf16((uint32_t)pixels, (uint32_t)OG, (uint32_t)K);
+    const uint32_t width = half ? 2u : 4u;
+    const FilterShape fs = {(uint64_t)OC, (uint64_t)CG, (uint64_t)taps, half};
+    const uint64_t wt = prepared_form(c, 1, half ? 1u : 0u, (uint64_t)OC * (uint64_t)K * width, filters_ohwi, &fs);
     if (!wt) return false;
     int64_t dims[4] = {N, OC, oh, ow};
     if (X->rank == 3) dims[2] = ow;
-    const uint64_t in_bytes = align_up(xin * 4u), out_bytes = align_up(pixels * (uint64_t)OC * 4u);
+    const uint64_t in_bytes = align_up(xin * width), out_bytes = align_up(pixels * (uint64_t)OC * 4u);
     uint32_t *table = NULL;
     if (!pointwise) {
         table = (uint32_t *)calloc(info.size, sizeof(uint32_t));
@@ -1486,14 +1516,15 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
         return set_shape(out[0], F32, X->rank, dims);
     }
     const uint64_t xs = c->scratch, ys = c->scratch + in_bytes;
-    const Range rxs = {xs, xs + xin * 4u}, rys = {ys, ys + pixels * (uint64_t)OC * 4u};
+    const Range rxs = {xs, xs + xin * width}, rys = {ys, ys + pixels * (uint64_t)OC * 4u};
     /* channels last: [N][pixels][C] from [N][C][pixels] */
     const int64_t ip = h * w, op = oh * ow;
     {
         const int64_t d3[3] = {N, ip, C}, sx[3] = {C * ip, 1, ip}, sy[3] = {ip * C, C, 1};
-        copy_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, 4u, rxs, range_of(c, n->inputs[0]));
+        if (half) convert_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, rxs, range_of(c, n->inputs[0]));
+        else copy_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, 4u, rxs, range_of(c, n->inputs[0]));
     }
-    const Range none = {0, 0}, rw = {wt, wt + (uint64_t)OC * (uint64_t)K * 4u};
+    const Range none = {0, 0}, rw = {wt, wt + (uint64_t)OC * (uint64_t)K * width};
     SpgGemmPush push = {
         .a = xs, .b = wt, .c = ys, .e0 = Bias ? in_at(c, 2) : 0, .geo = geo_at, .M = (uint32_t)pixels,
         .N = (uint32_t)(pointwise ? OC : OG), .K = (uint32_t)K, .lda = (uint32_t)C, .ldb = (uint32_t)K,
@@ -1509,9 +1540,9 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
     need(c->r, &a);
     SpgGemmMode m = {pointwise ? SPG_A_ROW : SPG_A_CONV, SPG_B_COL, SPG_EPI_BIAS_ACT, (uint32_t)act,
                      pointwise ? 1u : (uint32_t)G, false, pointwise || (CG % 4 == 0 && C % 4 == 0), true, 0,
-                     pixels * (uint64_t)OC, product_bf16((uint32_t)pixels, (uint32_t)OG, (uint32_t)K), 0, false, false};
-    m.wide_a = CG % 8 == 0 && C % 8 == 0;
-    m.wide_b = true;
+                     pixels * (uint64_t)OC, half, half ? 3u : 0u, false, false};
+    m.wide_a = half && (pointwise || (CG % 8 == 0 && C % 8 == 0));
+    m.wide_b = half;
     spg_gemm(c->r->c, &push, &m);
     (void)none;
     /* back to channels first */
@@ -1849,6 +1880,15 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
         if (n->inputs[i] != NONE) reads(&a, range_of(c, n->inputs[i]));
     writes(&a, range_of(c, n->outputs[0]));
     const uint32_t spec[1] = {unit};
+    /* in bfloat16 on the matrix units (gflash: blocks of 128 queries, of 32 for heads of 128), else in single
+       precision (gattn) */
+    if (spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && spg_gpu_mma_bf16() &&
+        spg_gpu_kernel_built(SPG_KERNEL_gflash)) {
+        const uint32_t rows = unit > 64u ? 32u : 128u;
+        dispatch(c, &a, SPG_KERNEL_gflash, spec, 1, &push, sizeof push, (uint32_t)((S + rows - 1) / rows),
+                 (uint32_t)(B * H), 1);
+        return true;
+    }
     dispatch(c, &a, SPG_KERNEL_gattn, spec, 1, &push, sizeof push, (uint32_t)((S + SPG_GATTN_ROWS - 1) / SPG_GATTN_ROWS),
              (uint32_t)(B * H), 1);
     return true;
@@ -1859,12 +1899,22 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
 /* Whether products multiply in bfloat16 on the matrix units (spingalett_set_gpu_precision()), for a product of this
    size: those smaller than the units' blocks stay in single precision (as the networks' do). */
 static bool product_bf16(uint32_t M, uint32_t N, uint32_t K) {
-    return spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && K >= 32u && M >= 16u && N >= 16u;
+    return spingalett_get_gpu_precision() == PRECISION_BFLOAT16 && K >= 32u && M >= 16u && N >= 16u &&
+           spg_gpu_mma_bf16() && spg_gpu_bf16_storage() && spg_gpu_kernel_built(SPG_KERNEL_gcvt);
 }
 
 /* Records C = A B through spg_gemm(): z products (A, B and C each z_a, z_b, z_c elements apart: 0 for one shared). */
+static void gemm_half(GCtx *c, SpgGemmPush *push, uint32_t amode, uint32_t bmode, uint32_t epi, uint32_t act, uint32_t z,
+                      Range ra, Range rb, Range rbias, Range rc, uint32_t half);
+
 static void gemm(GCtx *c, SpgGemmPush *push, uint32_t amode, uint32_t bmode, uint32_t epi, uint32_t act, uint32_t z,
                  Range ra, Range rb, Range rbias, Range rc) {
+    gemm_half(c, push, amode, bmode, epi, act, z, ra, rb, rbias, rc, 0);
+}
+
+/* The same with operands kept as bfloat16 (half: A 1, B 2), multiplied on the matrix units. */
+static void gemm_half(GCtx *c, SpgGemmPush *push, uint32_t amode, uint32_t bmode, uint32_t epi, uint32_t act, uint32_t z,
+                      Range ra, Range rb, Range rbias, Range rc, uint32_t half) {
     Access a = {0};
     reads(&a, ra);
     reads(&a, rb);
@@ -1872,8 +1922,10 @@ static void gemm(GCtx *c, SpgGemmPush *push, uint32_t amode, uint32_t bmode, uin
     writes(&a, rc);
     if (epi == SPG_EPI_STORE && push->beta != 0.0f) reads(&a, rc);
     need(c->r, &a);
-    SpgGemmMode m = {amode, bmode, epi, act, z, false, true, true, 0, (uint64_t)z * push->M * push->N,
-                     product_bf16(push->M, push->N, push->K), 0, false, false};
+    /* (operands of floats stay in single precision: the matrix units' kernels that round floats as they read them read
+       a value at a time, slower than single precision) */
+    SpgGemmMode m = {amode, bmode, epi, act, z, false, true, true, 0, (uint64_t)z * push->M * push->N, half != 0, half,
+                     half != 0, half != 0};
     if (push->alpha == 0.0f && epi != SPG_EPI_STORE) push->alpha = 1.0f;
     spg_gemm(c->r->c, push, &m);
 }
@@ -1888,6 +1940,19 @@ static void transposed(void *dst, const IrTensor *src, const void *arg) {
         for (uint64_t j = 0; j < N; j++) t[j * K + k] = w[k * N + j];
 }
 
+/* A K x N matrix of floats as N x K of bfloat16 (prepared()); an N x K one (arg not NULL) as it is, rounded. */
+static void transposed_bf16(void *dst, const IrTensor *src, const void *arg) {
+    const uint64_t R = (uint64_t)src->dims[0], C = (uint64_t)src->dims[1];
+    const float *w = (const float *)src->data;
+    uint16_t *t = (uint16_t *)dst;
+    if (arg) {
+        for (uint64_t i = 0; i < R * C; i++) t[i] = spingalett_float_to_bf16(w[i]);
+        return;
+    }
+    for (uint64_t k = 0; k < R; k++)
+        for (uint64_t j = 0; j < C; j++) t[j * R + k] = spingalett_float_to_bf16(w[k * C + j]);
+}
+
 /* The activations of the products' epilogues (ActivationFunction): those the kernels hold. */
 static bool epilogue_act(int64_t act) {
     return act == SPINGALETT_ACT_NONE || act == SPINGALETT_ACT_RELU || act == SPINGALETT_ACT_LEAKY_RELU ||
@@ -1895,23 +1960,46 @@ static bool epilogue_act(int64_t act) {
            act == SPINGALETT_ACT_GELU_TANH || act == SPINGALETT_ACT_SILU;
 }
 
-/* Linear (fusions make it): X (..., K) times W (K x N, or N x K with trans_b), plus a bias, through an activation. */
-static bool op_linear(GCtx *c, IrTensor *const *in, IrTensor **out) {
+/* X (..., K) times W (K x N, or N x K with trans), plus a bias (of N values, or a row of them), through an activation:
+   Linear (fusions make it), and Gemm by a constant matrix. */
+static bool linear_product(GCtx *c, IrTensor *const *in, IrTensor **out, bool trans, int64_t act) {
     const IrNode *n = c->n;
     const IrTensor *x = in[0], *w = in[1], *bias = n->input_count > 2 ? in[2] : NULL;
     if (!x || !w || !out[0] || x->dtype != F32 || w->dtype != F32 || w->rank != 2 || !x->rank) return false;
-    const bool trans = ir_attr_int(n, "trans_b", 0) != 0;
     const int64_t K = trans ? w->dims[1] : w->dims[0], N = trans ? w->dims[0] : w->dims[1];
-    const int64_t act = ir_attr_int(n, "activation", SPINGALETT_ACT_NONE);
     if (x->dims[x->rank - 1] != K || !epilogue_act(act) || (bias && (bias->dtype != F32 || bias->count != (uint64_t)N)))
         return false;
     const uint64_t M = K ? x->count / (uint64_t)K : 0;
     if (M > UINT32_MAX || N > UINT32_MAX || K > UINT32_MAX || !K) return false;
     int64_t dims[IR_MAX_RANK];
     for (uint32_t d = 0; d < x->rank; d++) dims[d] = d + 1 < x->rank ? x->dims[d] : N;
+    const bool constant = c->g->values[n->inputs[1]].kind == VALUE_CONST;
+    /* in bfloat16: the weights' copy as N x K, the input rounded into scratch memory */
+    if (constant && product_bf16((uint32_t)M, (uint32_t)N, (uint32_t)K)) {
+        static const int as_is = 1;
+        const uint64_t w16 = prepared_form(c, 1, 1, (uint64_t)K * (uint64_t)N * 2u, transposed_bf16,
+                                           trans ? &as_is : NULL);
+        if (!w16) return false;
+        if (!c->record) {
+            c->scratch = M * (uint64_t)K * 2u;
+            return set_shape(out[0], F32, x->rank, dims);
+        }
+        const int64_t flat[1] = {(int64_t)(M * (uint64_t)K)}, one[1] = {1};
+        const Range r16 = {c->scratch, c->scratch + M * (uint64_t)K * 2u};
+        convert_strided(c, c->scratch, in_at(c, 0), 1, flat, one, one, r16, range_of(c, n->inputs[0]));
+        SpgGemmPush push = {
+            .a = c->scratch, .b = w16, .c = out_at(c, 0), .e0 = bias ? in_at(c, 2) : 0, .M = (uint32_t)M, .N = (uint32_t)N,
+            .K = (uint32_t)K, .lda = (uint32_t)K, .ldb = (uint32_t)K, .ldc = (uint32_t)N, .alpha = 1.0f,
+            .flags = bias ? SPG_GEMM_BIAS : 0u,
+        };
+        const Range none = {0, 0}, rw = {w16, w16 + (uint64_t)K * (uint64_t)N * 2u};
+        gemm_half(c, &push, SPG_A_ROW, SPG_B_COL, SPG_EPI_BIAS_ACT, (uint32_t)act, 1, r16, rw,
+                  bias ? range_of(c, n->inputs[2]) : none, range_of(c, n->outputs[0]), 3u);
+        return true;
+    }
     /* constant weights as N x K, the layout of the products' forward kernels (made once) */
     uint64_t wt = 0;
-    if (!trans && c->g->values[n->inputs[1]].kind == VALUE_CONST) {
+    if (!trans && constant) {
         wt = prepared(c, 1, (uint64_t)K * (uint64_t)N * 4u, transposed, NULL);
         if (!wt) return false;
     }
@@ -1928,6 +2016,12 @@ static bool op_linear(GCtx *c, IrTensor *const *in, IrTensor **out) {
     return true;
 }
 
+/* Linear (fusions make it): X (..., K) times W (K x N, or N x K with trans_b), plus a bias, through an activation. */
+static bool op_linear(GCtx *c, IrTensor *const *in, IrTensor **out) {
+    return linear_product(c, in, out, ir_attr_int(c->n, "trans_b", 0) != 0,
+                          ir_attr_int(c->n, "activation", SPINGALETT_ACT_NONE));
+}
+
 /* Gemm: alpha A' B' + beta C, A' and B' A and B or their transposes, C broadcast to the output (a bias of the columns
    in the product's epilogue; else copied into the output, which the product adds to). */
 static bool op_gemm(GCtx *c, IrTensor *const *in, IrTensor **out) {
@@ -1938,6 +2032,10 @@ static bool op_gemm(GCtx *c, IrTensor *const *in, IrTensor **out) {
         return false;
     const bool ta = ir_attr_int(n, "transA", 0) != 0, tb = ir_attr_int(n, "transB", 0) != 0;
     const float alpha = ir_attr_float(n, "alpha", 1.0f), beta = ir_attr_float(n, "beta", 1.0f);
+    /* by a constant matrix, alpha 1, C none or a bias of the columns with beta 1: Linear's product */
+    if (!ta && alpha == 1.0f && c->g->values[n->inputs[1]].kind == VALUE_CONST &&
+        (!C || (beta == 1.0f && C->count == (uint64_t)(tb ? B->dims[0] : B->dims[1]) && (C->rank < 2 || C->dims[0] == 1))))
+        return linear_product(c, in, out, tb, SPINGALETT_ACT_NONE);
     const int64_t M = ta ? A->dims[1] : A->dims[0], K = ta ? A->dims[0] : A->dims[1];
     const int64_t N = tb ? B->dims[0] : B->dims[1];
     if ((tb ? B->dims[1] : B->dims[0]) != K || M > UINT32_MAX || N > UINT32_MAX || K > UINT32_MAX) return false;
@@ -2588,7 +2686,7 @@ static GpuGraph *gpu_of(SpingalettGraph *g) {
     gg = (GpuGraph *)calloc(1, sizeof *gg);
     if (!gg) return NULL;
     gg->consts = (SpgGpuBuffer *)calloc(g->value_count ? g->value_count : 1u, sizeof(SpgGpuBuffer));
-    gg->prepared = (SpgGpuBuffer *)calloc(g->node_count ? g->node_count : 1u, sizeof(SpgGpuBuffer));
+    gg->prepared = (SpgGpuBuffer *)calloc(2u * (g->node_count ? g->node_count : 1u), sizeof(SpgGpuBuffer));
     if (!gg->consts || !gg->prepared) {
         free(gg->consts);
         free(gg->prepared);
@@ -2673,7 +2771,7 @@ void spingalett_gpu_graph_free(SpingalettGraph *g) {
     spg_gpu_use(gg->backend);
     for (uint32_t k = 0; k < PLANS; k++) plan_free(gg->plans[k]);
     for (uint32_t k = 0; k < gg->arena_count; k++) spg_gpu_arena_free(gg->arenas[k]);
-    for (uint32_t k = 0; k < g->node_count; k++) spg_gpu_buffer_free(&gg->prepared[k]);
+    for (uint32_t k = 0; k < 2u * g->node_count; k++) spg_gpu_buffer_free(&gg->prepared[k]);
     free(gg->arenas);
     free(gg->consts);
     free(gg->prepared);

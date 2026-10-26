@@ -453,6 +453,8 @@ static bool vkb_kernel_built(SpgKernel kernel) {
     if ((kernel == SPG_KERNEL_gew || kernel == SPG_KERNEL_gcopy || kernel == SPG_KERNEL_ggather ||
          kernel == SPG_KERNEL_gattn) && !gpu.storage8)
         return false;               /* (they declare 8-bit storage) */
+    if (kernel == SPG_KERNEL_gcvt && !gpu.storage16) return false;     /* (and this 16-bit storage) */
+    if (kernel == SPG_KERNEL_gflash) return false;                      /* (CUDA's alone) */
     return vkb_open() && kernel < SPG_KERNEL_COUNT && spg_kernel_spirv_size[kernel] > 20u;
 }
 

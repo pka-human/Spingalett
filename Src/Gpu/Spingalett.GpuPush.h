@@ -285,6 +285,9 @@ typedef struct {
     int32_t sx[SPG_COPY_AXES], sy[SPG_COPY_AXES];
 } SpgCopyPush;
 
+/* gcvt.comp: floats copied as gcopy copies them (SpgCopyPush, its strides in elements), each rounded to bfloat16 (to
+   the nearest, ties to even) as it is written: the operands of products on the matrix units. */
+
 /* ggather.comp: Gather of graphs: y[o][j][e] = x[o][idx[j]][e] over `outer` x count x inner values (an index below 0
    counts from the axis's end; one outside it gives zeros). Spec: SIZE (bytes an element: 1, 4 or 8), the indices'
    type (SPG_T_I32 or SPG_T_I64). */

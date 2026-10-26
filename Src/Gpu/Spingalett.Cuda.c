@@ -281,6 +281,7 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
         case SPG_KERNEL_attn: case SPG_KERNEL_attn_h: return count > 3 ? spec[3] : 0u;
         case SPG_KERNEL_attn_cache: case SPG_KERNEL_attn_cache_h: return count > 1 ? spec[1] : 0u;
         case SPG_KERNEL_gattn: return SPG_GATTN_THREADS;
+        case SPG_KERNEL_gflash: return count > 0 && spec[0] > 64u ? 64u : 128u;    /* (gflash.cu's WARPS) */
         default: return 256u;
     }
 }
@@ -291,7 +292,7 @@ static bool grid_stride(SpgKernel kernel) {
         case SPG_KERNEL_eltwise: case SPG_KERNEL_eltwise_h: case SPG_KERNEL_combine: case SPG_KERNEL_combine_h:
         case SPG_KERNEL_pool: case SPG_KERNEL_pool_h: case SPG_KERNEL_upsample: case SPG_KERNEL_upsample_h:
         case SPG_KERNEL_wtrans: case SPG_KERNEL_optim: case SPG_KERNEL_optim_h: case SPG_KERNEL_rows: case SPG_KERNEL_rows_h:
-        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h: case SPG_KERNEL_gew: case SPG_KERNEL_gcopy:
+        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h: case SPG_KERNEL_gew: case SPG_KERNEL_gcopy: case SPG_KERNEL_gcvt:
         case SPG_KERNEL_ggather: case SPG_KERNEL_gpool: case SPG_KERNEL_gresize:
             return true;
         default:
@@ -354,9 +355,9 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], op);
         else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u%s", spec[2], op, op == SPG_ATTN_PRE ? "" : ext);
         else snprintf(name, sizeof name, "attn_d%u%s", spec[2], ext);
-    } else if (kernel == SPG_KERNEL_gattn) {
+    } else if (kernel == SPG_KERNEL_gattn || kernel == SPG_KERNEL_gflash) {
         if (count < 1) return -1;
-        snprintf(name, sizeof name, "gattn_d%u", spec[0]);     /* (the head size of the unit) */
+        snprintf(name, sizeof name, "%s_d%u", base, spec[0]);  /* (the head size of the unit) */
     } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
         if (count < 2) return -1;
         snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */

@@ -32,11 +32,15 @@ SPG_CUDA_UNIT(embed, embed, "")
 SPG_CUDA_UNIT(attn_cache, attn_cache, "")   /* attention over a cache of keys and values (decoding) */
 SPG_CUDA_UNIT(gew, gew, "")                 /* the element-wise operators of graphs */
 SPG_CUDA_UNIT(gcopy, gcopy, "")             /* their copies through strides */
+SPG_CUDA_UNIT(gcvt, gcvt, "")               /* the same of floats rounded to bfloat16 */
 SPG_CUDA_UNIT(ggather, ggather, "")         /* Gather */
 SPG_CUDA_UNIT(grow, grow, "")               /* reductions, softmax and normalizations over rows */
 SPG_CUDA_UNIT(gattn_d32, gattn, "-DD=32u")  /* FusedAttention: heads of up to 32, 64, 128 values */
 SPG_CUDA_UNIT(gattn_d64, gattn, "-DD=64u")
 SPG_CUDA_UNIT(gattn_d128, gattn, "-DD=128u")
+SPG_CUDA_UNIT(gflash_d32, gflash, "-DD=32u")    /* and on the matrix units, in bfloat16 */
+SPG_CUDA_UNIT(gflash_d64, gflash, "-DD=64u")
+SPG_CUDA_UNIT(gflash_d128, gflash, "-DD=128u")
 SPG_CUDA_UNIT(gpool, gpool, "")             /* MaxPool, AveragePool and LpPool */
 SPG_CUDA_UNIT(gresize, gresize, "")         /* Resize */
 SPG_CUDA_UNIT(iquant, iquant, "")           /* integer models: their activations quantized, */
