@@ -8,7 +8,7 @@
 # the rest, and it exports the functions of Src/Spingalett.Runtime.map. Built next to the library
 # (SPINGALETT_RUNTIME, on by default) or alone (SPINGALETT_RUNTIME_ONLY), as libspingalett-runtime.
 
-set(SPINGALETT_RUNTIME_SOURCES Inference Model Session Blocks Attention Image Gguf Tokenizer Json Chat IR IROps IROnnx IRFile IRFuse
+set(SPINGALETT_RUNTIME_SOURCES Inference Model Session Blocks Attention Image Gguf Tokenizer Json Chat IR IROps IROnnx IRFile IRFuse IRShapes
     GEMM ConvGEMM Int8Tiles SIMD Conv Error Memory Settings Thread)
 list(TRANSFORM SPINGALETT_RUNTIME_SOURCES REPLACE "^(.+)$" "${PROJECT_SOURCE_DIR}/Src/Spingalett.\\1.c")
 

@@ -142,6 +142,9 @@ typedef struct {
    none). */
 typedef bool (*GpuOp)(GCtx *c, IrTensor *const *in, IrTensor **out);
 
+static bool epilogue_act(int64_t act);
+static bool product_bf16(uint32_t M, uint32_t N, uint32_t K);
+
 static bool fail(const char *message) {
     set_error(SPINGALETT_ERR_INVALID, message);
     return false;
@@ -1409,7 +1412,10 @@ static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
         return false;
     const int64_t N = x->dims[0], C = x->dims[1];
     const int64_t G = n->op == IR_InstanceNormalization ? C : ir_attr_int(n, "num_groups", 0);
-    if (G < 1 || C % G || (sc->count != (uint64_t)C && sc->count != (uint64_t)G) || bias->count != sc->count) return false;
+    const int64_t act = ir_attr_int(n, "activation", SPINGALETT_ACT_NONE);
+    if (G < 1 || C % G || (sc->count != (uint64_t)C && sc->count != (uint64_t)G) || bias->count != sc->count ||
+        !epilogue_act(act))
+        return false;
     if (x->count >= UINT32_MAX || !N || !C) return false;
     const uint64_t pix = x->count / (uint64_t)(N * C);
     if (!c->record) return set_shape(out[0], F32, x->rank, x->dims);
@@ -1427,6 +1433,7 @@ static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
     push.b = in_at(c, 2);
     push.eps = ir_attr_float(n, "epsilon", 1e-5f);
     push.flags = sc->count == (uint64_t)G && G != C ? SPG_ROW_BY_GROUP : 0u;
+    push.act = (uint32_t)act;
     const Range none = {0, 0};
     row_dispatch(c, &push, SPG_ROW_GROUPNORM, range_of(c, n->inputs[0]), range_of(c, n->outputs[0]),
                  range_of(c, n->inputs[1]), range_of(c, n->inputs[2]), none);
@@ -1434,9 +1441,6 @@ static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
 }
 
 /* ------------------------------------------------------------------------- convolutions and pooling */
-
-static bool epilogue_act(int64_t act);
-static bool product_bf16(uint32_t M, uint32_t N, uint32_t K);
 
 /* The windows of the node over x by the CPU's rules (ir_geometry()). */
 static bool windows_of(GCtx *c, const IrTensor *x, const int64_t *kernel, IrGeometry *g, bool ceil_mode) {

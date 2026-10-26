@@ -2230,6 +2230,9 @@ static bool k_group_norm(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **o
     if ((S->count != (uint64_t)C && S->count != (uint64_t)G) || Bias->count != S->count) return ir_fail(r, "a scale of another size");
     const bool by_group = S->count == (uint64_t)G && G != C;
     const float eps = ir_attr_float(r->node, "epsilon", 1e-5f);
+    /* (an activation the fusions put after it: the library's attribute) */
+    const int64_t act = ir_attr_int(r->node, "activation", ACT_NONE);
+    if (act < 0 || act >= ACT_COUNT || act == ACT_SOFTMAX) return ir_fail(r, "the activation %lld", (long long)act);
     if (!ir_output(r, out[0], F32, X->rank, X->dims)) return false;
     const uint64_t pix = X->count / (uint64_t)(N && C ? N * C : 1), per = (uint64_t)(C / G) * pix;
     SPINGALETT_PARALLEL_FOR(r->parallel && X->count >= PARALLEL_WORK,
@@ -2251,6 +2254,7 @@ static bool k_group_norm(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **o
                     y[at] = (x[at] - mf) * inv * sc + sh;
                 }
             }
+            if (act != ACT_NONE) apply_activation_bulk(y, per, (ActivationFunction)act);
         }
     );
     return true;

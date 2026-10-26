@@ -699,7 +699,9 @@ bool ir_finish(SpingalettGraph *g) {
     }
     for (uint32_t o = 0; o < g->output_count; o++)
         if (g->outputs[o] == IR_NONE) return fail_open("graph: an output nothing computes");
-    if (!order_nodes(g) || !fold_constants(g) || !drop_dead(g) || !ir_fuse(g)) return false;
+    if (!order_nodes(g) || !fold_constants(g) || !drop_dead(g)) return false;
+    ir_infer_shapes(g);
+    if (!ir_fuse(g)) return false;
     for (uint32_t v = 0; v < g->value_count; v++) g->values[v].last = -1;
     for (uint32_t k = 0; k < g->node_count; k++)
         for (uint32_t i = 0; i < g->nodes[k].input_count; i++)

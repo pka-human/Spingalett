@@ -25,7 +25,10 @@
  *                into new filters and a bias; then Relu, Sigmoid, Tanh, Gelu or SiLU: the activation in the
  *                convolution's epilogue (an attribute "activation" of the library's)
  *   norms        layer and RMS normalization over the last axis written out (ReduceMean, Sub, Pow, Sqrt, Div, a
- *                scale and a bias) become LayerNormalization and RMSNormalization
+ *                scale and a bias) become LayerNormalization and RMSNormalization; group normalization as exporters
+ *                write it (a Reshape into groups, InstanceNormalization, a Reshape back, a channel's Mul and Add of
+ *                constants), then Relu, Sigmoid, Tanh, Gelu or SiLU, becomes GroupNormalization of a scale and bias
+ *                a channel, the activation in its pass (an attribute "activation" of the library's)
  *
  * A fused node takes the place of the chain's last node, which runs after everything the chain reads.
  */
@@ -642,6 +645,119 @@ static bool fuse_layer_norm(Fuse *f, IrNode *first) {
     return rewrite(f, last, rms ? IR_RMSNormalization : IR_LayerNormalization, ins, beta != IR_NONE ? 3u : 2u, y, attrs, 2);
 }
 
+static uint64_t value_count(const IrValue *v) {
+    uint64_t count = 1;
+    for (uint32_t d = 0; d < v->rank; d++) count *= (uint64_t)(v->dims[d] < 0 ? 0 : v->dims[d]);
+    return count;
+}
+
+/* The integers of a constant of int64 (at most most of them): their count, -1 for no such constant. */
+static int64_t const_ints(const SpingalettGraph *g, uint32_t v, int64_t *out, int64_t most) {
+    if (v == IR_NONE) return -1;
+    const IrValue *c = &g->values[v];
+    if (c->kind != VALUE_CONST || c->dtype != SPINGALETT_DTYPE_INT64 || c->rank != 1 || c->dims[0] > most) return -1;
+    memcpy(out, c->data, (size_t)c->dims[0] * sizeof(int64_t));
+    return c->dims[0];
+}
+
+static uint32_t new_constant(SpingalettGraph *g, const char *name, uint32_t rank, const int64_t *dims, float **data);
+static const float *per_channel(const SpingalettGraph *g, uint32_t v, uint32_t rank, int64_t channels);
+
+/* Reshape(x into [N, G, ...]), InstanceNormalization of constants a group, Reshape back to x's shape, Mul and Add of
+   constants a channel, then an activation (optional): GroupNormalization of x with the scale and bias a channel
+   folded together. */
+static bool fuse_group_norm(Fuse *f, IrNode *inorm) {
+    SpingalettGraph *g = f->g;
+    if (inorm->input_count < 3 || inorm->output_count < 1) return true;
+    const uint32_t grouped = inorm->inputs[0];
+    IrNode *r1 = producer_of(f, grouped, IR_Reshape);
+    if (!r1 || !single(f, grouped) || r1->input_count < 2) return true;
+    const uint32_t x = r1->inputs[0];
+    const IrValue *X = &g->values[x];
+    if (!X->declared || X->rank < 3 || X->dtype != SPINGALETT_DTYPE_FLOAT32 || X->dims[1] <= 0) return true;
+    const int64_t C = X->dims[1];
+    const IrValue *S = &g->values[inorm->inputs[1]], *Bv = &g->values[inorm->inputs[2]];
+    if (S->kind != VALUE_CONST || Bv->kind != VALUE_CONST || S->dtype != SPINGALETT_DTYPE_FLOAT32 ||
+        Bv->dtype != SPINGALETT_DTYPE_FLOAT32 || S->rank != 1 || Bv->rank != 1 || S->dims[0] != Bv->dims[0])
+        return true;
+    const int64_t G = S->dims[0];
+    int64_t shape[IR_MAX_RANK];
+    /* into groups: [N or 0, G, the rest] */
+    const int64_t n1 = const_ints(g, r1->inputs[1], shape, IR_MAX_RANK);
+    if (n1 != 3 || G < 1 || C % G || shape[1] != G || (shape[0] != 0 && shape[0] != X->dims[0]) ||
+        (shape[2] != -1 && (X->dims[2] < 0 || shape[2] * G != C * X->dims[2] * (X->rank > 3 ? X->dims[3] : 1))))
+        return true;
+    IrNode *r2 = consumer_of(f, inorm->outputs[0], IR_Reshape, NULL);
+    if (!r2 || r2->input_count < 2 || r2->inputs[0] != inorm->outputs[0]) return true;
+    /* back: x's shape, each size its own or 0 (copied) */
+    const int64_t n2 = const_ints(g, r2->inputs[1], shape, IR_MAX_RANK);
+    if (n2 != X->rank) return true;
+    for (uint32_t d = 0; d < X->rank; d++)
+        if (shape[d] != 0 && (X->dims[d] < 0 || shape[d] != X->dims[d])) return true;
+    IrNode *mul = consumer_of(f, r2->outputs[0], IR_Mul, NULL);
+    if (!mul) return true;
+    const float *gamma = per_channel(g, other(mul, r2->outputs[0]), X->rank, C);
+    IrNode *add = gamma ? consumer_of(f, mul->outputs[0], IR_Add, NULL) : NULL;
+    const float *beta = add ? per_channel(g, other(add, mul->outputs[0]), X->rank, C) : NULL;
+    if (!gamma || !beta) return true;
+    /* (per_channel()'s constants: a value a channel, or one for all) */
+    const bool g_one = value_count(&g->values[other(mul, r2->outputs[0])]) == 1;
+    const bool b_one = value_count(&g->values[other(add, mul->outputs[0])]) == 1;
+    int64_t act = ACT_NONE;
+    IrNode *last = add, *act_node = activation_reader(f, add->outputs[0], &act);
+    uint32_t y = add->outputs[0];
+    if (act_node) {
+        last = act_node;
+        y = act_node->outputs[0];
+    }
+    /* the scale and bias a channel: gamma s[g], gamma b[g] + beta (the values may move as constants are added) */
+    const float *gs = (const float *)S->data, *gb = (const float *)Bv->data;
+    const uint32_t old_count = g->value_count;
+    char name[64];
+    snprintf(name, sizeof name, "groupnorm_scale_%u", (unsigned)(inorm - g->nodes));
+    const int64_t cdims[1] = {C};
+    float *sc, *bi;
+    const uint32_t scale = new_constant(g, name, 1, cdims, &sc);
+    snprintf(name, sizeof name, "groupnorm_bias_%u", (unsigned)(inorm - g->nodes));
+    const uint32_t bias = scale == IR_NONE ? IR_NONE : new_constant(g, name, 1, cdims, &bi);
+    if (bias == IR_NONE) return false;
+    for (int64_t c = 0; c < C; c++) {
+        const int64_t grp = c / (C / G);
+        const float gm = gamma[g_one ? 0 : c], bt = beta[b_one ? 0 : c];
+        sc[c] = gm * gs[grp];
+        bi[c] = gm * gb[grp] + bt;
+    }
+    int32_t *producer = (int32_t *)realloc(f->producer, (size_t)g->value_count * sizeof(int32_t));
+    if (producer) f->producer = producer;
+    uint32_t *uses = (uint32_t *)realloc(f->uses, (size_t)g->value_count * sizeof(uint32_t));
+    if (uses) f->uses = uses;
+    if (!producer || !uses) return false;
+    for (uint32_t v = old_count; v < g->value_count; v++) {
+        f->producer[v] = -1;
+        f->uses[v] = 0;
+    }
+    IrAttr attrs[3];
+    memset(attrs, 0, sizeof attrs);
+    attrs[0].name = ir_strdup(g, "num_groups", 10);
+    attrs[0].type = ATTR_INT;
+    attrs[0].i = G;
+    attrs[1].name = ir_strdup(g, "epsilon", 7);
+    attrs[1].type = ATTR_FLOAT;
+    attrs[1].f = ir_attr_float(inorm, "epsilon", 1e-5f);
+    attrs[2].name = ir_strdup(g, "activation", 10);
+    attrs[2].type = ATTR_INT;
+    attrs[2].i = act;
+    if (!attrs[0].name || !attrs[1].name || !attrs[2].name) return false;
+    kill(f, r1);
+    kill(f, inorm);
+    kill(f, r2);
+    kill(f, mul);
+    if (act_node) kill(f, add);
+    kill(f, last);
+    const uint32_t ins[3] = {x, scale, bias};
+    return rewrite(f, last, IR_GroupNormalization, ins, 3, y, attrs, act != ACT_NONE ? 3u : 2u);
+}
+
 /* ------------------------------------------------------------------------- convolutions */
 
 /* A constant of float32 of one value a channel of a convolution's output of `rank` axes (channels second): its
@@ -886,6 +1002,8 @@ bool ir_fuse(SpingalettGraph *g) {
         else if (g->nodes[k].op == IR_Tanh) ok = fuse_gelu_tanh(&f, &g->nodes[k]);
         else if (g->nodes[k].op == IR_Sigmoid) ok = fuse_silu(&f, &g->nodes[k]);
     }
+    for (uint32_t k = 0; ok && k < g->node_count; k++)
+        if (!f.dead[k] && g->nodes[k].op == IR_InstanceNormalization) ok = fuse_group_norm(&f, &g->nodes[k]);
     for (uint32_t k = 0; ok && k < g->node_count; k++)
         if (!f.dead[k] && g->nodes[k].op == IR_Softmax) ok = fuse_attention(&f, &g->nodes[k]);
     for (uint32_t k = 0; ok && k < g->node_count; k++)

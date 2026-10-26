@@ -20,7 +20,8 @@ layout(push_constant) uniform Push {
     F32 x, y, a, b, aux;
     uint outer, len, inner, rows;
     uint groups, cpg, pix, flags;
-    float eps, pad;
+    float eps;
+    uint act;
 } p;
 
 #define SUM 0u
@@ -181,7 +182,8 @@ void main() {
                 sa = p.a.v[(p.flags & F_A_ONE) != 0u ? 0u : l];
                 sb = (p.flags & F_B) != 0u ? p.b.v[(p.flags & F_B_ONE) != 0u ? 0u : l] : 0.0;
             }
-            p.y.v[at] = (p.x.v[at] - mean) * inv * sa + sb;
+            float v = (p.x.v[at] - mean) * inv * sa + sb;
+            p.y.v[at] = p.act != 0u ? activate(v, p.act) : v;
         }
     }
 }

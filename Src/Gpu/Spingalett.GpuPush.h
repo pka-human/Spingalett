@@ -305,7 +305,8 @@ typedef struct {
     uint64_t x, y, a, b, aux;
     uint32_t outer, len, inner, rows;
     uint32_t groups, cpg, pix, flags;       /* GroupNorm: groups, channels a group, values a channel */
-    float eps, pad;
+    float eps;
+    uint32_t act;                   /* GroupNorm: the activation of its outputs (ActivationFunction) */
 } SpgRowPush;
 enum {
     SPG_ROW_SUM, SPG_ROW_MEAN, SPG_ROW_MAX, SPG_ROW_MIN, SPG_ROW_PROD, SPG_ROW_L1, SPG_ROW_L2, SPG_ROW_SUMSQ,

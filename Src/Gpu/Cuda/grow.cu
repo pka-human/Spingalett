@@ -166,7 +166,8 @@ KERNEL(grow, SpgRowPush) {
                 sa = F(p.a)[(p.flags & SPG_ROW_A_ONE) ? 0u : l];
                 sb = (p.flags & SPG_ROW_B) ? F(p.b)[(p.flags & SPG_ROW_B_ONE) ? 0u : l] : 0.0f;
             }
-            F(p.y)[at] = (F(p.x)[at] - mean) * inv * sa + sb;
+            const float v = (F(p.x)[at] - mean) * inv * sa + sb;
+            F(p.y)[at] = p.act ? activate(v, p.act) : v;
         }
     }
 }
