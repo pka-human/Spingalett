@@ -79,6 +79,8 @@ typedef struct {
     void *data;
     bool owned;                     /* the run's: its block of the graph's pool (ir_release()) */
     bool constant;                  /* a constant of the graph (kernels may prepare it once, by node) */
+    bool staged;                    /* its values in memory of the GPU's plan (Spingalett.GpuGraph.c), valid until the
+                                       next run */
     size_t capacity;                /* owned: the bytes of its block */
 } IrTensor;
 
@@ -125,6 +127,7 @@ struct SpingalettGraph {
     SpingalettGemmScratch *scratch; /* products on all the threads */
     SpingalettGemmScratch **thread_scratch;     /* products of one thread each, side by side (batched MatMul) */
     int scratch_threads;
+    void *gpu;                      /* the graph on the GPU (Spingalett.GpuGraph.c), NULL until a run there */
     char *error;
 };
 
@@ -196,6 +199,11 @@ int64_t ir_get_int(const IrTensor *t, uint64_t i);
 double ir_get_float(const IrTensor *t, uint64_t i);
 /* The table of kernels, by IrOp. */
 extern const IrKernel ir_kernels[IR_OP_COUNT];
+/* Node `index` run by its kernel on tensors[] (the run's, by value), on the OpenMP threads with parallel; false with
+   the error set (the node named). */
+bool ir_run_node(SpingalettGraph *g, uint32_t index, IrTensor *tensors, bool parallel);
+/* A constant's tensor: a view of its values. */
+IrTensor ir_const_tensor(const IrValue *v);
 
 /* Readers of the sources: a graph from ONNX bytes (dir: the directory of external data files, or NULL), and from a
    `.slett` image of format 11. NULL with the error set. */

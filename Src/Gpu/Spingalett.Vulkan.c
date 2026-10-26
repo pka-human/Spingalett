@@ -136,6 +136,7 @@ static struct {
     uint32_t subgroup;              /* the subgroup size */
     bool mma_bf16;                  /* cooperative matrices of bfloat16, 16 x 16 x 16, sums in float */
     bool storage16;                 /* 16-bit values in storage buffers (bfloat16 activations) */
+    bool storage8;                  /* 8-bit integers in storage buffers and arithmetic (graphs' booleans) */
     bool full_subgroups;            /* the matrix units' kernel can ask for subgroups without inactive lanes */
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     VkPipelineLayout layout;
@@ -356,6 +357,13 @@ static bool open_device(void) {
         }
     }
     free(extensions);
+    /* bytes in storage buffers and 8-bit integers, which the kernels of graphs read and write (their booleans) */
+    {
+        VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
+        vkGetPhysicalDeviceFeatures2(gpu.physical, &f);
+        gpu.storage8 = f12.storageBuffer8BitAccess && f12.shaderInt8;
+    }
     VkPhysicalDeviceSubgroupProperties subgroup = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 props2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroup};
     vkGetPhysicalDeviceProperties2(gpu.physical, &props2);
@@ -369,6 +377,7 @@ static bool open_device(void) {
     VkPhysicalDeviceVulkan12Features enable12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                                  .bufferDeviceAddress = VK_TRUE,
                                                  .shaderFloat16 = gpu.mma_bf16, .vulkanMemoryModel = gpu.mma_bf16,
+                                                 .storageBuffer8BitAccess = gpu.storage8, .shaderInt8 = gpu.storage8,
                                                  .pNext = &enable11};
     VkPhysicalDeviceFeatures2 enable = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &enable12};
     enable.features.shaderInt16 = gpu.storage16;
@@ -441,6 +450,7 @@ static bool vkb_host_writes(void) {
 
 /* (a build whose glslc could not compile a kernel holds an empty module for it) */
 static bool vkb_kernel_built(SpgKernel kernel) {
+    if (kernel == SPG_KERNEL_gew && !gpu.storage8) return false;     /* (it declares 8-bit storage) */
     return vkb_open() && kernel < SPG_KERNEL_COUNT && spg_kernel_spirv_size[kernel] > 20u;
 }
 

@@ -247,6 +247,32 @@ typedef struct {
 } SpgSumsqPush;
 enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
 
+/* gew.comp: the element-wise operators of graphs (Spingalett.GpuGraph.c): output value i = OP(a, b, c) at its position,
+   each operand read through its strides over the output's axes (0 where it broadcasts), SPG_GEW_AXES of them at most
+   after merging (innermost last, sizes 1 before fewer). Spec: OP, TYPES (the types of a, b, c and y, four bits each,
+   from the lowest), FLAGS (two bits an operand, a's lowest: 0 through its strides, 1 at the output's index, 2 its first
+   value only). Unary operators below SPG_GEW_ADD, binary below SPG_GEW_WHERE. */
+#define SPG_GEW_AXES 4u
+typedef struct {
+    uint64_t y, a, b, c;
+    uint32_t total, pad;
+    uint32_t dims[SPG_GEW_AXES];
+    uint32_t sa[SPG_GEW_AXES], sb[SPG_GEW_AXES], sc[SPG_GEW_AXES];
+    float alpha, beta;
+} SpgGewPush;
+enum { SPG_T_F32, SPG_T_U8, SPG_T_I32, SPG_T_I64, SPG_T_BOOL, SPG_T_I8 };
+enum {
+    SPG_GEW_COPY, SPG_GEW_NEG, SPG_GEW_ABS, SPG_GEW_EXP, SPG_GEW_LOG, SPG_GEW_SQRT, SPG_GEW_RECIPROCAL, SPG_GEW_SIGMOID,
+    SPG_GEW_TANH, SPG_GEW_RELU, SPG_GEW_LEAKY, SPG_GEW_ELU, SPG_GEW_SELU, SPG_GEW_GELU, SPG_GEW_GELU_TANH, SPG_GEW_SILU,
+    SPG_GEW_HARD_SIGMOID, SPG_GEW_HARD_SWISH, SPG_GEW_SOFTPLUS, SPG_GEW_SOFTSIGN, SPG_GEW_SIN, SPG_GEW_COS, SPG_GEW_ERF,
+    SPG_GEW_FLOOR, SPG_GEW_CEIL, SPG_GEW_ROUND, SPG_GEW_SIGN, SPG_GEW_CLIP, SPG_GEW_NOT, SPG_GEW_ISNAN, SPG_GEW_ISINF,
+    SPG_GEW_MISH, SPG_GEW_CELU, SPG_GEW_THRESHOLDED_RELU, SPG_GEW_TO_HALF, SPG_GEW_TO_BF16, SPG_GEW_AFFINE,
+    SPG_GEW_ADD = 48, SPG_GEW_SUB, SPG_GEW_MUL, SPG_GEW_DIV, SPG_GEW_POW, SPG_GEW_MAX, SPG_GEW_MIN, SPG_GEW_PRELU,
+    SPG_GEW_EQUAL, SPG_GEW_LESS, SPG_GEW_LESS_EQUAL, SPG_GEW_GREATER, SPG_GEW_GREATER_EQUAL, SPG_GEW_AND, SPG_GEW_OR,
+    SPG_GEW_XOR, SPG_GEW_FMOD, SPG_GEW_MOD,
+    SPG_GEW_WHERE = 96
+};
+
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
 #define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */
 

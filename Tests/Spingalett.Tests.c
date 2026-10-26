@@ -17,6 +17,9 @@
  * results are deterministic.
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L     /* setenv() */
+#endif
 #include <Spingalett/Spingalett.Short.h>    /* the names of 0.x, and Spingalett.h */
 #include "Spingalett.Network.h"      /* white-box: the network's arrays */
 #include "Spingalett.RuntimeData.h"  /* the samples of export-models */
@@ -6868,6 +6871,15 @@ static void tokenizer_cases(const char *name, const char *file, const char *expe
 
 /* ------------------------------------------------------------------------- graphs of operators */
 
+/* An environment variable set for the process (an empty value: as if unset, for the library's getenv() readers). */
+static void setenv_(const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 /* A tensor of Tests/Data/graph_cases.bin (Tests/make_graph_tests.py), pointing into the file's bytes. */
 typedef struct {
     char name[128];
@@ -6918,8 +6930,12 @@ static float case_float(const SpingalettTensor *t, uint64_t i) {
 
 /* Every case of Tests/Data/graph_cases.bin: ONNX's conformance tests of single operators, each graph run on its
    inputs against the reference's outputs (floats within the case's tolerances, integers and booleans exactly),
-   on one thread and on four, which give the same bits. */
-static void operator_cases(void) {
+   on one thread and on four, which give the same bits; with gpu (COMPUTE_CUDA or COMPUTE_VULKAN) on the GPU, twice
+   (the second run replays the first's plan), which give the same bits. */
+static void operator_cases(ComputeMode gpu) {
+    const bool on_gpu = gpu == COMPUTE_CUDA || gpu == COMPUTE_VULKAN;
+    /* (on the GPU every node its kernels take, however small) */
+    if (on_gpu) setenv_("SPINGALETT_GRAPH_GPU_MIN", "0");
     char path[512];
     snprintf(path, sizeof path, "%s/graph_cases.bin", SPINGALETT_TEST_DATA_DIR);
     size_t size = 0;
@@ -6961,14 +6977,21 @@ static void operator_cases(void) {
         }
         CHECK(parsed, "graph_cases.bin: case %u malformed", c);
         if (!parsed) break;
+        /* (SPINGALETT_TEST_CASE: the cases whose names hold it, alone) */
+        const char *only_case = getenv("SPINGALETT_TEST_CASE");
+        if (only_case && *only_case && !strstr(name, only_case)) continue;
         run++;
         SpingalettGraph *g = spingalett_graph_open(.data = model, .size = model_len);
         bool ok = g != NULL;
         const char *why = ok ? "" : spingalett_last_error_message();
         /* one thread first, then four: the same bits */
         for (int pass = 0; ok && pass < 2; pass++) {
-            spingalett_set_compute_mode(pass ? SPINGALETT_COMPUTE_OPENMP : SPINGALETT_COMPUTE_SINGLE_THREADED);
-            if (pass) spingalett_set_num_threads(4);
+            if (on_gpu) {
+                spingalett_set_compute_mode(gpu);
+            } else {
+                spingalett_set_compute_mode(pass ? SPINGALETT_COMPUTE_OPENMP : SPINGALETT_COMPUTE_SINGLE_THREADED);
+                if (pass) spingalett_set_num_threads(4);
+            }
             SpingalettTensor inputs[MOST];
             for (uint32_t k = 0; k < nin; k++) inputs[k] = ins[k].t;
             SpingalettTensor *o = pass ? again : outs;
@@ -6990,7 +7013,7 @@ static void operator_cases(void) {
                 const size_t bytes = (size_t)refs[k].bytes;
                 if (pass) {
                     ok = !bytes || !memcmp(first[k], got->data, bytes);
-                    if (!ok) why = "other bits on four threads";
+                    if (!ok) why = on_gpu ? "other bits when run again" : "other bits on four threads";
                     free(first[k]);
                     first[k] = NULL;
                     continue;
@@ -7011,11 +7034,12 @@ static void operator_cases(void) {
         for (uint32_t k = 0; k < nout; k++) { free(first[k]); first[k] = NULL; }
         spingalett_set_compute_mode(mode);
         spingalett_set_num_threads(threads);
-        if (!ok && ++wrong <= 8) printf("  %s: %s\n", name, why);
+        if (!ok && ++wrong <= (getenv("SPINGALETT_TEST_ALL") ? 100000 : 8)) printf("  %s: %s\n", name, why);
         spingalett_graph_free(g);
     }
-    CHECK(!wrong, "%d of %d operator cases fail", wrong, run);
-    printf("  %d of ONNX's conformance cases\n", run);
+    if (on_gpu) setenv_("SPINGALETT_GRAPH_GPU_MIN", "");
+    CHECK(!wrong, "%d of %d operator cases fail%s", wrong, run, on_gpu ? " on the GPU" : "");
+    printf("  %d of ONNX's conformance cases%s\n", run, on_gpu ? " on the GPU" : "");
     free(ins);
     free(refs);
     free(file);
@@ -9786,7 +9810,7 @@ int main(int argc, char **argv) {
     }
     if (!*only || !strcmp(only, "operators")) {
         printf("[graphs of operators]\n");
-        operator_cases();
+        operator_cases(COMPUTE_SINGLE_THREADED);
     }
     if (!*only || !strcmp(only, "chat")) {
         printf("[chat templates]\n");
@@ -9937,6 +9961,15 @@ int main(int argc, char **argv) {
         for (int p = PRECISION_Q8_0; p < PRECISION_COUNT; p++) block_kernels((PrecisionMode)p);
         block_models();
     }
+    /* (the graphs of the groups "gpu" and "cuda" alone: "gpu-graphs", "cuda-graphs") */
+    for (int backend = 0; backend < 2; backend++) {
+        if (strcmp(only, backend ? "cuda-graphs" : "gpu-graphs")) continue;
+        const ComputeMode mode = backend ? COMPUTE_CUDA : COMPUTE_VULKAN;
+        printf("[graphs of operators on the GPU, %s]\n", backend ? "CUDA" : "Vulkan");
+        if (!(backend ? spingalett_cuda_device() : spingalett_gpu_device())) printf("  skipped: no device\n");
+        else operator_cases(mode);
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    }
     for (int backend = 0; backend < 2; backend++) {
         /* the group "gpu" on Vulkan, "cuda" on CUDA */
         if (*only && strcmp(only, backend ? "cuda" : "gpu")) continue;
@@ -9990,6 +10023,7 @@ int main(int argc, char **argv) {
             gpu_resume();
             gpu_session(false);
             gpu_session(true);
+            operator_cases(gpu_mode);
             gpu_model_predict();
             gpu_model_exact();
             for (int k = 0; k < 3; k++) gpu_session_int(k);

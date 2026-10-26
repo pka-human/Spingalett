@@ -30,6 +30,7 @@ SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
 SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
 SPG_CUDA_UNIT(embed, embed, "")
 SPG_CUDA_UNIT(attn_cache, attn_cache, "")   /* attention over a cache of keys and values (decoding) */
+SPG_CUDA_UNIT(gew, gew, "")                 /* the element-wise operators of graphs */
 SPG_CUDA_UNIT(iquant, iquant, "")           /* integer models: their activations quantized, */
 SPG_CUDA_UNIT(ipass, ipass, "")             /* their other passes */
 /* integer models' linear layers in sessions: products of a few rows with their codes widened in registers, a unit of

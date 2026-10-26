@@ -131,6 +131,13 @@ void spingalett_gpu_model_free(SpgGpuModel *m);
 /* outputs [count x output_size] for inputs [count x input_size], in chunks; waits */
 bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t count, float *outputs);
 
+/* Graphs of operators on the GPU (Spingalett.GpuGraph.c): runs graph g's nodes on the calling thread's backend, its
+   inputs and constants bound in g->tensors as the CPU's run binds them, and leaves the outputs there (on the host): 1
+   when it ran them, 0 when it failed (the error set), -1 when it declines (the CPU runs them then). */
+int spingalett_gpu_graph_run(struct SpingalettGraph *g);
+/* What the graph keeps on the GPU, freed (nothing for a graph that never ran there). */
+void spingalett_gpu_graph_free(struct SpingalettGraph *g);
+
 /* Where the next chunk's inputs and targets go (rows of the input and output layers), once the
    device is done with the chunk that used that memory before. */
 float *spingalett_gpu_chunk_inputs(SpgGpuNet *g, float **targets);
@@ -261,6 +268,8 @@ static inline SpgGpuModel *spingalett_gpu_model_new(const SpingalettModel *model
     return NULL;
 }
 static inline void spingalett_gpu_model_free(SpgGpuModel *m) { (void)m; }
+static inline int spingalett_gpu_graph_run(struct SpingalettGraph *g) { (void)g; return -1; }
+static inline void spingalett_gpu_graph_free(struct SpingalettGraph *g) { (void)g; }
 static inline bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t count, float *outputs) {
     (void)m; (void)inputs; (void)count; (void)outputs;
     return false;
