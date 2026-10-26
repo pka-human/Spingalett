@@ -914,11 +914,34 @@ static bool permute(IrRun *r, const IrTensor *x, const int64_t *perm, IrTensor *
     return true;
 }
 
+bool ir_moves_ones(const int64_t *dims, const int64_t *perm, uint32_t rank) {
+    int64_t last = -1;
+    for (uint32_t k = 0; k < rank; k++) {
+        if (perm[k] < 0 || perm[k] >= (int64_t)rank) return false;
+        if (dims[perm[k]] == 1) continue;
+        if (perm[k] < last) return false;
+        last = perm[k];
+    }
+    return true;
+}
+
 static bool k_transpose(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
     if (n < 1 || m < 1 || !in[0]) return ir_fail(r, "an input and an output are needed");
     int64_t perm[IR_MAX_RANK];
     if (int_list(r->node, "perm", NULL, perm, IR_MAX_RANK) != (int64_t)in[0]->rank)
         for (uint32_t k = 0; k < in[0]->rank; k++) perm[k] = in[0]->rank - 1 - k;
+    /* (a permutation that moves only axes of size 1 keeps the values' order: a view) */
+    bool valid = true, seen[IR_MAX_RANK] = {false};
+    for (uint32_t k = 0; k < in[0]->rank && valid; k++) {
+        valid = perm[k] >= 0 && perm[k] < (int64_t)in[0]->rank && !seen[perm[k]];
+        if (valid) seen[perm[k]] = true;
+    }
+    if (valid && ir_moves_ones(in[0]->dims, perm, in[0]->rank)) {
+        int64_t dims[IR_MAX_RANK];
+        for (uint32_t k = 0; k < in[0]->rank; k++) dims[k] = in[0]->dims[perm[k]];
+        ir_view(r, out[0], in[0], in[0]->rank, dims);
+        return true;
+    }
     return permute(r, in[0], perm, out[0]);
 }
 

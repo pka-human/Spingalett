@@ -208,6 +208,8 @@ extern const IrKernel ir_kernels[IR_OP_COUNT];
 /* Node `index` run by its kernel on tensors[] (the run's, by value), on the OpenMP threads with parallel; false with
    the error set (the node named). */
 bool ir_run_node(SpingalettGraph *g, uint32_t index, IrTensor *tensors, bool parallel);
+/* Whether a permutation of axes of these sizes moves only axes of size 1 (the values' order kept: a view). */
+bool ir_moves_ones(const int64_t *dims, const int64_t *perm, uint32_t rank);
 /* A constant's tensor: a view of its values. */
 IrTensor ir_const_tensor(const IrValue *v);
 

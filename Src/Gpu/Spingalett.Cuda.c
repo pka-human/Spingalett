@@ -357,7 +357,8 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         else snprintf(name, sizeof name, "attn_d%u%s", spec[2], ext);
     } else if (kernel == SPG_KERNEL_gattn || kernel == SPG_KERNEL_gflash) {
         if (count < 1) return -1;
-        snprintf(name, sizeof name, "%s_d%u", base, spec[0]);  /* (the head size of the unit) */
+        /* (the head size of the unit; gflash's tiles of queries a warp, 1: _m1) */
+        snprintf(name, sizeof name, "%s_d%u%s", base, spec[0], kernel == SPG_KERNEL_gflash && count > 1 && spec[1] == 1u ? "_m1" : "");
     } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
         if (count < 2) return -1;
         snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */

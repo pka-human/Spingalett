@@ -41,6 +41,8 @@ SPG_CUDA_UNIT(gattn_d128, gattn, "-DD=128u")
 SPG_CUDA_UNIT(gflash_d32, gflash, "-DD=32u")    /* and on the matrix units, in bfloat16 */
 SPG_CUDA_UNIT(gflash_d64, gflash, "-DD=64u")
 SPG_CUDA_UNIT(gflash_d128, gflash, "-DD=128u")
+SPG_CUDA_UNIT(gflash_d32_m1, gflash, "-DD=32u -DMTS=1u")
+SPG_CUDA_UNIT(gflash_d64_m1, gflash, "-DD=64u -DMTS=1u")
 SPG_CUDA_UNIT(gpool, gpool, "")             /* MaxPool, AveragePool and LpPool */
 SPG_CUDA_UNIT(gresize, gresize, "")         /* Resize */
 SPG_CUDA_UNIT(iquant, iquant, "")           /* integer models: their activations quantized, */
@@ -186,6 +188,9 @@ SPG_CUDA_MMA_GENERAL(0, 0, 2, 2)
    as bfloat16, read eight values at once (A, B), and with GENERAL (_g) for those listed so: units
    gemm_pipe_<BM>x<BN>x<BK>_<TM>x<TN>_s<STAGES>_a<A>b<B> */
 SPG_CUDA_PIPE_TILE(128, 128, 32, 4, 4, 3)
+SPG_CUDA_PIPE_TILE(128, 64, 32, 4, 2, 3)
+SPG_CUDA_PIPE_TILE(64, 128, 32, 2, 4, 3)
+SPG_CUDA_PIPE_TILE(64, 64, 32, 2, 2, 4)
 
 SPG_CUDA_PIPE_MODES(0, 1)           /* forward */
 SPG_CUDA_PIPE_MODES(0, 0)           /* data gradient */

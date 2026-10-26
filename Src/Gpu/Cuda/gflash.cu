@@ -11,7 +11,8 @@
  * reads them) and rounded to bfloat16 as they are loaded; the scores are scaled in single precision, then the keep
  * mask and the mask apply as in gattn.cu, the softmax online in registers (a row's maximum and sum combined over the
  * four threads that hold it, in a fixed pattern), O += P V with P rounded to bfloat16. Every product adds its 16
- * values of k at a time in the order of k: the same bits on every run. A unit per head size D (32, 64, 128).
+ * values of k at a time in the order of k: the same bits on every run. A unit per head size D (32, 64, 128), and for
+ * heads of 32 and 64 one of blocks of half the queries (_m1: MTS 1), for sequences too short to fill the device.
  */
 
 #include "common.cuh"
@@ -21,7 +22,11 @@
 #define D 64u
 #endif
 #define WARPS (D <= 64u ? 4u : 2u)         /* warps a block */
-#define MT (D <= 64u ? 2u : 1u)            /* tiles of 16 queries a warp */
+#if defined(MTS)
+#define MT MTS                             /* tiles of 16 queries a warp: units _m1 for short sequences (more blocks) */
+#else
+#define MT (D <= 64u ? 2u : 1u)
+#endif
 #define ROWS (16u * MT * WARPS)            /* queries of a block */
 #define BT (D <= 64u ? 64u : 32u)          /* keys a tile */
 #define SD (D + 8u)                        /* bfloat16 a row in shared memory */
