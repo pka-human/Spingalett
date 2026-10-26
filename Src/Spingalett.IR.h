@@ -158,6 +158,9 @@ bool ir_fuse(SpingalettGraph *g);
 /* The types and shapes of the values the nodes compute where their inputs' are declared (Spingalett.IRShapes.c): those
    values declared. */
 void ir_infer_shapes(SpingalettGraph *g);
+/* Convolutions' maps kept channels last between them (Spingalett.IRLayout.c); false (out of memory) with the error
+   set. */
+bool ir_layout(SpingalettGraph *g);
 
 /* An attribute of a node, NULL when it has none of that name. */
 const IrAttr *ir_attr(const IrNode *n, const char *name);

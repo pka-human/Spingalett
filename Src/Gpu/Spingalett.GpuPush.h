@@ -311,7 +311,9 @@ typedef struct {
 enum {
     SPG_ROW_SUM, SPG_ROW_MEAN, SPG_ROW_MAX, SPG_ROW_MIN, SPG_ROW_PROD, SPG_ROW_L1, SPG_ROW_L2, SPG_ROW_SUMSQ,
     SPG_ROW_LOGSUMEXP, SPG_ROW_LOGSUM, SPG_ROW_ARGMAX, SPG_ROW_ARGMIN,
-    SPG_ROW_SOFTMAX = 16, SPG_ROW_LOGSOFTMAX, SPG_ROW_HARDMAX, SPG_ROW_LAYERNORM, SPG_ROW_RMSNORM, SPG_ROW_GROUPNORM
+    SPG_ROW_SOFTMAX = 16, SPG_ROW_LOGSOFTMAX, SPG_ROW_HARDMAX, SPG_ROW_LAYERNORM, SPG_ROW_RMSNORM, SPG_ROW_GROUPNORM,
+    SPG_ROW_GROUPNORM_LAST          /* channels last: row (batch, group) of pix pixels' cpg channels, every groups cpg
+                                       values a pixel */
 };
 #define SPG_ROW_LAST     1u         /* ArgMax, ArgMin: the last of equal values */
 #define SPG_ROW_A_ONE    2u         /* LayerNorm, RMSNorm: one scale for every column (else a column each) */
@@ -352,6 +354,7 @@ typedef struct {
 #define SPG_GPOOL_MAX     1u
 #define SPG_GPOOL_LP      2u
 #define SPG_GPOOL_INCLUDE 4u        /* AveragePool: padding counted (count_include_pad) */
+#define SPG_GPOOL_LAST    8u        /* channels last ([N, H, W, C]): rows the channels, the batch the rest */
 
 /* gresize.comp: Resize of graphs through the taps of ir_resize_taps(): output value i at (o0, o1, o2, o3) (four axes,
    sizes 1 before fewer) is the sum over every axis d's T[d] taps of the product of their weights times the input at

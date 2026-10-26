@@ -1781,8 +1781,9 @@ static void conv_filters_free(void *p) {
    (OC, KH, KW, C / G), the output transposed back, the bias and an activation in the products' epilogue. It takes
    convolutions without dilation whose padding at the end adds nothing beyond the padding at the start that the
    windows read; false (nothing done, no error) for others. */
+/* (cl: X's values and Y's channels last already, X given with the dims of its channels-first shape) */
 static bool conv_channels_last(IrRun *r, const IrTensor *X, const IrTensor *W, const IrTensor *B, const Geometry *g,
-                               int64_t group, ActivationFunction act, IrTensor *Y, bool *done) {
+                               int64_t group, ActivationFunction act, IrTensor *Y, bool *done, bool cl) {
     *done = false;
     if (X->rank > 4 || g->in[0] != 1 || g->k[0] != 1 || g->dil[1] != 1 || g->dil[2] != 1 || !W->constant ||
         (B && (!B->constant || B->dtype != F32)))
@@ -1827,13 +1828,17 @@ static bool conv_channels_last(IrRun *r, const IrTensor *X, const IrTensor *W, c
     memset(&scratch, 0, sizeof scratch);
     int64_t dims[IR_MAX_RANK] = {N, OC};
     for (uint32_t a = 0; a + 2 < X->rank; a++) dims[2 + a] = g->out[3 - (X->rank - 2) + a];
-    bool ok = ir_output_raw(r, &xt, F32, 1, xd) && ir_output_raw(r, &yt, F32, 1, yd) &&
+    if (cl) {
+        for (uint32_t a = 0; a + 2 < X->rank; a++) dims[1 + a] = g->out[3 - (X->rank - 2) + a];
+        dims[X->rank - 1] = OC;
+    }
+    bool ok = (cl || (ir_output_raw(r, &xt, F32, 1, xd) && ir_output_raw(r, &yt, F32, 1, yd))) &&
               ir_output_raw(r, &scratch, F32, 1, sd) && ir_output_raw(r, Y, F32, X->rank, dims);
     if (ok) {
-        to_channels(r, fdata(X), fdata(&xt), N, C, ipix, true);
-        spingalett_conv_forward_shapes(&is, &os, f->filters, f->bias, fdata(&xt), fdata(&yt), (uint32_t)N, act,
-                                       fdata(&scratch), gemm, mode);
-        to_channels(r, fdata(&yt), fdata(Y), N, OC, opix, false);
+        if (!cl) to_channels(r, fdata(X), fdata(&xt), N, C, ipix, true);
+        spingalett_conv_forward_shapes(&is, &os, f->filters, f->bias, cl ? fdata(X) : fdata(&xt), cl ? fdata(Y) : fdata(&yt),
+                                       (uint32_t)N, act, fdata(&scratch), gemm, mode);
+        if (!cl) to_channels(r, fdata(&yt), fdata(Y), N, OC, opix, false);
         *done = true;
     }
     ir_release(r->g, &xt);
@@ -1842,7 +1847,54 @@ static bool conv_channels_last(IrRun *r, const IrTensor *X, const IrTensor *W, c
     return ok;
 }
 
+static bool conv_first(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m);
+
+/* Conv; of maps channels last with the layout pass's attribute (Spingalett.IRLayout.c): the library's kernel straight
+   on them, or where it does not apply the maps transposed to channels first and back around the general one. */
 static bool k_conv(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
+    if (!ir_attr_int(r->node, "channels_last", 0)) return conv_first(r, in, n, out, m);
+    if (n < 2 || m < 1 || !in[0] || !in[1]) return ir_fail(r, "inputs and an output are needed");
+    const IrTensor *X = in[0], *W = in[1], *B = n > 2 ? in[2] : NULL;
+    if (X->dtype != F32 || W->dtype != F32 || W->rank != X->rank || X->rank < 3)
+        return ir_fail(r, "weights of another rank, or not float32");
+    const uint32_t R = X->rank;
+    IrTensor xc = *X;               /* (its channels-first shape, its values channels last) */
+    xc.dims[1] = X->dims[R - 1];
+    for (uint32_t d = 2; d < R; d++) xc.dims[d] = X->dims[d - 1];
+    xc.owned = false;
+    const int64_t group = ir_attr_int(r->node, "group", 1), C = xc.dims[1], OC = W->dims[0];
+    if (group < 1 || C % group || OC % group || W->dims[1] != C / group) return ir_fail(r, "channels that do not fit the groups");
+    Geometry g;
+    if (!ir_geometry(r, &xc, W->dims + 2, &g, false)) return false;
+    const int64_t act = ir_attr_int(r->node, "activation", ACT_NONE);
+    if (act < 0 || act >= ACT_COUNT || act == ACT_SOFTMAX) return ir_fail(r, "the activation %lld", (long long)act);
+    bool done;
+    if (!conv_channels_last(r, &xc, W, B, &g, group, (ActivationFunction)act, out[0], &done, true)) return false;
+    if (done) return true;
+    /* the general kernel between transposes */
+    IrTensor xt, yt;
+    memset(&xt, 0, sizeof xt);
+    memset(&yt, 0, sizeof yt);
+    const int64_t P = (int64_t)(X->count / (uint64_t)(X->dims[0] && C ? X->dims[0] * C : 1));
+    bool ok = ir_output_raw(r, &xt, F32, R, xc.dims);
+    if (ok) to_channels(r, fdata(X), fdata(&xt), X->dims[0], C, P, false);
+    IrTensor *ins[3] = {&xt, (IrTensor *)W, (IrTensor *)B}, *outs[1] = {&yt};
+    ok = ok && conv_first(r, ins, n > 3 ? 3u : n, outs, 1);
+    if (ok) {
+        int64_t dims[IR_MAX_RANK];
+        dims[0] = yt.dims[0];
+        for (uint32_t d = 2; d < R; d++) dims[d - 1] = yt.dims[d];
+        dims[R - 1] = yt.dims[1];
+        const int64_t OP = (int64_t)(yt.count / (uint64_t)(yt.dims[0] && OC ? yt.dims[0] * OC : 1));
+        ok = ir_output_raw(r, out[0], F32, R, dims);
+        if (ok) to_channels(r, fdata(&yt), fdata(out[0]), yt.dims[0], OC, OP, true);
+    }
+    ir_release(r->g, &xt);
+    ir_release(r->g, &yt);
+    return ok;
+}
+
+static bool conv_first(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
     if (n < 2 || m < 1 || !in[0] || !in[1]) return ir_fail(r, "inputs and an output are needed");
     const IrTensor *X = in[0], *W = in[1], *B = n > 2 ? in[2] : NULL;
     if (X->dtype != F32 || W->dtype != F32 || W->rank != X->rank) return ir_fail(r, "weights of another rank, or not float32");
@@ -1855,7 +1907,7 @@ static bool k_conv(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, ui
     if (B && (B->dtype != F32 || B->count != (uint64_t)OC)) return ir_fail(r, "a bias of %llu values for %lld channels",
                                                                           (unsigned long long)B->count, (long long)OC);
     bool done;
-    if (!conv_channels_last(r, X, W, B, &g, group, (ActivationFunction)act, out[0], &done)) return false;
+    if (!conv_channels_last(r, X, W, B, &g, group, (ActivationFunction)act, out[0], &done, false)) return false;
     if (done) return true;
     int64_t dims[IR_MAX_RANK] = {N, OC};
     for (uint32_t a = 0; a < g.spatial; a++) dims[2 + a] = g.out[3 - g.spatial + a];
@@ -2051,8 +2103,62 @@ static bool k_conv_transpose(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor
     return true;
 }
 
+/* MaxPool and AveragePool of maps channels last ([N, H, W, C], the layout pass's): a pixel's window channel by
+   channel, as k_pool() takes it. */
+static bool pool_last(IrRun *r, const IrTensor *X, IrTensor *Y) {
+    const bool max = OP(r) == IR_MaxPool;
+    if (X->dtype != F32 || X->rank != 4) return ir_fail(r, "channels last of an input of %s or not four axes",
+                                                        ir_dtype_name(X->dtype));
+    int64_t kernel[3];
+    if (int_list(r->node, "kernel_shape", NULL, kernel, 3) != 2) return ir_fail(r, "no kernel_shape");
+    IrTensor xc = *X;
+    xc.dims[1] = X->dims[3];
+    xc.dims[2] = X->dims[1];
+    xc.dims[3] = X->dims[2];
+    Geometry g;
+    if (!ir_geometry(r, &xc, kernel, &g, ir_attr_int(r->node, "ceil_mode", 0) != 0)) return false;
+    const bool include = ir_attr_int(r->node, "count_include_pad", 0) != 0;
+    const int64_t N = X->dims[0], C = X->dims[3], H = g.in[1], W = g.in[2], OH = g.out[1], OW = g.out[2];
+    const int64_t dims[4] = {N, OH, OW, C};
+    if (!ir_output_raw(r, Y, F32, 4, dims)) return false;
+    const float *x = fdata(X);
+    float *y = fdata(Y);
+    SPINGALETT_PARALLEL_FOR(r->parallel && (uint64_t)N * OH * OW * C >= PARALLEL_WORK / 4,
+        for (int64_t q = 0; q < N * OH * OW; q++) {
+            const int64_t b = q / (OH * OW), o1 = (q / OW) % OH, o2 = q % OW;
+            float *yp = y + (size_t)q * (size_t)C;
+            for (int64_t c = 0; c < C; c++) yp[c] = max ? -INFINITY : 0.0f;
+            int64_t count = 0, padded = 0;
+            for (int64_t k1 = 0; k1 < g.k[1]; k1++) {
+                const int64_t i1 = o1 * g.s[1] - g.pb[1] + k1 * g.dil[1];
+                for (int64_t k2 = 0; k2 < g.k[2]; k2++) {
+                    const int64_t i2 = o2 * g.s[2] - g.pb[2] + k2 * g.dil[2];
+                    padded += i1 < H + g.pe[1] && i2 < W + g.pe[2];
+                    if (i1 < 0 || i1 >= H || i2 < 0 || i2 >= W) continue;
+                    const float *xp = x + (size_t)(((b * H + i1) * W + i2) * C);
+                    for (int64_t c = 0; c < C; c++) {
+                        const float v = xp[c];
+                        if (max) {
+                            if (!count || v > yp[c] || (isnan(v) && !isnan(yp[c]))) yp[c] = v;
+                        } else {
+                            yp[c] += v;
+                        }
+                    }
+                    count++;
+                }
+            }
+            if (!max) {
+                const float div = (float)(include ? padded : count ? count : 1);
+                for (int64_t c = 0; c < C; c++) yp[c] /= div;
+            }
+        }
+    );
+    return true;
+}
+
 static bool k_pool(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
     if (n < 1 || m < 1 || !in[0]) return ir_fail(r, "an input and an output are needed");
+    if (ir_attr_int(r->node, "channels_last", 0)) return pool_last(r, in[0], out[0]);
     const IrTensor *X = in[0];
     const IrOp op = OP(r);
     const bool max = op == IR_MaxPool, lp = op == IR_LpPool;
@@ -2224,7 +2330,8 @@ static bool k_group_norm(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **o
     if (n < 3 || m < 1 || !in[0] || !in[1] || !in[2]) return ir_fail(r, "an input, scale, bias and output are needed");
     const IrTensor *X = in[0], *S = in[1], *Bias = in[2];
     if (X->dtype != F32 || S->dtype != F32 || Bias->dtype != F32 || X->rank < 2) return ir_fail(r, "inputs not float32");
-    const int64_t N = X->dims[0], C = X->dims[1];
+    const bool last = ir_attr_int(r->node, "channels_last", 0) != 0;
+    const int64_t N = X->dims[0], C = X->dims[last ? X->rank - 1 : 1];
     const int64_t G = OP(r) == IR_InstanceNormalization ? C : ir_attr_int(r->node, "num_groups", 0);
     if (G < 1 || C % G) return ir_fail(r, "%lld groups of %lld channels", (long long)G, (long long)C);
     if ((S->count != (uint64_t)C && S->count != (uint64_t)G) || Bias->count != S->count) return ir_fail(r, "a scale of another size");
@@ -2234,6 +2341,43 @@ static bool k_group_norm(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **o
     const int64_t act = ir_attr_int(r->node, "activation", ACT_NONE);
     if (act < 0 || act >= ACT_COUNT || act == ACT_SOFTMAX) return ir_fail(r, "the activation %lld", (long long)act);
     if (!ir_output(r, out[0], F32, X->rank, X->dims)) return false;
+    if (ir_attr_int(r->node, "channels_last", 0)) {
+        /* channels last ([N, spatial..., C], the layout pass's): a group's channels of every pixel */
+        const int64_t CL = X->dims[X->rank - 1], cpg = CL / G;
+        if (CL % G || (S->count != (uint64_t)CL && S->count != (uint64_t)G)) return ir_fail(r, "%lld groups of %lld channels",
+                                                                                     (long long)G, (long long)CL);
+        const bool per_group = S->count == (uint64_t)G && G != CL;
+        const uint64_t pixels = X->count / (uint64_t)(N && CL ? N * CL : 1);
+        SPINGALETT_PARALLEL_FOR(r->parallel && X->count >= PARALLEL_WORK,
+            for (int64_t q = 0; q < N * G; q++) {
+                const int64_t b = q / G, grp = q % G;
+                const float *x = fdata(X) + (size_t)b * pixels * (size_t)CL + (size_t)(grp * cpg);
+                float *y = fdata(out[0]) + (size_t)b * pixels * (size_t)CL + (size_t)(grp * cpg);
+                const uint64_t values = pixels * (uint64_t)cpg;
+                const double count = (double)(values ? values : 1u);
+                double mean = 0.0, var = 0.0;
+                for (uint64_t p = 0; p < pixels; p++)
+                    for (int64_t c = 0; c < cpg; c++) mean += x[p * (uint64_t)CL + (uint64_t)c];
+                mean /= count;
+                for (uint64_t p = 0; p < pixels; p++)
+                    for (int64_t c = 0; c < cpg; c++) {
+                        const double d = (double)x[p * (uint64_t)CL + (uint64_t)c] - mean;
+                        var += d * d;
+                    }
+                var /= count;
+                const float inv = (float)(1.0 / sqrt(var + (double)eps)), mf = (float)mean;
+                for (uint64_t p = 0; p < pixels; p++) {
+                    float *yr = y + p * (uint64_t)CL;
+                    for (int64_t c = 0; c < cpg; c++) {
+                        const int64_t pi = per_group ? grp : grp * cpg + c;
+                        yr[c] = (x[p * (uint64_t)CL + (uint64_t)c] - mf) * inv * fdata(S)[pi] + fdata(Bias)[pi];
+                    }
+                    if (act != ACT_NONE) apply_activation_bulk(yr, (uint64_t)cpg, (ActivationFunction)act);
+                }
+            }
+        );
+        return true;
+    }
     const uint64_t pix = X->count / (uint64_t)(N && C ? N * C : 1), per = (uint64_t)(C / G) * pix;
     SPINGALETT_PARALLEL_FOR(r->parallel && X->count >= PARALLEL_WORK,
         for (int64_t q = 0; q < N * G; q++) {

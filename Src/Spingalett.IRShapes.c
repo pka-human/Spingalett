@@ -171,7 +171,8 @@ static bool windows(SpingalettGraph *g, const IrNode *n, uint32_t index, const S
 /* The outputs of node k from its inputs' shapes, where its operator has a rule. */
 static void infer(SpingalettGraph *g, uint32_t k) {
     const IrNode *n = &g->nodes[k];
-    if (!n->input_count || n->input_count > 64) return;
+    /* (nodes the layout pass made channels last declare their outputs themselves) */
+    if (!n->input_count || n->input_count > 64 || ir_attr_int(n, "channels_last", 0)) return;
     Shape in[64];
     for (uint32_t i = 0; i < n->input_count; i++) in[i] = shape_of(g, n->inputs[i]);
     const Shape *x = &in[0];

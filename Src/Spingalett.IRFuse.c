@@ -1023,5 +1023,6 @@ bool ir_fuse(SpingalettGraph *g) {
     free(f.producer);
     free(f.uses);
     free(f.dead);
-    return ok;
+    /* then the maps of convolutions channels last (Spingalett.IRLayout.c) */
+    return ok && ir_layout(g);
 }

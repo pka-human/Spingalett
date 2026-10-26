@@ -16,6 +16,15 @@ struct Part {
     float a, b, c;      /* sums, Welford's count, mean and M2, or a value and its index */
 };
 
+/* The address of value l of row (o, i): rows of len values inner apart; with channels last (GROUPNORM_LAST), row o is
+   (batch, group) and value l the pixel l / cpg's channel group cpg + l % cpg */
+DEVICE uint64_t at_of(const SpgRowPush &p, uint32_t op, uint32_t o, uint32_t i, uint32_t l) {
+    if (op == SPG_ROW_GROUPNORM_LAST) {
+        const uint32_t b = o / p.groups, g = o % p.groups;
+        return ((uint64_t)b * p.pix + l / p.cpg) * (uint64_t)(p.groups * p.cpg) + g * p.cpg + l % p.cpg;
+    }
+    return ((uint64_t)o * p.len + l) * p.inner + i;
+}
 DEVICE float x_at(const SpgRowPush &p, uint32_t o, uint32_t i, uint32_t l) {
     return F(p.x)[((uint64_t)o * p.len + l) * p.inner + i];
 }
@@ -135,7 +144,7 @@ KERNEL(grow, SpgRowPush) {
         /* normalizations: Welford's count, mean and M2 (RMS: the sum of squares) */
         Part w = {0.0f, 0.0f, 0.0f};
         for (uint32_t l = lane; l < len; l += TPR) {
-            const float v = x_at(p, o, i, l);
+            const float v = F(p.x)[at_of(p, op, o, i, l)];
             if (op == SPG_ROW_RMSNORM) {
                 w.a += v * v;
             } else {
@@ -154,12 +163,13 @@ KERNEL(grow, SpgRowPush) {
             F(p.aux)[q] = mean;
             F(p.aux)[p.rows + q] = inv;
         }
-        const uint32_t g = op == SPG_ROW_GROUPNORM ? o % p.groups : 0u;
+        const bool grouped = op == SPG_ROW_GROUPNORM || op == SPG_ROW_GROUPNORM_LAST;
+        const uint32_t g = grouped ? o % p.groups : 0u;
         for (uint32_t l = lane; l < len; l += TPR) {
-            const uint64_t at = ((uint64_t)o * p.len + l) * p.inner + i;
+            const uint64_t at = at_of(p, op, o, i, l);
             float sa, sb;
-            if (op == SPG_ROW_GROUPNORM) {
-                const uint32_t k = (p.flags & SPG_ROW_BY_GROUP) ? g : g * p.cpg + l / p.pix;
+            if (grouped) {
+                const uint32_t k = (p.flags & SPG_ROW_BY_GROUP) ? g : g * p.cpg + (op == SPG_ROW_GROUPNORM ? l / p.pix : l % p.cpg);
                 sa = F(p.a)[k];
                 sb = F(p.b)[k];
             } else {

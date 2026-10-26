@@ -267,6 +267,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
     set_source_files_properties(Src/Spingalett.IR.c Src/Spingalett.IROps.c Src/Spingalett.IROnnx.c
                                 Src/Spingalett.IRFile.c Src/Spingalett.IRFuse.c Src/Spingalett.IRShapes.c
+                                Src/Spingalett.IRLayout.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP};-fsigned-zeros")
 endif()
 

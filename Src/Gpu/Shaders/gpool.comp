@@ -24,7 +24,9 @@ void main() {
     uint opix = p.out_[0] * p.out_[1] * p.out_[2], ipix = p.in_[0] * p.in_[1] * p.in_[2];
     const uint stride = gl_NumWorkGroups.x * 256u;
     for (uint e = gl_GlobalInvocationID.x; e < p.total; e += stride) {
-        uint q = e / opix, o = e % opix;
+        bool last = (p.flags & 8u) != 0u;
+        uint C = last ? p.rows : 1u, ch = last ? e % C : 0u, t = last ? e / C : e;
+        uint q = t / opix, o = t % opix;
         uint o2 = o % p.out_[2], o1 = (o / p.out_[2]) % p.out_[1], o0 = o / (p.out_[1] * p.out_[2]);
         float acc = mx ? uintBitsToFloat(0xFF800000u) : 0.0;
         bool any = false;
@@ -38,7 +40,7 @@ void main() {
                     if (i0 < int(p.in_[0] + p.pe[0]) && i1 < int(p.in_[1] + p.pe[1]) && i2 < int(p.in_[2] + p.pe[2])) padded++;
                     if (i0 < 0 || i0 >= int(p.in_[0]) || i1 < 0 || i1 >= int(p.in_[1]) || i2 < 0 || i2 >= int(p.in_[2]))
                         continue;
-                    float v = p.x.v[q * ipix + (uint(i0) * p.in_[1] + uint(i1)) * p.in_[2] + uint(i2)];
+                    float v = p.x.v[(q * ipix + (uint(i0) * p.in_[1] + uint(i1)) * p.in_[2] + uint(i2)) * C + ch];
                     if (mx) {
                         if (!any || v > acc || (isnan(v) && !isnan(acc))) acc = v;
                         any = true;

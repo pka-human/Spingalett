@@ -42,6 +42,7 @@ layout(push_constant) uniform Push {
 #define LAYERNORM 19u
 #define RMSNORM 20u
 #define GROUPNORM 21u
+#define GROUPNORM_LAST 22u
 #define F_LAST 1u
 #define F_A_ONE 2u
 #define F_B 4u
@@ -52,6 +53,15 @@ layout(push_constant) uniform Push {
 shared vec3 sh[256];
 
 float x_at(uint o, uint i, uint l) { return p.x.v[(o * p.len + l) * p.inner + i]; }
+
+/* value l of row (o, i); channels last (GROUPNORM_LAST): row (batch, group), pixel l / cpg, channel l % cpg of it */
+uint at_of(uint op, uint o, uint i, uint l) {
+    if (op == GROUPNORM_LAST) {
+        uint b = o / p.groups, g = o % p.groups;
+        return (b * p.pix + l / p.cpg) * (p.groups * p.cpg) + g * p.cpg + l % p.cpg;
+    }
+    return (o * p.len + l) * p.inner + i;
+}
 
 vec3 combine(uint op, vec3 a, vec3 b, bool last) {
     if (op == MAX) return vec3(isnan(a.x) ? a.x : isnan(b.x) || b.x > a.x ? b.x : a.x, 0.0, 0.0);
@@ -152,7 +162,7 @@ void main() {
         }
         vec3 w = vec3(0.0);
         for (uint l = lane; l < len; l += TPR) {
-            float v = x_at(o, i, l);
+            float v = p.x.v[at_of(op, o, i, l)];
             if (op == RMSNORM) {
                 w.x += v * v;
             } else {
@@ -170,12 +180,13 @@ void main() {
             p.aux.v[q] = mean;
             p.aux.v[p.rows + q] = inv;
         }
-        uint g = op == GROUPNORM ? o % p.groups : 0u;
+        bool grouped = op == GROUPNORM || op == GROUPNORM_LAST;
+        uint g = grouped ? o % p.groups : 0u;
         for (uint l = lane; l < len; l += TPR) {
-            uint at = (o * p.len + l) * p.inner + i;
+            uint at = at_of(op, o, i, l);
             float sa, sb;
-            if (op == GROUPNORM) {
-                uint k = (p.flags & F_BY_GROUP) != 0u ? g : g * p.cpg + l / p.pix;
+            if (grouped) {
+                uint k = (p.flags & F_BY_GROUP) != 0u ? g : g * p.cpg + (op == GROUPNORM ? l / p.pix : l % p.cpg);
                 sa = p.a.v[k];
                 sb = p.b.v[k];
             } else {

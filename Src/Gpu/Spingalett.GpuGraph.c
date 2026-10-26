@@ -1410,7 +1410,8 @@ static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
     const IrTensor *x = in[0], *sc = n->input_count > 1 ? in[1] : NULL, *bias = n->input_count > 2 ? in[2] : NULL;
     if (!x || !sc || !bias || !out[0] || x->dtype != F32 || sc->dtype != F32 || bias->dtype != F32 || x->rank < 2)
         return false;
-    const int64_t N = x->dims[0], C = x->dims[1];
+    const bool cl = ir_attr_int(n, "channels_last", 0) != 0;
+    const int64_t N = x->dims[0], C = x->dims[cl ? x->rank - 1 : 1];
     const int64_t G = n->op == IR_InstanceNormalization ? C : ir_attr_int(n, "num_groups", 0);
     const int64_t act = ir_attr_int(n, "activation", SPINGALETT_ACT_NONE);
     if (G < 1 || C % G || (sc->count != (uint64_t)C && sc->count != (uint64_t)G) || bias->count != sc->count ||
@@ -1435,7 +1436,7 @@ static bool op_groupnorm(GCtx *c, IrTensor *const *in, IrTensor **out) {
     push.flags = sc->count == (uint64_t)G && G != C ? SPG_ROW_BY_GROUP : 0u;
     push.act = (uint32_t)act;
     const Range none = {0, 0};
-    row_dispatch(c, &push, SPG_ROW_GROUPNORM, range_of(c, n->inputs[0]), range_of(c, n->outputs[0]),
+    row_dispatch(c, &push, cl ? SPG_ROW_GROUPNORM_LAST : SPG_ROW_GROUPNORM, range_of(c, n->inputs[0]), range_of(c, n->outputs[0]),
                  range_of(c, n->inputs[1]), range_of(c, n->inputs[2]), none);
     return true;
 }
@@ -1476,11 +1477,18 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
     if (!X || !W || !out[0] || X->dtype != F32 || W->dtype != F32 || W->rank != X->rank || X->rank < 3 || X->rank > 4 ||
         c->g->values[n->inputs[1]].kind != VALUE_CONST || (Bias && (Bias->dtype != F32 || Bias->count != (uint64_t)W->dims[0])))
         return false;
-    const int64_t G = ir_attr_int(n, "group", 1), N = X->dims[0], C = X->dims[1], OC = W->dims[0];
+    /* (channels last, the layout pass's: [N, spatial..., C] in and out, seen channels first for the windows) */
+    const bool cl = ir_attr_int(n, "channels_last", 0) != 0;
+    IrTensor xc = *X;
+    if (cl) {
+        xc.dims[1] = X->dims[X->rank - 1];
+        for (uint32_t d = 2; d < X->rank; d++) xc.dims[d] = X->dims[d - 1];
+    }
+    const int64_t G = ir_attr_int(n, "group", 1), N = X->dims[0], C = xc.dims[1], OC = W->dims[0];
     const int64_t act = ir_attr_int(n, "activation", SPINGALETT_ACT_NONE);
     if (G < 1 || C % G || OC % G || W->dims[1] != C / G || !epilogue_act(act)) return false;
     IrGeometry geo;
-    if (!windows_of(c, X, W->dims + 2, &geo, false)) {
+    if (!windows_of(c, &xc, W->dims + 2, &geo, false)) {
         spingalett_clear_error();
         return false;
     }
@@ -1504,7 +1512,13 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
     if (!wt) return false;
     int64_t dims[4] = {N, OC, oh, ow};
     if (X->rank == 3) dims[2] = ow;
-    const uint64_t in_bytes = align_up(xin * width), out_bytes = align_up(pixels * (uint64_t)OC * 4u);
+    if (cl) {
+        dims[1] = X->rank == 3 ? ow : oh;
+        dims[2] = X->rank == 3 ? OC : ow;
+        dims[3] = OC;
+    }
+    /* scratch: the input channels last (or rounded to bfloat16), the output before its transpose */
+    const uint64_t in_bytes = cl && !half ? 0 : align_up(xin * width), out_bytes = cl ? 0 : align_up(pixels * (uint64_t)OC * 4u);
     uint32_t *table = NULL;
     if (!pointwise) {
         table = (uint32_t *)calloc(info.size, sizeof(uint32_t));
@@ -1519,11 +1533,15 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
         c->scratch = in_bytes + out_bytes;
         return set_shape(out[0], F32, X->rank, dims);
     }
-    const uint64_t xs = c->scratch, ys = c->scratch + in_bytes;
-    const Range rxs = {xs, xs + xin * width}, rys = {ys, ys + pixels * (uint64_t)OC * 4u};
-    /* channels last: [N][pixels][C] from [N][C][pixels] */
+    const uint64_t xs = cl && !half ? in_at(c, 0) : c->scratch, ys = cl ? out_at(c, 0) : c->scratch + in_bytes;
+    const Range rxs = cl && !half ? range_of(c, n->inputs[0]) : (Range){xs, xs + xin * width};
+    const Range rys = cl ? range_of(c, n->outputs[0]) : (Range){ys, ys + pixels * (uint64_t)OC * 4u};
+    /* channels last: [N][pixels][C] from [N][C][pixels] (or as they are, rounded to bfloat16) */
     const int64_t ip = h * w, op = oh * ow;
-    {
+    if (cl && half) {
+        const int64_t flat[1] = {(int64_t)xin}, one[1] = {1};
+        convert_strided(c, xs, in_at(c, 0), 1, flat, one, one, rxs, range_of(c, n->inputs[0]));
+    } else if (!cl) {
         const int64_t d3[3] = {N, ip, C}, sx[3] = {C * ip, 1, ip}, sy[3] = {ip * C, C, 1};
         if (half) convert_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, rxs, range_of(c, n->inputs[0]));
         else copy_strided(c, xs, in_at(c, 0), 3, d3, sx, sy, 4u, rxs, range_of(c, n->inputs[0]));
@@ -1550,7 +1568,7 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
     spg_gemm(c->r->c, &push, &m);
     (void)none;
     /* back to channels first */
-    {
+    if (!cl) {
         const int64_t d3[3] = {N, OC, op}, sx[3] = {op * OC, 1, OC}, sy[3] = {OC * op, op, 1};
         copy_strided(c, out_at(c, 0), ys, 3, d3, sx, sy, 4u, range_of(c, n->outputs[0]), rys);
     }
@@ -1567,13 +1585,27 @@ static bool op_pool(GCtx *c, IrTensor *const *in, IrTensor **out) {
     const IrAttr *ks = ir_attr(n, "kernel_shape");
     if (!ks || ks->type != ATTR_INTS || ks->count != X->rank - 2u) return false;
     for (uint32_t k = 0; k < ks->count; k++) kernel[k] = ks->ints[k];
+    /* (channels last, the layout pass's: [N, H, W, C], seen channels first for the windows) */
+    const bool cl = ir_attr_int(n, "channels_last", 0) != 0;
+    if (cl && (X->rank != 4 || n->op == IR_LpPool)) return false;
+    IrTensor xc = *X;
+    if (cl) {
+        xc.dims[1] = X->dims[3];
+        xc.dims[2] = X->dims[1];
+        xc.dims[3] = X->dims[2];
+    }
     IrGeometry g;
-    if (!windows_of(c, X, kernel, &g, ir_attr_int(n, "ceil_mode", 0) != 0)) {
+    if (!windows_of(c, &xc, kernel, &g, ir_attr_int(n, "ceil_mode", 0) != 0)) {
         spingalett_clear_error();
         return false;
     }
     int64_t dims[IR_MAX_RANK] = {X->dims[0], X->dims[1]};
     for (uint32_t a = 0; a < g.spatial; a++) dims[2 + a] = g.out[3 - g.spatial + a];
+    if (cl) {
+        dims[1] = g.out[1];
+        dims[2] = g.out[2];
+        dims[3] = xc.dims[1];
+    }
     uint64_t total = (uint64_t)X->dims[0] * (uint64_t)X->dims[1];
     for (uint32_t a = 0; a < 3; a++) total *= (uint64_t)g.out[a];
     if (total >= UINT32_MAX || X->count >= UINT32_MAX) return false;
@@ -1594,7 +1626,8 @@ static bool op_pool(GCtx *c, IrTensor *const *in, IrTensor **out) {
         push.dil[a] = (uint32_t)g.dil[a];
     }
     push.flags = (n->op == IR_MaxPool ? SPG_GPOOL_MAX : 0u) | (n->op == IR_LpPool ? SPG_GPOOL_LP : 0u) |
-                 (ir_attr_int(n, "count_include_pad", 0) ? SPG_GPOOL_INCLUDE : 0u);
+                 (ir_attr_int(n, "count_include_pad", 0) ? SPG_GPOOL_INCLUDE : 0u) | (cl ? SPG_GPOOL_LAST : 0u);
+    if (cl) push.rows = (uint32_t)xc.dims[1];       /* (channels last: the channels) */
     push.p = (float)ir_attr_int(n, "p", 2);
     Access a = {0};
     reads(&a, range_of(c, n->inputs[0]));

@@ -13,9 +13,12 @@ KERNEL(gpool, SpgPoolGPush) {
     const uint32_t opix = p.out[0] * p.out[1] * p.out[2], ipix = p.in[0] * p.in[1] * p.in[2];
     const uint32_t stride = blocks_x() * threads_x();
     for (uint32_t e = global_x(); e < p.total; e += stride) {
-        const uint32_t q = e / opix, o = e % opix;
+        /* (channels last: rows the channels, value e at (batch, pixel o, channel ch)) */
+        const bool last = (p.flags & SPG_GPOOL_LAST) != 0u;
+        const uint32_t C = last ? p.rows : 1u, ch = last ? e % C : 0u, t = last ? e / C : e;
+        const uint32_t q = t / opix, o = t % opix;
         const uint32_t o2 = o % p.out[2], o1 = (o / p.out[2]) % p.out[1], o0 = o / (p.out[1] * p.out[2]);
-        const float *x = F(p.x) + (uint64_t)q * ipix;
+        const float *x = F(p.x) + (uint64_t)q * ipix * C + ch;
         float acc = max ? -__builtin_inff() : 0.0f;
         bool any = false;
         uint32_t count = 0, padded = 0;
@@ -30,7 +33,7 @@ KERNEL(gpool, SpgPoolGPush) {
                     if (i0 < 0 || i0 >= (int32_t)p.in[0] || i1 < 0 || i1 >= (int32_t)p.in[1] || i2 < 0 ||
                         i2 >= (int32_t)p.in[2])
                         continue;
-                    const float v = x[((uint32_t)i0 * p.in[1] + (uint32_t)i1) * p.in[2] + (uint32_t)i2];
+                    const float v = x[(uint64_t)(((uint32_t)i0 * p.in[1] + (uint32_t)i1) * p.in[2] + (uint32_t)i2) * C];
                     if (max) {
                         if (!any || v > acc || (isnan_(v) && !isnan_(acc))) acc = v;
                         any = true;
