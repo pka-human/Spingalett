@@ -383,17 +383,18 @@ Models that do not fit one GPU's memory or time (planned for 1.4 until the langu
 
 A program in a repository of its own (working name SaLaM, "Spingalett Language Models"), built on the
 runtime library alone, that does for Spingalett what llama.cpp's programs do for llama.cpp: one binary
-without dependencies, packaged where the library is. It waits for its repository (the maintainer's account);
-`Examples/Runtime/Chat.c` is its seed.
+without dependencies, packaged where the library is. It waits for its repository (the maintainer's account: 0.1's
+part of the library shipped with 1.5); `Examples/Runtime/Chat.c` is its seed.
 
 - **0.1, with 1.5** (the runtime's tokenizers, chat templates and sampling are there): `salam run model.gguf -p
   "..."` (a prompt's continuation), `salam chat` (the model's chat template, the conversation's cache kept between
   turns), `salam bench` (prompt processing and generation in tokens per second, as `llama-bench` reports them), GGUF
   files, sampling options as llama.cpp's, models fetched from Hugging Face by name.
-- **0.2, with 1.6**: the GPU (CUDA or Vulkan by flag), Hugging Face's directories, a server with an
+- **0.2, with 1.6**: the GPU (CUDA or Vulkan by flag), a model split between the GPU and host memory by flag or by
+  the GPU's free memory (as llama.cpp's `--n-gpu-layers`), Hugging Face's directories, a server with an
   OpenAI-compatible HTTP API (completions, chat, streaming) that batches its requests in one session.
 - **0.3, with 1.8**: `salam image` (SDXL and FLUX.1: a prompt, a seed, a sampler, steps).
-- **0.4, with 1.9 and 1.10**: the experts' offload and layer splits by flag, speculative decoding with a draft model,
+- **0.4, with 1.9 and 1.10**: the experts' offload, speculative decoding with a draft model,
   the hybrid models, images in chats (the vision encoders), grammars that constrain generation (GBNF, JSON schemas).
 
 ## 2.0: what 1.x cannot add
