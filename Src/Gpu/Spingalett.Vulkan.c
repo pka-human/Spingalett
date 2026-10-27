@@ -74,7 +74,7 @@ static PFN_vkVoidFunction loader_symbol(void *lib, const char *name) {
     X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
     X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkResetFences) \
     X(vkWaitForFences) X(vkQueueSubmit) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) \
-    X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+    X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkDeviceWaitIdle) X(vkDestroyDevice)
 
 /* VK_KHR_cooperative_matrix and VK_KHR_shader_bfloat16, declared here for headers that predate them */
 typedef struct {
@@ -205,6 +205,8 @@ static bool has_extension(const VkExtensionProperties *list, uint32_t count, con
         if (!strcmp(list[k].extensionName, name)) return true;
     return false;
 }
+
+static void vkb_close(void);
 
 static bool open_device(void) {
     gpu.loader = open_loader();
@@ -388,6 +390,9 @@ static bool open_device(void) {
     VK_DEVICE_FUNCTIONS(LOAD_DEVICE)
 #undef LOAD_DEVICE
     vkGetDeviceQueue(gpu.device, gpu.family, 0, &gpu.queue);
+    /* (the device closed at exit, after the profile's report: drivers left to destroy a device in their own
+       destructors at times spun there, with every test passed) */
+    atexit(vkb_close);
 
     VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, SPG_PUSH_BYTES};
     VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 0, NULL, 1, &range};
@@ -398,6 +403,19 @@ static bool open_device(void) {
     gpu.profile = profile && *profile && *profile != '0' && props.limits.timestampComputeAndGraphics;
     if (gpu.profile) atexit(profile_report);
     return gpu.lock != NULL;
+}
+
+/* The device idle, then destroyed with what it holds, and the instance (at exit) */
+static void vkb_close(void) {
+    if (gpu.device) {
+        vkDeviceWaitIdle(gpu.device);
+        vkDestroyDevice(gpu.device, NULL);
+        gpu.device = VK_NULL_HANDLE;
+    }
+    if (gpu.instance) {
+        vkDestroyInstance(gpu.instance, NULL);
+        gpu.instance = VK_NULL_HANDLE;
+    }
 }
 
 static bool vkb_open(void) {
