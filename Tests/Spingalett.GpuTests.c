@@ -868,6 +868,77 @@ static void bench_attention(void) {
     attn_free(&b);
 }
 
+/* ------------------------------------------------------------------------- block precisions */
+
+#include "Spingalett.Engine.h"         /* the engine's block products, the references */
+
+void spingalett_block_quantize(PrecisionMode p, const float *x, uint8_t *dst, uint32_t n);
+
+/* A layer of a block precision (rows of K weights quantized as GGUF's quantizers do, a bias each) on R rows of
+   inputs: bquant against spingalett_quantize_blocks() and bdot (its units of 1 and 8 rows) against
+   spingalett_block_dot() plus the bias, bit for bit. */
+static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
+    static const char *const names[] = {"Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K",
+                                        "Q6_K", "IQ4_NL", "IQ4_XS"};
+    const uint32_t BV = slett_block_values(p), stride = K / BV * slett_block_bytes(p), type = p - PRECISION_Q8_0;
+    float *wf = (float *)malloc((size_t)K * sizeof(float)), *x = (float *)malloc((size_t)R * K * sizeof(float));
+    float *bias = (float *)malloc(N * sizeof(float)), *want = (float *)malloc((size_t)R * N * sizeof(float));
+    float *got = (float *)malloc((size_t)R * N * sizeof(float)), *dx = (float *)malloc((size_t)R * (K / BV) * 4);
+    float *gdx = (float *)malloc((size_t)R * (K / BV) * 4);
+    uint8_t *w = (uint8_t *)malloc((size_t)N * stride);
+    int8_t *xq = (int8_t *)malloc((size_t)R * K), *gxq = (int8_t *)malloc((size_t)R * K);
+    int32_t *xs = (int32_t *)malloc((size_t)R * (K / 16) * 4), *gxs = (int32_t *)malloc((size_t)R * (K / 16) * 4);
+    for (uint32_t j = 0; j < N; j++) {
+        for (uint32_t k = 0; k < K; k++) wf[k] = (uniform() * 2 - 1) * powf(10.0f, (float)(j % 5) - 2.0f) * (k % 37 ? 1.0f : 6.0f);
+        spingalett_block_quantize(p, wf, w + (size_t)j * stride, K);
+        bias[j] = uniform() - 0.5f;
+    }
+    /* (a row of zeros, and a block of them) */
+    for (uint32_t r = 0; r < R; r++)
+        for (uint32_t k = 0; k < K; k++) x[(size_t)r * K + k] = r == 2 || (r == 1 && k < BV) ? 0.0f : (uniform() * 2 - 1) * (k % 11 ? 1.0f : 9.0f);
+    for (uint32_t r = 0; r < R; r++) {
+        int8_t *q = xq + (size_t)r * K;
+        float *d = dx + (size_t)r * (K / BV);
+        int32_t *sums = xs + (size_t)r * (K / 16);
+        spingalett_quantize_blocks(x + (size_t)r * K, K, BV, q, d, sums);
+        for (uint32_t j = 0; j < N; j++)
+            want[(size_t)r * N + j] = bias[j] + spingalett_block_dot(p, w + (size_t)j * stride, q, d, sums, K);
+    }
+    SpgGpuBuffer bw, bx, bq, bdx, bxs, bb, by;
+    memset(&bq, 0, sizeof bq); memset(&bdx, 0, sizeof bdx); memset(&bxs, 0, sizeof bxs); memset(&by, 0, sizeof by);
+    bool ok = upload(&bw, w, (size_t)N * stride) && upload(&bx, x, (size_t)R * K * 4) && upload(&bb, bias, N * 4) &&
+              spg_gpu_buffer_create(&bq, (size_t)R * K, false) && spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
+              spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) && spg_gpu_buffer_create(&by, (size_t)R * N * 4, false);
+    bool same_q = false, same_y = true;
+    for (uint32_t unit = 0; ok && unit < 2; unit++) {
+        const uint32_t rows_a_pass = unit ? SPG_BDOT_ROWS : 1u;
+        SpgGpuCommands *c = spg_gpu_commands_create();
+        ok = c && spg_gpu_record_begin(c);
+        SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
+        if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
+        for (uint32_t r0 = 0; ok && r0 < R; r0 += rows_a_pass) {
+            spg_gpu_barrier(c);
+            const uint32_t spec[2] = {type, rows_a_pass};
+            SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address,
+                              R - r0 < rows_a_pass ? R - r0 : rows_a_pass, N, K, stride, r0, N};
+            spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 2, &dp, sizeof dp, (N + 7) / 8, 1, 1);
+        }
+        ok = ok && spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
+        if (c) spg_gpu_commands_free(c);
+        ok = ok && download(gxq, &bq, (size_t)R * K) && download(gdx, &bdx, (size_t)R * (K / BV) * 4) &&
+             download(gxs, &bxs, (size_t)R * (K / 16) * 4) && download(got, &by, (size_t)R * N * 4);
+        same_q = ok && !memcmp(gxq, xq, (size_t)R * K) && !memcmp(gdx, dx, (size_t)R * (K / BV) * 4) &&
+                 !memcmp(gxs, xs, (size_t)R * (K / 16) * 4);
+        same_y = same_y && ok && !memcmp(got, want, (size_t)R * N * 4);
+    }
+    if (!ok || !same_q || !same_y) failures++;
+    printf("  blocks %-6s %5u x %3u, %2u rows: %s\n", names[type], K, N, R,
+           !ok ? "FAILED to run" : !same_q ? "quantized rows DIFFER" : !same_y ? "products DIFFER" : "the CPU's bits");
+    SpgGpuBuffer *bufs[] = {&bw, &bx, &bq, &bdx, &bxs, &bb, &by};
+    for (size_t k = 0; k < sizeof bufs / sizeof *bufs; k++) spg_gpu_buffer_free(bufs[k]);
+    free(wf); free(x); free(bias); free(want); free(got); free(dx); free(gdx); free(w); free(xq); free(gxq); free(xs); free(gxs);
+}
+
 int main(int argc, char **argv) {
     const char *backend = getenv("SPINGALETT_GPU_BACKEND");
     const bool cuda = backend && !strcmp(backend, "cuda");
@@ -923,6 +994,14 @@ int main(int argc, char **argv) {
         test_attention(64, 4, 2, 200, 2, false, true);
         test_attention(32, 4, 2, 150, 2, true, false);
         test_attention(128, 2, 2, 150, 2, false, false);
+    }
+    if (spg_gpu_kernel_built(SPG_KERNEL_bdot)) {
+        /* every block precision: one block, several, rounds of 32 chunks and a partial one; rows of a pass and more */
+        for (int p = PRECISION_Q8_0; p < PRECISION_COUNT; p++) {
+            const uint32_t BV = slett_block_values((PrecisionMode)p);
+            test_blocks((PrecisionMode)p, BV, 9, 3);
+            test_blocks((PrecisionMode)p, BV == 32u ? 37u * 32u : 5u * 256u, 13, 11);
+        }
     }
     printf(failures ? "%d FAILED\n" : "ALL PASSED\n", failures);
     return failures != 0;

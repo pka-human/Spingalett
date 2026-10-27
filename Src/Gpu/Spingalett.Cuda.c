@@ -359,6 +359,11 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         if (count < 1) return -1;
         /* (the head size of the unit; gflash's tiles of queries a warp, 1: _m1) */
         snprintf(name, sizeof name, "%s_d%u%s", base, spec[0], kernel == SPG_KERNEL_gflash && count > 1 && spec[1] == 1u ? "_m1" : "");
+    } else if (kernel == SPG_KERNEL_bdot) {
+        static const char *const types[SPG_B_TYPES] = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k",
+                                                       "q6_k", "iq4_nl", "iq4_xs"};
+        if (count < 2 || spec[0] >= SPG_B_TYPES) return -1;
+        snprintf(name, sizeof name, "bdot_%s_r%u", types[spec[0]], spec[1]);    /* (the type, the rows a pass) */
     } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
         if (count < 2) return -1;
         snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */

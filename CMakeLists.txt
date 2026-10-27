@@ -620,13 +620,15 @@ if(BUILD_TESTS)
     # The GPU kernels against references in double precision, on each backend (skipped without a
     # device).
     if(SPINGALETT_HAS_VULKAN OR SPINGALETT_HAS_CUDA)
+        # (the engine's block products and GGUF's quantizers: the references of the block kernels)
         add_executable(SpingalettGpuTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.GpuTests.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Device.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuKernels.c
-                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c)
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Quantize.c)
         target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_SOURCE_DIR}/Include
-                                   ${CMAKE_CURRENT_BINARY_DIR})
-        target_link_libraries(SpingalettGpuTests PRIVATE ${CMAKE_DL_LIBS})
+                                   ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/Spingalett)
+        target_link_libraries(SpingalettGpuTests PRIVATE SpingalettEngine ${CMAKE_DL_LIBS})
         if(NOT WIN32)
             target_link_libraries(SpingalettGpuTests PRIVATE Threads::Threads m)
         endif()

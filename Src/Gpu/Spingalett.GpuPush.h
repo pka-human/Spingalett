@@ -206,6 +206,26 @@ enum { SPG_IP_EPI, SPG_IP_DIRECT, SPG_IP_POOL, SPG_IP_GAP, SPG_IP_ADD, SPG_IP_MU
 #define SPG_IP_DW4        8u        /* DIRECT with FLOATS: a depthwise convolution's four channels at a time */
 #define SPG_IP_OG4        16u       /* DIRECT with FLOATS: four filters of a group at a time */
 
+/* bquant.comp: rows of activations quantized in blocks of bv values (32 or 256) as spingalett_quantize_blocks()
+   quantizes them, the bits of the CPU: x [rows][ldx floats] to codes q [rows][k] (signed bytes), a scale a block dx
+   [rows][k / bv] and the sum of every 16 codes xs [rows][k / 16] (int32). A warp a block. */
+typedef struct {
+    uint64_t x, q, dx, xs;
+    uint32_t rows, k, bv, ldx;
+} SpgBquantPush;
+
+/* bdot.comp: rows of activations quantized by bquant times a linear layer's weights of a block precision (TYPE: the
+   precision less SPINGALETT_PRECISION_Q8_0), y[r][j] = bias[j] + spingalett_block_dot() of row j, the bits of the CPU:
+   a row of weights `stride` bytes of whole blocks as GGUF stores them, k values; rows r0 to r0 + rows - 1 of the
+   bquant arrays (SPG_BDOT_ROWS at most a dispatch), y's rows ldy floats apart. A warp a row of weights. */
+typedef struct {
+    uint64_t w, q, dx, xs, bias, y;
+    uint32_t rows, n, k, stride, r0, ldy;
+} SpgBdotPush;
+#define SPG_BDOT_ROWS 8u
+enum { SPG_B_Q8_0, SPG_B_Q4_0, SPG_B_Q4_1, SPG_B_Q5_0, SPG_B_Q5_1, SPG_B_Q2_K, SPG_B_Q3_K, SPG_B_Q4_K, SPG_B_Q5_K,
+       SPG_B_Q6_K, SPG_B_IQ4_NL, SPG_B_IQ4_XS, SPG_B_TYPES };
+
 /* wqmv.comp: products of rows of activations with a linear layer's weights kept as integer codes (INT8, INT4, INT2:
    BITS) and a scale a row of weights, the codes widened in registers: y[r][n] = act(bias[n] + scale[n] sum_k
    x[r][k] code[n][k]) for the `rows` rows from r0 on (SPG_WQ_ROWS at most). A row of codes takes `stride` bytes (a
