@@ -221,8 +221,8 @@ static bool session_workspace(SpingalettSession *s, ComputeMode mode) {
     return s->w && s->queries;
 }
 
-/* Rows a step of the GPU's session from the image (its logits' memory a row of the vocabulary each). */
-#define GS_ROWS 128u
+/* Rows a step of the GPU's session from the image (the logits of SPG_SESSION_LOGITS of them at most). */
+#define GS_ROWS 512u
 
 /* The session on the GPU of the compute mode straight from the model's image (Spingalett.GpuSession.c: weights of
    floats, float16, bfloat16 and GGUF's block types); false (and the session elsewhere) when the GPU cannot run it. */
@@ -233,7 +233,7 @@ static bool session_image_gpu(SpingalettSession *s) {
     s->gs = spingalett_gpu_session_new(s->model, s->sequences, s->max_length, s->gs_rows, &why);
     s->gs_tokens = (uint32_t *)malloc((size_t)s->gs_rows * sizeof(uint32_t));
     s->gs_pick = (uint32_t *)malloc((size_t)s->gs_rows * sizeof(uint32_t));
-    s->gs_logits = (float *)malloc((size_t)s->gs_rows * s->vocabulary * sizeof(float));
+    s->gs_logits = (float *)malloc((size_t)SPG_SESSION_LOGITS * s->vocabulary * sizeof(float));
     if (s->gs && s->gs_tokens && s->gs_pick && s->gs_logits) {
         spingalett_log(LOG_DEBUG, "session: on the GPU, from the model's image");
         return true;
@@ -253,7 +253,7 @@ static bool session_image_gpu(SpingalettSession *s) {
 static bool session_feed_gs(SpingalettSession *s, const SpingalettSessionFeed *feeds, uint32_t count) {
     for (uint32_t f = 0, t = 0;;) {
         uint32_t rows = 0, picked = 0;
-        while (rows < s->gs_rows && f < count) {
+        while (rows < s->gs_rows && picked < SPG_SESSION_LOGITS && f < count) {
             const SpingalettSessionFeed *e = &feeds[f];
             if (t >= e->count) {
                 f++, t = 0;

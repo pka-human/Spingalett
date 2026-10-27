@@ -52,6 +52,9 @@ typedef struct {
     float keep, share;              /* label smoothing of the targets: keep t + share (keep 0: none) */
 } SpgGpuRows;
 
+/* Rows whose logits a step of a GPU session from the model's image writes, at most. */
+#define SPG_SESSION_LOGITS 64u
+
 #if defined(SPINGALETT_HAS_VULKAN) || defined(SPINGALETT_HAS_CUDA)
 
 /* Directs the calling thread's GPU work to the backend of a compute mode (CUDA for COMPUTE_CUDA, Vulkan
@@ -137,7 +140,7 @@ bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t 
    `sequences` sequences of max_length positions, steps of `most` rows at most; NULL with *why for a model whose
    layers it does not run (integer weights, layers that mix positions), or when memory runs out. A step runs rows
    (each a token of a sequence at a position) through every layer and writes the logits of the rows of pick[]
-   (picked of them) to logits [picked x vocabulary]. */
+   (picked of them, SPG_SESSION_LOGITS at most) to logits [picked x vocabulary]. */
 SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t sequences, uint32_t max_length,
                                           uint32_t most, const char **why);
 void spingalett_gpu_session_free(SpgGpuSession *s);

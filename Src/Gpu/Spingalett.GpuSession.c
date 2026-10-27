@@ -60,6 +60,7 @@ typedef struct {
 struct SpgGpuSession {
     const uint8_t *image;
     uint32_t layers, sequences, max_length, most, vocabulary;
+    uint32_t most_logits;           /* rows whose logits a step writes, at most */
     GLayer *L;
     SpgGpuBuffer *buffers;          /* everything allocated, freed together */
     uint32_t buffer_count, buffer_cap;
@@ -93,9 +94,10 @@ static uint64_t buffer_new(SpgGpuSession *s, size_t bytes, bool host) {
     return b->address;
 }
 
-/* bytes from the host into a new buffer (through a staging buffer, waited for): its address, 0 on failure */
+/* bytes from the host into a new buffer (through a staging buffer, waited for), 16 more after them that kernels may
+   read (bmm reads rows of weights in whole words): its address, 0 on failure */
 static uint64_t upload(SpgGpuSession *s, const void *data, size_t bytes) {
-    const uint64_t at = buffer_new(s, bytes, false);
+    const uint64_t at = buffer_new(s, bytes + 16u, false);
     if (!at) return 0;
     const SpgGpuBuffer *dst = &s->buffers[s->buffer_count - 1u];
     SpgGpuBuffer stage;
@@ -398,8 +400,11 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     s->xq = buffer_new(s, (size_t)most * kmax, false);
     s->dx = buffer_new(s, (size_t)most * (kmax / 32u + 1u) * sizeof(float), false);
     s->xs = buffer_new(s, (size_t)most * (kmax / 16u + 1u) * sizeof(int32_t), false);
-    s->gathered = buffer_new(s, (size_t)most * widest * sizeof(float), false);
-    s->logits = buffer_new(s, (size_t)most * s->vocabulary * sizeof(float), false);
+    /* logits of SPG_SESSION_LOGITS rows a step at most, unless the last layer runs on every row */
+    s->most_logits = most < SPG_SESSION_LOGITS || last->run == RUN_ATTN || last->run == RUN_EMBED ? most
+                     : SPG_SESSION_LOGITS;
+    s->gathered = buffer_new(s, (size_t)s->most_logits * widest * sizeof(float), false);
+    s->logits = buffer_new(s, (size_t)s->most_logits * s->vocabulary * sizeof(float), false);
     s->tokens = buffer_new(s, (size_t)most * sizeof(uint32_t), false);
     s->info = buffer_new(s, (size_t)most * 2u * sizeof(uint32_t), false);
     s->pick = buffer_new(s, (size_t)most * sizeof(uint32_t), false);
@@ -407,7 +412,7 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     s->pick_at = s->info_at + (size_t)most * 2u * sizeof(uint32_t);
     s->logits_at = (s->pick_at + (size_t)most * sizeof(uint32_t) + 15u) & ~(size_t)15u;
     if (!s->acts || !s->q || !s->xq || !s->dx || !s->xs || !s->gathered || !s->logits || !s->tokens || !s->info ||
-        !s->pick || !spg_gpu_buffer_create(&s->staging, s->logits_at + (size_t)most * s->vocabulary * sizeof(float), true)) {
+        !s->pick || !spg_gpu_buffer_create(&s->staging, s->logits_at + (size_t)s->most_logits * s->vocabulary * sizeof(float), true)) {
         spingalett_gpu_session_free(s);
         return *why = "out of device memory", NULL;
     }
@@ -469,7 +474,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 /* a prompt's rows on the matrix units */
                 const uint32_t spec[3] = {G->type, 0u, (uint32_t)L->activation};
                 SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, L->rows, K, G->stride, 0, L->out_c};
-                spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, groups(L->rows, 64u), groups(rows, 64u), 1);
+                spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, groups(rows, 64u), groups(L->rows, 64u), 1);
                 break;
             }
             const uint32_t pass = rows == 1u ? 1u : SPG_BDOT_ROWS;
@@ -660,6 +665,7 @@ bool spingalett_gpu_session_step(SpgGpuSession *s, uint32_t rows, const uint32_t
     if (!s || !rows || rows > s->most) return false;
     const GLayer *last = &s->L[s->layers - 1u];
     const bool all = picked == rows || last->run == RUN_ATTN || last->run == RUN_EMBED;
+    if ((all && picked ? rows : picked) > s->most_logits) return false;
     uint8_t *stage = (uint8_t *)s->staging.mapped;
     memcpy(stage, tokens, (size_t)rows * sizeof(uint32_t));
     uint32_t *info = (uint32_t *)(void *)(stage + s->info_at);

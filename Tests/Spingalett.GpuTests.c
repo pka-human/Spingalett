@@ -885,7 +885,7 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
     float *bias = (float *)malloc(N * sizeof(float)), *want = (float *)malloc((size_t)R * N * sizeof(float));
     float *got = (float *)malloc((size_t)R * N * sizeof(float)), *dx = (float *)malloc((size_t)R * (K / BV) * 4);
     float *gdx = (float *)malloc((size_t)R * (K / BV) * 4);
-    uint8_t *w = (uint8_t *)malloc((size_t)N * stride);
+    uint8_t *w = (uint8_t *)calloc((size_t)N * stride + 16u, 1);        /* (bmm reads whole words: 16 bytes more) */
     int8_t *xq = (int8_t *)malloc((size_t)R * K), *gxq = (int8_t *)malloc((size_t)R * K);
     int32_t *xs = (int32_t *)malloc((size_t)R * (K / 16) * 4), *gxs = (int32_t *)malloc((size_t)R * (K / 16) * 4);
     for (uint32_t j = 0; j < N; j++) {
@@ -904,9 +904,12 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
         for (uint32_t j = 0; j < N; j++)
             want[(size_t)r * N + j] = bias[j] + spingalett_block_dot(p, w + (size_t)j * stride, q, d, sums, K);
     }
-    SpgGpuBuffer bw, bx, bq, bdx, bxs, bb, by;
+    SpgGpuBuffer bw, bx, bq, bdx, bxs, bb, by, bnan;
     memset(&bq, 0, sizeof bq); memset(&bdx, 0, sizeof bdx); memset(&bxs, 0, sizeof bxs); memset(&by, 0, sizeof by);
-    bool ok = upload(&bw, w, (size_t)N * stride) && upload(&bx, x, (size_t)R * K * 4) && upload(&bb, bias, N * 4) &&
+    memset(&bnan, 0, sizeof bnan);
+    memset(got, 0xFF, (size_t)R * N * 4);              /* (NaNs written over the outputs before each unit) */
+    bool ok = upload(&bw, w, (size_t)N * stride + 16u) && upload(&bx, x, (size_t)R * K * 4) && upload(&bb, bias, N * 4) &&
+              upload(&bnan, got, (size_t)R * N * 4) &&
               spg_gpu_buffer_create(&bq, (size_t)R * K, false) && spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
               spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) && spg_gpu_buffer_create(&by, (size_t)R * N * 4, false);
     bool same_q = false, same_y = true;
@@ -915,13 +918,14 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
         SpgGpuCommands *c = spg_gpu_commands_create();
         ok = c && spg_gpu_record_begin(c);
         SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
+        if (ok) spg_gpu_copy(c, &bnan, 0, &by, 0, (size_t)R * N * 4);
         if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
         if (unit == 2) {
             /* bmm: every row at once, on the matrix units */
             spg_gpu_barrier(c);
             const uint32_t spec[3] = {type, 0u, 0u};
             SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, R, N, K, stride, 0, N};
-            spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (N + 63) / 64, (R + 63) / 64, 1);
+            spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, (N + 63) / 64, 1);
         }
         for (uint32_t r0 = 0; ok && unit < 2 && r0 < R; r0 += rows_a_pass) {
             spg_gpu_barrier(c);
@@ -941,9 +945,76 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
     if (!ok || !same_q || !same_y) failures++;
     printf("  blocks %-6s %5u x %3u, %2u rows: %s\n", names[type], K, N, R,
            !ok ? "FAILED to run" : !same_q ? "quantized rows DIFFER" : !same_y ? "products DIFFER" : "the CPU's bits");
-    SpgGpuBuffer *bufs[] = {&bw, &bx, &bq, &bdx, &bxs, &bb, &by};
+    SpgGpuBuffer *bufs[] = {&bw, &bx, &bq, &bdx, &bxs, &bb, &by, &bnan};
     for (size_t k = 0; k < sizeof bufs / sizeof *bufs; k++) spg_gpu_buffer_free(bufs[k]);
     free(wf); free(x); free(bias); free(want); free(got); free(dx); free(gdx); free(w); free(xq); free(gxq); free(xs); free(gxs);
+}
+
+/* bmm on the products of a layer of Qwen3-0.6B (R = SPINGALETT_BENCH_ROWS rows, 512 by default: a prompt's step)
+   in the block precisions named, Q8_0, Q4_K and Q6_K by default: each product's time. */
+static void bench_blocks(int count, char **types) {
+    static const char *const names[] = {"Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K",
+                                        "Q6_K", "IQ4_NL", "IQ4_XS"};
+    static const uint32_t shapes[4][2] = {{4096, 1024}, {1024, 2048}, {3072, 1024}, {1024, 3072}};   /* N, K */
+    static char *defaults[] = {"Q8_0", "Q4_K", "Q6_K"};
+    const char *env = getenv("SPINGALETT_BENCH_ROWS");
+    const uint32_t R = env ? (uint32_t)atoi(env) : 512u;
+    if (!count) count = 3, types = defaults;
+    printf("bmm: %u rows\n", R);
+    for (int k = 0; k < count; k++) {
+        int type = -1;
+        for (int t = 0; t < 12; t++)
+            if (!strcmp(types[k], names[t])) type = t;
+        if (type < 0) continue;
+        const PrecisionMode p = (PrecisionMode)(PRECISION_Q8_0 + type);
+        double total = 0, ops = 0;
+        for (int sh = 0; sh < 4; sh++) {
+            const uint32_t N = shapes[sh][0], K = shapes[sh][1], BV = slett_block_values(p);
+            const uint32_t stride = K / BV * slett_block_bytes(p);
+            uint8_t *w = (uint8_t *)calloc((size_t)N * stride + 16u, 1);
+            float *row = (float *)malloc((size_t)K * sizeof(float)), *x = (float *)malloc((size_t)R * K * 4);
+            for (uint32_t j = 0; j < N; j++) {
+                for (uint32_t i = 0; i < K; i++) row[i] = uniform();
+                spingalett_block_quantize(p, row, w + (size_t)j * stride, K);
+            }
+            for (size_t i = 0; i < (size_t)R * K; i++) x[i] = uniform();
+            SpgGpuBuffer bw, bx, bq, bdx, bxs, bb, by;
+            float *bias = (float *)calloc(N, sizeof(float));
+            bool ok = bias && upload(&bw, w, (size_t)N * stride + 16u) && upload(&bx, x, (size_t)R * K * 4) &&
+                      upload(&bb, bias, N * 4) && spg_gpu_buffer_create(&bq, (size_t)R * K, false) &&
+                      spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
+                      spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) &&
+                      spg_gpu_buffer_create(&by, (size_t)R * N * 4, false);
+            double t = 0;
+            for (int pass = 0; ok && pass < 2; pass++) {
+                const int reps = pass ? 50 : 3;
+                SpgGpuCommands *c = spg_gpu_commands_create();
+                ok = c && spg_gpu_record_begin(c);
+                SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
+                if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
+                for (int r = 0; ok && r < reps; r++) {
+                    spg_gpu_barrier(c);
+                    const uint32_t spec[3] = {(uint32_t)type, 0u, 0u};
+                    SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, R, N, K,
+                                      stride, 0, N};
+                    spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, (N + 63) / 64, 1);
+                }
+                ok = ok && spg_gpu_record_end(c);
+                const double start = seconds();
+                ok = ok && spg_gpu_submit(c) && spg_gpu_wait(c);
+                t = (seconds() - start) / reps;
+                if (c) spg_gpu_commands_free(c);
+            }
+            if (ok) {
+                printf("  %-6s %4u x %4u: %7.1f us %6.2f TOPS\n", names[type], N, K, t * 1e6, 2.0 * R * N * K / t * 1e-12);
+                total += t, ops += 2.0 * R * N * K;
+            }
+            SpgGpuBuffer *bufs[] = {&bw, &bx, &bq, &bdx, &bxs, &bb, &by};
+            for (size_t b = 0; b < sizeof bufs / sizeof *bufs; b++) spg_gpu_buffer_free(bufs[b]);
+            free(w); free(row); free(x); free(bias);
+        }
+        if (total > 0) printf("  %-6s a layer:    %7.1f us %6.2f TOPS\n", names[type], total * 1e6, ops / total * 1e-12);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -965,6 +1036,7 @@ int main(int argc, char **argv) {
             if (!strcmp(argv[k], "fw")) float_weights = true;
         }
         if (argc > 2 && !strcmp(argv[2], "attn")) bench_attention();
+        else if (argc > 2 && !strcmp(argv[2], "blocks")) bench_blocks(argc - 3, argv + 3);
         else bench(dense);
         return 0;
     }
