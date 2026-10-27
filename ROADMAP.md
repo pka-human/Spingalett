@@ -165,6 +165,10 @@ What was planned for 1.5 before the IR, built on it: the families become convert
   data moved (a warning, and CI counting the coverage); GGUF's block types on the GPU: products of a token bound by
   memory (dp4a, Vulkan's integer dot products), products of a prompt on the matrix units, the weights kept in their
   blocks (a 1B model in Q4_K_M takes 800 MB of the GPU, not 5 GB).
+- **Models larger than the GPU's memory**: a graph placed by a budget of device memory, as llama.cpp's
+  `--n-gpu-layers` does: the first layers' weights and key-value cache on the GPU, the rest in host memory and run by
+  the CPU's block kernels, the hidden state crossing once each way a token (Qwen3 8B in Q4_K_M with its cache on a
+  6 GB GPU); the split chosen from the sizes, or given. The experts of mixtures (1.9) build on it.
 - **The CPU's other instruction sets** for the block kernels: NEON with the dot product (Apple silicon, AArch64
   servers), AVX-512's 512-bit vectors.
 - **Tokenizers**: SentencePiece's Unigram (T5, many multilingual models) and WordPiece (BERT's encoders and embedding
