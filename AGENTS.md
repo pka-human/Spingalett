@@ -36,7 +36,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Tokenizer.c`, `Src/Spingalett.Json.c` | Tokenizers of `tokenizer.json` files (BPE; the pre-tokenizers' expressions matched by hand over `Spingalett.Unicode.h`, written by `Src/make_unicode.py`); the JSON reader they and the checkpoints' files share |
 | `Src/Spingalett.Pretrained.c`, `.h` | Language models from Hugging Face's directories (`config.json`, safetensors through `Torch.c`): the transformer built from hyper-parameters, its tensors read from a source each format provides |
 | `Src/Spingalett.IR.h`, `IR.c`, `IROps.c`, `IROps.def` | Graphs of operators (`spingalett_graph_*()`, docs/Graphs.md): values, nodes, what happens when a graph opens (order, folding, dead nodes), runs (inputs bound, a pool of blocks, views, values freed after their last reader); the operators' kernels; the operators in the order of their codes in format 11 (new ones at the end) |
-| `Src/Spingalett.IROnnx.c`, `IRFile.c`, `IRFuse.c` | ONNX files as graphs (its own protocol buffer reader); `.slett` format 11; common subexpressions and the fusions into the library's operators (Linear, FusedAttention, Gelu and Swish written out, a Conv's activation) |
+| `Src/Spingalett.IROnnx.c`, `IRFile.c`, `IRFuse.c` | ONNX files as graphs (its own protocol buffer reader); `.slett` formats 11 and 12 (12 where nodes use 1.6's attributes: maps channels last, attention of views); common subexpressions and the fusions into the library's operators (Linear, FusedAttention with the heads' transposes and the views of a joint QKV product taken in, Gelu and Swish written out, a Conv's activation, group normalization) |
 | `Src/Spingalett.Gguf.c` | GGUF files: metadata, the families' hyper-parameters (`gguf_describe()`), a language model's `.slett` image built from the file's tensors as stored (`spingalett_gguf_image()`, which `spingalett_model_open()` runs), the float network of `spingalett_load_pretrained()`, the queries' and keys' rows put back in Hugging Face's order, vocabularies for `Tokenizer.c` |
 | `Src/Spingalett.Image.c`, `Src/Spingalett.Quantize.c` | `.slett` images written layer by layer without a network (the plan of the outputs' buffers); GGUF's quantizers, ggml's reference ones byte for byte |
 | `Src/Spingalett.Blocks.c`, `Src/Spingalett.Attention.c` | Layers of block precisions over many rows (a token's rows eight at a time, a prompt's tokens in transposed groups against unpacked tiles; AVX2, AVX-VNNI, AVX-512 VNNI, recompiled through `Src/Kernels/` for dispatch), and sessions' attention over keys kept transposed in blocks of eight: both give the engine's bits |
@@ -108,11 +108,13 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   joins `SPINGALETT_STRICT_FP` in `CMakeLists.txt`); epilogues use `spingalett_int_output()` so every path rounds
   alike. On the GPU integer models compute in the CPU's order (`iquant`, `ipass`, `precise`, CUDA's `mul.rn` and
   `add.rn`): `spingalett_model_predict()` gives `spingalett_model_run()`'s bits there too.
-- **Formats.** `.slett` versions 3 to 10 stay loadable (version 11, graphs of operators, opens through
+- **Formats.** `.slett` versions 3 to 10 stay loadable (versions 11 and 12, graphs of operators, open through
   `spingalett_graph_open()`); the writer picks the lowest version that
   can hold the network (chains 3 to 5, graphs 6, transposed convolutions, upsampling and layer
   normalization 7, embeddings, attention, RMS normalization, products of layers, GELU and SiLU, the
-  sparse cross-entropy 8, layers tied to an embedding 9, block precisions and format 10's attention 10). Any change to the format updates `docs/ModelFormat.md` and adds a version.
+  sparse cross-entropy 8, layers tied to an embedding 9, block precisions and format 10's attention 10; graphs 11, or
+  12 where nodes use 1.6's attributes, which a 1.5 reader must refuse rather than misread). Any change to the format
+  updates `docs/ModelFormat.md` and adds a version.
 - **Graphs.** Layers run in index order, every layer after its inputs. A layer read by several gets
   their gradients in a fixed order (first written, the rest added), so graphs keep determinism.
   Chains must compute what they computed before graphs existed; `graph` group tests both.
