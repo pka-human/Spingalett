@@ -275,6 +275,17 @@ static void infer(SpingalettGraph *g, uint32_t k) {
             return;
         }
         case IR_FusedAttention: {
+            const IrAttr *sa = ir_attr(n, "shape");
+            if (ir_attr_int(n, "layout", 0) == 2) {
+                /* (the views' output: the shape the fusion gave it) */
+                if (!sa || sa->type != ATTR_INTS || sa->count > IR_MAX_RANK) return;
+                y.known = true;
+                y.dtype = F32;
+                y.rank = (uint8_t)sa->count;
+                for (uint32_t d = 0; d < sa->count; d++) y.dims[d] = sa->ints[d], y.sym[d] = 0;
+                declare(g, n, 0, &y);
+                return;
+            }
             if (n->input_count < 3 || !x->known || !in[2].known) return;
             const Shape *v = &in[2];
             if (ir_attr_int(n, "layout", 0) == 1) {

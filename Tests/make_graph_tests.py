@@ -144,7 +144,8 @@ def write_cases(path, kept):
 def block_cases():
     """Tests/Data/graph_blocks.bin, in graph_cases.bin's format: small networks of several operators, which the layout
     pass, the fusions and the GPU's plans see whole (channels-last convolutions and poolings, a convolution of patches,
-    a bottleneck block, attention written out; on the GPU in bfloat16, values kept as such between products)."""
+    a bottleneck block, attention written out, attention of Q, K and V split from one product or gathered from it; on
+    the GPU in bfloat16, values kept as such between products)."""
     from onnx import TensorProto, helper, numpy_helper
     from onnx.reference import ReferenceEvaluator
     rng = np.random.default_rng(11)
@@ -209,6 +210,34 @@ def block_cases():
           "Wk": w(64, 64), "bk": w(64, scale=0.1), "Wv": w(64, 64), "bv": w(64, scale=0.1),
           "split": np.array([1, 32, 2, 32], np.int64), "scale": np.array(32 ** -0.5, np.float32),
           "merge": np.array([1, 32, 64], np.int64), "Wo": w(64, 64), "bo": w(64, scale=0.1)})
+    # Q, K and V of one product: split in three as GPT-2's export has them, gathered as torchvision's (sequence first)
+    split = [conv("MatMul", ["x", "Wp"], ["p0"]), conv("Add", ["p0", "bp"], ["p"]),
+             conv("Split", ["p", "thirds"], ["q0", "k0", "v0"], axis=2)]
+    for t, perm in (("q", [0, 2, 1, 3]), ("v", [0, 2, 1, 3]), ("k", [0, 2, 1, 3])):
+        split += [conv("Reshape", [t + "0", "heads"], [t + "1"]), conv("Transpose", [t + "1"], [t + "2"], perm=perm)]
+    split += [conv("Reshape", ["k2", "merged"], ["k3"]), conv("Transpose", ["k3"], ["k4"], perm=[0, 2, 1]),
+              conv("Reshape", ["k4", "kt_shape"], ["kt"]), conv("MatMul", ["q2", "kt"], ["s0"]),
+              conv("Mul", ["s0", "scale"], ["s"]), conv("Softmax", ["s"], ["sm"], axis=-1),
+              conv("MatMul", ["sm", "v2"], ["o0"]), conv("Transpose", ["o0"], ["o1"], perm=[0, 2, 1, 3]),
+              conv("Reshape", ["o1", "back"], ["y"])]
+    case("attention_split", split, {"x": x(1, 24, 64)}, ["y"],
+         {"Wp": w(64, 192), "bp": w(192, scale=0.1), "thirds": np.array([64, 64, 64], np.int64),
+          "heads": np.array([1, 24, 2, 32], np.int64), "merged": np.array([2, 24, 32], np.int64),
+          "kt_shape": np.array([1, 2, 32, 24], np.int64), "scale": np.array(32 ** -0.5, np.float32),
+          "back": np.array([1, 24, 64], np.int64)})
+    gather = [conv("MatMul", ["x", "Wp"], ["p0"]), conv("Add", ["p0", "bp"], ["p"]),
+              conv("Reshape", ["p", "packs"], ["p1"]), conv("Transpose", ["p1"], ["p2"], perm=[2, 1, 0, 3])]
+    for i, t in enumerate("qkv"):
+        gather += [conv("Gather", ["p2", f"i{i}"], [t + "0"], axis=0), conv("Reshape", [t + "0", "heads"], [t + "1"]),
+                   conv("Transpose", [t + "1"], [t + "2"], perm=[0, 2, 3, 1] if t == "k" else [0, 2, 1, 3])]
+    gather += [conv("MatMul", ["q2", "k2"], ["s0"]), conv("Mul", ["s0", "scale"], ["s"]),
+               conv("Softmax", ["s"], ["sm"], axis=-1), conv("MatMul", ["sm", "v2"], ["o0"]),
+               conv("Transpose", ["o0"], ["o1"], perm=[2, 0, 1, 3]), conv("Reshape", ["o1", "back"], ["y"])]
+    case("attention_gather", gather, {"x": x(17, 1, 64)}, ["y"],
+         {"Wp": w(64, 192), "bp": w(192, scale=0.1), "packs": np.array([17, 1, 3, 64], np.int64),
+          "i0": np.array(0, np.int64), "i1": np.array(1, np.int64), "i2": np.array(2, np.int64),
+          "heads": np.array([1, 17, 2, 32], np.int64), "scale": np.array(32 ** -0.5, np.float32),
+          "back": np.array([17, 1, 64], np.int64)})
     write_cases(os.path.join(HERE, "Data", "graph_blocks.bin"), cases)
     print(f"{len(cases)} cases of blocks")
 

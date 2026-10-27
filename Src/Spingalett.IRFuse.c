@@ -440,6 +440,227 @@ static bool permuted(const Fuse *f, uint32_t v, unsigned want, uint32_t *src, Ir
     return false;
 }
 
+/* Integers of a constant of int64 or int32 (a scalar, or a list of at most `most`): their number, -1 when v is none. */
+static int64_t const_list(const SpingalettGraph *g, uint32_t v, int64_t *out, int64_t most) {
+    if (v == IR_NONE) return -1;
+    const IrValue *c = &g->values[v];
+    if (c->kind != VALUE_CONST || c->rank > 1 || (c->dtype != SPINGALETT_DTYPE_INT64 && c->dtype != SPINGALETT_DTYPE_INT32))
+        return -1;
+    const int64_t n = c->rank ? c->dims[0] : 1;
+    if (n < 0 || n > most) return -1;
+    for (int64_t k = 0; k < n; k++)
+        out[k] = c->dtype == SPINGALETT_DTYPE_INT64 ? ((const int64_t *)c->data)[k] : ((const int32_t *)c->data)[k];
+    return n;
+}
+
+/* Whether a value is declared with sizes that are numbers, none of them 0. */
+static bool sized(const SpingalettGraph *g, uint32_t v) {
+    if (v == IR_NONE || !g->values[v].declared) return false;
+    for (uint32_t d = 0; d < g->values[v].rank; d++)
+        if (g->values[v].dims[d] <= 0) return false;
+    return true;
+}
+
+/* A node that only rearranges its input's values (Reshape, Flatten, Squeeze, Unsqueeze, Identity, Transpose, a Gather
+   of one constant index, a Slice and a Split of constant bounds): the place in its input of output o's value at idx
+   (rewritten in place), false where the node is none of them or its sizes are not declared numbers. */
+static bool view_back(const SpingalettGraph *g, const IrNode *n, uint32_t o, int64_t *idx) {
+    if (!n->input_count || !sized(g, n->inputs[0]) || o >= n->output_count || !sized(g, n->outputs[o])) return false;
+    const IrValue *in = &g->values[n->inputs[0]], *out = &g->values[n->outputs[o]];
+    int64_t at[IR_MAX_RANK];
+    switch ((IrOp)n->op) {
+        case IR_Reshape: case IR_Flatten: case IR_Squeeze: case IR_Unsqueeze: case IR_Identity: {
+            uint64_t flat = 0;
+            for (uint32_t d = 0; d < out->rank; d++) flat = flat * (uint64_t)out->dims[d] + (uint64_t)idx[d];
+            for (uint32_t d = in->rank; d-- > 0;) {
+                idx[d] = (int64_t)(flat % (uint64_t)in->dims[d]);
+                flat /= (uint64_t)in->dims[d];
+            }
+            return true;
+        }
+        case IR_Transpose: {
+            const IrAttr *pa = ir_attr(n, "perm");
+            if (in->rank != out->rank || (pa && (pa->type != ATTR_INTS || pa->count != in->rank))) return false;
+            for (uint32_t k = 0; k < in->rank; k++) {
+                const int64_t a = pa ? pa->ints[k] : (int64_t)(in->rank - 1u - k);
+                if (a < 0 || a >= (int64_t)in->rank) return false;
+                at[a] = idx[k];
+            }
+            memcpy(idx, at, in->rank * sizeof(int64_t));
+            return true;
+        }
+        case IR_Gather: {
+            int64_t axis = ir_attr_int(n, "axis", 0), c;
+            if (axis < 0) axis += in->rank;
+            if (n->input_count < 2 || axis < 0 || axis >= (int64_t)in->rank || const_list(g, n->inputs[1], &c, 1) != 1)
+                return false;
+            if (c < 0) c += in->dims[axis];
+            if (c < 0 || c >= in->dims[axis]) return false;
+            if (g->values[n->inputs[1]].rank == 0) {
+                if (out->rank + 1u != in->rank) return false;
+                for (uint32_t d = in->rank; d-- > 0;)
+                    idx[d] = d == (uint32_t)axis ? c : d > (uint32_t)axis ? idx[d - 1u] : idx[d];
+            } else {
+                if (out->rank != in->rank) return false;
+                idx[axis] = c;
+            }
+            return true;
+        }
+        case IR_Slice: {
+            /* (opset 10 on: starts, ends, axes and steps as inputs; before it, attributes) */
+            int64_t starts[IR_MAX_RANK], axes[IR_MAX_RANK], steps[IR_MAX_RANK];
+            int64_t ns;
+            if (n->input_count >= 3) {
+                ns = const_list(g, n->inputs[1], starts, IR_MAX_RANK);
+                if (ns < 0) return false;
+                if (n->input_count > 3 && n->inputs[3] != IR_NONE) {
+                    if (const_list(g, n->inputs[3], axes, IR_MAX_RANK) != ns) return false;
+                } else for (int64_t k = 0; k < ns; k++) axes[k] = k;
+                if (n->input_count > 4 && n->inputs[4] != IR_NONE) {
+                    if (const_list(g, n->inputs[4], steps, IR_MAX_RANK) != ns) return false;
+                } else for (int64_t k = 0; k < ns; k++) steps[k] = 1;
+            } else {
+                const IrAttr *sa = ir_attr(n, "starts"), *aa = ir_attr(n, "axes");
+                if (!sa || sa->type != ATTR_INTS || sa->count > IR_MAX_RANK) return false;
+                ns = sa->count;
+                for (int64_t k = 0; k < ns; k++) {
+                    starts[k] = sa->ints[k];
+                    axes[k] = aa && aa->type == ATTR_INTS && aa->count == sa->count ? aa->ints[k] : k;
+                    steps[k] = 1;
+                }
+            }
+            if (in->rank != out->rank) return false;
+            for (int64_t k = 0; k < ns; k++) {
+                int64_t a = axes[k] < 0 ? axes[k] + in->rank : axes[k], st = starts[k];
+                if (a < 0 || a >= (int64_t)in->rank || steps[k] != 1) return false;
+                if (st < 0) st += in->dims[a];
+                st = st < 0 ? 0 : st > in->dims[a] ? in->dims[a] : st;
+                idx[a] += st;
+            }
+            return true;
+        }
+        case IR_Split: {
+            int64_t axis = ir_attr_int(n, "axis", 0), sizes[64];
+            if (axis < 0) axis += in->rank;
+            if (axis < 0 || axis >= (int64_t)in->rank || in->rank != out->rank || n->output_count > 64) return false;
+            int64_t count = n->input_count > 1 && n->inputs[1] != IR_NONE ? const_list(g, n->inputs[1], sizes, 64) : -1;
+            const IrAttr *sp = ir_attr(n, "split");
+            if (count < 0 && sp && sp->type == ATTR_INTS && sp->count <= 64) {
+                count = sp->count;
+                memcpy(sizes, sp->ints, (size_t)count * sizeof(int64_t));
+            }
+            if (count < 0) {
+                /* equal parts (the last smaller), as many as the outputs */
+                const int64_t parts = (int64_t)n->output_count, each = (in->dims[axis] + parts - 1) / parts;
+                count = parts;
+                for (int64_t k = 0; k < parts; k++) sizes[k] = each;
+            }
+            if ((int64_t)o >= count) return false;
+            int64_t before = 0;
+            for (uint32_t k = 0; k < o; k++) before += sizes[k];
+            idx[axis] += before;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/* The offset in x of v's value at q (four axes, v's leading ones where it has three) through the first `length` nodes
+   of the chain from v (chain[j] making the value of its output outs[j]), -1 where the chain does not map it. */
+static int64_t chain_offset(const SpingalettGraph *g, IrNode *const *chain, const uint32_t *outs, uint32_t length,
+                            uint32_t v, uint32_t x, const int64_t *q) {
+    const IrValue *V = &g->values[v], *X = &g->values[x];
+    int64_t idx[IR_MAX_RANK];
+    for (uint32_t d = 0; d < V->rank; d++) idx[d] = q[4u - V->rank + d];
+    for (uint32_t j = 0; j < length; j++)
+        if (!view_back(g, chain[j], outs[j], idx)) return -1;
+    int64_t flat = 0;
+    for (uint32_t d = 0; d < X->rank; d++) {
+        if (idx[d] < 0 || idx[d] >= X->dims[d]) return -1;
+        flat = flat * X->dims[d] + idx[d];
+    }
+    return flat;
+}
+
+/* Whether v (Q (B, H, S, D), K^T (B, H, D, T) or V (B, H, T, Dv), or without B) reads the values of a value src through
+   a chain of nodes that only rearrange them (view_back(); from v back, in chain, length of them), each of its values at
+   at + its index times strides[4] in src (the last axis's stride 1, or with kt that of the axis of D), checked on values
+   of every axis and values drawn. The farthest such src first (v itself, a chain of none, last). */
+static bool strided_view(const Fuse *f, uint32_t v, bool kt, uint32_t *src, IrNode **chain, uint32_t *length,
+                         int64_t *at, int64_t *strides) {
+    const SpingalettGraph *g = f->g;
+    if (!sized(g, v) || (g->values[v].rank != 4 && g->values[v].rank != 3)) return false;
+    uint32_t values[13] = {v}, outs[12], count = 0;
+    while (count < 12) {
+        const uint32_t x = values[count];
+        if (f->producer[x] < 0 || f->dead[f->producer[x]]) break;
+        IrNode *n = &g->nodes[f->producer[x]];
+        if (n->op != IR_Reshape && n->op != IR_Flatten && n->op != IR_Squeeze && n->op != IR_Unsqueeze &&
+            n->op != IR_Identity && n->op != IR_Transpose && n->op != IR_Gather && n->op != IR_Slice && n->op != IR_Split)
+            break;
+        uint32_t o = 0;
+        while (o < n->output_count && n->outputs[o] != x) o++;
+        chain[count] = n;
+        outs[count++] = o;
+        values[count] = n->inputs[0];
+    }
+    const IrValue *V = &g->values[v];
+    const uint32_t lead = 4u - V->rank;
+    int64_t dims[4] = {1, 1, 1, 1};
+    for (uint32_t d = 0; d < V->rank; d++) dims[lead + d] = V->dims[d];
+    for (uint32_t i = count + 1u; i-- > 0;) {
+        const uint32_t x = values[i];
+        if (!sized(g, x)) continue;
+        int64_t q[4];
+        bool ok = true;
+        memset(q, 0, sizeof q);
+        const int64_t base = chain_offset(g, chain, outs, i, v, x, q);
+        if (base < 0) continue;
+        int64_t st[4];
+        for (uint32_t a = 0; a < 4 && ok; a++) {
+            st[a] = 0;
+            if (dims[a] < 2) continue;
+            q[a] = 1;
+            const int64_t o1 = chain_offset(g, chain, outs, i, v, x, q);
+            q[a] = 0;
+            ok = o1 >= 0 && o1 >= base;
+            st[a] = o1 - base;
+        }
+        if (!ok || st[kt ? 2 : 3] != 1) continue;
+        uint64_t total = 1;
+        for (uint32_t a = 0; a < 4; a++) total *= (uint64_t)dims[a];
+        /* the offsets the affine ones: every value of each axis, the others at 0 and at their last, then 4,096 values
+           drawn (a chain's maps carry within an axis where they are not affine, which the first finds) */
+        uint64_t state = 0x9E3779B97F4A7C15ull;
+        for (uint32_t corner = 0; corner < 2 && ok; corner++)
+            for (uint32_t a = 0; a < 4 && ok; a++) {
+                for (uint32_t b = 0; b < 4; b++) q[b] = corner ? dims[b] - 1 : 0;
+                for (int64_t c = 0; c < dims[a] && ok; c++) {
+                    q[a] = c;
+                    ok = chain_offset(g, chain, outs, i, v, x, q) ==
+                         base + q[0] * st[0] + q[1] * st[1] + q[2] * st[2] + q[3] * st[3];
+                }
+            }
+        for (uint32_t e = 0; e < 4096u && ok; e++) {
+            state = state * 6364136223846793005ull + 1442695040888963407ull;
+            uint64_t r = (state >> 11) % total;
+            for (uint32_t a = 4; a-- > 0;) {
+                q[a] = (int64_t)(r % (uint64_t)dims[a]);
+                r /= (uint64_t)dims[a];
+            }
+            ok = chain_offset(g, chain, outs, i, v, x, q) == base + q[0] * st[0] + q[1] * st[1] + q[2] * st[2] + q[3] * st[3];
+        }
+        if (!ok) continue;
+        *src = x;
+        *length = i;
+        *at = base;
+        memcpy(strides, st, sizeof st);
+        return true;
+    }
+    return false;
+}
+
 /* The rank of a value where the graph says it: declared, or made by a Transpose's permutation or a Reshape to a
    constant shape; -1 otherwise. */
 static int64_t rank_of(const Fuse *f, uint32_t v) {
@@ -568,15 +789,90 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
     const bool heads = permuted(f, q, 0x0213, &xq, cq, &lq) && permuted(f, kt, 0x0231, &xk, ck, &lk) &&
                        permuted(f, vv, 0x0213, &xv, cv, &lv);
     IrNode *ty = consumer_of(f, y, IR_Transpose, NULL);
-    const bool layout = heads && ty && perm_is(ty, 0x0213) && xv != xq && xk != xq;
+    bool layout = heads && ty && perm_is(ty, 0x0213) && xv != xq && xk != xq;
+    /* (layout 2 below in its place where it reads from farther: Q, K and V split from one product) */
+    uint32_t sq0, sk0, sv0, l0, l1, l2;
+    IrNode *probe[12];
+    int64_t pat, pst[4];
+    if (layout && strided_view(f, q, false, &sq0, probe, &l0, &pat, pst) &&
+        strided_view(f, kt, true, &sk0, probe, &l1, &pat, pst) && strided_view(f, vv, false, &sv0, probe, &l2, &pat, pst) &&
+        (sq0 != xq || sk0 != xk || sv0 != xv))
+        layout = false;
     if (layout) {
         q = xq;
         kt = xk;
         vv = xv;
         y = ty->outputs[0];
     }
+    /* or Q, K and V read where they are, through strides, in the values the nodes around them only rearrange (a
+       product of Q, K and V together, split in three or gathered from: GPT-2's and torchvision's exports): layout 2,
+       the views' sizes and strides an attribute, the output (B, S, H, Dv) where a transpose of the heads follows */
+    IrNode *chains[3][12], *core[4] = {qk, pv, qs, ks};
+    uint32_t srcs[3], lens[3] = {0, 0, 0};
+    int64_t ats[3], sts[3][4], views[18], shape[IR_MAX_RANK];
+    bool packed = false, heads_out = false;
+    uint32_t shape_rank = 0;
+    if (!layout && strided_view(f, q, false, &srcs[0], chains[0], &lens[0], &ats[0], sts[0]) &&
+        strided_view(f, kt, true, &srcs[1], chains[1], &lens[1], &ats[1], sts[1]) &&
+        strided_view(f, vv, false, &srcs[2], chains[2], &lens[2], &ats[2], sts[2]) && sized(g, y) &&
+        (g->values[y].rank == 4 || g->values[y].rank == 3)) {
+        int64_t dq[4] = {1, 1, 1, 1}, dk[4] = {1, 1, 1, 1}, dv[4] = {1, 1, 1, 1};
+        const IrValue *Q = &g->values[q], *K = &g->values[kt], *V = &g->values[vv];
+        for (uint32_t d = 0; d < Q->rank; d++) dq[4u - Q->rank + d] = Q->dims[d];
+        for (uint32_t d = 0; d < K->rank; d++) dk[4u - K->rank + d] = K->dims[d];
+        for (uint32_t d = 0; d < V->rank; d++) dv[4u - V->rank + d] = V->dims[d];
+        packed = lens[0] + lens[1] + lens[2] > 0 && (dk[0] == dq[0] || dk[0] == 1) && (dk[1] == dq[1] || dk[1] == 1) && dk[2] == dq[3] &&
+                 (dv[0] == dq[0] || dv[0] == 1) && (dv[1] == dq[1] || dv[1] == 1) && dv[2] == dk[3];
+        /* the chains' values read by the chains and the attention alone */
+        for (uint32_t c = 0; c < 3 && packed; c++)
+            for (uint32_t j = 0; j < lens[c] && packed; j++)
+                for (uint32_t o = 0; o < chains[c][j]->output_count && packed; o++) {
+                    const uint32_t w = chains[c][j]->outputs[o];
+                    if (w == IR_NONE) continue;
+                    uint32_t reads = 0;
+                    for (uint32_t c2 = 0; c2 < 3; c2++)
+                        for (uint32_t j2 = 0; j2 < lens[c2]; j2++) {
+                            bool again = false;         /* (a node shared by chains counted once) */
+                            for (uint32_t c3 = 0; c3 < c2 && !again; c3++)
+                                for (uint32_t j3 = 0; j3 < lens[c3] && !again; j3++) again = chains[c3][j3] == chains[c2][j2];
+                            for (uint32_t i = 0; !again && i < chains[c2][j2]->input_count; i++) reads += chains[c2][j2]->inputs[i] == w;
+                        }
+                    for (uint32_t k = 0; k < 4; k++)
+                        for (uint32_t i = 0; core[k] && i < core[k]->input_count; i++) reads += core[k]->inputs[i] == w;
+                    packed = f->uses[w] == reads;
+                }
+        if (packed) {
+            const int64_t v18[18] = {dq[0], dq[1], dq[2], dk[3], dq[3], dv[3], ats[0], sts[0][0], sts[0][1], sts[0][2],
+                                     ats[1], sts[1][0], sts[1][1], sts[1][3], ats[2], sts[2][0], sts[2][1], sts[2][2]};
+            memcpy(views, v18, sizeof v18);
+            /* the output's transpose of its heads ((B, H, S, Dv) to (B, S, H, Dv), axes of 1 anywhere): taken in */
+            const IrValue *Y = &g->values[y];
+            int64_t dy[4] = {1, 1, 1, 1};
+            for (uint32_t d = 0; d < Y->rank; d++) dy[4u - Y->rank + d] = Y->dims[d];
+            const IrAttr *pa = ty ? ir_attr(ty, "perm") : NULL;
+            if (ty && Y->rank == 4 && pa && pa->type == ATTR_INTS && pa->count == 4 && sized(g, ty->outputs[0])) {
+                static const int64_t want[4] = {0, 2, 1, 3};
+                uint32_t a = 0, b = 0;
+                bool same = true;
+                while (same) {
+                    while (a < 4 && dy[pa->ints[a]] == 1) a++;
+                    while (b < 4 && dy[want[b]] == 1) b++;
+                    if (a == 4 || b == 4) { same = a == b; break; }
+                    same = pa->ints[a++] == want[b++];
+                }
+                heads_out = same;
+            }
+            const IrValue *out = &g->values[heads_out ? ty->outputs[0] : y];
+            shape_rank = out->rank;
+            for (uint32_t d = 0; d < out->rank; d++) shape[d] = out->dims[d];
+            q = srcs[0];
+            kt = srcs[1];
+            vv = srcs[2];
+            if (heads_out) y = ty->outputs[0];
+        }
+    }
     const uint32_t ins[5] = {q, kt, vv, mask, keep};
-    IrAttr attrs[4];
+    IrAttr attrs[7];
     memset(attrs, 0, sizeof attrs);
     attrs[0].name = ir_strdup(g, "scale", 5);
     attrs[0].type = ATTR_FLOAT;
@@ -586,11 +882,40 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
     attrs[1].i = where != NULL;
     attrs[2].name = ir_strdup(g, "layout", 6);
     attrs[2].type = ATTR_INT;
-    attrs[2].i = layout;
-    attrs[3].name = ir_strdup(g, "fill", 4);
-    attrs[3].type = ATTR_FLOAT;
-    attrs[3].f = fill;
-    if (!attrs[0].name || !attrs[1].name || !attrs[2].name || !attrs[3].name) return false;
+    attrs[2].i = packed ? 2 : layout;
+    uint32_t attr_count = 3;
+    if (keep != IR_NONE) {
+        attrs[3].name = ir_strdup(g, "fill", 4);
+        attrs[3].type = ATTR_FLOAT;
+        attrs[3].f = fill;
+        attr_count = 4;
+    }
+    if (packed) {
+        IrAttr *a = attrs + attr_count;
+        a[0].name = ir_strdup(g, "views", 5);
+        a[0].type = ATTR_INTS;
+        a[0].ints = (int64_t *)ir_alloc(g, sizeof views);
+        a[0].count = 18;
+        a[1].name = ir_strdup(g, "shape", 5);
+        a[1].type = ATTR_INTS;
+        a[1].ints = (int64_t *)ir_alloc(g, shape_rank * sizeof(int64_t));
+        a[1].count = shape_rank;
+        a[2].name = ir_strdup(g, "heads", 5);
+        a[2].type = ATTR_INT;
+        a[2].i = heads_out;
+        if (!a[0].name || !a[0].ints || !a[1].name || !a[1].ints || !a[2].name) return false;
+        memcpy(a[0].ints, views, sizeof views);
+        memcpy(a[1].ints, shape, shape_rank * sizeof(int64_t));
+        attr_count += 3;
+    }
+    for (uint32_t k = 0; k < attr_count; k++)
+        if (!attrs[k].name) return false;
+    if (packed) {
+        /* the chains' nodes (shared ones once) */
+        for (uint32_t c = 0; c < 3; c++)
+            for (uint32_t j = 0; j < lens[c]; j++) kill(f, chains[c][j]);
+        if (heads_out) kill(f, ty);
+    }
     if (layout) {
         for (uint32_t j = 0; j < lq; j++) kill(f, cq[j]);
         for (uint32_t j = 0; j < lk; j++) kill(f, ck[j]);
@@ -607,7 +932,7 @@ static bool fuse_attention(Fuse *f, IrNode *softmax) {
     if (isnan_node) kill(f, isnan_node);
     if (where) kill(f, where);
     const uint32_t inputs = keep != IR_NONE ? 5u : mask != IR_NONE ? 4u : 3u;
-    return rewrite(f, layout ? ty : pv, IR_FusedAttention, ins, inputs, y, attrs, keep != IR_NONE ? 4u : 3u);
+    return rewrite(f, layout || heads_out ? ty : pv, IR_FusedAttention, ins, inputs, y, attrs, attr_count);
 }
 
 /* ------------------------------------------------------------------------- normalizations written out */

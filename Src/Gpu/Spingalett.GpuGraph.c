@@ -1924,7 +1924,9 @@ static bool attention_products(GCtx *c, IrTensor *const *in, IrTensor **out, int
 /* FusedAttention (fusions make it) through gattn, heads of up to 128 values (the values' as long as the queries'):
    layout 0, Q (..., S, D) over up to two axes of batches broadcast between Q, K (..., D, T as K^T: the keys' rows its
    columns), V (..., T, Dv) and the output (..., S, Dv); layout 1, Q (B, S, H, D), K and V (B, T, H or 1, D) and the
-   output (B, S, H, Dv). The mask and keep broadcast to the scores. */
+   output (B, S, H, Dv); layout 2, Q, K and V where the attribute "views" puts them in the inputs (offsets and strides
+   over B, H and rows) and the output (B, S, H, Dv) with "heads", else (B, H, S, Dv). The mask and keep broadcast to
+   the scores. */
 static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
     const IrNode *n = c->n;
     const IrTensor *Q = in[0], *K = in[1], *V = in[2];
@@ -1932,13 +1934,42 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
     if (!Q || !K || !V || !out[0] || Q->dtype != F32 || K->dtype != F32 || V->dtype != F32 ||
         (mask && mask->dtype != F32 && mask->dtype != BOOL) || (keep && keep->dtype != BOOL))
         return false;
-    const bool layout1 = ir_attr_int(n, "layout", 0) == 1;
+    const int64_t layout = ir_attr_int(n, "layout", 0);
+    const bool layout1 = layout == 1;
     int64_t S, D, T, Dv, B = 1, H = 1;
     uint32_t st[21] = {0};
     int64_t odims[IR_MAX_RANK];
     uint32_t orank;
     int64_t bdims[2] = {1, 1};          /* the batches as (B, H) */
-    if (layout1) {
+    int64_t at[3] = {0, 0, 0};          /* (layout 2: the views' offsets in their inputs) */
+    if (layout == 2) {
+        const IrAttr *va = ir_attr(n, "views"), *sa = ir_attr(n, "shape");
+        if (!va || va->type != ATTR_INTS || va->count != 18 || !sa || sa->type != ATTR_INTS || sa->count > IR_MAX_RANK)
+            return false;
+        const int64_t *w = va->ints;
+        B = w[0]; H = w[1]; S = w[2]; T = w[3]; D = w[4]; Dv = w[5];
+        const IrTensor *x3[3] = {Q, K, V};
+        const int64_t rows[3] = {S, T, T}, len[3] = {D, D, Dv};
+        for (uint32_t k = 0; k < 3; k++) {
+            const int64_t *v = w + 6 + 4 * k;
+            if (B < 1 || H < 1 || v[0] < 0 || v[1] < 0 || v[2] < 0 || v[3] < 0 || v[1] >= UINT32_MAX ||
+                v[2] >= UINT32_MAX || v[3] >= UINT32_MAX ||
+                (uint64_t)(v[0] + (B - 1) * v[1] + (H - 1) * v[2] + (rows[k] - 1) * v[3] + len[k] - 1) >= x3[k]->count)
+                return false;
+            at[k] = v[0];
+        }
+        const bool heads = ir_attr_int(n, "heads", 0) != 0;
+        const int64_t s[12] = {w[7], w[8], w[9], w[11], w[12], w[13], w[15], w[16], w[17],
+                               heads ? S * H * Dv : H * S * Dv, heads ? Dv : S * Dv, heads ? H * Dv : Dv};
+        for (uint32_t k = 0; k < 12; k++) st[k] = (uint32_t)s[k];
+        st[20] = 1;
+        orank = sa->count;
+        int64_t count = 1;
+        for (uint32_t d = 0; d < orank; d++) count *= (odims[d] = sa->ints[d]);
+        if (count != B * H * S * Dv || Dv != D || D > 128) return false;
+        bdims[0] = B;
+        bdims[1] = H;
+    } else if (layout1) {
         if (Q->rank != 4 || K->rank != 4 || V->rank != 4) return false;
         B = Q->dims[0];
         H = Q->dims[2];
@@ -2032,7 +2063,8 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
     }
     if (!out[0]->count) return true;
     const uint32_t unit = D <= 32 ? 32u : D <= 64 ? 64u : 128u;
-    SpgGattnPush push = {in_at(c, 0), in_at(c, 1), in_at(c, 2), out_at(c, 0), mask ? in_at(c, 3) : in_at(c, 0),
+    SpgGattnPush push = {in_at(c, 0) + (uint64_t)at[0] * in_size(c, 0), in_at(c, 1) + (uint64_t)at[1] * in_size(c, 1),
+                         in_at(c, 2) + (uint64_t)at[2] * in_size(c, 2), out_at(c, 0), mask ? in_at(c, 3) : in_at(c, 0),
                          keep ? in_at(c, 4) : in_at(c, 0), param_put(c, st, sizeof st), (uint32_t)S, (uint32_t)T,
                          (uint32_t)D, (uint32_t)H, ir_attr_float(n, "scale", 1.0f), ir_attr_float(n, "fill", -INFINITY), 0, 0};
     push.flags = (mask ? (mask->dtype == BOOL ? SPG_GATTN_BOOL : SPG_GATTN_MASK) : 0u) | (keep ? SPG_GATTN_KEEP : 0u) |
@@ -2712,7 +2744,8 @@ static bool half_reader(const SpingalettGraph *g, const IrNode *n, uint32_t v) {
     uint32_t slot = NONE;
     for (uint32_t i = 0; i < n->input_count; i++)
         if (n->inputs[i] == v) {
-            if (slot != NONE) return false;
+            /* (attention may read one value as two or three of Q, K and V: views of it) */
+            if (slot != NONE && !(n->op == IR_FusedAttention && i < 3)) return false;
             slot = i;
         }
     const uint64_t count = declared_count(g, v);
@@ -2752,6 +2785,11 @@ static bool half_reader(const SpingalettGraph *g, const IrNode *n, uint32_t v) {
         }
         case IR_FusedAttention: {
             if (slot > 2 || n->input_count < 3) return false;
+            if (ir_attr_int(n, "layout", 0) == 2) {
+                const IrAttr *va = ir_attr(n, "views");
+                return va && va->type == ATTR_INTS && va->count == 18 && va->ints[4] > 0 && va->ints[4] <= 128 &&
+                       va->ints[4] == va->ints[5];
+            }
             const IrValue *Q = &g->values[n->inputs[0]], *V = &g->values[n->inputs[2]];
             if (!Q->declared || !V->declared || !Q->rank || !V->rank) return false;
             const int64_t D = Q->dims[Q->rank - 1], Dv = V->dims[V->rank - 1];

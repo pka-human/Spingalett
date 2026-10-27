@@ -4013,20 +4013,50 @@ static bool k_linear(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, 
    (with "safe", rows of no keys 0, as PyTorch's safe softmax); the mask and keep optional. With layout 0, over the broadcast batches of Q (..., S, D), K^T
    (..., D, T), V (..., T, Dv) and a mask broadcast to (..., S, T), into (..., S, Dv); with layout 1 (the transposes
    around attention taken in), Q (B, S, H, D), K (B, T, H or 1, D), V (B, T, H or 1, Dv) into (B, S, H, Dv), the mask
-   broadcast to (B, H, S, T). Blocks of 64 queries of a batch and head at a time, each on one thread: their scores by
-   a product, then the mask, the softmax (the vector exp) and their outputs by a second product. */
+   broadcast to (B, H, S, T); with layout 2 (the views around attention taken in), Q, K and V where the attribute
+   "views" puts them in the inputs (B, H, S, T, D, Dv, then for each an offset and its strides over B, H and rows: a
+   query's row, a key's, a value's), into "shape", (B, S, H, Dv) with "heads", else (B, H, S, Dv). Blocks of 64
+   queries of a batch and head at a time, each on one thread: their scores by a product, then the mask, the softmax
+   (the vector exp) and their outputs by a second product. */
 static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTensor **out, uint32_t m) {
     if (n < 3 || m < 1 || !in[0] || !in[1] || !in[2]) return ir_fail(r, "queries, keys, values and an output are needed");
     const IrTensor *Q = in[0], *K = in[1], *V = in[2], *mask = n > 3 ? in[3] : NULL, *keep = n > 4 ? in[4] : NULL;
     if (Q->dtype != F32 || K->dtype != F32 || V->dtype != F32 || (mask && mask->dtype != F32 && mask->dtype != BOOL) ||
         (keep && keep->dtype != BOOL)) return ir_fail(r, "inputs not float32, or masks of other types");
     const float scale = ir_attr_float(r->node, "scale", 1.0f), fill = ir_attr_float(r->node, "fill", -INFINITY);
-    const bool safe = ir_attr_int(r->node, "safe", 0) != 0, heads_inside = ir_attr_int(r->node, "layout", 0) == 1;
-    uint32_t R;                     /* the batch's axes (layout 1: B and H) */
+    const int64_t layout = ir_attr_int(r->node, "layout", 0);
+    const bool safe = ir_attr_int(r->node, "safe", 0) != 0, heads_inside = layout == 1;
+    /* (K's rows its keys: layouts 1 and 2; the output (B, S, H, Dv)) */
+    const bool k_rows = layout != 0, heads_out = heads_inside || (layout == 2 && ir_attr_int(r->node, "heads", 0));
+    uint32_t R;                     /* the batch's axes (layouts 1 and 2: B and H) */
     int64_t dims[IR_MAX_RANK], S, D, T, Dv;
     int64_t sq[IR_MAX_RANK], sk[IR_MAX_RANK], sv[IR_MAX_RANK], sm[IR_MAX_RANK] = {0}, sw[IR_MAX_RANK] = {0};
+    int64_t at_q = 0, at_k = 0, at_v = 0;
     size_t ldq, ldk, ldv, ldy;
-    if (heads_inside) {
+    const IrAttr *va = layout == 2 ? ir_attr(r->node, "views") : NULL, *sa = layout == 2 ? ir_attr(r->node, "shape") : NULL;
+    if (layout == 2) {
+        if (!va || va->type != ATTR_INTS || va->count != 18 || !sa || sa->type != ATTR_INTS || sa->count > IR_MAX_RANK)
+            return ir_fail(r, "attention of views without their sizes and strides");
+        const int64_t *w = va->ints, B = w[0], H = w[1];
+        S = w[2]; T = w[3]; D = w[4]; Dv = w[5];
+        /* (every view within its input) */
+        const IrTensor *x3[3] = {Q, K, V};
+        const int64_t rows[3] = {S, T, T}, row_len[3] = {D, D, Dv};
+        for (uint32_t k = 0; k < 3; k++) {
+            const int64_t *v = w + 6 + 4 * k;
+            bool fits = B > 0 && H > 0 && v[0] >= 0 && v[1] >= 0 && v[2] >= 0 && v[3] >= 0;
+            const int64_t last = v[0] + (B - 1) * v[1] + (H - 1) * v[2] + (rows[k] - 1) * v[3] + row_len[k] - 1;
+            if (!fits || (rows[k] && row_len[k] && (uint64_t)last >= x3[k]->count))
+                return ir_fail(r, "attention of views beyond its inputs (sizes other than the graph declares)");
+        }
+        R = 2;
+        dims[0] = B;
+        dims[1] = H;
+        at_q = w[6]; sq[0] = w[7]; sq[1] = w[8]; ldq = (size_t)w[9];
+        at_k = w[10]; sk[0] = w[11]; sk[1] = w[12]; ldk = (size_t)w[13];
+        at_v = w[14]; sv[0] = w[15]; sv[1] = w[16]; ldv = (size_t)w[17];
+        ldy = (size_t)(heads_out ? H * Dv : Dv);
+    } else if (heads_inside) {
         if (Q->rank != 4 || K->rank != 4 || V->rank != 4) return ir_fail(r, "inputs of four axes");
         const int64_t B = Q->dims[0], H = Q->dims[2], Hk = K->dims[2];
         S = Q->dims[1]; D = Q->dims[3]; T = K->dims[1]; Dv = V->dims[3];
@@ -4091,14 +4121,20 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
         broadcast_strides(keep, R + 2, full, sw);
     }
     int64_t odims[IR_MAX_RANK];
-    if (heads_inside) {
+    uint32_t orank = R + 2;
+    if (layout == 2) {
+        int64_t count = 1;
+        orank = sa->count;
+        for (uint32_t d = 0; d < orank; d++) count *= (odims[d] = sa->ints[d]);
+        if (count != dims[0] * dims[1] * S * Dv) return ir_fail(r, "attention of views into a shape of another size");
+    } else if (heads_inside) {
         odims[0] = dims[0]; odims[1] = S; odims[2] = dims[1]; odims[3] = Dv;
     } else {
         for (uint32_t d = 0; d < R; d++) odims[d] = dims[d];
         odims[R] = S;
         odims[R + 1] = Dv;
     }
-    if (!ir_output_raw(r, out[0], F32, R + 2, odims)) return false;
+    if (!ir_output_raw(r, out[0], F32, orank, odims)) return false;
     if (!S || !Dv) return true;
     SpingalettGemmScratch *main = ir_scratch(r);
     if (!main) return false;
@@ -4108,7 +4144,7 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
     SPINGALETT_PARALLEL_FOR(across,
         for (int64_t it = 0; it < items; it++) {
             const int64_t blk = it % blocks, bt = it / blocks, q0 = blk * BLOCK, rows = S - q0 < BLOCK ? S - q0 : BLOCK;
-            int64_t oq = 0, ok_ = 0, ov = 0, om = 0, ow = 0;
+            int64_t oq = at_q, ok_ = at_k, ov = at_v, om = 0, ow = 0;
             uint64_t t = (uint64_t)bt;
             for (uint32_t d = R; d-- > 0;) {
                 const int64_t c = (int64_t)(t % (uint64_t)dims[d]);
@@ -4122,8 +4158,8 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
             float *s = (float *)spingalett_aligned_alloc((size_t)(rows * T) * sizeof(float) + 64);
             if (!s) { failed = true; continue; }
             SpingalettGemmScratch *scr = across ? ir_thread_scratch(r, spingalett_thread_num()) : main;
-            /* scores: Q's rows times K^T (layout 1: K's rows, transposed) */
-            spingalett_gemm_native(scr, false, heads_inside, (uint32_t)rows, (uint32_t)T, (uint32_t)D, scale,
+            /* scores: Q's rows times K^T (layouts 1 and 2: K's rows, transposed) */
+            spingalett_gemm_native(scr, false, k_rows, (uint32_t)rows, (uint32_t)T, (uint32_t)D, scale,
                                    fdata(Q) + oq + q0 * (int64_t)ldq, ldq, fdata(K) + ok_, ldk, 0.0f, s, (size_t)T,
                                    !across && r->parallel);
             for (int64_t i = 0; i < rows; i++) {
@@ -4151,7 +4187,7 @@ static bool k_fused_attention(IrRun *r, IrTensor *const *in, uint32_t n, IrTenso
                 if (safe)
                     for (int64_t j = 0; j < T; j++) row[j] = isnan(row[j]) ? 0.0f : row[j];
             }
-            float *y = heads_inside ? fdata(out[0]) + (bt / dims[1]) * S * (int64_t)ldy + (bt % dims[1]) * Dv + q0 * (int64_t)ldy
+            float *y = heads_out ? fdata(out[0]) + (bt / dims[1]) * S * (int64_t)ldy + (bt % dims[1]) * Dv + q0 * (int64_t)ldy
                                     : fdata(out[0]) + ((int64_t)bt * S + q0) * Dv;
             spingalett_gemm_native(scr, false, false, (uint32_t)rows, (uint32_t)Dv, (uint32_t)T, 1.0f, s, (size_t)T,
                                    fdata(V) + ov, ldv, 0.0f, y, ldy, !across && r->parallel);
