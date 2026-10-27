@@ -382,6 +382,8 @@ typedef struct {
     uint32_t queries, keys, d, heads;
     float scale, fill;
     uint32_t flags, pad;
+    uint64_t info;                  /* gflash with CACHE: a session's rows' sequences and positions (kvattn's info) */
+    uint32_t group, window;         /* and the query heads a head of keys and values, the window (0: none) */
 } SpgGattnPush;
 #define SPG_GATTN_ROWS 64u
 #define SPG_GATTN_THREADS 128u
@@ -394,6 +396,10 @@ typedef struct {
 #define SPG_GATTN_HALF_K 64u
 #define SPG_GATTN_HALF_V 128u
 #define SPG_GATTN_HALF_Y 256u
+#define SPG_GATTN_CACHE 512u        /* gflash: a session's prompt over its caches: the queries rows of one sequence at
+                                       consecutive positions (info's first row's on), the keys and values its caches
+                                       (strides[3] a sequence's, [4] a head's), each query over the keys at its position
+                                       and before (the last `window` of them) */
 
 /* gpool.comp: MaxPool, AveragePool and LpPool of graphs over channels-first maps of up to three spatial axes (as three,
    the first of size 1 for fewer): output value (row, o0, o1, o2) of rows (batch x channels) maps from its window. */

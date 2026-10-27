@@ -64,6 +64,19 @@ SPG_CUDA_UNIT(wqmv_b2_r8, wqmv, "-DBITS=2u -DROWS=8u")
 /* language models' layers of block precisions (GGUF's types) in sessions: their inputs quantized in blocks, then
    products of a few rows with the blocks as stored, the CPU's bits: a unit a type and ROWS (bdot_<type>_r<ROWS>) */
 SPG_CUDA_UNIT(bquant, bquant, "")
+/* (a prompt's many rows on the matrix units, a unit a type: bmm_<type>) */
+SPG_CUDA_UNIT(bmm_q8_0, bmm, "-DTYPE=0u")
+SPG_CUDA_UNIT(bmm_q4_0, bmm, "-DTYPE=1u")
+SPG_CUDA_UNIT(bmm_q4_1, bmm, "-DTYPE=2u")
+SPG_CUDA_UNIT(bmm_q5_0, bmm, "-DTYPE=3u")
+SPG_CUDA_UNIT(bmm_q5_1, bmm, "-DTYPE=4u")
+SPG_CUDA_UNIT(bmm_q2_k, bmm, "-DTYPE=5u")
+SPG_CUDA_UNIT(bmm_q3_k, bmm, "-DTYPE=6u")
+SPG_CUDA_UNIT(bmm_q4_k, bmm, "-DTYPE=7u")
+SPG_CUDA_UNIT(bmm_q5_k, bmm, "-DTYPE=8u")
+SPG_CUDA_UNIT(bmm_q6_k, bmm, "-DTYPE=9u")
+SPG_CUDA_UNIT(bmm_iq4_nl, bmm, "-DTYPE=10u")
+SPG_CUDA_UNIT(bmm_iq4_xs, bmm, "-DTYPE=11u")
 SPG_CUDA_UNIT(bembed, bembed, "")           /* and the rest of a session's step: embeddings, attention */
 SPG_CUDA_UNIT(kvattn, kvattn, "")
 SPG_CUDA_UNIT(bdot_q8_0_r1, bdot, "-DTYPE=0u -DROWS=1u")

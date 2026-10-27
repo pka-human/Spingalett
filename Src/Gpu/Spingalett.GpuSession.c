@@ -46,12 +46,14 @@ typedef struct {
     bool skip;                      /* a product of layers its reader's epilogue computes */
     /* attention */
     uint64_t keys, values, table, gq, gk;
+    uint64_t strides;               /* gflash's strides over the caches (a prompt's attention), or 0 */
     uint32_t heads, kv, head, rot;
     float eps, scale;
 } GLayer;
 
 typedef struct {
     uint32_t rows, picked;
+    uint64_t runs;                  /* the runs of rows it was recorded for (a hash of their lengths) */
     SpgGpuCommands *c;
 } Kept;
 
@@ -67,6 +69,8 @@ struct SpgGpuSession {
     SpgGpuBuffer staging;           /* host-visible: tokens, info, picks, then the logits */
     size_t info_at, pick_at, logits_at;
     uint32_t kmax;                  /* inputs of the widest block layer */
+    uint32_t run_count, *runs;      /* recording: the step's runs of rows (each of one sequence at consecutive
+                                       positions): their first rows, and one past the last */
     uint64_t quantized;             /* recording: the input the quantized rows hold (0: none), in blocks of quantized_bv */
     uint32_t quantized_bv;
     Kept kept[KEPT];
@@ -155,6 +159,7 @@ void spingalett_gpu_session_free(SpgGpuSession *s) {
     free(s->buffers);
     free(s->uploaded);
     free(s->L);
+    free(s->runs);
     free(s);
 }
 
@@ -270,6 +275,14 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             } else {
                 G->rot = 0;
             }
+            if ((G->head == 32u || G->head == 64u || G->head == 128u) && spg_gpu_mma_bf16() &&
+                spg_gpu_kernel_built(SPG_KERNEL_gflash)) {
+                /* a prompt's queries over the caches on the matrix units (gflash): its strides */
+                const uint32_t D = G->head, H = G->heads, ML = s->max_length;
+                const uint32_t st[21] = {0, D, H * D, G->kv * ML * D, ML * D, D, G->kv * ML * D, ML * D, D, 0, D, H * D,
+                                         0, 0, 0, 0, 0, 0, 0, 0, 1};
+                G->strides = upload(s, st, sizeof st);
+            }
             return true;
         }
         default:
@@ -343,6 +356,7 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     *why = NULL;
     if (!spg_gpu_kernel_built(SPG_KERNEL_bembed) || !spg_gpu_kernel_built(SPG_KERNEL_kvattn) ||
         !spg_gpu_kernel_built(SPG_KERNEL_bquant) || !spg_gpu_kernel_built(SPG_KERNEL_bdot) ||
+        !spg_gpu_kernel_built(SPG_KERNEL_bmm) ||
         !spg_gpu_kernel_built(SPG_KERNEL_gew) || !spg_gpu_kernel_built(SPG_KERNEL_grow) ||
         !spg_gpu_kernel_built(SPG_KERNEL_ggather) || !spg_gpu_kernel_built(SPG_KERNEL_gcopy))
         return *why = "the backend has not its kernels (CUDA's alone, as yet)", NULL;
@@ -354,7 +368,8 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     s->max_length = max_length;
     s->most = most;
     s->L = (GLayer *)calloc(s->layers, sizeof(GLayer));
-    if (!s->L) {
+    s->runs = (uint32_t *)malloc((size_t)(most + 1u) * sizeof(uint32_t));
+    if (!s->L || !s->runs) {
         spingalett_gpu_session_free(s);
         return *why = "out of memory", NULL;
     }
@@ -450,6 +465,13 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 s->quantized = x[0];
                 s->quantized_bv = BV;
             }
+            if (rows >= 16u) {
+                /* a prompt's rows on the matrix units */
+                const uint32_t spec[3] = {G->type, 0u, (uint32_t)L->activation};
+                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, L->rows, K, G->stride, 0, L->out_c};
+                spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, groups(L->rows, 64u), groups(rows, 64u), 1);
+                break;
+            }
             const uint32_t pass = rows == 1u ? 1u : SPG_BDOT_ROWS;
             for (uint32_t r0 = 0; r0 < rows; r0 += pass) {
                 const uint32_t spec[3] = {G->type, pass, (uint32_t)L->activation};
@@ -541,6 +563,34 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                                G->head, G->rot, L->window, s->max_length, SPG_KV_PREP, G->eps, G->scale};
             spg_gpu_dispatch(c, SPG_KERNEL_kvattn, NULL, 0, &p, sizeof p, groups((uint64_t)rows * (G->heads + G->kv), 8u), 1, 1);
             spg_gpu_barrier(c);
+            if (G->strides) {
+                /* each run of rows (a sequence's tokens at consecutive positions: a prompt, or a token of a sequence) over
+                   its caches on the matrix units, whatever rows are with it: the same bits however tokens are fed */
+                const uint32_t D = G->head, unit = D;
+                for (uint32_t k = 0; k < s->run_count; k++) {
+                    const uint32_t r0 = s->runs[k], n = s->runs[k + 1u] - r0;
+                    const bool half_rows = unit <= 64u && (uint64_t)((n + 127u) / 128u) * G->heads < 64u;
+                    const uint32_t block_rows = unit > 64u ? 32u : half_rows ? 64u : 128u, spec[2] = {unit, half_rows ? 1u : 2u};
+                    SpgGattnPush gp;
+                    memset(&gp, 0, sizeof gp);
+                    gp.q = s->q + (uint64_t)r0 * G->heads * D * sizeof(float);
+                    gp.k = G->keys;
+                    gp.v = G->values;
+                    gp.y = y + (uint64_t)r0 * L->out_c * sizeof(float);
+                    gp.mask = gp.keep = s->q;
+                    gp.strides = G->strides;
+                    gp.queries = n;
+                    gp.d = D;
+                    gp.heads = G->heads;
+                    gp.scale = G->scale;
+                    gp.flags = SPG_GATTN_CACHE | SPG_GATTN_VEC;
+                    gp.info = s->info + (uint64_t)r0 * 2u * sizeof(uint32_t);
+                    gp.group = G->heads / G->kv;
+                    gp.window = L->window;
+                    spg_gpu_dispatch(c, SPG_KERNEL_gflash, spec, 2, &gp, sizeof gp, groups(n, block_rows), G->heads, 1);
+                }
+                break;
+            }
             p.op = SPG_KV_ATTEND;
             spg_gpu_dispatch(c, SPG_KERNEL_kvattn, NULL, 0, &p, sizeof p, rows * G->heads, 1, 1);
             break;
@@ -615,9 +665,19 @@ bool spingalett_gpu_session_step(SpgGpuSession *s, uint32_t rows, const uint32_t
     uint32_t *info = (uint32_t *)(void *)(stage + s->info_at);
     for (uint32_t r = 0; r < rows; r++) info[2u * r] = sequence[r], info[2u * r + 1u] = position[r];
     if (picked) memcpy(stage + s->pick_at, pick, (size_t)picked * sizeof(uint32_t));
+    /* the runs of rows of one sequence at consecutive positions (attention takes each over its caches) */
+    s->run_count = 0;
+    uint64_t runs = 1469598103934665603ull;
+    for (uint32_t r = 0; r < rows; r++)
+        if (!r || sequence[r] != sequence[r - 1u] || position[r] != position[r - 1u] + 1u) {
+            s->runs[s->run_count++] = r;
+            runs = (runs ^ r) * 1099511628211ull;
+        }
+    s->runs[s->run_count] = rows;
     SpgGpuCommands *c = NULL;
     for (uint32_t k = 0; k < KEPT && !c; k++)
-        if (s->kept[k].c && s->kept[k].rows == rows && s->kept[k].picked == picked) c = s->kept[k].c;
+        if (s->kept[k].c && s->kept[k].rows == rows && s->kept[k].picked == picked && s->kept[k].runs == runs)
+            c = s->kept[k].c;
     if (!c) {
         c = record_step(s, rows, picked);
         if (!c) return false;
@@ -625,6 +685,7 @@ bool spingalett_gpu_session_step(SpgGpuSession *s, uint32_t rows, const uint32_t
         if (k->c) spg_gpu_commands_free(k->c);
         k->rows = rows;
         k->picked = picked;
+        k->runs = runs;
         k->c = c;
         s->next = (s->next + 1u) % KEPT;
     }

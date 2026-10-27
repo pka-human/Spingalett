@@ -198,9 +198,14 @@ extern "C" __global__ void __attribute__((launch_bounds(32u * WARPS, MIN_BLOCKS)
     const uint32_t bh = block_y(), b = bh / p.heads, h = bh % p.heads, i0 = block_x() * ROWS, r0 = 16u * MT * w;
     const bool hq = (p.flags & SPG_GATTN_HALF_Q) != 0u, hk = (p.flags & SPG_GATTN_HALF_K) != 0u;
     const bool hv = (p.flags & SPG_GATTN_HALF_V) != 0u, hy = (p.flags & SPG_GATTN_HALF_Y) != 0u;
+    /* (a session's prompt: its sequence's caches, the head of keys and values of its group, keys up to its last row's
+       position) */
+    const bool cache = (p.flags & SPG_GATTN_CACHE) != 0u;
+    const uint32_t seq = cache ? U(p.info)[0] : b, p0 = cache ? U(p.info)[1] : 0u, hkv = cache ? h / p.group : h;
+    const uint32_t keys = cache ? p0 + p.queries : p.keys;
     const uint64_t qb = p.q + (hq ? 2ull : 4ull) * ((uint64_t)b * st[0] + (uint64_t)h * st[1]);
-    const uint64_t kb = p.k + (hk ? 2ull : 4ull) * ((uint64_t)b * st[3] + (uint64_t)h * st[4]);
-    const uint64_t vb = p.v + (hv ? 2ull : 4ull) * ((uint64_t)b * st[6] + (uint64_t)h * st[7]);
+    const uint64_t kb = p.k + (hk ? 2ull : 4ull) * ((uint64_t)seq * st[3] + (uint64_t)hkv * st[4]);
+    const uint64_t vb = p.v + (hv ? 2ull : 4ull) * ((uint64_t)seq * st[6] + (uint64_t)hkv * st[7]);
     const uint64_t mbase = (uint64_t)b * st[12] + (uint64_t)h * st[13], wbase = (uint64_t)b * st[16] + (uint64_t)h * st[17];
     const bool vec = (p.flags & SPG_GATTN_VEC) != 0u, masked = (p.flags & (SPG_GATTN_MASK | SPG_GATTN_BOOL | SPG_GATTN_KEEP)) != 0u;
     const float NEG = -__builtin_inff(), scale = p.scale;
@@ -218,15 +223,15 @@ extern "C" __global__ void __attribute__((launch_bounds(32u * WARPS, MIN_BLOCKS)
     auto fetch = [&](uint32_t j0, uint32_t s) {
         uint16_t *kt = s ? sh.x.s1 : sh.s0, *vt = kt + BT * SD;
         if (async) {
-            fetch_tile(kt, kb, st[5], j0, p.keys);
-            fetch_tile(vt, vb, st[8], j0, p.keys);
+            fetch_tile(kt, kb, st[5], j0, keys);
+            fetch_tile(vt, vb, st[8], j0, keys);
             copies_commit();
         } else {
-            load_tile(p, kt, kb, st[5], st[20], j0, BT, p.keys, vec, hk);
-            load_tile(p, vt, vb, st[8], 1u, j0, BT, p.keys, vec, hv);
+            load_tile(p, kt, kb, st[5], st[20], j0, BT, keys, vec, hk);
+            load_tile(p, vt, vb, st[8], 1u, j0, BT, keys, vec, hv);
         }
     };
-    if (STAGES > 1u) fetch(0u, 0u);
+    if (STAGES > 1u) fetch(cache && p.window && p0 + i0 + 1u > p.window ? (p0 + i0 + 1u - p.window) / BT * BT : 0u, 0u);
     float o[MT][DT][4], m_[MT][2], l_[MT][2];
 #pragma unroll
     for (uint32_t mt = 0; mt < MT; mt++) {
@@ -236,8 +241,11 @@ extern "C" __global__ void __attribute__((launch_bounds(32u * WARPS, MIN_BLOCKS)
         l_[mt][0] = l_[mt][1] = 0.0f;
     }
     uint32_t s = 0;
-    for (uint32_t j0 = 0; j0 < p.keys; j0 += BT, s ^= STAGES - 1u) {
-        const bool more = j0 + BT < p.keys;
+    /* (a prompt's block: the keys at its last query's position and before, from its first query's window on) */
+    const uint32_t last_key = cache ? (p0 + i0 + ROWS < keys ? p0 + i0 + ROWS : keys) : keys;
+    const uint32_t first_key = cache && p.window && p0 + i0 + 1u > p.window ? (p0 + i0 + 1u - p.window) / BT * BT : 0u;
+    for (uint32_t j0 = first_key; j0 < last_key; j0 += BT, s ^= STAGES - 1u) {
+        const bool more = j0 + BT < last_key;
         if (STAGES == 1u) fetch(j0, 0u);
         else if (more) fetch(j0 + BT, s ^ 1u);
         if (async) {
@@ -268,7 +276,7 @@ extern "C" __global__ void __attribute__((launch_bounds(32u * WARPS, MIN_BLOCKS)
             /* the scale, then the masks (and keys past the end, queries past the end) on the tiles that need them:
                this thread's rows g and g + 8 of the tile */
             const uint32_t q0 = i0 + r0 + 16u * mt, ra = q0 + g, rb = ra + 8u;
-            const bool edge = masked || j0 + BT > p.keys || q0 + 16u > p.queries;
+            const bool edge = masked || cache || j0 + BT > keys || q0 + 16u > p.queries;
 #pragma unroll
             for (uint32_t j = 0; j < NT; j++)
 #pragma unroll
@@ -276,7 +284,8 @@ extern "C" __global__ void __attribute__((launch_bounds(32u * WARPS, MIN_BLOCKS)
                     float v = sc[mt][j][e] * scale;
                     if (edge) {
                         const uint32_t key = j0 + 8u * j + 2u * t + (e & 1u), row = e < 2u ? ra : rb;
-                        if (key >= p.keys || row >= p.queries) {
+                        if (key >= keys || row >= p.queries || (cache && (key > p0 + row ||
+                                                                        (p.window && key + p.window <= p0 + row)))) {
                             v = NEG;
                         } else {
                             if ((p.flags & SPG_GATTN_KEEP) &&

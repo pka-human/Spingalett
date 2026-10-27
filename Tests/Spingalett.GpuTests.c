@@ -910,13 +910,20 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
               spg_gpu_buffer_create(&bq, (size_t)R * K, false) && spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
               spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) && spg_gpu_buffer_create(&by, (size_t)R * N * 4, false);
     bool same_q = false, same_y = true;
-    for (uint32_t unit = 0; ok && unit < 2; unit++) {
-        const uint32_t rows_a_pass = unit ? SPG_BDOT_ROWS : 1u;
+    for (uint32_t unit = 0; ok && unit < 3; unit++) {
+        const uint32_t rows_a_pass = unit == 1 ? SPG_BDOT_ROWS : 1u;
         SpgGpuCommands *c = spg_gpu_commands_create();
         ok = c && spg_gpu_record_begin(c);
         SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
         if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
-        for (uint32_t r0 = 0; ok && r0 < R; r0 += rows_a_pass) {
+        if (unit == 2) {
+            /* bmm: every row at once, on the matrix units */
+            spg_gpu_barrier(c);
+            const uint32_t spec[3] = {type, 0u, 0u};
+            SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, R, N, K, stride, 0, N};
+            spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (N + 63) / 64, (R + 63) / 64, 1);
+        }
+        for (uint32_t r0 = 0; ok && unit < 2 && r0 < R; r0 += rows_a_pass) {
             spg_gpu_barrier(c);
             const uint32_t spec[3] = {type, rows_a_pass, 0u};
             SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0,
@@ -1002,6 +1009,7 @@ int main(int argc, char **argv) {
             const uint32_t BV = slett_block_values((PrecisionMode)p);
             test_blocks((PrecisionMode)p, BV, 9, 3);
             test_blocks((PrecisionMode)p, BV == 32u ? 37u * 32u : 5u * 256u, 13, 11);
+            test_blocks((PrecisionMode)p, BV == 32u ? 9u * 32u : 2u * 256u, 150, 100);   /* (bmm's tiles, partial ones) */
         }
     }
     printf(failures ? "%d FAILED\n" : "ALL PASSED\n", failures);

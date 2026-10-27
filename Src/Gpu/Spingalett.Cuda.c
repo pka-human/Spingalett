@@ -282,6 +282,7 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
         case SPG_KERNEL_attn_cache: case SPG_KERNEL_attn_cache_h: return count > 1 ? spec[1] : 0u;
         case SPG_KERNEL_gattn: return SPG_GATTN_THREADS;
         case SPG_KERNEL_gflash: return count > 0 && spec[0] > 64u ? 64u : 128u;    /* (gflash.cu's WARPS) */
+        case SPG_KERNEL_bmm: return 128u;
         default: return 256u;
     }
 }
@@ -364,6 +365,11 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
                                                        "q6_k", "iq4_nl", "iq4_xs"};
         if (count < 2 || spec[0] >= SPG_B_TYPES) return -1;
         snprintf(name, sizeof name, "bdot_%s_r%u", types[spec[0]], spec[1]);    /* (the type, the rows a pass) */
+    } else if (kernel == SPG_KERNEL_bmm) {
+        static const char *const types[SPG_B_TYPES] = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k",
+                                                       "q6_k", "iq4_nl", "iq4_xs"};
+        if (count < 1 || spec[0] >= SPG_B_TYPES) return -1;
+        snprintf(name, sizeof name, "bmm_%s", types[spec[0]]);
     } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
         if (count < 2) return -1;
         snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */
