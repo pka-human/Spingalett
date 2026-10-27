@@ -918,10 +918,10 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
         if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
         for (uint32_t r0 = 0; ok && r0 < R; r0 += rows_a_pass) {
             spg_gpu_barrier(c);
-            const uint32_t spec[2] = {type, rows_a_pass};
-            SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address,
+            const uint32_t spec[3] = {type, rows_a_pass, 0u};
+            SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0,
                               R - r0 < rows_a_pass ? R - r0 : rows_a_pass, N, K, stride, r0, N};
-            spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 2, &dp, sizeof dp, (N + 7) / 8, 1, 1);
+            spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 3, &dp, sizeof dp, (N + 7) / 8, 1, 1);
         }
         ok = ok && spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
         if (c) spg_gpu_commands_free(c);
@@ -967,6 +967,7 @@ int main(int argc, char **argv) {
         {3, 5, 6, 3, 5, 2, 3, 1, 2, 0, 1, 1}, {2, 8, 8, 8, 12, 3, 3, 1, 1, 1, 1, 2},
         {2, 7, 7, 6, 6, 3, 3, 1, 1, 1, 1, 6}, {1, 10, 9, 32, 16, 1, 1, 2, 2, 0, 0, 1},
         {4, 6, 6, 16, 24, 5, 5, 1, 1, 2, 2, 4}, {2, 12, 12, 12, 8, 3, 3, 3, 2, 1, 0, 1},
+        {1, 16, 16, 32, 32, 3, 3, 1, 1, 1, 1, 1}, {4, 8, 8, 32, 32, 3, 3, 1, 1, 1, 1, 1},
     };
     for (int pass = 0; pass < (spg_gpu_mma_bf16() ? 2 : 1); pass++) {
         mma = pass == 1;

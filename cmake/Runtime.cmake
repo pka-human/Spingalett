@@ -30,7 +30,7 @@ function(spingalett_runtime_gpu)
     endif()
     set(gpu_dir ${PROJECT_SOURCE_DIR}/Src/Gpu)
     target_sources(spingalett_runtime PRIVATE ${gpu_dir}/Spingalett.Device.c ${gpu_dir}/Spingalett.GpuKernels.c
-                                              ${gpu_dir}/Spingalett.GpuGraph.c)
+                                              ${gpu_dir}/Spingalett.GpuGraph.c ${gpu_dir}/Spingalett.GpuSession.c)
     target_compile_definitions(spingalett_runtime PRIVATE SPINGALETT_RUNTIME_GPU)
     target_include_directories(spingalett_runtime PRIVATE ${gpu_dir})
     if(NOT WIN32)

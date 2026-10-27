@@ -217,14 +217,41 @@ typedef struct {
 /* bdot.comp: rows of activations quantized by bquant times a linear layer's weights of a block precision (TYPE: the
    precision less SPINGALETT_PRECISION_Q8_0), y[r][j] = bias[j] + spingalett_block_dot() of row j, the bits of the CPU:
    a row of weights `stride` bytes of whole blocks as GGUF stores them, k values; rows r0 to r0 + rows - 1 of the
-   bquant arrays (SPG_BDOT_ROWS at most a dispatch), y's rows ldy floats apart. A warp a row of weights. */
+   bquant arrays (SPG_BDOT_ROWS at most a dispatch), y's rows ldy floats apart. A warp a row of weights. Then the
+   activation of spec 2 (ActivationFunction, 0: none), and with e0 the product by e0's value at y's place (a gated
+   unit's other half). */
 typedef struct {
-    uint64_t w, q, dx, xs, bias, y;
+    uint64_t w, q, dx, xs, bias, y, e0;
     uint32_t rows, n, k, stride, r0, ldy;
 } SpgBdotPush;
 #define SPG_BDOT_ROWS 8u
 enum { SPG_B_Q8_0, SPG_B_Q4_0, SPG_B_Q4_1, SPG_B_Q5_0, SPG_B_Q5_1, SPG_B_Q2_K, SPG_B_Q3_K, SPG_B_Q4_K, SPG_B_Q5_K,
        SPG_B_Q6_K, SPG_B_IQ4_NL, SPG_B_IQ4_XS, SPG_B_TYPES };
+
+/* bembed.comp: the embedding of a session's rows: y[r] = (the table's row of token[r] decoded as the CPU decodes it,
+   zeros for a token out of [0, vocabulary)) times scale (0: none), plus the positions' row info[2 r + 1] of
+   `positions` (0: none). The table's rows `stride` bytes of TYPE: SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, or
+   SPG_EMB_BLOCK + a block type. A thread a value. */
+typedef struct {
+    uint64_t table, token, info, positions, y;
+    uint32_t rows, d, stride, type, vocabulary;
+    float scale;
+} SpgBembedPush;
+enum { SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, SPG_EMB_BLOCK = 16 };
+
+/* kvattn.comp: a session's attention over the keys and values it keeps. PREP: a warp a row and head of the rows'
+   queries, keys and values x [rows][(heads + 2 kv) head]: each query and key RMS-normalized by gq, gk (0: none) then
+   rotated by the table of cosines then sines [max_length][rot / 2] (rot 0: none) at its row's position; the queries to
+   q [rows][heads][head], the keys and values into their caches [sequence][kv][max_length][head] at the position.
+   ATTEND: a warp a row and query head: its query over the keys of its sequence from position p + 1 - attended to p
+   (window: the last `window`, 0: all), the scores times scale, a softmax, the values' weighted sum to y [rows][heads
+   head]. info [rows]: each row's sequence and position. */
+typedef struct {
+    uint64_t x, q, keys, values, y, table, gq, gk, info;
+    uint32_t rows, heads, kv, head, rot, window, max_length, op;
+    float eps, scale;
+} SpgKvattnPush;
+enum { SPG_KV_PREP, SPG_KV_ATTEND };
 
 /* wqmv.comp: products of rows of activations with a linear layer's weights kept as integer codes (INT8, INT4, INT2:
    BITS) and a scale a row of weights, the codes widened in registers: y[r][n] = act(bias[n] + scale[n] sum_k

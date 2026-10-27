@@ -23,9 +23,7 @@
 #include "Spingalett.Model.h"
 #include "Spingalett.Blocks.h"
 #include "Spingalett.Attention.h"
-#if !defined(SPINGALETT_RUNTIME)
 #include "Spingalett.Gpu.h"
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <float.h>
@@ -85,6 +83,11 @@ struct SpingalettSession {
     uint32_t query_floats;
     float *gathered, *out;          /* the last layer's inputs on the picked rows, and its outputs */
     size_t gathered_floats, out_floats;
+    /* on a GPU from the model's image (Spingalett.GpuSession.c: models of block precisions), steps of gs_rows rows: the
+       rows' token ids, the rows whose logits a step writes, and those logits */
+    SpgGpuSession *gs;
+    uint32_t gs_rows, *gs_tokens, *gs_pick;
+    float *gs_logits;
 #if !defined(SPINGALETT_RUNTIME)
     /* on a GPU (its compute modes, the full library): the model as a network there, run a step of rows at a time
        by a decoder that keeps the caches; the logits of a step's rows */
@@ -176,6 +179,10 @@ static void caches_free(Cache *caches, uint32_t layers) {
 
 void spingalett_session_free(SpingalettSession *s) {
     if (!s) return;
+    spingalett_gpu_session_free(s->gs);
+    free(s->gs_tokens);
+    free(s->gs_pick);
+    free(s->gs_logits);
 #if !defined(SPINGALETT_RUNTIME)
     spingalett_gpu_decoder_free(s->decoder);
     spingalett_gpu_net_free(s->gpu);
@@ -212,6 +219,65 @@ static bool session_workspace(SpingalettSession *s, ComputeMode mode) {
     s->w = spingalett_predict_workspace_create(s->model, s->m, mode, false, true);
     s->queries = (float *)spingalett_aligned_alloc((size_t)threads * s->query_floats * sizeof(float));
     return s->w && s->queries;
+}
+
+/* Rows a step of the GPU's session from the image (its logits' memory a row of the vocabulary each). */
+#define GS_ROWS 128u
+
+/* The session on the GPU of the compute mode straight from the model's image (Spingalett.GpuSession.c: weights of
+   floats, float16, bfloat16 and GGUF's block types); false (and the session elsewhere) when the GPU cannot run it. */
+static bool session_image_gpu(SpingalettSession *s) {
+    if (!spingalett_use_gpu()) return false;
+    const char *why = NULL;
+    s->gs_rows = s->capacity < GS_ROWS ? s->capacity : GS_ROWS;
+    s->gs = spingalett_gpu_session_new(s->model, s->sequences, s->max_length, s->gs_rows, &why);
+    s->gs_tokens = (uint32_t *)malloc((size_t)s->gs_rows * sizeof(uint32_t));
+    s->gs_pick = (uint32_t *)malloc((size_t)s->gs_rows * sizeof(uint32_t));
+    s->gs_logits = (float *)malloc((size_t)s->gs_rows * s->vocabulary * sizeof(float));
+    if (s->gs && s->gs_tokens && s->gs_pick && s->gs_logits) {
+        spingalett_log(LOG_DEBUG, "session: on the GPU, from the model's image");
+        return true;
+    }
+    spingalett_log(LOG_DEBUG, "session: not on the GPU from the model's image%s%s", why ? ": " : "", why ? why : "");
+    spingalett_gpu_session_free(s->gs);
+    free(s->gs_tokens);
+    free(s->gs_pick);
+    free(s->gs_logits);
+    s->gs = NULL;
+    s->gs_tokens = s->gs_pick = NULL;
+    s->gs_logits = NULL;
+    return false;
+}
+
+/* A feed on the GPU's session from the image: the feeds' tokens in steps of its rows, the logits copied where asked. */
+static bool session_feed_gs(SpingalettSession *s, const SpingalettSessionFeed *feeds, uint32_t count) {
+    for (uint32_t f = 0, t = 0;;) {
+        uint32_t rows = 0, picked = 0;
+        while (rows < s->gs_rows && f < count) {
+            const SpingalettSessionFeed *e = &feeds[f];
+            if (t >= e->count) {
+                f++, t = 0;
+                continue;
+            }
+            s->row_sequence[rows] = e->sequence;
+            s->row_position[rows] = s->length[e->sequence] + t;
+            s->gs_tokens[rows] = e->tokens[t];
+            s->row_logits[rows] = !e->logits ? NULL : e->all ? e->logits + (size_t)t * s->vocabulary
+                                : t + 1 == e->count ? e->logits : NULL;
+            if (s->row_logits[rows]) s->gs_pick[picked++] = rows;
+            rows++, t++;
+        }
+        if (!rows) break;
+        if (!spingalett_gpu_session_step(s->gs, rows, s->gs_tokens, s->row_sequence, s->row_position, picked, s->gs_pick,
+                                         s->gs_logits)) {
+            set_error(SPINGALETT_ERR_ALLOC, "session feed: the GPU failed");
+            return false;
+        }
+        for (uint32_t k = 0; k < picked; k++)
+            memcpy(s->row_logits[s->gs_pick[k]], s->gs_logits + (size_t)k * s->vocabulary, s->vocabulary * sizeof(float));
+    }
+    for (uint32_t f = 0; f < count; f++) s->length[feeds[f].sequence] += feeds[f].count;
+    return true;
 }
 
 #if !defined(SPINGALETT_RUNTIME)
@@ -300,6 +366,7 @@ SpingalettSession *spingalett_session_new(const SpingalettModel *model, const Sp
     s->picked_position = (uint32_t *)malloc((size_t)s->capacity * sizeof(uint32_t));
     bool ok = s->length && s->caches && s->row_sequence && s->row_position && s->row_token && s->row_logits &&
               s->row_sums && s->picked && s->picked_position;
+    if (ok && session_image_gpu(s)) return s;
 #if !defined(SPINGALETT_RUNTIME)
     if (ok && session_gpu(s)) return s;
 #endif
@@ -363,6 +430,14 @@ bool spingalett_session_copy(SpingalettSession *s, uint32_t from, uint32_t to) {
         return false;
     }
     if (from == to) return true;
+    if (s->gs) {
+        if (!spingalett_gpu_session_copy(s->gs, from, to, s->length[from])) {
+            set_error(SPINGALETT_ERR_ALLOC, "session copy: the GPU failed");
+            return false;
+        }
+        s->length[to] = s->length[from];
+        return true;
+    }
 #if !defined(SPINGALETT_RUNTIME)
     if (s->decoder) {
         if (!spingalett_gpu_decoder_copy(s->decoder, from, to, s->length[from])) {
@@ -747,6 +822,7 @@ bool spingalett_session_feed(SpingalettSession *s, const SpingalettSessionFeed *
         }
     }
     const ComputeMode mode = resolve_compute_mode();
+    if (s->gs) return session_feed_gs(s, feeds, count);
 #if !defined(SPINGALETT_RUNTIME)
     if (s->decoder) return session_feed_gpu(s, feeds, count);
 #endif

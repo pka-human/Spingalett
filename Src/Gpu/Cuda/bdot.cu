@@ -9,7 +9,7 @@
  * sums of its sub-blocks' products times their integer scales (I1) and, of the types with minima, the minima times
  * the sub-blocks' sums of codes (I2), exact in any order; then the block's term (d dx) I1 (+ (m dx) I2), each
  * product and sum rounded alone (the unit is compiled without contraction), added to the row's sum block after block;
- * the bias then the sum. A warp a row of weights: lane l takes the l-th chunk of 32 values of each round of 32, the
+ * the bias then the sum (then the activation of spec 2, and the product by e0's value). A warp a row of weights: lane l takes the l-th chunk of 32 values of each round of 32, the
  * integers of a block's chunks (eight of a super-block of 256) summed across their lanes, the blocks' terms added in
  * their order through shuffles. A unit a TYPE (SPG_B_*) and ROWS, the rows of activations a pass (bdot_<type>_r<ROWS>).
  */
@@ -94,6 +94,19 @@ DEVICE int32_t iq4xs_scale(const uint8_t *block, uint32_t ib) {
     return (int32_t)(((low >> (4u * (ib % 2u))) & 0xFu) | (((high >> (2u * ib)) & 3u) << 4)) - 32;
 }
 
+/* four signed bytes' products with four, added to c */
+DEVICE int32_t dp4a(uint32_t a, uint32_t b, int32_t c) {
+    int32_t d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+/* a word from two bytes' alignment (two loads of 16 bits), and from four's */
+DEVICE uint32_t word2(const uint8_t *b) {
+    const uint16_t *h = (const uint16_t *)b;
+    return (uint32_t)h[0] | (uint32_t)h[1] << 16;
+}
+DEVICE uint32_t word4(const uint8_t *b) { return *(const uint32_t *)b; }
+
 /* A block's scale d and minimum's m (0: none) */
 DEVICE void block_scales(const uint8_t *w, float &d, float &m) {
     m = 0.0f;
@@ -112,11 +125,22 @@ DEVICE void block_scales(const uint8_t *w, float &d, float &m) {
 DEVICE void chunk_dot(const uint8_t *w, uint32_t c, const int8_t *x, const int32_t *xs, int32_t &i1, int32_t &i2) {
     i1 = 0;
     i2 = 0;
+    /* (x: the chunk's 32 codes, a multiple of 32 bytes in: eight words) */
+    const uint32_t *xw = (const uint32_t *)x;
     switch (TYPE) {
         case SPG_B_Q8_0:
-            for (uint32_t k = 0; k < 32u; k++) i1 += (int8_t)w[2 + k] * x[k];
+            for (uint32_t k = 0; k < 8u; k++) i1 = dp4a(word2(w + 2 + 4u * k), xw[k], i1);
             break;
-        case SPG_B_Q4_0: i1 = nibbles_dot(w + 2, 0u, 8, false, false, x); break;
+        case SPG_B_Q4_0: {
+            /* (q - 8) x: the codes' products less 8 times the sums of x, sixteen values each */
+            for (uint32_t k = 0; k < 4u; k++) {
+                const uint32_t q = word2(w + 2 + 4u * k);
+                i1 = dp4a(q & 0x0F0F0F0Fu, xw[k], i1);
+                i1 = dp4a((q >> 4) & 0x0F0F0F0Fu, xw[k + 4u], i1);
+            }
+            i1 -= 8 * (xs[0] + xs[1]);
+            break;
+        }
         case SPG_B_IQ4_NL: i1 = nibbles_dot(w + 2, 0u, 0, true, false, x); break;
         case SPG_B_Q4_1: i1 = nibbles_dot(w + 4, 0u, 0, false, false, x); i2 = xs[0] + xs[1]; break;
         case SPG_B_Q5_0: i1 = nibbles_dot(w + 6, get32(w + 2), 16, false, true, x); break;
@@ -145,16 +169,18 @@ DEVICE void chunk_dot(const uint8_t *w, uint32_t c, const int8_t *x, const int32
             break;
         }
         case SPG_B_Q4_K: case SPG_B_Q5_K: {
-            /* sub-block c of 32: value 64 (c / 2) + 32 (c % 2) + l in the low (c even) or high nibble of byte 32 (c / 2) + l */
+            /* sub-block c of 32: value 64 (c / 2) + 32 (c % 2) + l in the low (c even) or high nibble of byte 32 (c / 2) + l
+               (with a fifth bit, bit c of qh[l]); the blocks four bytes aligned (144 and 176 bytes) */
             const bool five = TYPE == SPG_B_Q5_K;
             const uint8_t *qh = w + 16, *q = w + (five ? 48 : 16);
             int32_t sc, mn, s = 0;
             scale_min_k4(c, w + 4, sc, mn);
             const uint8_t *qb = q + 32u * (c / 2u);
-            for (uint32_t l = 0; l < 32u; l++) {
-                int32_t code = c % 2u ? qb[l] >> 4 : qb[l] & 0xF;
-                if (five) code |= (int32_t)(((qh[l] >> c) & 1u) << 4);
-                s += code * x[l];
+            const uint32_t shift = 4u * (c % 2u);
+            for (uint32_t k = 0; k < 8u; k++) {
+                uint32_t code = (word4(qb + 4u * k) >> shift) & 0x0F0F0F0Fu;
+                if (five) code |= ((word4(qh + 4u * k) >> c) & 0x01010101u) << 4;
+                s = dp4a(code, xw[k], s);
             }
             i1 = sc * s;
             i2 = mn * (xs[2u * c] + xs[2u * c + 1u]);
@@ -162,19 +188,21 @@ DEVICE void chunk_dot(const uint8_t *w, uint32_t c, const int8_t *x, const int32
         }
         case SPG_B_Q6_K: {
             /* sub-blocks 2c and 2c + 1 of 16, a signed scale each: value 128 h + 32 g + l from byte 64 h + l (g even)
-               or 64 h + 32 + l (g odd) of ql, its low nibble (g < 2) or high one, and bits 2 g of byte 32 h + l of qh */
-            const uint8_t *ql = w, *qh = w + 128;
+               or 64 h + 32 + l (g odd) of ql, its low nibble (g < 2) or high one, and bits 2 g of byte 32 h + l of qh;
+               the codes less 32 as their products less 32 times the sums of x (blocks of 210 bytes: two aligned) */
+            const uint32_t h = c / 4u, g = c % 4u;
+            const uint8_t *lb = w + 64u * h + 32u * (g % 2u), *hb = w + 128 + 32u * h;
             const int8_t *sc = (const int8_t *)(w + 192);
-            for (uint32_t is = 2u * c; is < 2u * c + 2u; is++) {
-                const uint32_t h = is / 8u, g = (is % 8u) / 2u, l0 = 16u * (is % 2u);
-                const uint8_t *lb = ql + 64u * h + 32u * (g % 2u), *hb = qh + 32u * h;
-                const int8_t *xb = x + 16u * (is - 2u * c);
+            const uint32_t lshift = g < 2u ? 0u : 4u, hshift = 2u * g;
+            for (uint32_t half = 0; half < 2u; half++) {
                 int32_t s = 0;
-                for (uint32_t l = l0; l < l0 + 16u; l++) {
-                    const int32_t low = g < 2u ? lb[l] & 0xF : lb[l] >> 4;
-                    s += ((int32_t)((uint32_t)low | (((hb[l] >> (2u * g)) & 3u) << 4)) - 32) * xb[l - l0];
+                for (uint32_t k = 4u * half; k < 4u * half + 4u; k++) {
+                    const uint32_t code = ((word2(lb + 4u * k) >> lshift) & 0x0F0F0F0Fu) |
+                                          (((word2(hb + 4u * k) >> hshift) & 0x03030303u) << 4);
+                    s = dp4a(code, xw[k], s);
                 }
-                i1 += sc[is] * s;
+                const uint32_t is = 2u * c + half;
+                i1 += sc[is] * (s - 32 * xs[is]);
             }
             break;
         }
@@ -185,7 +213,6 @@ DEVICE void chunk_dot(const uint8_t *w, uint32_t c, const int8_t *x, const int32
 }
 
 extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p, const Spec spec) {
-    (void)spec;
     const uint32_t lane = thread_x() & 31u, j = block_x() * 8u + (thread_x() >> 5);
     if (j >= p.n) return;                       /* (a whole warp) */
     const uint32_t rows = p.rows < ROWS ? p.rows : ROWS, blocks = p.k / BV, chunks = p.k / 32u;
@@ -224,6 +251,14 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
 #pragma unroll
             for (uint32_t r = 0; r < ROWS; r++) acc[r] = acc[r] + shfl_f(t[r], g * CPB);
     }
-    if (lane == 0u)
-        for (uint32_t r = 0; r < rows; r++) F(p.y)[(uint64_t)(p.r0 + r) * p.ldy + j] = F(p.bias)[j] + acc[r];
+    if (lane == 0u) {
+        const uint32_t act = spec.v[2];
+        for (uint32_t r = 0; r < rows; r++) {
+            const uint64_t at = (uint64_t)(p.r0 + r) * p.ldy + j;
+            float v = F(p.bias)[j] + acc[r];
+            if (act) v = activate(v, act);
+            if (p.e0) v = v * F(p.e0)[at];
+            F(p.y)[at] = v;
+        }
+    }
 }

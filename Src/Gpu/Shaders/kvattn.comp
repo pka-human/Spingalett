@@ -1,0 +1,11 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* Sessions of language models: CUDA's (kvattn.cu) only, as yet (spg_gpu_kernel_built() is false
+   for this placeholder). */
+
+#version 460
+layout(local_size_x = 1) in;
+void main() {}

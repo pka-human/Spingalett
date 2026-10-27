@@ -454,7 +454,8 @@ static bool vkb_kernel_built(SpgKernel kernel) {
          kernel == SPG_KERNEL_gattn) && !gpu.storage8)
         return false;               /* (they declare 8-bit storage) */
     if (kernel == SPG_KERNEL_gcvt && !gpu.storage16) return false;     /* (and this 16-bit storage) */
-    if (kernel == SPG_KERNEL_gflash || kernel == SPG_KERNEL_bquant || kernel == SPG_KERNEL_bdot)
+    if (kernel == SPG_KERNEL_gflash || kernel == SPG_KERNEL_bquant || kernel == SPG_KERNEL_bdot ||
+        kernel == SPG_KERNEL_bembed || kernel == SPG_KERNEL_kvattn)
         return false;                                                   /* (CUDA's alone) */
     return vkb_open() && kernel < SPG_KERNEL_COUNT && spg_kernel_spirv_size[kernel] > 20u;
 }

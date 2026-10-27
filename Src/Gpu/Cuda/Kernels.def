@@ -64,6 +64,8 @@ SPG_CUDA_UNIT(wqmv_b2_r8, wqmv, "-DBITS=2u -DROWS=8u")
 /* language models' layers of block precisions (GGUF's types) in sessions: their inputs quantized in blocks, then
    products of a few rows with the blocks as stored, the CPU's bits: a unit a type and ROWS (bdot_<type>_r<ROWS>) */
 SPG_CUDA_UNIT(bquant, bquant, "")
+SPG_CUDA_UNIT(bembed, bembed, "")           /* and the rest of a session's step: embeddings, attention */
+SPG_CUDA_UNIT(kvattn, kvattn, "")
 SPG_CUDA_UNIT(bdot_q8_0_r1, bdot, "-DTYPE=0u -DROWS=1u")
 SPG_CUDA_UNIT(bdot_q8_0_r8, bdot, "-DTYPE=0u -DROWS=8u")
 SPG_CUDA_UNIT(bdot_q4_0_r1, bdot, "-DTYPE=1u -DROWS=1u")
