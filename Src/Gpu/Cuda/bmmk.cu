@@ -28,6 +28,7 @@
 #define TN 4u                               /* tiles of 8 columns a warp */
 #define THREADS (64u * WN)
 #define SIX (TYPE == SPG_B_Q6_K)            /* Q6_K: halves of 16 of their own scales, two high bits, no minima */
+#define FIVE (TYPE == SPG_B_Q5_K)           /* Q5_K: Q4_K's and a fifth bit */
 #define BM 64u
 #define BN (8u * TN * WN)
 #define SB 2u                               /* sub-blocks of 32 values a stage */
@@ -66,6 +67,8 @@ DEVICE void mma_s8u8_k16(int32_t (&d)[4], uint32_t a0, uint32_t a1, uint32_t b, 
     asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.u8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %7, %8, %8};"
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b), "r"(c01), "r"(c23));
 }
+/* four bits of x at bit 4 of four bytes */
+DEVICE uint32_t spread1(uint32_t x) { return ((x * 0x00204081u) & 0x01010101u) << 4; }
 /* four 2-bit fields of x at bits 4 and 5 of four bytes */
 DEVICE uint32_t spread2(uint32_t x) {
     x = x | x << 6;
@@ -91,6 +94,7 @@ DEVICE uint32_t chunk_b(uint32_t r, uint32_t cb) { return 32u * r + 16u * (cb ^ 
 struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
     uint8_t a[BM * 64u], b[BN * 32u];       /* the rows' codes, the weights' (Q6_K: their low four bits) */
     uint8_t h[SIX ? BN * 16u : 16u];        /* Q6_K: their high two bits, 8 bytes a sub-block */
+    uint32_t f[FIVE ? BN : 4u][SB];         /* Q5_K: their fifth bits */
 };
 struct Super {
     uint16_t pairs[BN][8];                  /* the sub-blocks' scale | minimum << 8 (Q6_K: the halves' signed scales) */
@@ -112,6 +116,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
     const uint8_t *highs = (const uint8_t *)p.w + (uint64_t)p.n * (p.k / 2u);
     const uint16_t *pairs = (const uint16_t *)(highs + (SIX ? (uint64_t)p.n * (p.k / 4u) : 0u));
     const float *dm = (const float *)((const uint8_t *)pairs + (uint64_t)p.n * subs * 2u);
+    const uint32_t *fifth = (const uint32_t *)(dm + (uint64_t)p.n * blocks * 2u);
     /* the copies of stage s (zeros past the rows and the weights) */
     auto issue = [&](uint32_t s) {
         Stage &st = sh.st[s % STAGES];
@@ -130,6 +135,11 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
             const bool live = n < p.n;
             copy16(shared_address(st.b + chunk_b(r, cb)), codes + (live ? (uint64_t)n * (p.k / 2u) + 16u * (SB * s + cb) : 0u),
                    live ? 16u : 0u);
+        }
+        if (FIVE && tid < BN) {
+            const uint32_t n = n0 + tid;
+            const bool live = n < p.n;
+            copy8(shared_address(&st.f[FIVE ? tid : 0u][0]), fifth + (live ? (uint64_t)n * subs + SB * s : 0u), live ? 8u : 0u);
         }
         if (SIX && tid < BN) {
             const uint32_t n = n0 + tid;
@@ -192,6 +202,11 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
                 const uint32_t r = 8u * TN * wn + 8u * b + g, w = *(const uint32_t *)(st.b + chunk_b(r, cb) + 4u * t);
                 b0[b] = w & 0x0F0F0F0Fu;
                 b1[b] = (w >> 4) & 0x0F0F0F0Fu;
+                if (FIVE) {
+                    const uint32_t f = st.f[FIVE ? r : 0u][cb];
+                    b0[b] |= spread1((f >> (4u * t)) & 0xFu);
+                    b1[b] |= spread1((f >> (16u + 4u * t)) & 0xFu);
+                }
                 if (SIX) {
                     /* (the high two bits of the four values of each half) */
                     const uint32_t piece = *(const uint16_t *)(st.h + 16u * r + 8u * cb + 2u * t);

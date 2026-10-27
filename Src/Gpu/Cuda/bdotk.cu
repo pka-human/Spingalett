@@ -22,6 +22,7 @@
 #endif
 
 #define SIX (TYPE == SPG_B_Q6_K)
+#define FIVE (TYPE == SPG_B_Q5_K)
 
 struct uint4_ {
     uint32_t x, y, z, w;
@@ -29,6 +30,7 @@ struct uint4_ {
 
 DEVICE float shfl_f(float v, uint32_t lane) { return __nvvm_shfl_sync_idx_f32(0xFFFFFFFFu, v, lane, 0x1F); }
 DEVICE int32_t shfl_add(int32_t v, uint32_t mask) { return v + (int32_t)__nvvm_shfl_sync_bfly_i32(0xFFFFFFFFu, v, mask, 0x1F); }
+DEVICE uint32_t spread1(uint32_t x) { return ((x * 0x00204081u) & 0x01010101u) << 4; }
 DEVICE int32_t dp4a(uint32_t a, uint32_t b, int32_t c) {
     int32_t d;
     asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
@@ -45,6 +47,7 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
     const uint16_t *pairs = pairs0 + (uint64_t)j * subs;
     const float *dm = (const float *)((const uint8_t *)pairs0 + (uint64_t)p.n * subs * 2u) + 2u * (uint64_t)j * blocks;
     highs += (uint64_t)j * (p.k / 4u);
+    const uint32_t *fifth = (const uint32_t *)(dm - 2u * (uint64_t)j * blocks + (uint64_t)p.n * blocks * 2u) + (uint64_t)j * subs;
     const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
     const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
     float acc = 0.0f;
@@ -77,14 +80,18 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
                 i1 += (int32_t)(signed char)(pr >> 8) * (hi - 32 * xs[2u * c + 1u]);
             }
             int32_t s = 0;
-            s = dp4a(w.x & m4, x0.x, s);
-            s = dp4a(w.y & m4, x0.y, s);
-            s = dp4a(w.z & m4, x0.z, s);
-            s = dp4a(w.w & m4, x0.w, s);
-            s = dp4a((w.x >> 4) & m4, x1.x, s);
-            s = dp4a((w.y >> 4) & m4, x1.y, s);
-            s = dp4a((w.z >> 4) & m4, x1.z, s);
-            s = dp4a((w.w >> 4) & m4, x1.w, s);
+            const uint32_t f = FIVE ? fifth[c] : 0u;
+            const uint32_t ws[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) {
+                uint32_t lo = ws[k] & m4, hi = (ws[k] >> 4) & m4;
+                if (FIVE) {
+                    lo |= spread1((f >> (4u * k)) & 0xFu);
+                    hi |= spread1((f >> (16u + 4u * k)) & 0xFu);
+                }
+                s = dp4a(lo, xa[k], s);
+                s = dp4a(hi, xb[k], s);
+            }
             if (!SIX) {
                 const uint32_t pr = pairs[c];
                 i1 = (int32_t)(pr & 0xFFu) * s;

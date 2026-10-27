@@ -972,7 +972,10 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
 static void bench_blocks(int count, char **types) {
     static const char *const names[] = {"Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K",
                                         "Q6_K", "IQ4_NL", "IQ4_XS"};
-    static const uint32_t shapes[4][2] = {{4096, 1024}, {1024, 2048}, {3072, 1024}, {1024, 3072}};   /* N, K */
+    static uint32_t shapes[4][2] = {{4096, 1024}, {1024, 2048}, {3072, 1024}, {1024, 3072}};   /* N, K */
+    /* (SPINGALETT_BENCH_SHAPE="N K": that product alone) */
+    const char *shape = getenv("SPINGALETT_BENCH_SHAPE");
+    const int nshapes = shape && sscanf(shape, "%u %u", &shapes[0][0], &shapes[0][1]) == 2 ? 1 : 4;
     static char *defaults[] = {"Q8_0", "Q4_K", "Q6_K"};
     const char *env = getenv("SPINGALETT_BENCH_ROWS");
     const uint32_t R = env ? (uint32_t)atoi(env) : 512u;
@@ -985,7 +988,7 @@ static void bench_blocks(int count, char **types) {
         if (type < 0) continue;
         const PrecisionMode p = (PrecisionMode)(PRECISION_Q8_0 + type);
         double total = 0, ops = 0;
-        for (int sh = 0; sh < 4; sh++) {
+        for (int sh = 0; sh < nshapes; sh++) {
             const uint32_t N = shapes[sh][0], K = shapes[sh][1], BV = slett_block_values(p);
             const uint32_t stride = K / BV * slett_block_bytes(p);
             const size_t raw_bytes = (size_t)N * stride, packed_bytes = spg_packed_bytes((uint32_t)type, N, K);

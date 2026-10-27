@@ -9,7 +9,8 @@
  * rounded. Q8_0: the codes, N rows of K bytes, then the blocks' scales as floats, N x K / 32. Q4_K: the codes of every
  * sub-block of 32 values in 16 bytes (byte i the code of value i, then of value i + 16 above it: a lane's word gives
  * both halves of a fragment of 32), N rows of K / 2 bytes; the sub-blocks' 6-bit scales and minima in pairs of bytes,
- * N x K / 32; the super-blocks' scale and minimum's negation (as the products take them) as pairs of floats, N x K / 256.
+ * N x K / 32; the super-blocks' scale and minimum's negation (as the products take them) as pairs of floats, N x K / 256;
+ * Q5_K as Q4_K, then the fifth bits, a word a sub-block (bit i value i's), N x K / 32.
  * Q6_K: the low four bits of the codes as Q4_K's, then their high two bits, eight bytes a sub-block of 32 (sixteen bits
  * a lane's word of low bits: the high bits of its four values of the first half of 16, then of the second's), N rows of
  * K / 4 bytes; the halves' signed scales in pairs of bytes, N x K / 32; the super-blocks' scales (and zeros) as pairs of
@@ -40,6 +41,9 @@ size_t spg_packed_bytes(uint32_t type, uint32_t N, uint32_t K) {
     switch (type) {
         case SPG_B_Q8_0: return (size_t)N * K + (size_t)N * (K / 32u) * sizeof(float);
         case SPG_B_Q4_K: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u + (size_t)N * (K / 256u) * 2u * sizeof(float);
+        case SPG_B_Q5_K:
+            return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u + (size_t)N * (K / 256u) * 2u * sizeof(float) +
+                   (size_t)N * (K / 32u) * 4u;
         case SPG_B_Q4_0: case SPG_B_IQ4_NL: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * sizeof(float);
         case SPG_B_Q4_1: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u * sizeof(float);
         case SPG_B_Q5_0: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 4u + (size_t)N * (K / 32u) * sizeof(float);
@@ -85,14 +89,17 @@ void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, 
             }
         return;
     }
-    if (type == SPG_B_Q4_K) {
+    if (type == SPG_B_Q4_K || type == SPG_B_Q5_K) {
+        const bool five = type == SPG_B_Q5_K;
         const uint32_t blocks = K / 256u, subs = K / 32u;
         uint8_t *codes = dst;
         uint16_t *pairs = (uint16_t *)(void *)(dst + (size_t)N * (K / 2u));
         float *dm = (float *)(void *)(dst + (size_t)N * (K / 2u) + (size_t)N * subs * 2u);
+        uint32_t *fifth = (uint32_t *)(void *)(dm + (size_t)N * blocks * 2u);
         for (uint32_t j = 0; j < N; j++)
             for (uint32_t b = 0; b < blocks; b++) {
-                const uint8_t *block = src + ((size_t)j * blocks + b) * 144u, *qs = block + 16;
+                /* (Q5_K: the high bits of value l of every sub-block in byte 16 + l, the codes from byte 48) */
+                const uint8_t *block = src + ((size_t)j * blocks + b) * (five ? 176u : 144u), *qs = block + (five ? 48 : 16);
                 dm[2u * ((size_t)j * blocks + b)] = half_at(block);
                 dm[2u * ((size_t)j * blocks + b) + 1u] = -half_at(block + 2);
                 for (uint32_t c = 0; c < 8u; c++) {
@@ -105,6 +112,11 @@ void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, 
                     uint8_t *out = codes + (size_t)j * (K / 2u) + 16u * (8u * b + c);
                     for (uint32_t i = 0; i < 16u; i++)
                         out[i] = (uint8_t)(((q[i] >> shift) & 0xFu) | (((q[i + 16u] >> shift) & 0xFu) << 4));
+                    if (five) {
+                        uint32_t bits = 0;
+                        for (uint32_t i = 0; i < 32u; i++) bits |= ((uint32_t)(block[16u + i] >> c) & 1u) << i;
+                        fifth[(size_t)j * subs + 8u * b + c] = bits;
+                    }
                 }
             }
     }

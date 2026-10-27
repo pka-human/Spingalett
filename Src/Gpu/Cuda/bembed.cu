@@ -126,12 +126,15 @@ KERNEL(bembed, SpgBembedPush) {
             /* (packed: the code times its block's scale, as spingalett_block_decode()) */
             const float d = F(p.table + (uint64_t)p.vocabulary * p.d)[(uint64_t)token * (p.d / 32u) + c / 32u];
             v = (float)(int8_t)row[c] * d;
-        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q4_K) {
+        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q4_K || p.type == SPG_EMB_PACKED + SPG_B_Q5_K) {
             /* (packed: the sub-block's scale and minimum times the super-block's, then the code's value) */
             const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;
-            const uint32_t byte = row[16u * sub + (i & 15u)], code = i < 16u ? byte & 0xFu : byte >> 4;
+            const uint32_t byte = row[16u * sub + (i & 15u)];
+            uint32_t code = i < 16u ? byte & 0xFu : byte >> 4;
             const uint32_t pair = ((const uint16_t *)(p.table + V * (p.d / 2u)))[(uint64_t)token * subs + sub];
             const float *dm = F(p.table + V * (p.d / 2u) + V * subs * 2u) + 2u * ((uint64_t)token * blocks + sub / 8u);
+            if (p.type == SPG_EMB_PACKED + SPG_B_Q5_K)
+                code |= ((U(p.table + V * (p.d / 2u) + V * subs * 2u + V * blocks * 8u)[(uint64_t)token * subs + sub] >> i) & 1u) << 4;
             const float d1 = dm[0] * (float)(pair & 0xFFu), m1 = -dm[1] * (float)(pair >> 8);
             v = d1 * (float)code - m1;
         } else if (p.type >= SPG_EMB_PACKED + SPG_B_Q4_0 && p.type <= SPG_EMB_PACKED + SPG_B_Q5_1 ||
