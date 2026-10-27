@@ -365,6 +365,9 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
                                                        "q6_k", "iq4_nl", "iq4_xs"};
         if (count < 2 || spec[0] >= SPG_B_TYPES) return -1;
         snprintf(name, sizeof name, "bdot_%s_r%u", types[spec[0]], spec[1]);    /* (the type, the rows a pass) */
+    } else if (kernel == SPG_KERNEL_bnorm) {
+        if (count < 2) return -1;
+        snprintf(name, sizeof name, "bnorm_v%u", spec[1]);       /* (the values a thread at most) */
     } else if (kernel == SPG_KERNEL_bmm) {
         static const char *const types[SPG_B_TYPES] = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k",
                                                        "q6_k", "iq4_nl", "iq4_xs"};

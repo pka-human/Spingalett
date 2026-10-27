@@ -64,6 +64,10 @@ SPG_CUDA_UNIT(wqmv_b2_r8, wqmv, "-DBITS=2u -DROWS=8u")
 /* language models' layers of block precisions (GGUF's types) in sessions: their inputs quantized in blocks, then
    products of a few rows with the blocks as stored, the CPU's bits: a unit a type and ROWS (bdot_<type>_r<ROWS>) */
 SPG_CUDA_UNIT(bquant, bquant, "")
+/* (RMS normalizations with the sums before them and the quantizations after them, a unit the values a thread at most) */
+SPG_CUDA_UNIT(bnorm_v8, bnorm, "-DVMAX=8u")
+SPG_CUDA_UNIT(bnorm_v16, bnorm, "-DVMAX=16u")
+SPG_CUDA_UNIT(bnorm_v32, bnorm, "-DVMAX=32u")
 /* (a prompt's many rows on the matrix units, a unit a type: bmm_<type>) */
 SPG_CUDA_UNIT(bmm_q8_0, bmm, "-DTYPE=0u")
 SPG_CUDA_UNIT(bmm_q4_0, bmm, "-DTYPE=1u")

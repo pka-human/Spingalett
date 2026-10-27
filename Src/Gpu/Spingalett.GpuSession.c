@@ -44,6 +44,9 @@ typedef struct {
     uint64_t gate;                  /* RUN_BLOCK: the values its outputs are multiplied by (the product of layers after it,
                                        taken in), or 0 */
     bool skip;                      /* a product of layers its reader's epilogue computes */
+    bool folded;                    /* a sum of two layers the RMS normalization after it computes (bnorm) */
+    uint32_t tpr, qbv;              /* RMS normalizations by bnorm: grow's threads a row; the blocks of values its
+                                       outputs are quantized in for the block layer after it (0: none) */
     /* attention */
     uint64_t keys, values, table, gq, gk;
     uint64_t strides;               /* gflash's strides over the caches (a prompt's attention), or 0 */
@@ -353,6 +356,31 @@ static bool layout(SpgGpuSession *s) {
     return ok;
 }
 
+/* RMS normalizations in one pass with what is around them (bnorm): the sum of two layers just before one, read by it
+   (and by others: it writes the sum), and the quantization of its outputs for a block layer just after it that reads
+   them (which then reads them quantized: s->quantized). Where grow takes 32 threads a row or more, and 32 values a
+   thread at most. */
+static void fuse_norms(SpgGpuSession *s) {
+    if (!spg_gpu_kernel_built(SPG_KERNEL_bnorm)) return;
+    for (uint32_t i = 0; i < s->layers; i++) {
+        GLayer *G = &s->L[i];
+        const uint32_t k = G->L.out_c;
+        uint32_t tpr = 1;
+        while (tpr < 256u && 8u * tpr <= k) tpr *= 2u;
+        if (G->run != RUN_RMS || tpr < 32u || k % tpr || k / tpr > 32u || G->act_gew != NONE) continue;
+        G->tpr = tpr;
+        GLayer *A = i ? &s->L[i - 1u] : NULL;
+        if (A && A->run == RUN_ADD && A->L.input_count == 2 && A->act_gew == NONE && G->inputs[0] == i && A->inputs[0] &&
+            A->inputs[1] && A->L.out_c == k)
+            A->folded = true;
+        const GLayer *B = i + 1u < s->layers ? &s->L[i + 1u] : NULL;
+        if (B && B->run == RUN_BLOCK && B->inputs[0] == i + 1u && B->L.row_len == k) {
+            const uint32_t bv = slett_block_values(B->L.precision);
+            if (k % bv == 0u) G->qbv = bv;
+        }
+    }
+}
+
 SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t sequences, uint32_t max_length,
                                           uint32_t most, const char **why) {
     *why = NULL;
@@ -388,6 +416,7 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     }
     const GLayer *last = &s->L[s->layers - 1u];
     s->vocabulary = last->L.out_c;
+    fuse_norms(s);
     if (!layout(s)) {
         spingalett_gpu_session_free(s);
         return *why = "out of memory", NULL;
@@ -470,18 +499,17 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 s->quantized = x[0];
                 s->quantized_bv = BV;
             }
-            if (rows >= 16u) {
-                /* a prompt's rows on the matrix units */
+            if (rows >= 3u) {
+                /* three rows or more on the matrix units (bmm's 64 rows cost little more than bdot's one: Qwen3-0.6B's
+                   layer in Q8_0 on an RTX 4050, 150 us for up to 64 rows, 53 us a row by bdot, 365 us 8 rows) */
                 const uint32_t spec[3] = {G->type, 0u, (uint32_t)L->activation};
                 SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, L->rows, K, G->stride, 0, L->out_c};
                 spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, groups(rows, 64u), groups(L->rows, 64u), 1);
                 break;
             }
-            const uint32_t pass = rows == 1u ? 1u : SPG_BDOT_ROWS;
-            for (uint32_t r0 = 0; r0 < rows; r0 += pass) {
-                const uint32_t spec[3] = {G->type, pass, (uint32_t)L->activation};
-                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows - r0 < pass ? rows - r0 : pass, L->rows,
-                                  K, G->stride, r0, L->out_c};
+            for (uint32_t r0 = 0; r0 < rows; r0++) {
+                const uint32_t spec[3] = {G->type, 1u, (uint32_t)L->activation};
+                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, 1u, L->rows, K, G->stride, r0, L->out_c};
                 spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 3, &dp, sizeof dp, groups(L->rows, 8u), 1, 1);
             }
             break;
@@ -510,6 +538,20 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
         }
         case RUN_RMS:
         case RUN_NORM: {
+            if (G->tpr) {
+                /* (with the sum before it, the quantization after it) */
+                const GLayer *A = i && s->L[i - 1u].folded ? &s->L[i - 1u] : NULL;
+                SpgBnormPush p = {A ? output_of(s, A->inputs[0]) : x[0], A ? output_of(s, A->inputs[1]) : 0, A ? A->out : 0,
+                                  G->g, y, G->qbv ? s->xq : 0, G->qbv ? s->dx : 0, G->qbv ? s->xs : 0, rows, L->out_c,
+                                  G->qbv, L->eps};
+                const uint32_t n = L->out_c / G->tpr, spec[2] = {G->tpr, n <= 8u ? 8u : n <= 16u ? 16u : 32u};
+                spg_gpu_dispatch(c, SPG_KERNEL_bnorm, spec, 2, &p, sizeof p, groups(rows, 256u / G->tpr), 1, 1);
+                if (G->qbv) {
+                    s->quantized = y;
+                    s->quantized_bv = G->qbv;
+                }
+                break;
+            }
             SpgRowPush p;
             memset(&p, 0, sizeof p);
             p.x = x[0];
@@ -623,7 +665,7 @@ static SpgGpuCommands *record_step(SpgGpuSession *s, uint32_t rows, uint32_t pic
     s->quantized = 0;
     for (uint32_t i = 0; i < s->layers; i++) {
         const GLayer *G = &s->L[i];
-        if (G->skip) continue;
+        if (G->skip || G->folded) continue;
         spg_gpu_barrier(c);
         if (G->run != RUN_BLOCK) s->quantized = 0;      /* (a layer that may write where the quantized input was) */
         uint64_t x[SPINGALETT_MAX_INPUTS];

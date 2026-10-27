@@ -214,6 +214,15 @@ typedef struct {
     uint32_t rows, k, bv, ldx;
 } SpgBquantPush;
 
+/* bnorm.comp: a session's RMS normalization of rows of k values, y = the rows times gamma as grow's RMSNORM computes
+   them (TPR, spec 0, threads a row: its bits); with b, of the sums a + b (written to sum), the layers before it; with bv,
+   its outputs then quantized in blocks of bv values to q, dx and xs as bquant quantizes them (its bits). */
+typedef struct {
+    uint64_t a, b, sum, gamma, y, q, dx, xs;
+    uint32_t rows, k, bv;
+    float eps;
+} SpgBnormPush;
+
 /* bdot.comp: rows of activations quantized by bquant times a linear layer's weights of a block precision (TYPE: the
    precision less SPINGALETT_PRECISION_Q8_0), y[r][j] = bias[j] + spingalett_block_dot() of row j, the bits of the CPU:
    a row of weights `stride` bytes of whole blocks as GGUF stores them, k values; rows r0 to r0 + rows - 1 of the

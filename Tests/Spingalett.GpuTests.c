@@ -950,8 +950,9 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
     free(wf); free(x); free(bias); free(want); free(got); free(dx); free(gdx); free(w); free(xq); free(gxq); free(xs); free(gxs);
 }
 
-/* bmm on the products of a layer of Qwen3-0.6B (R = SPINGALETT_BENCH_ROWS rows, 512 by default: a prompt's step)
-   in the block precisions named, Q8_0, Q4_K and Q6_K by default: each product's time. */
+/* bmm on the products of a layer of Qwen3-0.6B (R = SPINGALETT_BENCH_ROWS rows, 512 by default: a prompt's step;
+   bdot's passes of a row below 3 rows, as sessions run them) in the block precisions named, Q8_0, Q4_K and Q6_K by
+   default: each product's time, its weights read from memory (copies of them in turn: 64 MB, more than L2 holds). */
 static void bench_blocks(int count, char **types) {
     static const char *const names[] = {"Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K",
                                         "Q6_K", "IQ4_NL", "IQ4_XS"};
@@ -971,16 +972,19 @@ static void bench_blocks(int count, char **types) {
         for (int sh = 0; sh < 4; sh++) {
             const uint32_t N = shapes[sh][0], K = shapes[sh][1], BV = slett_block_values(p);
             const uint32_t stride = K / BV * slett_block_bytes(p);
-            uint8_t *w = (uint8_t *)calloc((size_t)N * stride + 16u, 1);
+            const size_t wbytes = ((size_t)N * stride + 255u) & ~(size_t)255u;
+            const uint32_t copies = (uint32_t)((64u << 20) / wbytes + 1u);
+            uint8_t *w = (uint8_t *)calloc(copies * wbytes + 16u, 1);
             float *row = (float *)malloc((size_t)K * sizeof(float)), *x = (float *)malloc((size_t)R * K * 4);
             for (uint32_t j = 0; j < N; j++) {
                 for (uint32_t i = 0; i < K; i++) row[i] = uniform();
                 spingalett_block_quantize(p, row, w + (size_t)j * stride, K);
             }
+            for (uint32_t copy = 1; copy < copies; copy++) memcpy(w + copy * wbytes, w, (size_t)N * stride);
             for (size_t i = 0; i < (size_t)R * K; i++) x[i] = uniform();
             SpgGpuBuffer bw, bx, bq, bdx, bxs, bb, by;
             float *bias = (float *)calloc(N, sizeof(float));
-            bool ok = bias && upload(&bw, w, (size_t)N * stride + 16u) && upload(&bx, x, (size_t)R * K * 4) &&
+            bool ok = bias && upload(&bw, w, copies * wbytes + 16u) && upload(&bx, x, (size_t)R * K * 4) &&
                       upload(&bb, bias, N * 4) && spg_gpu_buffer_create(&bq, (size_t)R * K, false) &&
                       spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
                       spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) &&
@@ -994,8 +998,18 @@ static void bench_blocks(int count, char **types) {
                 if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
                 for (int r = 0; ok && r < reps; r++) {
                     spg_gpu_barrier(c);
+                    const uint64_t wat = bw.address + (uint64_t)((uint32_t)r % copies) * wbytes;
+                    if (R < 3u) {
+                        for (uint32_t r0 = 0; r0 < R; r0++) {
+                            const uint32_t spec[3] = {(uint32_t)type, 1u, 0u};
+                            SpgBdotPush dp = {wat, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, 1u, N,
+                                              K, stride, r0, N};
+                            spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 3, &dp, sizeof dp, (N + 7) / 8, 1, 1);
+                        }
+                        continue;
+                    }
                     const uint32_t spec[3] = {(uint32_t)type, 0u, 0u};
-                    SpgBdotPush dp = {bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, R, N, K,
+                    SpgBdotPush dp = {wat, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, R, N, K,
                                       stride, 0, N};
                     spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, (N + 63) / 64, 1);
                 }
@@ -1006,7 +1020,8 @@ static void bench_blocks(int count, char **types) {
                 if (c) spg_gpu_commands_free(c);
             }
             if (ok) {
-                printf("  %-6s %4u x %4u: %7.1f us %6.2f TOPS\n", names[type], N, K, t * 1e6, 2.0 * R * N * K / t * 1e-12);
+                printf("  %-6s %4u x %4u: %7.1f us %6.2f TOPS %6.1f GB/s of weights\n", names[type], N, K, t * 1e6,
+                       2.0 * R * N * K / t * 1e-12, (double)N * stride / t * 1e-9);
                 total += t, ops += 2.0 * R * N * K;
             }
             SpgGpuBuffer *bufs[] = {&bw, &bx, &bq, &bdx, &bxs, &bb, &by};
