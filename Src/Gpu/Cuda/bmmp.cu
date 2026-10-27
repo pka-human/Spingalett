@@ -65,7 +65,7 @@ DEVICE uint32_t chunk_at(uint32_t r, uint32_t g) {
     return 16u * (idx ^ ((idx >> 3) & 7u));
 }
 
-struct Stage {
+struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
     uint8_t a[BM * ROWB], b[BN * ROWB];     /* the rows' codes, the weights' */
     float dx[BM][SB], dw[BN][SB];           /* their blocks' scales */
 };

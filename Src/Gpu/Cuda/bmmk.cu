@@ -88,7 +88,7 @@ DEVICE uint32_t chunk_a(uint32_t r, uint32_t g) {
 /* sub-block cb of row r of the weights' codes (rows of 32 bytes), swizzled: rows 4-7 of every 8 the other way round */
 DEVICE uint32_t chunk_b(uint32_t r, uint32_t cb) { return 32u * r + 16u * (cb ^ ((r >> 2) & 1u)); }
 
-struct Stage {
+struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
     uint8_t a[BM * 64u], b[BN * 32u];       /* the rows' codes, the weights' (Q6_K: their low four bits) */
     uint8_t h[SIX ? BN * 16u : 16u];        /* Q6_K: their high two bits, 8 bytes a sub-block */
 };

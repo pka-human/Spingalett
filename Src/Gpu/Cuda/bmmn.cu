@@ -1,0 +1,236 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * bmmn.comp: bmm's product for weights of blocks of 32 4-bit codes (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL) packed as sessions
+ * keep them (Spingalett.GpuPack.c), the CPU's bits: tiles of 64 rows by 64 weights, four warps of 32 x 32 outputs, k in
+ * stages of two blocks, STAGES of them in shared memory by asynchronous copies two ahead. A lane's word of a block's
+ * codes gives both halves of its fragment (the low nibbles values 4t to 4t + 3, the high ones 16 + 4t on), with the
+ * fifth bits (Q5_0, Q5_1) at bit 4 of each byte, or IQ4_NL's values from its table. Each block's products by mma.sync
+ * m16n8k32 of 8-bit integers (exact) from an accumulator of 1.5 2^23's bits less the codes' offset (8: Q4_0, 16: Q5_0)
+ * times the rows' sums of 32 (the CPU's I1 = the codes less the offset times the rows' codes); its float then
+ * 1.5 2^23 less, exactly; then each output's term (d dx) I1 (Q4_1, Q5_1: + (m dx) times the rows' sum), every product
+ * and sum rounded alone, added to its sum block after block. The bias then the sum, the activation of spec 2, the
+ * product by e0's value: bdot's epilogue. Push: SpgBdotPush (r0 the first row, rows its rows); groups: the tiles of
+ * rows, then of weights. A unit a TYPE (bmmp_q4_0, ...).
+ */
+
+#include "common.cuh"
+
+#if !defined(SPG_ENTRY)
+#define SPG_ENTRY spg_bmmp_q4_0
+#define TYPE 1u
+#endif
+
+#define ONE (TYPE == SPG_B_Q4_1 || TYPE == SPG_B_Q5_1)       /* a minimum a block */
+#define FIVE (TYPE == SPG_B_Q5_0 || TYPE == SPG_B_Q5_1)      /* fifth bits */
+#define NL (TYPE == SPG_B_IQ4_NL)                            /* IQ4_NL's table of values */
+#define OFF (TYPE == SPG_B_Q4_0 ? 8 : TYPE == SPG_B_Q5_0 ? 16 : 0)
+#define WN 2u
+#define TN 4u
+#define THREADS (64u * WN)
+#define BM 64u
+#define BN (8u * TN * WN)
+#define SB 2u                               /* blocks of 32 a stage */
+#define STAGES 3u
+
+typedef signed char int8_t;
+
+DEVICE uint32_t shared_address(const void *p) {
+    uint64_t r;
+    asm("cvta.to.shared.u64 %0, %1;" : "=l"(r) : "l"(p));
+    return (uint32_t)r;
+}
+DEVICE void copy4(uint32_t dst, const void *src, uint32_t bytes) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src), "r"(bytes) : "memory");
+}
+DEVICE void copy8(uint32_t dst, const void *src, uint32_t bytes) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(dst), "l"(src), "r"(bytes) : "memory");
+}
+DEVICE void copy16(uint32_t dst, const void *src, uint32_t bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(bytes) : "memory");
+}
+DEVICE void copies_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <uint32_t N>
+DEVICE void copies_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
+DEVICE void ldsm4(uint32_t at, uint32_t (&r)[4]) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at) : "memory");
+}
+/* d = c + a b of 8-bit integers (16 x 32 signed by 32 x 8, unsigned or signed), exact: c's rows g (c01), g + 8 (c23) */
+DEVICE void mma_k32(int32_t (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, int32_t c01, int32_t c23) {
+    if (NL)
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+            "{%10, %10, %11, %11};"
+            : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c01), "r"(c23));
+    else
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+            "{%10, %10, %11, %11};"
+            : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c01), "r"(c23));
+}
+/* four bits of x at bit 4 of four bytes */
+DEVICE uint32_t spread1(uint32_t x) { return ((x * 0x00204081u) & 0x01010101u) << 4; }
+/* four codes (bytes of 0 to 15) as IQ4_NL's values (llama.cpp's kvalues_iq4nl), by two byte permutations */
+DEVICE uint32_t nl_values(uint32_t q) {
+    const uint32_t y = q | q >> 4, sel = ((y & 0xFFu) | ((y >> 8) & 0xFF00u)) & 0x7777u;
+    uint32_t lo, hi;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo) : "r"(0xBFAD9881u), "r"(0xF6EADDCFu), "r"(sel));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi) : "r"(0x26190D01u), "r"(0x71594535u), "r"(sel));
+    const uint32_t mask = ((q >> 3) & 0x01010101u) * 0xFFu;
+    return (lo & ~mask) | (hi & mask);
+}
+
+/* chunk g of row r of the rows' codes (rows of 64 bytes), swizzled: ldmatrix's eight rows in distinct banks */
+DEVICE uint32_t chunk_a(uint32_t r, uint32_t g) {
+    const uint32_t idx = r * 4u + g;
+    return 16u * (idx ^ ((idx >> 3) & 7u));
+}
+/* block cb of row r of the weights' codes (rows of 32 bytes), swizzled: rows 4-7 of every 8 the other way round */
+DEVICE uint32_t chunk_b(uint32_t r, uint32_t cb) { return 32u * r + 16u * (cb ^ ((r >> 2) & 1u)); }
+
+struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
+    uint8_t a[BM * 64u], b[BN * 32u];       /* the rows' codes, the weights' */
+    uint32_t f[FIVE ? BN : 1u][SB];         /* the weights' fifth bits */
+    float d[BN][SB][ONE ? 2u : 1u];         /* their blocks' scales (and minima) */
+    float dx[BM][SB];                       /* the rows' */
+    int32_t xs[BM][2u * SB];                /* the rows' sums of 16 codes */
+};
+
+extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPush p, const Spec spec) {
+    __shared__ __attribute__((aligned(16))) Stage sh[STAGES];
+    const uint32_t tid = thread_x(), lane = tid & 31u, warp = tid >> 5, wm = warp / WN, wn = warp % WN;
+    const uint32_t g = lane >> 2, t = lane & 3u;
+    const uint32_t m0 = block_x() * BM, n0 = block_y() * BN, blocks = p.k / 32u, stages = (blocks + SB - 1u) / SB;
+    const uint8_t *codes = (const uint8_t *)p.w;
+    const float *scales = (const float *)(p.w + (uint64_t)p.n * (p.k / 2u));
+    const uint32_t *fifth = (const uint32_t *)(scales + (uint64_t)p.n * blocks * (ONE ? 2u : 1u));
+    /* the copies of stage s (zeros past the rows, the weights and the blocks) */
+    auto issue = [&](uint32_t s) {
+        Stage &st = sh[s % STAGES];
+#pragma unroll
+        for (uint32_t i = 0; i < BM * 4u / THREADS; i++) {
+            const uint32_t u = tid + THREADS * i, r = u >> 2, c = u & 3u, m = m0 + r;
+            const bool live = m < p.rows && SB * s + c / 2u < blocks;
+            copy16(shared_address(st.a + chunk_a(r, c)),
+                   (const int8_t *)p.q + (live ? (uint64_t)(p.r0 + m) * p.k + 32u * SB * s + 16u * c : 0u), live ? 16u : 0u);
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < BN * SB / THREADS; i++) {
+            const uint32_t u = tid + THREADS * i, r = u / SB, cb = u % SB, n = n0 + r;
+            const bool live = n < p.n && SB * s + cb < blocks;
+            copy16(shared_address(st.b + chunk_b(r, cb)), codes + (live ? (uint64_t)n * (p.k / 2u) + 16u * (SB * s + cb) : 0u),
+                   live ? 16u : 0u);
+        }
+        if (tid < BN)
+#pragma unroll
+            for (uint32_t cb = 0; cb < SB; cb++) {
+                const uint32_t n = n0 + tid, b = SB * s + cb;
+                const bool live = n < p.n && b < blocks;
+                const uint64_t at = live ? (uint64_t)n * blocks + b : 0u;
+                if (FIVE) copy4(shared_address(&st.f[FIVE ? tid : 0u][cb]), fifth + at, live ? 4u : 0u);
+                if (ONE) copy8(shared_address(&st.d[tid][cb][0]), scales + 2u * at, live ? 8u : 0u);
+                else copy4(shared_address(&st.d[tid][cb][0]), scales + at, live ? 4u : 0u);
+            }
+        if (tid < BM)
+#pragma unroll
+            for (uint32_t cb = 0; cb < SB; cb++) {
+                const uint32_t m = m0 + tid, b = SB * s + cb;
+                const bool live = m < p.rows && b < blocks;
+                copy4(shared_address(&st.dx[tid][cb]), F(p.dx) + (live ? (uint64_t)(p.r0 + m) * blocks + b : 0u), live ? 4u : 0u);
+                copy8(shared_address(&st.xs[tid][2u * cb]),
+                      (const int32_t *)p.xs + (live ? (uint64_t)(p.r0 + m) * (p.k / 16u) + 2u * b : 0u), live ? 8u : 0u);
+            }
+    };
+    float acc[2][TN][4];
+#pragma unroll
+    for (uint32_t a = 0; a < 2u; a++)
+#pragma unroll
+        for (uint32_t b = 0; b < TN; b++)
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) acc[a][b][e] = 0.0f;
+#pragma unroll
+    for (uint32_t s = 0; s + 1u < STAGES; s++) {
+        if (s < stages) issue(s);
+        copies_commit();
+    }
+    for (uint32_t s = 0; s < stages; s++) {
+        copies_wait<STAGES - 2u>();
+        barrier();
+        if (s + STAGES - 1u < stages) issue(s + STAGES - 1u);
+        copies_commit();
+        const Stage &st = sh[s % STAGES];
+#pragma unroll
+        for (uint32_t cb = 0; cb < SB; cb++) {
+            if (SB * s + cb >= blocks) continue;
+            /* A fragments (two tiles of 16 rows: rows 0-7 k 0-15, rows 8-15 k 0-15, rows 0-7 k 16-31, rows 8-15 k 16-31),
+               B's of each tile of 8 columns from a word of codes */
+            uint32_t af[2][4], b0[TN], b1[TN];
+#pragma unroll
+            for (uint32_t a = 0; a < 2u; a++)
+                ldsm4(shared_address(st.a + chunk_a(32u * wm + 16u * a + (lane & 15u), 2u * cb + (lane >> 4))), af[a]);
+#pragma unroll
+            for (uint32_t b = 0; b < TN; b++) {
+                const uint32_t r = 8u * TN * wn + 8u * b + g, w = *(const uint32_t *)(st.b + chunk_b(r, cb) + 4u * t);
+                b0[b] = w & 0x0F0F0F0Fu;
+                b1[b] = (w >> 4) & 0x0F0F0F0Fu;
+                if (FIVE) {
+                    const uint32_t f = st.f[FIVE ? r : 0u][cb];
+                    b0[b] |= spread1((f >> (4u * t)) & 0xFu);
+                    b1[b] |= spread1((f >> (16u + 4u * t)) & 0xFu);
+                }
+                if (NL) {
+                    b0[b] = nl_values(b0[b]);
+                    b1[b] = nl_values(b1[b]);
+                }
+            }
+            /* the rows' scales, their accumulators' start (1.5 2^23's bits less the offset times the rows' sums of 32),
+               the sums as floats (the minima's I2) */
+            float dx[2][2], x2[2][2];
+            int32_t c0[2][2];
+#pragma unroll
+            for (uint32_t a = 0; a < 2u; a++)
+#pragma unroll
+                for (uint32_t h = 0; h < 2u; h++) {
+                    const uint32_t rm = 32u * wm + 16u * a + g + 8u * h;
+                    const int32_t sum = st.xs[rm][2u * cb] + st.xs[rm][2u * cb + 1u];
+                    dx[a][h] = st.dx[rm][cb];
+                    c0[a][h] = 0x4B400000 - OFF * sum;
+                    x2[a][h] = (float)sum;
+                }
+#pragma unroll
+            for (uint32_t a = 0; a < 2u; a++)
+#pragma unroll
+                for (uint32_t b = 0; b < TN; b++) {
+                    int32_t s4[4];
+                    mma_k32(s4, af[a], b0[b], b1[b], c0[a][0], c0[a][1]);
+#pragma unroll
+                    for (uint32_t e = 0; e < 4u; e++) {
+                        const uint32_t cn = 8u * TN * wn + 8u * b + 2u * t + (e & 1u);
+                        const float i1 = __builtin_bit_cast(float, s4[e]) - 12582912.0f;
+                        float term = (st.d[cn][cb][0] * dx[a][e >> 1]) * i1;
+                        if (ONE) term = term + (st.d[cn][cb][ONE ? 1u : 0u] * dx[a][e >> 1]) * x2[a][e >> 1];
+                        acc[a][b][e] = acc[a][b][e] + term;
+                    }
+                }
+        }
+    }
+    const uint32_t act = spec.v[2];
+#pragma unroll
+    for (uint32_t a = 0; a < 2u; a++)
+#pragma unroll
+        for (uint32_t b = 0; b < TN; b++)
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) {
+                const uint32_t n = n0 + 8u * TN * wn + 8u * b + 2u * t + (e & 1u), m = m0 + 32u * wm + 16u * a + g + 8u * (e >> 1);
+                if (n >= p.n || m >= p.rows) continue;
+                const uint64_t at = (uint64_t)(p.r0 + m) * p.ldy + n;
+                float v = F(p.bias)[n] + acc[a][b][e];
+                if (act) v = activate(v, act);
+                if (p.e0) v = v * F(p.e0)[at];
+                F(p.y)[at] = v;
+            }
+}

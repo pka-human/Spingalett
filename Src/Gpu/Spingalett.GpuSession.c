@@ -217,7 +217,7 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             if (spingalett_precision_is_block(L->precision) && spg_packed_bytes(t, L->rows, L->row_len)) {
                 /* (packed: a table tied to the output layer is that layer's weights) */
                 G->type = SPG_EMB_PACKED + t;
-                G->stride = t == SPG_B_Q8_0 ? L->row_len : L->row_len / 2u;
+                G->stride = t == SPG_B_Q8_0 ? L->row_len : L->row_len / 2u;      /* (the bytes of a row's codes) */
                 G->w = image_packed(s, L->weights, t, L->rows, L->row_len);
             } else {
                 G->w = image_bytes(s, L->weights, (size_t)G->stride * L->rows);

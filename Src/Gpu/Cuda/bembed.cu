@@ -134,6 +134,18 @@ KERNEL(bembed, SpgBembedPush) {
             const float *dm = F(p.table + V * (p.d / 2u) + V * subs * 2u) + 2u * ((uint64_t)token * blocks + sub / 8u);
             const float d1 = dm[0] * (float)(pair & 0xFFu), m1 = -dm[1] * (float)(pair >> 8);
             v = d1 * (float)code - m1;
+        } else if (p.type >= SPG_EMB_PACKED + SPG_B_Q4_0 && p.type <= SPG_EMB_PACKED + SPG_B_Q5_1 ||
+                   p.type == SPG_EMB_PACKED + SPG_B_IQ4_NL) {
+            /* (packed blocks of 32 4-bit codes: as spingalett_block_decode()) */
+            const uint32_t t = p.type - SPG_EMB_PACKED, blocks = p.d / 32u, b = c / 32u, i = c % 32u;
+            const bool one = t == SPG_B_Q4_1 || t == SPG_B_Q5_1, five = t == SPG_B_Q5_0 || t == SPG_B_Q5_1;
+            const uint64_t V = p.vocabulary, at = (uint64_t)token * blocks + b;
+            const uint32_t byte = row[16u * b + (i & 15u)];
+            int32_t code = (int32_t)(i < 16u ? byte & 0xFu : byte >> 4);
+            const float *sc = F(p.table + V * (p.d / 2u)) + (one ? 2u : 1u) * at;
+            if (five) code |= (int32_t)(((U(p.table + V * (p.d / 2u) + V * blocks * (one ? 8u : 4u))[at] >> i) & 1u) << 4);
+            v = t == SPG_B_Q4_0 ? (float)(code - 8) * sc[0] : t == SPG_B_IQ4_NL ? (float)iq4_value((uint32_t)code) * sc[0]
+              : t == SPG_B_Q5_0 ? (float)(code - 16) * sc[0] : (float)code * sc[0] + sc[1];
         } else if (p.type == SPG_EMB_PACKED + SPG_B_Q6_K) {
             /* (packed: the super-block's scale times the half's, times the code less 32) */
             const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;

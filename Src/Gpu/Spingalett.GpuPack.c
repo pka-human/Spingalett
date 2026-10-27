@@ -13,7 +13,10 @@
  * Q6_K: the low four bits of the codes as Q4_K's, then their high two bits, eight bytes a sub-block of 32 (sixteen bits
  * a lane's word of low bits: the high bits of its four values of the first half of 16, then of the second's), N rows of
  * K / 4 bytes; the halves' signed scales in pairs of bytes, N x K / 32; the super-blocks' scales (and zeros) as pairs of
- * floats, N x K / 256.
+ * floats, N x K / 256. Blocks of 32 of 4-bit codes (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL): their codes as GGUF keeps them (byte i
+ * the code of value i, then of value i + 16), N rows of K / 2 bytes; the blocks' scales as floats (with Q4_1 and
+ * Q5_1 pairs of the scale and the minimum), N x K / 32; Q5_0's and Q5_1's fifth bits, a word a block (bit i value
+ * i's), N x K / 32.
  */
 
 #include "Spingalett.GpuKernels.h"
@@ -37,13 +40,17 @@ size_t spg_packed_bytes(uint32_t type, uint32_t N, uint32_t K) {
     switch (type) {
         case SPG_B_Q8_0: return (size_t)N * K + (size_t)N * (K / 32u) * sizeof(float);
         case SPG_B_Q4_K: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u + (size_t)N * (K / 256u) * 2u * sizeof(float);
+        case SPG_B_Q4_0: case SPG_B_IQ4_NL: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * sizeof(float);
+        case SPG_B_Q4_1: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u * sizeof(float);
+        case SPG_B_Q5_0: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 4u + (size_t)N * (K / 32u) * sizeof(float);
+        case SPG_B_Q5_1: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 4u + (size_t)N * (K / 32u) * 2u * sizeof(float);
         case SPG_B_Q6_K:
             return (size_t)N * (K / 2u) + (size_t)N * (K / 4u) + (size_t)N * (K / 32u) * 2u + (size_t)N * (K / 256u) * 2u * sizeof(float);
         default: return 0;
     }
 }
 
-uint32_t spg_packed_cols(uint32_t type) { return type == SPG_B_Q4_K || type == SPG_B_Q6_K ? 64u : 128u; }
+uint32_t spg_packed_cols(uint32_t type) { return type == SPG_B_Q8_0 ? 128u : 64u; }
 
 void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, uint8_t *dst) {
     if (type == SPG_B_Q8_0) {
@@ -54,6 +61,27 @@ void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, 
                 const uint8_t *block = src + ((size_t)j * blocks + b) * 34u;
                 memcpy(dst + (size_t)j * K + 32u * b, block + 2, 32);
                 scales[(size_t)j * blocks + b] = half_at(block);
+            }
+        return;
+    }
+    if (type == SPG_B_Q4_0 || type == SPG_B_Q4_1 || type == SPG_B_Q5_0 || type == SPG_B_Q5_1 || type == SPG_B_IQ4_NL) {
+        /* (GGUF's blocks: the scale, the minimum (Q4_1, Q5_1), the fifth bits (Q5_0, Q5_1), then the codes) */
+        const bool one = type == SPG_B_Q4_1 || type == SPG_B_Q5_1, five = type == SPG_B_Q5_0 || type == SPG_B_Q5_1;
+        const uint32_t blocks = K / 32u, bytes = 18u + (one ? 2u : 0u) + (five ? 4u : 0u), qs = bytes - 16u;
+        float *scales = (float *)(void *)(dst + (size_t)N * (K / 2u));
+        uint8_t *fifth = (uint8_t *)(scales + (size_t)N * blocks * (one ? 2u : 1u));
+        for (uint32_t j = 0; j < N; j++)
+            for (uint32_t b = 0; b < blocks; b++) {
+                const uint8_t *block = src + ((size_t)j * blocks + b) * bytes;
+                const size_t at = (size_t)j * blocks + b;
+                memcpy(dst + (size_t)j * (K / 2u) + 16u * b, block + qs, 16);
+                if (five) memcpy(fifth + 4u * at, block + (one ? 4 : 2), 4);
+                if (one) {
+                    scales[2u * at] = half_at(block);
+                    scales[2u * at + 1u] = half_at(block + 2);
+                } else {
+                    scales[at] = half_at(block);
+                }
             }
         return;
     }
