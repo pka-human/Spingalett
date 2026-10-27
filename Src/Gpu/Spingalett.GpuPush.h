@@ -224,8 +224,18 @@ typedef struct {
 } SpgBnormPush;
 
 /* bmmp.comp, bdotp.comp: bmm's and bdot's products (SpgBdotPush) of weights packed as sessions keep them
-   (Spingalett.GpuPack.c: Q8_0 and Q4_K; w, 16 bytes more after them). bmm's spec 1, bdot's spec 3 non-zero. bmmp:
-   groups of 64 rows by spg_packed_cols() weights. */
+   (Spingalett.GpuPack.c; w, 16 bytes more after them; stride SPG_PACK_ROW()). bmm's spec 1, bdot's spec 3 non-zero.
+   bmmp: groups of 64 rows by spg_packed_cols() weights.
+   A packed row of k values of block type t: its codes (SPG_PACK_CODES() bytes), then what else its blocks hold
+   (SPG_PACK_AUX() bytes: scales as float16, minima, fifth bits), the row a multiple of 16 bytes (0: a type kept as
+   stored). */
+#define SPG_PACK_CODES(t, k) ((t) == SPG_B_Q8_0 ? (k) : (t) == SPG_B_Q6_K ? (k) / 2u + (k) / 4u : (k) / 2u)
+#define SPG_PACK_AUX(t, k) \
+    ((t) == SPG_B_Q8_0 || (t) == SPG_B_Q4_0 || (t) == SPG_B_IQ4_NL ? (k) / 16u : (t) == SPG_B_Q4_1 ? (k) / 8u : \
+     (t) == SPG_B_Q5_0 ? (k) / 8u + (k) / 16u : (t) == SPG_B_Q5_1 ? (k) / 4u : \
+     (t) == SPG_B_Q4_K || (t) == SPG_B_IQ4_XS ? (k) / 16u + (k) / 64u : (t) == SPG_B_Q5_K ? (k) / 8u + (k) / 16u + (k) / 64u : \
+     (t) == SPG_B_Q6_K ? (k) / 16u + (k) / 128u : 0u)
+#define SPG_PACK_ROW(t, k) (SPG_PACK_AUX(t, k) ? (SPG_PACK_CODES(t, k) + SPG_PACK_AUX(t, k) + 15u) & ~15u : 0u)
 
 /* bdot.comp: rows of activations quantized by bquant times a linear layer's weights of a block precision (TYPE: the
    precision less SPINGALETT_PRECISION_Q8_0), y[r][j] = bias[j] + spingalett_block_dot() of row j, the bits of the CPU:

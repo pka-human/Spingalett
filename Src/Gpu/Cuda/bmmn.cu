@@ -5,7 +5,7 @@
 
 /*
  * bmmn.comp: bmm's product for weights of blocks of 32 4-bit codes (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL) packed as sessions
- * keep them (Spingalett.GpuPack.c), the CPU's bits: tiles of 64 rows by 64 weights, four warps of 32 x 32 outputs, k in
+ * keep them (Spingalett.GpuPack.c: rows `stride` bytes apart), the CPU's bits: tiles of 64 rows by 64 weights, four warps of 32 x 32 outputs, k in
  * stages of two blocks, STAGES of them in shared memory by asynchronous copies two ahead. A lane's word of a block's
  * codes gives both halves of its fragment (the low nibbles values 4t to 4t + 3, the high ones 16 + 4t on), with the
  * fifth bits (Q5_0, Q5_1) at bit 4 of each byte, or IQ4_NL's values from its table. Each block's products by mma.sync
@@ -95,7 +95,7 @@ DEVICE uint32_t chunk_b(uint32_t r, uint32_t cb) { return 32u * r + 16u * (cb ^ 
 struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
     uint8_t a[BM * 64u], b[BN * 32u];       /* the rows' codes, the weights' */
     uint32_t f[FIVE ? BN : 1u][SB];         /* the weights' fifth bits */
-    float d[BN][SB][ONE ? 2u : 1u];         /* their blocks' scales (and minima) */
+    uint32_t d[BN][SB];                     /* their blocks' scales (and minima), float16 */
     float dx[BM][SB];                       /* the rows' */
     int32_t xs[BM][2u * SB];                /* the rows' sums of 16 codes */
 };
@@ -105,9 +105,8 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
     const uint32_t tid = thread_x(), lane = tid & 31u, warp = tid >> 5, wm = warp / WN, wn = warp % WN;
     const uint32_t g = lane >> 2, t = lane & 3u;
     const uint32_t m0 = block_x() * BM, n0 = block_y() * BN, blocks = p.k / 32u, stages = (blocks + SB - 1u) / SB;
-    const uint8_t *codes = (const uint8_t *)p.w;
-    const float *scales = (const float *)(p.w + (uint64_t)p.n * (p.k / 2u));
-    const uint32_t *fifth = (const uint32_t *)(scales + (uint64_t)p.n * blocks * (ONE ? 2u : 1u));
+    const uint8_t *weights = (const uint8_t *)p.w;
+    const uint32_t aux = p.k / 2u, scales = aux + (FIVE ? 4u * blocks : 0u);  /* (their offsets in a row) */
     /* the copies of stage s (zeros past the rows, the weights and the blocks) */
     auto issue = [&](uint32_t s) {
         Stage &st = sh[s % STAGES];
@@ -122,7 +121,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         for (uint32_t i = 0; i < BN * SB / THREADS; i++) {
             const uint32_t u = tid + THREADS * i, r = u / SB, cb = u % SB, n = n0 + r;
             const bool live = n < p.n && SB * s + cb < blocks;
-            copy16(shared_address(st.b + chunk_b(r, cb)), codes + (live ? (uint64_t)n * (p.k / 2u) + 16u * (SB * s + cb) : 0u),
+            copy16(shared_address(st.b + chunk_b(r, cb)), weights + (live ? (uint64_t)n * p.stride + 16u * (SB * s + cb) : 0u),
                    live ? 16u : 0u);
         }
         if (tid < BN)
@@ -130,10 +129,11 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
             for (uint32_t cb = 0; cb < SB; cb++) {
                 const uint32_t n = n0 + tid, b = SB * s + cb;
                 const bool live = n < p.n && b < blocks;
-                const uint64_t at = live ? (uint64_t)n * blocks + b : 0u;
-                if (FIVE) copy4(shared_address(&st.f[FIVE ? tid : 0u][cb]), fifth + at, live ? 4u : 0u);
-                if (ONE) copy8(shared_address(&st.d[tid][cb][0]), scales + 2u * at, live ? 8u : 0u);
-                else copy4(shared_address(&st.d[tid][cb][0]), scales + at, live ? 4u : 0u);
+                const uint8_t *row = weights + (live ? (uint64_t)n * p.stride : 0u);
+                if (FIVE) copy4(shared_address(&st.f[FIVE ? tid : 0u][cb]), row + aux + 4u * b, live ? 4u : 0u);
+                /* (a float16 scale, two bytes of the word: the other's the next block's, unread) */
+                if (ONE) copy4(shared_address(&st.d[tid][cb]), row + scales + 4u * b, live ? 4u : 0u);
+                else if (cb % 2u == 0u) copy4(shared_address(&st.d[tid][cb]), row + scales + 2u * b, live ? 4u : 0u);
             }
         if (tid < BM)
 #pragma unroll
@@ -211,8 +211,9 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
                     for (uint32_t e = 0; e < 4u; e++) {
                         const uint32_t cn = 8u * TN * wn + 8u * b + 2u * t + (e & 1u);
                         const float i1 = __builtin_bit_cast(float, s4[e]) - 12582912.0f;
-                        float term = (st.d[cn][cb][0] * dx[a][e >> 1]) * i1;
-                        if (ONE) term = term + (st.d[cn][cb][ONE ? 1u : 0u] * dx[a][e >> 1]) * x2[a][e >> 1];
+                        const uint32_t dw = ONE ? st.d[cn][cb] : st.d[cn][cb & ~1u] >> (16u * (cb & 1u));
+                        float term = (from_half(dw & 0xFFFFu) * dx[a][e >> 1]) * i1;
+                        if (ONE) term = term + (from_half(dw >> 16) * dx[a][e >> 1]) * x2[a][e >> 1];
                         acc[a][b][e] = acc[a][b][e] + term;
                     }
                 }

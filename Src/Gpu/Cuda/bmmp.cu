@@ -5,7 +5,7 @@
 
 /*
  * bmmp.comp: bmm's product for weights of blocks of 32 values kept packed on the device (the session's copy of a
- * layer: the codes of every row in a matrix of N rows of K signed bytes, then the blocks' scales as floats, N x K / 32;
+ * layer: a row's codes, K signed bytes, then its blocks' scales as float16; rows `stride` bytes apart;
  * the values of the image, rearranged), the CPU's bits: a workgroup takes BM rows of the quantized activations and BN
  * rows of weights, four warps of 32 x 64 outputs, over k in stages of SB blocks, STAGES of them in shared memory,
  * copied STAGES - 1 ahead by asynchronous copies (rows of codes in chunks of 16 bytes, swizzled so that ldmatrix's
@@ -67,7 +67,8 @@ DEVICE uint32_t chunk_at(uint32_t r, uint32_t g) {
 
 struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
     uint8_t a[BM * ROWB], b[BN * ROWB];     /* the rows' codes, the weights' */
-    float dx[BM][SB], dw[BN][SB];           /* their blocks' scales */
+    float dx[BM][SB];                       /* the rows' blocks' scales */
+    uint32_t dw[BN];                        /* the weights' (SB of float16) */
 };
 
 extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p, const Spec spec) {
@@ -75,8 +76,7 @@ extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p,
     const uint32_t tid = thread_x(), lane = tid & 31u, warp = tid >> 5, wm = warp >> 1, wn = warp & 1u;
     const uint32_t g = lane >> 2, t = lane & 3u;
     const uint32_t m0 = block_x() * BM, n0 = block_y() * BN, blocks = p.k / 32u, stages = (blocks + SB - 1u) / SB;
-    const int8_t *codes = (const int8_t *)p.w;
-    const float *scales = (const float *)(p.w + (uint64_t)p.n * p.k);
+    const uint8_t *weights = (const uint8_t *)p.w;
     /* the copies of stage s: chunks of 16 bytes of the rows' and the weights' codes, eight bytes of their scales */
     auto issue = [&](uint32_t s) {
         Stage &st = sh[s % STAGES];
@@ -92,7 +92,7 @@ extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p,
         for (uint32_t i = 0; i < BN * GR / 128u; i++) {
             const uint32_t u = tid + 128u * i, r = u / GR, c = u % GR, n = n0 + r;
             const bool live = n < p.n && k0 + 16u * c < p.k;
-            copy16(shared_address(st.b + chunk_at(r, c)), codes + (uint64_t)(live ? n : 0u) * p.k + (live ? k0 + 16u * c : 0u),
+            copy16(shared_address(st.b + chunk_at(r, c)), weights + (live ? (uint64_t)n * p.stride + k0 + 16u * c : 0u),
                    live ? 16u : 0u);
         }
         /* (the scales of blocks past the end zeros) */
@@ -105,9 +105,12 @@ extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p,
                 copy4(shared_address(&st.dx[tid][cb]), F(p.dx) + (live ? (uint64_t)(p.r0 + m) * blocks + b0 + cb : 0u),
                       live ? 4u : 0u);
             }
+        }
+        {
+            /* (both blocks' scales in a word: past the last block, the next bytes of the row, unread) */
             const uint32_t n = n0 + tid;
-            const bool live = n < p.n && in;
-            copy4(shared_address(&st.dw[tid][cb]), scales + (live ? (uint64_t)n * blocks + b0 + cb : 0u), live ? 4u : 0u);
+            const bool live = n < p.n;
+            copy4(shared_address(&st.dw[tid]), weights + (live ? (uint64_t)n * p.stride + p.k + 2u * b0 : 0u), live ? 4u : 0u);
         }
     };
     float acc[2][8][4];
@@ -150,7 +153,7 @@ extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p,
 #pragma unroll
             for (uint32_t b = 0; b < 8u; b++)
 #pragma unroll
-                for (uint32_t e = 0; e < 2u; e++) dw[b][e] = st.dw[64u * wn + 8u * b + 2u * t + e][cb];
+                for (uint32_t e = 0; e < 2u; e++) dw[b][e] = from_half((st.dw[64u * wn + 8u * b + 2u * t + e] >> (16u * cb)) & 0xFFFFu);
 #pragma unroll
             for (uint32_t a = 0; a < 2u; a++)
 #pragma unroll

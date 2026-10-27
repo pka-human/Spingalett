@@ -4,7 +4,8 @@
 */
 
 /*
- * bdotk.comp: bdot's product for weights of Q4_K packed as sessions keep them (Spingalett.GpuPack.c), the CPU's bits:
+ * bdotk.comp: bdot's product for weights of Q4_K, Q5_K, Q6_K and IQ4_XS packed as sessions keep them
+ * (Spingalett.GpuPack.c: rows `stride` bytes apart), the CPU's bits:
  * a warp a row of weights, a lane a sub-block of 32 values of each round of 32 (its 16 bytes of codes and the
  * activations' 32 in sixteen bytes' loads): its products by dp4a (the low nibbles with values 0 to 15, the high ones
  * with 16 to 31) times its scale (I1), its minimum times the rows' sum of 32 (I2), both summed over the eight lanes of
@@ -50,13 +51,11 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
     const uint32_t lane = thread_x() & 31u, j = block_x() * 8u + (thread_x() >> 5);
     if (j >= p.n) return;                       /* (a whole warp) */
     const uint32_t subs = p.k / 32u, blocks = p.k / 256u;
-    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * (p.k / 2u), *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
-    const uint8_t *highs = (const uint8_t *)p.w + (uint64_t)p.n * (p.k / 2u);
-    const uint16_t *pairs0 = (const uint16_t *)(highs + (SIX ? (uint64_t)p.n * (p.k / 4u) : 0u));
-    const uint16_t *pairs = pairs0 + (uint64_t)j * subs;
-    const float *dm = (const float *)((const uint8_t *)pairs0 + (uint64_t)p.n * subs * 2u) + 2u * (uint64_t)j * blocks;
-    highs += (uint64_t)j * (p.k / 4u);
-    const uint32_t *fifth = (const uint32_t *)(dm - 2u * (uint64_t)j * blocks + (uint64_t)p.n * blocks * 2u) + (uint64_t)j * subs;
+    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
+    const uint8_t *highs = row + p.k / 2u, *aux = row + SPG_PACK_CODES(TYPE, p.k);
+    const uint32_t *fifth = (const uint32_t *)aux;
+    const uint16_t *pairs = (const uint16_t *)(aux + (FIVE ? 4u * subs : 0u));
+    const uint16_t *dm = (const uint16_t *)(pairs + subs);       /* (Q6_K: the scales alone) */
     const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
     const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
     float acc = 0.0f;
@@ -119,7 +118,7 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
         float term = 0.0f;
         const uint32_t b = c / 8u;
         if (lane % 8u == 0u && b < blocks) {
-            const float d = dm[2u * b], m = dm[2u * b + 1u], dxv = dx[b];
+            const float d = from_half(dm[SIX ? b : 2u * b]), m = SIX ? 0.0f : -from_half(dm[2u * b + 1u]), dxv = dx[b];
             term = (d * dxv) * (float)i1;
             if (!SIX && !NLX) term = term + (m * dxv) * (float)i2;
         }

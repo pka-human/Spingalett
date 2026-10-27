@@ -217,7 +217,7 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             if (spingalett_precision_is_block(L->precision) && spg_packed_bytes(t, L->rows, L->row_len)) {
                 /* (packed: a table tied to the output layer is that layer's weights) */
                 G->type = SPG_EMB_PACKED + t;
-                G->stride = t == SPG_B_Q8_0 ? L->row_len : L->row_len / 2u;      /* (the bytes of a row's codes) */
+                G->stride = SPG_PACK_ROW(t, L->row_len);
                 G->w = image_packed(s, L->weights, t, L->rows, L->row_len);
             } else {
                 G->w = image_bytes(s, L->weights, (size_t)G->stride * L->rows);
@@ -243,6 +243,7 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
                 G->stride = (uint32_t)spingalett_slett_row_bytes(L->precision, K);
                 G->packed = spg_packed_bytes(G->type, N, K) != 0;
                 G->w = G->packed ? image_packed(s, L->weights, G->type, N, K) : image_bytes(s, L->weights, (size_t)G->stride * N);
+                if (G->packed) G->stride = SPG_PACK_ROW(G->type, K);
                 if (K > s->kmax) s->kmax = K;
                 return G->w || (*why = "out of device memory", false);
             }

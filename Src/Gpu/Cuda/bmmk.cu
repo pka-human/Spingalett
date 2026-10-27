@@ -4,7 +4,8 @@
 */
 
 /*
- * bmmk.comp: bmm's product for weights of Q4_K packed as sessions keep them (Spingalett.GpuPack.c), the CPU's bits:
+ * bmmk.comp: bmm's product for weights of Q4_K, Q5_K, Q6_K and IQ4_XS packed as sessions keep them (Spingalett.GpuPack.c:
+ * rows `stride` bytes apart), the CPU's bits:
  * tiles of 64 rows by 64 weights, four warps of 32 x 32 outputs (three workgroups an SM), k in stages of two sub-blocks of 32 values, STAGES
  * of them in shared memory by asynchronous copies two ahead (the rows' codes in chunks of 16 bytes swizzled for
  * ldmatrix; the weights' codes, a sub-block's 16 bytes, swizzled so that a warp's words fall in distinct banks); each
@@ -115,7 +116,7 @@ struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: th
 struct Super {
     uint16_t pairs[BN][8];                  /* the sub-blocks' scale | minimum << 8 (Q6_K: the halves' signed scales) */
     int32_t xs[BM][16];                     /* the rows' sums of 16 codes */
-    float dm[BN][2];                        /* the scale, the minimum's negation */
+    uint32_t dm[BN];                        /* the scale and minimum (Q6_K: two scales), float16 */
     float dx[BM];                           /* the rows' scales */
 };
 struct Shared {
@@ -128,11 +129,9 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
     const uint32_t tid = thread_x(), lane = tid & 31u, warp = tid >> 5, wm = warp / WN, wn = warp % WN;
     const uint32_t g = lane >> 2, t = lane & 3u;
     const uint32_t m0 = block_x() * BM, n0 = block_y() * BN, subs = p.k / 32u, blocks = p.k / 256u, stages = subs / SB;
-    const uint8_t *codes = (const uint8_t *)p.w;
-    const uint8_t *highs = (const uint8_t *)p.w + (uint64_t)p.n * (p.k / 2u);
-    const uint16_t *pairs = (const uint16_t *)(highs + (SIX ? (uint64_t)p.n * (p.k / 4u) : 0u));
-    const float *dm = (const float *)((const uint8_t *)pairs + (uint64_t)p.n * subs * 2u);
-    const uint32_t *fifth = (const uint32_t *)(dm + (uint64_t)p.n * blocks * 2u);
+    /* (a row's codes, Q6_K's high bits, then its fifth bits, scales and minima, the super-blocks' scales) */
+    const uint8_t *weights = (const uint8_t *)p.w;
+    const uint32_t aux = SPG_PACK_CODES(TYPE, p.k), pairs = aux + (FIVE ? 4u * subs : 0u), dm = pairs + 2u * subs;
     /* the copies of stage s (zeros past the rows and the weights) */
     auto issue = [&](uint32_t s) {
         Stage &st = sh.st[s % STAGES];
@@ -149,25 +148,28 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         for (uint32_t i = 0; i < BN * SB / THREADS; i++) {
             const uint32_t u = tid + THREADS * i, r = u / SB, cb = u % SB, n = n0 + r;
             const bool live = n < p.n;
-            copy16(shared_address(st.b + chunk_b(r, cb)), codes + (live ? (uint64_t)n * (p.k / 2u) + 16u * (SB * s + cb) : 0u),
+            copy16(shared_address(st.b + chunk_b(r, cb)), weights + (live ? (uint64_t)n * p.stride + 16u * (SB * s + cb) : 0u),
                    live ? 16u : 0u);
         }
         if (FIVE && tid < BN) {
             const uint32_t n = n0 + tid;
             const bool live = n < p.n;
-            copy8(shared_address(&st.f[FIVE ? tid : 0u][0]), fifth + (live ? (uint64_t)n * subs + SB * s : 0u), live ? 8u : 0u);
+            copy8(shared_address(&st.f[FIVE ? tid : 0u][0]), weights + (live ? (uint64_t)n * p.stride + aux + 4u * SB * s : 0u),
+                  live ? 8u : 0u);
         }
         if (SIX && tid < BN) {
             const uint32_t n = n0 + tid;
             const bool live = n < p.n;
-            copy16(shared_address(st.h + 16u * tid), highs + (live ? (uint64_t)n * (p.k / 4u) + 8u * SB * s : 0u), live ? 16u : 0u);
+            copy16(shared_address(st.h + 16u * tid), weights + (live ? (uint64_t)n * p.stride + p.k / 2u + 8u * SB * s : 0u),
+                   live ? 16u : 0u);
         }
         if (tid < BN) {
             const uint32_t n = n0 + tid;
             const bool live = n < p.n;
-            copy4(shared_address(&su.pairs[tid][SB * j]), pairs + (live ? (uint64_t)n * subs + SB * s : 0u), live ? 4u : 0u);
-            if (j == 0u)
-                copy8(shared_address(&su.dm[tid][0]), dm + (live ? 2u * ((uint64_t)n * blocks + sb) : 0u), live ? 8u : 0u);
+            const uint8_t *row = weights + (live ? (uint64_t)n * p.stride : 0u);
+            copy4(shared_address(&su.pairs[tid][SB * j]), row + pairs + 2u * SB * s, live ? 4u : 0u);
+            /* (Q6_K: a float16 scale a super-block, the word of this one's and its neighbour's) */
+            if (j == 0u) copy4(shared_address(&su.dm[tid]), row + dm + (SIX ? 4u * (sb / 2u) : 4u * sb), live ? 4u : 0u);
         }
         if (tid < BM) {
             const uint32_t m = m0 + tid;
@@ -297,8 +299,9 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
                             int32_t i2 = 0;
 #pragma unroll
                             for (uint32_t c = 0; c < 8u; c++) i2 += (int32_t)((words[c / 2u] >> (16u * (c & 1u) + 8u)) & 0xFFu) * x32[c];
-                            float term = (su.dm[cn][0] * dx) * (float)i1[a][b][e];
-                            if (!SIX && !NLX) term = term + (su.dm[cn][1] * dx) * (float)i2;
+                            const uint32_t w = SIX ? su.dm[cn] >> (16u * (sb & 1u)) : su.dm[cn];
+                            float term = (from_half(w & 0xFFFFu) * dx) * (float)i1[a][b][e];
+                            if (!SIX && !NLX) term = term + (-from_half(w >> 16) * dx) * (float)i2;
                             acc[a][b][e] = acc[a][b][e] + term;
                             i1[a][b][e] = 0;
                         }

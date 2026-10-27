@@ -122,50 +122,42 @@ KERNEL(bembed, SpgBembedPush) {
             v = from_half(get16(row + 2u * c));
         } else if (p.type == SPG_EMB_BF16) {
             v = from_bf16(get16(row + 2u * c));
-        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q8_0) {
-            /* (packed: the code times its block's scale, as spingalett_block_decode()) */
-            const float d = F(p.table + (uint64_t)p.vocabulary * p.d)[(uint64_t)token * (p.d / 32u) + c / 32u];
-            v = (float)(int8_t)row[c] * d;
-        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q4_K || p.type == SPG_EMB_PACKED + SPG_B_Q5_K) {
-            /* (packed: the sub-block's scale and minimum times the super-block's, then the code's value) */
-            const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;
+        } else if (p.type >= SPG_EMB_PACKED) {
+            /* (packed, Spingalett.GpuPack.c: the row's codes, then the rest of its blocks; each value as
+               spingalett_block_decode() computes it) */
+            const uint32_t t = p.type - SPG_EMB_PACKED, subs = p.d / 32u, sub = c / 32u, i = c % 32u, sb = sub / 8u;
+            const uint8_t *aux = row + SPG_PACK_CODES(t, p.d);
             const uint32_t byte = row[16u * sub + (i & 15u)];
-            uint32_t code = i < 16u ? byte & 0xFu : byte >> 4;
-            const uint32_t pair = ((const uint16_t *)(p.table + V * (p.d / 2u)))[(uint64_t)token * subs + sub];
-            const float *dm = F(p.table + V * (p.d / 2u) + V * subs * 2u) + 2u * ((uint64_t)token * blocks + sub / 8u);
-            if (p.type == SPG_EMB_PACKED + SPG_B_Q5_K)
-                code |= ((U(p.table + V * (p.d / 2u) + V * subs * 2u + V * blocks * 8u)[(uint64_t)token * subs + sub] >> i) & 1u) << 4;
-            const float d1 = dm[0] * (float)(pair & 0xFFu), m1 = -dm[1] * (float)(pair >> 8);
-            v = d1 * (float)code - m1;
-        } else if (p.type >= SPG_EMB_PACKED + SPG_B_Q4_0 && p.type <= SPG_EMB_PACKED + SPG_B_Q5_1 ||
-                   p.type == SPG_EMB_PACKED + SPG_B_IQ4_NL) {
-            /* (packed blocks of 32 4-bit codes: as spingalett_block_decode()) */
-            const uint32_t t = p.type - SPG_EMB_PACKED, blocks = p.d / 32u, b = c / 32u, i = c % 32u;
-            const bool one = t == SPG_B_Q4_1 || t == SPG_B_Q5_1, five = t == SPG_B_Q5_0 || t == SPG_B_Q5_1;
-            const uint64_t V = p.vocabulary, at = (uint64_t)token * blocks + b;
-            const uint32_t byte = row[16u * b + (i & 15u)];
             int32_t code = (int32_t)(i < 16u ? byte & 0xFu : byte >> 4);
-            const float *sc = F(p.table + V * (p.d / 2u)) + (one ? 2u : 1u) * at;
-            if (five) code |= (int32_t)(((U(p.table + V * (p.d / 2u) + V * blocks * (one ? 8u : 4u))[at] >> i) & 1u) << 4);
-            v = t == SPG_B_Q4_0 ? (float)(code - 8) * sc[0] : t == SPG_B_IQ4_NL ? (float)iq4_value((uint32_t)code) * sc[0]
-              : t == SPG_B_Q5_0 ? (float)(code - 16) * sc[0] : (float)code * sc[0] + sc[1];
-        } else if (p.type == SPG_EMB_PACKED + SPG_B_IQ4_XS) {
-            /* (packed: the super-block's scale times the sub-block's, times the code's value) */
-            const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;
-            const uint32_t byte = row[16u * sub + (i & 15u)], code = i < 16u ? byte & 0xFu : byte >> 4;
-            const int32_t sc = (int8_t)((const uint16_t *)(p.table + V * (p.d / 2u)))[(uint64_t)token * subs + sub];
-            const float d = F(p.table + V * (p.d / 2u) + V * subs * 2u)[2u * ((uint64_t)token * blocks + sub / 8u)];
-            v = d * (float)sc * (float)iq4_value(code);
-        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q6_K) {
-            /* (packed: the super-block's scale times the half's, times the code less 32) */
-            const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;
-            const uint32_t byte = row[16u * sub + (i & 15u)], low = i < 16u ? byte & 0xFu : byte >> 4;
-            const uint8_t *hb = (const uint8_t *)(p.table + V * (p.d / 2u)) + ((uint64_t)token * subs + sub) * 8u;
-            const uint32_t piece = hb[2u * ((i & 15u) / 4u)] | (uint32_t)hb[2u * ((i & 15u) / 4u) + 1u] << 8;
-            const uint32_t high = (piece >> ((i < 16u ? 0u : 8u) + 2u * (i % 4u))) & 3u;
-            const uint8_t *pr = (const uint8_t *)(p.table + V * (p.d / 2u) + V * (p.d / 4u)) + ((uint64_t)token * subs + sub) * 2u;
-            const float *dm = F(p.table + V * (p.d / 2u) + V * (p.d / 4u) + V * subs * 2u) + 2u * ((uint64_t)token * blocks + sub / 8u);
-            v = dm[0] * (float)(int8_t)pr[i < 16u ? 0 : 1] * (float)((int32_t)(low | high << 4) - 32);
+            const uint16_t *h16 = (const uint16_t *)aux;
+            if (t == SPG_B_Q8_0) {
+                v = (float)(int8_t)row[c] * from_half(h16[sub]);
+            } else if (t == SPG_B_Q4_0 || t == SPG_B_IQ4_NL || t == SPG_B_Q4_1 || t == SPG_B_Q5_0 || t == SPG_B_Q5_1) {
+                const bool one = t == SPG_B_Q4_1 || t == SPG_B_Q5_1, five = t == SPG_B_Q5_0 || t == SPG_B_Q5_1;
+                if (five) code |= (int32_t)(((((const uint32_t *)aux)[sub] >> i) & 1u) << 4);
+                const uint16_t *sc = (const uint16_t *)(aux + (five ? 4u * subs : 0u)) + (one ? 2u : 1u) * sub;
+                const float d = from_half(sc[0]);
+                v = t == SPG_B_Q4_0 ? (float)(code - 8) * d : t == SPG_B_IQ4_NL ? (float)iq4_value((uint32_t)code) * d
+                  : t == SPG_B_Q5_0 ? (float)(code - 16) * d : (float)code * d + from_half(sc[1]);
+            } else if (t == SPG_B_Q4_K || t == SPG_B_Q5_K) {
+                const bool five = t == SPG_B_Q5_K;
+                if (five) code |= (int32_t)(((((const uint32_t *)aux)[sub] >> i) & 1u) << 4);
+                const uint16_t *pairs = (const uint16_t *)(aux + (five ? 4u * subs : 0u));
+                const uint32_t pair = pairs[sub];
+                const uint16_t *dm = pairs + subs + 2u * sb;
+                const float d1 = from_half(dm[0]) * (float)(pair & 0xFFu), m1 = from_half(dm[1]) * (float)(pair >> 8);
+                v = d1 * (float)code - m1;
+            } else if (t == SPG_B_IQ4_XS) {
+                const uint16_t *pairs = (const uint16_t *)aux;
+                v = from_half(pairs[subs + 2u * sb]) * (float)(int8_t)pairs[sub] * (float)iq4_value((uint32_t)code);
+            } else {                            /* Q6_K */
+                const uint8_t *hb = row + p.d / 2u + 8u * sub;
+                const uint32_t piece = hb[2u * ((i & 15u) / 4u)] | (uint32_t)hb[2u * ((i & 15u) / 4u) + 1u] << 8;
+                const uint32_t high = (piece >> ((i < 16u ? 0u : 8u) + 2u * (i % 4u))) & 3u;
+                const uint8_t *pr = aux + 2u * sub;
+                const float d = from_half(((const uint16_t *)(aux + 2u * subs))[sb]);
+                v = d * (float)(int8_t)pr[i < 16u ? 0 : 1] * (float)((code | (int32_t)(high << 4)) - 32);
+            }
         } else {
             const uint32_t t = p.type - SPG_EMB_BLOCK, bv = t >= SPG_B_Q2_K && t != SPG_B_IQ4_NL ? 256u : 32u;
             const uint32_t bytes = t == SPG_B_Q8_0 ? 34u : t == SPG_B_Q4_0 ? 18u : t == SPG_B_Q4_1 ? 20u : t == SPG_B_Q5_0 ? 22u

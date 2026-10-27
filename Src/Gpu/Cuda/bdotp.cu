@@ -4,8 +4,8 @@
 */
 
 /*
- * bdotp.comp: bdot's product for weights of blocks of 32 values kept packed on the device (bmmp's layout: the codes of
- * every row, N rows of K signed bytes, then the blocks' scales as floats, N x K / 32), the CPU's bits: a warp a row of
+ * bdotp.comp: bdot's product for weights of Q8_0 packed as sessions keep them (Spingalett.GpuPack.c: a row's codes,
+ * then its blocks' scales as float16; rows `stride` bytes apart), the CPU's bits: a warp a row of
  * weights, a lane a block of each round of 32 (its codes and the activations' in sixteen bytes' loads), the blocks'
  * integer sums by dp4a, their terms (d dx) I1, each product and sum rounded alone, added in their order through
  * shuffles; the bias then the sum, the activation of spec 2, the product by e0's value. A row of activations a pass
@@ -34,8 +34,8 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
     const uint32_t lane = thread_x() & 31u, j = block_x() * 8u + (thread_x() >> 5);
     if (j >= p.n) return;                       /* (a whole warp) */
     const uint32_t blocks = p.k / 32u;
-    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * p.k, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
-    const float *scales = (const float *)(p.w + (uint64_t)p.n * p.k) + (uint64_t)j * blocks;
+    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
+    const uint16_t *scales = (const uint16_t *)(row + p.k);
     const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
     float acc = 0.0f;
     for (uint32_t b0 = 0; b0 < blocks; b0 += 32u) {
@@ -53,7 +53,7 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
             i1 = dp4a(w1.y, x1.y, i1);
             i1 = dp4a(w1.z, x1.z, i1);
             i1 = dp4a(w1.w, x1.w, i1);
-            term = (scales[b] * dx[b]) * (float)i1;
+            term = (from_half(scales[b]) * dx[b]) * (float)i1;
         }
         /* the round's blocks' terms in their order */
         const uint32_t count = blocks - b0 < 32u ? blocks - b0 : 32u;

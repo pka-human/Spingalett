@@ -931,7 +931,8 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
             /* bdotp: a row of the packed rows at a time */
             spg_gpu_barrier(c);
             const uint32_t spec[4] = {type, 1u, 0u, 1u};
-            SpgBdotPush dp = {bp.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, 1u, N, K, stride, r0, N};
+            SpgBdotPush dp = {bp.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, 1u, N, K,
+                              SPG_PACK_ROW(type, K), r0, N};
             spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 4, &dp, sizeof dp, (N + 7) / 8, 1, 1);
         }
         if (unit == 2u || unit == 3u) {
@@ -939,7 +940,7 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
             spg_gpu_barrier(c);
             const uint32_t spec[3] = {type, unit == 3u, 0u};
             SpgBdotPush dp = {unit == 3u ? bp.address : bw.address, bq.address, bdx.address, bxs.address, bb.address,
-                              by.address, 0, R, N, K, stride, 0, N};
+                              by.address, 0, R, N, K, unit == 3u ? SPG_PACK_ROW(type, K) : stride, 0, N};
             spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, unit == 3u ? (N + spg_packed_cols(type) - 1u) / spg_packed_cols(type) : (N + 63) / 64, 1);
         }
         for (uint32_t r0 = 0; ok && unit < 2 && r0 < R; r0 += rows_a_pass) {
@@ -1030,14 +1031,14 @@ static void bench_blocks(int count, char **types) {
                         for (uint32_t r0 = 0; r0 < R; r0++) {
                             const uint32_t spec[4] = {(uint32_t)type, 1u, 0u, pack};
                             SpgBdotPush dp = {wat, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, 1u, N,
-                                              K, stride, r0, N};
+                                              K, pack ? SPG_PACK_ROW((uint32_t)type, K) : stride, r0, N};
                             spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 4, &dp, sizeof dp, (N + 7) / 8, 1, 1);
                         }
                         continue;
                     }
                     const uint32_t spec[3] = {(uint32_t)type, pack, 0u};
                     SpgBdotPush dp = {wat, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, R, N, K,
-                                      stride, 0, N};
+                                      pack ? SPG_PACK_ROW((uint32_t)type, K) : stride, 0, N};
                     spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, pack ? (N + spg_packed_cols((uint32_t)type) - 1u) / spg_packed_cols((uint32_t)type) : (N + 63) / 64, 1);
                 }
                 ok = ok && spg_gpu_record_end(c);

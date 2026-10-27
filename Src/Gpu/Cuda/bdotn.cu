@@ -5,7 +5,7 @@
 
 /*
  * bdotn.comp: bdot's product for weights of blocks of 32 4-bit codes (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL) packed as sessions
- * keep them (Spingalett.GpuPack.c), the CPU's bits: a warp a row of weights, a lane a block of each round of 32 (its 16
+ * keep them (Spingalett.GpuPack.c: rows `stride` bytes apart), the CPU's bits: a warp a row of weights, a lane a block of each round of 32 (its 16
  * bytes of codes and the activations' 32 in sixteen bytes' loads): its products by dp4a (the low nibbles with values 0
  * to 15, the high ones with 16 to 31; the fifth bits at bit 4; IQ4_NL's values from its table) less the offset times
  * the rows' sum of 32 (I1), its term (d dx) I1 (Q4_1, Q5_1: + (m dx) times the sum), each product and sum rounded
@@ -49,10 +49,9 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
     const uint32_t lane = thread_x() & 31u, j = block_x() * 8u + (thread_x() >> 5);
     if (j >= p.n) return;                       /* (a whole warp) */
     const uint32_t blocks = p.k / 32u;
-    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * (p.k / 2u), *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
-    const float *scales0 = (const float *)(p.w + (uint64_t)p.n * (p.k / 2u));
-    const uint32_t *fifth = (const uint32_t *)(scales0 + (uint64_t)p.n * blocks * (ONE ? 2u : 1u)) + (uint64_t)j * blocks;
-    const float *scales = scales0 + (ONE ? 2u : 1u) * (uint64_t)j * blocks;
+    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
+    const uint32_t *fifth = (const uint32_t *)(row + p.k / 2u);
+    const uint16_t *scales = (const uint16_t *)(row + p.k / 2u + (FIVE ? 4u * blocks : 0u));
     const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
     const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
     float acc = 0.0f;
@@ -80,9 +79,9 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
                 s = dp4a(hi, xb[k], s);
             }
             const int32_t sum = xs[2u * b] + xs[2u * b + 1u], i1 = s - OFF * sum;
-            const float d = scales[(ONE ? 2u : 1u) * b];
+            const float d = from_half(scales[(ONE ? 2u : 1u) * b]);
             term = (d * dx[b]) * (float)i1;
-            if (ONE) term = term + (scales[2u * b + 1u] * dx[b]) * (float)sum;
+            if (ONE) term = term + (from_half(scales[2u * b + 1u]) * dx[b]) * (float)sum;
         }
         /* the round's blocks' terms in their order */
         const uint32_t count = blocks - b0 < 32u ? blocks - b0 : 32u;
