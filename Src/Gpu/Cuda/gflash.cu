@@ -187,7 +187,10 @@ struct Shared {
     uint16_t s0[2u * BT * SD];
 };
 
-extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGattnPush p, const Spec spec) {
+/* (blocks of 64 queries three to a multiprocessor: left to itself the compiler takes registers enough for two) */
+#define MIN_BLOCKS (MT == 1u && D <= 64u ? 3u : 1u)
+
+extern "C" __global__ void __attribute__((launch_bounds(32u * WARPS, MIN_BLOCKS))) SPG_ENTRY(const SpgGattnPush p, const Spec spec) {
     (void)spec;
     __shared__ __attribute__((aligned(16))) Shared sh;
     const uint32_t *st = U(p.strides);
@@ -296,14 +299,26 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
             ta = quad_max(ta);
             tb = quad_max(tb);
             const float na = max_(m_[mt][0], ta), nb = max_(m_[mt][1], tb);
-            const float aa = na == NEG ? 1.0f : exp_(m_[mt][0] - na), ab = nb == NEG ? 1.0f : exp_(m_[mt][1] - nb);
+            /* e^(v - m) as 2^(v log2 e - m log2 e): one fused step a score; scores of -inf (only on edge tiles) 0 */
+            const float L2E = 1.4426950408889634f, ma = na * L2E, mb = nb * L2E;
+            const float aa = na == NEG ? 1.0f : __nvvm_ex2_approx_f(fma_(m_[mt][0], L2E, -ma));
+            const float ab = nb == NEG ? 1.0f : __nvvm_ex2_approx_f(fma_(m_[mt][1], L2E, -mb));
             float suma = 0.0f, sumb = 0.0f;
+            if (edge) {
+#pragma unroll
+                for (uint32_t j = 0; j < NT; j++)
+#pragma unroll
+                    for (uint32_t e = 0; e < 4u; e++)
+                        sc[mt][j][e] = sc[mt][j][e] == NEG ? 0.0f
+                                     : __nvvm_ex2_approx_f(fma_(sc[mt][j][e], L2E, e < 2u ? -ma : -mb));
+            } else {
+#pragma unroll
+                for (uint32_t j = 0; j < NT; j++)
+#pragma unroll
+                    for (uint32_t e = 0; e < 4u; e++) sc[mt][j][e] = __nvvm_ex2_approx_f(fma_(sc[mt][j][e], L2E, e < 2u ? -ma : -mb));
+            }
 #pragma unroll
             for (uint32_t j = 0; j < NT; j++) {
-                sc[mt][j][0] = sc[mt][j][0] == NEG ? 0.0f : exp_(sc[mt][j][0] - na);
-                sc[mt][j][1] = sc[mt][j][1] == NEG ? 0.0f : exp_(sc[mt][j][1] - na);
-                sc[mt][j][2] = sc[mt][j][2] == NEG ? 0.0f : exp_(sc[mt][j][2] - nb);
-                sc[mt][j][3] = sc[mt][j][3] == NEG ? 0.0f : exp_(sc[mt][j][3] - nb);
                 suma += sc[mt][j][0] + sc[mt][j][1];
                 sumb += sc[mt][j][2] + sc[mt][j][3];
             }
