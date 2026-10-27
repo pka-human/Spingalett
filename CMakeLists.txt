@@ -624,6 +624,7 @@ if(BUILD_TESTS)
         add_executable(SpingalettGpuTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.GpuTests.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Device.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuKernels.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuPack.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Quantize.c)
         target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_SOURCE_DIR}/Include

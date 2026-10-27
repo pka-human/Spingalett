@@ -282,7 +282,7 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
         case SPG_KERNEL_attn_cache: case SPG_KERNEL_attn_cache_h: return count > 1 ? spec[1] : 0u;
         case SPG_KERNEL_gattn: return SPG_GATTN_THREADS;
         case SPG_KERNEL_gflash: return count > 0 && spec[0] > 64u ? 64u : 128u;    /* (gflash.cu's WARPS) */
-        case SPG_KERNEL_bmm: return 128u;
+        case SPG_KERNEL_bmm: return 128u;          /* (bmm.cu's, bmmp.cu's, bmmk.cu's) */   /* (bmmk.cu's, bmm.cu's) */
         default: return 256u;
     }
 }

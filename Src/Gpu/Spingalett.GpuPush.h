@@ -223,9 +223,9 @@ typedef struct {
     float eps;
 } SpgBnormPush;
 
-/* bmmp.comp, bdotp.comp: bmm's and bdot's products (SpgBdotPush) of weights of Q8_0 packed as sessions keep them: the
-   codes, n rows of k bytes, then the blocks' scales as floats, n x k / 32 (w; 16 bytes more after them). bmm's spec 1,
-   bdot's spec 3 non-zero. bmmp: groups of 64 rows by 128 weights. */
+/* bmmp.comp, bdotp.comp: bmm's and bdot's products (SpgBdotPush) of weights packed as sessions keep them
+   (Spingalett.GpuPack.c: Q8_0 and Q4_K; w, 16 bytes more after them). bmm's spec 1, bdot's spec 3 non-zero. bmmp:
+   groups of 64 rows by spg_packed_cols() weights. */
 
 /* bdot.comp: rows of activations quantized by bquant times a linear layer's weights of a block precision (TYPE: the
    precision less SPINGALETT_PRECISION_Q8_0), y[r][j] = bias[j] + spingalett_block_dot() of row j, the bits of the CPU:
@@ -244,8 +244,8 @@ enum { SPG_B_Q8_0, SPG_B_Q4_0, SPG_B_Q4_1, SPG_B_Q5_0, SPG_B_Q5_1, SPG_B_Q2_K, S
 /* bembed.comp: the embedding of a session's rows: y[r] = (the table's row of token[r] decoded as the CPU decodes it,
    zeros for a token out of [0, vocabulary)) times scale (0: none), plus the positions' row info[2 r + 1] of
    `positions` (0: none). The table's rows `stride` bytes of TYPE: SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, or
-   SPG_EMB_BLOCK + a block type; or SPG_EMB_PACKED, Q8_0 packed as bmmp keeps it (vocabulary rows of d codes, then their
-   blocks' scales as floats). A thread a value. */
+   SPG_EMB_BLOCK + a block type; or SPG_EMB_PACKED + a block type, packed as sessions keep it (Spingalett.GpuPack.c:
+   stride the bytes of a row's codes). A thread a value. */
 typedef struct {
     uint64_t table, token, info, positions, y;
     uint32_t rows, d, stride, type, vocabulary;

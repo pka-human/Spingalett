@@ -874,22 +874,6 @@ static void bench_attention(void) {
 
 void spingalett_block_quantize(PrecisionMode p, const float *x, uint8_t *dst, uint32_t n);
 
-/* Rows of Q8_0 blocks packed as sessions keep them for bmmp: the codes, N rows of K bytes, then the scales as floats,
-   N x K / 32 (16 bytes more: kernels read whole words) */
-static uint8_t *pack_q8_0(const uint8_t *w, uint32_t N, uint32_t K, size_t *bytes) {
-    const uint32_t blocks = K / 32u;
-    *bytes = (size_t)N * K + (size_t)N * blocks * 4u + 16u;
-    uint8_t *packed = (uint8_t *)calloc(*bytes, 1);
-    float *scales = (float *)(void *)(packed + (size_t)N * K);
-    for (uint32_t j = 0; j < N; j++)
-        for (uint32_t b = 0; b < blocks; b++) {
-            const uint8_t *block = w + ((size_t)j * blocks + b) * 34u;
-            memcpy(packed + (size_t)j * K + 32u * b, block + 2, 32);
-            scales[(size_t)j * blocks + b] = spingalett_fp16_to_float((uint16_t)(block[0] | block[1] << 8));
-        }
-    return packed;
-}
-
 /* A layer of a block precision (rows of K weights quantized as GGUF's quantizers do, a bias each) on R rows of
    inputs: bquant against spingalett_quantize_blocks() and bdot (its units of 1 and 8 rows) against
    spingalett_block_dot() plus the bias, bit for bit. */
@@ -928,9 +912,10 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
               upload(&bnan, got, (size_t)R * N * 4) &&
               spg_gpu_buffer_create(&bq, (size_t)R * K, false) && spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
               spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) && spg_gpu_buffer_create(&by, (size_t)R * N * 4, false);
-    /* (Q8_0: bmmp's packed rows too, unit 3) */
-    size_t packed_bytes = 0;
-    uint8_t *packed = p == PRECISION_Q8_0 ? pack_q8_0(w, N, K, &packed_bytes) : NULL;
+    /* (the types sessions keep packed: bmmp's and bdotp's packed rows too, units 3 and 4) */
+    const size_t packed_bytes = spg_packed_bytes(type, N, K) + 16u;
+    uint8_t *packed = packed_bytes > 16u ? (uint8_t *)calloc(packed_bytes, 1) : NULL;
+    if (packed) spg_pack_blocks(type, w, N, K, packed);
     SpgGpuBuffer bp;
     memset(&bp, 0, sizeof bp);
     ok = ok && (!packed || upload(&bp, packed, packed_bytes));
@@ -955,7 +940,7 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
             const uint32_t spec[3] = {type, unit == 3u, 0u};
             SpgBdotPush dp = {unit == 3u ? bp.address : bw.address, bq.address, bdx.address, bxs.address, bb.address,
                               by.address, 0, R, N, K, stride, 0, N};
-            spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, unit == 3u ? (N + 127) / 128 : (N + 63) / 64, 1);
+            spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, unit == 3u ? (N + spg_packed_cols(type) - 1u) / spg_packed_cols(type) : (N + 63) / 64, 1);
         }
         for (uint32_t r0 = 0; ok && unit < 2 && r0 < R; r0 += rows_a_pass) {
             spg_gpu_barrier(c);
@@ -1003,7 +988,8 @@ static void bench_blocks(int count, char **types) {
         for (int sh = 0; sh < 4; sh++) {
             const uint32_t N = shapes[sh][0], K = shapes[sh][1], BV = slett_block_values(p);
             const uint32_t stride = K / BV * slett_block_bytes(p);
-            const size_t wbytes = ((size_t)N * stride + 255u) & ~(size_t)255u;
+            const size_t raw_bytes = (size_t)N * stride, packed_bytes = spg_packed_bytes((uint32_t)type, N, K);
+            const size_t wbytes = ((raw_bytes > packed_bytes ? raw_bytes : packed_bytes) + 255u) & ~(size_t)255u;
             const uint32_t copies = (uint32_t)((64u << 20) / wbytes + 1u);
             uint8_t *w = (uint8_t *)calloc(copies * wbytes + 16u, 1);
             float *row = (float *)malloc((size_t)K * sizeof(float)), *x = (float *)malloc((size_t)R * K * 4);
@@ -1011,14 +997,14 @@ static void bench_blocks(int count, char **types) {
                 for (uint32_t i = 0; i < K; i++) row[i] = uniform();
                 spingalett_block_quantize(p, row, w + (size_t)j * stride, K);
             }
-            const bool pack = getenv("SPINGALETT_BENCH_PACKED") && p == PRECISION_Q8_0;
+            const bool pack = getenv("SPINGALETT_BENCH_PACKED") && packed_bytes;
             if (pack) {
-                size_t bytes;
-                uint8_t *packed = pack_q8_0(w, N, K, &bytes);
-                memcpy(w, packed, bytes - 16u < wbytes ? bytes - 16u : wbytes);
+                uint8_t *packed = (uint8_t *)malloc(packed_bytes);
+                spg_pack_blocks((uint32_t)type, w, N, K, packed);
+                memcpy(w, packed, packed_bytes);
                 free(packed);
             }
-            for (uint32_t copy = 1; copy < copies; copy++) memcpy(w + copy * wbytes, w, (size_t)N * stride);
+            for (uint32_t copy = 1; copy < copies; copy++) memcpy(w + copy * wbytes, w, wbytes);
             for (size_t i = 0; i < (size_t)R * K; i++) x[i] = uniform();
             SpgGpuBuffer bw, bx, bq, bdx, bxs, bb, by;
             float *bias = (float *)calloc(N, sizeof(float));
@@ -1049,7 +1035,7 @@ static void bench_blocks(int count, char **types) {
                     const uint32_t spec[3] = {(uint32_t)type, pack, 0u};
                     SpgBdotPush dp = {wat, bq.address, bdx.address, bxs.address, bb.address, by.address, 0, R, N, K,
                                       stride, 0, N};
-                    spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, pack ? (N + 127) / 128 : (N + 63) / 64, 1);
+                    spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, (R + 63) / 64, pack ? (N + spg_packed_cols((uint32_t)type) - 1u) / spg_packed_cols((uint32_t)type) : (N + 63) / 64, 1);
                 }
                 ok = ok && spg_gpu_record_end(c);
                 const double start = seconds();

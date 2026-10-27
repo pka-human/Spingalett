@@ -12,7 +12,8 @@ set(gpu_dir ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu)
 if(SPINGALETT_HAS_VULKAN OR SPINGALETT_HAS_CUDA)
     target_sources(spingalett PRIVATE ${gpu_dir}/Spingalett.Device.c ${gpu_dir}/Spingalett.GpuKernels.c
                                       ${gpu_dir}/Spingalett.Gpu.c ${gpu_dir}/Spingalett.GpuModel.c
-                                      ${gpu_dir}/Spingalett.GpuGraph.c ${gpu_dir}/Spingalett.GpuSession.c)
+                                      ${gpu_dir}/Spingalett.GpuGraph.c ${gpu_dir}/Spingalett.GpuSession.c
+                                      ${gpu_dir}/Spingalett.GpuPack.c)
     target_include_directories(spingalett PRIVATE ${gpu_dir})
     if(NOT WIN32)
         target_link_libraries(spingalett PRIVATE ${CMAKE_DL_LIBS})

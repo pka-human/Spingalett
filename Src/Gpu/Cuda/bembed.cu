@@ -122,10 +122,28 @@ KERNEL(bembed, SpgBembedPush) {
             v = from_half(get16(row + 2u * c));
         } else if (p.type == SPG_EMB_BF16) {
             v = from_bf16(get16(row + 2u * c));
-        } else if (p.type == SPG_EMB_PACKED) {
-            /* (Q8_0 packed: the code times its block's scale, as spingalett_block_decode()) */
+        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q8_0) {
+            /* (packed: the code times its block's scale, as spingalett_block_decode()) */
             const float d = F(p.table + (uint64_t)p.vocabulary * p.d)[(uint64_t)token * (p.d / 32u) + c / 32u];
             v = (float)(int8_t)row[c] * d;
+        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q4_K) {
+            /* (packed: the sub-block's scale and minimum times the super-block's, then the code's value) */
+            const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;
+            const uint32_t byte = row[16u * sub + (i & 15u)], code = i < 16u ? byte & 0xFu : byte >> 4;
+            const uint32_t pair = ((const uint16_t *)(p.table + V * (p.d / 2u)))[(uint64_t)token * subs + sub];
+            const float *dm = F(p.table + V * (p.d / 2u) + V * subs * 2u) + 2u * ((uint64_t)token * blocks + sub / 8u);
+            const float d1 = dm[0] * (float)(pair & 0xFFu), m1 = -dm[1] * (float)(pair >> 8);
+            v = d1 * (float)code - m1;
+        } else if (p.type == SPG_EMB_PACKED + SPG_B_Q6_K) {
+            /* (packed: the super-block's scale times the half's, times the code less 32) */
+            const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;
+            const uint32_t byte = row[16u * sub + (i & 15u)], low = i < 16u ? byte & 0xFu : byte >> 4;
+            const uint8_t *hb = (const uint8_t *)(p.table + V * (p.d / 2u)) + ((uint64_t)token * subs + sub) * 8u;
+            const uint32_t piece = hb[2u * ((i & 15u) / 4u)] | (uint32_t)hb[2u * ((i & 15u) / 4u) + 1u] << 8;
+            const uint32_t high = (piece >> ((i < 16u ? 0u : 8u) + 2u * (i % 4u))) & 3u;
+            const uint8_t *pr = (const uint8_t *)(p.table + V * (p.d / 2u) + V * (p.d / 4u)) + ((uint64_t)token * subs + sub) * 2u;
+            const float *dm = F(p.table + V * (p.d / 2u) + V * (p.d / 4u) + V * subs * 2u) + 2u * ((uint64_t)token * blocks + sub / 8u);
+            v = dm[0] * (float)(int8_t)pr[i < 16u ? 0 : 1] * (float)((int32_t)(low | high << 4) - 32);
         } else {
             const uint32_t t = p.type - SPG_EMB_BLOCK, bv = t >= SPG_B_Q2_K && t != SPG_B_IQ4_NL ? 256u : 32u;
             const uint32_t bytes = t == SPG_B_Q8_0 ? 34u : t == SPG_B_Q4_0 ? 18u : t == SPG_B_Q4_1 ? 20u : t == SPG_B_Q5_0 ? 22u
