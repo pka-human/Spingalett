@@ -51,6 +51,7 @@ typedef struct {
     /* attention */
     uint64_t keys, values, table, gq, gk;
     uint64_t strides;               /* gflash's strides over the caches (a prompt's attention), or 0 */
+    bool half_kv;                   /* the caches of bfloat16 (gflash's: it rounds them so as it reads them) */
     uint32_t heads, kv, head, rot;
     float eps, scale;
 } GLayer;
@@ -302,9 +303,13 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             G->run = RUN_ATTN;
             G->heads = a.heads, G->kv = a.kv, G->head = a.head, G->rot = a.rot, G->eps = a.eps, G->scale = a.scale;
             if (G->head > 256u || !G->kv || G->heads % G->kv) return *why = "attention heads of over 256 values", false;
+            /* (the queries over the caches on the matrix units, gflash, where it has the head's unit: its caches of
+               bfloat16, which it reads by asynchronous copies) */
+            G->half_kv = (G->head == 32u || G->head == 64u || G->head == 128u) && spg_gpu_mma_bf16() &&
+                         spg_gpu_kernel_built(SPG_KERNEL_gflash);
             const size_t floats = (size_t)s->sequences * G->kv * s->max_length * G->head;
-            G->keys = buffer_new(s, floats * sizeof(float), false);
-            G->values = buffer_new(s, floats * sizeof(float), false);
+            G->keys = buffer_new(s, floats * (G->half_kv ? 2u : sizeof(float)), false);
+            G->values = buffer_new(s, floats * (G->half_kv ? 2u : sizeof(float)), false);
             if (!G->keys || !G->values) return *why = "out of device memory for the keys and values", false;
             if (a.gq) {
                 G->gq = image_bytes(s, L->weights, 2u * G->head * sizeof(float));
@@ -322,9 +327,8 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             } else {
                 G->rot = 0;
             }
-            if ((G->head == 32u || G->head == 64u || G->head == 128u) && spg_gpu_mma_bf16() &&
-                spg_gpu_kernel_built(SPG_KERNEL_gflash)) {
-                /* a prompt's queries over the caches on the matrix units (gflash): its strides */
+            if (G->half_kv) {
+                /* gflash's strides */
                 const uint32_t D = G->head, H = G->heads, ML = s->max_length;
                 const uint32_t st[21] = {0, D, H * D, G->kv * ML * D, ML * D, D, G->kv * ML * D, ML * D, D, 0, D, H * D,
                                          0, 0, 0, 0, 0, 0, 0, 0, 1};
@@ -650,7 +654,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
         }
         case RUN_ATTN: {
             SpgKvattnPush p = {x[0], s->q, G->keys, G->values, y, G->table, G->gq, G->gk, s->info, rows, G->heads, G->kv,
-                               G->head, G->rot, L->window, s->max_length, SPG_KV_PREP, G->eps, G->scale};
+                               G->head, G->rot, L->window, s->max_length, SPG_KV_PREP, G->eps, G->scale, G->half_kv, 0};
             spg_gpu_dispatch(c, SPG_KERNEL_kvattn, NULL, 0, &p, sizeof p, groups((uint64_t)rows * (G->heads + G->kv), 8u), 1, 1);
             spg_gpu_barrier(c);
             if (G->strides) {
@@ -673,7 +677,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                     gp.d = D;
                     gp.heads = G->heads;
                     gp.scale = G->scale;
-                    gp.flags = SPG_GATTN_CACHE | SPG_GATTN_VEC;
+                    gp.flags = SPG_GATTN_CACHE | SPG_GATTN_VEC | SPG_GATTN_HALF_K | SPG_GATTN_HALF_V;
                     gp.info = s->info + (uint64_t)r0 * 2u * sizeof(uint32_t);
                     gp.group = G->heads / G->kv;
                     gp.window = L->window;
@@ -799,12 +803,12 @@ bool spingalett_gpu_session_copy(SpgGpuSession *s, uint32_t from, uint32_t to, u
     for (uint32_t i = 0; ok && i < s->layers; i++) {
         const GLayer *G = &s->L[i];
         if (G->run != RUN_ATTN) continue;
-        const size_t per = (size_t)s->max_length * G->head * sizeof(float), seq = per * G->kv;
+        const size_t per = (size_t)s->max_length * G->head * (G->half_kv ? 2u : sizeof(float)), seq = per * G->kv;
         for (int kv = 0; kv < 2; kv++) {
             const SpgGpuBuffer *b = buffer_at(s, kv ? G->values : G->keys);
             for (uint32_t g = 0; g < G->kv; g++)
                 spg_gpu_copy(c, b, (size_t)from * seq + g * per, b, (size_t)to * seq + g * per,
-                             (size_t)length * G->head * sizeof(float));
+                             (size_t)length * G->head * (G->half_kv ? 2u : sizeof(float)));
         }
     }
     ok = ok && spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);

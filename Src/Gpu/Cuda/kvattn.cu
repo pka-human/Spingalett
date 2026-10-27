@@ -72,8 +72,13 @@ KERNEL(kvattn, SpgKvattnPush) {
         const uint64_t at = (((uint64_t)seq * p.kv + g) * p.max_length + pos) * D;
         const float *vs = F(p.x) + (uint64_t)r * C + (uint64_t)(p.heads + p.kv + g) * D;
         for (uint32_t i = lane; i < D; i += 32u) {
-            F(p.keys)[at + i] = v[i];
-            F(p.values)[at + i] = vs[i];
+            if (p.half) {
+                H(p.keys)[at + i] = (uint16_t)to_bf16(v[i]);
+                H(p.values)[at + i] = (uint16_t)to_bf16(vs[i]);
+            } else {
+                F(p.keys)[at + i] = v[i];
+                F(p.values)[at + i] = vs[i];
+            }
         }
         return;
     }

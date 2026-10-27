@@ -259,11 +259,13 @@ enum { SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, SPG_EMB_BLOCK = 16, SPG_EMB_PACKE
    q [rows][heads][head], the keys and values into their caches [sequence][kv][max_length][head] at the position.
    ATTEND: a warp a row and query head: its query over the keys of its sequence from position p + 1 - attended to p
    (window: the last `window`, 0: all), the scores times scale, a softmax, the values' weighted sum to y [rows][heads
-   head]. info [rows]: each row's sequence and position. */
+   head]. info [rows]: each row's sequence and position. With half, the caches of bfloat16 (PREP writes them so, rounded
+   to the nearest, ties to even; ATTEND reads floats only). */
 typedef struct {
     uint64_t x, q, keys, values, y, table, gq, gk, info;
     uint32_t rows, heads, kv, head, rot, window, max_length, op;
     float eps, scale;
+    uint32_t half, pad;
 } SpgKvattnPush;
 enum { SPG_KV_PREP, SPG_KV_ATTEND };
 
