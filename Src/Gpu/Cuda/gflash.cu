@@ -7,11 +7,14 @@
  * gflash: FusedAttention of graphs on the matrix units (mma.sync m16n8k16, bfloat16 operands, single-precision sums)
  * when their products are in bfloat16, as flash.cu's FORWARD computes attention: a warp takes MT tiles of 16 queries
  * of a batch and head, a block WARPS of them; tiles of BT keys and their values pass through shared memory (rows of
- * D + 8 bfloat16). Queries, keys and values are read as floats where strides put them (SpgGattnPush, as gattn.cu
- * reads them) and rounded to bfloat16 as they are loaded; the scores are scaled in single precision, then the keep
- * mask and the mask apply as in gattn.cu, the softmax online in registers (a row's maximum and sum combined over the
- * four threads that hold it, in a fixed pattern), O += P V with P rounded to bfloat16. Every product adds its 16
- * values of k at a time in the order of k: the same bits on every run. A unit per head size D (32, 64, 128), and for
+ * D + 8 bfloat16), with blocks of 128 queries the next tile's copied while the products of one run (asynchronous copies,
+ * where keys and values are kept as bfloat16 in rows of 16 bytes; the second stage in the queries' room once they are
+ * in registers).
+ * Queries, keys and values are read where strides put them (SpgGattnPush, as gattn.cu reads them), floats rounded
+ * to bfloat16 as they are loaded; the scores are scaled in single precision, then the keep mask and the mask apply
+ * as in gattn.cu, the softmax online in registers (a row's maximum and sum combined over the four threads that hold
+ * it, in a fixed pattern), O += P V with P rounded to bfloat16. Every product adds its 16 values of k at a time in
+ * the order of k: the same bits on every run. A unit per head size D (32, 64, 128), and for
  * heads of 32 and 64 one of blocks of half the queries (_m1: MTS 1), for sequences too short to fill the device.
  */
 
@@ -33,6 +36,7 @@
 #define NT (BT / 8u)                       /* n-tiles of 8 of a tile of scores */
 #define DT (D / 8u)                        /* n-tiles of 8 of a row of D */
 #define KS (D / 16u)                       /* k-steps of 16 over D */
+#define STAGES (ROWS >= 2u * BT ? 2u : 1u)  /* of keys and values: the second where the queries' room holds it */
 
 DEVICE uint32_t lane_id() { return thread_x() & 31u; }
 DEVICE uint32_t warp_id() { return thread_x() >> 5; }
@@ -63,6 +67,13 @@ DEVICE uint32_t pack2(float lo, float hi) {
     return r;
 }
 DEVICE float shfl_xor(float v, uint32_t mask) { return __nvvm_shfl_sync_bfly_f32(0xFFFFFFFFu, v, mask, 0x1F); }
+/* asynchronous copies of 16 bytes to shared memory (`bytes` of them from src, the rest zeros) */
+DEVICE void copy16(uint32_t dst, const void *src, uint32_t bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(bytes) : "memory");
+}
+DEVICE void copies_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <uint32_t N>
+DEVICE void copies_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
 
 /* x[b] (b < 4): this thread's pair of values of fragment b of a group of four, of a row the four threads of a quad
    hold (thread t its columns 2t and 2t + 1 of each fragment); after the exchange (a 4 x 4 transpose in two steps of
@@ -132,6 +143,16 @@ DEVICE void load_tile(const SpgGattnPush &p, uint16_t *tile, uint64_t base, uint
     }
 }
 
+/* Rows r0 .. r0 + BT - 1 (of `rows`) of bfloat16 kept so, D contiguous values at 16 bytes, into a shared tile by
+   asynchronous copies (zeros past the rows) */
+DEVICE void fetch_tile(uint16_t *tile, uint64_t base, uint32_t stride, uint32_t r0, uint32_t rows) {
+    for (uint32_t e = thread_x(); e < BT * (D / 8u); e += 32u * WARPS) {
+        const uint32_t row = e / (D / 8u), c = 8u * (e % (D / 8u)), pos = r0 + row;
+        copy16(shared_address(tile + row * SD + c), pos < rows ? H(base) + (uint64_t)pos * stride + c : H(base),
+               pos < rows ? 16u : 0u);
+    }
+}
+
 /* A operand fragments (16 rows x 16 k) of a warp's rows r0.. of a shared tile, k-step ks */
 DEVICE void frag_a(const uint16_t *tile, uint32_t r0, uint32_t ks, uint32_t (&a)[4]) {
     const uint32_t l = lane_id();
@@ -156,9 +177,14 @@ DEVICE void scores_a(const float (&s)[NT][4], uint32_t j, uint32_t (&a)[4]) {
     a[3] = pack2(s[2u * j + 1u][2], s[2u * j + 1u][3]);
 }
 
+/* the block's queries, then (once in registers) the second of the stages of a tile of keys and one of values (with
+   blocks of fewer queries one stage: a second would take room enough to leave the device fewer blocks) */
 struct Shared {
-    uint16_t a[ROWS * SD];          /* the block's queries */
-    uint16_t t[BT * SD], u[BT * SD];    /* a tile of keys, of values */
+    union {
+        uint16_t a[ROWS * SD];
+        uint16_t s1[STAGES > 1u ? 2u * BT * SD : 1u];
+    } x;
+    uint16_t s0[2u * BT * SD];
 };
 
 extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGattnPush p, const Spec spec) {
@@ -175,13 +201,29 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
     const uint64_t mbase = (uint64_t)b * st[12] + (uint64_t)h * st[13], wbase = (uint64_t)b * st[16] + (uint64_t)h * st[17];
     const bool vec = (p.flags & SPG_GATTN_VEC) != 0u, masked = (p.flags & (SPG_GATTN_MASK | SPG_GATTN_BOOL | SPG_GATTN_KEEP)) != 0u;
     const float NEG = -__builtin_inff(), scale = p.scale;
-    load_tile(p, sh.a, qb, st[2], 1u, i0, ROWS, p.queries, vec, hq);
+    load_tile(p, sh.x.a, qb, st[2], 1u, i0, ROWS, p.queries, vec, hq);
     barrier();
     uint32_t qa[MT][KS][4];
 #pragma unroll
     for (uint32_t mt = 0; mt < MT; mt++)
 #pragma unroll
-        for (uint32_t k = 0; k < KS; k++) frag_a(sh.a, r0 + 16u * mt, k, qa[mt][k]);
+        for (uint32_t k = 0; k < KS; k++) frag_a(sh.x.a, r0 + 16u * mt, k, qa[mt][k]);
+    barrier();          /* (the queries' tile free for the second stage) */
+    /* tiles of keys and values into stage s: the next tile's copied while this one's products run, where both are
+       kept as bfloat16 in rows of 16 bytes */
+    const bool async = vec && hk && hv;
+    auto fetch = [&](uint32_t j0, uint32_t s) {
+        uint16_t *kt = s ? sh.x.s1 : sh.s0, *vt = kt + BT * SD;
+        if (async) {
+            fetch_tile(kt, kb, st[5], j0, p.keys);
+            fetch_tile(vt, vb, st[8], j0, p.keys);
+            copies_commit();
+        } else {
+            load_tile(p, kt, kb, st[5], st[20], j0, BT, p.keys, vec, hk);
+            load_tile(p, vt, vb, st[8], 1u, j0, BT, p.keys, vec, hv);
+        }
+    };
+    if (STAGES > 1u) fetch(0u, 0u);
     float o[MT][DT][4], m_[MT][2], l_[MT][2];
 #pragma unroll
     for (uint32_t mt = 0; mt < MT; mt++) {
@@ -190,11 +232,17 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
         m_[mt][0] = m_[mt][1] = NEG;
         l_[mt][0] = l_[mt][1] = 0.0f;
     }
-    for (uint32_t j0 = 0; j0 < p.keys; j0 += BT) {
+    uint32_t s = 0;
+    for (uint32_t j0 = 0; j0 < p.keys; j0 += BT, s ^= STAGES - 1u) {
+        const bool more = j0 + BT < p.keys;
+        if (STAGES == 1u) fetch(j0, 0u);
+        else if (more) fetch(j0 + BT, s ^ 1u);
+        if (async) {
+            if (STAGES > 1u && more) copies_wait<1>();
+            else copies_wait<0>();
+        }
         barrier();
-        load_tile(p, sh.t, kb, st[5], st[20], j0, BT, p.keys, vec, hk);
-        load_tile(p, sh.u, vb, st[8], 1u, j0, BT, p.keys, vec, hv);
-        barrier();
+        const uint16_t *kt = s ? sh.x.s1 : sh.s0, *vt = kt + BT * SD;
         float sc[MT][NT][4];
 #pragma unroll
         for (uint32_t mt = 0; mt < MT; mt++)
@@ -205,7 +253,7 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
 #pragma unroll
             for (uint32_t j = 0; j < NT; j += 2u) {
                 uint32_t bf[4];
-                frag_b(sh.t, 8u * j, k, bf);
+                frag_b(kt, 8u * j, k, bf);
 #pragma unroll
                 for (uint32_t mt = 0; mt < MT; mt++) {
                     mma(sc[mt][j], qa[mt][k], bf[0], bf[1]);
@@ -278,7 +326,7 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
 #pragma unroll
             for (uint32_t j = 0; j < DT; j += 2u) {
                 uint32_t bf[4];
-                frag_bt(sh.u, 8u * j, k, bf);
+                frag_bt(vt, 8u * j, k, bf);
 #pragma unroll
                 for (uint32_t mt = 0; mt < MT; mt++) {
                     mma(o[mt][j], pa[mt], bf[0], bf[1]);
@@ -286,6 +334,7 @@ extern "C" __global__ void __launch_bounds__(32u * WARPS) SPG_ENTRY(const SpgGat
                 }
             }
         }
+        barrier();      /* (stage s free for the tile after next, or the next with one stage) */
     }
     /* y = O / sum (a row of no key: zeros with SAFE, else NaN), this thread's columns 8 j + 2 t, + 1 of rows g, g + 8 */
     const uint64_t yb = p.y + (hy ? 2ull : 4ull) * ((uint64_t)b * st[9] + (uint64_t)h * st[10]);
