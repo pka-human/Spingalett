@@ -10,7 +10,7 @@ against PyTorch on the same machine.
 - **Training as much as inference.** Spingalett was made to train efficiently, not only to run what others trained:
   every kind of model the library runs it should also train, on the CPU and on the GPU, as fast as the heavyweights
   or faster (the GPT on the CPU and in bfloat16 on CUDA already is), and in a program's own loop, a step at a time
-  in fixed memory.
+  in fixed memory. Graphs train from 1.7, as soon as they run on the GPU, not at 2.0.
 - **The GPU as much as the CPU.** Most work runs on GPUs. The library's own kernels (no cuDNN or cuBLAS) beat PyTorch
   on dense and convolutional networks and `torch.compile` on the GPT by sound mathematics and algorithms and by
   carrying nothing they do not need; every version that moves the CPU forward plans the GPU's side too, measured
@@ -24,7 +24,7 @@ against PyTorch on the same machine.
 - **Embedded in other programs.** A C library without dependencies, an engine without a heap and results that
   repeat their bits are what a game engine (creatures' minds, opponents, the same decisions on every client of a
   lockstep game, replays that replay), a robot (trained in simulation, run on the real machine, a failure replayed
-  in the simulation bit for bit) or a server can link. Trees (1.10) and learning from rewards (1.11) serve exactly
+  in the simulation bit for bit) or a server can link. Trees (1.11) and learning from rewards (1.12) serve exactly
   there.
 
 ## Done so far
@@ -69,7 +69,7 @@ engine for microcontrollers and the training API go on as they are: the graph is
 layer models join once it runs them no slower (1.6).
 
 The target that keeps this honest is diffusion: SDXL and FLUX.1 run with no line of code specific to diffusion in the
-executor (1.7). Language models keep their bar: on the same GGUF files faster than llama.cpp (`llama-bench`: prompt
+executor (1.8). Language models keep their bar: on the same GGUF files faster than llama.cpp (`llama-bench`: prompt
 processing of 512 tokens, generation of 128, at 1 and 8 threads, on CUDA and on Vulkan) and against PyTorch, each
 family checked on real checkpoints (the logits of a prompt against transformers', the tokens of greedy generation
 against llama.cpp's). **SaLaM** (below), a program of its own on the runtime, serves them.
@@ -109,8 +109,8 @@ The foundation, on the CPU, with the language-model work of 1.5 that needed no n
   SmolLM3, OLMo 2, Phi-3 and GLM-4 from GGUF files on 1.4's layers; a chat in the terminal on the runtime alone.
 - **Decided**: an opset of the library's own, ONNX's semantics where ONNX has them (free references) and its own
   operators where it has not; no control flow in graphs (generation loops and samplers stay code of the host);
-  training through graphs waits for 2.0 (the training API stays the layers'); the engine for microcontrollers runs
-  layer models until a static subset of graphs reaches it (1.12).
+  training through graphs waits for 2.0 (the training API stays the layers'; brought forward to 1.7, beside it);
+  the engine for microcontrollers runs layer models until a static subset of graphs reaches it (1.13).
 - **Moved to 1.6**, where language models and the GPU need them: GGUF's block types as types of constants, the
   metadata of a model in format 11 (a tokenizer, a chat template, generation's defaults), shapes inferred when a
   graph opens (kernels compute them as they run in 1.5) and composite operators' decompositions into primitives
@@ -169,7 +169,28 @@ What was planned for 1.5 before the IR, built on it: the families become convert
 - **Operators of the program's own**: a reference kernel registered by the program (and optionally GPU kernels),
   named in the graph's opset.
 
-## 1.7: diffusion
+## 1.7: training through graphs
+
+Planned for 2.0 until 1.6: any model the library runs, it trains. Added beside the layer networks' API (new
+functions, nothing of 1.x removed), on the executors of 1.5 and 1.6, so that a model is trained where it runs.
+
+- **Gradients of operators**: for every operator its derivative written as operators of the IR (MatMul's two
+  products, Conv's data and filter gradients as the transposed convolutions the kernels already have, the reductions'
+  broadcasts back, Gather's scatter as a fixed-order sum), a backward graph built when a graph is opened for training
+  and fused as forward graphs are; the fused operators' backward passes are the layer networks' kernels (attention's
+  flash backward, layer and RMS normalization, convolutions channels last, GELU and SiLU from the values before them).
+- **The same bits on any number of threads and every run on one GPU**: a value read by several nodes gets their
+  gradients in a fixed order (first written, the rest added), sums over fixed chunks; the layer networks' rule kept.
+- **The training loop of the library**: the graph's constants marked trainable (an ONNX initializer, a safetensors
+  tensor), losses as operators (cross-entropy over classes and tokens, mean squared error), the optimizers,
+  schedules, gradient accumulation, clipping, mixed precision (bfloat16 on the matrix units, weights in single
+  precision) and checkpoints that resume to the bits of an uninterrupted run, a step at a time in a program's loop
+  in planned memory. Python: `Graph.from_torch()` modules fine-tuned without PyTorch at run time.
+- **Measured** against PyTorch eager and `torch.compile` training the same models on the same machine (ResNet-50,
+  ViT-B/16, BERT-base fine-tuned, GPT-2 small, the SDXL-style UNet), by the margin of the aim above; the layer
+  networks' training then moves onto graphs where it is no slower, as their inference does in 1.6.
+
+## 1.8: diffusion
 
 - **SDXL first**: its UNet, VAE and text encoders (CLIP-L, OpenCLIP bigG) from diffusers' directories and GGUF files,
   in float16 and block dtypes; then **FLUX.1** (schnell and dev) with T5-XXL (Unigram) and its double and single
@@ -183,7 +204,7 @@ What was planned for 1.5 before the IR, built on it: the families become convert
 - Measured against diffusers with `torch.compile` and against stable-diffusion.cpp on the same files: seconds an
   image at 1024 x 1024 on the CPU, CUDA and Vulkan.
 
-## 1.8: mixture of experts
+## 1.9: mixture of experts
 
 - **A layer of experts** with a learned router (top-k gating, softmax or sigmoid scores, shared
   experts), the experts' products batched by expert, in inference and in training (the load-balancing
@@ -197,21 +218,21 @@ What was planned for 1.5 before the IR, built on it: the families become convert
 - **Speculative decoding** with a draft model (several tokens checked in one pass, the bits of plain
   sampling kept).
 
-## 1.9: hybrid models: linear attention and state spaces
+## 1.10: hybrid models: linear attention and state spaces
 
 - **Gated DeltaNet** (Qwen3.5, Qwen3-Next) with its short causal convolution and gated output, and
   attention with a gated output beside it; **Mamba-2** (Falcon-H1, Granite 4, Nemotron-H). Layers whose
   state is a matrix carried from token to token instead of a key-value cache: sessions keep it per
   sequence (rewound by checkpoints of the state), training runs the chunked parallel form, the GPU
   backends scan in fixed orders. In graphs the scans are composite operators whose reference decomposition is
-  their chunked form, the state the session's named state of 1.6. With 1.8's experts this opens every Qwen3.5
+  their chunked form, the state the session's named state of 1.6. With 1.9's experts this opens every Qwen3.5
   model, Qwen3.5-2B among them.
 - **Recurrent layers** (GRU, LSTM) on the same scans, as layers of the same graphs as attention.
 - **Multimodal inputs**: the vision encoders of these models (Qwen3.5's, Gemma 3's: patch embeddings,
   their own attention) and audio frames, inputs of several kinds in one graph.
 - **ALiBi positions** and block-sparse masks in the flash kernels, for the models that use them.
 
-## 1.10: beyond neural networks: trees and the classical toolbox
+## 1.11: beyond neural networks: trees and the classical toolbox
 
 Most of the machine learning in production still runs on tables, and there gradient-boosted trees
 (XGBoost, LightGBM, CatBoost) beat neural networks; they are also the models most often run on
@@ -243,7 +264,7 @@ Measured against XGBoost, LightGBM and CatBoost (time to the same validation los
 throughput on Higgs, Covertype and Epsilon, on the CPU and the GPU) and against Treelite's compiled
 trees.
 
-## 1.11: learning from rewards: reinforcement learning and evolution
+## 1.12: learning from rewards: reinforcement learning and evolution
 
 Networks trained by the consequences of what they do rather than by labelled examples, wherever a
 program can score an outcome: characters and opponents in games (a character that learns to walk,
@@ -268,20 +289,20 @@ does.
 - **Algorithms**: PPO (discrete actions and continuous ones from Gaussian policies, generalized
   advantage estimation, clipping, an entropy bonus), SAC for continuous control from a replay buffer,
   DQN with its double and dueling variants for discrete actions; observations and rewards normalized by
-  running statistics saved with the policy; recurrent policies on 1.9's layers. Several agents in one
+  running statistics saved with the policy; recurrent policies on 1.10's layers. Several agents in one
   environment, each with a policy of its own or one shared, and self-play against a league of their past
   versions; tree search guided by a network's policy and value (AlphaZero's) for board games and for
   planning where the program can simulate a move. Every draw from a seed, the environments' too: a run
   repeats its bits on any number of threads, and resumes from a checkpoint as supervised training does.
 - **Bandits** for decisions whose reward comes at once (which item to recommend, which price or variant
-  to show): epsilon-greedy, LinUCB and Thompson sampling over 1.10's linear models or over networks, and
+  to show): epsilon-greedy, LinUCB and Thompson sampling over 1.11's linear models or over networks, and
   a new policy evaluated on logged decisions before it serves (inverse propensity and doubly robust
   estimates).
 - **Learning from logs** where exploring is costly or unsafe: behaviour cloning from recorded play or
   operation (a person's demonstrations, a running system's decisions) to start from before rewards take
   over, and offline reinforcement learning (implicit and conservative Q-learning) on recorded
   transitions, read as `.slettd` data sets.
-- **Language models from rewards and preferences**: the transformers of 1.4 to 1.9 tuned by GRPO (groups
+- **Language models from rewards and preferences**: the transformers of 1.4 to 1.10 tuned by GRPO (groups
   of completions sampled by the sessions' batched generation, scored by the program's function: tests
   passed, an answer checked, a format kept) and by DPO from pairs of preferred and rejected answers;
   low-rank adapters (LoRA), which train a small share of the parameters, serve supervised fine-tuning as
@@ -309,9 +330,9 @@ Measured against Stable-Baselines3 and CleanRL (wall time to the same returns on
 HalfCheetah and Humanoid in MuJoCo and on Atari games, on the CPU and the GPU), Vowpal Wabbit for bandits,
 TRL for GRPO and DPO, and evosax, EvoTorch, DEAP and pymoo for evolution.
 
-## 1.12: Arm, Apple and the edge
+## 1.13: Arm, Apple and the edge
 
-The CPU and GPU paths that 1.0 to 1.11 tuned on x86 and NVIDIA, brought to the other hardware the
+The CPU and GPU paths that 1.0 to 1.12 tuned on x86 and NVIDIA, brought to the other hardware the
 library runs on.
 
 - **NEON kernels for training** (and SVE where available), so that Apple silicon and AArch64
@@ -327,7 +348,7 @@ library runs on.
   and operators whose workspace is known when they are exported, run by the engine without a heap (C99,
   as now) and in WebAssembly; an export outside the subset names the operator that keeps it out.
 
-## 1.13: scale
+## 1.14: scale
 
 Models that do not fit one GPU's memory or time (planned for 1.4 until the language models came first).
 
@@ -359,19 +380,16 @@ without dependencies, packaged where the library is. It waits for its repository
   files, sampling options as llama.cpp's, models fetched from Hugging Face by name.
 - **0.2, with 1.6**: the GPU (CUDA or Vulkan by flag), Hugging Face's directories, a server with an
   OpenAI-compatible HTTP API (completions, chat, streaming) that batches its requests in one session.
-- **0.3, with 1.7**: `salam image` (SDXL and FLUX.1: a prompt, a seed, a sampler, steps).
-- **0.4, with 1.8 and 1.9**: the experts' offload and layer splits by flag, speculative decoding with a draft model,
+- **0.3, with 1.8**: `salam image` (SDXL and FLUX.1: a prompt, a seed, a sampler, steps).
+- **0.4, with 1.9 and 1.10**: the experts' offload and layer splits by flag, speculative decoding with a draft model,
   the hybrid models, images in chats (the vision encoders), grammars that constrain generation (GBNF, JSON schemas).
 
 ## 2.0: what 1.x cannot add
 
 A major release only for what would break programs; candidates so far:
 
-- the training API on graphs: networks built as 1.5's graphs and trained through the gradients of their
-  operators, so that any graph trains, with tensors of more than three axes and of variable length (sequences
-  of any length per call rather than a fixed input layer, which the transformer layers of 1.2 approximate with
-  a fixed context), replacing the network of fixed layers that programs build today; inference has both from
-  1.5;
+- the network of fixed layers replaced by graphs (trained through graphs from 1.7, beside it): the layer API
+  removed once every program it serves has a graph to move to;
 - layers of the program's own in networks the library trains (their backward passes; operators of the
   program's own run in graphs from 1.6);
 - training across machines.
@@ -414,7 +432,7 @@ On an RTX 4050 Laptop GPU against PyTorch 2.14 with cuDNN (`Bin/Benchmark gpu` a
 0.14 is ahead in every workload, with the data in GPU memory (its data sets) or in host memory:
 the MNIST CNN (with and without batch normalization) trains 1.6 to 1.9 times as fast as PyTorch and
 runs 2.1 to 2.4 times as fast in single precision, 1.5 to 1.6 and 1.8 to 2.1 times as fast as its
-autocast in bfloat16; ResNet-20 and the U-Net run 1.75 to 1.9 times as fast in either precision and
+autocast in bfloat16; ResNet-20 and the U-Net run 1.75 to 1.10 times as fast in either precision and
 train 1.3 to 1.45 times as fast in bfloat16; the MobileNet-style network 1.45 and 4.5 times, 1.26 and
 3 times; the 784-512-1000-10 MLP trains mini-batches 3.7 to 6.2 times as fast and infers 1.23 and 1.3
 times as fast. The margins left thin, 1.14 to 1.25 times, are the MLP's full batches (single
