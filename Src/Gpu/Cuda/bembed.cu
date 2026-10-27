@@ -149,6 +149,13 @@ KERNEL(bembed, SpgBembedPush) {
             if (five) code |= (int32_t)(((U(p.table + V * (p.d / 2u) + V * blocks * (one ? 8u : 4u))[at] >> i) & 1u) << 4);
             v = t == SPG_B_Q4_0 ? (float)(code - 8) * sc[0] : t == SPG_B_IQ4_NL ? (float)iq4_value((uint32_t)code) * sc[0]
               : t == SPG_B_Q5_0 ? (float)(code - 16) * sc[0] : (float)code * sc[0] + sc[1];
+        } else if (p.type == SPG_EMB_PACKED + SPG_B_IQ4_XS) {
+            /* (packed: the super-block's scale times the sub-block's, times the code's value) */
+            const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;
+            const uint32_t byte = row[16u * sub + (i & 15u)], code = i < 16u ? byte & 0xFu : byte >> 4;
+            const int32_t sc = (int8_t)((const uint16_t *)(p.table + V * (p.d / 2u)))[(uint64_t)token * subs + sub];
+            const float d = F(p.table + V * (p.d / 2u) + V * subs * 2u)[2u * ((uint64_t)token * blocks + sub / 8u)];
+            v = d * (float)sc * (float)iq4_value(code);
         } else if (p.type == SPG_EMB_PACKED + SPG_B_Q6_K) {
             /* (packed: the super-block's scale times the half's, times the code less 32) */
             const uint64_t V = p.vocabulary, subs = p.d / 32u, blocks = p.d / 256u, sub = c / 32u, i = c % 32u;

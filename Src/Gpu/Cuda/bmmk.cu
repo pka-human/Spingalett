@@ -29,6 +29,7 @@
 #define THREADS (64u * WN)
 #define SIX (TYPE == SPG_B_Q6_K)            /* Q6_K: halves of 16 of their own scales, two high bits, no minima */
 #define FIVE (TYPE == SPG_B_Q5_K)           /* Q5_K: Q4_K's and a fifth bit */
+#define NLX (TYPE == SPG_B_IQ4_XS)          /* IQ4_XS: IQ4_NL's values, signed scales, no minima */
 #define BM 64u
 #define BN (8u * TN * WN)
 #define SB 2u                               /* sub-blocks of 32 values a stage */
@@ -75,12 +76,27 @@ DEVICE uint32_t spread2(uint32_t x) {
     x = x | x << 12;
     return (x & 0x03030303u) << 4;
 }
-/* d = a b of 8-bit integers (16 x 32 signed by 32 x 8 unsigned), exact */
+/* d = a b of 8-bit integers (16 x 32 signed by 32 x 8 unsigned; IQ4_XS: signed), exact */
 DEVICE void mma_s8u8_k32(int32_t (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-        "{%10, %10, %10, %10};"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+    if (NLX)
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+            "{%10, %10, %10, %10};"
+            : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+    else
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+            "{%10, %10, %10, %10};"
+            : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+/* four codes (bytes of 0 to 15) as IQ4_NL's values (llama.cpp's kvalues_iq4nl), by two byte permutations */
+DEVICE uint32_t nl_values(uint32_t q) {
+    const uint32_t y = q | q >> 4, sel = ((y & 0xFFu) | ((y >> 8) & 0xFF00u)) & 0x7777u;
+    uint32_t lo, hi;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo) : "r"(0xBFAD9881u), "r"(0xF6EADDCFu), "r"(sel));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi) : "r"(0x26190D01u), "r"(0x71594535u), "r"(sel));
+    const uint32_t mask = ((q >> 3) & 0x01010101u) * 0xFFu;
+    return (lo & ~mask) | (hi & mask);
 }
 
 /* chunk g of row r of the rows' codes (rows of 64 bytes), swizzled: ldmatrix's eight rows in distinct banks */
@@ -207,6 +223,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
                     b0[b] |= spread1((f >> (4u * t)) & 0xFu);
                     b1[b] |= spread1((f >> (16u + 4u * t)) & 0xFu);
                 }
+                if (NLX) {
+                    b0[b] = nl_values(b0[b]);
+                    b1[b] = nl_values(b1[b]);
+                }
                 if (SIX) {
                     /* (the high two bits of the four values of each half) */
                     const uint32_t piece = *(const uint16_t *)(st.h + 16u * r + 8u * cb + 2u * t);
@@ -248,7 +268,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
                     int32_t s4[4];
                     mma_s8u8_k32(s4, af[a], b0[b], b1[b]);
 #pragma unroll
-                    for (uint32_t e = 0; e < 4u; e++) i1[a][b][e] += (int32_t)((pw[b][e & 1u] >> (16u * cb)) & 0xFFu) * s4[e];
+                    for (uint32_t e = 0; e < 4u; e++) {
+                        const uint32_t sc = (pw[b][e & 1u] >> (16u * cb)) & 0xFFu;
+                        i1[a][b][e] += (NLX ? (int32_t)(int8_t)sc : (int32_t)sc) * s4[e];
+                    }
                 }
         }
         if (j == PER - 1u) {
@@ -275,7 +298,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
 #pragma unroll
                             for (uint32_t c = 0; c < 8u; c++) i2 += (int32_t)((words[c / 2u] >> (16u * (c & 1u) + 8u)) & 0xFFu) * x32[c];
                             float term = (su.dm[cn][0] * dx) * (float)i1[a][b][e];
-                            if (!SIX) term = term + (su.dm[cn][1] * dx) * (float)i2;
+                            if (!SIX && !NLX) term = term + (su.dm[cn][1] * dx) * (float)i2;
                             acc[a][b][e] = acc[a][b][e] + term;
                             i1[a][b][e] = 0;
                         }

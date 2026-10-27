@@ -23,6 +23,7 @@
 
 #define SIX (TYPE == SPG_B_Q6_K)
 #define FIVE (TYPE == SPG_B_Q5_K)
+#define NLX (TYPE == SPG_B_IQ4_XS)
 
 struct uint4_ {
     uint32_t x, y, z, w;
@@ -31,6 +32,14 @@ struct uint4_ {
 DEVICE float shfl_f(float v, uint32_t lane) { return __nvvm_shfl_sync_idx_f32(0xFFFFFFFFu, v, lane, 0x1F); }
 DEVICE int32_t shfl_add(int32_t v, uint32_t mask) { return v + (int32_t)__nvvm_shfl_sync_bfly_i32(0xFFFFFFFFu, v, mask, 0x1F); }
 DEVICE uint32_t spread1(uint32_t x) { return ((x * 0x00204081u) & 0x01010101u) << 4; }
+DEVICE uint32_t nl_values(uint32_t q) {
+    const uint32_t y = q | q >> 4, sel = ((y & 0xFFu) | ((y >> 8) & 0xFF00u)) & 0x7777u;
+    uint32_t lo, hi;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo) : "r"(0xBFAD9881u), "r"(0xF6EADDCFu), "r"(sel));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi) : "r"(0x26190D01u), "r"(0x71594535u), "r"(sel));
+    const uint32_t mask = ((q >> 3) & 0x01010101u) * 0xFFu;
+    return (lo & ~mask) | (hi & mask);
+}
 DEVICE int32_t dp4a(uint32_t a, uint32_t b, int32_t c) {
     int32_t d;
     asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
@@ -89,13 +98,17 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
                     lo |= spread1((f >> (4u * k)) & 0xFu);
                     hi |= spread1((f >> (16u + 4u * k)) & 0xFu);
                 }
+                if (NLX) {
+                    lo = nl_values(lo);
+                    hi = nl_values(hi);
+                }
                 s = dp4a(lo, xa[k], s);
                 s = dp4a(hi, xb[k], s);
             }
             if (!SIX) {
                 const uint32_t pr = pairs[c];
-                i1 = (int32_t)(pr & 0xFFu) * s;
-                i2 = (int32_t)(pr >> 8) * (xs[2u * c] + xs[2u * c + 1u]);
+                i1 = (NLX ? (int32_t)(signed char)(pr & 0xFFu) : (int32_t)(pr & 0xFFu)) * s;
+                i2 = NLX ? 0 : (int32_t)(pr >> 8) * (xs[2u * c] + xs[2u * c + 1u]);
             }
         }
         /* (a super-block's sub-blocks: their integers summed across their eight lanes, exact) */
@@ -108,7 +121,7 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
         if (lane % 8u == 0u && b < blocks) {
             const float d = dm[2u * b], m = dm[2u * b + 1u], dxv = dx[b];
             term = (d * dxv) * (float)i1;
-            if (!SIX) term = term + (m * dxv) * (float)i2;
+            if (!SIX && !NLX) term = term + (m * dxv) * (float)i2;
         }
         /* the round's super-blocks' terms in their order */
         const uint32_t first = c0 / 8u, count = blocks - first < 4u ? blocks - first : 4u;

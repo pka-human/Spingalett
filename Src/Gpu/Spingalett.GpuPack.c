@@ -10,7 +10,8 @@
  * sub-block of 32 values in 16 bytes (byte i the code of value i, then of value i + 16 above it: a lane's word gives
  * both halves of a fragment of 32), N rows of K / 2 bytes; the sub-blocks' 6-bit scales and minima in pairs of bytes,
  * N x K / 32; the super-blocks' scale and minimum's negation (as the products take them) as pairs of floats, N x K / 256;
- * Q5_K as Q4_K, then the fifth bits, a word a sub-block (bit i value i's), N x K / 32.
+ * Q5_K as Q4_K, then the fifth bits, a word a sub-block (bit i value i's), N x K / 32. IQ4_XS as Q4_K: its codes (of
+ * IQ4_NL's values), its sub-blocks' signed scales (minima 0), its super-blocks' scales (and zeros).
  * Q6_K: the low four bits of the codes as Q4_K's, then their high two bits, eight bytes a sub-block of 32 (sixteen bits
  * a lane's word of low bits: the high bits of its four values of the first half of 16, then of the second's), N rows of
  * K / 4 bytes; the halves' signed scales in pairs of bytes, N x K / 32; the super-blocks' scales (and zeros) as pairs of
@@ -40,7 +41,7 @@ static float half_at(const uint8_t *b) { return spingalett_fp16_to_float((uint16
 size_t spg_packed_bytes(uint32_t type, uint32_t N, uint32_t K) {
     switch (type) {
         case SPG_B_Q8_0: return (size_t)N * K + (size_t)N * (K / 32u) * sizeof(float);
-        case SPG_B_Q4_K: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u + (size_t)N * (K / 256u) * 2u * sizeof(float);
+        case SPG_B_Q4_K: case SPG_B_IQ4_XS: return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u + (size_t)N * (K / 256u) * 2u * sizeof(float);
         case SPG_B_Q5_K:
             return (size_t)N * (K / 2u) + (size_t)N * (K / 32u) * 2u + (size_t)N * (K / 256u) * 2u * sizeof(float) +
                    (size_t)N * (K / 32u) * 4u;
@@ -119,6 +120,26 @@ void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, 
                     }
                 }
             }
+    }
+    if (type == SPG_B_IQ4_XS) {
+        /* (GGUF's: the scale, the scales' high two bits, their low four bits, then the codes of every sub-block in sixteen
+           bytes as Q4_0's) */
+        const uint32_t blocks = K / 256u, subs = K / 32u;
+        uint16_t *pairs = (uint16_t *)(void *)(dst + (size_t)N * (K / 2u));
+        float *dm = (float *)(void *)(dst + (size_t)N * (K / 2u) + (size_t)N * subs * 2u);
+        for (uint32_t j = 0; j < N; j++)
+            for (uint32_t b = 0; b < blocks; b++) {
+                const uint8_t *block = src + ((size_t)j * blocks + b) * 136u;
+                const uint32_t high = (uint32_t)block[2] | (uint32_t)block[3] << 8;
+                dm[2u * ((size_t)j * blocks + b)] = half_at(block);
+                dm[2u * ((size_t)j * blocks + b) + 1u] = 0.0f;
+                memcpy(dst + (size_t)j * (K / 2u) + 128u * b, block + 8, 128);
+                for (uint32_t c = 0; c < 8u; c++) {
+                    const int32_t sc = (int32_t)(((block[4u + c / 2u] >> (4u * (c % 2u))) & 0xFu) | (((high >> (2u * c)) & 3u) << 4)) - 32;
+                    pairs[(size_t)j * subs + 8u * b + c] = (uint16_t)(uint8_t)(int8_t)sc;
+                }
+            }
+        return;
     }
     if (type == SPG_B_Q6_K) {
         const uint32_t blocks = K / 256u, subs = K / 32u;
