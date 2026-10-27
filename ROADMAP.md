@@ -15,6 +15,12 @@ against PyTorch on the same machine.
   on dense and convolutional networks and `torch.compile` on the GPT by sound mathematics and algorithms and by
   carrying nothing they do not need; every version that moves the CPU forward plans the GPU's side too, measured
   against the strongest rival on the same card (`torch.compile`, llama.cpp's CUDA and Vulkan builds).
+- **Ahead, not level.** Matching the heavyweights is not the aim: every workload the project tracks (training and
+  inference, CPU and GPU, layer networks, graphs and language models) runs clearly faster than the strongest rival on
+  the same machine (PyTorch eager and `torch.compile` with `max-autotune`, ONNX Runtime, llama.cpp), by 1.3 times or
+  more, measured end to end as a program sees it (inputs from and outputs to the host where the rival's are too).
+  A margin under 1.1 times counts as a gap: it stays listed below with its cause and the next step until it closes,
+  and a release names its gaps in the CHANGELOG.
 - **Embedded in other programs.** A C library without dependencies, an engine without a heap and results that
   repeat their bits are what a game engine (creatures' minds, opponents, the same decisions on every client of a
   lockstep game, replays that replay), a robot (trained in simulation, run on the real machine, a failure replayed
@@ -132,6 +138,26 @@ What was planned for 1.5 before the IR, built on it: the families become convert
 - **No slower than 1.4**: passes that fuse a language model's graph into 1.4's block kernels, sessions' attention and
   their threads, measured with `llama-bench` on 1.4's files; then the layer models of formats 3 to 10 read as graphs
   of composite operators with the same kernels, measured on every benchmark of README.
+- **Graphs on the GPU ahead of PyTorch by a margin** (the aim above). Where dev/1.6 stands on an RTX 4050 Laptop GPU
+  against PyTorch 2.14.1 (ms, medians; Spingalett's times take the inputs from and the outputs to the host, PyTorch's
+  with its tensors already on the GPU, then with them on the host too):
+
+  | Model | bfloat16 | PyTorch fp16 autocast (on GPU / from host) | single precision | PyTorch fp32 |
+  |---|---:|---:|---:|---:|
+  | ResNet-50 | 1.86 | 1.90 | 3.50 | 3.71 |
+  | BERT-base, 2 x 128 tokens | 3.40 | 3.79 / 3.94 | 10.1 | 9.0 |
+  | GPT-2, 64 tokens | 3.76 | 3.03 / 4.19 | 7.2 | 4.7 |
+  | CLIP's text encoder | 1.86 | 1.94 | 4.74 | 5.13 |
+  | Whisper's encoder | 3.51 | 3.04 | 8.59 | 9.74 |
+  | ViT-B/16 | 3.47 | 3.30 | 10.2 | 8.6 |
+  | A UNet of SDXL's architecture | 4.01 | 13.6 | 8.05 | 11.45 |
+  | Stable Diffusion's VAE decoder | 54 | 58 | 138 | 80 |
+
+  None is yet 1.3 times ahead but the UNet. What is left, by the profiles: attention on the matrix units at 10 TFLOPS
+  (Whisper, ViT; the softmax between the products, blocks that do not fill the device), copies around attention where
+  exporters split a joint QKV product (GPT-2), normalizations written twice for their readers in two precisions, the
+  residual additions and their activations as passes of their own (ResNet), convolutions of single precision in VAE's
+  sizes, products of few rows bound by their weights' memory (GPT-2, CLIP); then `torch.compile` as the rival.
 - **The GPU executor**: CUDA and Vulkan kernels for the operators, an operator without one run on the CPU with its
   data moved (a warning, and CI counting the coverage); GGUF's block types on the GPU: products of a token bound by
   memory (dp4a, Vulkan's integer dot products), products of a prompt on the matrix units, the weights kept in their
