@@ -35,6 +35,7 @@ typedef struct {
     uint8_t run;
     uint32_t type;                  /* RUN_BLOCK: SPG_B_*; RUN_EMBED: SPG_EMB_* */
     uint32_t stride;                /* bytes a row of weights (RUN_BLOCK, RUN_EMBED) */
+    bool packed;                    /* RUN_BLOCK of Q8_0: the weights packed (bmmp, bdotp: image_packed()) */
     uint64_t w, b, g;               /* weights (floats N x K for RUN_FLOAT), biases (or the positions' table), gamma */
     uint32_t inputs[SPINGALETT_MAX_INPUTS];     /* the layers it reads (1 + their index) */
     uint32_t channels[SPINGALETT_MAX_INPUTS];   /* their channels (RUN_CONCAT) */
@@ -133,6 +134,39 @@ static uint64_t image_bytes(SpgGpuSession *s, uint64_t offset, size_t bytes) {
     return at;
 }
 
+/* The image's rows of N x K values of Q8_0 at offset packed, uploaded once (tied tables shared): the codes, N rows of
+   K bytes, then the blocks' scales as floats, N x K / 32 (bmmp's, bdotp's and bembed's layout: the matrix units and
+   the loads take whole sectors of codes) */
+#define PACKED (1ull << 63)         /* (uploaded[]'s offsets of packed copies) */
+static uint64_t image_packed(SpgGpuSession *s, uint64_t offset, uint32_t N, uint32_t K) {
+    for (uint32_t k = 0; k < s->uploaded_count; k++)
+        if (s->uploaded[2u * k] == (offset | PACKED)) return s->uploaded[2u * k + 1u];
+    if (s->uploaded_count == s->uploaded_cap) {
+        const uint32_t cap = s->uploaded_cap ? 2u * s->uploaded_cap : 64u;
+        uint64_t *grown = (uint64_t *)realloc(s->uploaded, 2u * cap * sizeof(uint64_t));
+        if (!grown) return 0;
+        s->uploaded = grown;
+        s->uploaded_cap = cap;
+    }
+    const uint32_t blocks = K / 32u;
+    const size_t bytes = (size_t)N * K + (size_t)N * blocks * sizeof(float);
+    uint8_t *packed = (uint8_t *)malloc(bytes);
+    if (!packed) return 0;
+    float *scales = (float *)(void *)(packed + (size_t)N * K);
+    for (uint32_t j = 0; j < N; j++)
+        for (uint32_t b = 0; b < blocks; b++) {
+            const uint8_t *block = s->image + offset + ((size_t)j * blocks + b) * 34u;
+            memcpy(packed + (size_t)j * K + 32u * b, block + 2, 32);
+            scales[(size_t)j * blocks + b] = spingalett_fp16_to_float(slett_get16(block));
+        }
+    const uint64_t at = upload(s, packed, bytes);
+    free(packed);
+    if (!at) return 0;
+    s->uploaded[2u * s->uploaded_count] = offset | PACKED;
+    s->uploaded[2u * s->uploaded_count++ + 1u] = at;
+    return at;
+}
+
 /* An activation as gew's operator (alpha its slope), NONE for none, false for one gew has not */
 static bool gew_act(ActivationFunction act, uint32_t *op, float *alpha) {
     *alpha = 0.0f;
@@ -186,7 +220,14 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             else if (spingalett_precision_is_block(L->precision)) G->type = SPG_EMB_BLOCK + (L->precision - PRECISION_Q8_0);
             else return *why = "an embedding of integer weights", false;
             G->stride = (uint32_t)spingalett_slett_row_bytes(L->precision, L->row_len);
-            G->w = image_bytes(s, L->weights, (size_t)G->stride * L->rows);
+            if (L->precision == PRECISION_Q8_0) {
+                /* (packed: a table tied to the output layer is that layer's weights) */
+                G->type = SPG_EMB_PACKED;
+                G->stride = L->row_len;
+                G->w = image_packed(s, L->weights, L->rows, L->row_len);
+            } else {
+                G->w = image_bytes(s, L->weights, (size_t)G->stride * L->rows);
+            }
             if (!G->w) return *why = "out of device memory", false;
             if (L->positions) {
                 G->b = image_bytes(s, L->biases, (size_t)L->out_h * L->out_w * L->out_c * sizeof(float));
@@ -206,7 +247,8 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
                 G->act_gew = NONE;          /* (bdot's epilogue applies it) */
                 G->type = L->precision - PRECISION_Q8_0;
                 G->stride = (uint32_t)spingalett_slett_row_bytes(L->precision, K);
-                G->w = image_bytes(s, L->weights, (size_t)G->stride * N);
+                G->packed = L->precision == PRECISION_Q8_0;
+                G->w = G->packed ? image_packed(s, L->weights, N, K) : image_bytes(s, L->weights, (size_t)G->stride * N);
                 if (K > s->kmax) s->kmax = K;
                 return G->w || (*why = "out of device memory", false);
             }
@@ -502,15 +544,16 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             if (rows >= 3u) {
                 /* three rows or more on the matrix units (bmm's 64 rows cost little more than bdot's one: Qwen3-0.6B's
                    layer in Q8_0 on an RTX 4050, 150 us for up to 64 rows, 53 us a row by bdot, 365 us 8 rows) */
-                const uint32_t spec[3] = {G->type, 0u, (uint32_t)L->activation};
+                const uint32_t spec[3] = {G->type, G->packed, (uint32_t)L->activation};
                 SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, L->rows, K, G->stride, 0, L->out_c};
-                spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, groups(rows, 64u), groups(L->rows, 64u), 1);
+                spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 3, &dp, sizeof dp, groups(rows, 64u), groups(L->rows, G->packed ? 128u : 64u),
+                                 1);
                 break;
             }
             for (uint32_t r0 = 0; r0 < rows; r0++) {
-                const uint32_t spec[3] = {G->type, 1u, (uint32_t)L->activation};
+                const uint32_t spec[4] = {G->type, 1u, (uint32_t)L->activation, G->packed};
                 SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, 1u, L->rows, K, G->stride, r0, L->out_c};
-                spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 3, &dp, sizeof dp, groups(L->rows, 8u), 1, 1);
+                spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 4, &dp, sizeof dp, groups(L->rows, 8u), 1, 1);
             }
             break;
         }

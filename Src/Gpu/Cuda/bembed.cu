@@ -122,6 +122,10 @@ KERNEL(bembed, SpgBembedPush) {
             v = from_half(get16(row + 2u * c));
         } else if (p.type == SPG_EMB_BF16) {
             v = from_bf16(get16(row + 2u * c));
+        } else if (p.type == SPG_EMB_PACKED) {
+            /* (Q8_0 packed: the code times its block's scale, as spingalett_block_decode()) */
+            const float d = F(p.table + (uint64_t)p.vocabulary * p.d)[(uint64_t)token * (p.d / 32u) + c / 32u];
+            v = (float)(int8_t)row[c] * d;
         } else {
             const uint32_t t = p.type - SPG_EMB_BLOCK, bv = t >= SPG_B_Q2_K && t != SPG_B_IQ4_NL ? 256u : 32u;
             const uint32_t bytes = t == SPG_B_Q8_0 ? 34u : t == SPG_B_Q4_0 ? 18u : t == SPG_B_Q4_1 ? 20u : t == SPG_B_Q5_0 ? 22u

@@ -364,7 +364,8 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         static const char *const types[SPG_B_TYPES] = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k",
                                                        "q6_k", "iq4_nl", "iq4_xs"};
         if (count < 2 || spec[0] >= SPG_B_TYPES) return -1;
-        snprintf(name, sizeof name, "bdot_%s_r%u", types[spec[0]], spec[1]);    /* (the type, the rows a pass) */
+        if (count > 3 && spec[3]) snprintf(name, sizeof name, "bdotp_%s", types[spec[0]]);   /* (spec 3: packed) */
+        else snprintf(name, sizeof name, "bdot_%s_r%u", types[spec[0]], spec[1]);    /* (the type, the rows a pass) */
     } else if (kernel == SPG_KERNEL_bnorm) {
         if (count < 2) return -1;
         snprintf(name, sizeof name, "bnorm_v%u", spec[1]);       /* (the values a thread at most) */
@@ -372,7 +373,8 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         static const char *const types[SPG_B_TYPES] = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k",
                                                        "q6_k", "iq4_nl", "iq4_xs"};
         if (count < 1 || spec[0] >= SPG_B_TYPES) return -1;
-        snprintf(name, sizeof name, "bmm_%s", types[spec[0]]);
+        /* (spec 1: the weights packed, bmmp's units) */
+        snprintf(name, sizeof name, "%s_%s", count > 1 && spec[1] ? "bmmp" : "bmm", types[spec[0]]);
     } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
         if (count < 2) return -1;
         snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */

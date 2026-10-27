@@ -223,6 +223,10 @@ typedef struct {
     float eps;
 } SpgBnormPush;
 
+/* bmmp.comp, bdotp.comp: bmm's and bdot's products (SpgBdotPush) of weights of Q8_0 packed as sessions keep them: the
+   codes, n rows of k bytes, then the blocks' scales as floats, n x k / 32 (w; 16 bytes more after them). bmm's spec 1,
+   bdot's spec 3 non-zero. bmmp: groups of 64 rows by 128 weights. */
+
 /* bdot.comp: rows of activations quantized by bquant times a linear layer's weights of a block precision (TYPE: the
    precision less SPINGALETT_PRECISION_Q8_0), y[r][j] = bias[j] + spingalett_block_dot() of row j, the bits of the CPU:
    a row of weights `stride` bytes of whole blocks as GGUF stores them, k values; rows r0 to r0 + rows - 1 of the
@@ -240,13 +244,14 @@ enum { SPG_B_Q8_0, SPG_B_Q4_0, SPG_B_Q4_1, SPG_B_Q5_0, SPG_B_Q5_1, SPG_B_Q2_K, S
 /* bembed.comp: the embedding of a session's rows: y[r] = (the table's row of token[r] decoded as the CPU decodes it,
    zeros for a token out of [0, vocabulary)) times scale (0: none), plus the positions' row info[2 r + 1] of
    `positions` (0: none). The table's rows `stride` bytes of TYPE: SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, or
-   SPG_EMB_BLOCK + a block type. A thread a value. */
+   SPG_EMB_BLOCK + a block type; or SPG_EMB_PACKED, Q8_0 packed as bmmp keeps it (vocabulary rows of d codes, then their
+   blocks' scales as floats). A thread a value. */
 typedef struct {
     uint64_t table, token, info, positions, y;
     uint32_t rows, d, stride, type, vocabulary;
     float scale;
 } SpgBembedPush;
-enum { SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, SPG_EMB_BLOCK = 16 };
+enum { SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, SPG_EMB_BLOCK = 16, SPG_EMB_PACKED = 32 };
 
 /* kvattn.comp: a session's attention over the keys and values it keeps. PREP: a warp a row and head of the rows'
    queries, keys and values x [rows][(heads + 2 kv) head]: each query and key RMS-normalized by gq, gk (0: none) then
