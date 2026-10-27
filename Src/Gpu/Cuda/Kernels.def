@@ -191,6 +191,9 @@ SPG_CUDA_PIPE_TILE(128, 128, 32, 4, 4, 3)
 SPG_CUDA_PIPE_TILE(128, 64, 32, 4, 2, 3)
 SPG_CUDA_PIPE_TILE(64, 128, 32, 2, 4, 3)
 SPG_CUDA_PIPE_TILE(64, 64, 32, 2, 2, 4)
+SPG_CUDA_PIPE_TILE(32, 64, 32, 1, 2, 4)        /* (few rows, as a short sequence's: weights streamed through four stages) */
+SPG_CUDA_PIPE_TILE(64, 32, 32, 1, 2, 4)
+SPG_CUDA_PIPE_TILE(16, 64, 32, 1, 2, 4)
 
 SPG_CUDA_PIPE_MODES(0, 1)           /* forward */
 SPG_CUDA_PIPE_MODES(0, 0)           /* data gradient */
