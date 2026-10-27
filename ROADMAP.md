@@ -135,6 +135,9 @@ What was planned for 1.5 before the IR, built on it: the families become convert
 - **Sessions of graphs**: a session's named state (key-value caches, windows as rings), the graph's operators reading and
   writing it, so that a decoder fed a token at a time is a graph like any other; the key-value cache in FP16 or 8
   bits; a prompt's cache kept between requests, the context shifted when it fills.
+- **Language models measured on today's families**: Qwen3 (0.6B, 1.7B, 4B; 8B where it fits) the yardstick on the GPU
+  as on the CPU, against llama.cpp's CUDA and Vulkan builds on the same GGUF files and transformers with
+  `torch.compile`; GPT-2 kept for regressions only.
 - **No slower than 1.4**: passes that fuse a language model's graph into 1.4's block kernels, sessions' attention and
   their threads, measured with `llama-bench` on 1.4's files; then the layer models of formats 3 to 10 read as graphs
   of composite operators with the same kernels, measured on every benchmark of README.
@@ -186,8 +189,13 @@ functions, nothing of 1.x removed), on the executors of 1.5 and 1.6, so that a m
   schedules, gradient accumulation, clipping, mixed precision (bfloat16 on the matrix units, weights in single
   precision) and checkpoints that resume to the bits of an uninterrupted run, a step at a time in a program's loop
   in planned memory. Python: `Graph.from_torch()` modules fine-tuned without PyTorch at run time.
+- **Fine-tuning language models on one consumer GPU**: LoRA adapters on a frozen base (its products in bfloat16, or
+  in 1.4's block types: QLoRA on Q4 and Q8 weights the GPU keeps in their blocks), only the adapters' gradients and
+  moments kept, the base's activations recomputed where memory asks; full fine-tuning where it fits, with the
+  optimizer's moments in bfloat16 or on the host. Target: Qwen3 1.7B and 4B fine-tuned on a 6 GB laptop GPU (an RTX
+  4050), Qwen3 0.6B fully, against PyTorch with PEFT (and bitsandbytes for QLoRA).
 - **Measured** against PyTorch eager and `torch.compile` training the same models on the same machine (ResNet-50,
-  ViT-B/16, BERT-base fine-tuned, GPT-2 small, the SDXL-style UNet), by the margin of the aim above; the layer
+  ViT-B/16, BERT-base fine-tuned, the SDXL-style UNet, Qwen3 0.6B to 4B), by the margin of the aim above; the layer
   networks' training then moves onto graphs where it is no slower, as their inference does in 1.6.
 
 ## 1.8: diffusion
