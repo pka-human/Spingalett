@@ -49,6 +49,9 @@ typedef struct {
                                        (1 + its index; find_pairs()), or 0 */
     bool paired;                    /* RUN_BLOCK: computed by a later layer's pair */
     uint32_t pair_act;              /* the pair's activation (its first rows') */
+    uint32_t into;                  /* RUN_BLOCK: the concatenation it writes its columns of (1 + its index), or 0 */
+    uint32_t ldy;                   /* RUN_BLOCK: floats between its output's rows (0: its channels) */
+    bool gathered;                  /* RUN_CONCAT: its inputs write their columns of it themselves */
     bool folded;                    /* a sum of two layers the RMS normalization after it computes (bnorm) */
     uint32_t tpr, qbv;              /* RMS normalizations by bnorm: grow's threads a row; the blocks of values its
                                        outputs are quantized in for the block layer after it (0: none) */
@@ -409,7 +412,8 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
 /* The layers' outputs in one buffer, each `most` rows of its channels from an offset of a multiple of 256 bytes (the
    kernels' vector loads), first fit, its room free again after its last reader; a product of two layers whose
    second is the block layer just before it, read by it alone, in that layer's epilogue (a gated unit: up times the
-   gate's activation), written where the product's output goes. */
+   gate's activation), written where the product's output goes; a concatenation of block layers read by it alone
+   written by them, each its columns (rows ldy apart: queries, keys and values of types apart, with no copies). */
 static bool layout(SpgGpuSession *s) {
     const uint32_t L = s->layers;
     uint32_t *readers = (uint32_t *)calloc(L + 1u, sizeof(uint32_t)), *last = (uint32_t *)calloc(L + 1u, sizeof(uint32_t));
@@ -430,13 +434,30 @@ static bool layout(SpgGpuSession *s) {
                 break;
             }
     }
+    for (uint32_t i = 1; ok && i + 1u < L; i++) {
+        GLayer *G = &s->L[i];
+        bool all = G->run == RUN_CONCAT && G->act_gew == NONE;
+        for (uint32_t k = 0; all && k < G->L.input_count; k++) {
+            const uint32_t j = G->inputs[k];
+            all = j && j <= i && s->L[j - 1u].run == RUN_BLOCK && !s->L[j - 1u].paired && !s->L[j - 1u].skip &&
+                  readers[j] == 1u && !s->L[j - 1u].into;
+            for (uint32_t m = 0; all && m < k; m++) all = G->inputs[m] != j;
+            if (all && j < L && s->L[j].skip) all = false;  /* (a product of layers writes where its block layer would) */
+        }
+        if (!all) continue;
+        G->gathered = true;
+        for (uint32_t k = 0; k < G->L.input_count; k++) s->L[G->inputs[k] - 1u].into = i + 1u;
+    }
     /* the rooms: of each layer's output but the last's and those a fused product writes instead, from the layer that
        writes it (from[]) to the last that reads it, in the order they are taken */
     uint64_t top = 0;
     for (uint32_t i = 0; ok && i + 1u < L; i++) {
         if (i + 2u < L && s->L[i + 1u].skip) continue;     /* (its product's room instead) */
-        if (s->L[i].paired) continue;                       /* (never written) */
+        if (s->L[i].paired || s->L[i].into) continue;       /* (never written; its concatenation's room instead) */
         from[i] = s->L[i].skip ? i - 1u : i;
+        if (s->L[i].gathered)                               /* (from its first input on) */
+            for (uint32_t k = 0; k < s->L[i].L.input_count; k++)
+                if (s->L[i].inputs[k] - 1u < from[i]) from[i] = s->L[i].inputs[k] - 1u;
         bytes[i] = ((uint64_t)s->most * s->L[i].L.out_c * sizeof(float) + 255u) & ~(uint64_t)255u;
         uint64_t place_at = 0;
         for (bool moved = true; moved;) {
@@ -460,6 +481,13 @@ static bool layout(SpgGpuSession *s) {
             P->gate = P->pair ? 0 : s->L[other - 1u].out;
             P->out = G->out;
         }
+    for (uint32_t i = 1; ok && i + 1u < L; i++)
+        if (s->L[i].gathered)
+            for (uint32_t k = 0, at = 0; k < s->L[i].L.input_count; at += s->L[i].channels[k], k++) {
+                GLayer *P = &s->L[s->L[i].inputs[k] - 1u];
+                P->out = s->L[i].out + (uint64_t)at * sizeof(float);
+                P->ldy = s->L[i].L.out_c;
+            }
     free(readers);
     free(last);
     free(at);
@@ -623,14 +651,16 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 /* three rows or more on the matrix units (bmm's 64 rows cost little more than bdot's one: Qwen3-0.6B's
                    layer in Q8_0 on an RTX 4050, 150 us for up to 64 rows, 53 us a row by bdot, 365 us 8 rows) */
                 const uint32_t spec[4] = {G->type, G->packed, act, G->pair != 0u};
-                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, N, K, G->stride, 0, L->out_c};
+                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, N, K, G->stride, 0,
+                                  G->ldy ? G->ldy : L->out_c};
                 spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 4, &dp, sizeof dp, groups(rows, 64u),
                                  groups(N, G->packed ? spg_packed_cols(G->type) : 64u), 1);
                 break;
             }
             for (uint32_t r0 = 0; r0 < rows; r0++) {
                 const uint32_t spec[5] = {G->type, 1u, act, G->packed, G->pair != 0u};
-                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, 1u, N, K, G->stride, r0, L->out_c};
+                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, 1u, N, K, G->stride, r0,
+                                  G->ldy ? G->ldy : L->out_c};
                 spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 5, &dp, sizeof dp, groups(L->rows, 8u), 1, 1);
             }
             break;
@@ -786,7 +816,7 @@ static SpgGpuCommands *record_step(SpgGpuSession *s, uint32_t rows, uint32_t pic
     s->quantized = 0;
     for (uint32_t i = 0; i < s->layers; i++) {
         const GLayer *G = &s->L[i];
-        if (G->skip || G->folded || G->paired) continue;
+        if (G->skip || G->folded || G->paired || G->gathered) continue;
         spg_gpu_barrier(c);
         if (G->run != RUN_BLOCK) s->quantized = 0;      /* (a layer that may write where the quantized input was) */
         uint64_t x[SPINGALETT_MAX_INPUTS];
