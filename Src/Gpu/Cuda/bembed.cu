@@ -142,14 +142,15 @@ KERNEL(bembed, SpgBembedPush) {
             } else if (t == SPG_B_Q4_K || t == SPG_B_Q5_K) {
                 const bool five = t == SPG_B_Q5_K;
                 if (five) code |= (int32_t)(((((const uint32_t *)aux)[sub] >> i) & 1u) << 4);
-                const uint16_t *pairs = (const uint16_t *)(aux + (five ? 4u * subs : 0u));
-                const uint32_t pair = pairs[sub];
-                const uint16_t *dm = pairs + subs + 2u * sb;
-                const float d1 = from_half(dm[0]) * (float)(pair & 0xFFu), m1 = from_half(dm[1]) * (float)(pair >> 8);
+                /* (the super-block's first 16 bytes as GGUF keeps them) */
+                const uint8_t *hd = aux + (five ? 4u * subs : 0u) + 16u * sb;
+                int32_t s, mn;
+                scale_min_k4(sub % 8u, hd + 4, s, mn);
+                const float d1 = half_at(hd) * (float)s, m1 = half_at(hd + 2) * (float)mn;
                 v = d1 * (float)code - m1;
             } else if (t == SPG_B_IQ4_XS) {
-                const uint16_t *pairs = (const uint16_t *)aux;
-                v = from_half(pairs[subs + 2u * sb]) * (float)(int8_t)pairs[sub] * (float)iq4_value((uint32_t)code);
+                const uint32_t *hd = (const uint32_t *)(aux + 8u * sb);     /* (its first 8 bytes) */
+                v = from_half(hd[0] & 0xFFFFu) * (float)iq4xs_scale(hd[0], hd[1], sub % 8u) * (float)iq4_value((uint32_t)code);
             } else {                            /* Q6_K */
                 /* (byte (i % 16) of the pair of sub-blocks' highs: the first's at bits 0 to 3, the second's 4 to 7) */
                 const uint8_t hb = row[p.d / 2u + 16u * (sub / 2u) + (i & 15u)];

@@ -138,8 +138,8 @@ struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: th
     uint32_t f[FIVE ? BN : 4u][SB];         /* Q5_K: their fifth bits */
 };
 struct Super {
-    uint32_t pairs[BN][4];                  /* the sub-blocks' scale | minimum << 8 (Q6_K: the halves' signed scales),
-                                               two sub-blocks a word */
+    uint32_t pairs[BN][4];                  /* the sub-blocks' scale | minimum << 8 (IQ4_XS: the signed scale; Q6_K: the
+                                               halves' signed scales), two sub-blocks a word */
     int32_t xs[BM][16];                     /* the rows' sums of 16 codes (Q4_K, Q5_K: then in their place those sums as
                                                64 h + l, the bytes h then the bytes l: three workgroups an SM) */
     uint32_t dm[BN];                        /* the scale and minimum (Q6_K: two scales), float16 */
@@ -148,6 +148,8 @@ struct Super {
 struct Shared {
     Stage st[STAGES];
     Super su[2];
+    uint32_t heads[SIX ? 1u : BN][4];       /* a super-block's first 16 bytes as GGUF keeps them (IQ4_XS: 8), copied a
+                                               stage ahead of the super-block and spread into its pairs and dm */
 };
 
 extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPush p, const Spec spec) {
@@ -155,9 +157,11 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
     const uint32_t tid = thread_x(), lane = tid & 31u, warp = tid >> 5, wm = warp / WN, wn = warp % WN;
     const uint32_t g = lane >> 2, t = lane & 3u;
     const uint32_t m0 = block_x() * BM, n0 = block_y() * BN, subs = p.k / 32u, blocks = p.k / 256u, stages = subs / SB;
-    /* (a row's codes, Q6_K's high bits, then its fifth bits, scales and minima, the super-blocks' scales) */
+    /* (a row's codes, Q6_K's high bits, then its fifth bits, the super-blocks' first bytes; Q6_K: the halves' scales,
+       then the super-blocks') */
     const uint8_t *weights = (const uint8_t *)p.w;
     const uint32_t aux = SPG_PACK_CODES(TYPE, p.k), pairs = aux + (FIVE ? 4u * subs : 0u), dm = pairs + 2u * subs;
+    const uint32_t head = NLX ? 8u : 16u;   /* (bytes of a super-block's first, at `pairs`) */
     /* this thread's copies, their sources at stage 0 and their sizes, computed once (past the rows and the weights the
        first row's, zero bytes of it) */
     const uint32_t base = shared_address(&sh);
@@ -209,10 +213,17 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
             if (FIVE) copy8(st + __builtin_offsetof(Stage, f) + 4u * SB * tid, row + aux + 4u * SB * s, 2u * size_w);
             if (SIX) copy16(st + __builtin_offsetof(Stage, h) + 16u * tid, row + p.k / 2u + 8u * SB * s, 4u * size_w);
             /* (a super-block's scales at its first stage, 16 bytes: copies of few bytes from many rows cost as much as
-               the codes; Q6_K: a float16 scale a super-block, the word of this one's and its neighbour's) */
-            if (j == 0u) {
+               the codes; Q6_K: a float16 scale a super-block, the word of this one's and its neighbour's. The others:
+               its first bytes a stage before its first, the first super-block's with the first stage) */
+            if (SIX && j == 0u) {
                 copy16(su + __builtin_offsetof(Super, pairs) + 16u * tid, row + pairs + 16u * sb, 4u * size_w);
-                copy4(su + __builtin_offsetof(Super, dm) + 4u * tid, row + dm + (SIX ? 4u * (sb / 2u) : 4u * sb), size_w);
+                copy4(su + __builtin_offsetof(Super, dm) + 4u * tid, row + dm + 4u * (sb / 2u), size_w);
+            }
+            const uint32_t next = s == 0u ? 0u : (s + 1u) / PER;
+            if (!SIX && (s == 0u || (j == PER - 1u && next < blocks))) {
+                const uint32_t to = base + __builtin_offsetof(Shared, heads) + 16u * tid;
+                if (NLX) copy8(to, row + pairs + 8u * next, 2u * size_w);
+                else copy16(to, row + pairs + 16u * next, 4u * size_w);
             }
         }
         if (!NLX && j == 0u)
@@ -249,6 +260,30 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         wr = wr == STAGES - 1u ? 0u : wr + 1u;
         const uint32_t sb = s / PER, j = s % PER;
         const Super &su = sh.su[sb & 1u];
+        if (!SIX && (s == 0u || (j == PER - 1u && sb + 1u < blocks))) {
+            /* the next super-block's first bytes (with the first stage the first's) spread into its pairs and dm, a
+               thread half a column (sub-blocks 4 part to 4 part + 3; shown to the other warps by the next stage's
+               barrier, the first super-block's by one of its own) */
+            static_assert(THREADS == 2u * BN, "half a column a thread");
+            Super &sw = sh.su[(s == 0u ? 0u : sb + 1u) & 1u];
+            const uint32_t col = tid >> 1, part = tid & 1u;
+            const uint32_t w0 = sh.heads[col][0], w1 = sh.heads[col][1];
+            uint32_t lo, hi;
+            if (NLX) {
+                lo = ((uint32_t)iq4xs_scale(w0, w1, 4u * part) & 0xFFu) | ((uint32_t)iq4xs_scale(w0, w1, 4u * part + 1u) & 0xFFu) << 16;
+                hi = ((uint32_t)iq4xs_scale(w0, w1, 4u * part + 2u) & 0xFFu) | ((uint32_t)iq4xs_scale(w0, w1, 4u * part + 3u) & 0xFFu) << 16;
+                if (part == 0u) sw.dm[col] = w0 & 0xFFFFu;
+            } else {
+                uint32_t sc, mn;
+                k4_scales(w1, sh.heads[col][2], sh.heads[col][3], part, sc, mn);
+                lo = prmt(sc, mn, 0x5140u);
+                hi = prmt(sc, mn, 0x7362u);
+                if (part == 0u) sw.dm[col] = w0;
+            }
+            sw.pairs[col][2u * part] = lo;
+            sw.pairs[col][2u * part + 1u] = hi;
+            if (s == 0u) barrier();
+        }
         if (!NLX && j == 0u && tid < BM) {
             /* this row's sums of 16 codes of the super-block as 64 h + l (h of -32 to 31, l of 0 to 63), the bytes of the
                minima's products (Q6_K: of the halves' scales'; shown to the other warps by the next stage's barrier: a

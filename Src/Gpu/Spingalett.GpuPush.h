@@ -235,7 +235,7 @@ typedef struct {
 #define SPG_PACK_AUX(t, k) \
     ((t) == SPG_B_Q8_0 || (t) == SPG_B_Q4_0 || (t) == SPG_B_IQ4_NL ? (k) / 16u : (t) == SPG_B_Q4_1 ? (k) / 8u : \
      (t) == SPG_B_Q5_0 ? (k) / 8u + (k) / 16u : (t) == SPG_B_Q5_1 ? (k) / 4u : \
-     (t) == SPG_B_Q4_K || (t) == SPG_B_IQ4_XS ? (k) / 16u + (k) / 64u : (t) == SPG_B_Q5_K ? (k) / 8u + (k) / 16u + (k) / 64u : \
+     (t) == SPG_B_Q4_K ? (k) / 16u : (t) == SPG_B_IQ4_XS ? (k) / 32u : (t) == SPG_B_Q5_K ? (k) / 8u + (k) / 16u : \
      (t) == SPG_B_Q6_K ? (k) / 16u + (k) / 128u : 0u)
 #define SPG_PACK_ROW(t, k) (SPG_PACK_AUX(t, k) ? (SPG_PACK_CODES(t, k) + SPG_PACK_AUX(t, k) + 15u) & ~15u : 0u)
 

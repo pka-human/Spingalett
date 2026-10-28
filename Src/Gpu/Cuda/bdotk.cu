@@ -57,8 +57,9 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
         const uint8_t *row = (const uint8_t *)p.w + (uint64_t)r * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
         const uint8_t *highs = row + p.k / 2u, *aux = row + SPG_PACK_CODES(TYPE, p.k);
         const uint32_t *fifth = (const uint32_t *)aux;
-        const uint16_t *pairs = (const uint16_t *)(aux + (FIVE ? 4u * subs : 0u));
+        const uint16_t *pairs = (const uint16_t *)(aux + (FIVE ? 4u * subs : 0u));     /* (Q6_K) */
         const uint16_t *dm = (const uint16_t *)(pairs + subs);       /* (Q6_K: the scales alone) */
+        const uint8_t *heads = (const uint8_t *)pairs;  /* (the others: the super-blocks' first bytes as GGUF keeps them) */
         const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
         const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
         float acc = 0.0f;
@@ -103,10 +104,17 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
                     s = dp4a(lo, xa[k], s);
                     s = dp4a(hi, xb[k], s);
                 }
-                if (!SIX) {
-                    const uint32_t pr = pairs[c];
-                    i1 = (NLX ? (int32_t)(signed char)(pr & 0xFFu) : (int32_t)(pr & 0xFFu)) * s;
-                    i2 = NLX ? 0 : (int32_t)(pr >> 8) * (xs[2u * c] + xs[2u * c + 1u]);
+                if (NLX) {
+                    const uint2_ hw = *(const uint2_ *)(heads + 8u * (c / 8u));
+                    i1 = iq4xs_scale(hw.x, hw.y, c % 8u) * s;
+                } else if (!SIX) {
+                    /* (the super-block's 16 bytes, the same for its eight lanes) */
+                    const uint4_ hw = *(const uint4_ *)(heads + 16u * (c / 8u));
+                    uint32_t sc, mn;
+                    k4_scales(hw.y, hw.z, hw.w, (c % 8u) / 4u, sc, mn);
+                    const uint32_t at = 8u * (c % 4u);
+                    i1 = (int32_t)((sc >> at) & 0xFFu) * s;
+                    i2 = (int32_t)((mn >> at) & 0xFFu) * (xs[2u * c] + xs[2u * c + 1u]);
                 }
             }
             /* (a super-block's sub-blocks: their integers summed across their eight lanes, exact) */
@@ -117,7 +125,8 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
             float term = 0.0f;
             const uint32_t b = c / 8u;
             if (lane % 8u == 0u && b < blocks) {
-                const float d = from_half(dm[SIX ? b : 2u * b]), m = SIX ? 0.0f : -from_half(dm[2u * b + 1u]), dxv = dx[b];
+                const uint16_t *hd = (const uint16_t *)(heads + (NLX ? 8u : 16u) * b);
+                const float d = from_half(SIX ? dm[b] : hd[0]), m = SIX || NLX ? 0.0f : -from_half(hd[1]), dxv = dx[b];
                 term = (d * dxv) * (float)i1;
                 if (!SIX && !NLX) term = term + (m * dxv) * (float)i2;
             }

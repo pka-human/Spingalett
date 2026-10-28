@@ -17,26 +17,15 @@
  * shift and a mask put each fragment's at bits 4 and 5 of its bytes.
  * The rest, in order: Q8_0, Q4_0, IQ4_NL: the blocks' scales (float16); Q4_1: the scale and the minimum; Q5_0: the
  * fifth bits, a word a block (bit i value i's), then the scales; Q5_1: the fifth bits, then the scales and minima;
- * Q4_K: the sub-blocks' 6-bit scale and minimum in a pair of bytes, then the super-blocks' scale and minimum (float16);
- * Q5_K: the fifth bits, a word a sub-block, then Q4_K's; IQ4_XS: the sub-blocks' signed scales in pairs of bytes (the
- * second 0), then the super-blocks' scale (and 0); Q6_K: the halves' signed scales in pairs of bytes, then the
- * super-blocks' scales.
+ * Q4_K: every super-block's first 16 bytes as GGUF keeps them (its scale and minimum as float16, then its sub-blocks'
+ * 6-bit scales and minima in 12 bytes); Q5_K: the fifth bits, a word a sub-block, then Q4_K's; IQ4_XS: every
+ * super-block's first 8 bytes as GGUF keeps them (its scale, then the high two and the low four bits of its sub-blocks'
+ * scales); Q6_K: the halves' signed scales in pairs of bytes, then the super-blocks' scales.
  */
 
 #include "Spingalett.GpuKernels.h"
 #include "Spingalett.Engine.h"
 #include <string.h>
-
-/* The 6-bit scale and minimum j of a Q4_K or Q5_K super-block (llama.cpp's get_scale_min_k4()) */
-static void scale_min_k4(uint32_t j, const uint8_t *q, uint32_t *d, uint32_t *m) {
-    if (j < 4u) {
-        *d = q[j] & 63u;
-        *m = q[j + 4u] & 63u;
-    } else {
-        *d = (q[j + 4u] & 0xFu) | ((uint32_t)(q[j - 4u] >> 6) << 4);
-        *m = (uint32_t)(q[j + 4u] >> 4) | ((uint32_t)(q[j] >> 6) << 4);
-    }
-}
 
 size_t spg_packed_bytes(uint32_t type, uint32_t N, uint32_t K) { return (size_t)N * SPG_PACK_ROW(type, K); }
 
@@ -78,16 +67,13 @@ void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, 
             case SPG_B_Q4_K: case SPG_B_Q5_K: {
                 const bool five = type == SPG_B_Q5_K;
                 uint32_t *fifth = (uint32_t *)(void *)aux;
-                uint16_t *pairs = (uint16_t *)(void *)(aux + (five ? 4u * B : 0u));
-                uint8_t *dm = (uint8_t *)(pairs + B);
+                uint8_t *heads = aux + (five ? 4u * B : 0u);
                 for (uint32_t b = 0; b < SBK; b++) {
                     /* (Q5_K: the high bits of value l of every sub-block in byte 16 + l, the codes from byte 48) */
                     const uint8_t *block = src + ((size_t)j * SBK + b) * (five ? 176u : 144u), *qs = block + (five ? 48 : 16);
-                    memcpy(dm + 4u * b, block, 4);
+                    memcpy(heads + 16u * b, block, 16);
                     for (uint32_t c = 0; c < 8u; c++) {
-                        uint32_t sc, mn, code[32];
-                        scale_min_k4(c, block + 4, &sc, &mn);
-                        pairs[8u * b + c] = (uint16_t)(sc | mn << 8);
+                        uint32_t code[32];
                         /* value i of sub-block c: the low (c even) or high nibble of byte 32 (c / 2) + i */
                         for (uint32_t i = 0; i < 32u; i++) code[i] = (uint32_t)(qs[32u * (c / 2u) + i] >> (4u * (c % 2u))) & 0xFu;
                         nibbles(r + 16u * (8u * b + c), code);
@@ -100,23 +86,15 @@ void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, 
                 }
                 break;
             }
-            case SPG_B_IQ4_XS: {
+            case SPG_B_IQ4_XS:
                 /* (GGUF's: the scale, the scales' high two bits, their low four bits, then the codes of every sub-block
                    in sixteen bytes as Q4_0's) */
-                uint16_t *pairs = (uint16_t *)(void *)aux;
-                uint8_t *dm = (uint8_t *)(pairs + B);
                 for (uint32_t b = 0; b < SBK; b++) {
                     const uint8_t *block = src + ((size_t)j * SBK + b) * 136u;
-                    const uint32_t high = (uint32_t)block[2] | (uint32_t)block[3] << 8;
-                    memcpy(dm + 4u * b, block, 2);
+                    memcpy(aux + 8u * b, block, 8);
                     memcpy(r + 128u * b, block + 8, 128);
-                    for (uint32_t c = 0; c < 8u; c++) {
-                        const int32_t sc = (int32_t)(((block[4u + c / 2u] >> (4u * (c % 2u))) & 0xFu) | (((high >> (2u * c)) & 3u) << 4)) - 32;
-                        pairs[8u * b + c] = (uint16_t)(uint8_t)(int8_t)sc;
-                    }
                 }
                 break;
-            }
             case SPG_B_Q6_K: {
                 uint8_t *highs = r + K / 2u;
                 uint16_t *pairs = (uint16_t *)(void *)aux;

@@ -96,6 +96,18 @@ DEVICE float from_half(uint32_t h) {
     return f;
 }
 
+/* The 6-bit scales (sc) and minima (mn) of sub-blocks 4 part to 4 part + 3 of a Q4_K or Q5_K super-block, a byte each,
+   from words 1 to 3 of its first 16 bytes as GGUF keeps them (llama.cpp's get_scale_min_k4(), four at once) */
+DEVICE void k4_scales(uint32_t w1, uint32_t w2, uint32_t w3, uint32_t part, uint32_t &sc, uint32_t &mn) {
+    sc = part ? (w3 & 0x0F0F0F0Fu) | ((w1 >> 2) & 0x30303030u) : w1 & 0x3F3F3F3Fu;
+    mn = part ? ((w3 >> 4) & 0x0F0F0F0Fu) | ((w2 >> 2) & 0x30303030u) : w2 & 0x3F3F3F3Fu;
+}
+/* The signed scale of sub-block j of an IQ4_XS super-block from its first 8 bytes as GGUF keeps them (w0: the scale,
+   then the scales' high two bits; w1: their low four bits) */
+DEVICE int32_t iq4xs_scale(uint32_t w0, uint32_t w1, uint32_t j) {
+    return (int32_t)(((w1 >> (4u * j)) & 0xFu) | ((w0 >> (16u + 2u * j)) & 3u) << 4) - 32;
+}
+
 /* Value i of buffer x, whose push-constant word is w: bfloat16 where bit w of the kernel's HALF says so
    (half.glsl), else a float. */
 DEVICE float ld(uint64_t x, uint32_t i, uint32_t w, uint32_t half) {
