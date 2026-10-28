@@ -152,6 +152,7 @@ static struct {
     float tick_ns;                  /* timestamp period */
     uint32_t stamp_bits;            /* valid bits of the queue's timestamps (0: none) */
     bool profile;                   /* SPINGALETT_GPU_PROFILE: time every dispatch */
+    bool closed_first;              /* vkb_close() registered again after the first pipeline (pipeline()) */
     struct { char label[48]; double ms; uint64_t calls; } stats[256];
     uint32_t stat_count;
     double busy_ms;                 /* profiling: first to last timestamp of every submission */
@@ -405,10 +406,20 @@ static bool open_device(void) {
     return gpu.lock != NULL;
 }
 
-/* The device idle, then destroyed with what it holds, and the instance (at exit) */
+static void commands_destroy(struct VkbCommands *c);
+static void vkb_buffer_free(SpgGpuBuffer *b);
+
+/* The device idle, the backend's spare command lists and blocks destroyed, then the device and the instance: at exit,
+   before the libraries the driver loaded are torn down (pipeline() registers it again). The pipelines, shader modules
+   and layout go with the device, and so do the buffers and command lists the program still holds: destroying the
+   pipelines first raced with NVIDIA's background compiles of them (a crash at exit in one run of twenty). */
 static void vkb_close(void) {
     if (gpu.device) {
         vkDeviceWaitIdle(gpu.device);
+        for (uint32_t k = 0; k < gpu.spare_count; k++) commands_destroy(gpu.spare[k]);
+        gpu.spare_count = 0;
+        for (uint32_t k = 0; k < gpu.spare_block_count; k++) vkb_buffer_free(&gpu.spare_blocks[k].block);
+        gpu.spare_block_count = 0;
         vkDestroyDevice(gpu.device, NULL);
         gpu.device = VK_NULL_HANDLE;
     }
@@ -519,6 +530,11 @@ static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t coun
     if (vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cci, NULL, &made) != VK_SUCCESS) return VK_NULL_HANDLE;
 
     spg_lock(gpu.lock);
+    /* (the device closed at exit before the libraries the driver loaded for its first pipeline are torn down: exit's
+       handlers run last registered first, and NVIDIA's SPIR-V compiler, loaded then, had its objects destroyed under
+       its compiler threads, which then corrupted the heap, crashed or spun, after every test passed) */
+    if (!gpu.closed_first) atexit(vkb_close);
+    gpu.closed_first = true;
     found = made_pipeline(kernel, spec, count);
     if (!found && gpu.pipeline_count == gpu.pipeline_cap) {
         size_t cap = gpu.pipeline_cap ? 2 * gpu.pipeline_cap : 64;
@@ -868,6 +884,10 @@ static void vkb_commands_free(void *c_) {
         spg_unlock(gpu.lock);
         if (kept) return;
     }
+    commands_destroy(c);
+}
+
+static void commands_destroy(VkbCommands *c) {
     if (c->fence) vkDestroyFence(gpu.device, c->fence, NULL);
     if (c->queries) vkDestroyQueryPool(gpu.device, c->queries, NULL);
     free(c->labels);
