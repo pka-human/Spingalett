@@ -9,7 +9,8 @@
  * the values of the image, rearranged), the CPU's bits: a workgroup takes BM rows of the quantized activations and BN
  * rows of weights, four warps of 32 x 64 outputs, over k in stages of SB blocks, STAGES of them in shared memory,
  * copied STAGES - 1 ahead by asynchronous copies (rows of codes in chunks of 16 bytes, swizzled so that ldmatrix's
- * eight rows fall in distinct banks). Each block's products by mma.sync m16n8k32 of 8-bit integers (exact) from an
+ * eight rows fall in distinct banks; the scales of GB blocks at once, in buffers of their own: copies of a few bytes
+ * from many rows cost as much as the codes). Each block's products by mma.sync m16n8k32 of 8-bit integers (exact) from an
  * accumulator of 1.5 2^23's bits (the sum's float then 1.5 2^23 less: exact below 2^22), then each output's block term
  * (d dx) I1, every product and sum rounded alone, added to its sum block after block. The bias then the sum, the
  * activation of spec 2, the product by e0's value: bdot's epilogue. Push: SpgBdotPush (r0 the first row, rows its rows,
@@ -29,6 +30,8 @@
 #define STAGES 3u
 #define ROWB (32u * SB)                     /* bytes of a row of codes a stage */
 #define GR (ROWB / 16u)                     /* its chunks of 16 bytes */
+#define GB 8u                               /* blocks of a group of scales */
+#define GS (GB / SB)                        /* stages a group */
 
 typedef signed char int8_t;
 
@@ -67,19 +70,25 @@ DEVICE uint32_t chunk_at(uint32_t r, uint32_t g) {
 
 struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
     uint8_t a[BM * ROWB], b[BN * ROWB];     /* the rows' codes, the weights' */
-    float dx[BM][SB];                       /* the rows' blocks' scales */
-    uint32_t dw[BN];                        /* the weights' (SB of float16) */
+};
+struct __attribute__((aligned(16))) Group {
+    float dx[BM][GB];                       /* the rows' blocks' scales */
+    uint32_t dw[BN][GB / 2u];               /* the weights' (two float16 a word) */
+};
+struct Shared {
+    Stage st[STAGES];
+    Group gr[2];                            /* (by the group's parity) */
 };
 
 extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p, const Spec spec) {
-    __shared__ __attribute__((aligned(16))) Stage sh[STAGES];
+    __shared__ __attribute__((aligned(16))) Shared sh;
     const uint32_t tid = thread_x(), lane = tid & 31u, warp = tid >> 5, wm = warp >> 1, wn = warp & 1u;
     const uint32_t g = lane >> 2, t = lane & 3u;
     const uint32_t m0 = block_x() * BM, n0 = block_y() * BN, blocks = p.k / 32u, stages = (blocks + SB - 1u) / SB;
     const uint8_t *weights = (const uint8_t *)p.w;
     /* the copies of stage s: chunks of 16 bytes of the rows' and the weights' codes, eight bytes of their scales */
     auto issue = [&](uint32_t s) {
-        Stage &st = sh[s % STAGES];
+        Stage &st = sh.st[s % STAGES];
         const uint32_t b0 = s * SB, k0 = 32u * b0;
 #pragma unroll
         for (uint32_t i = 0; i < BM * GR / 128u; i++) {
@@ -95,22 +104,22 @@ extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p,
             copy16(shared_address(st.b + chunk_at(r, c)), weights + (live ? (uint64_t)n * p.stride + k0 + 16u * c : 0u),
                    live ? 16u : 0u);
         }
-        /* (the scales of blocks past the end zeros) */
+        if (s % GS == 0u) {
+            /* a group's scales: the rows' (four threads a row, a warp's copies four rows' 32 bytes) and the weights'
+               (16 bytes a row: past the last block, the next bytes of the row, unread); the rows' past the last block
+               zeros */
+            Group &gr = sh.gr[(s / GS) & 1u];
 #pragma unroll
-        for (uint32_t cb = 0; cb < SB; cb++) {
-            const bool in = b0 + cb < blocks;
-            if (tid < BM) {
-                const uint32_t m = m0 + tid;
-                const bool live = m < p.rows && in;
-                copy4(shared_address(&st.dx[tid][cb]), F(p.dx) + (live ? (uint64_t)(p.r0 + m) * blocks + b0 + cb : 0u),
+            for (uint32_t i = 0; i < BM * GB / 128u; i++) {
+                const uint32_t u = tid + 128u * i, r = u / GB, c = u % GB, m = m0 + r;
+                const bool live = m < p.rows && b0 + c < blocks;
+                copy4(shared_address(&gr.dx[r][c]), F(p.dx) + (live ? (uint64_t)(p.r0 + m) * blocks + b0 + c : 0u),
                       live ? 4u : 0u);
             }
-        }
-        {
-            /* (both blocks' scales in a word: past the last block, the next bytes of the row, unread) */
             const uint32_t n = n0 + tid;
             const bool live = n < p.n;
-            copy4(shared_address(&st.dw[tid]), weights + (live ? (uint64_t)n * p.stride + p.k + 2u * b0 : 0u), live ? 4u : 0u);
+            copy16(shared_address(&gr.dw[tid][0]), weights + (live ? (uint64_t)n * p.stride + p.k + 2u * b0 : 0u),
+                   live ? 16u : 0u);
         }
     };
     float acc[2][8][4];
@@ -130,7 +139,9 @@ extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p,
         barrier();
         if (s + STAGES - 1u < stages) issue(s + STAGES - 1u);
         copies_commit();
-        const Stage &st = sh[s % STAGES];
+        const Stage &st = sh.st[s % STAGES];
+        const Group &gr = sh.gr[(s / GS) & 1u];
+        const uint32_t gc = SB * (s % GS);        /* (the stage's first block in its group) */
 #pragma unroll
         for (uint32_t cb = 0; cb < SB; cb++) {
             if (s * SB + cb >= blocks) continue;
@@ -149,11 +160,12 @@ extern "C" __global__ void __launch_bounds__(128) SPG_ENTRY(const SpgBdotPush p,
 #pragma unroll
             for (uint32_t a = 0; a < 2u; a++)
 #pragma unroll
-                for (uint32_t e = 0; e < 2u; e++) dx[a][e] = st.dx[32u * wm + 16u * a + g + 8u * e][cb];
+                for (uint32_t e = 0; e < 2u; e++) dx[a][e] = gr.dx[32u * wm + 16u * a + g + 8u * e][gc + cb];
 #pragma unroll
             for (uint32_t b = 0; b < 8u; b++)
 #pragma unroll
-                for (uint32_t e = 0; e < 2u; e++) dw[b][e] = from_half((st.dw[64u * wn + 8u * b + 2u * t + e] >> (16u * cb)) & 0xFFFFu);
+                for (uint32_t e = 0; e < 2u; e++)
+                    dw[b][e] = from_half((gr.dw[64u * wn + 8u * b + 2u * t + e][(gc + cb) / 2u] >> (16u * ((gc + cb) & 1u))) & 0xFFFFu);
 #pragma unroll
             for (uint32_t a = 0; a < 2u; a++)
 #pragma unroll
