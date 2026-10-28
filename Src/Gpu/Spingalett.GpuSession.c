@@ -534,7 +534,8 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             const uint32_t K = L->row_len, BV = slett_block_values(L->precision);
             if (s->quantized != x[0] || s->quantized_bv != BV) {
                 SpgBquantPush qp = {x[0], s->xq, s->dx, s->xs, rows, K, BV, L->in_c};
-                spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, groups((uint64_t)rows * (K / BV), 8u), 1, 1);
+                spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
+                                 groups((uint64_t)rows * (K / BV), SPG_BQUANT_BLOCKS(BV)), 1, 1);
                 spg_gpu_barrier(c);
                 s->quantized = x[0];
                 s->quantized_bv = BV;

@@ -926,7 +926,9 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
         ok = c && spg_gpu_record_begin(c);
         SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
         if (ok) spg_gpu_copy(c, &bnan, 0, &by, 0, (size_t)R * N * 4);
-        if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
+        if (ok)
+            spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
+                             (R * (K / BV) + SPG_BQUANT_BLOCKS(BV) - 1) / SPG_BQUANT_BLOCKS(BV), 1, 1);
         for (uint32_t r0 = 0; ok && unit == 4u && r0 < R; r0++) {
             /* bdotp: a row of the packed rows at a time */
             spg_gpu_barrier(c);
@@ -1023,7 +1025,9 @@ static void bench_blocks(int count, char **types) {
                 SpgGpuCommands *c = spg_gpu_commands_create();
                 ok = c && spg_gpu_record_begin(c);
                 SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
-                if (ok) spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp, (R * (K / BV) + 7) / 8, 1, 1);
+                if (ok)
+                    spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
+                                     (R * (K / BV) + SPG_BQUANT_BLOCKS(BV) - 1) / SPG_BQUANT_BLOCKS(BV), 1, 1);
                 for (int r = 0; ok && r < reps; r++) {
                     spg_gpu_barrier(c);
                     const uint64_t wat = bw.address + (uint64_t)((uint32_t)r % copies) * wbytes;

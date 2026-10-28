@@ -208,11 +208,13 @@ enum { SPG_IP_EPI, SPG_IP_DIRECT, SPG_IP_POOL, SPG_IP_GAP, SPG_IP_ADD, SPG_IP_MU
 
 /* bquant.comp: rows of activations quantized in blocks of bv values (32 or 256) as spingalett_quantize_blocks()
    quantizes them, the bits of the CPU: x [rows][ldx floats] to codes q [rows][k] (signed bytes), a scale a block dx
-   [rows][k / bv] and the sum of every 16 codes xs [rows][k / 16] (int32). A warp a block. */
+   [rows][k / bv] and the sum of every 16 codes xs [rows][k / 16] (int32). A lane four values, bv / 4 lanes a block up
+   to a warp: SPG_BQUANT_BLOCKS(bv) blocks a workgroup. */
 typedef struct {
     uint64_t x, q, dx, xs;
     uint32_t rows, k, bv, ldx;
 } SpgBquantPush;
+#define SPG_BQUANT_BLOCKS(bv) ((bv) >= 128u ? 8u : 8u * 128u / (bv))
 
 /* bnorm.comp: a session's RMS normalization of rows of k values, y = the rows times gamma as grow's RMSNORM computes
    them (TPR, spec 0, threads a row: its bits); with b, of the sums a + b (written to sum), the layers before it; with bv,
