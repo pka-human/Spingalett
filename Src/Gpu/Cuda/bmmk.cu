@@ -371,18 +371,21 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         }
     }
     const uint32_t act = spec.v[2];
+    const bool pair = spec.v[3] != 0u;          /* (a gated unit's pair: a thread's columns 2j and 2j + 1, block_out()) */
 #pragma unroll
     for (uint32_t a = 0; a < 2u; a++)
 #pragma unroll
         for (uint32_t b = 0; b < TN; b++)
 #pragma unroll
-            for (uint32_t e = 0; e < 4u; e++) {
-                const uint32_t n = n0 + 8u * TN * wn + 8u * b + 2u * t + (e & 1u), m = m0 + 32u * wm + 16u * a + g + 8u * (e >> 1);
-                if (n >= p.n || m >= p.rows) continue;
-                const uint64_t at = (uint64_t)(p.r0 + m) * p.ldy + n;
-                float v = F(p.bias)[n] + acc[a][b][e];
-                if (act) v = activate(v, act);
-                if (p.e0) v = v * F(p.e0)[at];
-                F(p.y)[at] = v;
+            for (uint32_t h = 0; h < 2u; h++) {
+                const uint32_t n = n0 + 8u * TN * wn + 8u * b + 2u * t, m = m0 + 32u * wm + 16u * a + g + 8u * h;
+                if (m >= p.rows) continue;
+                if (pair) {
+                    if (n < p.n) block_out(p, act, true, m, n / 2u, acc[a][b][2u * h], acc[a][b][2u * h + 1u]);
+                    continue;
+                }
+#pragma unroll
+                for (uint32_t e = 0; e < 2u; e++)
+                    if (n + e < p.n) block_out(p, act, false, m, n + e, acc[a][b][2u * h + e], 0.0f);
             }
 }

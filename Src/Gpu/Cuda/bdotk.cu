@@ -48,90 +48,89 @@ DEVICE int32_t dp4a(uint32_t a, uint32_t b, int32_t c) {
 }
 
 extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p, const Spec spec) {
+    const bool pair = spec.v[4] != 0u;          /* (a gated unit's pair of rows a warp: block_out()) */
     const uint32_t lane = thread_x() & 31u, j = block_x() * 8u + (thread_x() >> 5);
-    if (j >= p.n) return;                       /* (a whole warp) */
-    const uint32_t subs = p.k / 32u, blocks = p.k / 256u;
-    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
-    const uint8_t *highs = row + p.k / 2u, *aux = row + SPG_PACK_CODES(TYPE, p.k);
-    const uint32_t *fifth = (const uint32_t *)aux;
-    const uint16_t *pairs = (const uint16_t *)(aux + (FIVE ? 4u * subs : 0u));
-    const uint16_t *dm = (const uint16_t *)(pairs + subs);       /* (Q6_K: the scales alone) */
-    const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
-    const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
-    float acc = 0.0f;
-    for (uint32_t c0 = 0; c0 < subs; c0 += 32u) {
-        const uint32_t c = c0 + lane;
-        int32_t i1 = 0, i2 = 0;
-        if (c < subs) {
-            const uint4_ w = *(const uint4_ *)(row + 16u * c);
-            const uint4_ x0 = ((const uint4_ *)(x + 32u * c))[0], x1 = ((const uint4_ *)(x + 32u * c))[1];
-            const uint32_t m4 = 0x0F0F0F0Fu;
-            if (SIX) {
-                /* (each half of 16 alone: its four words of codes, a lane's low nibbles and the high two bits) */
-                const uint2_ hb = *(const uint2_ *)(highs + 8u * c);
-                const uint32_t pieces[4] = {hb.x & 0xFFFFu, hb.x >> 16, hb.y & 0xFFFFu, hb.y >> 16};
-                const uint32_t words[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
-                int32_t lo = 0, hi = 0;
-#pragma unroll
+    if (j >= (pair ? p.n / 2u : p.n)) return;   /* (a whole warp) */
+    /* the sum of the weights' row r */
+    auto dot = [&](uint32_t r) {
+        const uint32_t subs = p.k / 32u, blocks = p.k / 256u;
+        const uint8_t *row = (const uint8_t *)p.w + (uint64_t)r * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
+        const uint8_t *highs = row + p.k / 2u, *aux = row + SPG_PACK_CODES(TYPE, p.k);
+        const uint32_t *fifth = (const uint32_t *)aux;
+        const uint16_t *pairs = (const uint16_t *)(aux + (FIVE ? 4u * subs : 0u));
+        const uint16_t *dm = (const uint16_t *)(pairs + subs);       /* (Q6_K: the scales alone) */
+        const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
+        const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
+        float acc = 0.0f;
+        for (uint32_t c0 = 0; c0 < subs; c0 += 32u) {
+            const uint32_t c = c0 + lane;
+            int32_t i1 = 0, i2 = 0;
+            if (c < subs) {
+                const uint4_ w = *(const uint4_ *)(row + 16u * c);
+                const uint4_ x0 = ((const uint4_ *)(x + 32u * c))[0], x1 = ((const uint4_ *)(x + 32u * c))[1];
+                const uint32_t m4 = 0x0F0F0F0Fu;
+                if (SIX) {
+                    /* (each half of 16 alone: its four words of codes, a lane's low nibbles and the high two bits) */
+                    const uint2_ hb = *(const uint2_ *)(highs + 8u * c);
+                    const uint32_t pieces[4] = {hb.x & 0xFFFFu, hb.x >> 16, hb.y & 0xFFFFu, hb.y >> 16};
+                    const uint32_t words[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+                    int32_t lo = 0, hi = 0;
+    #pragma unroll
+                    for (uint32_t k = 0; k < 4u; k++) {
+                        uint32_t h = pieces[k] & 0xFFu;
+                        h = h | h << 6;
+                        h = h | h << 12;
+                        lo = dp4a((words[k] & m4) | (h & 0x03030303u) << 4, xa[k], lo);
+                        h = pieces[k] >> 8;
+                        h = h | h << 6;
+                        h = h | h << 12;
+                        hi = dp4a(((words[k] >> 4) & m4) | (h & 0x03030303u) << 4, xb[k], hi);
+                    }
+                    const uint32_t pr = pairs[c];
+                    i1 = (int32_t)(signed char)(pr & 0xFFu) * (lo - 32 * xs[2u * c]);
+                    i1 += (int32_t)(signed char)(pr >> 8) * (hi - 32 * xs[2u * c + 1u]);
+                }
+                int32_t s = 0;
+                const uint32_t f = FIVE ? fifth[c] : 0u;
+                const uint32_t ws[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+    #pragma unroll
                 for (uint32_t k = 0; k < 4u; k++) {
-                    uint32_t h = pieces[k] & 0xFFu;
-                    h = h | h << 6;
-                    h = h | h << 12;
-                    lo = dp4a((words[k] & m4) | (h & 0x03030303u) << 4, xa[k], lo);
-                    h = pieces[k] >> 8;
-                    h = h | h << 6;
-                    h = h | h << 12;
-                    hi = dp4a(((words[k] >> 4) & m4) | (h & 0x03030303u) << 4, xb[k], hi);
+                    uint32_t lo = ws[k] & m4, hi = (ws[k] >> 4) & m4;
+                    if (FIVE) {
+                        lo |= spread1((f >> (4u * k)) & 0xFu);
+                        hi |= spread1((f >> (16u + 4u * k)) & 0xFu);
+                    }
+                    if (NLX) {
+                        lo = nl_values(lo);
+                        hi = nl_values(hi);
+                    }
+                    s = dp4a(lo, xa[k], s);
+                    s = dp4a(hi, xb[k], s);
                 }
-                const uint32_t pr = pairs[c];
-                i1 = (int32_t)(signed char)(pr & 0xFFu) * (lo - 32 * xs[2u * c]);
-                i1 += (int32_t)(signed char)(pr >> 8) * (hi - 32 * xs[2u * c + 1u]);
-            }
-            int32_t s = 0;
-            const uint32_t f = FIVE ? fifth[c] : 0u;
-            const uint32_t ws[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
-#pragma unroll
-            for (uint32_t k = 0; k < 4u; k++) {
-                uint32_t lo = ws[k] & m4, hi = (ws[k] >> 4) & m4;
-                if (FIVE) {
-                    lo |= spread1((f >> (4u * k)) & 0xFu);
-                    hi |= spread1((f >> (16u + 4u * k)) & 0xFu);
+                if (!SIX) {
+                    const uint32_t pr = pairs[c];
+                    i1 = (NLX ? (int32_t)(signed char)(pr & 0xFFu) : (int32_t)(pr & 0xFFu)) * s;
+                    i2 = NLX ? 0 : (int32_t)(pr >> 8) * (xs[2u * c] + xs[2u * c + 1u]);
                 }
-                if (NLX) {
-                    lo = nl_values(lo);
-                    hi = nl_values(hi);
-                }
-                s = dp4a(lo, xa[k], s);
-                s = dp4a(hi, xb[k], s);
             }
-            if (!SIX) {
-                const uint32_t pr = pairs[c];
-                i1 = (NLX ? (int32_t)(signed char)(pr & 0xFFu) : (int32_t)(pr & 0xFFu)) * s;
-                i2 = NLX ? 0 : (int32_t)(pr >> 8) * (xs[2u * c] + xs[2u * c + 1u]);
+            /* (a super-block's sub-blocks: their integers summed across their eight lanes, exact) */
+            for (uint32_t h = 1u; h < 8u; h <<= 1) {
+                i1 = shfl_add(i1, h);
+                i2 = shfl_add(i2, h);
             }
+            float term = 0.0f;
+            const uint32_t b = c / 8u;
+            if (lane % 8u == 0u && b < blocks) {
+                const float d = from_half(dm[SIX ? b : 2u * b]), m = SIX ? 0.0f : -from_half(dm[2u * b + 1u]), dxv = dx[b];
+                term = (d * dxv) * (float)i1;
+                if (!SIX && !NLX) term = term + (m * dxv) * (float)i2;
+            }
+            /* the round's super-blocks' terms in their order */
+            const uint32_t first = c0 / 8u, count = blocks - first < 4u ? blocks - first : 4u;
+            for (uint32_t k = 0; k < count; k++) acc = acc + shfl_f(term, 8u * k);
         }
-        /* (a super-block's sub-blocks: their integers summed across their eight lanes, exact) */
-        for (uint32_t h = 1u; h < 8u; h <<= 1) {
-            i1 = shfl_add(i1, h);
-            i2 = shfl_add(i2, h);
-        }
-        float term = 0.0f;
-        const uint32_t b = c / 8u;
-        if (lane % 8u == 0u && b < blocks) {
-            const float d = from_half(dm[SIX ? b : 2u * b]), m = SIX ? 0.0f : -from_half(dm[2u * b + 1u]), dxv = dx[b];
-            term = (d * dxv) * (float)i1;
-            if (!SIX && !NLX) term = term + (m * dxv) * (float)i2;
-        }
-        /* the round's super-blocks' terms in their order */
-        const uint32_t first = c0 / 8u, count = blocks - first < 4u ? blocks - first : 4u;
-        for (uint32_t k = 0; k < count; k++) acc = acc + shfl_f(term, 8u * k);
-    }
-    if (lane == 0u) {
-        const uint32_t act = spec.v[2];
-        const uint64_t at = (uint64_t)p.r0 * p.ldy + j;
-        float v = F(p.bias)[j] + acc;
-        if (act) v = activate(v, act);
-        if (p.e0) v = v * F(p.e0)[at];
-        F(p.y)[at] = v;
-    }
+        return acc;
+    };
+    const float a0 = dot(pair ? 2u * j : j), a1 = pair ? dot(2u * j + 1u) : 0.0f;
+    if (lane == 0u) block_out(p, spec.v[2], pair, 0u, j, a0, a1);
 }

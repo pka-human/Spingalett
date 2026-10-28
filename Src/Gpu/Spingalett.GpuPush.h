@@ -244,7 +244,8 @@ typedef struct {
    a row of weights `stride` bytes of whole blocks as GGUF stores them, k values; rows r0 to r0 + rows - 1 of the
    bquant arrays (SPG_BDOT_ROWS at most a dispatch), y's rows ldy floats apart. A warp a row of weights. Then the
    activation of spec 2 (ActivationFunction, 0: none), and with e0 the product by e0's value at y's place (a gated
-   unit's other half). */
+   unit's other half). The packed kernels' pairs (bmmp's spec 3, bdotp's spec 4): a gated unit's two layers, rows 2j
+   and 2j + 1 of the weights (n of them) and of the biases, the second's sum times the first's activated, at y's j. */
 typedef struct {
     uint64_t w, q, dx, xs, bias, y, e0;
     uint32_t rows, n, k, stride, r0, ldy;

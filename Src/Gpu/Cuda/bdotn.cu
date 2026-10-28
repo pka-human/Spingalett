@@ -46,53 +46,52 @@ DEVICE uint32_t nl_values(uint32_t q) {
 }
 
 extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p, const Spec spec) {
+    const bool pair = spec.v[4] != 0u;          /* (a gated unit's pair of rows a warp: block_out()) */
     const uint32_t lane = thread_x() & 31u, j = block_x() * 8u + (thread_x() >> 5);
-    if (j >= p.n) return;                       /* (a whole warp) */
-    const uint32_t blocks = p.k / 32u;
-    const uint8_t *row = (const uint8_t *)p.w + (uint64_t)j * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
-    const uint32_t *fifth = (const uint32_t *)(row + p.k / 2u);
-    const uint16_t *scales = (const uint16_t *)(row + p.k / 2u + (FIVE ? 4u * blocks : 0u));
-    const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
-    const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
-    float acc = 0.0f;
-    for (uint32_t b0 = 0; b0 < blocks; b0 += 32u) {
-        const uint32_t b = b0 + lane;
-        float term = 0.0f;
-        if (b < blocks) {
-            const uint4_ w = *(const uint4_ *)(row + 16u * b);
-            const uint4_ x0 = ((const uint4_ *)(x + 32u * b))[0], x1 = ((const uint4_ *)(x + 32u * b))[1];
-            const uint32_t words[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
-            const uint32_t f = FIVE ? fifth[b] : 0u;
-            int32_t s = 0;
-#pragma unroll
-            for (uint32_t k = 0; k < 4u; k++) {
-                uint32_t lo = words[k] & 0x0F0F0F0Fu, hi = (words[k] >> 4) & 0x0F0F0F0Fu;
-                if (FIVE) {
-                    lo |= spread1((f >> (4u * k)) & 0xFu);
-                    hi |= spread1((f >> (16u + 4u * k)) & 0xFu);
+    if (j >= (pair ? p.n / 2u : p.n)) return;   /* (a whole warp) */
+    /* the sum of the weights' row r */
+    auto dot = [&](uint32_t r) {
+        const uint32_t blocks = p.k / 32u;
+        const uint8_t *row = (const uint8_t *)p.w + (uint64_t)r * p.stride, *x = (const uint8_t *)p.q + (uint64_t)p.r0 * p.k;
+        const uint32_t *fifth = (const uint32_t *)(row + p.k / 2u);
+        const uint16_t *scales = (const uint16_t *)(row + p.k / 2u + (FIVE ? 4u * blocks : 0u));
+        const int32_t *xs = (const int32_t *)p.xs + (uint64_t)p.r0 * (p.k / 16u);
+        const float *dx = F(p.dx) + (uint64_t)p.r0 * blocks;
+        float acc = 0.0f;
+        for (uint32_t b0 = 0; b0 < blocks; b0 += 32u) {
+            const uint32_t b = b0 + lane;
+            float term = 0.0f;
+            if (b < blocks) {
+                const uint4_ w = *(const uint4_ *)(row + 16u * b);
+                const uint4_ x0 = ((const uint4_ *)(x + 32u * b))[0], x1 = ((const uint4_ *)(x + 32u * b))[1];
+                const uint32_t words[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+                const uint32_t f = FIVE ? fifth[b] : 0u;
+                int32_t s = 0;
+    #pragma unroll
+                for (uint32_t k = 0; k < 4u; k++) {
+                    uint32_t lo = words[k] & 0x0F0F0F0Fu, hi = (words[k] >> 4) & 0x0F0F0F0Fu;
+                    if (FIVE) {
+                        lo |= spread1((f >> (4u * k)) & 0xFu);
+                        hi |= spread1((f >> (16u + 4u * k)) & 0xFu);
+                    }
+                    if (NL) {
+                        lo = nl_values(lo);
+                        hi = nl_values(hi);
+                    }
+                    s = dp4a(lo, xa[k], s);
+                    s = dp4a(hi, xb[k], s);
                 }
-                if (NL) {
-                    lo = nl_values(lo);
-                    hi = nl_values(hi);
-                }
-                s = dp4a(lo, xa[k], s);
-                s = dp4a(hi, xb[k], s);
+                const int32_t sum = xs[2u * b] + xs[2u * b + 1u], i1 = s - OFF * sum;
+                const float d = from_half(scales[(ONE ? 2u : 1u) * b]);
+                term = (d * dx[b]) * (float)i1;
+                if (ONE) term = term + (from_half(scales[2u * b + 1u]) * dx[b]) * (float)sum;
             }
-            const int32_t sum = xs[2u * b] + xs[2u * b + 1u], i1 = s - OFF * sum;
-            const float d = from_half(scales[(ONE ? 2u : 1u) * b]);
-            term = (d * dx[b]) * (float)i1;
-            if (ONE) term = term + (from_half(scales[2u * b + 1u]) * dx[b]) * (float)sum;
+            /* the round's blocks' terms in their order */
+            const uint32_t count = blocks - b0 < 32u ? blocks - b0 : 32u;
+            for (uint32_t k = 0; k < count; k++) acc = acc + shfl_f(term, k);
         }
-        /* the round's blocks' terms in their order */
-        const uint32_t count = blocks - b0 < 32u ? blocks - b0 : 32u;
-        for (uint32_t k = 0; k < count; k++) acc = acc + shfl_f(term, k);
-    }
-    if (lane == 0u) {
-        const uint32_t act = spec.v[2];
-        const uint64_t at = (uint64_t)p.r0 * p.ldy + j;
-        float v = F(p.bias)[j] + acc;
-        if (act) v = activate(v, act);
-        if (p.e0) v = v * F(p.e0)[at];
-        F(p.y)[at] = v;
-    }
+        return acc;
+    };
+    const float a0 = dot(pair ? 2u * j : j), a1 = pair ? dot(2u * j + 1u) : 0.0f;
+    if (lane == 0u) block_out(p, spec.v[2], pair, 0u, j, a0, a1);
 }

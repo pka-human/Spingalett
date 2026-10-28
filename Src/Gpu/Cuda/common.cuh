@@ -261,6 +261,23 @@ DEVICE float derivative_s(float y, uint32_t act, float slope) { return slope >= 
 #define STEP_KEEP       17u
 #define STEP_SHARE      18u
 
+/* bdot's and bmm's epilogue of output j of row r0 + r: the bias then the sum a0, the activation act, the product by e0's
+   value; of a gated unit's pair (the weights' rows 2j and 2j + 1, the gate's and the up's, sums a0 and a1: bmm's spec 3,
+   bdot's 4), the gate's activation times the up, as the unit's two layers and their product compute it */
+DEVICE void block_out(const SpgBdotPush &p, uint32_t act, bool pair, uint32_t r, uint32_t j, float a0, float a1) {
+    const uint64_t at = (uint64_t)(p.r0 + r) * p.ldy + j;
+    if (pair) {
+        float v = F(p.bias)[2u * j] + a0;
+        if (act) v = activate(v, act);
+        F(p.y)[at] = v * (F(p.bias)[2u * j + 1u] + a1);
+        return;
+    }
+    float v = F(p.bias)[j] + a0;
+    if (act) v = activate(v, act);
+    if (p.e0) v = v * F(p.e0)[at];
+    F(p.y)[at] = v;
+}
+
 DEVICE uint64_t header64(const uint32_t *h, uint32_t lo) { return (uint64_t)h[lo] | (uint64_t)h[lo + 1] << 32; }
 
 /* splitmix64's finalizer (mix64 of common.glsl) */
