@@ -6,7 +6,7 @@
 /*
  * bmmk.comp: bmm's product for weights of Q4_K, Q5_K, Q6_K and IQ4_XS packed as sessions keep them (Spingalett.GpuPack.c:
  * rows `stride` bytes apart), the CPU's bits:
- * tiles of 64 rows by 64 weights, four warps of 32 x 32 outputs (three workgroups an SM), k in stages of two sub-blocks of 32 values, STAGES
+ * tiles of 64 rows by BN weights, four warps of 32 x BN / 2 outputs, k in stages of two sub-blocks of 32 values, STAGES
  * of them in shared memory by asynchronous copies two ahead (the rows' codes in chunks of 16 bytes swizzled for
  * ldmatrix; the weights' codes, a sub-block's 16 bytes, swizzled so that a warp's words fall in distinct banks); each
  * super-block's scales, minima, the rows' sums of 16 and scales in a buffer of its own (two, by the super-block's
@@ -27,7 +27,9 @@
 #endif
 
 #define WN 2u                               /* warps along the weights (two along the rows) */
+#if !defined(TN)
 #define TN 4u                               /* tiles of 8 columns a warp */
+#endif
 #define THREADS (64u * WN)
 #define SIX (TYPE == SPG_B_Q6_K)            /* Q6_K: halves of 16 of their own scales, two high bits, no minima */
 #define FIVE (TYPE == SPG_B_Q5_K)           /* Q5_K: Q4_K's and a fifth bit */
@@ -162,38 +164,56 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         to_a[i] = __builtin_offsetof(Stage, a) + chunk_a(r, c);
         size_a[i] = m < p.rows ? 16u : 0u;
     }
-    static_assert(BN * SB == THREADS, "a copy of the weights' codes a thread");
-    const uint32_t rb = tid / SB, nb = n0 + rb;
-    const uint8_t *src_b = weights + (nb < p.n ? (uint64_t)nb * p.stride : 0u) + 16u * (tid % SB);
-    const uint32_t to_b = __builtin_offsetof(Stage, b) + 4u * chunk_b(rb, tid % SB), size_b = nb < p.n ? 16u : 0u;
-    /* (the first BN threads: a weight's scales and bits, a row's sums and scales) */
-    static_assert(BN == BM, "a weight and a row a thread");
+#define CB (BN * SB / THREADS)              /* copies of the weights' codes a thread */
+    const uint8_t *src_b[CB];
+    uint32_t to_b[CB], size_b[CB];
+#pragma unroll
+    for (uint32_t i = 0; i < CB; i++) {
+        const uint32_t u = tid + THREADS * i, rb = u / SB, nb = n0 + rb;
+        src_b[i] = weights + (nb < p.n ? (uint64_t)nb * p.stride : 0u) + 16u * (u % SB);
+        to_b[i] = __builtin_offsetof(Stage, b) + 4u * chunk_b(rb, u % SB);
+        size_b[i] = nb < p.n ? 16u : 0u;
+    }
+    /* (the first BN threads: a weight's scales and bits; the first BM: a row's sums and scales) */
+    static_assert(BN <= THREADS && BM <= THREADS, "a weight and a row a thread");
     const uint32_t ns = n0 + tid, ms = m0 + tid, size_w = ns < p.n ? 4u : 0u, size_x = ms < p.rows ? 4u : 0u;
     const uint8_t *row = weights + (ns < p.n ? (uint64_t)ns * p.stride : 0u);
-    const int32_t *xs_row = (const int32_t *)p.xs + (ms < p.rows ? (uint64_t)(p.r0 + ms) * (p.k / 16u) : 0u);
     const float *dx_row = F(p.dx) + (ms < p.rows ? (uint64_t)(p.r0 + ms) * blocks : 0u);
+    /* (the rows' sums of 16 of a super-block, 64 bytes a row: four threads a row, a warp's copies eight rows) */
+#define CX (BM * 4u / THREADS)
+    const int32_t *src_x[CX];
+    uint32_t to_x[CX], size_xs[CX];
+#pragma unroll
+    for (uint32_t i = 0; i < CX; i++) {
+        const uint32_t u = tid + THREADS * i, r = u >> 2, m = m0 + r;
+        src_x[i] = (const int32_t *)p.xs + (m < p.rows ? (uint64_t)(p.r0 + m) * (p.k / 16u) : 0u) + 4u * (u & 3u);
+        to_x[i] = __builtin_offsetof(Super, xs) + 64u * r + 16u * (u & 3u);
+        size_xs[i] = m < p.rows ? 16u : 0u;
+    }
     /* the copies of stage s, to the buffer `slot` */
     auto issue = [&](uint32_t s, uint32_t slot) {
         const uint32_t st = base + __builtin_offsetof(Shared, st) + slot * (uint32_t)sizeof(Stage);
 #pragma unroll
         for (uint32_t i = 0; i < BM * 4u / THREADS; i++) copy16(st + to_a[i], src_a[i] + 32u * SB * s, size_a[i]);
-        copy16(st + to_b, src_b + 16u * SB * s, size_b);
+#pragma unroll
+        for (uint32_t i = 0; i < CB; i++) copy16(st + to_b[i], src_b[i] + 16u * SB * s, size_b[i]);
+        const uint32_t sb = s / PER, j = s % PER;
+        const uint32_t su = base + __builtin_offsetof(Shared, su) + (sb & 1u) * (uint32_t)sizeof(Super);
         if (tid < BN) {
-            const uint32_t sb = s / PER, j = s % PER;
-            const uint32_t su = base + __builtin_offsetof(Shared, su) + (sb & 1u) * (uint32_t)sizeof(Super);
             if (FIVE) copy8(st + __builtin_offsetof(Stage, f) + 4u * SB * tid, row + aux + 4u * SB * s, 2u * size_w);
             if (SIX) copy16(st + __builtin_offsetof(Stage, h) + 16u * tid, row + p.k / 2u + 8u * SB * s, 4u * size_w);
-            copy4(su + __builtin_offsetof(Super, pairs) + 16u * tid + 2u * SB * j, row + pairs + 2u * SB * s, size_w);
-            /* (Q6_K: a float16 scale a super-block, the word of this one's and its neighbour's) */
-            if (j == 0u)
-                copy4(su + __builtin_offsetof(Super, dm) + 4u * tid, row + dm + (SIX ? 4u * (sb / 2u) : 4u * sb), size_w);
+            /* (a super-block's scales at its first stage, 16 bytes: copies of few bytes from many rows cost as much as
+               the codes; Q6_K: a float16 scale a super-block, the word of this one's and its neighbour's) */
             if (j == 0u) {
-                /* (the rows' sums of 16 whole at the super-block's first stage: Q4_K's and Q5_K's taken apart then) */
-                if (!NLX)
+                copy16(su + __builtin_offsetof(Super, pairs) + 16u * tid, row + pairs + 16u * sb, 4u * size_w);
+                copy4(su + __builtin_offsetof(Super, dm) + 4u * tid, row + dm + (SIX ? 4u * (sb / 2u) : 4u * sb), size_w);
+            }
+        }
+        if (!NLX && j == 0u)
 #pragma unroll
-                    for (uint32_t c = 0; c < 4u; c++)
-                        copy16(su + __builtin_offsetof(Super, xs) + 64u * tid + 16u * c, xs_row + 16u * sb + 4u * c,
-                               4u * size_x);
+            for (uint32_t i = 0; i < CX; i++) copy16(su + to_x[i], src_x[i] + 16u * sb, size_xs[i]);
+        if (tid < BM) {
+            if (j == 0u) {
                 copy4(su + __builtin_offsetof(Super, dx) + 4u * tid, dx_row + sb, size_x);
             }
         }
@@ -317,44 +337,37 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         if (j == PER - 1u) {
             /* the super-block's end: I2, the minima times the rows' sums of 32, on the matrix units (k the 16 sums of 16,
                each minimum twice: by the h bytes, 64 times, then by the l bytes); then the terms, in order */
-            int32_t i2[2][TN][4];
-            if (MINIMA) {
-                uint32_t mb[TN];
+            /* (a tile at a time: its I2 lives four registers) */
 #pragma unroll
-                for (uint32_t b = 0; b < TN; b++) mb[b] = prmt(su.pairs[8u * TN * wn + 8u * b + g][t], 0u, 0x3311u);
+            for (uint32_t a = 0; a < 2u; a++) {
+                const uint32_t r = 32u * wm + 16u * a + g;
+                const float dx[2] = {su.dx[r], su.dx[r + 8u]};
+                uint32_t h0 = 0u, h1 = 0u, l0 = 0u, l1 = 0u;
+                if (MINIMA) {
+                    h0 = (uint32_t)su.xs[r][t], h1 = (uint32_t)su.xs[r + 8u][t];
+                    l0 = (uint32_t)su.xs[r][4u + t], l1 = (uint32_t)su.xs[r + 8u][4u + t];
+                }
 #pragma unroll
-                for (uint32_t a = 0; a < 2u; a++) {
-                    const uint32_t r = 32u * wm + 16u * a + g;
-                    const uint32_t h0 = (uint32_t)su.xs[r][t], h1 = (uint32_t)su.xs[r + 8u][t];
-                    const uint32_t l0 = (uint32_t)su.xs[r][4u + t], l1 = (uint32_t)su.xs[r + 8u][4u + t];
-#pragma unroll
-                    for (uint32_t b = 0; b < TN; b++) {
-                        const int32_t zero[4] = {0, 0, 0, 0};
+                for (uint32_t b = 0; b < TN; b++) {
+                    int32_t i2[4] = {0, 0, 0, 0};
+                    if (MINIMA) {
+                        const uint32_t mb = prmt(su.pairs[8u * TN * wn + 8u * b + g][t], 0u, 0x3311u);
                         int32_t d[4];
-                        mma_k16(d, h0, h1, mb[b], zero);
+                        mma_k16(d, h0, h1, mb, i2);
                         const int32_t c[4] = {d[0] * 64, d[1] * 64, d[2] * 64, d[3] * 64};
-                        mma_k16(i2[a][b], l0, l1, mb[b], c);
+                        mma_k16(i2, l0, l1, mb, c);
+                    }
+#pragma unroll
+                    for (uint32_t e = 0; e < 4u; e++) {
+                        const uint32_t cn = 8u * TN * wn + 8u * b + 2u * t + (e & 1u);
+                        const uint32_t w = SIX ? su.dm[cn] >> (16u * (sb & 1u)) : su.dm[cn];
+                        float term = (from_half(w & 0xFFFFu) * dx[e >> 1]) * (float)i1[a][b][e];
+                        if (MINIMA) term = term + (-from_half(w >> 16) * dx[e >> 1]) * (float)i2[e];
+                        acc[a][b][e] = acc[a][b][e] + term;
+                        i1[a][b][e] = 0;
                     }
                 }
             }
-#pragma unroll
-            for (uint32_t a = 0; a < 2u; a++)
-#pragma unroll
-                for (uint32_t h = 0; h < 2u; h++) {
-                    const uint32_t rm = 32u * wm + 16u * a + g + 8u * h;
-                    const float dx = su.dx[rm];
-#pragma unroll
-                    for (uint32_t b = 0; b < TN; b++)
-#pragma unroll
-                        for (uint32_t e1 = 0; e1 < 2u; e1++) {
-                            const uint32_t cn = 8u * TN * wn + 8u * b + 2u * t + e1, e = e1 + 2u * h;
-                            const uint32_t w = SIX ? su.dm[cn] >> (16u * (sb & 1u)) : su.dm[cn];
-                            float term = (from_half(w & 0xFFFFu) * dx) * (float)i1[a][b][e];
-                            if (MINIMA) term = term + (-from_half(w >> 16) * dx) * (float)i2[a][b][e];
-                            acc[a][b][e] = acc[a][b][e] + term;
-                            i1[a][b][e] = 0;
-                        }
-                }
         }
     }
     const uint32_t act = spec.v[2];
