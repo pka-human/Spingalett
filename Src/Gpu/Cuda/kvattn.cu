@@ -7,7 +7,8 @@
  * kvattn.comp: a session's attention over the keys and values it keeps, in single precision (the CPU's to rounding).
  * PREP: a warp a row and head (queries' heads first, then the keys' and values'): the head's values through shared
  * memory, RMS-normalized by its gamma and rotated (value i with value i + rot / 2, by the table's cosine and sine of the
- * row's position) as spingalett_engine_head() does; queries to q, keys and values into their caches. ATTEND: a warp a
+ * row's position) as spingalett_engine_head() does; queries to q (half_q: as bfloat16), keys and values into their
+ * caches. ATTEND: a warp a
  * row and query head: the keys split between its eight warps, a lane values d = l, l + 32, ... of the query, a key and
  * a value (each key's score a sum over the warp's lanes), each warp's softmax online (the running maximum rescales
  * what came before, as spingalett_engine_attend() does), then the warps' sums combined by their maxima. 256 threads a
@@ -64,8 +65,11 @@ KERNEL(kvattn, SpgKvattnPush) {
             warp_sync();
         }
         if (query) {
-            float *dst = F(p.q) + ((uint64_t)r * p.heads + h) * D;
-            for (uint32_t i = lane; i < D; i += 32u) dst[i] = v[i];
+            const uint64_t at = ((uint64_t)r * p.heads + h) * D;
+            for (uint32_t i = lane; i < D; i += 32u) {
+                if (p.half_q) H(p.q)[at + i] = (uint16_t)to_bf16(v[i]);
+                else F(p.q)[at + i] = v[i];
+            }
             return;
         }
         const uint32_t g = h - p.heads;

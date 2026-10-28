@@ -59,6 +59,7 @@ typedef struct {
     bool folded;                    /* a sum of two layers the RMS normalization after it computes (bnorm) */
     uint32_t tpr, qbv;              /* RMS normalizations by bnorm: grow's threads a row; the blocks of values its
                                        outputs are quantized in for the block layer after it (0: none) */
+    bool unwritten;                 /* and its outputs quantized alone (its readers block layers that take them so) */
     /* attention */
     uint64_t keys, values, table, gq, gk;
     uint64_t strides;               /* gflash's strides over the caches (a prompt's attention), or 0 */
@@ -574,10 +575,18 @@ static bool layout(SpgGpuSession *s) {
     return ok;
 }
 
+static bool reads(const GLayer *G, uint32_t from) {
+    for (uint32_t k = 0; k < G->L.input_count; k++)
+        if (G->inputs[k] == from) return true;
+    return false;
+}
+
 /* RMS normalizations in one pass with what is around them (bnorm): the sum of two layers just before one, read by it
    (and by others: it writes the sum), and the quantization of its outputs for a block layer just after it that reads
    them (which then reads them quantized: s->quantized). Where grow takes 32 threads a row or more, and 32 values a
-   thread at most. */
+   thread at most. Outputs read by block layers alone, of its blocks, the layers just after it (none between to quantize
+   other rows), not the last layer (which reads its rows gathered), are not written at all: Qwen3-4B's prompt of 512 on
+   an RTX 4050, 5 MB a normalization. */
 static void fuse_norms(SpgGpuSession *s) {
     if (!spg_gpu_kernel_built(SPG_KERNEL_bnorm)) return;
     for (uint32_t i = 0; i < s->layers; i++) {
@@ -595,6 +604,14 @@ static void fuse_norms(SpgGpuSession *s) {
         if (B && B->run == RUN_BLOCK && B->inputs[0] == i + 1u && B->L.row_len == k) {
             const uint32_t bv = slett_block_values(B->L.precision);
             if (k % bv == 0u) G->qbv = bv;
+        }
+        if (G->qbv) {
+            uint32_t j = i + 1u;
+            while (j + 1u < s->layers && reads(&s->L[j], i + 1u) && s->L[j].run == RUN_BLOCK &&
+                   slett_block_values(s->L[j].L.precision) == G->qbv && s->L[j].L.row_len == k)
+                j++;
+            G->unwritten = true;
+            for (; G->unwritten && j < s->layers; j++) G->unwritten = !reads(&s->L[j], i + 1u);
         }
     }
 }
@@ -773,8 +790,8 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 /* (with the sum before it, the quantization after it) */
                 const GLayer *A = i && s->L[i - 1u].folded ? &s->L[i - 1u] : NULL;
                 SpgBnormPush p = {A ? output_of(s, A->inputs[0]) : x[0], A ? output_of(s, A->inputs[1]) : 0, A ? A->out : 0,
-                                  G->g, y, G->qbv ? s->xq : 0, G->qbv ? s->dx : 0, G->qbv ? s->xs : 0, rows, L->out_c,
-                                  G->qbv, L->eps};
+                                  G->g, G->unwritten ? 0 : y, G->qbv ? s->xq : 0, G->qbv ? s->dx : 0,
+                                  G->qbv ? s->xs : 0, rows, L->out_c, G->qbv, L->eps};
                 const uint32_t n = L->out_c / G->tpr, spec[2] = {G->tpr, n <= 8u ? 8u : n <= 16u ? 16u : 32u};
                 spg_gpu_dispatch(c, SPG_KERNEL_bnorm, spec, 2, &p, sizeof p, groups(rows, 256u / G->tpr), 1, 1);
                 if (G->qbv) {
@@ -837,8 +854,10 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             break;
         }
         case RUN_ATTN: {
+            /* (with gflash its queries as bfloat16, as it would round them) */
             SpgKvattnPush p = {x[0], s->q, G->keys, G->values, y, G->table, G->gq, G->gk, s->info, rows, G->heads, G->kv,
-                               G->head, G->rot, L->window, s->max_length, SPG_KV_PREP, G->eps, G->scale, G->half_kv, 0};
+                               G->head, G->rot, L->window, s->max_length, SPG_KV_PREP, G->eps, G->scale, G->half_kv,
+                               G->strides != 0};
             spg_gpu_dispatch(c, SPG_KERNEL_kvattn, NULL, 0, &p, sizeof p, groups((uint64_t)rows * (G->heads + G->kv), 8u), 1, 1);
             spg_gpu_barrier(c);
             if (G->strides) {
@@ -851,7 +870,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                     const uint32_t block_rows = unit > 64u || half_rows ? 64u : 128u, spec[2] = {unit, half_rows ? 1u : 2u};
                     SpgGattnPush gp;
                     memset(&gp, 0, sizeof gp);
-                    gp.q = s->q + (uint64_t)r0 * G->heads * D * sizeof(float);
+                    gp.q = s->q + (uint64_t)r0 * G->heads * D * 2u;
                     gp.k = G->keys;
                     gp.v = G->values;
                     gp.y = y + (uint64_t)r0 * L->out_c * sizeof(float);
@@ -861,7 +880,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                     gp.d = D;
                     gp.heads = G->heads;
                     gp.scale = G->scale;
-                    gp.flags = SPG_GATTN_CACHE | SPG_GATTN_VEC | SPG_GATTN_HALF_K | SPG_GATTN_HALF_V;
+                    gp.flags = SPG_GATTN_CACHE | SPG_GATTN_VEC | SPG_GATTN_HALF_Q | SPG_GATTN_HALF_K | SPG_GATTN_HALF_V;
                     gp.info = s->info + (uint64_t)r0 * 2u * sizeof(uint32_t);
                     gp.group = G->heads / G->kv;
                     gp.window = L->window;

@@ -218,7 +218,8 @@ typedef struct {
 
 /* bnorm.comp: a session's RMS normalization of rows of k values, y = the rows times gamma as grow's RMSNORM computes
    them (TPR, spec 0, threads a row: its bits); with b, of the sums a + b (written to sum), the layers before it; with bv,
-   its outputs then quantized in blocks of bv values to q, dx and xs as bquant quantizes them (its bits). */
+   its outputs then quantized in blocks of bv values to q, dx and xs as bquant quantizes them (its bits); y 0: the
+   outputs quantized alone. */
 typedef struct {
     uint64_t a, b, sum, gamma, y, q, dx, xs;
     uint32_t rows, k, bv;
@@ -273,12 +274,13 @@ enum { SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, SPG_EMB_BLOCK = 16, SPG_EMB_PACKE
    ATTEND: a warp a row and query head: its query over the keys of its sequence from position p + 1 - attended to p
    (window: the last `window`, 0: all), the scores times scale, a softmax, the values' weighted sum to y [rows][heads
    head]. info [rows]: each row's sequence and position. With half, the caches of bfloat16 (PREP writes them so, rounded
-   to the nearest, ties to even; ATTEND reads floats only). */
+   to the nearest, ties to even; ATTEND reads floats only); with half_q, PREP's queries so (for gflash, which rounds
+   them so as it reads them). */
 typedef struct {
     uint64_t x, q, keys, values, y, table, gq, gk, info;
     uint32_t rows, heads, kv, head, rot, window, max_length, op;
     float eps, scale;
-    uint32_t half, pad;
+    uint32_t half, half_q;
 } SpgKvattnPush;
 enum { SPG_KV_PREP, SPG_KV_ATTEND };
 

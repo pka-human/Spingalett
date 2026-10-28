@@ -72,7 +72,7 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBnormPush p
         if (i >= n) continue;
         const uint32_t l = lane + TPR * i;
         v[i] = (v[i] - 0.0f) * inv * gamma[i] + 0.0f;
-        if (live) F(p.y)[(uint64_t)r * p.k + l] = v[i];
+        if (live && p.y) F(p.y)[(uint64_t)r * p.k + l] = v[i];
     }
     if (!p.bv) return;
     /* the largest magnitude of every 32 values (a warp's for one i), then of every block (bv / 32 of them) and its
