@@ -6,10 +6,11 @@
 /*
  * gflash: FusedAttention of graphs on the matrix units (mma.sync m16n8k16, bfloat16 operands, single-precision sums)
  * when their products are in bfloat16, as flash.cu's FORWARD computes attention: a warp takes MT tiles of 16 queries
- * of a batch and head, a block WARPS of them; tiles of BT keys and their values pass through shared memory (rows of
- * D + 8 bfloat16), with blocks of 128 queries the next tile's copied while the products of one run (asynchronous copies,
- * where keys and values are kept as bfloat16 in rows of 16 bytes; the second stage in the queries' room once they are
- * in registers).
+ * of a batch and head, a block four of them; tiles of BT keys and their values pass through shared memory (rows of
+ * D + 8 bfloat16), with blocks of 128 queries (64 of heads of 128) the next tile's copied while the products of one
+ * run (asynchronous copies, where keys and values are kept as bfloat16 in rows of 16 bytes; the second stage in the
+ * queries' room once they are in registers). A session's prompt (CACHE): a warp skips the tiles of keys all after
+ * its rows.
  * Queries, keys and values are read where strides put them (SpgGattnPush, as gattn.cu reads them), floats rounded
  * to bfloat16 as they are loaded; the scores are scaled in single precision, then the keep mask and the mask apply
  * as in gattn.cu, the softmax online in registers (a row's maximum and sum combined over the four threads that hold
@@ -24,7 +25,7 @@
 #define SPG_ENTRY spg_gflash_d64
 #define D 64u
 #endif
-#define WARPS (D <= 64u ? 4u : 2u)         /* warps a block */
+#define WARPS 4u                           /* warps a block */
 #if defined(MTS)
 #define MT MTS                             /* tiles of 16 queries a warp: units _m1 for short sequences (more blocks) */
 #else
@@ -253,6 +254,12 @@ extern "C" __global__ void __attribute__((launch_bounds(32u * WARPS, MIN_BLOCKS)
             else copies_wait<0>();
         }
         barrier();
+        /* (a prompt's warp skips the tiles of keys all after its rows: a tile of none would scale its sums by the
+           rounding of m log2 e, not by 1) */
+        if (cache && j0 > p0 + i0 + r0 + 16u * MT - 1u) {
+            barrier();
+            continue;
+        }
         const uint16_t *kt = s ? sh.x.s1 : sh.s0, *vt = kt + BT * SD;
         float sc[MT][NT][4];
 #pragma unroll

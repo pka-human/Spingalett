@@ -768,7 +768,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 for (uint32_t k = 0; k < s->run_count; k++) {
                     const uint32_t r0 = s->runs[k], n = s->runs[k + 1u] - r0;
                     const bool half_rows = unit <= 64u && (uint64_t)((n + 127u) / 128u) * G->heads < 64u;
-                    const uint32_t block_rows = unit > 64u ? 32u : half_rows ? 64u : 128u, spec[2] = {unit, half_rows ? 1u : 2u};
+                    const uint32_t block_rows = unit > 64u || half_rows ? 64u : 128u, spec[2] = {unit, half_rows ? 1u : 2u};
                     SpgGattnPush gp;
                     memset(&gp, 0, sizeof gp);
                     gp.q = s->q + (uint64_t)r0 * G->heads * D * sizeof(float);

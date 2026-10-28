@@ -2080,12 +2080,12 @@ static bool op_attention(GCtx *c, IrTensor *const *in, IrTensor **out) {
         if (n->inputs[i] != NONE) reads(&a, range_of(c, n->inputs[i]));
     writes(&a, range_of(c, n->outputs[0]));
     const uint32_t spec[1] = {unit};
-    /* in bfloat16 on the matrix units (gflash: blocks of 128 queries, of 32 for heads of 128), else in single
+    /* in bfloat16 on the matrix units (gflash: blocks of 128 queries, of 64 for heads of 128), else in single
        precision (gattn) */
     if (flash) {
         /* (blocks of 64 queries where those of 128 would leave the device short of blocks) */
         const bool half_rows = unit <= 64u && (uint64_t)((S + 127) / 128) * (uint64_t)(B * H) < 64u;
-        const uint32_t rows = unit > 64u ? 32u : half_rows ? 64u : 128u, spec2[2] = {unit, half_rows ? 1u : 2u};
+        const uint32_t rows = unit > 64u || half_rows ? 64u : 128u, spec2[2] = {unit, half_rows ? 1u : 2u};
         dispatch(c, &a, SPG_KERNEL_gflash, spec2, 2, &push, sizeof push, (uint32_t)((S + rows - 1) / rows),
                  (uint32_t)(B * H), 1);
         return true;
