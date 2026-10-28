@@ -48,6 +48,10 @@ typedef struct {
     uint32_t pair;                  /* RUN_BLOCK: the other layer of a gated unit whose product this one's computes too
                                        (1 + its index; find_pairs()), or 0 */
     bool paired;                    /* RUN_BLOCK: computed by a later layer's pair */
+    uint32_t join;                  /* RUN_BLOCK: the layers after it in its concatenation whose rows its product computes
+                                       too (find_joins()), or 0 */
+    uint32_t joint;                 /* the rows of that product */
+    bool joined;                    /* RUN_BLOCK: computed by another layer's join */
     uint32_t pair_act;              /* the pair's activation (its first rows') */
     uint32_t into;                  /* RUN_BLOCK: the concatenation it writes its columns of (1 + its index), or 0 */
     uint32_t ldy;                   /* RUN_BLOCK: floats between its output's rows (0: its channels) */
@@ -239,6 +243,78 @@ static void find_pairs(SpgGpuSession *s) {
     free(readers);
 }
 
+/* Two layers of block precision one product may compute: linear layers of packed blocks of one input, precision, row
+   length and activation */
+static bool joinable(const GLayer *a, const GLayer *b) {
+    return pairable(&a->L) && pairable(&b->L) && a->L.precision == b->L.precision && a->L.row_len == b->L.row_len &&
+           a->L.in_c == b->L.in_c && a->inputs[0] == b->inputs[0] && a->L.activation == b->L.activation;
+}
+
+/* A concatenation's block layers as one product (attention's queries, keys and values): where every input of a
+   concatenation without activation is a packed block layer read by it alone (layout() then gathers it), a run of
+   inputs joinable() with the first is computed by the first (join, the count of the others: their rows after its own),
+   the others run nowhere (joined). Qwen3-4B's step of a token on an RTX 4050: the keys' and values' products of
+   1024 rows each, at 62% of the memory's bandwidth alone, run in the queries'. */
+static void find_joins(SpgGpuSession *s) {
+    const uint32_t L = s->layers;
+    uint32_t *readers = (uint32_t *)calloc(L + 1u, sizeof(uint32_t));
+    if (!readers) return;
+    for (uint32_t i = 0; i < L; i++)
+        for (uint32_t k = 0; k < s->L[i].L.input_count; k++) readers[s->L[i].inputs[k]]++;
+    for (uint32_t i = 1; i + 1u < L; i++) {
+        const GLayer *C = &s->L[i];
+        const uint32_t n = C->L.input_count;
+        bool all = C->L.type == LAYER_CONCAT && C->L.activation == ACT_NONE;
+        for (uint32_t k = 0; all && k < n; k++) {
+            const uint32_t j = C->inputs[k];
+            all = j && j <= i && readers[j] == 1u && pairable(&s->L[j - 1u].L) && !s->L[j - 1u].pair &&
+                  !s->L[j - 1u].paired;
+            for (uint32_t m = 0; all && m < k; m++) all = C->inputs[m] != j;
+        }
+        for (uint32_t k = 0; all && k < n;) {
+            GLayer *G = &s->L[C->inputs[k] - 1u];
+            uint32_t m = k + 1u;
+            G->joint = G->L.rows;
+            for (; m < n && joinable(G, &s->L[C->inputs[m] - 1u]); m++) {
+                s->L[C->inputs[m] - 1u].joined = true;
+                G->joint += s->L[C->inputs[m] - 1u].L.rows;
+            }
+            G->join = m - k - 1u;
+            k = m;
+        }
+    }
+    free(readers);
+}
+
+/* A join's layers as one (find_joins(), G the first): their packed rows one after the other, and so their biases;
+   false when memory runs out */
+static bool place_join(SpgGpuSession *s, uint32_t i) {
+    GLayer *G = &s->L[i];
+    const GLayer *C = NULL;
+    uint32_t k0 = 0;
+    for (uint32_t c = i + 1u; !C && c < s->layers; c++)
+        for (uint32_t k = 0; k < s->L[c].L.input_count; k++)
+            if (s->L[c].inputs[k] == i + 1u) C = &s->L[c], k0 = k;
+    const uint32_t K = G->L.row_len, N = G->joint, type = G->type, row = SPG_PACK_ROW(type, K);
+    uint8_t *w = (uint8_t *)malloc((size_t)N * row);
+    float *b = (float *)malloc((size_t)N * sizeof(float));
+    bool ok = C && w && b;
+    for (uint32_t m = 0, at = 0; ok && m <= G->join; m++) {
+        const SlettLayer *A = &s->L[C->inputs[k0 + m] - 1u].L;
+        spg_pack_blocks(type, s->image + A->weights, A->rows, K, w + (size_t)at * row);
+        memcpy(b + at, s->image + A->biases, (size_t)A->rows * sizeof(float));
+        at += A->rows;
+    }
+    G->packed = true;
+    G->stride = row;
+    G->w = ok ? upload(s, w, (size_t)N * row) : 0;
+    G->b = ok && G->w ? upload(s, b, (size_t)N * sizeof(float)) : 0;
+    if (K > s->kmax) s->kmax = K;
+    free(w);
+    free(b);
+    return G->w && G->b;
+}
+
 /* A gated unit's two block layers as one (G the later, U the other; find_pairs()): their packed rows interleaved, the
    layer with the activation first (row 2j, then the other's row j at 2j + 1), and so their biases; false when memory
    runs out */
@@ -306,15 +382,17 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             if (L->type == LAYER_CONV2D && (!slett_conv_pointwise(L) || L->groups != 1))
                 return *why = "a convolution that mixes positions", false;
             const uint32_t K = L->row_len, N = L->rows;
-            if (!G->pair && !G->paired) G->b = image_bytes(s, L->biases, (size_t)N * sizeof(float));
-            if (!G->b && !G->pair && !G->paired) return *why = "out of device memory", false;
+            const bool whole = !G->pair && !G->paired && !G->join && !G->joined;   /* (its own weights and biases) */
+            if (whole) G->b = image_bytes(s, L->biases, (size_t)N * sizeof(float));
+            if (!G->b && whole) return *why = "out of device memory", false;
             if (spingalett_precision_is_block(L->precision)) {
                 G->run = RUN_BLOCK;
                 G->act_gew = NONE;          /* (bdot's epilogue applies it) */
                 G->type = L->precision - PRECISION_Q8_0;
                 G->stride = (uint32_t)spingalett_slett_row_bytes(L->precision, K);
-                if (G->paired) return true;
+                if (G->paired || G->joined) return true;
                 if (G->pair) return place_pair(s, G, &s->L[G->pair - 1u]) || (*why = "out of device memory", false);
+                if (G->join) return place_join(s, i) || (*why = "out of device memory", false);
                 G->packed = spg_packed_bytes(G->type, N, K) != 0;
                 G->w = G->packed ? image_packed(s, L->weights, G->type, N, K) : image_bytes(s, L->weights, (size_t)G->stride * N);
                 if (G->packed) G->stride = SPG_PACK_ROW(G->type, K);
@@ -550,6 +628,7 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
         for (uint32_t k = 0; k < G->L.input_count; k++) G->inputs[k] = spingalett_slett_input(s->image, &G->L, k);
     }
     find_pairs(s);
+    find_joins(s);
     for (uint32_t i = 0; i < s->layers; i++) {
         GLayer *G = &s->L[i];
         if (G->L.in_c > widest) widest = G->L.in_c;
@@ -645,8 +724,9 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 s->quantized = x[0];
                 s->quantized_bv = BV;
             }
-            /* (a gated unit's pair: twice the rows of weights, the outputs of the unit) */
-            const uint32_t act = G->pair ? G->pair_act : (uint32_t)L->activation, N = G->pair ? 2u * L->rows : L->rows;
+            /* (a gated unit's pair: twice the rows of weights, the outputs of the unit; a join: its layers' rows) */
+            const uint32_t act = G->pair ? G->pair_act : (uint32_t)L->activation;
+            const uint32_t N = G->pair ? 2u * L->rows : G->join ? G->joint : L->rows;
             if (rows >= 3u) {
                 /* three rows or more on the matrix units (bmm's 64 rows cost little more than bdot's one: Qwen3-0.6B's
                    layer in Q8_0 on an RTX 4050, 150 us for up to 64 rows, 53 us a row by bdot, 365 us 8 rows) */
@@ -661,7 +741,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 const uint32_t spec[5] = {G->type, 1u, act, G->packed, G->pair != 0u};
                 SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, 1u, N, K, G->stride, r0,
                                   G->ldy ? G->ldy : L->out_c};
-                spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 5, &dp, sizeof dp, groups(L->rows, 8u), 1, 1);
+                spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 5, &dp, sizeof dp, groups(G->pair ? L->rows : N, 8u), 1, 1);
             }
             break;
         }
@@ -816,7 +896,7 @@ static SpgGpuCommands *record_step(SpgGpuSession *s, uint32_t rows, uint32_t pic
     s->quantized = 0;
     for (uint32_t i = 0; i < s->layers; i++) {
         const GLayer *G = &s->L[i];
-        if (G->skip || G->folded || G->paired || G->gathered) continue;
+        if (G->skip || G->folded || G->paired || G->joined || G->gathered) continue;
         spg_gpu_barrier(c);
         if (G->run != RUN_BLOCK) s->quantized = 0;      /* (a layer that may write where the quantized input was) */
         uint64_t x[SPINGALETT_MAX_INPUTS];
