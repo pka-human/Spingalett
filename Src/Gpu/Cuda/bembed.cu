@@ -151,9 +151,9 @@ KERNEL(bembed, SpgBembedPush) {
                 const uint16_t *pairs = (const uint16_t *)aux;
                 v = from_half(pairs[subs + 2u * sb]) * (float)(int8_t)pairs[sub] * (float)iq4_value((uint32_t)code);
             } else {                            /* Q6_K */
-                const uint8_t *hb = row + p.d / 2u + 8u * sub;
-                const uint32_t piece = hb[2u * ((i & 15u) / 4u)] | (uint32_t)hb[2u * ((i & 15u) / 4u) + 1u] << 8;
-                const uint32_t high = (piece >> ((i < 16u ? 0u : 8u) + 2u * (i % 4u))) & 3u;
+                /* (byte (i % 16) of the pair of sub-blocks' highs: the first's at bits 0 to 3, the second's 4 to 7) */
+                const uint8_t hb = row[p.d / 2u + 16u * (sub / 2u) + (i & 15u)];
+                const uint32_t high = (uint32_t)(hb >> (4u * (sub % 2u) + (i < 16u ? 0u : 2u))) & 3u;
                 const uint8_t *pr = aux + 2u * sub;
                 const float d = from_half(((const uint16_t *)(aux + 2u * subs))[sb]);
                 v = d * (float)(int8_t)pr[i < 16u ? 0 : 1] * (float)((code | (int32_t)(high << 4)) - 32);

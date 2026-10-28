@@ -12,8 +12,9 @@
  * Codes: Q8_0's as they are; 4-bit ones in sixteen bytes a sub-block of 32 values, byte i the code of value i, then of
  * value i + 16 above it (GGUF's order of Q4_0, IQ4_NL, IQ4_XS and of their fifth bits; Q4_K's, Q5_K's and Q6_K's low
  * bits rearranged so): a lane's word gives both halves of a fragment of 32 by a mask and a shift; Q6_K's high two bits
- * then, eight bytes a sub-block, sixteen bits a lane's word (the high bits of its four values of the first half of 16,
- * then of the second's).
+ * then, sixteen bytes a pair of sub-blocks, a word a lane t: its byte k the high bits of value 4t + k of the first
+ * sub-block (bits 0 and 1), of its value 16 + 4t + k (2, 3), then of the second sub-block's (4, 5 and 6, 7), so that a
+ * shift and a mask put each fragment's at bits 4 and 5 of its bytes.
  * The rest, in order: Q8_0, Q4_0, IQ4_NL: the blocks' scales (float16); Q4_1: the scale and the minimum; Q5_0: the
  * fifth bits, a word a block (bit i value i's), then the scales; Q5_1: the fifth bits, then the scales and minima;
  * Q4_K: the sub-blocks' 6-bit scale and minimum in a pair of bytes, then the super-blocks' scale and minimum (float16);
@@ -134,12 +135,10 @@ void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, 
                             high[i] = (hb[i] >> (2u * g)) & 3u;
                         }
                         nibbles(r + 16u * sub, low);
-                        for (uint32_t t = 0; t < 4u; t++) {
-                            uint32_t piece = 0;
-                            for (uint32_t k = 0; k < 4u; k++) piece |= high[4u * t + k] << (2u * k) | high[16u + 4u * t + k] << (8u + 2u * k);
-                            highs[8u * sub + 2u * t] = (uint8_t)piece;
-                            highs[8u * sub + 2u * t + 1u] = (uint8_t)(piece >> 8);
-                        }
+                        for (uint32_t t = 0; t < 4u; t++)
+                            for (uint32_t k = 0; k < 4u; k++)
+                                highs[16u * (sub / 2u) + 4u * t + k] |=
+                                    (uint8_t)((high[4u * t + k] | high[16u + 4u * t + k] << 2) << (4u * (sub % 2u)));
                         pairs[sub] = (uint16_t)(block[192u + 2u * c] | (uint32_t)block[192u + 2u * c + 1u] << 8);
                     }
                 }

@@ -70,21 +70,17 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBdotPush p,
                 const uint4_ x0 = ((const uint4_ *)(x + 32u * c))[0], x1 = ((const uint4_ *)(x + 32u * c))[1];
                 const uint32_t m4 = 0x0F0F0F0Fu;
                 if (SIX) {
-                    /* (each half of 16 alone: its four words of codes, a lane's low nibbles and the high two bits) */
-                    const uint2_ hb = *(const uint2_ *)(highs + 8u * c);
-                    const uint32_t pieces[4] = {hb.x & 0xFFFFu, hb.x >> 16, hb.y & 0xFFFFu, hb.y >> 16};
+                    /* (each half of 16 alone: its four words of codes, a lane's low nibbles and the high two bits, the
+                       words of its pair of sub-blocks, bits 0 to 3 of their bytes the first's, 4 to 7 the second's) */
+                    const uint4_ hb = *(const uint4_ *)(highs + 16u * (c / 2u));
+                    const uint32_t hw[4] = {hb.x, hb.y, hb.z, hb.w}, shift = 4u * (c % 2u);
                     const uint32_t words[4] = {w.x, w.y, w.z, w.w}, xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
                     int32_t lo = 0, hi = 0;
     #pragma unroll
                     for (uint32_t k = 0; k < 4u; k++) {
-                        uint32_t h = pieces[k] & 0xFFu;
-                        h = h | h << 6;
-                        h = h | h << 12;
+                        const uint32_t h = hw[k] >> shift;
                         lo = dp4a((words[k] & m4) | (h & 0x03030303u) << 4, xa[k], lo);
-                        h = pieces[k] >> 8;
-                        h = h | h << 6;
-                        h = h | h << 12;
-                        hi = dp4a(((words[k] >> 4) & m4) | (h & 0x03030303u) << 4, xb[k], hi);
+                        hi = dp4a(((words[k] >> 4) & m4) | (h & 0x0C0C0C0Cu) << 2, xb[k], hi);
                     }
                     const uint32_t pr = pairs[c];
                     i1 = (int32_t)(signed char)(pr & 0xFFu) * (lo - 32 * xs[2u * c]);

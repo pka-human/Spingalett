@@ -68,10 +68,10 @@ DEVICE void ldsm4(uint32_t at, uint32_t (&r)[4]) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at) : "memory");
 }
-/* d = c + a b of 8-bit integers (16 x 16 signed by 16 x 8 unsigned), exact: c's rows g (c01) and g + 8 (c23) */
-DEVICE void mma_s8u8_k16(int32_t (&d)[4], uint32_t a0, uint32_t a1, uint32_t b, int32_t c01, int32_t c23) {
-    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.u8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %7, %8, %8};"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b), "r"(c01), "r"(c23));
+/* d = a b of 8-bit integers (16 x 16 signed by 16 x 8 unsigned), exact */
+DEVICE void mma_s8u8_k16(int32_t (&d)[4], uint32_t a0, uint32_t a1, uint32_t b) {
+    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.u8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %7, %7, %7};"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b), "r"(0));
 }
 DEVICE uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
     uint32_t r;
@@ -80,17 +80,23 @@ DEVICE uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
 }
 /* four bits of x at bit 4 of four bytes */
 DEVICE uint32_t spread1(uint32_t x) { return ((x * 0x00204081u) & 0x01010101u) << 4; }
-/* four 2-bit fields of x at bits 4 and 5 of four bytes */
-DEVICE uint32_t spread2(uint32_t x) {
-    x = x | x << 6;
-    x = x | x << 12;
-    return (x & 0x03030303u) << 4;
-}
 /* d = c + a b of 8-bit integers (16 x 16 signed by 16 x 8 unsigned), exact */
 DEVICE void mma_k16(int32_t (&d)[4], uint32_t a0, uint32_t a1, uint32_t b, const int32_t (&c)[4]) {
     asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.u8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a0), "r"(a1), "r"(b), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+}
+/* d = c + a b of 8-bit integers (16 x 16 by 16 x 8 signed: a signed (S), else unsigned), exact */
+template <bool S>
+DEVICE void mma_k16_s(int32_t (&d)[4], uint32_t a0, uint32_t a1, uint32_t b, const int32_t (&c)[4]) {
+    if (S)
+        asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+            : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+            : "r"(a0), "r"(a1), "r"(b), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+    else
+        asm("mma.sync.aligned.m16n8k16.row.col.s32.u8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+            : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+            : "r"(a0), "r"(a1), "r"(b), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
 }
 /* d = a b of 8-bit integers (16 x 32 signed by 32 x 8 unsigned; IQ4_XS: signed), exact */
 DEVICE void mma_s8u8_k32(int32_t (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -128,7 +134,7 @@ DEVICE uint32_t chunk_b(uint32_t r, uint32_t cb) { return 8u * r + 4u * (cb ^ ((
 struct __attribute__((aligned(16))) Stage {       /* (a multiple of 16 bytes: the next stage's chunks aligned) */
     uint8_t a[BM * 64u];                    /* the rows' codes */
     uint32_t b[BN * 8u];                    /* the weights' (Q6_K: their low four bits) */
-    uint16_t h[SIX ? BN * 8u : 8u];         /* Q6_K: their high two bits, 8 bytes a sub-block */
+    uint32_t h[SIX ? BN * 4u : 4u];         /* Q6_K: their high two bits, a word a lane of the stage's two sub-blocks */
     uint32_t f[FIVE ? BN : 4u][SB];         /* Q5_K: their fifth bits */
 };
 struct Super {
@@ -243,9 +249,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         wr = wr == STAGES - 1u ? 0u : wr + 1u;
         const uint32_t sb = s / PER, j = s % PER;
         const Super &su = sh.su[sb & 1u];
-        if (MINIMA && j == 0u && tid < BM) {
+        if (!NLX && j == 0u && tid < BM) {
             /* this row's sums of 16 codes of the super-block as 64 h + l (h of -32 to 31, l of 0 to 63), the bytes of the
-               minima's products (shown to the other warps by the next stage's barrier: a super-block has four) */
+               minima's products (Q6_K: of the halves' scales'; shown to the other warps by the next stage's barrier: a
+               super-block has four) */
             Super &sw = sh.su[sb & 1u];
             uint32_t hl[8];
 #pragma unroll
@@ -288,30 +295,23 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
                     b1[b] = nl_values(b1[b]);
                 }
                 if (SIX) {
-                    /* (the high two bits of the four values of each half) */
-                    const uint32_t piece = st.h[8u * r + 4u * cb + t];
-                    b0[b] |= spread2(piece & 0xFFu);
-                    b1[b] |= spread2(piece >> 8);
+                    /* (the high two bits of the four values of each half: bits 0 to 3 of the word's bytes the first
+                       sub-block's, 4 to 7 the second's) */
+                    const uint32_t hw = st.h[4u * r + t];
+                    b0[b] |= cb ? hw & 0x30303030u : (hw << 4) & 0x30303030u;
+                    b1[b] |= cb ? (hw >> 2) & 0x30303030u : (hw << 2) & 0x30303030u;
                 }
             }
             if (SIX) {
-                /* the halves of 16, each from minus 32 times the rows' sums of 16 (the codes less 32), times its scale */
-                const uint32_t c16 = 2u * (SB * j + cb);
-                int32_t off[2][2][2];
-#pragma unroll
-                for (uint32_t a = 0; a < 2u; a++)
-#pragma unroll
-                    for (uint32_t h = 0; h < 2u; h++)
-#pragma unroll
-                        for (uint32_t half = 0; half < 2u; half++)
-                            off[a][h][half] = -32 * su.xs[32u * wm + 16u * a + g + 8u * h][c16 + half];
+                /* the halves of 16 of the codes as they are (0 to 63), each times its scale (the codes less 32: the
+                   super-block's end takes 32 times the scales by the rows' sums of 16 away) */
 #pragma unroll
                 for (uint32_t a = 0; a < 2u; a++)
 #pragma unroll
                     for (uint32_t b = 0; b < TN; b++) {
                         int32_t lo[4], hi[4];
-                        mma_s8u8_k16(lo, af[a][0], af[a][1], b0[b], off[a][0][0], off[a][1][0]);
-                        mma_s8u8_k16(hi, af[a][2], af[a][3], b1[b], off[a][0][1], off[a][1][1]);
+                        mma_s8u8_k16(lo, af[a][0], af[a][1], b0[b]);
+                        mma_s8u8_k16(hi, af[a][2], af[a][3], b1[b]);
 #pragma unroll
                         for (uint32_t e = 0; e < 4u; e++) {
                             const uint32_t pr = pw[b][e & 1u] >> (16u * cb);
@@ -336,14 +336,15 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
         }
         if (j == PER - 1u) {
             /* the super-block's end: I2, the minima times the rows' sums of 32, on the matrix units (k the 16 sums of 16,
-               each minimum twice: by the h bytes, 64 times, then by the l bytes); then the terms, in order */
+               each minimum twice: by the h bytes, 64 times, then by the l bytes; Q6_K: the halves' scales by the sums of
+               16, I1 less 32 times them); then the terms, in order */
             /* (a tile at a time: its I2 lives four registers) */
 #pragma unroll
             for (uint32_t a = 0; a < 2u; a++) {
                 const uint32_t r = 32u * wm + 16u * a + g;
                 const float dx[2] = {su.dx[r], su.dx[r + 8u]};
                 uint32_t h0 = 0u, h1 = 0u, l0 = 0u, l1 = 0u;
-                if (MINIMA) {
+                if (!NLX) {
                     h0 = (uint32_t)su.xs[r][t], h1 = (uint32_t)su.xs[r + 8u][t];
                     l0 = (uint32_t)su.xs[r][4u + t], l1 = (uint32_t)su.xs[r + 8u][4u + t];
                 }
@@ -356,6 +357,16 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
                         mma_k16(d, h0, h1, mb, i2);
                         const int32_t c[4] = {d[0] * 64, d[1] * 64, d[2] * 64, d[3] * 64};
                         mma_k16(i2, l0, l1, mb, c);
+                    }
+                    if (SIX) {
+                        /* (the scales of halves 4t to 4t + 3 of the column g, signed) */
+                        const uint32_t sb4 = su.pairs[8u * TN * wn + 8u * b + g][t];
+                        int32_t d[4];
+                        mma_k16_s<true>(d, h0, h1, sb4, i2);
+                        const int32_t c[4] = {d[0] * 64, d[1] * 64, d[2] * 64, d[3] * 64};
+                        mma_k16_s<false>(i2, l0, l1, sb4, c);
+#pragma unroll
+                        for (uint32_t e = 0; e < 4u; e++) i1[a][b][e] -= 32 * i2[e];
                     }
 #pragma unroll
                     for (uint32_t e = 0; e < 4u; e++) {
