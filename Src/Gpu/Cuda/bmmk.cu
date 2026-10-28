@@ -170,7 +170,8 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
 #pragma unroll
     for (uint32_t i = 0; i < BM * 4u / THREADS; i++) {
         const uint32_t u = tid + THREADS * i, r = u >> 2, c = u & 3u, m = m0 + r;
-        src_a[i] = (const int8_t *)p.q + (m < p.rows ? (uint64_t)(p.r0 + m) * p.k : 0u) + 16u * c;
+        static_assert(32u * SB == 64u, "a stage a tile of the rows");
+        src_a[i] = (const int8_t *)p.q + SPG_TILED_AT(m < p.rows ? p.r0 + m : 0u, 16u * c, p.k);
         to_a[i] = __builtin_offsetof(Stage, a) + chunk_a(r, c);
         size_a[i] = m < p.rows ? 16u : 0u;
     }
@@ -204,7 +205,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) SPG_ENTRY(const SpgBdotPus
     auto issue = [&](uint32_t s, uint32_t slot) {
         const uint32_t st = base + __builtin_offsetof(Shared, st) + slot * (uint32_t)sizeof(Stage);
 #pragma unroll
-        for (uint32_t i = 0; i < BM * 4u / THREADS; i++) copy16(st + to_a[i], src_a[i] + 32u * SB * s, size_a[i]);
+        for (uint32_t i = 0; i < BM * 4u / THREADS; i++) copy16(st + to_a[i], src_a[i] + 4096u * s, size_a[i]);
 #pragma unroll
         for (uint32_t i = 0; i < CB; i++) copy16(st + to_b[i], src_b[i] + 16u * SB * s, size_b[i]);
         const uint32_t sb = s / PER, j = s % PER;

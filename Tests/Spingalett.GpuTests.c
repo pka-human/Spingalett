@@ -910,8 +910,11 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
     memset(got, 0xFF, (size_t)R * N * 4);              /* (NaNs written over the outputs before each unit) */
     bool ok = upload(&bw, w, (size_t)N * stride + 16u) && upload(&bx, x, (size_t)R * K * 4) && upload(&bb, bias, N * 4) &&
               upload(&bnan, got, (size_t)R * N * 4) &&
-              spg_gpu_buffer_create(&bq, (size_t)R * K, false) && spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
+              spg_gpu_buffer_create(&bq, (size_t)SPG_TILED_BYTES(R, K), false) &&
+              spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
               spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) && spg_gpu_buffer_create(&by, (size_t)R * N * 4, false);
+    uint8_t *tiles = (uint8_t *)malloc((size_t)SPG_TILED_BYTES(R, K));
+    ok = ok && tiles;
     /* (the types sessions keep packed: bmmp's and bdotp's packed rows too, units 3 and 4) */
     const size_t packed_bytes = spg_packed_bytes(type, N, K) + 16u;
     uint8_t *packed = packed_bytes > 16u ? (uint8_t *)calloc(packed_bytes, 1) : NULL;
@@ -924,7 +927,9 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
         const uint32_t rows_a_pass = unit == 1 ? SPG_BDOT_ROWS : 1u;
         SpgGpuCommands *c = spg_gpu_commands_create();
         ok = c && spg_gpu_record_begin(c);
-        SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
+        /* (bmmp's unit of bmmk's types: the rows quantized in tiles) */
+        const bool tiled = unit == 3u && SPG_BMM_TILED(type);
+        SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K, tiled, 0};
         if (ok) spg_gpu_copy(c, &bnan, 0, &by, 0, (size_t)R * N * 4);
         if (ok)
             spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
@@ -954,8 +959,11 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
         }
         ok = ok && spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
         if (c) spg_gpu_commands_free(c);
-        ok = ok && download(gxq, &bq, (size_t)R * K) && download(gdx, &bdx, (size_t)R * (K / BV) * 4) &&
-             download(gxs, &bxs, (size_t)R * (K / 16) * 4) && download(got, &by, (size_t)R * N * 4);
+        ok = ok && download(tiled ? (void *)tiles : (void *)gxq, &bq, tiled ? (size_t)SPG_TILED_BYTES(R, K) : (size_t)R * K) &&
+             download(gdx, &bdx, (size_t)R * (K / BV) * 4) && download(gxs, &bxs, (size_t)R * (K / 16) * 4) &&
+             download(got, &by, (size_t)R * N * 4);
+        for (uint32_t r = 0; ok && tiled && r < R; r++)
+            for (uint32_t j = 0; j < K; j++) gxq[(size_t)r * K + j] = (int8_t)tiles[SPG_TILED_AT(r, j, K)];
         same_q = ok && !memcmp(gxq, xq, (size_t)R * K) && !memcmp(gdx, dx, (size_t)R * (K / BV) * 4) &&
                  !memcmp(gxs, xs, (size_t)R * (K / 16) * 4);
         same_y = same_y && ok && !memcmp(got, want, (size_t)R * N * 4);
@@ -965,6 +973,7 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
            !ok ? "FAILED to run" : !same_q ? "quantized rows DIFFER" : !same_y ? "products DIFFER" : "the CPU's bits");
     SpgGpuBuffer *bufs[] = {&bw, &bx, &bq, &bdx, &bxs, &bb, &by, &bnan, &bp};
     free(packed);
+    free(tiles);
     for (size_t k = 0; k < sizeof bufs / sizeof *bufs; k++) spg_gpu_buffer_free(bufs[k]);
     free(wf); free(x); free(bias); free(want); free(got); free(dx); free(gdx); free(w); free(xq); free(gxq); free(xs); free(gxs);
 }
@@ -1015,7 +1024,7 @@ static void bench_blocks(int count, char **types) {
             SpgGpuBuffer bw, bx, bq, bdx, bxs, bb, by;
             float *bias = (float *)calloc(N, sizeof(float));
             bool ok = bias && upload(&bw, w, copies * wbytes + 16u) && upload(&bx, x, (size_t)R * K * 4) &&
-                      upload(&bb, bias, N * 4) && spg_gpu_buffer_create(&bq, (size_t)R * K, false) &&
+                      upload(&bb, bias, N * 4) && spg_gpu_buffer_create(&bq, (size_t)SPG_TILED_BYTES(R, K), false) &&
                       spg_gpu_buffer_create(&bdx, (size_t)R * (K / BV) * 4, false) &&
                       spg_gpu_buffer_create(&bxs, (size_t)R * (K / 16) * 4, false) &&
                       spg_gpu_buffer_create(&by, (size_t)R * N * 4, false);
@@ -1024,7 +1033,8 @@ static void bench_blocks(int count, char **types) {
                 const int reps = pass ? 50 : 3;
                 SpgGpuCommands *c = spg_gpu_commands_create();
                 ok = c && spg_gpu_record_begin(c);
-                SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K};
+                SpgBquantPush qp = {bx.address, bq.address, bdx.address, bxs.address, R, K, BV, K,
+                                    R >= SPG_MM_ROWS && pack && SPG_BMM_TILED((uint32_t)type), 0};
                 if (ok)
                     spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
                                      (R * (K / BV) + SPG_BQUANT_BLOCKS(BV) - 1) / SPG_BQUANT_BLOCKS(BV), 1, 1);

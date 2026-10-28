@@ -46,7 +46,7 @@ KERNEL(bquant, SpgBquantPush) {
     for (uint32_t h = lb / 2u; h > 0u; h >>= 1) m = shfl_max(m, h);
     const bool bad = m >= 0x7F800000u, zero = m == 0u;
     const float amax = bits_float(m), inv = bad || zero ? 0.0f : __nvvm_div_rn_f(127.0f, amax);
-    signed char *q = (signed char *)p.q + (uint64_t)r * p.k + b * p.bv;
+    signed char *q = (signed char *)p.q;
     int32_t *xs = (int32_t *)p.xs + (uint64_t)r * (p.k / 16u) + b * (p.bv / 16u);
     for (uint32_t f = 0; f < fours; f++) {
         const uint32_t at = 4u * (l + lb * f);
@@ -62,7 +62,9 @@ KERNEL(bquant, SpgBquantPush) {
         sum = shfl_add(sum, 1u);
         sum = shfl_add(sum, 2u);
         if (live) {
-            *(uint32_t *)(q + at) = codes;
+            /* (four codes in one 64 of a tile's row) */
+            const uint32_t j = b * p.bv + at;
+            *(uint32_t *)(q + (p.tiled ? SPG_TILED_AT(r, j, p.k) : (uint64_t)r * p.k + j)) = codes;
             if ((l & 3u) == 0u) xs[at >> 4] = sum;
         }
     }

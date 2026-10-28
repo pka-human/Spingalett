@@ -104,7 +104,7 @@ extern "C" __global__ void __launch_bounds__(256) SPG_ENTRY(const SpgBnormPush p
         /* (a block of NaN or infinities, or of zeros: codes 0) */
         float y = qi == 0.0f ? 0.0f : __builtin_rintf(__nvvm_mul_rn_f(v[i], qi));
         y = y > 127.0f ? 127.0f : y < -127.0f ? -127.0f : y;
-        ((signed char *)p.q)[(uint64_t)r * p.k + l] = (signed char)(int32_t)y;
+        ((signed char *)p.q)[p.tiled ? SPG_TILED_AT(r, l, p.k) : (uint64_t)r * p.k + l] = (signed char)(int32_t)y;
         int32_t sum = (int32_t)y;
         for (uint32_t h = 8u; h > 0u; h >>= 1) sum = shfl_add(sum, h);
         if (l % 16u == 0u) ((int32_t *)p.xs)[(uint64_t)r * (p.k / 16u) + l / 16u] = sum;

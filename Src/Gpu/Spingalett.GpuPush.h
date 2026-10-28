@@ -213,7 +213,18 @@ enum { SPG_IP_EPI, SPG_IP_DIRECT, SPG_IP_POOL, SPG_IP_GAP, SPG_IP_ADD, SPG_IP_MU
 typedef struct {
     uint64_t x, q, dx, xs;
     uint32_t rows, k, bv, ldx;
+    uint32_t tiled, pad;            /* q in tiles (SPG_TILED_AT()), else rows of k bytes */
 } SpgBquantPush;
+/* Byte j of row r of rows of k quantized values in tiles (what bmm reads for weights of SPG_BMM_TILED() types, bmmk's,
+   in a session's steps of SPG_MM_ROWS rows or more; the others read rows of k bytes):
+   tiles of 64 rows by 64 values, each tile's rows of 64 bytes one after the other, a row of tiles in the order of the
+   values, so that a stage of bmm copies one piece of memory (rows of single bytes cost it as much as the weights);
+   SPG_TILED_BYTES() of them for rows rows */
+#define SPG_TILED_AT(r, j, k) \
+    (((uint64_t)((r) >> 6) * (((k) + 63u) >> 6) + ((j) >> 6)) * 4096u + ((r) & 63u) * 64u + ((j) & 63u))
+#define SPG_TILED_BYTES(rows, k) ((uint64_t)(((rows) + 63u) >> 6) * (((k) + 63u) >> 6) * 4096u)
+#define SPG_MM_ROWS 3u
+#define SPG_BMM_TILED(t) ((t) == SPG_B_Q4_K || (t) == SPG_B_Q5_K || (t) == SPG_B_Q6_K || (t) == SPG_B_IQ4_XS)
 #define SPG_BQUANT_BLOCKS(bv) ((bv) >= 128u ? 8u : 8u * 128u / (bv))
 
 /* bnorm.comp: a session's RMS normalization of rows of k values, y = the rows times gamma as grow's RMSNORM computes
@@ -224,6 +235,7 @@ typedef struct {
     uint64_t a, b, sum, gamma, y, q, dx, xs;
     uint32_t rows, k, bv;
     float eps;
+    uint32_t tiled, pad;            /* q in tiles (SPG_TILED_AT()) */
 } SpgBnormPush;
 
 /* bmmp.comp, bdotp.comp: bmm's and bdot's products (SpgBdotPush) of weights packed as sessions keep them
@@ -246,7 +258,8 @@ typedef struct {
    bquant arrays (SPG_BDOT_ROWS at most a dispatch), y's rows ldy floats apart. A warp a row of weights. Then the
    activation of spec 2 (ActivationFunction, 0: none), and with e0 the product by e0's value at y's place (a gated
    unit's other half). The packed kernels' pairs (bmmp's spec 3, bdotp's spec 4): a gated unit's two layers, rows 2j
-   and 2j + 1 of the weights (n of them) and of the biases, the second's sum times the first's activated, at y's j. */
+   and 2j + 1 of the weights (n of them) and of the biases, the second's sum times the first's activated, at y's j.
+   bmm (every row at once, on the matrix units) reads the codes q of SPG_BMM_TILED() types in tiles (SPG_TILED_AT()). */
 typedef struct {
     uint64_t w, q, dx, xs, bias, y, e0;
     uint32_t rows, n, k, stride, r0, ldy;

@@ -89,8 +89,10 @@ struct SpgGpuSession {
     uint32_t kmax;                  /* inputs of the widest block layer */
     uint32_t run_count, *runs;      /* recording: the step's runs of rows (each of one sequence at consecutive
                                        positions): their first rows, and one past the last */
-    uint64_t quantized;             /* recording: the input the quantized rows hold (0: none), in blocks of quantized_bv */
+    uint64_t quantized;             /* recording: the input the quantized rows hold (0: none), in blocks of quantized_bv
+                                       (in tiles: quantized_tiled) */
     uint32_t quantized_bv;
+    bool quantized_tiled;
     Kept kept[KEPT];
     uint32_t next;
 };
@@ -608,7 +610,8 @@ static void fuse_norms(SpgGpuSession *s) {
         if (G->qbv) {
             uint32_t j = i + 1u;
             while (j + 1u < s->layers && reads(&s->L[j], i + 1u) && s->L[j].run == RUN_BLOCK &&
-                   slett_block_values(s->L[j].L.precision) == G->qbv && s->L[j].L.row_len == k)
+                   slett_block_values(s->L[j].L.precision) == G->qbv && s->L[j].L.row_len == k &&
+                   SPG_BMM_TILED(s->L[j].type) == SPG_BMM_TILED(B->type))
                 j++;
             G->unwritten = true;
             for (; G->unwritten && j < s->layers; j++) G->unwritten = !reads(&s->L[j], i + 1u);
@@ -667,7 +670,7 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
         if (s->L[i].run == RUN_ATTN && s->L[i].heads * s->L[i].head > qfloats) qfloats = s->L[i].heads * s->L[i].head;
     const uint32_t kmax = s->kmax ? s->kmax : 16u;
     s->q = buffer_new(s, (size_t)most * (qfloats ? qfloats : 1u) * sizeof(float), false);
-    s->xq = buffer_new(s, (size_t)most * kmax, false);
+    s->xq = buffer_new(s, (size_t)SPG_TILED_BYTES(most, kmax), false);     /* (as many as rows of kmax bytes, or more) */
     s->dx = buffer_new(s, (size_t)most * (kmax / 32u + 1u) * sizeof(float), false);
     s->xs = buffer_new(s, (size_t)most * (kmax / 16u + 1u) * sizeof(int32_t), false);
     /* logits of SPG_SESSION_LOGITS rows a step at most, unless the last layer runs on every row */
@@ -733,18 +736,20 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
         case RUN_BLOCK: {
             /* (an input the block layer before quantized in blocks of as many values: quantized once) */
             const uint32_t K = L->row_len, BV = slett_block_values(L->precision);
-            if (s->quantized != x[0] || s->quantized_bv != BV) {
-                SpgBquantPush qp = {x[0], s->xq, s->dx, s->xs, rows, K, BV, L->in_c};
+            const bool tiled = rows >= SPG_MM_ROWS && SPG_BMM_TILED(G->type);    /* (as bmm reads them) */
+            if (s->quantized != x[0] || s->quantized_bv != BV || s->quantized_tiled != tiled) {
+                SpgBquantPush qp = {x[0], s->xq, s->dx, s->xs, rows, K, BV, L->in_c, tiled, 0};
                 spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
                                  groups((uint64_t)rows * (K / BV), SPG_BQUANT_BLOCKS(BV)), 1, 1);
                 spg_gpu_barrier(c);
                 s->quantized = x[0];
                 s->quantized_bv = BV;
+                s->quantized_tiled = tiled;
             }
             /* (a gated unit's pair: twice the rows of weights, the outputs of the unit; a join: its layers' rows) */
             const uint32_t act = G->pair ? G->pair_act : (uint32_t)L->activation;
             const uint32_t N = G->pair ? 2u * L->rows : G->join ? G->joint : L->rows;
-            if (rows >= 3u) {
+            if (rows >= SPG_MM_ROWS) {
                 /* three rows or more on the matrix units (bmm's 64 rows cost little more than bdot's one: Qwen3-0.6B's
                    layer in Q8_0 on an RTX 4050, 150 us for up to 64 rows, 53 us a row by bdot, 365 us 8 rows) */
                 const uint32_t spec[4] = {G->type, G->packed, act, G->pair != 0u};
@@ -789,14 +794,16 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             if (G->tpr) {
                 /* (with the sum before it, the quantization after it) */
                 const GLayer *A = i && s->L[i - 1u].folded ? &s->L[i - 1u] : NULL;
+                const bool tiled = G->qbv && rows >= SPG_MM_ROWS && SPG_BMM_TILED(s->L[i + 1u].type);  /* (its reader's) */
                 SpgBnormPush p = {A ? output_of(s, A->inputs[0]) : x[0], A ? output_of(s, A->inputs[1]) : 0, A ? A->out : 0,
                                   G->g, G->unwritten ? 0 : y, G->qbv ? s->xq : 0, G->qbv ? s->dx : 0,
-                                  G->qbv ? s->xs : 0, rows, L->out_c, G->qbv, L->eps};
+                                  G->qbv ? s->xs : 0, rows, L->out_c, G->qbv, L->eps, tiled, 0};
                 const uint32_t n = L->out_c / G->tpr, spec[2] = {G->tpr, n <= 8u ? 8u : n <= 16u ? 16u : 32u};
                 spg_gpu_dispatch(c, SPG_KERNEL_bnorm, spec, 2, &p, sizeof p, groups(rows, 256u / G->tpr), 1, 1);
                 if (G->qbv) {
                     s->quantized = y;
                     s->quantized_bv = G->qbv;
+                    s->quantized_tiled = tiled;
                 }
                 break;
             }
