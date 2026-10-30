@@ -752,10 +752,9 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     *why = NULL;
     if (!spg_gpu_kernel_built(SPG_KERNEL_bembed) || !spg_gpu_kernel_built(SPG_KERNEL_kvattn) ||
         !spg_gpu_kernel_built(SPG_KERNEL_bquant) || !spg_gpu_kernel_built(SPG_KERNEL_bdot) ||
-        !spg_gpu_kernel_built(SPG_KERNEL_bmm) ||
         !spg_gpu_kernel_built(SPG_KERNEL_gew) || !spg_gpu_kernel_built(SPG_KERNEL_grow) ||
         !spg_gpu_kernel_built(SPG_KERNEL_ggather) || !spg_gpu_kernel_built(SPG_KERNEL_gcopy))
-        return *why = "the backend has not its kernels (CUDA's alone, as yet)", NULL;
+        return *why = "the backend has not its kernels", NULL;
     SpgGpuSession *s = (SpgGpuSession *)calloc(1, sizeof *s);
     if (!s) return *why = "out of memory", NULL;
     s->image = (const uint8_t *)model->image;
@@ -912,7 +911,8 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
         case RUN_BLOCK: {
             /* (an input the block layer before quantized in blocks of as many values: quantized once) */
             const uint32_t K = L->row_len, BV = slett_block_values(L->precision);
-            const bool tiled = rows >= SPG_MM_ROWS && SPG_BMM_TILED(G->type);    /* (as bmm reads them) */
+            /* (as bmm reads them; bdot in rows) */
+            const bool tiled = rows >= SPG_MM_ROWS && SPG_BMM_TILED(G->type) && spg_gpu_kernel_built(SPG_KERNEL_bmm);
             if (s->quantized != x[0] || s->quantized_bv != BV || s->quantized_tiled != tiled) {
                 SpgBquantPush qp = {x[0], s->xq, s->dx, s->xs, rows, K, BV, L->in_c, tiled, 0};
                 spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
@@ -925,7 +925,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             /* (a gated unit's pair: twice the rows of weights, the outputs of the unit; a join: its layers' rows) */
             const uint32_t act = G->pair ? G->pair_act : (uint32_t)L->activation;
             const uint32_t N = G->pair ? 2u * L->rows : G->join ? G->joint : L->rows;
-            if (rows >= SPG_MM_ROWS) {
+            if (rows >= SPG_MM_ROWS && spg_gpu_kernel_built(SPG_KERNEL_bmm)) {
                 /* three rows or more on the matrix units (bmm's 64 rows cost little more than bdot's one: Qwen3-0.6B's
                    layer in Q8_0 on an RTX 4050, 150 us for up to 64 rows, 53 us a row by bdot, 365 us 8 rows) */
                 const uint32_t spec[4] = {G->type, G->packed, act, G->pair != 0u};
@@ -933,6 +933,14 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                                   G->ldy ? G->ldy : L->out_c};
                 spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 4, &dp, sizeof dp, groups(rows, 64u),
                                  groups(N, G->packed ? spg_packed_cols(G->type) : 64u), 1);
+                break;
+            }
+            if (spg_gpu_using() == SPG_BACKEND_VULKAN) {
+                /* (an invocation a row of weights and of activations: the rows in the workgroups' second axis) */
+                const uint32_t spec[5] = {G->type, 1u, act, G->packed, G->pair != 0u};
+                SpgBdotPush dp = {w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, N, K, G->stride, 0,
+                                  G->ldy ? G->ldy : L->out_c};
+                spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 5, &dp, sizeof dp, groups(G->pair ? L->rows : N, 64u), rows, 1);
                 break;
             }
             for (uint32_t r0 = 0; r0 < rows; r0++) {
@@ -1041,7 +1049,9 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             SpgKvattnPush p = {x[0], s->q, G->keys, G->values, y, G->table, G->gq, G->gk, s->info, rows, G->heads, G->kv,
                                G->head, G->rot, L->window, s->max_length, SPG_KV_PREP, G->eps, G->scale, G->half_kv,
                                G->strides != 0};
-            spg_gpu_dispatch(c, SPG_KERNEL_kvattn, NULL, 0, &p, sizeof p, groups((uint64_t)rows * (G->heads + G->kv), 8u), 1, 1);
+            /* (CUDA: a warp a row and head; Vulkan: an invocation, of 64 a workgroup) */
+            spg_gpu_dispatch(c, SPG_KERNEL_kvattn, NULL, 0, &p, sizeof p,
+                             groups((uint64_t)rows * (G->heads + G->kv), spg_gpu_using() == SPG_BACKEND_VULKAN ? 64u : 8u), 1, 1);
             spg_gpu_barrier(c);
             if (G->strides) {
                 /* each run of rows (a sequence's tokens at consecutive positions: a prompt, or a token of a sequence) over

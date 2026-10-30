@@ -10186,8 +10186,8 @@ int main(int argc, char **argv) {
             gpu_resume();
             gpu_session(false);
             gpu_session(true);
-            if (gpu_mode == COMPUTE_CUDA) gpu_gguf_sessions();
-            if (gpu_mode == COMPUTE_CUDA) gpu_split_sessions();
+            gpu_gguf_sessions();
+            gpu_split_sessions();
             graph_cases_gpu(gpu_mode);
             gpu_model_predict();
             gpu_model_exact();

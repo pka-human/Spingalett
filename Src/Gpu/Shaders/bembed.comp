@@ -3,9 +3,174 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
-/* Sessions of language models: CUDA's (bembed.cu) only, as yet (spg_gpu_kernel_built() is false
-   for this placeholder). */
+/*
+ * The embedding of a session's rows, an invocation a value: the table's row of the row's token decoded as the CPU decodes
+ * it (spingalett_block_decode(): each value's products in the CPU's order, rounded alone), times the scale, plus the
+ * positions' row.
+ */
 
 #version 460
-layout(local_size_x = 1) in;
-void main() {}
+#extension GL_EXT_buffer_reference_uvec2 : require
+#include "common.glsl"
+#include "block.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    U32 table, token, info;
+    uvec2 positions;
+    F32 y;
+    uint rows, d, stride, type, vocabulary;
+    float scale;
+} p;
+
+#define EMB_F32 0u
+#define EMB_F16 1u
+#define EMB_BF16 2u
+#define EMB_BLOCK 16u
+#define EMB_PACKED 32u
+
+/* Value c of a packed row at `row` (Spingalett.GpuPack.c) */
+float packed_value(uint t, uint row, uint c) {
+    const uint subs = p.d / 32u, sub = c / 32u, i = c % 32u, sb = sub / 8u;
+    const uint codes = t == B_Q8_0 ? p.d : t == B_Q6_K ? p.d / 2u + p.d / 4u : p.d / 2u, aux = row + codes;
+    if (t == B_Q8_0) {
+        precise float v = float(int(byte_at(p.table, row + c) << 24) >> 24) * from_half(half_at(p.table, aux + 2u * sub));
+        return v;
+    }
+    const uint byte = byte_at(p.table, row + 16u * sub + (i & 15u));
+    int code = int(i < 16u ? byte & 0xFu : byte >> 4);
+    if (t == B_Q4_0 || t == B_IQ4_NL || t == B_Q4_1 || t == B_Q5_0 || t == B_Q5_1) {
+        const bool one = t == B_Q4_1 || t == B_Q5_1, five = t == B_Q5_0 || t == B_Q5_1;
+        if (five) code |= int(((word_at(p.table, aux + 4u * sub) >> i) & 1u) << 4);
+        const uint sc = aux + (five ? 4u * subs : 0u) + (one ? 4u : 2u) * sub;
+        const float d = from_half(half_at(p.table, sc));
+        precise float v;
+        if (t == B_Q4_0) v = float(code - 8) * d;
+        else if (t == B_IQ4_NL) v = float(iq4_value(uint(code))) * d;
+        else if (t == B_Q5_0) v = float(code - 16) * d;
+        else v = float(code) * d + from_half(half_at(p.table, sc + 2u));
+        return v;
+    }
+    if (t == B_Q4_K || t == B_Q5_K) {
+        const bool five = t == B_Q5_K;
+        if (five) code |= int(((word_at(p.table, aux + 4u * sub) >> i) & 1u) << 4);
+        /* (the super-block's first 16 bytes as GGUF keeps them) */
+        const uint hd = aux + (five ? 4u * subs : 0u) + 16u * sb;
+        int s, mn;
+        scale_min_k4(p.table, hd + 4u, sub % 8u, s, mn);
+        precise float d1 = from_half(half_at(p.table, hd)) * float(s), m1 = from_half(half_at(p.table, hd + 2u)) * float(mn);
+        precise float v = d1 * float(code) - m1;
+        return v;
+    }
+    if (t == B_IQ4_XS) {
+        const uint w0 = word_at(p.table, aux + 8u * sb), w1 = word_at(p.table, aux + 8u * sb + 4u);
+        precise float v = from_half(w0 & 0xFFFFu) * float(iq4xs_scale(w0, w1, sub % 8u)) * float(iq4_value(uint(code)));
+        return v;
+    }
+    /* Q6_K: byte i % 16 of the pair of sub-blocks' highs: the first's at bits 0 to 3, the second's 4 to 7 */
+    const uint hb = byte_at(p.table, row + p.d / 2u + 16u * (sub / 2u) + (i & 15u));
+    const uint high = (hb >> (4u * (sub % 2u) + (i < 16u ? 0u : 2u))) & 3u;
+    const uint pr = byte_at(p.table, aux + 2u * sub + (i < 16u ? 0u : 1u));
+    const float d = from_half(half_at(p.table, aux + 2u * subs + 2u * sb));
+    precise float v = d * float(int(pr << 24) >> 24) * float((code | int(high << 4)) - 32);
+    return v;
+}
+
+/* Value v of a block at x of type t as GGUF stores it, as spingalett_block_decode() computes it */
+float block_value(uint t, uint x, uint v) {
+    if (t == B_Q8_0) {
+        precise float y = float(int(byte_at(p.table, x + 2u + v) << 24) >> 24) * from_half(half_at(p.table, x));
+        return y;
+    }
+    if (t == B_Q4_0 || t == B_IQ4_NL || t == B_Q4_1) {
+        const uint q = x + (t == B_Q4_1 ? 4u : 2u), b = byte_at(p.table, q + (v & 15u));
+        const int code = int(v < 16u ? b & 0xFu : b >> 4);
+        const float d = from_half(half_at(p.table, x));
+        precise float y;
+        if (t == B_Q4_0) y = float(code - 8) * d;
+        else if (t == B_IQ4_NL) y = float(iq4_value(uint(code))) * d;
+        else y = float(code) * d + from_half(half_at(p.table, x + 2u));
+        return y;
+    }
+    if (t == B_Q5_0 || t == B_Q5_1) {
+        const bool one = t == B_Q5_1;
+        const uint qh = word_at(p.table, x + (one ? 4u : 2u)), b = byte_at(p.table, x + (one ? 8u : 6u) + (v & 15u));
+        const int code = int(v < 16u ? b & 0xFu : b >> 4) | int(((qh >> v) & 1u) << 4);
+        const float d = from_half(half_at(p.table, x));
+        precise float y = one ? float(code) * d + from_half(half_at(p.table, x + 2u)) : float(code - 16) * d;
+        return y;
+    }
+    if (t == B_Q2_K || t == B_Q3_K) {
+        /* value v = 128 nb + 32 (shift / 2) + 16 part + l: bits `shift` of byte 32 nb + 16 part + l, scale is */
+        const bool three = t == B_Q3_K;
+        const uint nb = v / 128u, shift = 2u * ((v % 128u) / 32u), part = (v % 32u) / 16u, l = v % 16u;
+        const uint is = 8u * nb + shift + part, q = x + (three ? 32u : 16u) + 32u * nb;
+        const int code = int((byte_at(p.table, q + l + 16u * part) >> shift) & 3u);
+        if (three) {
+            precise float dl = from_half(half_at(p.table, x + 108u)) * float(q3_scale(p.table, x + 96u, is));
+            const uint m = 1u << (4u * nb + shift / 2u);
+            precise float y = dl * float(code - ((byte_at(p.table, x + l + 16u * part) & m) != 0u ? 0 : 4));
+            return y;
+        }
+        const uint s = byte_at(p.table, x + is);
+        precise float dl = from_half(half_at(p.table, x + 80u)) * float(s & 0xFu), ml = from_half(half_at(p.table, x + 82u)) * float(s >> 4);
+        precise float y = dl * float(code) - ml;
+        return y;
+    }
+    if (t == B_Q4_K || t == B_Q5_K) {
+        const bool five = t == B_Q5_K;
+        const uint j = v / 64u, half_ = (v % 64u) / 32u, l = v % 32u;
+        int s, mn;
+        scale_min_k4(p.table, x + 4u, 2u * j + half_, s, mn);
+        precise float d1 = from_half(half_at(p.table, x)) * float(s), m1 = from_half(half_at(p.table, x + 2u)) * float(mn);
+        const uint b = byte_at(p.table, x + (five ? 48u : 16u) + 32u * j + l);
+        int code = int(half_ != 0u ? b >> 4 : b & 0xFu);
+        if (five && ((byte_at(p.table, x + 16u + l) >> (2u * j + half_)) & 1u) != 0u) code += 16;
+        precise float y = d1 * float(code) - m1;
+        return y;
+    }
+    if (t == B_Q6_K) {
+        const uint nb = v / 128u, r = v % 128u, quarter = r / 32u, l = r % 32u, is = l / 16u;
+        const uint low = byte_at(p.table, x + 64u * nb + l + ((quarter & 1u) != 0u ? 32u : 0u));
+        const uint high = (byte_at(p.table, x + 128u + 32u * nb + l) >> (2u * quarter)) & 3u;
+        const int code = int((quarter < 2u ? low & 0xFu : low >> 4) | high << 4) - 32;
+        const uint sc = byte_at(p.table, x + 192u + 8u * nb + is + 2u * quarter);
+        precise float y = from_half(half_at(p.table, x + 208u)) * float(int(sc << 24) >> 24) * float(code);
+        return y;
+    }
+    /* IQ4_XS */
+    const uint ib = v / 32u, j = v % 32u, b = byte_at(p.table, x + 8u + 16u * ib + (j & 15u));
+    const uint code = j < 16u ? b & 0xFu : b >> 4;
+    precise float y = from_half(half_at(p.table, x)) * float(iq4xs_scale(word_at(p.table, x), word_at(p.table, x + 4u), ib)) *
+                      float(iq4_value(code));
+    return y;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.rows * p.d) return;
+    const uint r = i / p.d, c = i % p.d, token = p.token.v[r];
+    float v = 0.0;
+    if (token < p.vocabulary) {
+        const uint row = token * p.stride;
+        if (p.type == EMB_F32) {
+            v = uintBitsToFloat(p.table.v[(row >> 2) + c]);
+        } else if (p.type == EMB_F16) {
+            v = from_half(half_at(p.table, row + 2u * c));
+        } else if (p.type == EMB_BF16) {
+            v = uintBitsToFloat(half_at(p.table, row + 2u * c) << 16);
+        } else if (p.type >= EMB_PACKED) {
+            v = packed_value(p.type - EMB_PACKED, row, c);
+        } else {
+            const uint t = p.type - EMB_BLOCK, bv = t >= B_Q2_K && t != B_IQ4_NL ? 256u : 32u;
+            const uint bytes = t == B_Q8_0 ? 34u : t == B_Q4_0 ? 18u : t == B_Q4_1 ? 20u : t == B_Q5_0 ? 22u : t == B_Q5_1 ? 24u
+                             : t == B_Q2_K ? 84u : t == B_Q3_K ? 110u : t == B_Q4_K ? 144u : t == B_Q5_K ? 176u
+                             : t == B_Q6_K ? 210u : t == B_IQ4_NL ? 18u : 136u;
+            v = block_value(t, row + (c / bv) * bytes, c % bv);
+        }
+    }
+    if (p.scale != 0.0) v *= p.scale;
+    if (p.positions != uvec2(0u)) v += F32(p.positions).v[p.info.v[2u * r + 1u] * p.d + c];
+    p.y.v[r * p.d + c] = v;
+}

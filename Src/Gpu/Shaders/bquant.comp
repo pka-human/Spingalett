@@ -3,9 +3,57 @@
 * Copyright (c) 2026 pka_human (pka_human@proton.me)
 */
 
-/* Language models' layers of block precisions in sessions: CUDA's (bquant.cu) only, as yet (spg_gpu_kernel_built() is false
-   for this placeholder). */
+/*
+ * Rows of activations quantized in blocks of bv values as spingalett_quantize_blocks() quantizes them, the bits of the
+ * CPU: a block's largest magnitude (of NaN's and infinities: codes 0, a scale NaN; all zeros: codes 0, a scale 0), the
+ * codes roundEven(x * (127 / amax)) within -127 to 127 (div_rn(), `precise`: IEEE's rounding and no multiply-add), the
+ * scale amax / 127, the sums of every 16 codes. An invocation a block, of SPG_BQUANT_BLOCKS(bv) a workgroup.
+ */
 
 #version 460
-layout(local_size_x = 1) in;
-void main() {}
+#include "common.glsl"
+#include "int.glsl"
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform Push {
+    F32 x;
+    U32 q;
+    F32 dx;
+    U32 xs;
+    uint rows, k, bv, ldx, tiled, pad;
+} p;
+
+int code_of(float x, float inv) {
+    precise float y = x * inv;
+    return int(clamp(roundEven(y), -127.0, 127.0));
+}
+
+void main() {
+    const uint per = p.bv >= 128u ? 8u : 8u * 128u / p.bv, t = gl_LocalInvocationID.x, blocks = p.k / p.bv;
+    const uint w = gl_WorkGroupID.x * per + t;
+    if (t >= per || w >= p.rows * blocks) return;
+    const uint r = w / blocks, b = w % blocks, first = r * p.ldx + b * p.bv;
+    uint m = 0u;
+    for (uint i = 0u; i < p.bv; i++) m = max(m, floatBitsToUint(p.x.v[first + i]) & 0x7FFFFFFFu);
+    const bool none = m >= 0x7F800000u || m == 0u;
+    const float amax = uintBitsToFloat(m), inv = none ? 0.0 : div_rn(127.0, amax);
+    for (uint a = 0u; a < p.bv; a += 16u) {
+        int sum = 0;
+        for (uint f = 0u; f < 16u; f += 4u) {
+            uint codes = 0u;
+            for (uint i = 0u; i < 4u; i++) {
+                const int c = none ? 0 : code_of(p.x.v[first + a + f + i], inv);
+                codes |= (uint(c) & 0xFFu) << (8u * i);
+                sum += c;
+            }
+            const uint j = b * p.bv + a + f;
+            /* (four codes in one 64 of a tile's row: SPG_TILED_AT()) */
+            const uint at = p.tiled != 0u ? ((r >> 6) * ((p.k + 63u) >> 6) + (j >> 6)) * 4096u + (r & 63u) * 64u + (j & 63u)
+                                          : r * p.k + j;
+            p.q.v[at >> 2] = codes;
+        }
+        p.xs.v[r * (p.k / 16u) + (b * p.bv + a) / 16u] = uint(sum);
+    }
+    p.dx.v[r * blocks + b] = m >= 0x7F800000u ? uintBitsToFloat(0x7FC00000u) : m == 0u ? 0.0 : div_rn(amax, 127.0);
+}
