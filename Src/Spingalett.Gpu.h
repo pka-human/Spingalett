@@ -140,11 +140,28 @@ bool spingalett_gpu_model_predict(SpgGpuModel *m, const float *inputs, uint32_t 
    `sequences` sequences of max_length positions, steps of `most` rows at most; NULL with *why for a model whose
    layers it does not run (integer weights, layers that mix positions), or when memory runs out. A step runs rows
    (each a token of a sequence at a position) through every layer and writes the logits of the rows of pick[]
-   (picked of them, SPG_SESSION_LOGITS at most) to logits [picked x vocabulary]. */
+   (picked of them, SPG_SESSION_LOGITS at most) to logits [picked x vocabulary]. A model that does not fit in `budget` bytes
+   splits (spingalett_gpu_session_layers(): fewer than the model's layers; the file's top comment says how); NULL when not
+   even its embedding and caches fit. */
 SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t sequences, uint32_t max_length,
-                                          uint32_t most, const char **why);
+                                          uint32_t most, uint64_t budget, const char **why);
 void spingalett_gpu_session_free(SpgGpuSession *s);
+/* Bytes of device memory a new session may take: what the device has free, less a margin (0 without a device). */
+uint64_t spingalett_gpu_session_room(void);
 uint32_t spingalett_gpu_session_rows(const SpgGpuSession *s);
+uint32_t spingalett_gpu_session_layers(const SpgGpuSession *s);
+/* Whether a split session takes large steps. */
+bool spingalett_gpu_session_large(const SpgGpuSession *s);
+/* A step of a split session: rows through the first layers (a small step), or every layer but the last (`large`); values
+   [rows x channels] are the outputs of the last layer it ran. After a large step, spingalett_gpu_session_inputs() gives
+   the rows [rows x inputs] that a later attention layer read. */
+bool spingalett_gpu_session_step_split(SpgGpuSession *s, uint32_t rows, const uint32_t *tokens, const uint32_t *sequence,
+                                       const uint32_t *position, bool large, float *values);
+const float *spingalett_gpu_session_inputs(const SpgGpuSession *s, uint32_t layer);
+/* An attention layer's keys (as they are kept: normalized and rotated) and values [count x kv heads x values a head] of
+   positions from `position` on, into the device's caches of the sequence. */
+bool spingalett_gpu_session_fill(SpgGpuSession *s, uint32_t layer, uint32_t sequence, uint32_t position, uint32_t count,
+                                 const float *keys, const float *values);
 bool spingalett_gpu_session_step(SpgGpuSession *s, uint32_t rows, const uint32_t *tokens, const uint32_t *sequence,
                                  const uint32_t *position, uint32_t picked, const uint32_t *pick, float *logits);
 bool spingalett_gpu_session_copy(SpgGpuSession *s, uint32_t from, uint32_t to, uint32_t length);

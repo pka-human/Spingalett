@@ -1747,6 +1747,8 @@ Sessions: a causal language model run a token at a time, with a key-value cache.
 
 The logits of a position are those spingalett_model_predict() gives it for the window holding the sequence's tokens: bit for bit for integer models, and for float ones too where batched prediction multiplies with the library's kernels (every mode but SPINGALETT_COMPUTE_OPENBLAS, which takes OpenBLAS's order: equal to rounding); however the tokens were fed, alone or with others. A session runs on the CPU, on the threads of the compute mode, or in the full library's GPU modes on the GPU (its model a network there, its products in the GPU's precision, the keys and values in its memory: the logits the CPU's to rounding, still the same bits however the tokens were fed), and is used from one thread at a time; any number of sessions may run on one model at once, from any threads. The model must outlive its sessions. On the GPU the linear layers of an integer model (INT8, INT4, INT2) multiply its codes, kept in the GPU's memory with their scales and widened as they are read (each weight's 8, 4 or 2 bits read once a step), the activations in the GPU's precision and quantized nowhere: the logits those of the model's weights as floats to rounding, near the CPU's integer session's but not its bits (which quantizes each token's activations, and attention's exponentials are libm's).
 
+In a GPU mode a model of GGUF's types that the GPU's memory does not hold runs split: its first layers on the GPU, as many as fit up to a place where the hidden state alone crosses (the end of a transformer's block), with their keys and values; the rest, the logits among them, on all the CPU's threads, from the weights in host memory. The rows cross once a step. No attention layer fitting, the whole model runs on the CPU.
+
 ```c
 typedef struct SpingalettSession SpingalettSession;
 ```
@@ -1763,7 +1765,9 @@ typedef struct SpingalettTokenizer SpingalettTokenizer;
 typedef struct {
     uint32_t max_length;            /* tokens a sequence holds at most: the model's window at most; 0 for it */
     uint32_t sequences;             /* sequences the session holds (0: 1) */
-    uint64_t reserved[SPINGALETT_RESERVED];
+    uint64_t gpu_memory;            /* bytes of the GPU's memory the session may take (0: what the device has free, less
+                                       a margin); see below */
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettSessionOptions;
 ```
 

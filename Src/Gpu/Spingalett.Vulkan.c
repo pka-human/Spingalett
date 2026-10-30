@@ -1009,7 +1009,7 @@ static bool vkb_wait(void *c_) {
 }
 
 const SpgGpuOps spg_vulkan_ops = {
-    vkb_open, vkb_device_name, vkb_memory, vkb_shared_memory, vkb_subgroup_size, vkb_max_workgroups, vkb_mma_bf16,
+    vkb_open, vkb_device_name, vkb_memory, vkb_memory, vkb_shared_memory, vkb_subgroup_size, vkb_max_workgroups, vkb_mma_bf16,
     vkb_bf16_storage, vkb_host_writes, vkb_kernel_built, vkb_buffer_create, vkb_buffer_free, vkb_arena_create,
     vkb_arena_add, vkb_arena_commit, vkb_arena_free, vkb_commands_create, vkb_commands_free, vkb_commands_untimed,
     vkb_commands_stamps, vkb_timestamp, vkb_timestamps, vkb_record_begin, vkb_dispatch, vkb_prepare, vkb_barrier,

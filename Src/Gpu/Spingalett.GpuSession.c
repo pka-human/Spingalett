@@ -16,6 +16,17 @@
  * rows whose logits are asked for alone (their inputs gathered first). The commands of a step are recorded once for
  * each number of rows and of logits (the tokens, positions and rows asked for in buffers the host writes) and run
  * again. The logits are the CPU session's to rounding: the block products give its bits, the rest rounds otherwise.
+ *
+ * A model the budget of the device's memory does not hold splits (layers_within()). Weights of the model's first layers
+ * stay on the device as above; those of the rest but the last layer in pinned host memory, in the kernels' form. A small
+ * step runs the first layers alone and gives the rows of the last of them: Spingalett.Session.c runs the rest on the CPU.
+ * A large step (a prompt) runs every layer but the last on the device, each layer's weights copied over the bus into a
+ * buffer of the largest as its turn comes (they are read as often as the rows take tiles, a copy once: the memory the
+ * kernels read is the device's), and gives the rows the last layer reads, and the inputs of the later attention layers,
+ * from which the host's caches take their keys and values. The caches of every attention layer are on the device, the later
+ * layers' written by large steps, or from the host's before a large step reads them
+ * (spingalett_gpu_session_fill()). Large steps round otherwise than the CPU: a split session's logits are the CPU's to
+ * rounding, and a prompt fed at once equals its tokens fed one at a time to rounding too.
  */
 
 #include "Spingalett.Gpu.h"
@@ -27,8 +38,10 @@
 #include <string.h>
 
 #define KEPT 4u                     /* command lists kept, by their rows and logits */
+/* The device's memory a session leaves free: for the program's other work, and what the driver keeps for itself. */
+#define SESSION_MARGIN ((uint64_t)256 << 20)
 
-enum { RUN_EMBED, RUN_BLOCK, RUN_FLOAT, RUN_RMS, RUN_NORM, RUN_ADD, RUN_MUL, RUN_CONCAT, RUN_ATTN };
+enum { RUN_EMBED, RUN_BLOCK, RUN_FLOAT, RUN_RMS, RUN_NORM, RUN_ADD, RUN_MUL, RUN_CONCAT, RUN_ATTN, RUN_HOST };
 
 typedef struct {
     SlettLayer L;
@@ -44,6 +57,9 @@ typedef struct {
     uint64_t out;                   /* its output's address */
     uint64_t gate;                  /* RUN_BLOCK: the values its outputs are multiplied by (the product of layers after it,
                                        taken in), or 0 */
+    bool swap;                      /* a split's later layer: w in host memory, its copy over the bus before it runs */
+    size_t w_bytes;                 /* those weights' bytes */
+    size_t kept_at;                 /* attention of a later layer: where a large step leaves its inputs (s->kept) */
     bool skip;                      /* a product of layers its reader's epilogue computes */
     uint32_t pair;                  /* RUN_BLOCK: the other layer of a gated unit whose product this one's computes too
                                        (1 + its index; find_pairs()), or 0 */
@@ -70,13 +86,18 @@ typedef struct {
 
 typedef struct {
     uint32_t rows, picked;
-    uint64_t runs;                  /* the runs of rows it was recorded for (a hash of their lengths) */
+    uint64_t runs;                  /* the runs of rows it was recorded for (a hash of their lengths; a large step's apart) */
     SpgGpuCommands *c;
 } Kept;
 
 struct SpgGpuSession {
     const uint8_t *image;
     uint32_t layers, sequences, max_length, most, vocabulary;
+    uint32_t cut;                   /* layers a small step runs: the model's first (s->layers when it is not split) */
+    bool split, large;              /* the model split; it takes large steps (its last layer reads the one before alone) */
+    uint64_t scratch;               /* the weights of the layer a large step is at */
+    size_t scratch_bytes;
+    SpgGpuBuffer kept;              /* host-visible: a large step's inputs of the later attention layers */
     uint32_t most_logits;           /* rows whose logits a step writes, at most */
     GLayer *L;
     SpgGpuBuffer *buffers;          /* everything allocated, freed together */
@@ -93,7 +114,7 @@ struct SpgGpuSession {
                                        (in tiles: quantized_tiled) */
     uint32_t quantized_bv;
     bool quantized_tiled;
-    Kept kept[KEPT];
+    Kept commands[KEPT];
     uint32_t next;
 };
 
@@ -174,6 +195,17 @@ static uint64_t image_packed(SpgGpuSession *s, uint64_t offset, uint32_t type, u
     return at;
 }
 
+/* A layer's weights in the kernels' form: on the device, or for a split's later layer in host memory; 0 on failure */
+static uint64_t weights_new(SpgGpuSession *s, GLayer *G, const void *data, size_t bytes) {
+    if (!G->swap) return upload(s, data, bytes);
+    const uint64_t at = buffer_new(s, bytes + 16u, true);
+    if (!at) return 0;
+    memcpy(s->buffers[s->buffer_count - 1u].mapped, data, bytes);
+    G->w_bytes = bytes + 16u;
+    if (G->w_bytes > s->scratch_bytes) s->scratch_bytes = G->w_bytes;
+    return at;
+}
+
 /* An activation as gew's operator (alpha its slope), NONE for none, false for one gew has not */
 static bool gew_act(ActivationFunction act, uint32_t *op, float *alpha) {
     *alpha = 0.0f;
@@ -199,9 +231,10 @@ static bool epilogue_act(ActivationFunction act) {
 void spingalett_gpu_session_free(SpgGpuSession *s) {
     if (!s) return;
     for (uint32_t k = 0; k < KEPT; k++)
-        if (s->kept[k].c) spg_gpu_commands_free(s->kept[k].c);
+        if (s->commands[k].c) spg_gpu_commands_free(s->commands[k].c);
     for (uint32_t k = 0; k < s->buffer_count; k++) spg_gpu_buffer_free(&s->buffers[k]);
     spg_gpu_buffer_free(&s->staging);
+    spg_gpu_buffer_free(&s->kept);
     free(s->buffers);
     free(s->uploaded);
     free(s->L);
@@ -310,7 +343,7 @@ static bool place_join(SpgGpuSession *s, uint32_t i) {
     }
     G->packed = true;
     G->stride = row;
-    G->w = ok ? upload(s, w, (size_t)N * row) : 0;
+    G->w = ok ? weights_new(s, G, w, (size_t)N * row) : 0;
     G->b = ok && G->w ? upload(s, b, (size_t)N * sizeof(float)) : 0;
     if (K > s->kmax) s->kmax = K;
     free(w);
@@ -338,12 +371,18 @@ static bool place_pair(SpgGpuSession *s, GLayer *G, const GLayer *U) {
     G->packed = true;
     G->stride = row;
     G->pair_act = (uint32_t)A->activation;
-    G->w = ok ? upload(s, w, (size_t)2u * N * row) : 0;
+    G->w = ok ? weights_new(s, G, w, (size_t)2u * N * row) : 0;
     G->b = ok && G->w ? upload(s, b, (size_t)2u * N * sizeof(float)) : 0;
     if (K > s->kmax) s->kmax = K;
     free(w);
     free(b);
     return G->w && G->b;
+}
+
+/* Whether an attention layer's caches are of bfloat16: the queries over them on the matrix units (gflash), where it has
+   the head's unit (it reads them by asynchronous copies) */
+static bool caches_half(uint32_t head) {
+    return (head == 32u || head == 64u || head == 128u) && spg_gpu_mma_bf16() && spg_gpu_kernel_built(SPG_KERNEL_gflash);
 }
 
 /* Layer i's plan and weights on the device; false with *why for a layer the GPU's session does not run. */
@@ -397,7 +436,20 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
                 if (G->pair) return place_pair(s, G, &s->L[G->pair - 1u]) || (*why = "out of device memory", false);
                 if (G->join) return place_join(s, i) || (*why = "out of device memory", false);
                 G->packed = spg_packed_bytes(G->type, N, K) != 0;
-                G->w = G->packed ? image_packed(s, L->weights, G->type, N, K) : image_bytes(s, L->weights, (size_t)G->stride * N);
+                if (G->swap) {
+                    if (G->packed) {
+                        const size_t bytes = spg_packed_bytes(G->type, N, K);
+                        uint8_t *packed = (uint8_t *)malloc(bytes);
+                        if (!packed) return *why = "out of memory", false;
+                        spg_pack_blocks(G->type, s->image + L->weights, N, K, packed);
+                        G->w = weights_new(s, G, packed, bytes);
+                        free(packed);
+                    } else {
+                        G->w = weights_new(s, G, s->image + L->weights, (size_t)G->stride * N);
+                    }
+                } else {
+                    G->w = G->packed ? image_packed(s, L->weights, G->type, N, K) : image_bytes(s, L->weights, (size_t)G->stride * N);
+                }
                 if (G->packed) G->stride = SPG_PACK_ROW(G->type, K);
                 if (K > s->kmax) s->kmax = K;
                 return G->w || (*why = "out of device memory", false);
@@ -417,7 +469,7 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
                                          : L->precision == PRECISION_FP16 ? spingalett_fp16_to_float(slett_get16(e + 2u * k))
                                          : spingalett_bf16_to_float(slett_get16(e + 2u * k));
                 }
-            G->w = upload(s, w, (size_t)N * K * sizeof(float));
+            G->w = weights_new(s, G, w, (size_t)N * K * sizeof(float));
             free(w);
             if (epilogue_act(L->activation)) G->act_gew = NONE;
             return G->w || (*why = "out of device memory", false);
@@ -452,10 +504,7 @@ static bool place(SpgGpuSession *s, uint32_t i, const char **why) {
             G->run = RUN_ATTN;
             G->heads = a.heads, G->kv = a.kv, G->head = a.head, G->rot = a.rot, G->eps = a.eps, G->scale = a.scale;
             if (G->head > 256u || !G->kv || G->heads % G->kv) return *why = "attention heads of over 256 values", false;
-            /* (the queries over the caches on the matrix units, gflash, where it has the head's unit: its caches of
-               bfloat16, which it reads by asynchronous copies) */
-            G->half_kv = (G->head == 32u || G->head == 64u || G->head == 128u) && spg_gpu_mma_bf16() &&
-                         spg_gpu_kernel_built(SPG_KERNEL_gflash);
+            G->half_kv = caches_half(G->head);
             const size_t floats = (size_t)s->sequences * G->kv * s->max_length * G->head;
             G->keys = buffer_new(s, floats * (G->half_kv ? 2u : sizeof(float)), false);
             G->values = buffer_new(s, floats * (G->half_kv ? 2u : sizeof(float)), false);
@@ -598,11 +647,12 @@ static void fuse_norms(SpgGpuSession *s) {
         while (tpr < 256u && 8u * tpr <= k) tpr *= 2u;
         if (G->run != RUN_RMS || tpr < 32u || k % tpr || k / tpr > 32u || G->act_gew != NONE) continue;
         G->tpr = tpr;
-        GLayer *A = i ? &s->L[i - 1u] : NULL;
+        /* (nothing fused over the place a split's small steps stop at: their last layer's outputs are written) */
+        GLayer *A = i && i != s->cut ? &s->L[i - 1u] : NULL;
         if (A && A->run == RUN_ADD && A->L.input_count == 2 && A->act_gew == NONE && G->inputs[0] == i && A->inputs[0] &&
             A->inputs[1] && A->L.out_c == k)
             A->folded = true;
-        const GLayer *B = i + 1u < s->layers ? &s->L[i + 1u] : NULL;
+        const GLayer *B = i + 1u < s->layers && i + 1u != s->cut ? &s->L[i + 1u] : NULL;
         if (B && B->run == RUN_BLOCK && B->inputs[0] == i + 1u && B->L.row_len == k) {
             const uint32_t bv = slett_block_values(B->L.precision);
             if (k % bv == 0u) G->qbv = bv;
@@ -619,8 +669,86 @@ static void fuse_norms(SpgGpuSession *s) {
     }
 }
 
+uint64_t spingalett_gpu_session_room(void) {
+    if (!spg_gpu_open()) return 0;
+    const uint64_t available = spg_gpu_memory_free();
+    return available > SESSION_MARGIN ? available - SESSION_MARGIN : available / 2u;
+}
+
+/* Bytes of device memory a linear layer's or embedding's weights take as place() keeps them (0 for other layers; once
+   for a table tied to the embedding's) */
+static uint64_t weights_bytes(const SpgGpuSession *s, uint32_t i) {
+    const SlettLayer *L = &s->L[i].L;
+    if (L->type != LAYER_EMBEDDING && L->type != LAYER_DENSE && L->type != LAYER_CONV2D) return 0u;
+    if (L->type != LAYER_EMBEDDING && s->L[0].L.weights == L->weights) return 0u;
+    const bool block = spingalett_precision_is_block(L->precision);
+    const uint64_t packed = block ? spg_packed_bytes(L->precision - PRECISION_Q8_0, L->rows, L->row_len) : 0u;
+    if (packed) return packed;
+    /* (the matrix product's weights are floats, whatever their precision in the image) */
+    return block || L->type == LAYER_EMBEDDING ? (uint64_t)L->rows * spingalett_slett_row_bytes(L->precision, L->row_len)
+                                               : (uint64_t)L->rows * L->row_len * sizeof(float);
+}
+
+/* Bytes of device memory the rest of layer i takes: biases, gammas, an attention layer's caches and table */
+static uint64_t others_bytes(const SpgGpuSession *s, uint32_t i) {
+    const SlettLayer *L = &s->L[i].L;
+    switch (L->type) {
+        case LAYER_EMBEDDING: return L->positions ? (uint64_t)L->out_h * L->out_w * L->out_c * sizeof(float) : 0u;
+        case LAYER_DENSE:
+        case LAYER_CONV2D: return (uint64_t)L->rows * sizeof(float);
+        case LAYER_RMS_NORM: return (uint64_t)L->out_c * sizeof(float);
+        case LAYER_LAYER_NORM: return (uint64_t)L->out_c * 2u * sizeof(float);
+        case LAYER_ATTENTION: {
+            SlettAttention a;
+            spingalett_engine_attention_of(s->image, L, NULL, &a);
+            const uint64_t values = (uint64_t)s->sequences * a.kv * s->max_length * a.head;
+            return 2u * values * (caches_half(a.head) ? 2u : sizeof(float)) + (uint64_t)s->max_length * a.head * sizeof(float) +
+                   2u * a.head * sizeof(float);
+        }
+        default:
+            return 0u;
+    }
+}
+
+/* The layers a small step runs under a budget of the device's memory: all of them where everything fits. Otherwise what
+   no cut leaves behind (the embedding, biases, gammas and caches of all, the step's rows, the buffer of a large step's
+   weights) comes first, then the weights of the layers in order, up to the last place that fits where only the layer before it
+   has readers beyond (between a transformer's blocks: the hidden state alone crosses). The last layer's weights are
+   not on the device then. 0 when that first part does not fit. */
+static uint32_t layers_within(const SpgGpuSession *s, uint64_t budget) {
+    const uint32_t L = s->layers;
+    uint32_t widest = 0;
+    uint64_t largest = 0, weights = 0, others = 0;
+    for (uint32_t i = 0; i < L; i++) {
+        if (s->L[i].L.in_c > widest) widest = s->L[i].L.in_c;
+        if (i + 1u < L && s->L[i].L.out_c > widest) widest = s->L[i].L.out_c;
+        const uint64_t w = weights_bytes(s, i);
+        weights += w;
+        others += others_bytes(s, i);
+        if (i && i + 1u < L && w > largest) largest = w;
+    }
+    /* (the step's activations in eight of the widest) */
+    uint64_t total = (uint64_t)s->most * widest * sizeof(float) * 8u + others;
+    const uint64_t logits = (uint64_t)SPG_SESSION_LOGITS * s->L[L - 1u].L.out_c * sizeof(float);
+    if (total + weights + logits <= budget) return L;
+    /* (a gated unit's two layers are copied together) */
+    total += weights_bytes(s, 0) + 2u * largest;
+    if (total > budget) return 0;
+    uint32_t best = 1;
+    for (uint32_t i = 1; i + 1u < L; i++) {
+        total += weights_bytes(s, i);
+        if (total > budget) break;
+        bool alone = true;
+        for (uint32_t j = i + 1u; alone && j < L; j++)
+            for (uint32_t k = 0; k < s->L[j].L.input_count; k++)
+                if (s->L[j].inputs[k] <= i) alone = false;
+        if (alone) best = i + 1u;
+    }
+    return best;
+}
+
 SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t sequences, uint32_t max_length,
-                                          uint32_t most, const char **why) {
+                                          uint32_t most, uint64_t budget, const char **why) {
     *why = NULL;
     if (!spg_gpu_kernel_built(SPG_KERNEL_bembed) || !spg_gpu_kernel_built(SPG_KERNEL_kvattn) ||
         !spg_gpu_kernel_built(SPG_KERNEL_bquant) || !spg_gpu_kernel_built(SPG_KERNEL_bdot) ||
@@ -647,12 +775,27 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
         spingalett_slett_layer(s->image, i, &G->L);
         for (uint32_t k = 0; k < G->L.input_count; k++) G->inputs[k] = spingalett_slett_input(s->image, &G->L, k);
     }
+    s->cut = layers_within(s, budget);
+    if (!s->cut) {
+        spingalett_gpu_session_free(s);
+        return *why = "out of device memory: the budget holds not even the embedding and the caches", NULL;
+    }
+    s->split = s->cut < s->layers;
+    /* (large steps end with what the last layer reads, one layer's outputs) */
+    const SlettLayer *end = &s->L[s->layers - 1u].L;
+    s->large = s->split && end->input_count == 1u && s->L[s->layers - 1u].inputs[0] == s->layers - 1u;
+    for (uint32_t i = s->cut; s->split && i < s->layers; i++) s->L[i].swap = true;
     find_pairs(s);
     find_joins(s);
     for (uint32_t i = 0; i < s->layers; i++) {
         GLayer *G = &s->L[i];
         if (G->L.in_c > widest) widest = G->L.in_c;
-        if (G->L.out_c > widest) widest = G->L.out_c;
+        if (i + 1u < s->layers && G->L.out_c > widest) widest = G->L.out_c;
+        /* (of a split, the last layer is the host's, and so are the later ones without large steps) */
+        if (s->split && (i + 1u == s->layers || (i >= s->cut && !s->large))) {
+            G->run = RUN_HOST;
+            continue;
+        }
         if (!place(s, i, why)) {
             spingalett_gpu_session_free(s);
             return NULL;
@@ -660,6 +803,13 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     }
     const GLayer *last = &s->L[s->layers - 1u];
     s->vocabulary = last->L.out_c;
+    /* (of a split, a step writes the rows the host goes on from in place of logits) */
+    if (s->split) {
+        s->vocabulary = 0;
+        const uint32_t ends[2] = {s->cut - 1u, s->layers - 2u};
+        for (uint32_t k = 0; k < 2u; k++)
+            if (s->L[ends[k]].L.out_c > s->vocabulary) s->vocabulary = s->L[ends[k]].L.out_c;
+    }
     fuse_norms(s);
     if (!layout(s)) {
         spingalett_gpu_session_free(s);
@@ -674,9 +824,9 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
     s->dx = buffer_new(s, (size_t)most * (kmax / 32u + 1u) * sizeof(float), false);
     s->xs = buffer_new(s, (size_t)most * (kmax / 16u + 1u) * sizeof(int32_t), false);
     /* logits of SPG_SESSION_LOGITS rows a step at most, unless the last layer runs on every row */
-    s->most_logits = most < SPG_SESSION_LOGITS || last->run == RUN_ATTN || last->run == RUN_EMBED ? most
+    s->most_logits = s->split || most < SPG_SESSION_LOGITS || last->run == RUN_ATTN || last->run == RUN_EMBED ? most
                      : SPG_SESSION_LOGITS;
-    s->gathered = buffer_new(s, (size_t)s->most_logits * widest * sizeof(float), false);
+    s->gathered = buffer_new(s, s->split ? 16u : (size_t)s->most_logits * widest * sizeof(float), false);
     s->logits = buffer_new(s, (size_t)s->most_logits * s->vocabulary * sizeof(float), false);
     s->tokens = buffer_new(s, (size_t)most * sizeof(uint32_t), false);
     s->info = buffer_new(s, (size_t)most * 2u * sizeof(uint32_t), false);
@@ -689,10 +839,25 @@ SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t
         spingalett_gpu_session_free(s);
         return *why = "out of device memory", NULL;
     }
+    if (s->large) {
+        size_t kept = 0;
+        for (uint32_t i = s->cut; i < s->layers; i++)
+            if (s->L[i].run == RUN_ATTN) {
+                s->L[i].kept_at = kept;
+                kept += (size_t)most * s->L[i].L.in_c * sizeof(float);
+            }
+        s->scratch = buffer_new(s, s->scratch_bytes ? s->scratch_bytes : 16u, false);
+        if (!s->scratch || !spg_gpu_buffer_create(&s->kept, kept ? kept : 16u, true)) {
+            spingalett_gpu_session_free(s);
+            return *why = "out of device memory", NULL;
+        }
+    }
     return s;
 }
 
 uint32_t spingalett_gpu_session_rows(const SpgGpuSession *s) { return s ? s->most : 0; }
+uint32_t spingalett_gpu_session_layers(const SpgGpuSession *s) { return s ? s->cut : 0; }
+bool spingalett_gpu_session_large(const SpgGpuSession *s) { return s && s->large; }
 
 /* ------------------------------------------------------------------------- recording a step */
 
@@ -726,6 +891,17 @@ static uint64_t output_of(const SpgGpuSession *s, uint32_t j) { return s->L[j - 
 static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32_t rows, const uint64_t *x, uint64_t y) {
     const GLayer *G = &s->L[i];
     const SlettLayer *L = &G->L;
+    /* (a split's later layer: its weights over the bus into the device's buffer, and attention's inputs back) */
+    const uint64_t w = G->swap ? s->scratch : G->w;
+    if (G->swap && G->w && (G->run == RUN_BLOCK || G->run == RUN_FLOAT)) {
+        spg_gpu_copy(c, buffer_at(s, G->w), 0, buffer_at(s, s->scratch), 0, G->w_bytes);
+        spg_gpu_barrier(c);
+    }
+    if (G->swap && G->run == RUN_ATTN) {
+        spg_gpu_copy(c, buffer_at(s, x[0]), x[0] - buffer_at(s, x[0])->address, &s->kept, G->kept_at,
+                     (size_t)rows * L->in_c * sizeof(float));
+        spg_gpu_barrier(c);
+    }
     switch (G->run) {
         case RUN_EMBED: {
             SpgBembedPush p = {G->w, s->tokens, s->info, G->b, y, rows, L->out_c, G->stride, G->type, L->rows,
@@ -753,7 +929,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
                 /* three rows or more on the matrix units (bmm's 64 rows cost little more than bdot's one: Qwen3-0.6B's
                    layer in Q8_0 on an RTX 4050, 150 us for up to 64 rows, 53 us a row by bdot, 365 us 8 rows) */
                 const uint32_t spec[4] = {G->type, G->packed, act, G->pair != 0u};
-                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, N, K, G->stride, 0,
+                SpgBdotPush dp = {w, s->xq, s->dx, s->xs, G->b, y, G->gate, rows, N, K, G->stride, 0,
                                   G->ldy ? G->ldy : L->out_c};
                 spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 4, &dp, sizeof dp, groups(rows, 64u),
                                  groups(N, G->packed ? spg_packed_cols(G->type) : 64u), 1);
@@ -761,7 +937,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             }
             for (uint32_t r0 = 0; r0 < rows; r0++) {
                 const uint32_t spec[5] = {G->type, 1u, act, G->packed, G->pair != 0u};
-                SpgBdotPush dp = {G->w, s->xq, s->dx, s->xs, G->b, y, G->gate, 1u, N, K, G->stride, r0,
+                SpgBdotPush dp = {w, s->xq, s->dx, s->xs, G->b, y, G->gate, 1u, N, K, G->stride, r0,
                                   G->ldy ? G->ldy : L->out_c};
                 spg_gpu_dispatch(c, SPG_KERNEL_bdot, spec, 5, &dp, sizeof dp, groups(G->pair ? L->rows : N, 8u), 1, 1);
             }
@@ -771,7 +947,7 @@ static void record_layer(SpgGpuSession *s, SpgGpuCommands *c, uint32_t i, uint32
             SpgGemmPush p;
             memset(&p, 0, sizeof p);
             p.a = x[0];
-            p.b = G->w;
+            p.b = w;
             p.c = y;
             p.e0 = G->b;
             p.M = rows;
@@ -959,6 +1135,107 @@ static SpgGpuCommands *record_step(SpgGpuSession *s, uint32_t rows, uint32_t pic
     return c;
 }
 
+/* The commands of a split's step of `rows` rows: the layers it runs, and the rows of the last of them back to the host */
+static SpgGpuCommands *record_split(SpgGpuSession *s, uint32_t rows, bool large) {
+    SpgGpuCommands *c = spg_gpu_commands_create();
+    if (!c || !spg_gpu_record_begin(c)) {
+        if (c) spg_gpu_commands_free(c);
+        return NULL;
+    }
+    spg_gpu_copy(c, &s->staging, 0, buffer_at(s, s->tokens), 0, (size_t)rows * sizeof(uint32_t));
+    spg_gpu_copy(c, &s->staging, s->info_at, buffer_at(s, s->info), 0, (size_t)rows * 2u * sizeof(uint32_t));
+    s->quantized = 0;
+    const uint32_t end = large ? s->layers - 1u : s->cut;
+    for (uint32_t i = 0; i < end; i++) {
+        const GLayer *G = &s->L[i];
+        if (G->skip || G->folded || G->paired || G->joined || G->gathered) continue;
+        spg_gpu_barrier(c);
+        if (G->run != RUN_BLOCK) s->quantized = 0;
+        uint64_t x[SPINGALETT_MAX_INPUTS];
+        for (uint32_t k = 0; k < G->L.input_count; k++) x[k] = G->inputs[k] ? output_of(s, G->inputs[k]) : 0;
+        record_layer(s, c, i, rows, x, G->out);
+    }
+    spg_gpu_barrier(c);
+    const GLayer *E = &s->L[end - 1u];
+    spg_gpu_copy(c, buffer_at(s, s->acts), E->out - s->acts, &s->staging, s->logits_at,
+                 (size_t)rows * E->L.out_c * sizeof(float));
+    spg_gpu_barrier_host(c);
+    if (!spg_gpu_record_end(c)) {
+        spg_gpu_commands_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+bool spingalett_gpu_session_step_split(SpgGpuSession *s, uint32_t rows, const uint32_t *tokens, const uint32_t *sequence,
+                                       const uint32_t *position, bool large, float *values) {
+    if (!s || !s->split || !rows || rows > s->most || (large && !s->large)) return false;
+    uint8_t *stage = (uint8_t *)s->staging.mapped;
+    memcpy(stage, tokens, (size_t)rows * sizeof(uint32_t));
+    uint32_t *info = (uint32_t *)(void *)(stage + s->info_at);
+    for (uint32_t r = 0; r < rows; r++) info[2u * r] = sequence[r], info[2u * r + 1u] = position[r];
+    s->run_count = 0;
+    uint64_t runs = large ? 1099511628211ull : 1469598103934665603ull;
+    for (uint32_t r = 0; r < rows; r++)
+        if (!r || sequence[r] != sequence[r - 1u] || position[r] != position[r - 1u] + 1u) {
+            s->runs[s->run_count++] = r;
+            runs = (runs ^ r) * 1099511628211ull;
+        }
+    s->runs[s->run_count] = rows;
+    SpgGpuCommands *c = NULL;
+    for (uint32_t k = 0; k < KEPT && !c; k++)
+        if (s->commands[k].c && s->commands[k].rows == rows && s->commands[k].runs == runs) c = s->commands[k].c;
+    if (!c) {
+        c = record_split(s, rows, large);
+        if (!c) return false;
+        Kept *k = &s->commands[s->next];
+        if (k->c) spg_gpu_commands_free(k->c);
+        k->rows = rows;
+        k->picked = 0;
+        k->runs = runs;
+        k->c = c;
+        s->next = (s->next + 1u) % KEPT;
+    }
+    if (!spg_gpu_submit(c) || !spg_gpu_wait(c)) return false;
+    const GLayer *E = &s->L[(large ? s->layers - 1u : s->cut) - 1u];
+    memcpy(values, stage + s->logits_at, (size_t)rows * E->L.out_c * sizeof(float));
+    return true;
+}
+
+const float *spingalett_gpu_session_inputs(const SpgGpuSession *s, uint32_t layer) {
+    return (const float *)(const void *)((const uint8_t *)s->kept.mapped + s->L[layer].kept_at);
+}
+
+bool spingalett_gpu_session_fill(SpgGpuSession *s, uint32_t layer, uint32_t sequence, uint32_t position, uint32_t count,
+                                 const float *keys, const float *values) {
+    if (!s || layer >= s->layers || s->L[layer].run != RUN_ATTN || !count) return !count;
+    const GLayer *G = &s->L[layer];
+    const size_t unit = G->half_kv ? 2u : sizeof(float), floats = (size_t)count * G->kv * G->head;
+    SpgGpuBuffer stage;
+    if (!spg_gpu_buffer_create(&stage, 2u * floats * unit, true)) return false;
+    for (int kv = 0; kv < 2; kv++) {
+        const float *from = kv ? values : keys;
+        uint8_t *to = (uint8_t *)stage.mapped + (size_t)kv * floats * unit;
+        if (G->half_kv)
+            for (size_t k = 0; k < floats; k++) ((uint16_t *)(void *)to)[k] = spingalett_float_to_bf16(from[k]);
+        else
+            memcpy(to, from, floats * sizeof(float));
+    }
+    SpgGpuCommands *c = spg_gpu_commands_create();
+    bool ok = c && spg_gpu_record_begin(c);
+    const size_t per = (size_t)s->max_length * G->head * unit, seq = per * G->kv, row = (size_t)G->head * unit;
+    for (int kv = 0; ok && kv < 2; kv++) {
+        const SpgGpuBuffer *b = buffer_at(s, kv ? G->values : G->keys);
+        for (uint32_t g = 0; g < G->kv; g++)
+            spg_gpu_copy(c, &stage, (size_t)kv * floats * unit + (size_t)g * count * row, b,
+                         (size_t)sequence * seq + g * per + (size_t)position * row, (size_t)count * row);
+    }
+    ok = ok && spg_gpu_record_end(c) && spg_gpu_submit(c) && spg_gpu_wait(c);
+    if (c) spg_gpu_commands_free(c);
+    spg_gpu_buffer_free(&stage);
+    return ok;
+}
+
 bool spingalett_gpu_session_step(SpgGpuSession *s, uint32_t rows, const uint32_t *tokens, const uint32_t *sequence,
                                  const uint32_t *position, uint32_t picked, const uint32_t *pick, float *logits) {
     if (!s || !rows || rows > s->most) return false;
@@ -981,12 +1258,12 @@ bool spingalett_gpu_session_step(SpgGpuSession *s, uint32_t rows, const uint32_t
     s->runs[s->run_count] = rows;
     SpgGpuCommands *c = NULL;
     for (uint32_t k = 0; k < KEPT && !c; k++)
-        if (s->kept[k].c && s->kept[k].rows == rows && s->kept[k].picked == picked && s->kept[k].runs == runs)
-            c = s->kept[k].c;
+        if (s->commands[k].c && s->commands[k].rows == rows && s->commands[k].picked == picked && s->commands[k].runs == runs)
+            c = s->commands[k].c;
     if (!c) {
         c = record_step(s, rows, picked);
         if (!c) return false;
-        Kept *k = &s->kept[s->next];
+        Kept *k = &s->commands[s->next];
         if (k->c) spg_gpu_commands_free(k->c);
         k->rows = rows;
         k->picked = picked;

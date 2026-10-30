@@ -202,6 +202,11 @@ SPINGALETT_API SpingalettEvalMetrics spingalett_model_evaluate(const SpingalettM
  * step), the activations in the GPU's precision and quantized nowhere: the logits those of the model's weights
  * as floats to rounding, near the CPU's integer session's but not its bits (which quantizes each token's
  * activations, and attention's exponentials are libm's).
+ *
+ * In a GPU mode a model of GGUF's types that the GPU's memory does not hold runs split: its first layers on the GPU, as
+ * many as fit up to a place where the hidden state alone crosses (the end of a transformer's block), with their keys
+ * and values; the rest, the logits among them, on all the CPU's threads, from the weights in host memory. The rows cross
+ * once a step. No attention layer fitting, the whole model runs on the CPU.
  */
 typedef struct SpingalettSession SpingalettSession;
 typedef struct SpingalettTokenizer SpingalettTokenizer;
@@ -209,7 +214,9 @@ typedef struct SpingalettTokenizer SpingalettTokenizer;
 typedef struct {
     uint32_t max_length;            /* tokens a sequence holds at most: the model's window at most; 0 for it */
     uint32_t sequences;             /* sequences the session holds (0: 1) */
-    uint64_t reserved[SPINGALETT_RESERVED];
+    uint64_t gpu_memory;            /* bytes of the GPU's memory the session may take (0: what the device has free, less
+                                       a margin); see below */
+    uint64_t reserved[SPINGALETT_RESERVED - 1];
 } SpingalettSessionOptions;
 
 /* Opens a session on a causal language model (options NULL: the defaults). NULL with the error set for

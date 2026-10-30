@@ -96,6 +96,7 @@ typedef unsigned long long CUdeviceptr;
     X(cuFuncGetAttribute, "cuFuncGetAttribute", (int *, int, CUfunction)) \
     X(cuFuncSetAttribute, "cuFuncSetAttribute", (CUfunction, int, int)) \
     X(cuMemAlloc, "cuMemAlloc_v2", (CUdeviceptr *, size_t)) \
+    X(cuMemGetInfo, "cuMemGetInfo_v2", (size_t *, size_t *)) \
     X(cuMemFree, "cuMemFree_v2", (CUdeviceptr)) \
     X(cuMemHostAlloc, "cuMemHostAlloc", (void **, size_t, unsigned)) \
     X(cuMemFreeHost, "cuMemFreeHost", (void *)) \
@@ -253,6 +254,12 @@ static bool cub_open(void) {
 
 static const char *cub_device_name(void) { return cub_open() ? cu.name : NULL; }
 static uint64_t cub_memory(void) { return cub_open() ? cu.memory : 0; }
+static uint64_t cub_memory_free(void) {
+    if (!cub_open()) return 0;
+    make_current();
+    size_t available = 0, total = 0;
+    return cuMemGetInfo(&available, &total) == 0 ? available : cu.memory;
+}
 /* what a block may ask for (the product's tiles: dynamic shared memory, beyond the 48 KB of static) */
 static uint32_t cub_shared_memory(void) { return cub_open() ? cu.shared_optin : 48u * 1024u; }
 static uint32_t cub_subgroup_size(void) { return 32u; }
@@ -1003,7 +1010,7 @@ static bool cub_wait(void *commands) {
 }
 
 const SpgGpuOps spg_cuda_ops = {
-    cub_open, cub_device_name, cub_memory, cub_shared_memory, cub_subgroup_size, cub_max_workgroups, cub_mma_bf16,
+    cub_open, cub_device_name, cub_memory, cub_memory_free, cub_shared_memory, cub_subgroup_size, cub_max_workgroups, cub_mma_bf16,
     cub_bf16_storage, cub_host_writes, cub_kernel_built, cub_buffer_create, cub_buffer_free, cub_arena_create,
     cub_arena_add, cub_arena_commit, cub_arena_free, cub_commands_create, cub_commands_free, cub_commands_untimed,
     cub_commands_stamps, cub_timestamp, cub_timestamps, cub_record_begin, cub_dispatch, cub_prepare, cub_barrier,

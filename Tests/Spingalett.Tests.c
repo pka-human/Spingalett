@@ -8243,6 +8243,84 @@ static void gpu_gguf_sessions(void) {
     }
 }
 
+static _Atomic int split_sessions;
+static void count_split_sessions(LogLevel level, const char *message) {
+    (void)level;
+    if (strstr(message, "of the model's")) atomic_fetch_add(&split_sessions, 1);
+}
+
+/* Language models split between the GPU's memory and the CPU (SpingalettSessionOptions.gpu_memory, the smallest budget
+   that takes the session on the GPU and the largest that splits it): the logits near the CPU session's, through small steps
+   (the later layers on the CPU), large ones (every layer but the last on the GPU, the later layers' weights over the bus) and
+   large ones after small ones (the GPU's caches filled from the host's), a copied and rewound sequence too; tokens fed
+   one at a time, small steps alone, the bits of the same tokens fed a few at a time. */
+static void gpu_split_sessions(void) {
+    static const char *const files[] = {"gguf_quant", "gguf_qwen3", "gguf_llama3", "gguf_olmo2"};
+    for (size_t f = 0; f < sizeof files / sizeof *files; f++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s.gguf", SPINGALETT_TEST_DATA_DIR, files[f]);
+        SpingalettModel *m = spingalett_model_open(.path = path, .context = 128);
+        CHECK(m, "gpu split session %s: no model (%s)", files[f], spingalett_last_error_message());
+        if (!m) continue;
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 2});
+        const uint32_t V = s ? spingalett_session_vocabulary(s) : 0, P = 100, A = 40, B = 4;
+        uint32_t tok[100];
+        for (uint32_t i = 0; i < P; i++) tok[i] = (i * 37u + 5u) % (V ? V : 1u);
+        float *cpu = (float *)malloc((size_t)P * V * sizeof(float)), *got = (float *)malloc((size_t)P * V * sizeof(float));
+        float *few = (float *)malloc((size_t)P * V * sizeof(float));
+        bool ok = s && cpu && got && few &&
+                  spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = cpu, .all = true}, 1);
+        spingalett_session_free(s);
+        spingalett_set_compute_mode(gpu_mode);
+        spingalett_set_verbose(true);
+        spingalett_set_log_level(LOG_DEBUG);
+        spingalett_set_log_callback(count_split_sessions);
+        /* the budget: down from the whole model's to the last that holds a session on the GPU, split */
+        uint64_t budget = 0;
+        for (uint64_t b = (uint64_t)1 << 30; ok && b >= 4096u; b -= b / 16u) {
+            atomic_store(&split_sessions, 0);
+            s = spingalett_session_new(m, &(SpingalettSessionOptions){.gpu_memory = b, .sequences = 2});
+            if (s && atomic_load(&split_sessions) > 0) budget = b;
+            spingalett_session_free(s);
+        }
+        s = budget ? spingalett_session_new(m, &(SpingalettSessionOptions){.gpu_memory = budget, .sequences = 2}) : NULL;
+        spingalett_set_log_callback(NULL);
+        spingalett_set_log_level(LOG_INFO);
+        spingalett_set_verbose(false);
+        const uint32_t C = P - A - B;
+        /* large, small, large, then a copy rewound into the small ones and fed again */
+        ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = A, .logits = got, .all = true}, 1);
+        for (uint32_t i = A; ok && i < A + B; i++)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + i, .count = 1, .logits = got + (size_t)i * V}, 1);
+        ok = ok && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + A + B, .count = C,
+                                                                       .logits = got + (size_t)(A + B) * V, .all = true}, 1);
+        const double worst = ok ? gpu_max_scaled(cpu, got, (size_t)P * V) : 1.0;
+        ok = ok && spingalett_session_copy(s, 0, 1) && spingalett_session_rewind(s, 1, A + 2u) &&
+             spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 1, .tokens = tok + A + 2u, .count = P - A - 2u,
+                                                                 .logits = few + (size_t)(A + 2u) * V, .all = true}, 1);
+        const double copied = ok ? gpu_max_scaled(cpu + (size_t)(A + 2u) * V, few + (size_t)(A + 2u) * V, (size_t)(P - A - 2u) * V) : 1.0;
+        spingalett_session_free(s);
+        /* small steps alone: tokens one at a time, then the same a few at a time */
+        s = ok ? spingalett_session_new(m, &(SpingalettSessionOptions){.gpu_memory = budget}) : NULL;
+        ok = s != NULL;
+        for (uint32_t i = 0; ok && i < 16u; i++)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + i, .count = 1, .logits = got + (size_t)i * V}, 1);
+        ok = ok && spingalett_session_rewind(s, 0, 0);
+        for (uint32_t i = 0; ok && i < 16u; i += 4u)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + i, .count = 4, .logits = few + (size_t)i * V, .all = true}, 1);
+        const bool bits = ok && !memcmp(got, few, (size_t)16u * V * sizeof(float));
+        spingalett_session_free(s);
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        CHECK(ok && budget && worst < 0.05 && copied < 0.05 && bits, "gpu split session %s: a budget of %llu bytes, %.2e from the "
+              "CPU's logits, %.2e a copy, small steps the same bits %d", files[f], (unsigned long long)budget, worst, copied, bits);
+        printf("  gpu split session %-12s: %llu bytes, %.1e from the CPU's logits (a copy %.1e), small steps the same bits %s\n",
+               files[f], (unsigned long long)budget, worst, copied, bits ? "yes" : "NO");
+        free(cpu); free(got); free(few);
+        spingalett_model_free(m);
+    }
+}
+
 /* Sessions of integer models on the GPU: the linear layers multiply the model's codes there (weight-only, wqmv.comp:
    INT8, INT4, INT2), so that the logits are those of the model's weights as floats (the CPU's session of the network
    the model's image makes) to single precision's rounding, and within bfloat16's error; a prompt fed at once the bits
@@ -10109,6 +10187,7 @@ int main(int argc, char **argv) {
             gpu_session(false);
             gpu_session(true);
             if (gpu_mode == COMPUTE_CUDA) gpu_gguf_sessions();
+            if (gpu_mode == COMPUTE_CUDA) gpu_split_sessions();
             graph_cases_gpu(gpu_mode);
             gpu_model_predict();
             gpu_model_exact();

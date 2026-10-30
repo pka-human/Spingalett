@@ -64,6 +64,7 @@ struct SpgGpuCommands {
 bool spg_gpu_open(void) { return OPS && OPS->open(); }
 const char *spg_gpu_device_name(void) { return OPS ? OPS->device_name() : NULL; }
 uint64_t spg_gpu_memory(void) { return OPS ? OPS->memory() : 0; }
+uint64_t spg_gpu_memory_free(void) { return OPS ? OPS->memory_free() : 0; }
 uint32_t spg_gpu_shared_memory(void) { return OPS ? OPS->shared_memory() : 0; }
 uint32_t spg_gpu_subgroup_size(void) { return OPS ? OPS->subgroup_size() : 32u; }
 uint32_t spg_gpu_max_workgroups(uint32_t axis) { return OPS ? OPS->max_workgroups(axis) : 65535u; }
