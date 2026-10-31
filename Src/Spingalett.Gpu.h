@@ -304,10 +304,29 @@ static inline SpgGpuModel *spingalett_gpu_model_new(const SpingalettModel *model
 }
 static inline void spingalett_gpu_model_free(SpgGpuModel *m) { (void)m; }
 static inline SpgGpuSession *spingalett_gpu_session_new(const SpingalettModel *model, uint32_t sequences,
-                                                        uint32_t max_length, uint32_t most, const char **why) {
-    (void)model; (void)sequences; (void)max_length; (void)most;
-    *why = "no GPU";
+                                                        uint32_t max_length, uint32_t most, uint64_t budget,
+                                                        const char **why) {
+    (void)model, (void)sequences, (void)max_length, (void)most, (void)budget;
+    *why = "the library has no GPU backend";
     return NULL;
+}
+static inline uint64_t spingalett_gpu_session_room(void) { return 0; }
+static inline uint32_t spingalett_gpu_session_layers(const SpgGpuSession *s) { (void)s; return 0; }
+static inline bool spingalett_gpu_session_large(const SpgGpuSession *s) { (void)s; return false; }
+static inline bool spingalett_gpu_session_step_split(SpgGpuSession *s, uint32_t rows, const uint32_t *tokens,
+                                                     const uint32_t *sequence, const uint32_t *position, bool large,
+                                                     float *values) {
+    (void)s, (void)rows, (void)tokens, (void)sequence, (void)position, (void)large, (void)values;
+    return false;
+}
+static inline const float *spingalett_gpu_session_inputs(const SpgGpuSession *s, uint32_t layer) {
+    (void)s, (void)layer;
+    return NULL;
+}
+static inline bool spingalett_gpu_session_fill(SpgGpuSession *s, uint32_t layer, uint32_t sequence, uint32_t position,
+                                               uint32_t count, const float *keys, const float *values) {
+    (void)s, (void)layer, (void)sequence, (void)position, (void)count, (void)keys, (void)values;
+    return false;
 }
 static inline void spingalett_gpu_session_free(SpgGpuSession *s) { (void)s; }
 static inline uint32_t spingalett_gpu_session_rows(const SpgGpuSession *s) { (void)s; return 0; }
