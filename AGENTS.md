@@ -45,7 +45,7 @@ assumed (see [Performance work](#performance-work)).
 | `Src/Spingalett.Transformer.c`, `Generate.c` | Embeddings and attention over batches on the CPU (blocked products a thread per sample and group of heads, the backward pass recomputing the probabilities); text generation |
 | `Src/Spingalett.Serialize.c`, `docs/ModelFormat.md` | `.slett` files; `DatasetFile.c` and `docs/DatasetFormat.md` for `.slettd` (coders, readers) |
 | `Src/Spingalett.Thread.c` | A portable thread, lock and condition (POSIX threads or Win32), used by the data set reader |
-| `Src/Gpu/` | The GPU backends under one executor: `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as commands; the decoder of sessions), `Spingalett.GpuModel.c` (integer deployment models with the CPU's bits), `Spingalett.Recorder.h` (the barriers a dispatch's reads and writes need), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use, a table a backend; convolution geometries), `Spingalett.Device.h`/`.c` (the device interface: `SpgGpuOps` a backend, the calling thread's backend), `Spingalett.Vulkan.c` (the loader opened at run time; `Shaders/*.comp`, GLSL listed in `Spingalett.Kernels.def`, `SPG_KERNEL_H` ones built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`), `Spingalett.Cuda.c` (the driver opened at run time; commands captured as CUDA graphs; `Cuda/*.cu` compiled to PTX by Clang, units listed in `Cuda/Kernels.def`, gzip-compressed into the library and expanded by `Spingalett.Gunzip.c`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
+| `Src/Gpu/` | The GPU backends under one executor: `Spingalett.Gpu.c` (a network on the GPU: the batch path recorded as commands; the decoder of sessions), `Spingalett.GpuModel.c` (integer deployment models with the CPU's bits), `Spingalett.GpuSession.c` (sessions straight from a model's image: GGUF's block types as blocks, `Spingalett.GpuPack.c` packing them for the device; a model larger than the device's memory split with the CPU), `Spingalett.GpuGraph.c` (graphs of operators: device nodes recorded into pieces, values kept as bfloat16 between products), `Spingalett.Recorder.h` (the barriers a dispatch's reads and writes need), `Spingalett.GpuKernels.c` (the matrix product's tiles, timed on first use, a table a backend; convolution geometries), `Spingalett.Device.h`/`.c` (the device interface: `SpgGpuOps` a backend, the calling thread's backend), `Spingalett.Vulkan.c` (the loader opened at run time; `Shaders/*.comp`, GLSL listed in `Spingalett.Kernels.def`, `SPG_KERNEL_H` ones built a second time with `SPG_HALF` for buffers kept as bfloat16, `half.glsl`), `Spingalett.Cuda.c` (the driver opened at run time; commands captured as CUDA graphs; `Cuda/*.cu` compiled to PTX by Clang, units listed in `Cuda/Kernels.def`, gzip-compressed into the library and expanded by `Spingalett.Gunzip.c`); `Src/Spingalett.Gpu.h` is what the rest of the library calls |
 | `Bindings/Rust`, `CSharp`, `Go`, `Java` | Bindings over the shared library; their tests compare their structures with `Bin/SpingalettLayout` through `SPINGALETT_LAYOUT` (CI job `bindings`) |
 | `Bindings/JavaScript` | The engine in WebAssembly and its npm package: `build.sh` (Clang for wasm32, no C library), `wasm/` (the exports, `Spingalett.Libm.c` with the mathematical functions the engine calls, the parts of `<math.h>` and `<string.h>` it includes), `index.js` and `index.d.ts`; `test/` compares the module with the native engine (CI job `javascript`) |
 | `packaging/`, `Formula/`, `bucket/`, `flake.nix` | Conan, vcpkg, AUR, conda, the container image; Homebrew, Scoop, Nix; CPack (DEB, RPM) in `CMakeLists.txt` |
@@ -236,6 +236,22 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   keep their codes in format 11 from 1.5 on: new ones go at the end of `Spingalett.IROps.def`. A fusion
   (`IRFuse.c`) computes what the nodes it replaces compute, up to rounding (`check_graph_models.py` compares every
   model with `SPINGALETT_GRAPH_FUSE=0`), and fuses only chains whose intermediate values nothing else reads.
+- **Sessions on the GPU from the image.** `Spingalett.GpuSession.c` runs a model's image with no float network: a block
+  layer's product gives the CPU's bits on either backend (`bquant`, `bdot`, `bmm` and their packed units; `SpingalettGpuTests
+  blocks` compares all twelve types with `memcmp`, every unit), the rest of the step rounds as the GPU does, so that logits are
+  the CPU's to rounding and the bits of a whole step's rows do not depend on how the tokens were fed (`gguf` and `split`
+  session tests). Attention on the matrix units therefore has its tiles at a run's absolute positions, read from `info`
+  when the commands run: commands are recorded once for a step's shape and replayed, and nothing a step recorded may
+  depend on a token's position. Kernels on Vulkan assume neither a subgroup's size nor more shared memory than lavapipe's
+  unless `spg_gpu_kernel_built()` says the device has them (`bdots`, `bmm`), and never load through a null address in a
+  branch not taken (a flag or specialization constant says, and an unused address points at any valid buffer).
+- **A split session.** Where a model does not fit `SpingalettSessionOptions.gpu_memory` or the device's free memory,
+  `layers_within()` chooses how many first layers keep their weights on the device. A small step runs them and the CPU the
+  rest; a large step (`LARGE_STEP_ROWS` rows or more) runs every layer but the last on the device, the later layers' weights
+  copied over the bus into a buffer as their turn comes. Nothing fuses across the cut (`fuse_norms()`): small steps read
+  its last layer's outputs. The host's caches take their keys and values from a large step's attention inputs
+  (`session_keep()`), the device's from the host's before a large step reads what the CPU computed (`session_fill_gpu()`);
+  rewinding and copying a sequence keep `device_length` true. A large step gives the bits of the whole model on the GPU.
 - **Shared models.** A `SpingalettModel` may be used from several threads at once: what
   `spingalett_model_predict()` caches in a model it owns is built under the owner's lock and only
   read afterwards (`model_shared` in the `model` group runs four threads, `session_shared` four sessions
