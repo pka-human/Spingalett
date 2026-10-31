@@ -130,6 +130,7 @@ void main() {
     /* a lane's columns: n = lane, lane + SG, ... of the 32 (subgroups of 64: their first 32 lanes) */
     float acc[32u * COLS];
     int i1[KQ ? 32u * COLS : 1u], i2[MINS ? 32u * COLS : 1u];
+    uvec4 head[KQ ? COLS : 1u];             /* a super-block's first bytes as GGUF keeps them, once a super-block */
     [[unroll]] for (uint e = 0u; e < 32u * COLS; e++) acc[e] = 0.0;
     [[unroll]] for (uint e = 0u; e < (KQ ? 32u * COLS : 1u); e++) i1[e] = 0;
     [[unroll]] for (uint e = 0u; e < (MINS ? 32u * COLS : 1u); e++) i2[e] = 0;
@@ -197,16 +198,23 @@ void main() {
                 continue;
             }
             /* a sub-block's scale and minimum */
-            const uint e = u % 8u, b = u / 8u;
+            const uint e = u % 8u, b = u / 8u, part = e / 4u, shift = 8u * (e % 4u);
             int sc = 0, mn = 0, sc2 = 0;
             if (SIX) {
                 const uint pr = half_at(p.w, a.aux + 2u * u);
                 sc = int(pr << 24) >> 24;
                 sc2 = int(pr << 16) >> 24;
             } else if (TYPE == B_IQ4_XS) {
-                sc = iq4xs_scale(word_at(p.w, a.heads + 8u * b), word_at(p.w, a.heads + 8u * b + 4u), e);
+                if (e == 0u) head[c] = uvec4(word_at(p.w, a.heads + 8u * b), word_at(p.w, a.heads + 8u * b + 4u), 0u, 0u);
+                sc = iq4xs_scale(head[c].x, head[c].y, e);
             } else {
-                scale_min_k4(p.w, a.heads + 16u * b + 4u, e, sc, mn);
+                if (e == 0u) head[c] = U32x4(p.w).v[(a.heads + 16u * b) >> 4];
+                /* (llama.cpp's get_scale_min_k4(), four at once) */
+                const uvec4 w = head[c];
+                const uint scs = part != 0u ? (w.w & 0x0F0F0F0Fu) | ((w.y >> 2) & 0x30303030u) : w.y & 0x3F3F3F3Fu;
+                const uint mns = part != 0u ? ((w.w >> 4) & 0x0F0F0F0Fu) | ((w.z >> 2) & 0x30303030u) : w.z & 0x3F3F3F3Fu;
+                sc = int((scs >> shift) & 0xFFu);
+                mn = int((mns >> shift) & 0xFFu);
             }
             [[unroll]] for (uint m = 0u; m < 32u; m++) {
                 if (SIX) {
@@ -218,8 +226,8 @@ void main() {
             }
             if (e != 7u) continue;
             /* a super-block's term */
-            const float d = from_half(half_at(p.w, SIX ? a.scales + 2u * b : a.heads + (TYPE == B_IQ4_XS ? 8u : 16u) * b));
-            const float mi = MINS ? -from_half(half_at(p.w, a.heads + 16u * b + 2u)) : 0.0;
+            const float d = from_half(SIX ? half_at(p.w, a.scales + 2u * b) : head[c].x & 0xFFFFu);
+            const float mi = MINS ? -from_half(head[c].x >> 16) : 0.0;
             [[unroll]] for (uint m = 0u; m < 32u; m++) {
                 const float dxv = Dx[sg][m];
                 precise float term = (d * dxv) * float(i1[c * 32u + m]);
