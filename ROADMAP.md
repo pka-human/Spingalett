@@ -117,7 +117,7 @@ The foundation, on the CPU, with the language-model work of 1.5 that needed no n
   graph opens (kernels compute them as they run in 1.5) and composite operators' decompositions into primitives
   for backends without their kernels.
 
-## 1.6: graphs and language models on the GPU
+## 1.6: graphs and language models on the GPU (released)
 
 What 1.6 holds: graphs of operators on CUDA and Vulkan, GGUF's language models on the GPU from their images in their
 blocks, models larger than the GPU's memory split with the CPU. What was planned for it besides went to 1.7 (below): the GPU

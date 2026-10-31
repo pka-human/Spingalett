@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-31
+
 "On the GPU": graphs of operators run on CUDA and Vulkan; GGUF's language models run on the GPU straight from their images,
 their weights in their blocks and every block product with the CPU's bits; a model larger than the GPU's memory splits with
 the CPU. The rest of what 1.6 had planned (language models as graphs, tokenizers, NEON's block kernels) moved to 1.7.
@@ -1796,7 +1798,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/pka-human/Spingalett/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/pka-human/Spingalett/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/pka-human/Spingalett/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/pka-human/Spingalett/compare/v1.3.0...v1.4.0

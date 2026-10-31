@@ -14,4 +14,4 @@ keywords = ["neural-network", "machine-learning", "deep-learning", "transformer"
 categories = ["science", "api-bindings"]
 
 [dependencies]
-spingalett-sys = { path = "../spingalett-sys", version = "1.5.0" }
+spingalett-sys = { path = "../spingalett-sys", version = "1.6.0" }

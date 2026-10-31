@@ -5,8 +5,8 @@ defines. A **graph of operators** holds any model built of the operators ONNX de
 its constants and what its nodes compute), tensors of up to eight axes whose sizes are numbers or named symbols (a
 batch, a sequence's tokens), several named inputs and outputs, and nodes of 155 operators, each with ONNX's
 semantics. Graphs come from ONNX files, as PyTorch (`torch.onnx.export`), TensorFlow's and JAX's converters and
-other tools write them, and from `.slett` files of format 11 (docs/ModelFormat.md), which the library writes. They
-run on the CPU, in the runtime too (`libspingalett-runtime`).
+other tools write them, and from `.slett` files of formats 11 and 12 (docs/ModelFormat.md), which the library writes. They
+run on the CPU and on the GPU, in the runtime too (`libspingalett-runtime`).
 
 ## Running a graph
 
@@ -116,6 +116,17 @@ ONNX's (`Src/Spingalett.IRFuse.c`), which do the same work in fewer passes over 
 `SPINGALETT_GRAPH_FUSE=0` in the environment leaves the fusions out (to compare with).
 `spingalett_graph_node_count()` and `spingalett_graph_node_op()` (Python: `Graph.operators`) give the nodes that
 remain. A saved graph keeps its fusions; its constants are written as the source held them (float16 stays 16 bits).
+
+## Graphs on the GPU
+
+In `SPINGALETT_COMPUTE_CUDA` and `SPINGALETT_COMPUTE_VULKAN` a graph's nodes run on the GPU where it has their kernels, the others on the
+host with their values moved; the outputs arrive on the host as on the CPU. Nodes of few values stay on the host, whose time
+they would not repay (`SPINGALETT_GRAPH_GPU_MIN` sets what counts as few). `SPINGALETT_GRAPH_GPU_REPORT=1` lists the operators the host ran, 3 every
+node. The first run with new input shapes makes a plan of memory and commands, and later ones replay it.
+
+`spingalett_set_gpu_precision(SPINGALETT_PRECISION_BFLOAT16)` multiplies on the matrix units: products and attention read and write bfloat16, values
+whose readers all can are kept so in memory, and the rest computes in single precision. Results match the CPU's to rounding in single
+precision, and within bfloat16's error (3% of an output's largest magnitude in the tests) in bfloat16; a run on one device repeats its bits.
 
 ## How graphs compute
 
