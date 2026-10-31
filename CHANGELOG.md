@@ -7,6 +7,57 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+"On the GPU": graphs of operators run on CUDA and Vulkan; GGUF's language models run on the GPU straight from their images,
+their weights in their blocks and every block product with the CPU's bits; a model larger than the GPU's memory splits with
+the CPU. The rest of what 1.6 had planned (language models as graphs, tokenizers, NEON's block kernels) moved to 1.7.
+
+### Added
+- **Graphs of operators on the GPU**: `spingalett_graph_run()` in the GPU modes, in the runtime too: device nodes recorded into
+  pieces with planned memory, the host's between them; values kept as bfloat16 between products in bfloat16; FusedAttention
+  reading Q, K and V where a joint product leaves them; activations channels last between convolutions; shapes inferred
+  when a graph opens. Format 12 holds nodes with 1.6's attributes, which a 1.5 reader refuses. ONNX's conformance cases
+  run on either backend. Milliseconds on an RTX 4050 Laptop GPU, in bfloat16 against PyTorch 2.14.1's fp16 autocast with its tensors on the
+  GPU: ResNet-50 1.86 (1.90), BERT-base 3.40 (3.79), GPT-2 3.76 (3.03), CLIP's text encoder 1.86 (1.94), Whisper's encoder 3.51
+  (3.04), ViT-B/16 3.47 (3.30), a UNet of SDXL's architecture 4.01 (13.6), Stable Diffusion's VAE decoder 54 (58).
+- **Language models of GGUF files on the GPU**, CUDA and Vulkan, in the runtime too: sessions from the model's image, no float
+  network, the weights packed on the device (a 4B model in Q4_K_M takes 2.5 GB), all twelve block types with the CPU's bits in
+  their products. Prompts run on the matrix units (8-bit integers, in tiles), tokens at the memory's bandwidth.
+- **Models larger than the GPU's memory**: `SpingalettSessionOptions.gpu_memory` bounds what a session takes (0: what the device
+  has free, less 128 MB). The first layers keep their weights on the device; a token's step runs them there and the rest on all
+  the CPU's threads; a prompt's step (32 tokens or more) runs all but the last layer on the device, the later weights copied
+  over the bus as their turn comes. Python: `Model.session(gpu_memory=)`; PHP: `Model::session(gpuMemory:)`.
+- `Examples/Runtime/LlmBench.c` times sessions as `llama-bench` does, on the same files.
+
+### Performance
+Tokens a second on an RTX 4050 Laptop GPU with an i7-12650H, the GPU at 60 C or less before each run, against llama.cpp's Vulkan build
+(1242be6; `llama-bench -p 512 -n 128`), measured the same day. llama.cpp's CUDA build was not measured:
+
+| Model | CUDA prompt | Vulkan prompt | llama.cpp | CUDA tokens | Vulkan tokens | llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3-0.6B Q8_0 | 16,447 | 6,078 | 12,120 | 222 | 157 | 207 |
+| Qwen3-1.7B Q8_0 | 8,117 | 2,321 | 6,543 | 90.7 | 73.6 | 90.2 |
+| Qwen3-4B Q4_K_M | 3,601 | 789 | 2,974 | 64.9 | 52.5 | 65.2 |
+| Llama-3.2-1B Q4_K_M | 12,682 | 2,717 | 10,473 | 196 | 153 | 198 |
+| Qwen2.5-0.5B Q4_K_M | 22,215 | 6,243 | 16,265 | 326 | 189 | 290 |
+
+Split, Qwen3-4B Q4_K_M: 2 GB of the GPU 2,465 prompt / 34.0 tokens, 1.2 GB 1,771 / 26.5, 0.7 GB 1,502 / 19.2; llama.cpp with 30, 20, 10 and 0 of its
+37 layers on the GPU 1,816 / 41.0, 1,490 / 30.9, 1,258 / 25.2, 1,062 / 19.3. Qwen3-8B Q4_K_M with what a 6 GB card has free 1,946 / 29.6;
+llama.cpp, which fits it whole, 1,705 / 35.6.
+
+### Gaps
+Under the 1.3 times the roadmap aims for, or behind:
+- **Sessions on Vulkan are behind llama.cpp's Vulkan build**: prompts 0.26 to 0.50 times its speed, tokens 0.65 to 0.82. They are correct but not
+  yet tuned as CUDA's are (the roadmap says what is left). Measured on NVIDIA's driver alone: no AMD or Intel GPU was at hand.
+- CUDA's prompts are 1.21 to 1.24 times llama.cpp's on Qwen3-1.7B, Qwen3-4B and Llama-3.2-1B, under the aim; tokens are level (0.99 to 1.13), bound by
+  the memory's bandwidth.
+- Qwen3-8B on a 6 GB card keeps its output layer on the CPU: 0.83 times llama.cpp's tokens.
+- Graphs against PyTorch: only the UNet is 1.3 times ahead; GPT-2, Whisper's encoder and ViT-B/16 are behind in bfloat16.
+
+### Fixed
+- Convolutions of graphs on the GPU timed their tiles on a geometry not yet on the device: windows read wild addresses, which faulted on
+  lavapipe and left CI's tests failing; on CUDA this is the likely cause of an occasional "misaligned address" while timing tiles.
+- Vulkan: the device closed before the driver's libraries at exit (heap corruption, crashes or spins after every test passed).
+
 ## [1.5.0] - 2026-10-21
 
 "Graphs of operators": any model built of ONNX's operators runs as it is, not only the library's layers. A graph holds
