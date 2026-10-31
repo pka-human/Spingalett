@@ -144,7 +144,7 @@ was ready to ship, and SaLaM waits for it.
   residual additions and their activations as passes of their own (ResNet), convolutions of single precision in VAE's
   sizes, products of few rows bound by their weights' memory (GPT-2, CLIP); then `torch.compile` as the rival.
 - **Language models on the GPU, against llama.cpp's Vulkan build on the same files.** On CUDA prompts run 1.21 to 1.37 times
-  as fast; generation is level (0.99 to 1.13), since a token's products are bound by the memory's bandwidth, which both
+  as fast; generation is level (0.99 to 1.12), since a token's products are bound by the memory's bandwidth, which both
   reach to within a few percent: 1.3 times is not there to be had, and it counts as a gap only where it falls under level.
   Under 1.3 for prompts: Qwen3-1.7B, Qwen3-4B and Llama-3.2-1B (the copies of few bytes from many rows into shared memory,
   a third of bmm's time in Q4_K).
@@ -429,7 +429,7 @@ is next.
 ### The GPU against PyTorch
 
 On an RTX 4050 Laptop GPU against PyTorch 2.14 with cuDNN (`Bin/Benchmark gpu` against
-`benchmark_pytorch.py --cuda`, `--cuda-fp32`, `--cuda-bf16` and `--host-data`, README), Spingalett
+`benchmark_pytorch.py --cuda`, `--cuda-fp32`, `--cuda-bf16` and `--host-data`, [Performance](docs/Performance.md)), Spingalett
 0.14 is ahead in every workload, with the data in GPU memory (its data sets) or in host memory:
 the MNIST CNN (with and without batch normalization) trains 1.6 to 1.9 times as fast as PyTorch and
 runs 2.1 to 2.4 times as fast in single precision, 1.5 to 1.6 and 1.8 to 2.1 times as fast as its
@@ -448,7 +448,7 @@ which applies the batch normalization it reads and sums that normalization's bac
 data gradient (part of 3: the MobileNet-style network trains 3.4 and 12 times as fast as in 0.13.1);
 training chunks of 4,096 samples where no batch normalization groups them; networks made on the GPU
 in freed memory, their parameters' upload not waited for. Done in 1.1: the CUDA backend (above),
-whose margins over PyTorch are wider in every workload (1.2 to 7.7 times; README); on both backends
+whose margins over PyTorch are wider in every workload (1.2 to 7.7 times; [Performance](docs/Performance.md)); on both backends
 a batch normalization applied in the epilogue of the product it reads at inference (part of 3), its
 coefficients computed once until the parameters change, and three chunks in flight; on CUDA a
 kernel of its own for a first layer's few channels (part of 3). Done in 1.2 (CUDA): the weights'

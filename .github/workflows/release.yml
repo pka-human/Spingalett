@@ -208,7 +208,10 @@ jobs:
         run: |
           cmake --install Build
           cmake --install BuildRuntime
-          for dir in "$ARCHIVE" "$RUNTIME_ARCHIVE"; do cp LICENSE CHANGELOG.md README.md "$dir/"; done
+          for dir in "$ARCHIVE" "$RUNTIME_ARCHIVE"; do
+            cp LICENSE CHANGELOG.md README.md "$dir/"
+            mkdir -p "$dir/docs" && cp docs/*.md "$dir/docs/"       # the README's guides
+          done
           if [ "$RUNNER_OS" = Windows ]; then
             # the MinGW runtime DLLs the libraries and the tools load (libgomp, libwinpthread, ...)
             ldd "$ARCHIVE/bin/libspingalett.dll" "$ARCHIVE/bin/libspingalett-runtime.dll" \

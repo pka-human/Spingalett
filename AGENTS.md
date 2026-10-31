@@ -1,7 +1,7 @@
 # Notes for coding agents
 
 This file is for automated contributors (and humans who want the short version). The README
-documents the library for users; [ROADMAP.md](ROADMAP.md) says what comes next; the
+introduces the library, [docs/](docs/README.md) documents it for users; [ROADMAP.md](ROADMAP.md) says what comes next; the
 [CHANGELOG](CHANGELOG.md) records what changed.
 
 ## What the project is
@@ -280,7 +280,7 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   after an epoch, or the saved files, against a build of the previous commit, and with a profile
   (`gprofng collect app` works with AVX-512, Valgrind does not; Release builds are stripped, so
   profile a `RelWithDebInfo` build).
-- Numbers quoted in README and CHANGELOG are measured, with the machine named. Laptops throttle:
+- Numbers quoted in the README, docs/Performance.md and the CHANGELOG are measured, with the machine named. Laptops throttle:
   watch the temperature and frequency (`/proc/cpuinfo`) and let a long run finish before measuring.
 - `-DSPINGALETT_NO_DIRECT_CONV` builds the library without the indirect convolution kernels, for
   comparisons with the products of gathered windows.
@@ -325,15 +325,15 @@ Before a pull request, run what CI runs (`.github/workflows/ci.yml`) that the ch
   helpers, file-local names without a prefix. A new public name gets its short alias of 0.x only if
   it renames one (`Spingalett.Short.h`: other aliases would take names from the programs that
   include it). The library's sources (the internal headers define `SPINGALETT_SHORT_NAMES`), the
-  examples, the apps and the README's code use the short names, which read more easily; the
+  examples, the apps and the code of the README and the guides use the short names, which read more easily; the
   descriptions, the headers' comments and `docs/Reference.md` use the prefixed ones, which are also
   the exported symbols.
 - Every file starts with the SPDX header (`MIT`, copyright pka_human).
 - Comments say what a block computes and why, in full sentences; match the density of the code
   around them. Documentation is formal English and states facts, not intentions.
-- Public API changes go to `Spingalett.h` with a comment, the README, the Python bindings and their
-  README, and the CHANGELOG. From 1.0 the API and ABI follow semantic versioning (README,
-  **Compatibility**): a 1.x release only adds, and the soname carries the major version.
+- Public API changes go to `Spingalett.h` with a comment, the guide in `docs/` they belong to, the Python bindings and
+  their README, and the CHANGELOG; the README holds what makes a reader want the library, not how to use each part. From
+  1.0 the API and ABI follow semantic versioning ([docs/Compatibility.md](docs/Compatibility.md)): a 1.x release only adds, and the soname carries the major version.
 - Commits are small and topical, with a subject line in the imperative and a body that says what
   changed and why (with measurements for performance work).
 

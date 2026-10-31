@@ -62,7 +62,7 @@ llama.cpp, which fits it whole, 1,705 / 35.6.
 Under the 1.3 times the roadmap aims for, or behind:
 - **Sessions on Vulkan are behind llama.cpp's Vulkan build**: prompts 0.26 to 0.50 times its speed, tokens 0.65 to 0.82. They are correct but not
   yet tuned as CUDA's are (the roadmap says what is left). Measured on NVIDIA's driver alone: no AMD or Intel GPU was at hand.
-- CUDA's prompts are 1.21 to 1.24 times llama.cpp's on Qwen3-1.7B, Qwen3-4B and Llama-3.2-1B, under the aim; tokens are level (0.99 to 1.13), bound by
+- CUDA's prompts are 1.21 to 1.24 times llama.cpp's on Qwen3-1.7B, Qwen3-4B and Llama-3.2-1B, under the aim; tokens are level (0.99 to 1.12), bound by
   the memory's bandwidth.
 - Qwen3-8B on a 6 GB card keeps its output layer on the CPU: 0.83 times llama.cpp's tokens.
 - Graphs against PyTorch: only the UNet is 1.3 times ahead; GPT-2, Whisper's encoder and ViT-B/16 are behind in bfloat16.
