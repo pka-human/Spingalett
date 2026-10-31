@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="302" viewBox="0 0 880 302" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" role="img" aria-labelledby="t d">
+<title id="t">Spingalett on CUDA against llama.cpp on Vulkan, tokens a second</title>
+<desc id="d">Five GGUF models on an RTX 4050 Laptop GPU. Spingalett processes prompts 1.21 to 1.37 times as fast; generation is level, 0.99 to 1.12 times. The README's table holds the numbers.</desc>
+<rect x="150" y="6" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="168" y="16" font-size="13" fill="#0b0b0b">Spingalett on CUDA</text>
+<rect x="310" y="6" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="328" y="16" font-size="13" fill="#0b0b0b">llama.cpp on Vulkan</text>
+<text x="138" y="94" font-size="12" text-anchor="end" fill="#52514e">Qwen3-0.6B Q8_0</text>
+<text x="138" y="134" font-size="12" text-anchor="end" fill="#52514e">Qwen3-1.7B Q8_0</text>
+<text x="138" y="174" font-size="12" text-anchor="end" fill="#52514e">Qwen3-4B Q4_K_M</text>
+<text x="138" y="214" font-size="12" text-anchor="end" fill="#52514e">Llama-3.2-1B Q4_K_M</text>
+<text x="138" y="254" font-size="12" text-anchor="end" fill="#52514e">Qwen2.5-0.5B Q4_K_M</text>
+<text x="150" y="58" font-size="14" font-weight="600" fill="#0b0b0b">Prompt of 512 tokens, tokens/s</text>
+<line x1="150.0" y1="68" x2="150.0" y2="274" stroke="#e4e3df"/>
+<text x="150.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">0</text>
+<line x1="210.0" y1="68" x2="210.0" y2="274" stroke="#e4e3df"/>
+<text x="210.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">5,000</text>
+<line x1="270.0" y1="68" x2="270.0" y2="274" stroke="#e4e3df"/>
+<text x="270.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">10,000</text>
+<line x1="330.0" y1="68" x2="330.0" y2="274" stroke="#e4e3df"/>
+<text x="330.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">15,000</text>
+<line x1="390.0" y1="68" x2="390.0" y2="274" stroke="#e4e3df"/>
+<text x="390.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">20,000</text>
+<line x1="450.0" y1="68" x2="450.0" y2="274" stroke="#e4e3df"/>
+<text x="450.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">25,000</text>
+<path d="M150 78h193.4a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-193.4z" fill="#2a78d6"/>
+<path d="M150 91h141.4a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-141.4z" fill="#eb6834"/>
+<text x="354.4" y="94" font-size="12" font-weight="600" fill="#0b0b0b">1.36×</text>
+<path d="M150 118h93.4a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-93.4z" fill="#2a78d6"/>
+<path d="M150 131h74.5a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-74.5z" fill="#eb6834"/>
+<text x="254.4" y="134" font-size="12" font-weight="600" fill="#0b0b0b">1.24×</text>
+<path d="M150 158h39.2a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-39.2z" fill="#2a78d6"/>
+<path d="M150 171h31.7a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-31.7z" fill="#eb6834"/>
+<text x="200.2" y="174" font-size="12" font-weight="600" fill="#0b0b0b">1.21×</text>
+<path d="M150 198h148.2a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-148.2z" fill="#2a78d6"/>
+<path d="M150 211h121.7a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-121.7z" fill="#eb6834"/>
+<text x="309.2" y="214" font-size="12" font-weight="600" fill="#0b0b0b">1.21×</text>
+<path d="M150 238h262.6a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-262.6z" fill="#2a78d6"/>
+<path d="M150 251h191.2a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-191.2z" fill="#eb6834"/>
+<text x="423.6" y="254" font-size="12" font-weight="600" fill="#0b0b0b">1.37×</text>
+<text x="510" y="58" font-size="14" font-weight="600" fill="#0b0b0b">Generation of 128 tokens, tokens/s</text>
+<line x1="510.0" y1="68" x2="510.0" y2="274" stroke="#e4e3df"/>
+<text x="510.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">0</text>
+<line x1="585.0" y1="68" x2="585.0" y2="274" stroke="#e4e3df"/>
+<text x="585.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">100</text>
+<line x1="660.0" y1="68" x2="660.0" y2="274" stroke="#e4e3df"/>
+<text x="660.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">200</text>
+<line x1="735.0" y1="68" x2="735.0" y2="274" stroke="#e4e3df"/>
+<text x="735.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">300</text>
+<line x1="810.0" y1="68" x2="810.0" y2="274" stroke="#e4e3df"/>
+<text x="810.0" y="290" font-size="11" text-anchor="middle" fill="#52514e">400</text>
+<path d="M510 78h162.5a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-162.5z" fill="#2a78d6"/>
+<path d="M510 91h151.2a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-151.2z" fill="#eb6834"/>
+<text x="683.5" y="94" font-size="12" font-weight="600" fill="#0b0b0b">1.07×</text>
+<path d="M510 118h64.0a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-64.0z" fill="#2a78d6"/>
+<path d="M510 131h63.7a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-63.7z" fill="#eb6834"/>
+<text x="585.0" y="134" font-size="12" font-weight="600" fill="#0b0b0b">1.01×</text>
+<path d="M510 158h44.7a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-44.7z" fill="#2a78d6"/>
+<path d="M510 171h44.9a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-44.9z" fill="#eb6834"/>
+<text x="565.9" y="174" font-size="12" font-weight="600" fill="#0b0b0b">1.00×</text>
+<path d="M510 198h143.0a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-143.0z" fill="#2a78d6"/>
+<path d="M510 211h144.5a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-144.5z" fill="#eb6834"/>
+<text x="665.5" y="214" font-size="12" font-weight="600" fill="#0b0b0b">0.99×</text>
+<path d="M510 238h240.5a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-240.5z" fill="#2a78d6"/>
+<path d="M510 251h213.5a4 4 0 0 1 4 4v3a4 4 0 0 1 -4 4h-213.5z" fill="#eb6834"/>
+<text x="761.5" y="254" font-size="12" font-weight="600" fill="#0b0b0b">1.12×</text>
+</svg>

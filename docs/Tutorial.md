@@ -3,7 +3,7 @@
 Six programs of `Examples/`, each adding to the one before: a network and its training, real data
 with validation, convolutions, batch normalization with augmentation and a GPU, a graph for
 segmentation, and a model on a microcontroller. Every step names the program to run, what to read
-in it, and what it does. The [README](../README.md) documents each part in full, the
+in it, and what it does. [The guides](README.md) document each part in full, the
 [API reference](Reference.md) every declaration.
 
 Build the library and the examples once:
@@ -116,11 +116,11 @@ inference engine alone (`Src/Spingalett.Inference.c` and `Spingalett.Inference.h
 
 - Models in a program that does not train: `Examples/Runtime/RunModel.c` links the runtime,
   `libspingalett-runtime` (`Spingalett.Runtime.h`), a quarter of the library's size with the same
-  kernels and results (`Bin/RunModel mnist.slett` after step 2; README, The runtime).
+  kernels and results (`Bin/RunModel mnist.slett` after step 2; [The runtime](Deployment.md#the-runtime)).
 - C++: `Spingalett/Spingalett.hpp` wraps the same calls in owning types, `std::span` and
-  `std::expected` (README, section C++).
+  `std::expected` ([C++](Bindings.md#c)).
 - Python: `pip install spingalett` gives the same library to NumPy programs
   ([Bindings/Python](../Bindings/Python/README.md)).
-- Models from elsewhere: `spingalett_import_onnx()` and `spingalett_load_pytorch()` (README,
-  Importing models).
-- Files of training data: `.slettd` data sets, streamed by a reader (README, Data set files).
+- Models from elsewhere: `spingalett_import_onnx()` and `spingalett_load_pytorch()`
+  ([Models from elsewhere](Importing.md)).
+- Files of training data: `.slettd` data sets, streamed by a reader ([Data set files](Datasets.md#data-set-files)).
