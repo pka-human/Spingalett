@@ -1,0 +1,39 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* Floats of graphs copied through strides as gcopy.comp copies them (Spingalett.GpuGraph.c), rounded to bfloat16 as
+   they are written: the operands of products on the matrix units (devices with 16-bit storage). As gcvt.cu. */
+
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#define SPG_HALF
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+#define AXES 6
+layout(push_constant) uniform Push {
+    BF16 y;
+    F32 x;
+    uint total, base;
+    uint dims[AXES];
+    int sx[AXES], sy[AXES];
+} p;
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        uint r = i;
+        int ax = int(p.base), ay = 0;
+        for (int d = AXES - 1; d >= 0; d--) {
+            uint c = d > 0 ? r % p.dims[d] : r;
+            if (d > 0) r /= p.dims[d];
+            ax += int(c) * p.sx[d];
+            ay += int(c) * p.sy[d];
+        }
+        p.y.v[ay] = uint16_t(to_bf16(p.x.v[ax]));
+    }
+}

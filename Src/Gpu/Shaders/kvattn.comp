@@ -1,0 +1,160 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * A session's attention over the keys and values it keeps, in single precision (the CPU's to rounding).
+ *
+ *   PREP    an invocation a row and head (queries' heads first, then the keys' and values'): RMS-normalized by its gamma
+ *           and rotated (value i with value i + rot / 2, by the table's cosine and sine of the row's position) as
+ *           spingalett_engine_head() does; queries to q, keys and values into their caches
+ *   ATTEND  a workgroup a row and query head: in tiles of TILE positions, each invocation a key's score, the tile's maximum
+ *           and sum over shared memory in a fixed tree, then each invocation the values of its channels, the keys
+ *           in their order (the softmax online from tile to tile)
+ *
+ * Every sum runs in a fixed order, a row whatever rows are with it: the same bits however the tokens are fed.
+ */
+
+#version 460
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+#define PREP 0u
+#define ATTEND 1u
+#define THREADS 64u
+#define DMAX 256u
+#define TILE 256u
+
+layout(push_constant) uniform Push {
+    F32 x, q, keys, values, y, table, gq, gk;
+    U32 info;
+    uint rows, heads, kv, head, rot, window, max_length, op;
+    float eps, scale;
+    uint half_kv, half_q, gammas;
+} p;
+
+shared float ss[TILE], sr[THREADS];
+
+/* the maximum (with sum: the sum) of THREADS values of sr, in a fixed tree; every invocation calls it */
+float reduce(float v, bool sum) {
+    const uint tid = gl_LocalInvocationID.x;
+    sr[tid] = v;
+    barrier();
+    for (uint s = THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sr[tid] = sum ? sr[tid] + sr[tid + s] : max(sr[tid], sr[tid + s]);
+        barrier();
+    }
+    const float r = sr[0];
+    barrier();
+    return r;
+}
+
+void prepare(uint w) {
+    const uint D = p.head, C = (p.heads + 2u * p.kv) * D, half_d = p.rot / 2u, per = p.heads + p.kv;
+    const uint r = w / per, h = w % per, seq = p.info.v[2u * r], pos = p.info.v[2u * r + 1u];
+    const bool query = h < p.heads;
+    const uint src = r * C + h * D;
+    F32 gamma = query ? p.gq : p.gk;
+    const bool normalized = p.gammas != 0u;
+    float rr = 1.0;
+    if (normalized) {
+        float s = 0.0;
+        for (uint i = 0u; i < D; i++) s += p.x.v[src + i] * p.x.v[src + i];
+        rr = 1.0 / sqrt(s * (1.0 / float(D)) + p.eps);
+    }
+    const uint g = h - p.heads;
+    const uint at = query ? (r * p.heads + h) * D : ((seq * p.kv + g) * p.max_length + pos) * D;
+    /* (the rotated values in pairs, those past the pairs alone) */
+    for (uint i = 0u; i < D; i++) {
+        if (half_d != 0u && i >= half_d && i < 2u * half_d) continue;
+        const uint o = half_d != 0u && i < half_d ? i + half_d : i;
+        float a = p.x.v[src + i], b = p.x.v[src + o];
+        if (normalized) {
+            a = a * rr * gamma.v[i];
+            b = b * rr * gamma.v[o];
+        }
+        if (half_d != 0u && i < half_d) {
+            const float c = p.table.v[pos * half_d + i], s = p.table.v[(p.max_length + pos) * half_d + i], a0 = a;
+            a = a0 * c - b * s;
+            b = b * c + a0 * s;
+        }
+        F32 to = query ? p.q : p.keys;
+#ifdef SPG_HALF
+        /* (flash.comp rounds them so as it reads them) */
+        if (query ? p.half_q != 0u : p.half_kv != 0u) {
+            BF16(to).v[at + i] = uint16_t(to_bf16(a));
+            if (o != i) BF16(to).v[at + o] = uint16_t(to_bf16(b));
+            continue;
+        }
+#endif
+        to.v[at + i] = a;
+        if (o != i) to.v[at + o] = b;
+    }
+    if (query) return;
+    const uint vs = r * C + (p.heads + p.kv + g) * D;
+#ifdef SPG_HALF
+    if (p.half_kv != 0u) {
+        for (uint i = 0u; i < D; i++) BF16(p.values).v[at + i] = uint16_t(to_bf16(p.x.v[vs + i]));
+        return;
+    }
+#endif
+    for (uint i = 0u; i < D; i++) p.values.v[at + i] = p.x.v[vs + i];
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    if (p.op == PREP) {
+        const uint w = gl_GlobalInvocationID.x;
+        if (w < p.rows * (p.heads + p.kv)) prepare(w);
+        return;
+    }
+    const uint rh = gl_WorkGroupID.x, D = p.head;
+    if (rh >= p.rows * p.heads) return;
+    const uint r = rh / p.heads, h = rh % p.heads, g = h / (p.heads / p.kv);
+    const uint seq = p.info.v[2u * r], pos = p.info.v[2u * r + 1u];
+    const uint count0 = p.window != 0u && pos + 1u > p.window ? p.window : pos + 1u, first = pos + 1u - count0;
+    const uint base = (seq * p.kv + g) * p.max_length * D, query = (r * p.heads + h) * D;
+    float m = -3.402823466e38, l = 0.0;
+    float o[DMAX / THREADS];                /* channels tid, tid + THREADS, ... */
+    for (uint j = 0u; j < DMAX / THREADS; j++) o[j] = 0.0;
+    for (uint t0 = first; t0 <= pos; t0 += TILE) {
+        const uint count = min(TILE, pos + 1u - t0);
+        float best = -3.402823466e38;
+        for (uint t = tid; t < count; t += THREADS) {
+            const uint at = base + (t0 + t) * D;
+            float s = 0.0;
+            for (uint c = 0u; c < D; c++) s += p.q.v[query + c] * p.keys.v[at + c];
+            s *= p.scale;
+            ss[t] = s;
+            best = max(best, s);
+        }
+        const float nm = max(m, reduce(best, false)), a = exp(m - nm);
+        float part = 0.0;
+        for (uint t = tid; t < count; t += THREADS) {
+            const float e = exp(ss[t] - nm);
+            ss[t] = e;
+            part += e;
+        }
+        l = l * a + reduce(part, true);     /* (its barriers make ss visible) */
+        for (uint j = 0u; j < DMAX / THREADS; j++) {
+            const uint c = tid + j * THREADS;
+            if (c >= D) break;
+            float acc = o[j] * a;
+            for (uint t = 0u; t < count; t++) acc += ss[t] * p.values.v[base + (t0 + t) * D + c];
+            o[j] = acc;
+        }
+        m = nm;
+        barrier();
+    }
+    const uint out_at = r * p.heads * D + h * D;
+    for (uint j = 0u; j < DMAX / THREADS; j++) {
+        const uint c = tid + j * THREADS;
+        if (c >= D) break;
+        p.y.v[out_at + c] = o[j] / l;
+    }
+}

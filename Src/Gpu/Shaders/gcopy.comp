@@ -1,0 +1,46 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* Values of graphs copied through strides (Spingalett.GpuGraph.c): value i of the dispatch, at its coordinates over six
+   axes (innermost last), is x[base + sum c[d] sx[d]] written to y[sum c[d] sy[d]], elements of SIZE bytes (1, 4, 8
+   or 16; strides in elements, x's offsets 0 or more). As gcopy.cu. */
+
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+
+layout(constant_id = 0) const uint SIZE = 4;
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer B8 { uint8_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer B64 { uvec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer B128 { uvec4 v[]; };
+
+#define AXES 6
+layout(push_constant) uniform Push {
+    U32 y, x;
+    uint total, base;
+    uint dims[AXES];
+    int sx[AXES], sy[AXES];
+} p;
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        uint r = i;
+        int ax = int(p.base), ay = 0;
+        for (int d = AXES - 1; d >= 0; d--) {
+            uint c = d > 0 ? r % p.dims[d] : r;
+            if (d > 0) r /= p.dims[d];
+            ax += int(c) * p.sx[d];
+            ay += int(c) * p.sy[d];
+        }
+        if (SIZE == 1u) B8(p.y).v[ay] = B8(p.x).v[ax];
+        else if (SIZE == 8u) B64(p.y).v[ay] = B64(p.x).v[ax];
+        else if (SIZE == 16u) B128(p.y).v[ay] = B128(p.x).v[ax];
+        else p.y.v[ay] = p.x.v[ax];
+    }
+}

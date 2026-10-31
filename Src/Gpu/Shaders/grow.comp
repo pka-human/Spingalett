@@ -1,0 +1,200 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* Operators of graphs over rows (Spingalett.GpuGraph.c): reductions, ArgMax and ArgMin, Softmax, LogSoftmax, Hardmax,
+   LayerNorm, RMSNorm and GroupNorm, TPR threads a row, each its values in order, the partial results combined through
+   shared memory in a fixed tree. As grow.cu. */
+
+#version 460
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint TPR_ = 1;
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer I32 { int v[]; };
+
+layout(push_constant) uniform Push {
+    F32 x, y, a, b, aux;
+    uint outer, len, inner, rows;
+    uint groups, cpg, pix, flags;
+    float eps;
+    uint act;
+} p;
+
+#define SUM 0u
+#define MEAN 1u
+#define MAX 2u
+#define MIN 3u
+#define PROD 4u
+#define L1 5u
+#define L2 6u
+#define SUMSQ 7u
+#define LOGSUMEXP 8u
+#define LOGSUM 9u
+#define ARGMAX 10u
+#define ARGMIN 11u
+#define SOFTMAX 16u
+#define LOGSOFTMAX 17u
+#define HARDMAX 18u
+#define LAYERNORM 19u
+#define RMSNORM 20u
+#define GROUPNORM 21u
+#define GROUPNORM_LAST 22u
+#define F_LAST 1u
+#define F_A_ONE 2u
+#define F_B 4u
+#define F_B_ONE 8u
+#define F_STATS 16u
+#define F_BY_GROUP 32u
+
+shared vec3 sh[256];
+
+float x_at(uint o, uint i, uint l) { return p.x.v[(o * p.len + l) * p.inner + i]; }
+
+/* value l of row (o, i); channels last (GROUPNORM_LAST): row (batch, group), pixel l / cpg, channel l % cpg of it */
+uint at_of(uint op, uint o, uint i, uint l) {
+    if (op == GROUPNORM_LAST) {
+        uint b = o / p.groups, g = o % p.groups;
+        return (b * p.pix + l / p.cpg) * (p.groups * p.cpg) + g * p.cpg + l % p.cpg;
+    }
+    return (o * p.len + l) * p.inner + i;
+}
+
+vec3 combine(uint op, vec3 a, vec3 b, bool last) {
+    if (op == MAX) return vec3(isnan(a.x) ? a.x : isnan(b.x) || b.x > a.x ? b.x : a.x, 0.0, 0.0);
+    if (op == MIN) return vec3(isnan(a.x) ? a.x : isnan(b.x) || b.x < a.x ? b.x : a.x, 0.0, 0.0);
+    if (op == PROD) return vec3(a.x * b.x, 0.0, 0.0);
+    if (op == ARGMAX || op == ARGMIN) {
+        if (b.y < 0.0) return a;
+        if (a.y < 0.0) return b;
+        if (isnan(a.x)) return a;
+        if (isnan(b.x)) return b;
+        bool better = op == ARGMAX ? b.x > a.x : b.x < a.x;
+        return better || (b.x == a.x && last) ? b : a;
+    }
+    if (op == LAYERNORM || op == GROUPNORM) {
+        float n = a.x + b.x;
+        if (n == 0.0) return a;
+        float d = b.y - a.y, wb = b.x / n;
+        return vec3(n, a.y + d * wb, a.z + b.z + d * d * a.x * wb);
+    }
+    return vec3(a.x + b.x, 0.0, 0.0);
+}
+
+vec3 reduce_row(vec3 v, uint t, uint lane, uint op, bool last) {
+    const uint TPR = TPR_;
+    sh[t] = v;
+    for (uint s = TPR / 2u; s > 0u; s >>= 1) {
+        barrier();
+        if (lane < s) sh[t] = combine(op, sh[t], sh[t + s], last);
+    }
+    barrier();
+    vec3 r = sh[t - lane];
+    barrier();
+    return r;
+}
+
+uint sum_op(uint op) {
+    return op == L1 || op == L2 || op == SUMSQ || op == LOGSUMEXP || op == MEAN || op == LOGSUM ? SUM : op;
+}
+
+void main() {
+    const uint TPR = TPR_, per = 256u / TPR, t = gl_LocalInvocationID.x, lane = t % TPR;
+    const uint op = OP;
+    bool last = (p.flags & F_LAST) != 0u;
+    const float INF = uintBitsToFloat(0x7F800000u);
+    for (uint first = gl_WorkGroupID.x * per; first < p.rows; first += gl_NumWorkGroups.x * per) {
+        uint q = first + t / TPR;
+        bool live = q < p.rows;
+        uint o = live ? q / p.inner : 0u, i = live ? q % p.inner : 0u, len = live ? p.len : 0u;
+        if (op < SOFTMAX) {
+            float mx = -INF;
+            if (op == LOGSUMEXP) {
+                vec3 m = vec3(-INF, 0.0, 0.0);
+                for (uint l = lane; l < len; l += TPR) m = combine(MAX, m, vec3(x_at(o, i, l), 0.0, 0.0), false);
+                mx = reduce_row(m, t, lane, MAX, false).x;
+            }
+            bool arg = op == ARGMAX || op == ARGMIN;
+            vec3 acc = vec3(op == PROD ? 1.0 : op == MAX ? -INF : op == MIN ? INF : 0.0, arg ? -1.0 : 0.0, 0.0);
+            for (uint l = lane; l < len; l += TPR) {
+                float v = x_at(o, i, l);
+                vec3 e = op == L1 ? vec3(abs(v), 0.0, 0.0) : op == L2 || op == SUMSQ ? vec3(v * v, 0.0, 0.0)
+                       : op == LOGSUMEXP ? vec3(exp(v - mx), 0.0, 0.0) : vec3(v, float(l), 0.0);
+                acc = combine(sum_op(op), acc, e, last);
+            }
+            vec3 r = TPR > 1u ? reduce_row(acc, t, lane, sum_op(op), last) : acc;
+            if (live && lane == 0u) {
+                if (arg) {
+                    I32(p.y).v[2u * q] = int(r.y < 0.0 ? 0.0 : r.y);
+                    I32(p.y).v[2u * q + 1u] = 0;
+                } else {
+                    float v = r.x;
+                    if (op == MEAN) v = v / float(p.len);
+                    else if (op == L2) v = sqrt(v);
+                    else if (op == LOGSUMEXP) v = isinf(mx) && mx < 0.0 ? mx : log(v) + mx;
+                    else if (op == LOGSUM) v = log(v);
+                    p.y.v[q] = v;
+                }
+            }
+            continue;
+        }
+        if (op <= HARDMAX) {
+            uint mop = op == HARDMAX ? ARGMAX : MAX;
+            vec3 m = vec3(-INF, op == HARDMAX ? -1.0 : 0.0, 0.0);
+            for (uint l = lane; l < len; l += TPR) m = combine(mop, m, vec3(x_at(o, i, l), float(l), 0.0), false);
+            vec3 top = TPR > 1u ? reduce_row(m, t, lane, mop, false) : m;
+            if (op == HARDMAX) {
+                for (uint l = lane; l < len; l += TPR) p.y.v[(o * p.len + l) * p.inner + i] = float(l) == top.y ? 1.0 : 0.0;
+                continue;
+            }
+            vec3 s = vec3(0.0);
+            for (uint l = lane; l < len; l += TPR) s.x += exp(x_at(o, i, l) - top.x);
+            float sum = TPR > 1u ? reduce_row(s, t, lane, SUM, false).x : s.x;
+            float inv = 1.0 / sum, ls = log(sum);
+            for (uint l = lane; l < len; l += TPR) {
+                float v = x_at(o, i, l) - top.x;
+                p.y.v[(o * p.len + l) * p.inner + i] = op == LOGSOFTMAX ? v - ls : exp(v) * inv;
+            }
+            continue;
+        }
+        vec3 w = vec3(0.0);
+        for (uint l = lane; l < len; l += TPR) {
+            float v = p.x.v[at_of(op, o, i, l)];
+            if (op == RMSNORM) {
+                w.x += v * v;
+            } else {
+                w.x += 1.0;
+                float d = v - w.y;
+                w.y += d / w.x;
+                w.z += d * (v - w.y);
+            }
+        }
+        vec3 r = TPR > 1u ? reduce_row(w, t, lane, op == RMSNORM ? SUM : LAYERNORM, false) : w;
+        float mean = op == RMSNORM ? 0.0 : r.y;
+        float var = (op == RMSNORM ? r.x : r.z) / float(max(p.len, 1u));
+        float inv = 1.0 / sqrt(var + p.eps);
+        if (live && lane == 0u && (p.flags & F_STATS) != 0u) {
+            p.aux.v[q] = mean;
+            p.aux.v[p.rows + q] = inv;
+        }
+        bool grouped = op == GROUPNORM || op == GROUPNORM_LAST;
+        uint g = grouped ? o % p.groups : 0u;
+        for (uint l = lane; l < len; l += TPR) {
+            uint at = at_of(op, o, i, l);
+            float sa, sb;
+            if (grouped) {
+                uint k = (p.flags & F_BY_GROUP) != 0u ? g : g * p.cpg + (op == GROUPNORM ? l / p.pix : l % p.cpg);
+                sa = p.a.v[k];
+                sb = p.b.v[k];
+            } else {
+                sa = p.a.v[(p.flags & F_A_ONE) != 0u ? 0u : l];
+                sb = (p.flags & F_B) != 0u ? p.b.v[(p.flags & F_B_ONE) != 0u ? 0u : l] : 0.0;
+            }
+            float v = (p.x.v[at] - mean) * inv * sa + sb;
+            p.y.v[at] = p.act != 0u ? activate(v, p.act) : v;
+        }
+    }
+}

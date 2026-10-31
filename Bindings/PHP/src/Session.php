@@ -20,13 +20,15 @@ final class Session
     /** @var Model (kept: the model outlives its sessions) */
     private Model $model;
 
-    /** A session on $model of $sequences sequences of up to $maxLength tokens (0: the model's window). */
-    public function __construct(Model $model, int $maxLength = 0, int $sequences = 1)
+    /** A session on $model of $sequences sequences of up to $maxLength tokens (0: the model's window), taking up to
+        $gpuMemory bytes of the GPU's memory in a GPU mode (0: what it has free; a model it does not hold splits with the CPU). */
+    public function __construct(Model $model, int $maxLength = 0, int $sequences = 1, int $gpuMemory = 0)
     {
         $ffi = Library::ffi();
         $options = $ffi->new('SpingalettSessionOptions');
         $options->max_length = $maxLength;
         $options->sequences = $sequences;
+        $options->gpu_memory = $gpuMemory;
         $session = $ffi->spingalett_session_new($model->raw(), \FFI::addr($options));
         if (Native::isNull($session)) {
             throw SpingalettException::last('spingalett_session_new failed');

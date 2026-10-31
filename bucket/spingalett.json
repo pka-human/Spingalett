@@ -1,14 +1,14 @@
 {
-    "version": "1.5.0",
+    "version": "1.6.0",
     "description": "Neural networks in C: training on CPUs and GPUs (CUDA, Vulkan), transformers, INT8 to INT2 deployment",
     "homepage": "https://github.com/pka-human/Spingalett",
     "license": "MIT",
     "notes": "The library (bin\\libspingalett.dll, lib\\spingalett.lib for MSVC), headers and CMake files are in $dir.",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/pka-human/Spingalett/releases/download/v1.5.0/spingalett-1.5.0-windows-x86_64.zip",
+            "url": "https://github.com/pka-human/Spingalett/releases/download/v1.6.0/spingalett-1.6.0-windows-x86_64.zip",
             "hash": "e67eb2a7260c994e869a94e0546ff36821df94e1a64321d9a6f4883598ba1b34",
-            "extract_dir": "spingalett-1.5.0-windows-x86_64"
+            "extract_dir": "spingalett-1.6.0-windows-x86_64"
         }
     },
     "bin": [

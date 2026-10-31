@@ -1,0 +1,80 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* FusedAttention of graphs (Spingalett.GpuGraph.c, SpgGattnPush): a thread a query of a batch and head (a workgroup 64
+   of them), tiles of BK keys and their values in shared memory, the softmax online over the keys in their order: the
+   same bits on every run. Heads of up to DMAX values (32, 64 or 128). */
+
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+
+layout(constant_id = 0) const uint DMAX = 64;
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer B8 { uint8_t v[]; };
+
+layout(push_constant) uniform Push {
+    F32 q, k, v, y, mask, keep;
+    U32 strides;
+    uint queries, keys, d, heads;
+    float scale, fill;
+    uint flags, pad;
+} p;
+
+#define MASK 1u
+#define BOOLS 2u
+#define KEEP 4u
+#define SAFE 8u
+#define BK 16u
+
+shared float ks[BK * 128u], vs[BK * 128u];
+
+void main() {
+    const uint D = DMAX;
+    const uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x, bh = gl_WorkGroupID.y;
+    const uint b = bh / p.heads, h = bh % p.heads;
+    uint st[21];
+    for (uint k = 0u; k < 21u; k++) st[k] = p.strides.v[k];
+    const bool live = i < p.queries;
+    const uint qa = b * st[0] + h * st[1] + (live ? i : 0u) * st[2];
+    float q[DMAX], acc[DMAX];
+    for (uint c = 0u; c < D; c++) {
+        q[c] = live && c < p.d ? p.q.v[qa + c] * p.scale : 0.0;
+        acc[c] = 0.0;
+    }
+    const float NEG = uintBitsToFloat(0xFF800000u);
+    float mx = NEG, sum = 0.0;
+    const uint ka = b * st[3] + h * st[4], va = b * st[6] + h * st[7];
+    const uint ma = b * st[12] + h * st[13] + (live ? i : 0u) * st[14], wa = b * st[16] + h * st[17] + (live ? i : 0u) * st[18];
+    for (uint j0 = 0u; j0 < p.keys; j0 += BK) {
+        barrier();
+        for (uint e = gl_LocalInvocationID.x; e < BK * D; e += 64u) {
+            uint r = e / D, c = e % D, j = j0 + r;
+            bool in_ = j < p.keys && c < p.d;
+            ks[r * D + c] = in_ ? p.k.v[ka + j * st[5] + c * st[20]] : 0.0;
+            vs[r * D + c] = in_ ? p.v.v[va + j * st[8] + c] : 0.0;
+        }
+        barrier();
+        for (uint r = 0u; r < BK && j0 + r < p.keys; r++) {
+            uint j = j0 + r;
+            float s = 0.0;
+            for (uint c = 0u; c < D; c++) s = fma(q[c], ks[r * D + c], s);
+            if ((p.flags & KEEP) != 0u && uint(B8(p.keep).v[wa + j * st[19]]) == 0u) s = p.fill;
+            if ((p.flags & MASK) != 0u) s += p.mask.v[ma + j * st[15]];
+            else if ((p.flags & BOOLS) != 0u && uint(B8(p.mask).v[ma + j * st[15]]) == 0u) s = NEG;
+            if (s == NEG) continue;
+            float mn = max(mx, s), alpha = mx == NEG ? 0.0 : exp(mx - mn), e = exp(s - mn);
+            for (uint c = 0u; c < D; c++) acc[c] = fma(acc[c], alpha, e * vs[r * D + c]);
+            sum = sum * alpha + e;
+            mx = mn;
+        }
+    }
+    if (!live) return;
+    const uint ya = b * st[9] + h * st[10] + i * st[11];
+    float inv = sum > 0.0 ? 1.0 / sum : (p.flags & SAFE) != 0u ? 0.0 : uintBitsToFloat(0x7FC00000u);
+    for (uint c = 0u; c < p.d; c++) p.y.v[ya + c] = sum > 0.0 || (p.flags & SAFE) == 0u ? acc[c] * inv : 0.0;
+}

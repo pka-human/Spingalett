@@ -1,0 +1,103 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Rows of activations quantized by bquant.comp times a linear layer's weights of a block precision, the bits of the
+ * CPU's spingalett_block_dot() (Spingalett.Inference.c): in each block the integer sums of its sub-blocks' products
+ * times their integer scales (I1) and, of the types with minima, the minima times the sums of codes (I2), exact in any
+ * order; then the block's term (d dx) I1 (+ (m dx) I2), each product and sum rounded alone (`precise`), added to the
+ * row's sum block after block; the bias then the sum, the activation (ACT), the product by e0's value. An invocation a row of
+ * weights and of activations, reading sixteen bytes at a time (its weights packed, Spingalett.GpuPack.c; Q2_K and Q3_K
+ * as GGUF stores them). The rows of activations in the second axis of the workgroups, from r0 on (y of the kernel's
+ * dispatches); PAIR: a gated unit's two layers, rows 2j and 2j + 1, the second's sum times the first's activated.
+ */
+
+#version 460
+#include "common.glsl"
+#include "block.glsl"
+
+layout(constant_id = 0) const uint TYPE = 0;
+layout(constant_id = 2) const uint ACT = 0;
+layout(constant_id = 3) const uint PACKED = 1;
+layout(constant_id = 4) const uint PAIR = 0;
+layout(constant_id = 7) const uint GATED = 0;           /* e0's values multiply the outputs */
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+    U32 w;
+    U32 q;
+    F32 dx;
+    U32 xs;
+    F32 bias, y, e0;
+    uint rows, n, k, stride, r0, ldy;
+} p;
+
+const bool KQ = TYPE == B_Q2_K || TYPE == B_Q3_K || TYPE == B_Q4_K || TYPE == B_Q5_K || TYPE == B_Q6_K || TYPE == B_IQ4_XS;
+const uint BYTES = TYPE == B_Q2_K ? 84u : 110u;     /* (the types kept as stored) */
+
+#include "bdot.glsl"
+
+/* Row `row` of weights as GGUF stores them: Q2_K, Q3_K */
+float dot_stored(uint row, uint r) {
+    const uint blocks = p.k / 256u, base = row * p.stride, x = r * p.k, xs = r * (p.k / 16u), dx = r * blocks;
+    const bool three = TYPE == B_Q3_K;
+    precise float acc = 0.0;
+    for (uint b = 0u; b < blocks; b++) {
+        const uint w = base + b * BYTES, q = w + (three ? 32u : 16u);
+        int i1 = 0, i2 = 0;
+        for (uint is = 0u; is < 16u; is++) {
+            /* value v = 128 h + 32 j + 16 part + l in bits 2 j of byte 32 h + 16 part + l */
+            const uint h = is / 8u, j = (is % 8u) / 2u, part = is % 2u, shift = 2u * j, qb = q + 32u * h + 16u * part;
+            int s = 0;
+            for (uint l = 0u; l < 16u; l++) {
+                int code = int((byte_at(p.w, qb + l) >> shift) & 3u);
+                if (three && ((byte_at(p.w, w + 16u * part + l) >> (4u * h + j)) & 1u) == 0u) code -= 4;
+                const uint xw = p.q.v[(x + b * 256u + 16u * is + l) >> 2], sh = ((x + b * 256u + 16u * is + l) & 3u) * 8u;
+                s += code * (int(xw << (24u - sh)) >> 24);
+            }
+            if (three) {
+                i1 += q3_scale(p.w, w + 96u, is) * s;
+            } else {
+                const uint sm = byte_at(p.w, w + is);
+                i1 += int(sm & 0xFu) * s;
+                i2 += int(sm >> 4) * int(p.xs.v[xs + b * 16u + is]);
+            }
+        }
+        const float dxv = p.dx.v[dx + b];
+        precise float term;
+        if (three) {
+            term = (from_half(half_at(p.w, w + 108u)) * dxv) * float(i1);
+        } else {
+            const float d = from_half(half_at(p.w, w + 80u)), m = -from_half(half_at(p.w, w + 82u));
+            term = (d * dxv) * float(i1);
+            term = term + (m * dxv) * float(i2);
+        }
+        acc = acc + term;
+    }
+    return acc;
+}
+
+float dot_row(uint row, uint r) {
+    if (PACKED == 0u) return dot_stored(row, r);
+    const Row a = row_of(row, r);
+    precise float acc = 0.0;
+    if (!KQ) {
+        for (uint b = 0u; b < p.k / 32u; b++) acc = acc + block_term(a, b);
+        return acc;
+    }
+    for (uint b = 0u; b < p.k / 256u; b++) {
+        int i1 = 0, i2 = 0;
+        for (uint e = 0u; e < 8u; e++) sub_block(a, 8u * b + e, i1, i2);
+        acc = acc + super_term(a, b, i1, i2);
+    }
+    return acc;
+}
+
+void main() {
+    const uint j = gl_GlobalInvocationID.x, r = p.r0 + gl_WorkGroupID.y;
+    if (j >= (PAIR != 0u ? p.n / 2u : p.n)) return;
+    if (PAIR != 0u) block_out(j, r, dot_row(2u * j, r), dot_row(2u * j + 1u, r));
+    else block_out(j, r, dot_row(j, r), 0.0);
+}

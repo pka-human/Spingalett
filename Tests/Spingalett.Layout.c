@@ -141,6 +141,7 @@ int main(void) {
     FIELD(SpingalettModelOpenArgs, path); FIELD(SpingalettModelOpenArgs, context);
     SIZE(SpingalettSessionOptions); FIELD(SpingalettSessionOptions, reserved);
     FIELD(SpingalettSessionOptions, max_length); FIELD(SpingalettSessionOptions, sequences);
+    FIELD(SpingalettSessionOptions, gpu_memory);
     SIZE(SpingalettSessionFeed); FIELD(SpingalettSessionFeed, reserved);
     FIELD(SpingalettSessionFeed, sequence); FIELD(SpingalettSessionFeed, tokens); FIELD(SpingalettSessionFeed, count);
     FIELD(SpingalettSessionFeed, logits); FIELD(SpingalettSessionFeed, all);

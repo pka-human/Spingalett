@@ -4,7 +4,7 @@
 */
 
 /*
- * The large tiles of the product on the matrix units: blocks of BM x BN outputs over warps of 16 TI x 16 TJ, both
+ * The pipelined tiles of the product on the matrix units: blocks of BM x BN outputs over warps of 16 TI x 16 TJ, both
  * operands kept as bfloat16 and read eight values at a time (dense layers' modes: A_ROW or A_COL, B_ROW or
  * B_COL), STAGES steps of BK in shared memory, copied STAGES - 1 steps ahead by asynchronous copies. Shared
  * tiles keep each operand's layout in memory, chunks of 16 bytes XOR-swizzled within their rows (swizzle())

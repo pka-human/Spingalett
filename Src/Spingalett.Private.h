@@ -15,11 +15,13 @@
 #include <stdint.h>
 
 /* The runtime library (cmake/Runtime.cmake) is built from part of the sources with SPINGALETT_RUNTIME
-   defined: deployment models on the CPU, without the GPU backend or OpenBLAS, even in a build tree
-   whose Spingalett.Config.h has them for the full library. */
+   defined: deployment models on the CPU, without OpenBLAS, even in a build tree whose Spingalett.Config.h has it for
+   the full library; graphs of operators on the GPU's backends with SPINGALETT_RUNTIME_GPU, else without them. */
 #if defined(SPINGALETT_RUNTIME)
+#if !defined(SPINGALETT_RUNTIME_GPU)
 #undef SPINGALETT_HAS_VULKAN
 #undef SPINGALETT_HAS_CUDA
+#endif
 #undef SPINGALETT_HAS_OPENBLAS
 #endif
 

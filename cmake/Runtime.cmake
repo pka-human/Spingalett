@@ -8,7 +8,7 @@
 # the rest, and it exports the functions of Src/Spingalett.Runtime.map. Built next to the library
 # (SPINGALETT_RUNTIME, on by default) or alone (SPINGALETT_RUNTIME_ONLY), as libspingalett-runtime.
 
-set(SPINGALETT_RUNTIME_SOURCES Inference Model Session Blocks Attention Image Gguf Tokenizer Json Chat IR IROps IROnnx IRFile IRFuse
+set(SPINGALETT_RUNTIME_SOURCES Inference Model Session Blocks Attention Image Gguf Tokenizer Json Chat IR IROps IROnnx IRFile IRFuse IRShapes IRLayout
     GEMM ConvGEMM Int8Tiles SIMD Conv Error Memory Settings Thread)
 list(TRANSFORM SPINGALETT_RUNTIME_SOURCES REPLACE "^(.+)$" "${PROJECT_SOURCE_DIR}/Src/Spingalett.\\1.c")
 
@@ -21,6 +21,35 @@ function(spingalett_runtime_library)
 endfunction()
 
 # Examples/Runtime: programs of the runtime alone. RunModel, a tool, is installed with it.
+# The GPU's backends in the runtime (SPINGALETT_RUNTIME_GPU): the device layer, the matrix product's tiles and the
+# executor of graphs of operators, with the backends Vulkan.cmake and Cuda.cmake found (their kernels embedded).
+option(SPINGALETT_RUNTIME_GPU "Build the runtime with the GPU's backends (graphs of operators on CUDA and Vulkan)" ON)
+function(spingalett_runtime_gpu)
+    if(NOT TARGET spingalett_runtime OR NOT SPINGALETT_RUNTIME_GPU OR NOT (SPINGALETT_HAS_VULKAN OR SPINGALETT_HAS_CUDA))
+        return()
+    endif()
+    set(gpu_dir ${PROJECT_SOURCE_DIR}/Src/Gpu)
+    target_sources(spingalett_runtime PRIVATE ${gpu_dir}/Spingalett.Device.c ${gpu_dir}/Spingalett.GpuKernels.c
+                                              ${gpu_dir}/Spingalett.GpuGraph.c ${gpu_dir}/Spingalett.GpuSession.c
+                                              ${gpu_dir}/Spingalett.GpuPack.c)
+    target_compile_definitions(spingalett_runtime PRIVATE SPINGALETT_RUNTIME_GPU)
+    target_include_directories(spingalett_runtime PRIVATE ${gpu_dir})
+    if(NOT WIN32)
+        target_link_libraries(spingalett_runtime PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    if(SPINGALETT_HAS_VULKAN)
+        add_dependencies(spingalett_runtime spingalett_shaders)
+        target_sources(spingalett_runtime PRIVATE ${gpu_dir}/Spingalett.Vulkan.c)
+        target_include_directories(spingalett_runtime PRIVATE ${PROJECT_BINARY_DIR}/Gpu ${SPINGALETT_VULKAN_INCLUDE})
+    endif()
+    if(SPINGALETT_HAS_CUDA)
+        add_dependencies(spingalett_runtime spingalett_cuda_kernels)
+        target_sources(spingalett_runtime PRIVATE ${gpu_dir}/Spingalett.Cuda.c ${gpu_dir}/Spingalett.Gunzip.c)
+        target_include_directories(spingalett_runtime PRIVATE ${PROJECT_BINARY_DIR}/Cuda)
+    endif()
+    message(STATUS "Spingalett: the runtime with the GPU's backends (SPINGALETT_RUNTIME_GPU)")
+endfunction()
+
 function(spingalett_runtime_examples)
     file(GLOB sources ${PROJECT_SOURCE_DIR}/Examples/Runtime/*.c)
     foreach(source ${sources})
@@ -55,6 +84,8 @@ function(spingalett_runtime_tests exporter)
         set_target_properties(SpingalettRuntimeTests PROPERTIES BUILD_RPATH "$ORIGIN")
     endif()
     add_test(NAME runtime.models COMMAND SpingalettRuntimeTests ${PROJECT_SOURCE_DIR}/Tests/Data)
+    # (graphs on the GPU every node its kernels take, however small)
+    set_tests_properties(runtime.models PROPERTIES ENVIRONMENT "SPINGALETT_GRAPH_GPU_MIN=0")
     if(exporter)
         set(dir ${PROJECT_BINARY_DIR}/runtime_models)
         file(MAKE_DIRECTORY ${dir})

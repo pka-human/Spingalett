@@ -203,26 +203,6 @@ static DwSlices dw_slices(const ConvView *v, uint64_t n) {
     return d;
 }
 
-bool spingalett_gpu_select(ComputeMode mode) {
-    const SpgBackend backend = mode == COMPUTE_CUDA ? SPG_BACKEND_CUDA : SPG_BACKEND_VULKAN;
-    spg_gpu_use(backend);
-    return spg_gpu_built(backend) && spg_gpu_open();
-}
-
-const char *spingalett_gpu_name_of(ComputeMode mode) {
-    const SpgBackend saved = spg_gpu_using();
-    const char *name = spingalett_gpu_select(mode) ? spg_gpu_device_name() : NULL;
-    spg_gpu_use(saved);
-    return name;
-}
-
-bool spingalett_gpu_bf16_of(ComputeMode mode) {
-    const SpgBackend saved = spg_gpu_using();
-    const bool bf16 = spingalett_gpu_select(mode) && spg_gpu_mma_bf16();
-    spg_gpu_use(saved);
-    return bf16;
-}
-
 bool spingalett_gpu_available(void) {
     return spg_gpu_open();
 }

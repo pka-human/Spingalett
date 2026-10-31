@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Spingalett VERSION 1.5.0 LANGUAGES C)
+project(Spingalett VERSION 1.6.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -30,7 +30,7 @@ endif()
 # The libraries: the full one, and the runtime next to it or alone (cmake/Runtime.cmake)
 # ------------------------------------------------------------------------------
 option(SPINGALETT_RUNTIME "Build the runtime library (deployment models, without training) next to the library" ON)
-option(SPINGALETT_RUNTIME_ONLY "Build only the runtime library: deployment models on the CPU, no training, importers or GPU backend" OFF)
+option(SPINGALETT_RUNTIME_ONLY "Build only the runtime library: deployment models on the CPU and graphs of operators, no training or importers" OFF)
 
 # Feature flags (populated below, used for config header)
 set(SPINGALETT_HAS_OPENMP OFF)
@@ -266,7 +266,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
                                 Src/Gpu/Spingalett.GpuModel.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP}")
     set_source_files_properties(Src/Spingalett.IR.c Src/Spingalett.IROps.c Src/Spingalett.IROnnx.c
-                                Src/Spingalett.IRFile.c Src/Spingalett.IRFuse.c
+                                Src/Spingalett.IRFile.c Src/Spingalett.IRFuse.c Src/Spingalett.IRShapes.c
+                                Src/Spingalett.IRLayout.c
         PROPERTIES COMPILE_OPTIONS "${SPINGALETT_STRICT_FP};-fsigned-zeros")
 endif()
 
@@ -325,6 +326,11 @@ if(SPINGALETT_RUNTIME OR SPINGALETT_RUNTIME_ONLY)
     spingalett_runtime_library()
 endif()
 if(SPINGALETT_RUNTIME_ONLY)
+    if(SPINGALETT_RUNTIME_GPU)
+        include(cmake/Vulkan.cmake)
+        include(cmake/Cuda.cmake)
+        spingalett_runtime_gpu()
+    endif()
     spingalett_write_config()
     option(BUILD_EXAMPLE "Build examples" ON)
     option(BUILD_TESTS "Build the test suite" ON)
@@ -408,6 +414,7 @@ endif()
 # GPU backend (Vulkan compute)
 # ------------------------------------------------------------------------------
 include(cmake/Gpu.cmake)
+spingalett_runtime_gpu()
 
 spingalett_write_config()
 
@@ -613,13 +620,16 @@ if(BUILD_TESTS)
     # The GPU kernels against references in double precision, on each backend (skipped without a
     # device).
     if(SPINGALETT_HAS_VULKAN OR SPINGALETT_HAS_CUDA)
+        # (the engine's block products and GGUF's quantizers: the references of the block kernels)
         add_executable(SpingalettGpuTests ${CMAKE_CURRENT_SOURCE_DIR}/Tests/Spingalett.GpuTests.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.Device.c
                        ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuKernels.c
-                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c)
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Gpu/Spingalett.GpuPack.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Thread.c
+                       ${CMAKE_CURRENT_SOURCE_DIR}/Src/Spingalett.Quantize.c)
         target_include_directories(SpingalettGpuTests PRIVATE Src Src/Gpu ${CMAKE_CURRENT_SOURCE_DIR}/Include
-                                   ${CMAKE_CURRENT_BINARY_DIR})
-        target_link_libraries(SpingalettGpuTests PRIVATE ${CMAKE_DL_LIBS})
+                                   ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/Spingalett)
+        target_link_libraries(SpingalettGpuTests PRIVATE SpingalettEngine ${CMAKE_DL_LIBS})
         if(NOT WIN32)
             target_link_libraries(SpingalettGpuTests PRIVATE Threads::Threads m)
         endif()

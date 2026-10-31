@@ -1,0 +1,59 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* MaxPool, AveragePool and LpPool of graphs over channels-first maps (Spingalett.GpuGraph.c), an output value a
+   thread, its window in order. As gpool.cu. */
+
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    F32 x, y;
+    uint rows, total;
+    uint in_[3], out_[3], k[3], s[3], pb[3], pe[3], dil[3];
+    uint flags;
+    float p;
+} p;
+
+void main() {
+    bool mx = (p.flags & 1u) != 0u, lp = (p.flags & 2u) != 0u;
+    uint opix = p.out_[0] * p.out_[1] * p.out_[2], ipix = p.in_[0] * p.in_[1] * p.in_[2];
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint e = gl_GlobalInvocationID.x; e < p.total; e += stride) {
+        bool last = (p.flags & 8u) != 0u;
+        uint C = last ? p.rows : 1u, ch = last ? e % C : 0u, t = last ? e / C : e;
+        uint q = t / opix, o = t % opix;
+        uint o2 = o % p.out_[2], o1 = (o / p.out_[2]) % p.out_[1], o0 = o / (p.out_[1] * p.out_[2]);
+        float acc = mx ? uintBitsToFloat(0xFF800000u) : 0.0;
+        bool any = false;
+        uint count = 0u, padded = 0u;
+        for (uint k0 = 0u; k0 < p.k[0]; k0++) {
+            int i0 = int(o0 * p.s[0] + k0 * p.dil[0]) - int(p.pb[0]);
+            for (uint k1 = 0u; k1 < p.k[1]; k1++) {
+                int i1 = int(o1 * p.s[1] + k1 * p.dil[1]) - int(p.pb[1]);
+                for (uint k2 = 0u; k2 < p.k[2]; k2++) {
+                    int i2 = int(o2 * p.s[2] + k2 * p.dil[2]) - int(p.pb[2]);
+                    if (i0 < int(p.in_[0] + p.pe[0]) && i1 < int(p.in_[1] + p.pe[1]) && i2 < int(p.in_[2] + p.pe[2])) padded++;
+                    if (i0 < 0 || i0 >= int(p.in_[0]) || i1 < 0 || i1 >= int(p.in_[1]) || i2 < 0 || i2 >= int(p.in_[2]))
+                        continue;
+                    float v = p.x.v[(q * ipix + (uint(i0) * p.in_[1] + uint(i1)) * p.in_[2] + uint(i2)) * C + ch];
+                    if (mx) {
+                        if (!any || v > acc || (isnan(v) && !isnan(acc))) acc = v;
+                        any = true;
+                    } else {
+                        acc += lp ? exp2(p.p * log2(abs(v))) : v;
+                    }
+                    count++;
+                }
+            }
+        }
+        float y = acc;
+        if (lp) y = acc > 0.0 ? exp2(log2(acc) / p.p) : 0.0;
+        else if (!mx) y = acc / float((p.flags & 4u) != 0u ? padded : count > 0u ? count : 1u);
+        p.y.v[e] = y;
+    }
+}

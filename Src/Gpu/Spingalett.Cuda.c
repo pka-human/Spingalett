@@ -96,6 +96,7 @@ typedef unsigned long long CUdeviceptr;
     X(cuFuncGetAttribute, "cuFuncGetAttribute", (int *, int, CUfunction)) \
     X(cuFuncSetAttribute, "cuFuncSetAttribute", (CUfunction, int, int)) \
     X(cuMemAlloc, "cuMemAlloc_v2", (CUdeviceptr *, size_t)) \
+    X(cuMemGetInfo, "cuMemGetInfo_v2", (size_t *, size_t *)) \
     X(cuMemFree, "cuMemFree_v2", (CUdeviceptr)) \
     X(cuMemHostAlloc, "cuMemHostAlloc", (void **, size_t, unsigned)) \
     X(cuMemFreeHost, "cuMemFreeHost", (void *)) \
@@ -253,6 +254,12 @@ static bool cub_open(void) {
 
 static const char *cub_device_name(void) { return cub_open() ? cu.name : NULL; }
 static uint64_t cub_memory(void) { return cub_open() ? cu.memory : 0; }
+static uint64_t cub_memory_free(void) {
+    if (!cub_open()) return 0;
+    make_current();
+    size_t available = 0, total = 0;
+    return cuMemGetInfo(&available, &total) == 0 ? available : cu.memory;
+}
 /* what a block may ask for (the product's tiles: dynamic shared memory, beyond the 48 KB of static) */
 static uint32_t cub_shared_memory(void) { return cub_open() ? cu.shared_optin : 48u * 1024u; }
 static uint32_t cub_subgroup_size(void) { return 32u; }
@@ -261,7 +268,9 @@ static bool cub_mma_bf16(void) { return cub_open(); }          /* (Ampere and la
 static bool cub_bf16_storage(void) { return cub_open(); }
 static bool cub_host_writes(void) { return false; }
 /* (flash.comp and rattn.comp are Vulkan's: attention runs on attn's units of flash.cu and rattn.cu here) */
-static bool cub_kernel_built(SpgKernel kernel) { return kernel != SPG_KERNEL_flash && kernel != SPG_KERNEL_rattn; }
+static bool cub_kernel_built(SpgKernel kernel) {
+    return kernel != SPG_KERNEL_flash && kernel != SPG_KERNEL_rattn && kernel != SPG_KERNEL_bdots;
+}
 
 /* ------------------------------------------------------------------------- kernels */
 
@@ -280,6 +289,9 @@ static uint32_t block_threads(SpgKernel kernel, const uint32_t *spec, uint32_t c
         case SPG_KERNEL_gemm: case SPG_KERNEL_gemm_mma: return count > 9 ? spec[9] : 0u;
         case SPG_KERNEL_attn: case SPG_KERNEL_attn_h: return count > 3 ? spec[3] : 0u;
         case SPG_KERNEL_attn_cache: case SPG_KERNEL_attn_cache_h: return count > 1 ? spec[1] : 0u;
+        case SPG_KERNEL_gattn: return SPG_GATTN_THREADS;
+        case SPG_KERNEL_gflash: return 128u;       /* (gflash.cu's WARPS) */
+        case SPG_KERNEL_bmm: return 128u;          /* (bmm.cu's, bmmp.cu's, bmmk.cu's, bmmn.cu's) */
         default: return 256u;
     }
 }
@@ -290,7 +302,8 @@ static bool grid_stride(SpgKernel kernel) {
         case SPG_KERNEL_eltwise: case SPG_KERNEL_eltwise_h: case SPG_KERNEL_combine: case SPG_KERNEL_combine_h:
         case SPG_KERNEL_pool: case SPG_KERNEL_pool_h: case SPG_KERNEL_upsample: case SPG_KERNEL_upsample_h:
         case SPG_KERNEL_wtrans: case SPG_KERNEL_optim: case SPG_KERNEL_optim_h: case SPG_KERNEL_rows: case SPG_KERNEL_rows_h:
-        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h:
+        case SPG_KERNEL_ipass: case SPG_KERNEL_ipass_h: case SPG_KERNEL_gew: case SPG_KERNEL_gcopy: case SPG_KERNEL_gcvt:
+        case SPG_KERNEL_ggather: case SPG_KERNEL_gpool: case SPG_KERNEL_gresize:
             return true;
         default:
             return false;
@@ -352,6 +365,25 @@ static int unit_of(SpgKernel kernel, const uint32_t *spec, uint32_t count) {
         if (spec[1] == 0) snprintf(name, sizeof name, "flash_d%u_o%u", spec[2], op);
         else if (spec[2] <= 128u) snprintf(name, sizeof name, "rattn_d%u_o%u%s", spec[2], op, op == SPG_ATTN_PRE ? "" : ext);
         else snprintf(name, sizeof name, "attn_d%u%s", spec[2], ext);
+    } else if (kernel == SPG_KERNEL_gattn || kernel == SPG_KERNEL_gflash) {
+        if (count < 1) return -1;
+        /* (the head size of the unit; gflash's tiles of queries a warp, 1: _m1) */
+        snprintf(name, sizeof name, "%s_d%u%s", base, spec[0], kernel == SPG_KERNEL_gflash && count > 1 && spec[1] == 1u ? "_m1" : "");
+    } else if (kernel == SPG_KERNEL_bdot) {
+        static const char *const types[SPG_B_TYPES] = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k",
+                                                       "q6_k", "iq4_nl", "iq4_xs"};
+        if (count < 2 || spec[0] >= SPG_B_TYPES) return -1;
+        if (count > 3 && spec[3]) snprintf(name, sizeof name, "bdotp_%s", types[spec[0]]);   /* (spec 3: packed) */
+        else snprintf(name, sizeof name, "bdot_%s_r%u", types[spec[0]], spec[1]);    /* (the type, the rows a pass) */
+    } else if (kernel == SPG_KERNEL_bnorm) {
+        if (count < 2) return -1;
+        snprintf(name, sizeof name, "bnorm_v%u", spec[1]);       /* (the values a thread at most) */
+    } else if (kernel == SPG_KERNEL_bmm) {
+        static const char *const types[SPG_B_TYPES] = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k",
+                                                       "q6_k", "iq4_nl", "iq4_xs"};
+        if (count < 1 || spec[0] >= SPG_B_TYPES) return -1;
+        /* (spec 1: the weights packed, bmmp's units) */
+        snprintf(name, sizeof name, "%s_%s", count > 1 && spec[1] ? "bmmp" : "bmm", types[spec[0]]);
     } else if (kernel == SPG_KERNEL_wqmv || kernel == SPG_KERNEL_wqmv_h) {
         if (count < 2) return -1;
         snprintf(name, sizeof name, "wqmv_b%u_r%u", spec[0], spec[1]);       /* (the codes' bits, the rows a pass) */
@@ -980,7 +1012,7 @@ static bool cub_wait(void *commands) {
 }
 
 const SpgGpuOps spg_cuda_ops = {
-    cub_open, cub_device_name, cub_memory, cub_shared_memory, cub_subgroup_size, cub_max_workgroups, cub_mma_bf16,
+    cub_open, cub_device_name, cub_memory, cub_memory_free, cub_shared_memory, cub_subgroup_size, cub_max_workgroups, cub_mma_bf16,
     cub_bf16_storage, cub_host_writes, cub_kernel_built, cub_buffer_create, cub_buffer_free, cub_arena_create,
     cub_arena_add, cub_arena_commit, cub_arena_free, cub_commands_create, cub_commands_free, cub_commands_untimed,
     cub_commands_stamps, cub_timestamp, cub_timestamps, cub_record_begin, cub_dispatch, cub_prepare, cub_barrier,

@@ -30,6 +30,21 @@ SPG_CUDA_UNIT(dconv32, dconv, "-DKMAX=32")
 SPG_CUDA_UNIT(dconv48, dconv, "-DKMAX=48")
 SPG_CUDA_UNIT(embed, embed, "")
 SPG_CUDA_UNIT(attn_cache, attn_cache, "")   /* attention over a cache of keys and values (decoding) */
+SPG_CUDA_UNIT(gew, gew, "")                 /* the element-wise operators of graphs */
+SPG_CUDA_UNIT(gcopy, gcopy, "")             /* their copies through strides */
+SPG_CUDA_UNIT(gcvt, gcvt, "")               /* the same of floats rounded to bfloat16 */
+SPG_CUDA_UNIT(ggather, ggather, "")         /* Gather */
+SPG_CUDA_UNIT(grow, grow, "")               /* reductions, softmax and normalizations over rows */
+SPG_CUDA_UNIT(gattn_d32, gattn, "-DD=32u")  /* FusedAttention: heads of up to 32, 64, 128 values */
+SPG_CUDA_UNIT(gattn_d64, gattn, "-DD=64u")
+SPG_CUDA_UNIT(gattn_d128, gattn, "-DD=128u")
+SPG_CUDA_UNIT(gflash_d32, gflash, "-DD=32u")    /* and on the matrix units, in bfloat16 */
+SPG_CUDA_UNIT(gflash_d64, gflash, "-DD=64u")
+SPG_CUDA_UNIT(gflash_d128, gflash, "-DD=128u")
+SPG_CUDA_UNIT(gflash_d32_m1, gflash, "-DD=32u -DMTS=1u")
+SPG_CUDA_UNIT(gflash_d64_m1, gflash, "-DD=64u -DMTS=1u")
+SPG_CUDA_UNIT(gpool, gpool, "")             /* MaxPool, AveragePool and LpPool */
+SPG_CUDA_UNIT(gresize, gresize, "")         /* Resize */
 SPG_CUDA_UNIT(iquant, iquant, "")           /* integer models: their activations quantized, */
 SPG_CUDA_UNIT(ipass, ipass, "")             /* their other passes */
 /* integer models' linear layers in sessions: products of a few rows with their codes widened in registers, a unit of
@@ -46,6 +61,73 @@ SPG_CUDA_UNIT(wqmv_b2_r1, wqmv, "-DBITS=2u -DROWS=1u")
 SPG_CUDA_UNIT(wqmv_b2_r2, wqmv, "-DBITS=2u -DROWS=2u")
 SPG_CUDA_UNIT(wqmv_b2_r4, wqmv, "-DBITS=2u -DROWS=4u")
 SPG_CUDA_UNIT(wqmv_b2_r8, wqmv, "-DBITS=2u -DROWS=8u")
+/* language models' layers of block precisions (GGUF's types) in sessions: their inputs quantized in blocks, then
+   products of a few rows with the blocks as stored, the CPU's bits: a unit a type and ROWS (bdot_<type>_r<ROWS>) */
+SPG_CUDA_UNIT(bquant, bquant, "")
+/* (RMS normalizations with the sums before them and the quantizations after them, a unit the values a thread at most) */
+SPG_CUDA_UNIT(bnorm_v8, bnorm, "-DVMAX=8u")
+SPG_CUDA_UNIT(bnorm_v16, bnorm, "-DVMAX=16u")
+SPG_CUDA_UNIT(bnorm_v32, bnorm, "-DVMAX=32u")
+/* (a prompt's many rows on the matrix units, a unit a type: bmm_<type>) */
+SPG_CUDA_UNIT(bmmp_q8_0, bmmp, "-DTYPE=0u")
+SPG_CUDA_UNIT(bmmp_q4_k, bmmk, "-DTYPE=7u")
+SPG_CUDA_UNIT(bmmp_q5_k, bmmk, "-DTYPE=8u")
+SPG_CUDA_UNIT(bmmp_q6_k, bmmk, "-DTYPE=9u")
+SPG_CUDA_UNIT(bmmp_iq4_xs, bmmk, "-DTYPE=11u")
+SPG_CUDA_UNIT(bmmp_q4_0, bmmn, "-DTYPE=1u")
+SPG_CUDA_UNIT(bmmp_q4_1, bmmn, "-DTYPE=2u")
+SPG_CUDA_UNIT(bmmp_q5_0, bmmn, "-DTYPE=3u")
+SPG_CUDA_UNIT(bmmp_q5_1, bmmn, "-DTYPE=4u")
+SPG_CUDA_UNIT(bmmp_iq4_nl, bmmn, "-DTYPE=10u")
+/* (a row of the packed weights: bdotp_<type>) */
+SPG_CUDA_UNIT(bdotp_q8_0, bdotp, "-DTYPE=0u")
+SPG_CUDA_UNIT(bdotp_q4_k, bdotk, "-DTYPE=7u")
+SPG_CUDA_UNIT(bdotp_q5_k, bdotk, "-DTYPE=8u")
+SPG_CUDA_UNIT(bdotp_q6_k, bdotk, "-DTYPE=9u")
+SPG_CUDA_UNIT(bdotp_iq4_xs, bdotk, "-DTYPE=11u")
+SPG_CUDA_UNIT(bdotp_q4_0, bdotn, "-DTYPE=1u")
+SPG_CUDA_UNIT(bdotp_q4_1, bdotn, "-DTYPE=2u")
+SPG_CUDA_UNIT(bdotp_q5_0, bdotn, "-DTYPE=3u")
+SPG_CUDA_UNIT(bdotp_q5_1, bdotn, "-DTYPE=4u")
+SPG_CUDA_UNIT(bdotp_iq4_nl, bdotn, "-DTYPE=10u")
+SPG_CUDA_UNIT(bmm_q8_0, bmm, "-DTYPE=0u")
+SPG_CUDA_UNIT(bmm_q4_0, bmm, "-DTYPE=1u")
+SPG_CUDA_UNIT(bmm_q4_1, bmm, "-DTYPE=2u")
+SPG_CUDA_UNIT(bmm_q5_0, bmm, "-DTYPE=3u")
+SPG_CUDA_UNIT(bmm_q5_1, bmm, "-DTYPE=4u")
+SPG_CUDA_UNIT(bmm_q2_k, bmm, "-DTYPE=5u")
+SPG_CUDA_UNIT(bmm_q3_k, bmm, "-DTYPE=6u")
+SPG_CUDA_UNIT(bmm_q4_k, bmm, "-DTYPE=7u")
+SPG_CUDA_UNIT(bmm_q5_k, bmm, "-DTYPE=8u")
+SPG_CUDA_UNIT(bmm_q6_k, bmm, "-DTYPE=9u")
+SPG_CUDA_UNIT(bmm_iq4_nl, bmm, "-DTYPE=10u")
+SPG_CUDA_UNIT(bmm_iq4_xs, bmm, "-DTYPE=11u")
+SPG_CUDA_UNIT(bembed, bembed, "")           /* and the rest of a session's step: embeddings, attention */
+SPG_CUDA_UNIT(kvattn, kvattn, "")
+SPG_CUDA_UNIT(bdot_q8_0_r1, bdot, "-DTYPE=0u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q8_0_r8, bdot, "-DTYPE=0u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q4_0_r1, bdot, "-DTYPE=1u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q4_0_r8, bdot, "-DTYPE=1u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q4_1_r1, bdot, "-DTYPE=2u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q4_1_r8, bdot, "-DTYPE=2u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q5_0_r1, bdot, "-DTYPE=3u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q5_0_r8, bdot, "-DTYPE=3u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q5_1_r1, bdot, "-DTYPE=4u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q5_1_r8, bdot, "-DTYPE=4u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q2_k_r1, bdot, "-DTYPE=5u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q2_k_r8, bdot, "-DTYPE=5u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q3_k_r1, bdot, "-DTYPE=6u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q3_k_r8, bdot, "-DTYPE=6u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q4_k_r1, bdot, "-DTYPE=7u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q4_k_r8, bdot, "-DTYPE=7u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q5_k_r1, bdot, "-DTYPE=8u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q5_k_r8, bdot, "-DTYPE=8u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_q6_k_r1, bdot, "-DTYPE=9u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_q6_k_r8, bdot, "-DTYPE=9u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_iq4_nl_r1, bdot, "-DTYPE=10u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_iq4_nl_r8, bdot, "-DTYPE=10u -DROWS=8u")
+SPG_CUDA_UNIT(bdot_iq4_xs_r1, bdot, "-DTYPE=11u -DROWS=1u")
+SPG_CUDA_UNIT(bdot_iq4_xs_r8, bdot, "-DTYPE=11u -DROWS=8u")
 SPG_CUDA_UNIT(attn_d256, attn, "-DDMAX=256u")     /* attention in single precision: heads of up to 256, */
 SPG_CUDA_UNIT(rattn_d32_o0, rattn, "-DD=32u -DOPC=0u")   /* of up to 32, 64, 128 a unit per pass */
 SPG_CUDA_UNIT(rattn_d32_o1, rattn, "-DD=32u -DOPC=1u")
@@ -173,6 +255,12 @@ SPG_CUDA_MMA_GENERAL(0, 0, 2, 2)
    as bfloat16, read eight values at once (A, B), and with GENERAL (_g) for those listed so: units
    gemm_pipe_<BM>x<BN>x<BK>_<TM>x<TN>_s<STAGES>_a<A>b<B> */
 SPG_CUDA_PIPE_TILE(128, 128, 32, 4, 4, 3)
+SPG_CUDA_PIPE_TILE(128, 64, 32, 4, 2, 3)
+SPG_CUDA_PIPE_TILE(64, 128, 32, 2, 4, 3)
+SPG_CUDA_PIPE_TILE(64, 64, 32, 2, 2, 4)
+SPG_CUDA_PIPE_TILE(32, 64, 32, 1, 2, 4)        /* (few rows, as a short sequence's: weights streamed through four stages) */
+SPG_CUDA_PIPE_TILE(64, 32, 32, 1, 2, 4)
+SPG_CUDA_PIPE_TILE(16, 64, 32, 1, 2, 4)
 
 SPG_CUDA_PIPE_MODES(0, 1)           /* forward */
 SPG_CUDA_PIPE_MODES(0, 0)           /* data gradient */

@@ -49,11 +49,23 @@ static bool table_fits(const Image *im, uint64_t offset, uint64_t count, uint64_
            offset <= im->size && count * size <= im->size - offset;
 }
 
+/* The version a graph needs: 12 where a node means what 1.5's readers would take for something else (a map channels
+   last, a group normalization's activation, attention of views), else 11. */
+static uint16_t graph_version(const SpingalettGraph *g) {
+    for (uint32_t k = 0; k < g->node_count; k++) {
+        const IrNode *n = &g->nodes[k];
+        if (ir_attr_int(n, "channels_last", 0) || (n->op == IR_FusedAttention && ir_attr_int(n, "layout", 0) == 2) ||
+            ((n->op == IR_GroupNormalization || n->op == IR_InstanceNormalization) && ir_attr(n, "activation")))
+            return 12;
+    }
+    return 11;
+}
+
 SpingalettGraph *ir_read_slett(const uint8_t *data, size_t size) {
     SpingalettGraph *g = ir_graph_new();
     if (!g) return NULL;
     if (size < HEADER || memcmp(data, "SLETTM", 6)) return refuse(g, "no header");
-    if (slett_get16(data + 6) != 11) return refuse(g, "a version other than 11");
+    if (slett_get16(data + 6) != 11 && slett_get16(data + 6) != 12) return refuse(g, "a version other than 11 or 12");
     const uint64_t file_size = slett_get64(data + 24);
     if (file_size > size || file_size < HEADER) return refuse(g, "a file shorter than its size");
     if (spingalett_crc32(0, data, 124) != slett_get32(data + 124)) return refuse(g, "the header's checksum");
@@ -362,7 +374,7 @@ bool ir_write_slett(const SpingalettGraph *g, const char *path) {
         uint8_t header[HEADER];
         memset(header, 0, sizeof header);
         memcpy(header, "SLETTM", 6);
-        slett_put16(header + 6, 11);
+        slett_put16(header + 6, graph_version(g));
         slett_put32(header + 8, nv);
         slett_put32(header + 12, nn);
         slett_put32(header + 16, g->input_count);

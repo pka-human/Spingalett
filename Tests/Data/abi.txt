@@ -1,4 +1,4 @@
-# The ABI of Spingalett 1.5.0, written by Tests/check_abi.py update: later releases keep every
+# The ABI of Spingalett 1.6.0, written by Tests/check_abi.py update: later releases keep every
 # entry (layouts on 64-bit platforms). Recorded again at each release, with what it added.
 enum SPINGALETT_INIT_RANDOM 0
 enum SPINGALETT_INIT_XAVIER 1
@@ -313,6 +313,7 @@ field SpingalettModelOpenArgs.context offset 8 size 4
 struct SpingalettSessionOptions size 72
 field SpingalettSessionOptions.max_length offset 0 size 4
 field SpingalettSessionOptions.sequences offset 4 size 4
+field SpingalettSessionOptions.gpu_memory offset 8 size 8
 struct SpingalettSessionFeed size 104
 field SpingalettSessionFeed.sequence offset 0 size 4
 field SpingalettSessionFeed.tokens offset 8 size 8
@@ -514,10 +515,6 @@ field SpingalettLayerInfo.ignore_padding offset 166 size 1
 field SpingalettLayerInfo.tied offset 168 size 4
 field SpingalettLayerInfo.window offset 172 size 4
 field SpingalettLayerInfo.token_offset offset 176 size 4
-function spingalett_gpu_device const char *spingalett_gpu_device(void);
-function spingalett_cuda_device const char *spingalett_cuda_device(void);
-function spingalett_set_gpu_precision bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
-function spingalett_get_gpu_precision SpingalettPrecisionMode spingalett_get_gpu_precision(void);
 function spingalett_seed void spingalett_seed(uint64_t seed);
 function spingalett_network_new_args SpingalettNetwork *spingalett_network_new_args(SpingalettNetworkArgs args);
 function spingalett_append_layer uint32_t spingalett_append_layer(SpingalettLayerArgs args);
@@ -608,6 +605,10 @@ function spingalett_get_compute_mode SpingalettComputeMode spingalett_get_comput
 function spingalett_set_compute_mode bool spingalett_set_compute_mode(SpingalettComputeMode mode);
 function spingalett_get_num_threads unsigned spingalett_get_num_threads(void);
 function spingalett_set_num_threads void spingalett_set_num_threads(unsigned n);
+function spingalett_gpu_device const char *spingalett_gpu_device(void);
+function spingalett_cuda_device const char *spingalett_cuda_device(void);
+function spingalett_set_gpu_precision bool spingalett_set_gpu_precision(SpingalettPrecisionMode precision);
+function spingalett_get_gpu_precision SpingalettPrecisionMode spingalett_get_gpu_precision(void);
 function spingalett_set_log_callback void spingalett_set_log_callback(SpingalettLogCallback cb);
 function spingalett_set_log_level void spingalett_set_log_level(SpingalettLogLevel level);
 function spingalett_set_verbose void spingalett_set_verbose(bool enabled);

@@ -1,0 +1,267 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * Rows of activations quantized by bquant.comp times weights of a block precision packed as sessions keep them
+ * (Spingalett.GpuPack.c), on the matrix units (VK_KHR_cooperative_matrix of 8-bit integers, 16 x 16 x 32, sums in 32 bits),
+ * the CPU's bits, as CUDA's bmmp.cu, bmmn.cu and bmmk.cu: a workgroup takes 64 rows and 64 rows of weights, a subgroup 32 x
+ * 32 of its outputs. Each block of 32 values goes to shared memory (a row's and a row of weights' 16 bytes a load, the 4-bit
+ * codes widened to bytes, the next block's loads issued while this one multiplies), its integer products are exact, and
+ * each output's term (d dx) I1 (+ (m dx) I2), every product and sum rounded alone, is added to its sum block after block.
+ * Super-blocks' sub-blocks add their integers first, each times its scale (Q6_K: each half of 16 values alone, the codes less
+ * 32 as their products less 32 times the rows' sums). A lane holds a column's outputs, so that it loads a row of weights'
+ * scales once a block; the rows' scales and sums go through shared memory. The bias then the sum, the activation (ACT), a
+ * gated unit's other half: bdot.comp's epilogue.
+ */
+
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+#include "block.glsl"
+
+layout(constant_id = 0) const uint TYPE = 0;
+layout(constant_id = 2) const uint ACT = 0;
+layout(constant_id = 4) const uint PAIR = 0;
+layout(constant_id = 5) const uint THREADS = 128;       /* 4 SG: four subgroups */
+layout(constant_id = 6) const uint SG = 32;
+layout(constant_id = 7) const uint GATED = 0;           /* e0's values multiply the outputs */
+layout(constant_id = 8) const uint COLS = 1;            /* a lane's columns of 32: 32 / SG, 1 for subgroups of 32 or more */
+layout(local_size_x_id = 5) in;
+
+layout(push_constant) uniform Push {
+    U32 w;
+    U32 q;
+    F32 dx;
+    U32 xs;
+    F32 bias, y, e0;
+    uint rows, n, k, stride, r0, ldy;
+} p;
+
+const bool KQ = TYPE == B_Q2_K || TYPE == B_Q3_K || TYPE == B_Q4_K || TYPE == B_Q5_K || TYPE == B_Q6_K || TYPE == B_IQ4_XS;
+const bool SIX = TYPE == B_Q6_K;
+const bool MINS = TYPE == B_Q4_K || TYPE == B_Q5_K;     /* a super-block's minima */
+const bool ONE = TYPE == B_Q4_1 || TYPE == B_Q5_1;      /* a block's */
+
+#include "bdot.glsl"
+
+/* The block's rows and rows of weights as bytes, eight i8vec4 each (Q8_0's, and the widened codes less nothing); a
+   subgroup's products of it (with Q6_K, of its second half apart), the rows' scales and sums */
+shared i8vec4 As[64u * 8u], Bs[64u * 8u], Hs[SIX ? 64u * 8u : 1u];
+shared int Cs[4u][1024u], Ds[SIX ? 4u : 1u][SIX ? 1024u : 1u];
+shared float Dx[4u][32u];
+shared int Sum[4u][32u], Sum2[4u][32u];
+shared float Fs[PAIR != 0u ? 4u : 1u][PAIR != 0u ? 1024u : 1u];
+
+i8vec4 bytes_of(uint w) { return i8vec4(int8_t(w), int8_t(w >> 8), int8_t(w >> 16), int8_t(w >> 24)); }
+
+/* what a thread loads ahead of the next block: its rows' chunk, its rows of weights' */
+uvec4 ra, rb, rc;
+uint f5;
+
+uint m0, n0, tid;
+
+/* the chunks a thread takes: of a row's 32 bytes two (a row of weights' likewise: Q8_0's bytes, or sixteen bytes of nibbles) */
+void fetch(uint unit) {
+    const uint c = tid % 2u, row = (tid / 2u) % 64u, m = m0 + row, n = n0 + row;
+    const uint chunk = tid % THREADS;
+    ra = m < p.rows && chunk < 128u ? U32x4(p.q).v[((p.r0 + m) * p.k + 32u * unit + 16u * c) >> 4] : uvec4(0u);
+    if (TYPE == B_Q8_0) {
+        rb = n < p.n && chunk < 128u ? U32x4(p.w).v[(n * p.stride + 32u * unit + 16u * c) >> 4] : uvec4(0u);
+    } else if (c == 0u) {
+        rb = n < p.n && chunk < 128u ? U32x4(p.w).v[(n * p.stride + 16u * unit) >> 4] : uvec4(0u);
+        if (TYPE == B_Q5_0 || TYPE == B_Q5_1 || TYPE == B_Q5_K)
+            f5 = n < p.n ? p.w.v[(n * p.stride + p.k / 2u + 4u * unit) >> 2] : 0u;
+        if (SIX) rc = n < p.n ? U32x4(p.w).v[(n * p.stride + p.k / 2u + 16u * (unit / 2u)) >> 4] : uvec4(0u);
+    }
+}
+
+/* the bytes of the codes of 32 values from the nibbles' sixteen bytes, four at a time (t: the word) */
+uint low_bytes(uint t) {
+    uint lo = rb[t] & 0x0F0F0F0Fu;
+    if (TYPE == B_Q5_0 || TYPE == B_Q5_1 || TYPE == B_Q5_K) lo |= spread1((f5 >> (4u * t)) & 0xFu);
+    return TYPE == B_IQ4_NL || TYPE == B_IQ4_XS ? nl_values(lo) : lo;
+}
+uint high_bytes(uint t) {
+    uint hi = (rb[t] >> 4) & 0x0F0F0F0Fu;
+    if (TYPE == B_Q5_0 || TYPE == B_Q5_1 || TYPE == B_Q5_K) hi |= spread1((f5 >> (16u + 4u * t)) & 0xFu);
+    return TYPE == B_IQ4_NL || TYPE == B_IQ4_XS ? nl_values(hi) : hi;
+}
+
+void store(uint unit) {
+    const uint c = tid % 2u, row = (tid / 2u) % 64u;
+    for (uint t = 0u; t < 4u; t++) As[row * 8u + c * 4u + t] = bytes_of(ra[t]);
+    if (TYPE == B_Q8_0) {
+        for (uint t = 0u; t < 4u; t++) Bs[row * 8u + c * 4u + t] = bytes_of(rb[t]);
+    } else if (c == 0u) {
+        if (SIX) {
+            /* (the high two bits of the pair of sub-blocks' words: bits 0 to 3 of their bytes the first's, 4 to 7 the second's;
+               the first half alone in Bs, the second in Hs) */
+            const uint shift = 4u * (unit % 2u);
+            for (uint t = 0u; t < 4u; t++) {
+                const uint h = rc[t] >> shift;
+                Bs[row * 8u + t] = bytes_of((rb[t] & 0x0F0F0F0Fu) | (h & 0x03030303u) << 4);
+                Bs[row * 8u + 4u + t] = bytes_of(0u);
+                Hs[row * 8u + t] = bytes_of(0u);
+                Hs[row * 8u + 4u + t] = bytes_of(((rb[t] >> 4) & 0x0F0F0F0Fu) | (h & 0x0C0C0C0Cu) << 2);
+            }
+            return;
+        }
+        for (uint t = 0u; t < 4u; t++) {
+            Bs[row * 8u + t] = bytes_of(low_bytes(t));
+            Bs[row * 8u + 4u + t] = bytes_of(high_bytes(t));
+        }
+    }
+}
+
+void main() {
+    tid = gl_LocalInvocationID.x;
+    m0 = gl_WorkGroupID.x * 64u;
+    n0 = gl_WorkGroupID.y * 64u;
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID, sm = sg % 2u, sn = sg / 2u;
+    const uint units = p.k / 32u, firstm = m0 + sm * 32u, firstn = n0 + sn * 32u;
+    coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> zero = coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    /* a lane's columns: n = lane, lane + SG, ... of the 32 (subgroups of 64: their first 32 lanes) */
+    float acc[32u * COLS];
+    int i1[KQ ? 32u * COLS : 1u], i2[MINS ? 32u * COLS : 1u];
+    uvec4 head[KQ ? COLS : 1u];             /* a super-block's first bytes as GGUF keeps them, once a super-block */
+    [[unroll]] for (uint e = 0u; e < 32u * COLS; e++) acc[e] = 0.0;
+    [[unroll]] for (uint e = 0u; e < (KQ ? 32u * COLS : 1u); e++) i1[e] = 0;
+    [[unroll]] for (uint e = 0u; e < (MINS ? 32u * COLS : 1u); e++) i2[e] = 0;
+
+    fetch(0u);
+    for (uint u = 0u; u < units; u++) {
+        store(u);
+        barrier();
+        if (u + 1u < units) fetch(u + 1u);
+        /* the block's products, each 16 x 16 of the subgroup to shared memory */
+        [[unroll]] for (uint i = 0u; i < 2u; i++) {
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a;
+            coopMatLoad(a, As, (sm * 32u + i * 16u) * 8u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint j = 0u; j < 2u; j++) {
+                coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> b;
+                coopMatLoad(b, Bs, (sn * 32u + j * 16u) * 8u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
+                coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> r = coopMatMulAdd(a, b, zero);
+                coopMatStore(r, Cs[sg], (i * 32u + j) * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+                if (SIX) {
+                    coopMatLoad(b, Hs, (sn * 32u + j * 16u) * 8u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
+                    r = coopMatMulAdd(a, b, zero);
+                    coopMatStore(r, Ds[sg], (i * 32u + j) * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+        }
+        /* the rows' scales and sums: each lane some of the subgroup's 32 rows */
+        const uint block = KQ ? u / 8u : u, blocks = p.k / (KQ ? 256u : 32u);
+        for (uint m = lane; m < 32u; m += SG) {
+            const uint rm = firstm + m;
+            const bool live = rm < p.rows;
+            if (!KQ || u % 8u == 7u) Dx[sg][m] = live ? p.dx.v[(p.r0 + rm) * blocks + block] : 0.0;
+            if (SIX || MINS || (!KQ && TYPE != B_Q8_0 && TYPE != B_IQ4_NL)) {
+                const uint xs = (p.r0 + rm) * (p.k / 16u) + 2u * u;
+                const int a = live ? int(p.xs.v[xs]) : 0, b = live ? int(p.xs.v[xs + 1u]) : 0;
+                Sum[sg][m] = SIX ? a : a + b;
+                Sum2[sg][m] = b;
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        /* each column's outputs: what its row of weights holds of this block, once */
+        for (uint c = 0u; c < COLS; c++) {
+            const uint n = lane + c * SG;
+            if (n >= 32u) break;
+            const uint rn = firstn + n;
+            if (rn >= p.n) continue;
+            const Row a = row_of(rn, 0u);
+            if (!KQ) {
+                const float d = from_half(half_at(p.w, a.scales + (ONE ? 4u : 2u) * u));
+                const float mi = ONE ? from_half(half_at(p.w, a.scales + 4u * u + 2u)) : 0.0;
+                const int off = TYPE == B_Q4_0 ? 8 : TYPE == B_Q5_0 ? 16 : 0;
+                [[unroll]] for (uint m = 0u; m < 32u; m++) {
+                    const float dxv = Dx[sg][m];
+                    int v = Cs[sg][m * 32u + n];
+                    int sum = 0;
+                    if (off != 0 || ONE) {
+                        sum = Sum[sg][m];
+                        v -= off * sum;
+                    }
+                    precise float term = (d * dxv) * float(v);
+                    if (ONE) term = term + (mi * dxv) * float(sum);
+                    precise float next = acc[c * 32u + m] + term;
+                    acc[c * 32u + m] = next;
+                }
+                continue;
+            }
+            /* a sub-block's scale and minimum */
+            const uint e = u % 8u, b = u / 8u, part = e / 4u, shift = 8u * (e % 4u);
+            int sc = 0, mn = 0, sc2 = 0;
+            if (SIX) {
+                const uint pr = half_at(p.w, a.aux + 2u * u);
+                sc = int(pr << 24) >> 24;
+                sc2 = int(pr << 16) >> 24;
+            } else if (TYPE == B_IQ4_XS) {
+                if (e == 0u) head[c] = uvec4(word_at(p.w, a.heads + 8u * b), word_at(p.w, a.heads + 8u * b + 4u), 0u, 0u);
+                sc = iq4xs_scale(head[c].x, head[c].y, e);
+            } else {
+                if (e == 0u) head[c] = U32x4(p.w).v[(a.heads + 16u * b) >> 4];
+                /* (llama.cpp's get_scale_min_k4(), four at once) */
+                const uvec4 w = head[c];
+                const uint scs = part != 0u ? (w.w & 0x0F0F0F0Fu) | ((w.y >> 2) & 0x30303030u) : w.y & 0x3F3F3F3Fu;
+                const uint mns = part != 0u ? ((w.w >> 4) & 0x0F0F0F0Fu) | ((w.z >> 2) & 0x30303030u) : w.z & 0x3F3F3F3Fu;
+                sc = int((scs >> shift) & 0xFFu);
+                mn = int((mns >> shift) & 0xFFu);
+            }
+            [[unroll]] for (uint m = 0u; m < 32u; m++) {
+                if (SIX) {
+                    i1[c * 32u + m] += sc * (Cs[sg][m * 32u + n] - 32 * Sum[sg][m]) + sc2 * (Ds[sg][m * 32u + n] - 32 * Sum2[sg][m]);
+                } else {
+                    i1[c * 32u + m] += sc * Cs[sg][m * 32u + n];
+                    if (MINS) i2[c * 32u + m] += mn * Sum[sg][m];
+                }
+            }
+            if (e != 7u) continue;
+            /* a super-block's term */
+            const float d = from_half(SIX ? half_at(p.w, a.scales + 2u * b) : head[c].x & 0xFFFFu);
+            const float mi = MINS ? -from_half(head[c].x >> 16) : 0.0;
+            [[unroll]] for (uint m = 0u; m < 32u; m++) {
+                const float dxv = Dx[sg][m];
+                precise float term = (d * dxv) * float(i1[c * 32u + m]);
+                if (MINS) term = term + (mi * dxv) * float(i2[c * 32u + m]);
+                precise float next = acc[c * 32u + m] + term;
+                acc[c * 32u + m] = next;
+                i1[c * 32u + m] = 0;
+                if (MINS) i2[c * 32u + m] = 0;
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        barrier();
+    }
+
+    /* the outputs (a gated unit's two rows of weights, two columns: through shared memory) */
+    for (uint c = 0u; c < COLS; c++) {
+        const uint n = lane + c * SG;
+        if (n >= 32u) break;
+        [[unroll]] for (uint m = 0u; m < 32u; m++) {
+            if (PAIR != 0u) {
+                Fs[sg][m * 32u + n] = acc[c * 32u + m];
+                continue;
+            }
+            const uint rm = firstm + m, rn = firstn + n;
+            if (rm < p.rows && rn < p.n) block_out(rn, p.r0 + rm, acc[c * 32u + m], 0.0);
+        }
+    }
+    if (PAIR == 0u) return;
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    for (uint n = lane * 2u; n < 32u; n += 2u * SG)
+        [[unroll]] for (uint m = 0u; m < 32u; m++) {
+            const uint rm = firstm + m, rn = firstn + n;
+            if (rm < p.rows && rn + 1u < p.n) block_out(rn / 2u, p.r0 + rm, Fs[sg][m * 32u + n], Fs[sg][m * 32u + n + 1u]);
+        }
+}

@@ -79,4 +79,14 @@ typedef struct {
 bool spg_conv_geometry(uint32_t *geo, SpgConvGeometry *info, uint32_t h, uint32_t w, uint32_t in, uint32_t oh,
                        uint32_t ow, uint32_t out, uint32_t groups, uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw,
                        uint32_t ph, uint32_t pw);
+/* The forward geometry alone (inference: any stride), unless geo is NULL; its uints, 0 when a tap does not fit. */
+size_t spg_conv_forward(uint32_t *geo, uint32_t h, uint32_t w, uint32_t in, uint32_t oh, uint32_t ow, uint32_t groups,
+                        uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw, uint32_t ph, uint32_t pw);
 
+
+/* Weights of a block type (SPG_B_*) packed as sessions keep them on the device (Spingalett.GpuPack.c): the bytes of N
+   rows of K values (0: a type kept as stored), and GGUF's blocks src rearranged so into dst. */
+size_t spg_packed_bytes(uint32_t type, uint32_t N, uint32_t K);
+/* The weights a workgroup of bmm's packed units takes (its groups in y: N over them) */
+uint32_t spg_packed_cols(uint32_t type);
+void spg_pack_blocks(uint32_t type, const uint8_t *src, uint32_t N, uint32_t K, uint8_t *dst);

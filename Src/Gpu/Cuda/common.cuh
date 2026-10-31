@@ -84,6 +84,30 @@ DEVICE uint32_t to_bf16(float f) {
     return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
 }
 
+/* float16: to the nearest, ties to even, and back (the instructions: _Float16 is not every clang's on NVPTX) */
+DEVICE uint32_t to_half(float f) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+DEVICE float from_half(uint32_t h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"((unsigned short)h));
+    return f;
+}
+
+/* The 6-bit scales (sc) and minima (mn) of sub-blocks 4 part to 4 part + 3 of a Q4_K or Q5_K super-block, a byte each,
+   from words 1 to 3 of its first 16 bytes as GGUF keeps them (llama.cpp's get_scale_min_k4(), four at once) */
+DEVICE void k4_scales(uint32_t w1, uint32_t w2, uint32_t w3, uint32_t part, uint32_t &sc, uint32_t &mn) {
+    sc = part ? (w3 & 0x0F0F0F0Fu) | ((w1 >> 2) & 0x30303030u) : w1 & 0x3F3F3F3Fu;
+    mn = part ? ((w3 >> 4) & 0x0F0F0F0Fu) | ((w2 >> 2) & 0x30303030u) : w2 & 0x3F3F3F3Fu;
+}
+/* The signed scale of sub-block j of an IQ4_XS super-block from its first 8 bytes as GGUF keeps them (w0: the scale,
+   then the scales' high two bits; w1: their low four bits) */
+DEVICE int32_t iq4xs_scale(uint32_t w0, uint32_t w1, uint32_t j) {
+    return (int32_t)(((w1 >> (4u * j)) & 0xFu) | ((w0 >> (16u + 2u * j)) & 3u) << 4) - 32;
+}
+
 /* Value i of buffer x, whose push-constant word is w: bfloat16 where bit w of the kernel's HALF says so
    (half.glsl), else a float. */
 DEVICE float ld(uint64_t x, uint32_t i, uint32_t w, uint32_t half) {
@@ -248,6 +272,23 @@ DEVICE float derivative_s(float y, uint32_t act, float slope) { return slope >= 
 #define STEP_AUGMENT    16u
 #define STEP_KEEP       17u
 #define STEP_SHARE      18u
+
+/* bdot's and bmm's epilogue of output j of row r0 + r: the bias then the sum a0, the activation act, the product by e0's
+   value; of a gated unit's pair (the weights' rows 2j and 2j + 1, the gate's and the up's, sums a0 and a1: bmm's spec 3,
+   bdot's 4), the gate's activation times the up, as the unit's two layers and their product compute it */
+DEVICE void block_out(const SpgBdotPush &p, uint32_t act, bool pair, uint32_t r, uint32_t j, float a0, float a1) {
+    const uint64_t at = (uint64_t)(p.r0 + r) * p.ldy + j;
+    if (pair) {
+        float v = F(p.bias)[2u * j] + a0;
+        if (act) v = activate(v, act);
+        F(p.y)[at] = v * (F(p.bias)[2u * j + 1u] + a1);
+        return;
+    }
+    float v = F(p.bias)[j] + a0;
+    if (act) v = activate(v, act);
+    if (p.e0) v = v * F(p.e0)[at];
+    F(p.y)[at] = v;
+}
 
 DEVICE uint64_t header64(const uint32_t *h, uint32_t lo) { return (uint64_t)h[lo] | (uint64_t)h[lo + 1] << 32; }
 

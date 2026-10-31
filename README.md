@@ -169,8 +169,8 @@ pip install spingalett                    # Python: wheels with the library insi
 brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
 scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
 nix build github:pka-human/Spingalett     # the flake's package; nix develop: a shell to build it in
-sudo apt install ./spingalett_1.5.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
-docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.5.0     # the library, tools and Python, CUDA and Vulkan
+sudo apt install ./spingalett_1.6.0_amd64.deb        # Debian and Ubuntu; .rpm for Fedora and openSUSE
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.6.0     # the library, tools and Python, CUDA and Vulkan
 ```
 
 The `.deb` and `.rpm` packages are assets of each [release](https://github.com/pka-human/Spingalett/releases),
@@ -548,6 +548,28 @@ the GPU's precision): the logits are those of the model's weights as floats to r
 integer session's but not its bits. A model of GPT-2 small's size (12 blocks of 768, a vocabulary of
 50,257) generates 684 tokens a second in INT8 and 854 in INT4 on CUDA on an RTX 4050 Laptop GPU, where
 the same model in BF16 gives 368 (four sequences together: 1,953 and 2,053).
+
+A language model of a GGUF file runs on the GPU straight from its image, on CUDA and on Vulkan, in the runtime too: its
+weights stay in their blocks (a 4B model in Q4_K_M takes 2.5 GB of the GPU, not 16), a block layer's products give the
+CPU's bits, prompts run on the matrix units and tokens at what the memory's bandwidth allows. On CUDA on an RTX 4050 Laptop
+GPU, against llama.cpp's Vulkan build on the same files, the GPU at 60 C or less before each run (`Examples/Runtime/LlmBench.c`
+and `llama-bench -p 512 -n 128 -ngl 99`, tokens a second):
+
+| Model | Prompt of 512 | llama.cpp | Generation | llama.cpp |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B Q8_0 | 16,447 | 12,120 | 222 | 207 |
+| Qwen3-1.7B Q8_0 | 8,117 | 6,543 | 90.7 | 90.2 |
+| Qwen3-4B Q4_K_M | 3,601 | 2,974 | 64.9 | 65.2 |
+| Llama-3.2-1B Q4_K_M | 12,682 | 10,473 | 196 | 198 |
+| Qwen2.5-0.5B Q4_K_M | 22,215 | 16,265 | 326 | 290 |
+
+A model the GPU's memory does not hold splits (`SpingalettSessionOptions.gpu_memory` bounds what a session takes; 0 takes
+what the device has free, less 128 MB). Its first layers keep their weights on the GPU, as many as fit up to the end of a
+block; a token runs them there and the rest on all the CPU's threads, while a prompt (32 tokens or more) runs every layer but the
+last on the GPU, the later layers' weights copied over the bus as their turn comes, so that it keeps most of its speed. Qwen3-4B Q4_K_M with
+2 GB of the GPU processes a prompt at 2,465 tokens a second and generates 34.0, with 0.7 GB 1,502 and 19.2 (llama.cpp with 20 of its
+37 layers on the GPU 1,490 and 30.9, with none 1,062 and 19.3). A split session's logits are the CPU's to rounding, and a prompt fed at once
+equals its tokens fed one at a time to rounding as well, not to the bit: the two take different kernels for the later layers.
 
 ```c
 SpingalettModel *model = spingalett_model_from_network(net, PRECISION_INT8);   /* or spingalett_model_load() */
@@ -2095,7 +2117,7 @@ Src/Gpu/              The GPU backends: device layer, network executor, Vulkan's
 Examples/             XOR, MNIST (dense and convolutional), CIFAR-10, U-Net segmentation, CharGPT (a
                       character-level GPT), Pretrained (a Hugging Face or GGUF language model continuing a
                       prompt), throughput benchmark (C and PyTorch counterpart), DatasetTool, ModelTool
-Examples/Runtime/     Programs of the runtime alone: RunModel, RunGraph (graphs of operators), Chat
+Examples/Runtime/     Programs of the runtime alone: RunModel, RunGraph (graphs of operators), Chat, LlmBench (times sessions as llama-bench does)
 Examples/Embedded/    MNIST on a Cortex-M4 (QEMU) with the standalone inference engine
 docs/                 File format specifications (models, data sets), graphs of operators, the API reference
 Apps/DigitPad/        Digit-drawing demo app, its trainer and AppImage and Windows packaging
@@ -2143,7 +2165,7 @@ what 1.0 gave, and only 2.0 may take anything away.
 
 ## Status and roadmap
 
-Spingalett is at version 1.5.0. Its API (prefixed names, structs that can grow, zero as every
+Spingalett is at version 1.6.0. Its API (prefixed names, structs that can grow, zero as every
 field's default), its ABI (the soname `libspingalett.so.1`) and its formats (`.slett` 11, `.slettd` 2)
 are kept by every 1.x release, as [Compatibility](#compatibility) states. The network is an opaque
 handle, so its internal layout can change without breaking programs; saved models are versioned and

@@ -2,9 +2,11 @@
 # Copyright (c) 2026 pka_human (pka_human@proton.me)
 """Writes the cases of the `operators` test group: ONNX's conformance tests of single operators (the cases the onnx
 package generates, onnx.backend.test.case.node, whose outputs come from ONNX's reference implementation), into
-Tests/Data/graph_cases.bin, and the small model of the runtime's test (Tests/Data/graph_small.onnx and .bin):
+Tests/Data/graph_cases.bin, small networks of several operators into Tests/Data/graph_blocks.bin (block_cases()), and
+the small model of the runtime's test (Tests/Data/graph_small.onnx and .bin):
 
     SPINGALETT_LIBRARY=Bin/libspingalett.so python Tests/make_graph_tests.py     # needs onnx and numpy
+                                                                                 # (--blocks: graph_blocks.bin alone)
 
 and lists in Tests/Data/graph_cases.txt the cases left out and why: operators graphs do not have (control flow,
 sequences, strings, training, randomness), types they do not hold (float64 and float8, strings, 16-bit
@@ -116,6 +118,16 @@ def main():
         for k, (ins, refs, rtol, atol) in enumerate(records):
             name = case.name if len(records) == 1 else f"{case.name}#{k}"
             kept.append((name, model, rtol, atol, ins, refs))
+    write_cases(os.path.join(HERE, "Data", "graph_cases.bin"), kept)
+    with open(os.path.join(HERE, "Data", "graph_cases.txt"), "w") as f:
+        f.write(f"# ONNX's conformance cases of single operators that Tests/Data/graph_cases.bin leaves out "
+                f"({len(left)}; {len(kept)} kept), written by Tests/make_graph_tests.py\n")
+        for name, why in left:
+            f.write(f"{name}: {why}\n")
+    print(f"{len(kept)} cases kept, {len(left)} left out")
+
+
+def write_cases(path, kept):
     out = bytearray(b"SGCASES1" + struct.pack("<I", len(kept)))
     for name, model, rtol, atol, ins, refs in kept:
         out += struct.pack("<H", len(name.encode())) + name.encode() + struct.pack("<I", len(model)) + model
@@ -125,14 +137,109 @@ def main():
         out += struct.pack("<I", len(refs))
         for n, a in refs:
             pack_tensor(out, n, a)
-    with open(os.path.join(HERE, "Data", "graph_cases.bin"), "wb") as f:
+    with open(path, "wb") as f:
         f.write(out)
-    with open(os.path.join(HERE, "Data", "graph_cases.txt"), "w") as f:
-        f.write(f"# ONNX's conformance cases of single operators that Tests/Data/graph_cases.bin leaves out "
-                f"({len(left)}; {len(kept)} kept), written by Tests/make_graph_tests.py\n")
-        for name, why in left:
-            f.write(f"{name}: {why}\n")
-    print(f"{len(kept)} cases kept, {len(left)} left out")
+
+
+def block_cases():
+    """Tests/Data/graph_blocks.bin, in graph_cases.bin's format: small networks of several operators, which the layout
+    pass, the fusions and the GPU's plans see whole (channels-last convolutions and poolings, a convolution of patches,
+    a bottleneck block, attention written out, attention of Q, K and V split from one product or gathered from it; on
+    the GPU in bfloat16, values kept as such between products)."""
+    from onnx import TensorProto, helper, numpy_helper
+    from onnx.reference import ReferenceEvaluator
+    rng = np.random.default_rng(11)
+    cases = []
+
+    def case(name, nodes, inputs, outputs, inits):
+        inits = [numpy_helper.from_array(np.asarray(v), k) for k, v in inits.items()]
+        graph = helper.make_graph(nodes, name, [helper.make_tensor_value_info(k, TensorProto.FLOAT, v.shape)
+                                                for k, v in inputs.items()],
+                                  [helper.make_tensor_value_info(k, TensorProto.FLOAT, None) for k in outputs], inits)
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], producer_name="make_graph_tests")
+        refs = ReferenceEvaluator(model).run(None, inputs)
+        model = model.SerializeToString()
+        refs = [(k, np.asarray(r, np.float32)) for k, r in zip(outputs, refs)]
+        got = sp.Graph.from_bytes(model).run(inputs)
+        assert all(close(got[k], r, 1e-3, 1e-4) for k, r in refs), name
+        cases.append((name, model, 1e-3, 1e-4, list(inputs.items()), refs))
+
+    def w(*shape, scale=None):
+        fan = int(np.prod(shape[1:])) if len(shape) > 1 else shape[0]
+        return (rng.standard_normal(shape) * (scale or fan ** -0.5)).astype(np.float32)
+
+    def x(*shape):
+        return rng.standard_normal(shape).astype(np.float32)
+
+    conv = helper.make_node
+    for pool in ("MaxPool", "AveragePool"):
+        attrs = dict(kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1]) if pool == "MaxPool" else \
+            dict(kernel_shape=[2, 2], strides=[2, 2])
+        case(f"conv_{pool.lower()}", [conv("Conv", ["x", "W", "B"], ["c"], pads=[1, 1, 1, 1]),
+                                      conv("Relu", ["c"], ["r"]), conv(pool, ["r"], ["y"], **attrs)],
+             {"x": x(1, 3, 32, 32)}, ["y", "r"], {"W": w(8, 3, 3, 3), "B": w(8, scale=0.1)})
+    case("patches", [conv("Conv", ["x", "W", "B"], ["c"], kernel_shape=[16, 16], strides=[16, 16]),
+                     conv("Reshape", ["c", "shape"], ["s"]), conv("Transpose", ["s"], ["t"], perm=[0, 2, 1]),
+                     conv("LayerNormalization", ["t", "g", "b"], ["n"], axis=-1),
+                     conv("MatMul", ["n", "Wl"], ["m"]), conv("Add", ["m", "bl"], ["y"])],
+         {"x": x(1, 3, 64, 64)}, ["y"],
+         {"W": w(48, 3, 16, 16), "B": w(48, scale=0.1), "shape": np.array([1, 48, 16], np.int64),
+          "g": 1 + w(48, scale=0.1), "b": w(48, scale=0.1), "Wl": w(48, 32), "bl": w(32, scale=0.1)})
+    case("bottleneck", [conv("Conv", ["x", "W1", "B1"], ["c1"], kernel_shape=[7, 7], strides=[2, 2], pads=[3] * 4),
+                        conv("Relu", ["c1"], ["r1"]),
+                        conv("MaxPool", ["r1"], ["p"], kernel_shape=[3, 3], strides=[2, 2], pads=[1] * 4),
+                        conv("Conv", ["p", "Wa"], ["a0"]), conv("Relu", ["a0"], ["a"]),
+                        conv("Conv", ["a", "Wb"], ["b0"], pads=[1] * 4), conv("Relu", ["b0"], ["b"]),
+                        conv("Conv", ["b", "Wc"], ["c"]), conv("Conv", ["p", "Wd"], ["d"]),
+                        conv("Add", ["c", "d"], ["s0"]), conv("Relu", ["s0"], ["s"]),
+                        conv("GlobalAveragePool", ["s"], ["gp"]), conv("Flatten", ["gp"], ["f"]),
+                        conv("Gemm", ["f", "Wf", "bf"], ["y"], transB=1)],
+         {"x": x(1, 3, 64, 64)}, ["y"],
+         {"W1": w(32, 3, 7, 7), "B1": w(32, scale=0.1), "Wa": w(32, 32, 1, 1), "Wb": w(32, 32, 3, 3),
+          "Wc": w(64, 32, 1, 1), "Wd": w(64, 32, 1, 1), "Wf": w(10, 64), "bf": w(10, scale=0.1)})
+    heads = [conv("LayerNormalization", ["x", "g", "b"], ["n"], axis=-1)]
+    for p, perm in (("q", [0, 2, 1, 3]), ("k", [0, 2, 3, 1]), ("v", [0, 2, 1, 3])):
+        heads += [conv("MatMul", ["n", "W" + p], [p + "0"]), conv("Add", [p + "0", "b" + p], [p + "1"]),
+                  conv("Reshape", [p + "1", "split"], [p + "2"]), conv("Transpose", [p + "2"], [p], perm=perm)]
+    heads += [conv("MatMul", ["q", "k"], ["s0"]), conv("Mul", ["s0", "scale"], ["s"]),
+              conv("Softmax", ["s"], ["sm"], axis=-1), conv("MatMul", ["sm", "v"], ["o0"]),
+              conv("Transpose", ["o0"], ["o1"], perm=[0, 2, 1, 3]), conv("Reshape", ["o1", "merge"], ["o2"]),
+              conv("MatMul", ["o2", "Wo"], ["o3"]), conv("Add", ["o3", "bo"], ["o"]), conv("Add", ["o", "x"], ["y"])]
+    case("attention", heads, {"x": x(1, 32, 64)}, ["y"],
+         {"g": 1 + w(64, scale=0.1), "b": w(64, scale=0.1), "Wq": w(64, 64), "bq": w(64, scale=0.1),
+          "Wk": w(64, 64), "bk": w(64, scale=0.1), "Wv": w(64, 64), "bv": w(64, scale=0.1),
+          "split": np.array([1, 32, 2, 32], np.int64), "scale": np.array(32 ** -0.5, np.float32),
+          "merge": np.array([1, 32, 64], np.int64), "Wo": w(64, 64), "bo": w(64, scale=0.1)})
+    # Q, K and V of one product: split in three as GPT-2's export has them, gathered as torchvision's (sequence first)
+    split = [conv("MatMul", ["x", "Wp"], ["p0"]), conv("Add", ["p0", "bp"], ["p"]),
+             conv("Split", ["p", "thirds"], ["q0", "k0", "v0"], axis=2)]
+    for t, perm in (("q", [0, 2, 1, 3]), ("v", [0, 2, 1, 3]), ("k", [0, 2, 1, 3])):
+        split += [conv("Reshape", [t + "0", "heads"], [t + "1"]), conv("Transpose", [t + "1"], [t + "2"], perm=perm)]
+    split += [conv("Reshape", ["k2", "merged"], ["k3"]), conv("Transpose", ["k3"], ["k4"], perm=[0, 2, 1]),
+              conv("Reshape", ["k4", "kt_shape"], ["kt"]), conv("MatMul", ["q2", "kt"], ["s0"]),
+              conv("Mul", ["s0", "scale"], ["s"]), conv("Softmax", ["s"], ["sm"], axis=-1),
+              conv("MatMul", ["sm", "v2"], ["o0"]), conv("Transpose", ["o0"], ["o1"], perm=[0, 2, 1, 3]),
+              conv("Reshape", ["o1", "back"], ["y"])]
+    case("attention_split", split, {"x": x(1, 24, 64)}, ["y"],
+         {"Wp": w(64, 192), "bp": w(192, scale=0.1), "thirds": np.array([64, 64, 64], np.int64),
+          "heads": np.array([1, 24, 2, 32], np.int64), "merged": np.array([2, 24, 32], np.int64),
+          "kt_shape": np.array([1, 2, 32, 24], np.int64), "scale": np.array(32 ** -0.5, np.float32),
+          "back": np.array([1, 24, 64], np.int64)})
+    gather = [conv("MatMul", ["x", "Wp"], ["p0"]), conv("Add", ["p0", "bp"], ["p"]),
+              conv("Reshape", ["p", "packs"], ["p1"]), conv("Transpose", ["p1"], ["p2"], perm=[2, 1, 0, 3])]
+    for i, t in enumerate("qkv"):
+        gather += [conv("Gather", ["p2", f"i{i}"], [t + "0"], axis=0), conv("Reshape", [t + "0", "heads"], [t + "1"]),
+                   conv("Transpose", [t + "1"], [t + "2"], perm=[0, 2, 3, 1] if t == "k" else [0, 2, 1, 3])]
+    gather += [conv("MatMul", ["q2", "k2"], ["s0"]), conv("Mul", ["s0", "scale"], ["s"]),
+               conv("Softmax", ["s"], ["sm"], axis=-1), conv("MatMul", ["sm", "v2"], ["o0"]),
+               conv("Transpose", ["o0"], ["o1"], perm=[2, 0, 1, 3]), conv("Reshape", ["o1", "back"], ["y"])]
+    case("attention_gather", gather, {"x": x(17, 1, 64)}, ["y"],
+         {"Wp": w(64, 192), "bp": w(192, scale=0.1), "packs": np.array([17, 1, 3, 64], np.int64),
+          "i0": np.array(0, np.int64), "i1": np.array(1, np.int64), "i2": np.array(2, np.int64),
+          "heads": np.array([1, 17, 2, 32], np.int64), "scale": np.array(32 ** -0.5, np.float32),
+          "back": np.array([17, 1, 64], np.int64)})
+    write_cases(os.path.join(HERE, "Data", "graph_blocks.bin"), cases)
+    print(f"{len(cases)} cases of blocks")
 
 
 def small_model():
@@ -164,5 +271,7 @@ def small_model():
 
 
 if __name__ == "__main__":
-    small_model()
-    main()
+    block_cases()
+    if "--blocks" not in sys.argv:
+        small_model()
+        main()

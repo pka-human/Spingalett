@@ -13,6 +13,7 @@
 
 #include "Spingalett.IR.h"
 #include "Spingalett.Thread.h"
+#include "Spingalett.Gpu.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,6 +213,7 @@ static void print_profile(const SpingalettGraph *g) {
 
 void ir_graph_free(SpingalettGraph *g) {
     if (!g) return;
+    spingalett_gpu_graph_free(g);
     if (g->profile) print_profile(g);
     free(g->profile);
     free(g->profile_nodes);
@@ -561,8 +563,7 @@ static bool order_nodes(SpingalettGraph *g) {
     return ok;
 }
 
-/* The kernel of one node on tensors; false with the error set. */
-static bool run_node(SpingalettGraph *g, uint32_t index, IrTensor *tensors, bool parallel) {
+bool ir_run_node(SpingalettGraph *g, uint32_t index, IrTensor *tensors, bool parallel) {
     const IrNode *n = &g->nodes[index];
     IrTensor *in[64], *out[64];
     if (n->input_count > 64 || n->output_count > 64)
@@ -584,8 +585,7 @@ static bool run_node(SpingalettGraph *g, uint32_t index, IrTensor *tensors, bool
     return true;
 }
 
-/* A constant's tensor (a view of its data). */
-static IrTensor const_tensor(const IrValue *v) {
+IrTensor ir_const_tensor(const IrValue *v) {
     IrTensor t;
     memset(&t, 0, sizeof t);
     t.dtype = v->dtype;
@@ -612,8 +612,8 @@ static bool fold_constants(SpingalettGraph *g) {
             IrTensor *tensors = (IrTensor *)calloc(g->value_count, sizeof(IrTensor));
             if (!tensors) return fail_open("graph: out of memory");
             for (uint32_t i = 0; i < n->input_count; i++)
-                if (n->inputs[i] != IR_NONE) tensors[n->inputs[i]] = const_tensor(&g->values[n->inputs[i]]);
-            if (!run_node(g, k, tensors, false)) {
+                if (n->inputs[i] != IR_NONE) tensors[n->inputs[i]] = ir_const_tensor(&g->values[n->inputs[i]]);
+            if (!ir_run_node(g, k, tensors, false)) {
                 /* (a node that fails on constants would fail at every run: the graph is refused now) */
                 for (uint32_t v = 0; v < g->value_count; v++)
                     ir_release(g, &tensors[v]);
@@ -699,7 +699,9 @@ bool ir_finish(SpingalettGraph *g) {
     }
     for (uint32_t o = 0; o < g->output_count; o++)
         if (g->outputs[o] == IR_NONE) return fail_open("graph: an output nothing computes");
-    if (!order_nodes(g) || !fold_constants(g) || !drop_dead(g) || !ir_fuse(g)) return false;
+    if (!order_nodes(g) || !fold_constants(g) || !drop_dead(g)) return false;
+    ir_infer_shapes(g);
+    if (!ir_fuse(g)) return false;
     for (uint32_t v = 0; v < g->value_count; v++) g->values[v].last = -1;
     for (uint32_t k = 0; k < g->node_count; k++)
         for (uint32_t i = 0; i < g->nodes[k].input_count; i++)
@@ -922,7 +924,7 @@ bool spingalett_graph_run_args(SpingalettGraphRunArgs args) {
             ok = fail_open("graph run: the input '%s' is not given", g->values[g->inputs[i]].name);
     /* constants as views */
     for (uint32_t v = 0; ok && v < g->value_count; v++)
-        if (g->values[v].kind == VALUE_CONST) g->tensors[v] = const_tensor(&g->values[v]);
+        if (g->values[v].kind == VALUE_CONST) g->tensors[v] = ir_const_tensor(&g->values[v]);
     /* the nodes, each value freed after its last reader */
     const bool parallel = spingalett_get_compute_mode() == SPINGALETT_COMPUTE_OPENMP && spingalett_get_num_threads() > 1u;
     if (!g->profile && getenv("SPINGALETT_GRAPH_PROFILE") && *getenv("SPINGALETT_GRAPH_PROFILE") != '0') {
@@ -935,12 +937,21 @@ bool spingalett_graph_run_args(SpingalettGraphRunArgs args) {
             g->profile_nodes = NULL;
         }
     }
-    for (uint32_t k = 0; ok && k < g->node_count; k++) {
+    /* on the GPU in its compute modes (Spingalett.GpuGraph.c, which may decline: then here) */
+    bool done = false;
+#if defined(SPINGALETT_HAS_VULKAN) || defined(SPINGALETT_HAS_CUDA)
+    if (ok && g->node_count && spingalett_use_gpu()) {
+        const int on_gpu = spingalett_gpu_graph_run(g);
+        ok = on_gpu != 0;
+        done = on_gpu > 0;
+    }
+#endif
+    for (uint32_t k = 0; ok && !done && k < g->node_count; k++) {
         const IrNode *n = &g->nodes[k];
         /* (the first run, which also prepares constants, is left out) */
         const bool timed = g->profile && g->runs > 1;
         const double t0 = timed ? seconds() : 0.0;
-        ok = run_node(g, k, g->tensors, parallel);
+        ok = ir_run_node(g, k, g->tensors, parallel);
         if (timed) {
             g->profile[n->op] += seconds() - t0;
             g->profile_nodes[n->op]++;
@@ -961,7 +972,7 @@ bool spingalett_graph_run_args(SpingalettGraphRunArgs args) {
         }
         IrTensor *x = &g->tensors[v];
         const uint8_t declared = g->values[v].dtype;
-        if (!x->owned && x->data && x->count) {
+        if (!x->owned && !x->staged && x->data && x->count) {
             /* an output that is a constant or a graph's input (or a view of one): a copy in the graph's memory */
             size_t capacity;
             const size_t bytes = (size_t)x->count * ir_dtype_size(x->dtype);

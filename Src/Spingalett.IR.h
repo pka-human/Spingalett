@@ -79,6 +79,8 @@ typedef struct {
     void *data;
     bool owned;                     /* the run's: its block of the graph's pool (ir_release()) */
     bool constant;                  /* a constant of the graph (kernels may prepare it once, by node) */
+    bool staged;                    /* its values in memory of the GPU's plan (Spingalett.GpuGraph.c), valid until the
+                                       next run */
     size_t capacity;                /* owned: the bytes of its block */
 } IrTensor;
 
@@ -125,6 +127,7 @@ struct SpingalettGraph {
     SpingalettGemmScratch *scratch; /* products on all the threads */
     SpingalettGemmScratch **thread_scratch;     /* products of one thread each, side by side (batched MatMul) */
     int scratch_threads;
+    void *gpu;                      /* the graph on the GPU (Spingalett.GpuGraph.c), NULL until a run there */
     char *error;
 };
 
@@ -152,6 +155,12 @@ const char *ir_dtype_name(uint8_t dtype);
 bool ir_finish(SpingalettGraph *g);
 /* The fusions of Spingalett.IRFuse.c; false (out of memory) with the error set. */
 bool ir_fuse(SpingalettGraph *g);
+/* The types and shapes of the values the nodes compute where their inputs' are declared (Spingalett.IRShapes.c): those
+   values declared. */
+void ir_infer_shapes(SpingalettGraph *g);
+/* Convolutions' maps kept channels last between them (Spingalett.IRLayout.c); false (out of memory) with the error
+   set. */
+bool ir_layout(SpingalettGraph *g);
 
 /* An attribute of a node, NULL when it has none of that name. */
 const IrAttr *ir_attr(const IrNode *n, const char *name);
@@ -196,6 +205,36 @@ int64_t ir_get_int(const IrTensor *t, uint64_t i);
 double ir_get_float(const IrTensor *t, uint64_t i);
 /* The table of kernels, by IrOp. */
 extern const IrKernel ir_kernels[IR_OP_COUNT];
+/* Node `index` run by its kernel on tensors[] (the run's, by value), on the OpenMP threads with parallel; false with
+   the error set (the node named). */
+bool ir_run_node(SpingalettGraph *g, uint32_t index, IrTensor *tensors, bool parallel);
+/* Whether a permutation of axes of these sizes moves only axes of size 1 (the values' order kept: a view). */
+bool ir_moves_ones(const int64_t *dims, const int64_t *perm, uint32_t rank);
+/* A constant's tensor: a view of its values. */
+IrTensor ir_const_tensor(const IrValue *v);
+
+/* The windows of a convolution or pooling over one to three spatial axes (as three, the first ones of size 1 for
+   fewer): sizes, kernel, strides, padding at the start and end, dilations, outputs. */
+typedef struct {
+    uint32_t spatial;               /* the input's spatial axes */
+    int64_t in[3], k[3], s[3], pb[3], pe[3], dil[3], out[3];
+} IrGeometry;
+/* The windows of node r->node over x (kernel_shape, or the weights' given), its strides, dilations, pads or auto_pad;
+   outputs by ceil_mode for pooling. false with the error set. */
+bool ir_geometry(IrRun *r, const IrTensor *x, const int64_t *kernel, IrGeometry *g, bool ceil_mode);
+
+/* Resize's (and Upsample's) output shape and taps: for every axis d, T[d] taps of each output index (their input
+   indices, -1 for the extrapolation value, and their weights), in memory ir_resize_free() frees. */
+typedef struct {
+    int64_t dims[IR_MAX_RANK];
+    int T[IR_MAX_RANK];
+    int64_t *index[IR_MAX_RANK];
+    float *weight[IR_MAX_RANK];
+    float extrapolation;
+    void *index_memory, *weight_memory;
+} IrResizeTaps;
+bool ir_resize_taps(IrRun *r, IrTensor *const *in, uint32_t n, IrResizeTaps *plan);
+void ir_resize_free(IrResizeTaps *taps);
 
 /* Readers of the sources: a graph from ONNX bytes (dir: the directory of external data files, or NULL), and from a
    `.slett` image of format 11. NULL with the error set. */

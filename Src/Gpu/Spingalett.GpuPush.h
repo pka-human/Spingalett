@@ -206,6 +206,110 @@ enum { SPG_IP_EPI, SPG_IP_DIRECT, SPG_IP_POOL, SPG_IP_GAP, SPG_IP_ADD, SPG_IP_MU
 #define SPG_IP_DW4        8u        /* DIRECT with FLOATS: a depthwise convolution's four channels at a time */
 #define SPG_IP_OG4        16u       /* DIRECT with FLOATS: four filters of a group at a time */
 
+/* bquant.comp: rows of activations quantized in blocks of bv values (32 or 256) as spingalett_quantize_blocks()
+   quantizes them, the bits of the CPU: x [rows][ldx floats] to codes q [rows][k] (signed bytes), a scale a block dx
+   [rows][k / bv] and the sum of every 16 codes xs [rows][k / 16] (int32). A lane four values, bv / 4 lanes a block up
+   to a warp: SPG_BQUANT_BLOCKS(bv) blocks a workgroup. */
+typedef struct {
+    uint64_t x, q, dx, xs;
+    uint32_t rows, k, bv, ldx;
+    uint32_t tiled, pad;            /* q in tiles (SPG_TILED_AT()), else rows of k bytes */
+} SpgBquantPush;
+/* Byte j of row r of rows of k quantized values in tiles (what bmm reads for weights of SPG_BMM_TILED() types, bmmk's,
+   in a session's steps of SPG_MM_ROWS rows or more; the others read rows of k bytes):
+   tiles of 64 rows by 64 values, each tile's rows of 64 bytes one after the other, a row of tiles in the order of the
+   values, so that a stage of bmm copies one piece of memory (rows of single bytes cost it as much as the weights);
+   SPG_TILED_BYTES() of them for rows rows */
+#define SPG_TILED_AT(r, j, k) \
+    (((uint64_t)((r) >> 6) * (((k) + 63u) >> 6) + ((j) >> 6)) * 4096u + ((r) & 63u) * 64u + ((j) & 63u))
+#define SPG_TILED_BYTES(rows, k) ((uint64_t)(((rows) + 63u) >> 6) * (((k) + 63u) >> 6) * 4096u)
+#define SPG_MM_ROWS 3u
+#define SPG_BMM_TILED(t) ((t) == SPG_B_Q4_K || (t) == SPG_B_Q5_K || (t) == SPG_B_Q6_K || (t) == SPG_B_IQ4_XS)
+#define SPG_BQUANT_BLOCKS(bv) ((bv) >= 128u ? 8u : 8u * 128u / (bv))
+
+/* bnorm.comp: a session's RMS normalization of rows of k values, y = the rows times gamma as grow's RMSNORM computes
+   them (TPR, spec 0, threads a row: its bits); with b, of the sums a + b (written to sum), the layers before it; with bv,
+   its outputs then quantized in blocks of bv values to q, dx and xs as bquant quantizes them (its bits); y 0: the
+   outputs quantized alone. */
+typedef struct {
+    uint64_t a, b, sum, gamma, y, q, dx, xs;
+    uint32_t rows, k, bv;
+    float eps;
+    uint32_t tiled, pad;            /* q in tiles (SPG_TILED_AT()) */
+} SpgBnormPush;
+
+/* bmmp.comp, bdotp.comp: bmm's and bdot's products (SpgBdotPush) of weights packed as sessions keep them
+   (Spingalett.GpuPack.c; w, 16 bytes more after them; stride SPG_PACK_ROW()). bmm's spec 1, bdot's spec 3 non-zero.
+   bmmp: groups of 64 rows by spg_packed_cols() weights.
+   A packed row of k values of block type t: its codes (SPG_PACK_CODES() bytes), then what else its blocks hold
+   (SPG_PACK_AUX() bytes: scales as float16, minima, fifth bits), the row a multiple of 16 bytes (0: a type kept as
+   stored). */
+#define SPG_PACK_CODES(t, k) ((t) == SPG_B_Q8_0 ? (k) : (t) == SPG_B_Q6_K ? (k) / 2u + (k) / 4u : (k) / 2u)
+#define SPG_PACK_AUX(t, k) \
+    ((t) == SPG_B_Q8_0 || (t) == SPG_B_Q4_0 || (t) == SPG_B_IQ4_NL ? (k) / 16u : (t) == SPG_B_Q4_1 ? (k) / 8u : \
+     (t) == SPG_B_Q5_0 ? (k) / 8u + (k) / 16u : (t) == SPG_B_Q5_1 ? (k) / 4u : \
+     (t) == SPG_B_Q4_K ? (k) / 16u : (t) == SPG_B_IQ4_XS ? (k) / 32u : (t) == SPG_B_Q5_K ? (k) / 8u + (k) / 16u : \
+     (t) == SPG_B_Q6_K ? (k) / 16u + (k) / 128u : 0u)
+#define SPG_PACK_ROW(t, k) (SPG_PACK_AUX(t, k) ? (SPG_PACK_CODES(t, k) + SPG_PACK_AUX(t, k) + 15u) & ~15u : 0u)
+
+/* bdot.comp: rows of activations quantized by bquant times a linear layer's weights of a block precision (TYPE: the
+   precision less SPINGALETT_PRECISION_Q8_0), y[r][j] = bias[j] + spingalett_block_dot() of row j, the bits of the CPU:
+   a row of weights `stride` bytes of whole blocks as GGUF stores them, k values; rows r0 to r0 + rows - 1 of the
+   bquant arrays (SPG_BDOT_ROWS at most a dispatch), y's rows ldy floats apart. A warp a row of weights. Then the
+   activation of spec 2 (ActivationFunction, 0: none), and with e0 the product by e0's value at y's place (a gated
+   unit's other half). The packed kernels' pairs (bmmp's spec 3, bdotp's spec 4): a gated unit's two layers, rows 2j
+   and 2j + 1 of the weights (n of them) and of the biases, the second's sum times the first's activated, at y's j.
+   bmm (every row at once, on the matrix units) reads the codes q of SPG_BMM_TILED() types in tiles (SPG_TILED_AT()). */
+typedef struct {
+    uint64_t w, q, dx, xs, bias, y, e0;
+    uint32_t rows, n, k, stride, r0, ldy;
+} SpgBdotPush;
+#define SPG_BDOT_ROWS 8u
+enum { SPG_B_Q8_0, SPG_B_Q4_0, SPG_B_Q4_1, SPG_B_Q5_0, SPG_B_Q5_1, SPG_B_Q2_K, SPG_B_Q3_K, SPG_B_Q4_K, SPG_B_Q5_K,
+       SPG_B_Q6_K, SPG_B_IQ4_NL, SPG_B_IQ4_XS, SPG_B_TYPES };
+
+/* bembed.comp: the embedding of a session's rows: y[r] = (the table's row of token[r] decoded as the CPU decodes it,
+   zeros for a token out of [0, vocabulary)) times scale (0: none), plus the positions' row info[2 r + 1] of
+   `positions` (0: none). The table's rows `stride` bytes of TYPE: SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, or
+   SPG_EMB_BLOCK + a block type; or SPG_EMB_PACKED + a block type, packed as sessions keep it (Spingalett.GpuPack.c:
+   stride the bytes of a row's codes). A thread a value. */
+typedef struct {
+    uint64_t table, token, info, positions, y;
+    uint32_t rows, d, stride, type, vocabulary;
+    float scale;
+} SpgBembedPush;
+enum { SPG_EMB_F32, SPG_EMB_F16, SPG_EMB_BF16, SPG_EMB_BLOCK = 16, SPG_EMB_PACKED = 32 };
+
+/* kvattn.comp: a session's attention over the keys and values it keeps. PREP: a warp a row and head of the rows'
+   queries, keys and values x [rows][(heads + 2 kv) head]: each query and key RMS-normalized by gq, gk (0: none) then
+   rotated by the table of cosines then sines [max_length][rot / 2] (rot 0: none) at its row's position; the queries to
+   q [rows][heads][head], the keys and values into their caches [sequence][kv][max_length][head] at the position.
+   ATTEND: a warp a row and query head: its query over the keys of its sequence from position p + 1 - attended to p
+   (window: the last `window`, 0: all), the scores times scale, a softmax, the values' weighted sum to y [rows][heads
+   head]. info [rows]: each row's sequence and position. With half, the caches of bfloat16 (PREP writes them so, rounded
+   to the nearest, ties to even; ATTEND reads floats only); with half_q, PREP's queries so (for gflash, which rounds
+   them so as it reads them). */
+typedef struct {
+    uint64_t x, q, keys, values, y, table, gq, gk, info;
+    uint32_t rows, heads, kv, head, rot, window, max_length, op;
+    float eps, scale;
+    uint32_t half, half_q;
+    uint32_t gammas, pad;           /* Vulkan's: gq and gk hold gammas (0: they, and a table without rot, are any address:
+                                       lavapipe loads through a uniform address on a branch not taken) */
+} SpgKvattnPush;
+enum { SPG_KV_PREP, SPG_KV_ATTEND };
+
+/* flash.comp with CACHE: FORWARD of a run of `cells` tokens of a sequence at consecutive positions over its caches. x: the
+   prepared queries of the run's rows, in bfloat16 with HALF, row after row; dy, dx: the keys and values
+   [sequences][kv][max_length][d]; n: max_length; stats: the sequence and position of the run's first row (info, read as
+   the commands run); table any address. */
+typedef struct {
+    uint64_t x, y, dy, dx, stats, table;
+    uint32_t n, cells, heads, kv, d, flags;
+    float scale;
+    uint32_t window;
+} SpgFlashCachePush;
+
 /* wqmv.comp: products of rows of activations with a linear layer's weights kept as integer codes (INT8, INT4, INT2:
    BITS) and a scale a row of weights, the codes widened in registers: y[r][n] = act(bias[n] + scale[n] sum_k
    x[r][k] code[n][k]) for the `rows` rows from r0 on (SPG_WQ_ROWS at most). A row of codes takes `stride` bytes (a
@@ -246,6 +350,138 @@ typedef struct {
     float max_norm;
 } SpgSumsqPush;
 enum { SPG_SUMSQ_PARTIAL, SPG_SUMSQ_CLIP };
+
+/* gew.comp: the element-wise operators of graphs (Spingalett.GpuGraph.c): output value i = OP(a, b, c) at its position,
+   each operand read through its strides over the output's axes (0 where it broadcasts), SPG_GEW_AXES of them at most
+   after merging (innermost last, sizes 1 before fewer). Spec: OP, TYPES (the types of a, b, c and y, four bits each,
+   from the lowest), FLAGS (two bits an operand, a's lowest: 0 through its strides, 1 at the output's index, 2 its first
+   value only). Unary operators below SPG_GEW_ADD, binary below SPG_GEW_WHERE. */
+#define SPG_GEW_AXES 4u
+typedef struct {
+    uint64_t y, a, b, c;
+    uint32_t total, pad;
+    uint32_t dims[SPG_GEW_AXES];
+    uint32_t sa[SPG_GEW_AXES], sb[SPG_GEW_AXES], sc[SPG_GEW_AXES];
+    float alpha, beta;
+} SpgGewPush;
+enum { SPG_T_F32, SPG_T_U8, SPG_T_I32, SPG_T_I64, SPG_T_BOOL, SPG_T_I8, SPG_T_BF16 };     /* (bfloat16: read only) */
+enum {
+    SPG_GEW_COPY, SPG_GEW_NEG, SPG_GEW_ABS, SPG_GEW_EXP, SPG_GEW_LOG, SPG_GEW_SQRT, SPG_GEW_RECIPROCAL, SPG_GEW_SIGMOID,
+    SPG_GEW_TANH, SPG_GEW_RELU, SPG_GEW_LEAKY, SPG_GEW_ELU, SPG_GEW_SELU, SPG_GEW_GELU, SPG_GEW_GELU_TANH, SPG_GEW_SILU,
+    SPG_GEW_HARD_SIGMOID, SPG_GEW_HARD_SWISH, SPG_GEW_SOFTPLUS, SPG_GEW_SOFTSIGN, SPG_GEW_SIN, SPG_GEW_COS, SPG_GEW_ERF,
+    SPG_GEW_FLOOR, SPG_GEW_CEIL, SPG_GEW_ROUND, SPG_GEW_SIGN, SPG_GEW_CLIP, SPG_GEW_NOT, SPG_GEW_ISNAN, SPG_GEW_ISINF,
+    SPG_GEW_MISH, SPG_GEW_CELU, SPG_GEW_THRESHOLDED_RELU, SPG_GEW_TO_HALF, SPG_GEW_TO_BF16, SPG_GEW_AFFINE,
+    SPG_GEW_ADD = 48, SPG_GEW_SUB, SPG_GEW_MUL, SPG_GEW_DIV, SPG_GEW_POW, SPG_GEW_MAX, SPG_GEW_MIN, SPG_GEW_PRELU,
+    SPG_GEW_EQUAL, SPG_GEW_LESS, SPG_GEW_LESS_EQUAL, SPG_GEW_GREATER, SPG_GEW_GREATER_EQUAL, SPG_GEW_AND, SPG_GEW_OR,
+    SPG_GEW_XOR, SPG_GEW_FMOD, SPG_GEW_MOD,
+    SPG_GEW_WHERE = 96
+};
+
+/* gcopy.comp: values copied through strides (Transpose, Slice, Concat, Split, Expand, Tile and Pad of graphs): value i
+   of the dispatch, at its coordinates over SPG_COPY_AXES axes (innermost last, sizes 1 before fewer), is
+   x[base + sum c[d] sx[d]] written to y[sum c[d] sy[d]] (strides in elements; x's may be negative, base keeping its
+   offsets from x's address, its lowest value read, at 0 and above). Spec: SIZE (bytes an element: 1, 2 (CUDA's), 4, 8 or
+   16). */
+#define SPG_COPY_AXES 6u
+typedef struct {
+    uint64_t y, x;
+    uint32_t total, base;
+    uint32_t dims[SPG_COPY_AXES];
+    int32_t sx[SPG_COPY_AXES], sy[SPG_COPY_AXES];
+} SpgCopyPush;
+
+/* gcvt.comp: floats copied as gcopy copies them (SpgCopyPush, its strides in elements), each rounded to bfloat16 (to
+   the nearest, ties to even) as it is written: the operands of products on the matrix units. */
+
+/* ggather.comp: Gather of graphs: y[o][j][e] = x[o][idx[j]][e] over `outer` x count x inner values (an index below 0
+   counts from the axis's end; one outside it gives zeros). Spec: SIZE (bytes an element: 1, 4 or 8), the indices'
+   type (SPG_T_I32 or SPG_T_I64). */
+typedef struct {
+    uint64_t y, x, idx;
+    uint32_t total, inner, count, axis;
+} SpgGatherPush;
+
+/* grow.comp: operators of graphs over rows: row q of outer x inner (o = q / inner, i = q % inner) holds the len values
+   x[(o len + l) inner + i]; TPR threads take a row (1 where inner is above 1: neighbouring threads then read
+   neighbouring rows), each its values l = lane, lane + TPR, ... in order, their partial results combined in a fixed
+   tree. Reductions write a value a row to y (ArgMax and ArgMin an int64), the others a row of len values (LayerNorm
+   with its means and inverse deviations at aux, rows each). Spec: OP (SPG_ROW_*), TPR. */
+typedef struct {
+    uint64_t x, y, a, b, aux;
+    uint32_t outer, len, inner, rows;
+    uint32_t groups, cpg, pix, flags;       /* GroupNorm: groups, channels a group, values a channel */
+    float eps;
+    uint32_t act;                   /* GroupNorm: the activation of its outputs (ActivationFunction) */
+} SpgRowPush;
+enum {
+    SPG_ROW_SUM, SPG_ROW_MEAN, SPG_ROW_MAX, SPG_ROW_MIN, SPG_ROW_PROD, SPG_ROW_L1, SPG_ROW_L2, SPG_ROW_SUMSQ,
+    SPG_ROW_LOGSUMEXP, SPG_ROW_LOGSUM, SPG_ROW_ARGMAX, SPG_ROW_ARGMIN,
+    SPG_ROW_SOFTMAX = 16, SPG_ROW_LOGSOFTMAX, SPG_ROW_HARDMAX, SPG_ROW_LAYERNORM, SPG_ROW_RMSNORM, SPG_ROW_GROUPNORM,
+    SPG_ROW_GROUPNORM_LAST          /* channels last: row (batch, group) of pix pixels' cpg channels, every groups cpg
+                                       values a pixel */
+};
+#define SPG_ROW_LAST     1u         /* ArgMax, ArgMin: the last of equal values */
+#define SPG_ROW_A_ONE    2u         /* LayerNorm, RMSNorm: one scale for every column (else a column each) */
+#define SPG_ROW_B        4u         /* LayerNorm: a bias (b), like the scale */
+#define SPG_ROW_B_ONE    8u
+#define SPG_ROW_STATS    16u        /* LayerNorm: the means and inverse deviations at aux */
+#define SPG_ROW_BY_GROUP 32u        /* GroupNorm: the scale and bias a group (opset 18), else a channel */
+#define SPG_ROW_HALF_Y   64u        /* LayerNorm, RMSNorm, GroupNorm: y kept as bfloat16 (CUDA's) */
+
+/* gattn.comp: FusedAttention of graphs, softmax(Where(keep, scale Q K^T, fill) + mask) V in blocks of SPG_GATTN_ROWS
+   queries of a batch and head (block_y: batch heads + head), over tiles of keys, the softmax online. Q, K, V and Y are
+   rows of d values (a unit's head size D at most), their batches, heads and rows strides[] apart (elements: queries
+   0..2, keys 3..5, values 6..8, outputs 9..11); the mask (floats added, or booleans that leave keys out) and keep
+   (booleans: Where's condition) strides 12..15 and 16..19 over batch, head, query and key (0 where they broadcast),
+   a key's values strides[20] apart (K^T's columns, else 1). A row of no key gives zeros with SAFE, else NaN. Spec: none (a unit per D: gattn_d32, _d64, _d128). */
+typedef struct {
+    uint64_t q, k, v, y, mask, keep, strides;
+    uint32_t queries, keys, d, heads;
+    float scale, fill;
+    uint32_t flags, pad;
+    uint64_t info;                  /* gflash with CACHE: a session's rows' sequences and positions (kvattn's info) */
+    uint32_t group, window;         /* and the query heads a head of keys and values, the window (0: none) */
+} SpgGattnPush;
+#define SPG_GATTN_ROWS 64u
+#define SPG_GATTN_THREADS 128u
+#define SPG_GATTN_MASK  1u          /* floats added to the scores */
+#define SPG_GATTN_BOOL  2u          /* booleans: false leaves a key out */
+#define SPG_GATTN_KEEP  4u
+#define SPG_GATTN_SAFE  8u
+#define SPG_GATTN_VEC   16u         /* heads of exactly D values, rows and addresses in eights: loads of eight */
+#define SPG_GATTN_HALF_Q 32u        /* gflash: queries, keys, values, the output kept as bfloat16 */
+#define SPG_GATTN_HALF_K 64u
+#define SPG_GATTN_HALF_V 128u
+#define SPG_GATTN_HALF_Y 256u
+#define SPG_GATTN_CACHE 512u        /* gflash: a session's prompt over its caches: the queries rows of one sequence at
+                                       consecutive positions (info's first row's on), the keys and values its caches
+                                       (strides[3] a sequence's, [4] a head's), each query over the keys at its position
+                                       and before (the last `window` of them) */
+
+/* gpool.comp: MaxPool, AveragePool and LpPool of graphs over channels-first maps of up to three spatial axes (as three,
+   the first of size 1 for fewer): output value (row, o0, o1, o2) of rows (batch x channels) maps from its window. */
+typedef struct {
+    uint64_t x, y;
+    uint32_t rows, total;
+    uint32_t in[3], out[3], k[3], s[3], pb[3], pe[3], dil[3];
+    uint32_t flags;
+    float p;
+} SpgPoolGPush;
+#define SPG_GPOOL_MAX     1u
+#define SPG_GPOOL_LP      2u
+#define SPG_GPOOL_INCLUDE 4u        /* AveragePool: padding counted (count_include_pad) */
+#define SPG_GPOOL_LAST    8u        /* channels last ([N, H, W, C]): rows the channels, the batch the rest */
+
+/* gresize.comp: Resize of graphs through the taps of ir_resize_taps(): output value i at (o0, o1, o2, o3) (four axes,
+   sizes 1 before fewer) is the sum over every axis d's T[d] taps of the product of their weights times the input at
+   their indices (an index below 0: the extrapolation value); the taps a pair (index, weight bits) each, axis d's from
+   pair at[d] on, T[d] an output index. */
+typedef struct {
+    uint64_t x, y, taps;
+    uint32_t total, pad;
+    uint32_t dims[4], xs[4], T[4], at[4];
+    float extrapolation, pad2;
+} SpgResizePush;
 
 #define SPG_GEO_HEADER  16u         /* uints before the taps of a convolution's geometry (gemm.comp) */
 #define SPG_STEP_HEADER 20u         /* uints of the step header (common.glsl) */

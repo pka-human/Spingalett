@@ -83,6 +83,8 @@ bool spg_gpu_open(void);
 const char *spg_gpu_device_name(void);
 /* Bytes of the device's largest device-local memory heap (0 without a device). */
 uint64_t spg_gpu_memory(void);
+/* Bytes of that memory free now, as far as the driver tells (without a word from it, the whole heap). */
+uint64_t spg_gpu_memory_free(void);
 /* Bytes of shared memory a workgroup may use; the subgroup size (CUDA: the warp's). */
 uint32_t spg_gpu_shared_memory(void);
 uint32_t spg_gpu_subgroup_size(void);
@@ -150,6 +152,7 @@ typedef struct {
     bool (*open)(void);
     const char *(*device_name)(void);
     uint64_t (*memory)(void);
+    uint64_t (*memory_free)(void);
     uint32_t (*shared_memory)(void);
     uint32_t (*subgroup_size)(void);
     uint32_t (*max_workgroups)(uint32_t axis);

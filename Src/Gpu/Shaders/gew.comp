@@ -1,0 +1,283 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * The element-wise operators of graphs (Spingalett.GpuGraph.c): output value i is OP of the operands at its position,
+ * each read through its strides over the output's axes (0 where it broadcasts), at i where its layout is the
+ * output's, or its first value only (FLAGS, two bits an operand). Operands and the output are floats, bytes (booleans),
+ * or integers of 32 or 64 bits (TYPES, four bits each: a, b, c, y), computed as floats. As gew.cu.
+ */
+
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+
+layout(constant_id = 0) const uint OP = 0;
+layout(constant_id = 1) const uint TYPES = 0;
+layout(constant_id = 2) const uint FLAGS = 0;
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer U8 { uint8_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer I32 { int v[]; };
+
+#define AXES 4
+layout(push_constant) uniform Push {
+    F32 y, a, b, c;
+    uint total, pad;
+    uint dims[AXES];
+    uint sa[AXES], sb[AXES], sc[AXES];
+    float alpha, beta;
+} p;
+
+#define T_F32  0u
+#define T_U8   1u
+#define T_I32  2u
+#define T_I64  3u
+#define T_BOOL 4u
+#define T_I8   5u
+#define T_BF16 6u
+
+/* the codes of Spingalett.GpuPush.h's SPG_GEW_* */
+#define COPY 0u
+#define NEG 1u
+#define ABS 2u
+#define EXP 3u
+#define LOG 4u
+#define SQRT 5u
+#define RECIPROCAL 6u
+#define SIGMOID 7u
+#define TANH 8u
+#define RELU 9u
+#define LEAKY 10u
+#define ELU 11u
+#define SELU 12u
+#define GELU 13u
+#define GELU_TANH 14u
+#define SILU 15u
+#define HARD_SIGMOID 16u
+#define HARD_SWISH 17u
+#define SOFTPLUS 18u
+#define SOFTSIGN 19u
+#define SIN 20u
+#define COS 21u
+#define ERF 22u
+#define FLOOR 23u
+#define CEIL 24u
+#define ROUND 25u
+#define SIGN 26u
+#define CLIP 27u
+#define NOT 28u
+#define ISNAN 29u
+#define ISINF 30u
+#define MISH 31u
+#define CELU 32u
+#define THRESHOLDED_RELU 33u
+#define TO_HALF 34u
+#define TO_BF16 35u
+#define AFFINE 36u
+#define ADD 48u
+#define SUB 49u
+#define MUL 50u
+#define DIV 51u
+#define POW 52u
+#define MAX 53u
+#define MIN 54u
+#define PRELU 55u
+#define EQUAL 56u
+#define LESS 57u
+#define LESS_EQUAL 58u
+#define GREATER 59u
+#define GREATER_EQUAL 60u
+#define AND 61u
+#define OR 62u
+#define XOR 63u
+#define FMOD 64u
+#define MOD 65u
+#define WHERE 96u
+
+float load(F32 x, uint i, uint type) {
+    if (type == T_U8 || type == T_BOOL) return float(uint(U8(x).v[i]));
+    if (type == T_I8) return float(int(int8_t(U8(x).v[i])));
+    if (type == T_I32) return float(I32(x).v[i]);
+    if (type == T_I64) {                    /* (the low word, signed: indices and masks) */
+        return float(I32(x).v[2u * i]);
+    }
+    if (type == T_BF16) {                   /* (two a word: no 16-bit storage needed) */
+        const uint w = uint(I32(x).v[i >> 1u]);
+        return uintBitsToFloat((i & 1u) != 0u ? w & 0xFFFF0000u : w << 16u);
+    }
+    return x.v[i];
+}
+
+void store(F32 y, uint i, uint type, float v) {
+    int w = isnan(v) ? 0 : v >= 2147483648.0 ? 2147483647 : v <= -2147483648.0 ? -2147483647 - 1 : int(v);
+    if (type == T_BOOL) {
+        U8(y).v[i] = uint8_t(v != 0.0 ? 1u : 0u);
+    } else if (type == T_U8 || type == T_I8) {
+        U8(y).v[i] = uint8_t(uint(w) & 255u);
+    } else if (type == T_I32 || type == T_I64) {
+        if (type == T_I32) {
+            I32(y).v[i] = w;
+        } else {
+            I32(y).v[2u * i] = w;
+            I32(y).v[2u * i + 1u] = w < 0 ? -1 : 0;
+        }
+    } else {
+        y.v[i] = v;
+    }
+}
+
+/* the argument reduced by multiples of 2 pi in three parts (Cody and Waite) */
+float reduce_2pi(float x) {
+    float k = roundEven(x * 0.15915494309189535);
+    float r = fma(-k, 6.28318548202514648, x);
+    r = fma(-k, -1.74845560e-7, r);
+    return fma(-k, -2.12823051e-15, r);
+}
+
+float pow_(float x, float y) {
+    if (y == 2.0) return x * x;
+    if (y == 1.0) return x;
+    if (y == 0.0) return 1.0;
+    if (y == 0.5) return sqrt(x);
+    if (y == 3.0) return x * x * x;
+    if (y == -1.0) return 1.0 / x;
+    bool integer = roundEven(y) == y, odd = integer && mod(abs(y), 2.0) == 1.0;
+    if (x < 0.0 && !integer) return uintBitsToFloat(0x7FC00000u);
+    float a = abs(x);
+    if (a == 0.0) return y > 0.0 ? (odd && x < 0.0 ? -0.0 : 0.0) : uintBitsToFloat(0x7F800000u);
+    float m = exp2(y * log2(a));
+    return x < 0.0 && odd ? -m : m;
+}
+
+/* a / b rounded as IEEE division rounds (GLSL's may be off by 2.5 ulp): the quotient corrected by its residual */
+float div_(float a, float b) {
+    float q = a / b;
+    if (isinf(q) || isnan(q) || q == 0.0 || isinf(b)) return q;
+    return fma(fma(-q, b, a), 1.0 / b, q);
+}
+
+/* C's fmod: the remainder of a truncated quotient, with its special cases */
+float fmod_(float a, float b) {
+    if (isnan(a) || isnan(b) || isinf(a) || b == 0.0) return uintBitsToFloat(0x7FC00000u);
+    if (isinf(b) || a == 0.0) return a;
+    return fma(-b, trunc(div_(a, b)), a);
+}
+
+float softplus_(float x) { return x > 20.0 ? x : log(1.0 + exp(x)); }
+
+/* float16, to the nearest, ties to even, and back */
+float to_half(float x) { return unpackHalf2x16(packHalf2x16(vec2(x, 0.0))).x; }
+float to_bf16_(float x) {
+    uint u = floatBitsToUint(x);
+    if (isnan(x)) return uintBitsToFloat(u | 0x00400000u);
+    return uintBitsToFloat(((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) << 16);
+}
+
+float unary(float a) {
+    switch (OP) {
+        case COPY: return a;
+        case NEG: return -a;
+        case ABS: return abs(a);
+        case EXP: return exp(a);
+        case LOG: return log(a);
+        case SQRT: return sqrt(a);
+        case RECIPROCAL: return div_(1.0, a);
+        case SIGMOID: return 1.0 / (1.0 + exp(-a));
+        case TANH: return tanh_(a);
+        case RELU: return a > 0.0 ? a : 0.0;
+        case LEAKY: return a >= 0.0 ? a : p.alpha * a;
+        case ELU: return a >= 0.0 ? a : p.alpha * (exp(a) - 1.0);
+        case SELU: return p.beta * (a > 0.0 ? a : p.alpha * (exp(a) - 1.0));
+        case GELU: return 0.5 * a * (1.0 + erf_(a * 0.70710678118654752));
+        case GELU_TANH: return 0.5 * a * (1.0 + tanh_(0.79788456080286536 * (a + 0.044715 * a * a * a)));
+        case SILU: return a / (1.0 + exp(-p.alpha * a));
+        case HARD_SIGMOID: return max(0.0, min(1.0, p.alpha * a + p.beta));
+        case HARD_SWISH: return a * max(0.0, min(1.0, a / 6.0 + 0.5));
+        case SOFTPLUS: return softplus_(a);
+        case SOFTSIGN: return a / (1.0 + abs(a));
+        case SIN: return sin(reduce_2pi(a));
+        case COS: return cos(reduce_2pi(a));
+        case ERF: return erf_(a);
+        case FLOOR: return floor(a);
+        case CEIL: return ceil(a);
+        case ROUND: return roundEven(a);
+        case SIGN: return a > 0.0 ? 1.0 : a < 0.0 ? -1.0 : 0.0;
+        case CLIP: { float v = a < p.alpha ? p.alpha : a; return v > p.beta ? p.beta : v; }
+        case NOT: return a == 0.0 ? 1.0 : 0.0;
+        case ISNAN: return isnan(a) ? 1.0 : 0.0;
+        case ISINF: return isinf(a) && ((a > 0.0 && p.alpha != 0.0) || (a < 0.0 && p.beta != 0.0)) ? 1.0 : 0.0;
+        case MISH: return a * tanh_(softplus_(a));
+        case CELU: return max(0.0, a) + min(0.0, p.alpha * (exp(a / p.alpha) - 1.0));
+        case THRESHOLDED_RELU: return a > p.alpha ? a : 0.0;
+        case TO_HALF: return to_half(a);
+        case TO_BF16: return to_bf16_(a);
+        case AFFINE: return fma(a, p.alpha, p.beta);
+        default: return a;
+    }
+}
+
+float binary(float a, float b) {
+    switch (OP) {
+        case ADD: return a + b;
+        case SUB: return a - b;
+        case MUL: return a * b;
+        case DIV: return div_(a, b);
+        case POW: return pow_(a, b);
+        case MAX: return isnan(a) || isnan(b) ? uintBitsToFloat(0x7FC00000u) : a > b ? a : b;
+        case MIN: return isnan(a) || isnan(b) ? uintBitsToFloat(0x7FC00000u) : a < b ? a : b;
+        case PRELU: return a >= 0.0 ? a : a * b;
+        case EQUAL: return a == b ? 1.0 : 0.0;
+        case LESS: return a < b ? 1.0 : 0.0;
+        case LESS_EQUAL: return a <= b ? 1.0 : 0.0;
+        case GREATER: return a > b ? 1.0 : 0.0;
+        case GREATER_EQUAL: return a >= b ? 1.0 : 0.0;
+        case AND: return a != 0.0 && b != 0.0 ? 1.0 : 0.0;
+        case OR: return a != 0.0 || b != 0.0 ? 1.0 : 0.0;
+        case XOR: return (a != 0.0) != (b != 0.0) ? 1.0 : 0.0;
+        case FMOD: return fmod_(a, b);
+        case MOD: {
+            float m = fmod_(a, b);
+            return m != 0.0 && ((m < 0.0) != (b < 0.0)) ? m + b : m;
+        }
+        default: return a;
+    }
+}
+
+uint index_of(uint i, uvec4 c, uint s0, uint s1, uint s2, uint s3, uint mode) {
+    if (mode == 1u) return i;
+    if (mode == 2u) return 0u;
+    return c.x * s0 + c.y * s1 + c.z * s2 + c.w * s3;
+}
+
+void main() {
+    /* (variables, not constants: glslc's optimizer fails on the expressions of specialization constants) */
+    uint types = TYPES, flags = FLAGS;
+    uint ta = types & 15u, tb = (types >> 4) & 15u, tc = (types >> 8) & 15u, ty = (types >> 12) & 15u;
+    uint ma = flags & 3u, mb = (flags >> 2) & 3u, mc = (flags >> 4) & 3u;
+    bool strided = ma == 0u || (OP >= ADD && mb == 0u) || (OP >= WHERE && mc == 0u);
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += stride) {
+        uvec4 c = uvec4(0u);
+        if (strided) {
+            uint r = i;
+            c.w = r % p.dims[3]; r /= p.dims[3];
+            c.z = r % p.dims[2]; r /= p.dims[2];
+            c.y = r % p.dims[1];
+            c.x = r / p.dims[1];
+        }
+        float a = load(p.a, index_of(i, c, p.sa[0], p.sa[1], p.sa[2], p.sa[3], ma), ta), v;
+        if (OP < ADD) {
+            v = unary(a);
+        } else if (OP < WHERE) {
+            v = binary(a, load(p.b, index_of(i, c, p.sb[0], p.sb[1], p.sb[2], p.sb[3], mb), tb));
+        } else {
+            v = a != 0.0 ? load(p.b, index_of(i, c, p.sb[0], p.sb[1], p.sb[2], p.sb[3], mb), tb)
+                         : load(p.c, index_of(i, c, p.sc[0], p.sc[1], p.sc[2], p.sc[3], mc), tc);
+        }
+        store(p.y, i, ty, v);
+    }
+}

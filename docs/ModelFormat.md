@@ -14,7 +14,9 @@ linear layers tied to an embedding's table, attention that ignores padding or re
 cross-attention and embeddings of part of their input (1.3 on), version 10 for layers whose weights are in a
 block precision, one of GGUF's quantization types (1.4 on). `spingalett_load()` and `spingalett_load_from_memory()`
 read versions 1 to 10. Version 11 (1.5 on) holds a graph of operators instead of a network of layers
-(**Graphs of operators**): `spingalett_graph_save()` writes it and `spingalett_graph_open()` reads it.
+(**Graphs of operators**): `spingalett_graph_save()` writes it and `spingalett_graph_open()` reads it; version 12
+(1.6 on) is version 11 whose nodes use the attributes of 1.6 that a reader of version 11 would misread (maps
+channels last, a group normalization's activation, attention of views), which a writer gives only such graphs.
 A checkpoint (`spingalett_save_checkpoint()`, 1.4 on) is an image of one of these versions with a
 record of a training run after it, which readers of the image ignore (**Checkpoints**).
 
@@ -46,7 +48,8 @@ the network, as now, and every 1.x engine runs every file whose layers it has. C
 (activations, layer kinds, precisions) keep their values. Version 8 (Spingalett 1.2), version 9
 (Spingalett 1.3) and version 10 (Spingalett 1.4) are such additions. Version 11 (Spingalett 1.5) is a format
 of its own after the same magic: its operators' codes keep their values, new operators take new codes, and every
-1.x reader of graphs opens every file whose operators it has.
+1.x reader of graphs opens every file whose operators it has. Version 12 (Spingalett 1.6) is version 11's layout
+with attributes whose meaning a 1.5 reader does not know, so that it refuses the file rather than misread it.
 
 All integers are little-endian. "float" means an IEEE 754 binary32 stored as its bit pattern.
 CRC-32 is the IEEE polynomial (0xEDB88320, reflected, initial value and final XOR 0xFFFFFFFF), as
@@ -368,9 +371,9 @@ single precision):
 A file with bytes after its image that are not a record of this length, version and checksum does not
 load as a checkpoint.
 
-## Graphs of operators (version 11)
+## Graphs of operators (versions 11 and 12)
 
-A file of version 11 holds a graph (`docs/Graphs.md`): values (the graph's inputs, its constants and what its
+A file of version 11 or 12 holds a graph (`docs/Graphs.md`): values (the graph's inputs, its constants and what its
 nodes compute), nodes of operators that read and compute values, and the graph's inputs and outputs. It starts
 with the magic and the version of the other versions and lays out the rest as follows.
 
@@ -385,7 +388,7 @@ NUL; a string is given by its offset in the strings, and offset 0 holds the empt
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 6 | magic `SLETTM` |
-| 6 | 2 | format version, 11 |
+| 6 | 2 | format version, 11, or 12 where nodes use 1.6's attributes |
 | 8 | 4 | `V`: values |
 | 12 | 4 | `N`: nodes |
 | 16 | 4 | `I`: the graph's inputs |
@@ -461,8 +464,15 @@ the constant `W` (K x N; with the integer attribute `trans_b` 1, N x K and taken
 the activation of the integer attribute `activation`, an `ActivationFunction`), **FusedAttention** (`Q`, `K`, `V`, an optional mask: softmax(`Q K^T` times the float
 attribute `scale` plus the mask) `V`, the softmax over the keys, rows of no keys 0 with the integer attribute
 `safe` 1; with `layout` 0 `Q` (..., S, D), the second input `K^T` (..., D, T) and `V` (..., T, Dv) over broadcast
-batches, with `layout` 1 `Q` (B, S, H, D), `K` (B, T, H or 1, D) and `V` (B, T, H or 1, Dv) into (B, S, H, Dv)), and
-Conv's integer attribute `activation`, applied after the convolution and its bias. Codes:
+batches, with `layout` 1 `Q` (B, S, H, D), `K` (B, T, H or 1, D) and `V` (B, T, H or 1, Dv) into (B, S, H, Dv); with
+`layout` 2 (version 12) Q, K and V read in their inputs (which may be one value) where the 18 integers `views` put
+them: B, H, S, T, D and Dv, then for each of Q, K and V an offset in elements and its strides over B, over H and
+between rows (a query's, a key's, a value's), the values of a row contiguous; the output has the integers `shape`,
+(B, S, H, Dv) in memory with the integer `heads` 1, else (B, H, S, Dv)), and Conv's integer attribute `activation`,
+applied after the convolution and its bias. Version 12 adds the integer attribute `channels_last` 1 of Conv,
+MaxPool, AveragePool, GroupNormalization and InstanceNormalization (their maps [N, spatial..., C] in and out, the
+filters still ONNX's), and the `activation` of GroupNormalization and InstanceNormalization (after the scale and
+bias). Codes:
 
 | | | | | | |
 |---|---|---|---|---|---|
@@ -603,4 +613,5 @@ and decode as `q / 127`, `q / 7` and `q` times it. Reading such a file and savin
 version 3 file (`ModelTool convert`).
 
 Spingalett 0.5 and 0.6 read versions 1 to 3; version 4 appeared in 0.7, version 5 in 0.8,
-version 6 in 0.10, version 7 in 0.13, version 8 in 1.2, version 9 in 1.3, version 10 in 1.4 and version 11 in 1.5.
+version 6 in 0.10, version 7 in 0.13, version 8 in 1.2, version 9 in 1.3, version 10 in 1.4, version 11 in 1.5
+and version 12 in 1.6.

@@ -39,7 +39,7 @@ from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequenc
 
 import numpy as np
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 __all__ = [
     "Activation", "Loss", "Init", "Strategy", "Optimizer", "ComputeMode", "Precision",
@@ -607,7 +607,8 @@ class _SessionOptions(Structure):
     _fields_ = [
         ("max_length", c_uint32),
         ("sequences", c_uint32),
-        ("reserved", c_uint64 * _RESERVED),
+        ("gpu_memory", c_uint64),
+        ("reserved", c_uint64 * (_RESERVED - 1)),
     ]
 
 
@@ -2597,10 +2598,10 @@ class Model:
             raise ValueError(f"inputs have {x.shape[0]} rows and targets {y.shape[0]}; need the same, at least 1")
         return _metrics(_call(_model_evaluate, self._ptr, x.ctypes.data, y.ctypes.data, x.shape[0]))
 
-    def session(self, max_length: int = 0, sequences: int = 1) -> "Session":
+    def session(self, max_length: int = 0, sequences: int = 1, gpu_memory: int = 0) -> "Session":
         """A :class:`Session` of this causal language model: ``sequences`` sequences of at most
         ``max_length`` tokens (0: the model's window) run a token at a time with a key-value cache."""
-        return Session(self, max_length, sequences)
+        return Session(self, max_length, sequences, gpu_memory)
 
     def __repr__(self) -> str:
         if not getattr(self, "_ptr", None):
@@ -2626,10 +2627,10 @@ class Session:
             logits = s.feed([int(logits.argmax())])
     """
 
-    def __init__(self, model: Model, max_length: int = 0, sequences: int = 1):
+    def __init__(self, model: Model, max_length: int = 0, sequences: int = 1, gpu_memory: int = 0):
         model._model  # raise if closed
         self._owner = model                       # keeps the model alive
-        options = _SessionOptions(int(max_length), int(sequences))
+        options = _SessionOptions(int(max_length), int(sequences), int(gpu_memory))
         self._ptr = _call(_session_new, model._ptr, ctypes.byref(options))
         if not self._ptr:
             raise SpingalettError(-1, "could not create the session")

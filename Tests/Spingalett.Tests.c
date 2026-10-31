@@ -17,6 +17,9 @@
  * results are deterministic.
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L     /* setenv() */
+#endif
 #include <Spingalett/Spingalett.Short.h>    /* the names of 0.x, and Spingalett.h */
 #include "Spingalett.Network.h"      /* white-box: the network's arrays */
 #include "Spingalett.RuntimeData.h"  /* the samples of export-models */
@@ -6868,6 +6871,15 @@ static void tokenizer_cases(const char *name, const char *file, const char *expe
 
 /* ------------------------------------------------------------------------- graphs of operators */
 
+/* An environment variable set for the process (an empty value: as if unset, for the library's getenv() readers). */
+static void setenv_(const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 /* A tensor of Tests/Data/graph_cases.bin (Tests/make_graph_tests.py), pointing into the file's bytes. */
 typedef struct {
     char name[128];
@@ -6916,12 +6928,19 @@ static float case_float(const SpingalettTensor *t, uint64_t i) {
     return h & 0x8000 ? -v : v;
 }
 
-/* Every case of Tests/Data/graph_cases.bin: ONNX's conformance tests of single operators, each graph run on its
-   inputs against the reference's outputs (floats within the case's tolerances, integers and booleans exactly),
-   on one thread and on four, which give the same bits. */
-static void operator_cases(void) {
+/* Every case of Tests/Data/graph_cases.bin (ONNX's conformance tests of single operators) or graph_blocks.bin (small
+   networks, Tests/make_graph_tests.py), each graph run on its inputs against the reference's outputs (floats within
+   the case's tolerances, integers and booleans exactly), on one thread and on four, which give the same bits; with gpu
+   (COMPUTE_CUDA or COMPUTE_VULKAN) on the GPU, twice (the second run replays the first's plan), which give the same
+   bits; with bf16 there in bfloat16 (floats within 3% of the output's largest magnitude). */
+static void operator_cases(const char *name_of_file, ComputeMode gpu, bool bf16) {
+    const bool on_gpu = gpu == COMPUTE_CUDA || gpu == COMPUTE_VULKAN;
+    /* (on the GPU every node its kernels take, however small) */
+    if (on_gpu) setenv_("SPINGALETT_GRAPH_GPU_MIN", "0");
+    const PrecisionMode precision = spingalett_get_gpu_precision();
+    if (bf16) spingalett_set_gpu_precision(PRECISION_BFLOAT16);
     char path[512];
-    snprintf(path, sizeof path, "%s/graph_cases.bin", SPINGALETT_TEST_DATA_DIR);
+    snprintf(path, sizeof path, "%s/%s", SPINGALETT_TEST_DATA_DIR, name_of_file);
     size_t size = 0;
     uint8_t *file = read_all(path, &size);
     CHECK(file && size >= 12 && !memcmp(file, "SGCASES1", 8), "%s: no cases", path);
@@ -6960,15 +6979,27 @@ static void operator_cases(void) {
             parsed = case_tensors(file, &p, end, ins, &nin, MOST) && case_tensors(file, &p, end, refs, &nout, MOST);
         }
         CHECK(parsed, "graph_cases.bin: case %u malformed", c);
+        /* (SPINGALETT_TEST_CASES=1 names every case as it starts: which one crashed) */
+        if (getenv("SPINGALETT_TEST_CASES")) {
+            printf("    %s\n", name);
+            fflush(stdout);
+        }
         if (!parsed) break;
+        /* (SPINGALETT_TEST_CASE: the cases whose names hold it, alone) */
+        const char *only_case = getenv("SPINGALETT_TEST_CASE");
+        if (only_case && *only_case && !strstr(name, only_case)) continue;
         run++;
         SpingalettGraph *g = spingalett_graph_open(.data = model, .size = model_len);
         bool ok = g != NULL;
         const char *why = ok ? "" : spingalett_last_error_message();
         /* one thread first, then four: the same bits */
         for (int pass = 0; ok && pass < 2; pass++) {
-            spingalett_set_compute_mode(pass ? SPINGALETT_COMPUTE_OPENMP : SPINGALETT_COMPUTE_SINGLE_THREADED);
-            if (pass) spingalett_set_num_threads(4);
+            if (on_gpu) {
+                spingalett_set_compute_mode(gpu);
+            } else {
+                spingalett_set_compute_mode(pass ? SPINGALETT_COMPUTE_OPENMP : SPINGALETT_COMPUTE_SINGLE_THREADED);
+                if (pass) spingalett_set_num_threads(4);
+            }
             SpingalettTensor inputs[MOST];
             for (uint32_t k = 0; k < nin; k++) inputs[k] = ins[k].t;
             SpingalettTensor *o = pass ? again : outs;
@@ -6990,15 +7021,18 @@ static void operator_cases(void) {
                 const size_t bytes = (size_t)refs[k].bytes;
                 if (pass) {
                     ok = !bytes || !memcmp(first[k], got->data, bytes);
-                    if (!ok) why = "other bits on four threads";
+                    if (!ok) why = on_gpu ? "other bits when run again" : "other bits on four threads";
                     free(first[k]);
                     first[k] = NULL;
                     continue;
                 }
                 if (ref->dtype == SPINGALETT_DTYPE_FLOAT32 || ref->dtype == SPINGALETT_DTYPE_FLOAT16) {
+                    float most = 0.0f;
+                    for (uint64_t i = 0; bf16 && i < count; i++) most = fmaxf(most, fabsf(case_float(ref, i)));
                     for (uint64_t i = 0; ok && i < count; i++) {
                         const float a = case_float(got, i), b = case_float(ref, i);
-                        ok = (isnan(a) && isnan(b)) || a == b || fabsf(a - b) <= atol + rtol * fabsf(b);
+                        ok = (isnan(a) && isnan(b)) || a == b ||
+                             fabsf(a - b) <= atol + (bf16 ? 0.03f * most : rtol * fabsf(b));
                     }
                 } else {
                     ok = !bytes || !memcmp(got->data, ref->data, bytes);
@@ -7011,14 +7045,23 @@ static void operator_cases(void) {
         for (uint32_t k = 0; k < nout; k++) { free(first[k]); first[k] = NULL; }
         spingalett_set_compute_mode(mode);
         spingalett_set_num_threads(threads);
-        if (!ok && ++wrong <= 8) printf("  %s: %s\n", name, why);
+        if (!ok && ++wrong <= (getenv("SPINGALETT_TEST_ALL") ? 100000 : 8)) printf("  %s: %s\n", name, why);
         spingalett_graph_free(g);
     }
-    CHECK(!wrong, "%d of %d operator cases fail", wrong, run);
-    printf("  %d of ONNX's conformance cases\n", run);
+    if (on_gpu) setenv_("SPINGALETT_GRAPH_GPU_MIN", "");
+    spingalett_set_gpu_precision(precision);
+    CHECK(!wrong, "%d of %d cases of %s fail%s", wrong, run, name_of_file, on_gpu ? " on the GPU" : "");
+    printf("  %d cases of %s%s%s\n", run, name_of_file, on_gpu ? " on the GPU" : "", bf16 ? " in bfloat16" : "");
     free(ins);
     free(refs);
     free(file);
+}
+
+/* The cases of graphs on the GPU: ONNX's, then the blocks in single precision and in bfloat16. */
+static void graph_cases_gpu(ComputeMode gpu) {
+    operator_cases("graph_cases.bin", gpu, false);
+    operator_cases("graph_blocks.bin", gpu, false);
+    operator_cases("graph_blocks.bin", gpu, true);
 }
 
 /* Every case of Tests/Data/chat_cases.txt (Tests/make_chat_tests.py): a template of Tests/Data/chat rendering a
@@ -8133,6 +8176,154 @@ static _Atomic int coded_sessions;
 static void count_coded_sessions(LogLevel level, const char *message) {
     (void)level;
     if (strstr(message, "multiply the model's codes")) atomic_fetch_add(&coded_sessions, 1);
+}
+
+static _Atomic int image_sessions;
+static void count_image_sessions(LogLevel level, const char *message) {
+    (void)level;
+    if (strstr(message, "on the GPU, from the model's image")) atomic_fetch_add(&image_sessions, 1);
+}
+
+/* Language models of GGUF files on the GPU, from their images (Spingalett.GpuSession.c: GGUF's block types as blocks,
+   with the CPU's products of them; float16 and float weights): the logits of a prompt near the CPU session's (the block
+   products give its bits, the rest rounds otherwise: the next layers' quantized inputs may differ in a code), the same
+   token chosen at most positions, and the bits of a prompt fed at once those of its tokens fed one at a time; a copied
+   sequence rewound and fed again the bits of the first. */
+static void gpu_gguf_sessions(void) {
+    static const char *const files[] = {"gguf_quant", "gguf_qwen3", "gguf_llama3", "gguf_gemma3", "gguf_phi3",
+                                        "gguf_gpt2", "gguf_olmo2", "gguf_glm4"};
+    for (size_t f = 0; f < sizeof files / sizeof *files; f++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s.gguf", SPINGALETT_TEST_DATA_DIR, files[f]);
+        SpingalettModel *m = spingalett_model_open(.path = path, .context = 32);
+        CHECK(m, "gpu gguf session %s: no model (%s)", files[f], spingalett_last_error_message());
+        if (!m) continue;
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 3});
+        const uint32_t V = s ? spingalett_session_vocabulary(s) : 0, P = 24;
+        uint32_t tok[24];
+        for (uint32_t i = 0; i < P; i++) tok[i] = (i * 37u + 5u) % (V ? V : 1u);
+        float *cpu = (float *)malloc((size_t)P * V * sizeof(float)), *all = (float *)malloc((size_t)P * V * sizeof(float));
+        float *one = (float *)malloc((size_t)P * V * sizeof(float)), *rest = (float *)malloc((size_t)P * V * sizeof(float));
+        bool ok = s && cpu && all && one && rest &&
+                  spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = cpu, .all = true}, 1);
+        spingalett_session_free(s);
+        spingalett_set_compute_mode(gpu_mode);
+        spingalett_set_verbose(true);
+        spingalett_set_log_level(LOG_DEBUG);
+        spingalett_set_log_callback(count_image_sessions);
+        atomic_store(&image_sessions, 0);
+        s = ok ? spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 3}) : NULL;
+        spingalett_set_log_callback(NULL);
+        spingalett_set_log_level(LOG_INFO);
+        spingalett_set_verbose(false);
+        const bool image = atomic_load(&image_sessions) > 0;
+        ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = all, .all = true}, 1);
+        for (uint32_t i = 0; ok && i < P; i++)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 1, .tokens = tok + i, .count = 1,
+                                                                     .logits = one + (size_t)i * V}, 1);
+        ok = ok && spingalett_session_copy(s, 0, 2) && spingalett_session_rewind(s, 2, P / 2) &&
+             spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 2, .tokens = tok + P / 2, .count = P / 2,
+                                                                 .logits = rest, .all = true}, 1);
+        spingalett_session_free(s);
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        const double worst = ok ? gpu_max_scaled(cpu, all, (size_t)P * V) : 1.0;
+        uint32_t same = 0;
+        for (uint32_t r = 0; ok && r < P; r++) {
+            uint32_t a = 0, b = 0;
+            for (uint32_t v = 1; v < V; v++) {
+                if (cpu[(size_t)r * V + v] > cpu[(size_t)r * V + a]) a = v;
+                if (all[(size_t)r * V + v] > all[(size_t)r * V + b]) b = v;
+            }
+            same += a == b;
+        }
+        const bool bits = ok && !memcmp(all, one, (size_t)P * V * sizeof(float)) &&
+                          !memcmp(rest, all + (size_t)P / 2 * V, (size_t)P / 2 * V * sizeof(float));
+        CHECK(ok && image && worst < 0.05 && same >= P - 2 && bits, "gpu gguf session %s: from the image %d, %.2e from the "
+              "CPU's logits, %u of %u tokens the CPU's, a prompt the bits of its tokens %d", files[f], image, worst, same, P, bits);
+        printf("  gpu gguf session %-12s: %.1e from the CPU's logits, %u of %u tokens the CPU's, a prompt the bits of its "
+               "tokens %s\n", files[f], worst, same, P, bits ? "yes" : "NO");
+        free(cpu); free(all); free(one); free(rest);
+        spingalett_model_free(m);
+    }
+}
+
+static _Atomic int split_sessions;
+static void count_split_sessions(LogLevel level, const char *message) {
+    (void)level;
+    if (strstr(message, "of the model's")) atomic_fetch_add(&split_sessions, 1);
+}
+
+/* Language models split between the GPU's memory and the CPU (SpingalettSessionOptions.gpu_memory, the smallest budget
+   that takes the session on the GPU and the largest that splits it): the logits near the CPU session's, through small steps
+   (the later layers on the CPU), large ones (every layer but the last on the GPU, the later layers' weights over the bus) and
+   large ones after small ones (the GPU's caches filled from the host's), a copied and rewound sequence too; tokens fed
+   one at a time, small steps alone, the bits of the same tokens fed a few at a time. */
+static void gpu_split_sessions(void) {
+    static const char *const files[] = {"gguf_quant", "gguf_qwen3", "gguf_llama3", "gguf_olmo2"};
+    for (size_t f = 0; f < sizeof files / sizeof *files; f++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s.gguf", SPINGALETT_TEST_DATA_DIR, files[f]);
+        SpingalettModel *m = spingalett_model_open(.path = path, .context = 128);
+        CHECK(m, "gpu split session %s: no model (%s)", files[f], spingalett_last_error_message());
+        if (!m) continue;
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        SpingalettSession *s = spingalett_session_new(m, &(SpingalettSessionOptions){.sequences = 2});
+        const uint32_t V = s ? spingalett_session_vocabulary(s) : 0, P = 100, A = 40, B = 4;
+        uint32_t tok[100];
+        for (uint32_t i = 0; i < P; i++) tok[i] = (i * 37u + 5u) % (V ? V : 1u);
+        float *cpu = (float *)malloc((size_t)P * V * sizeof(float)), *got = (float *)malloc((size_t)P * V * sizeof(float));
+        float *few = (float *)malloc((size_t)P * V * sizeof(float));
+        bool ok = s && cpu && got && few &&
+                  spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = P, .logits = cpu, .all = true}, 1);
+        spingalett_session_free(s);
+        spingalett_set_compute_mode(gpu_mode);
+        spingalett_set_verbose(true);
+        spingalett_set_log_level(LOG_DEBUG);
+        spingalett_set_log_callback(count_split_sessions);
+        /* the budget: down from the whole model's to the last that holds a session on the GPU, split */
+        uint64_t budget = 0;
+        for (uint64_t b = (uint64_t)1 << 30; ok && b >= 4096u; b -= b / 16u) {
+            atomic_store(&split_sessions, 0);
+            s = spingalett_session_new(m, &(SpingalettSessionOptions){.gpu_memory = b, .sequences = 2});
+            if (s && atomic_load(&split_sessions) > 0) budget = b;
+            spingalett_session_free(s);
+        }
+        s = budget ? spingalett_session_new(m, &(SpingalettSessionOptions){.gpu_memory = budget, .sequences = 2}) : NULL;
+        spingalett_set_log_callback(NULL);
+        spingalett_set_log_level(LOG_INFO);
+        spingalett_set_verbose(false);
+        const uint32_t C = P - A - B;
+        /* large, small, large, then a copy rewound into the small ones and fed again */
+        ok = s && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok, .count = A, .logits = got, .all = true}, 1);
+        for (uint32_t i = A; ok && i < A + B; i++)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + i, .count = 1, .logits = got + (size_t)i * V}, 1);
+        ok = ok && spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + A + B, .count = C,
+                                                                       .logits = got + (size_t)(A + B) * V, .all = true}, 1);
+        const double worst = ok ? gpu_max_scaled(cpu, got, (size_t)P * V) : 1.0;
+        ok = ok && spingalett_session_copy(s, 0, 1) && spingalett_session_rewind(s, 1, A + 2u) &&
+             spingalett_session_feed(s, &(SpingalettSessionFeed){.sequence = 1, .tokens = tok + A + 2u, .count = P - A - 2u,
+                                                                 .logits = few + (size_t)(A + 2u) * V, .all = true}, 1);
+        const double copied = ok ? gpu_max_scaled(cpu + (size_t)(A + 2u) * V, few + (size_t)(A + 2u) * V, (size_t)(P - A - 2u) * V) : 1.0;
+        spingalett_session_free(s);
+        /* small steps alone: tokens one at a time, then the same a few at a time */
+        s = ok ? spingalett_session_new(m, &(SpingalettSessionOptions){.gpu_memory = budget}) : NULL;
+        ok = s != NULL;
+        for (uint32_t i = 0; ok && i < 16u; i++)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + i, .count = 1, .logits = got + (size_t)i * V}, 1);
+        ok = ok && spingalett_session_rewind(s, 0, 0);
+        for (uint32_t i = 0; ok && i < 16u; i += 4u)
+            ok = spingalett_session_feed(s, &(SpingalettSessionFeed){.tokens = tok + i, .count = 4, .logits = few + (size_t)i * V, .all = true}, 1);
+        const bool bits = ok && !memcmp(got, few, (size_t)16u * V * sizeof(float));
+        spingalett_session_free(s);
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+        CHECK(ok && budget && worst < 0.05 && copied < 0.05 && bits, "gpu split session %s: a budget of %llu bytes, %.2e from the "
+              "CPU's logits, %.2e a copy, small steps the same bits %d", files[f], (unsigned long long)budget, worst, copied, bits);
+        printf("  gpu split session %-12s: %llu bytes, %.1e from the CPU's logits (a copy %.1e), small steps the same bits %s\n",
+               files[f], (unsigned long long)budget, worst, copied, bits ? "yes" : "NO");
+        free(cpu); free(got); free(few);
+        spingalett_model_free(m);
+    }
 }
 
 /* Sessions of integer models on the GPU: the linear layers multiply the model's codes there (weight-only, wqmv.comp:
@@ -9786,7 +9977,8 @@ int main(int argc, char **argv) {
     }
     if (!*only || !strcmp(only, "operators")) {
         printf("[graphs of operators]\n");
-        operator_cases();
+        operator_cases("graph_cases.bin", COMPUTE_SINGLE_THREADED, false);
+        operator_cases("graph_blocks.bin", COMPUTE_SINGLE_THREADED, false);
     }
     if (!*only || !strcmp(only, "chat")) {
         printf("[chat templates]\n");
@@ -9937,6 +10129,15 @@ int main(int argc, char **argv) {
         for (int p = PRECISION_Q8_0; p < PRECISION_COUNT; p++) block_kernels((PrecisionMode)p);
         block_models();
     }
+    /* (the graphs of the groups "gpu" and "cuda" alone: "gpu-graphs", "cuda-graphs") */
+    for (int backend = 0; backend < 2; backend++) {
+        if (strcmp(only, backend ? "cuda-graphs" : "gpu-graphs")) continue;
+        const ComputeMode mode = backend ? COMPUTE_CUDA : COMPUTE_VULKAN;
+        printf("[graphs of operators on the GPU, %s]\n", backend ? "CUDA" : "Vulkan");
+        if (!(backend ? spingalett_cuda_device() : spingalett_gpu_device())) printf("  skipped: no device\n");
+        else graph_cases_gpu(mode);
+        spingalett_set_compute_mode(COMPUTE_SINGLE_THREADED);
+    }
     for (int backend = 0; backend < 2; backend++) {
         /* the group "gpu" on Vulkan, "cuda" on CUDA */
         if (*only && strcmp(only, backend ? "cuda" : "gpu")) continue;
@@ -9990,6 +10191,9 @@ int main(int argc, char **argv) {
             gpu_resume();
             gpu_session(false);
             gpu_session(true);
+            gpu_gguf_sessions();
+            gpu_split_sessions();
+            graph_cases_gpu(gpu_mode);
             gpu_model_predict();
             gpu_model_exact();
             for (int k = 0; k < 3; k++) gpu_session_int(k);

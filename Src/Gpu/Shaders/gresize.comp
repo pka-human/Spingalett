@@ -1,0 +1,56 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/* Resize of graphs through tables of taps (Spingalett.GpuGraph.c, ir_resize_taps()), the axes' taps in an odometer, the
+   first axis outermost. As gresize.cu. */
+
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer I32 { int v[]; };
+
+layout(push_constant) uniform Push {
+    F32 x, y;
+    I32 taps;
+    uint total, pad;
+    uint dims[4], xs[4], T[4], at[4];
+    float extrapolation, pad2;
+} p;
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint e = gl_GlobalInvocationID.x; e < p.total; e += stride) {
+        uint o[4], r = e;
+        for (int d = 3; d >= 1; d--) {
+            o[d] = r % p.dims[d];
+            r /= p.dims[d];
+        }
+        o[0] = r;
+        uint c[4] = uint[4](0u, 0u, 0u, 0u);
+        float sum = 0.0;
+        bool outside = false;
+        for (;;) {
+            float w = 1.0;
+            uint at = 0u;
+            for (uint d = 0u; d < 4u; d++) {
+                uint k = p.at[d] + o[d] * p.T[d] + c[d];
+                int i = p.taps.v[2u * k];
+                if (i < 0) outside = true;
+                at += uint(max(i, 0)) * p.xs[d];
+                w *= intBitsToFloat(p.taps.v[2u * k + 1u]);
+            }
+            if (outside) break;
+            sum = fma(w, p.x.v[at], sum);
+            int d = 3;
+            for (; d >= 0; d--) {
+                if (++c[d] < p.T[d]) break;
+                c[d] = 0u;
+            }
+            if (d < 0) break;
+        }
+        p.y.v[e] = outside ? p.extrapolation : sum;
+    }
+}
