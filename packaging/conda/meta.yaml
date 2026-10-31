@@ -3,7 +3,7 @@
 #
 # A recipe for conda-forge (staged-recipes), with build.sh and bld.bat: the library with the Vulkan backend,
 # its runtime, tools, headers, pkg-config and CMake files.
-{% set version = "1.6.0" %}
+{% set version = "1.6.1" %}
 
 package:
   name: spingalett
@@ -11,7 +11,7 @@ package:
 
 source:
   url: https://github.com/pka-human/Spingalett/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 0c06294d7e7fa5ca24c45ab2c9081bfe66a04bbc522ac01ee93b6dc85032d2f7
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
 
 build:
   number: 0
