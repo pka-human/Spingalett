@@ -191,7 +191,8 @@ typedef struct SpingalettTokenizer SpingalettTokenizer;
 typedef struct {
     uint32_t max_length;
     uint32_t sequences;
-    uint64_t reserved[8];
+    uint64_t gpu_memory;
+    uint64_t reserved[8 - 1];
 } SpingalettSessionOptions;
 SpingalettSession *spingalett_session_new(const SpingalettModel *model, const SpingalettSessionOptions *options);
 void spingalett_session_free(SpingalettSession *session);
