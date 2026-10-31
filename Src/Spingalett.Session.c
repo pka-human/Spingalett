@@ -240,7 +240,7 @@ static bool session_image_gpu(SpingalettSession *s, uint64_t budget, bool *memor
     uint64_t room = spingalett_gpu_session_room();
     if (budget && budget < room) room = budget;
     /* (the driver may tell of more than it then gives: less each time) */
-    for (int tries = 0; tries < 3 && !s->gs; tries++, room -= room / 4u) {
+    for (int tries = 0; tries < 3 && !s->gs; tries++, room -= room / 10u) {
         s->gs = spingalett_gpu_session_new(s->model, s->sequences, s->max_length, s->gs_rows, room, &why);
         *memory = !s->gs && why && strstr(why, "memory");
         if (!*memory) break;

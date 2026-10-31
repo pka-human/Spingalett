@@ -294,8 +294,21 @@ typedef struct {
     uint32_t rows, heads, kv, head, rot, window, max_length, op;
     float eps, scale;
     uint32_t half, half_q;
+    uint32_t gammas, pad;           /* Vulkan's: gq and gk hold gammas (0: they, and a table without rot, are any address:
+                                       lavapipe loads through a uniform address on a branch not taken) */
 } SpgKvattnPush;
 enum { SPG_KV_PREP, SPG_KV_ATTEND };
+
+/* flash.comp with CACHE: FORWARD of a run of `cells` tokens of a sequence at consecutive positions over its caches. x: the
+   prepared queries of the run's rows, in bfloat16 with HALF, row after row; dy, dx: the keys and values
+   [sequences][kv][max_length][d]; n: max_length; stats: the sequence and position of the run's first row (info, read as
+   the commands run); table any address. */
+typedef struct {
+    uint64_t x, y, dy, dx, stats, table;
+    uint32_t n, cells, heads, kv, d, flags;
+    float scale;
+    uint32_t window;
+} SpgFlashCachePush;
 
 /* wqmv.comp: products of rows of activations with a linear layer's weights kept as integer codes (INT8, INT4, INT2:
    BITS) and a scale a row of weights, the codes widened in registers: y[r][n] = act(bias[n] + scale[n] sum_k

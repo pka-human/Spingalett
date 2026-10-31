@@ -925,7 +925,8 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
     bool same_q = false, same_y = true;
     /* (Vulkan's bdot.comp: every row at once, of the packed rows, of Q2_K and Q3_K as stored; no matrix units yet) */
     const bool vulkan = spg_gpu_using() == SPG_BACKEND_VULKAN;
-    for (uint32_t unit = 0; ok && unit < (vulkan ? 1u : packed ? 5u : 3u); unit++) {
+    const bool vulkan_bmm = vulkan && packed && spg_gpu_kernel_built(SPG_KERNEL_bmm);
+    for (uint32_t unit = 0; ok && unit < (vulkan ? (vulkan_bmm ? 2u : 1u) : packed ? 5u : 3u); unit++) {
         const uint32_t rows_a_pass = unit == 1 ? SPG_BDOT_ROWS : 1u;
         SpgGpuCommands *c = spg_gpu_commands_create();
         ok = c && spg_gpu_record_begin(c);
@@ -936,7 +937,16 @@ static void test_blocks(PrecisionMode p, uint32_t K, uint32_t N, uint32_t R) {
         if (ok)
             spg_gpu_dispatch(c, SPG_KERNEL_bquant, NULL, 0, &qp, sizeof qp,
                              (R * (K / BV) + SPG_BQUANT_BLOCKS(BV) - 1) / SPG_BQUANT_BLOCKS(BV), 1, 1);
-        if (ok && vulkan) {
+        if (ok && vulkan && unit == 1u) {
+            /* bmm.comp: every row at once, on the matrix units */
+            spg_gpu_barrier(c);
+            const uint32_t sg = spg_gpu_subgroup_size();
+            const uint32_t spec[9] = {type, 1u, 0u, 1u, 0u, 4u * sg, sg, 0u, sg >= 32u ? 1u : 32u / sg};
+            SpgBdotPush dp = {bp.address, bq.address, bdx.address, bxs.address, bb.address, by.address, bb.address,
+                              R, N, K, SPG_PACK_ROW(type, K), 0, N};
+            spg_gpu_dispatch(c, SPG_KERNEL_bmm, spec, 9, &dp, sizeof dp, (R + 63) / 64, (N + 63) / 64, 1);
+        }
+        if (ok && vulkan && unit == 0u) {
             spg_gpu_barrier(c);
             const uint32_t spec[5] = {type, 1u, 0u, packed != NULL, 0u};
             SpgBdotPush dp = {packed ? bp.address : bw.address, bq.address, bdx.address, bxs.address, bb.address, by.address, 0,

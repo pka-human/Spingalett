@@ -1,0 +1,75 @@
+/*
+* SPDX-License-Identifier: MIT
+* Copyright (c) 2026 pka_human (pka_human@proton.me)
+*/
+
+/*
+ * bdot.comp's product of packed weights a subgroup a row, as CUDA's bdotp.cu, bdotn.cu and bdotk.cu: lane l takes block (or
+ * sub-block) l of each round of SG, so that a subgroup's loads read consecutive memory; where each lane reads a row of its
+ * own they do not coalesce, and a token of Qwen3-0.6B on an RTX 4050 takes 2.2 times as long. The integers of a super-block's
+ * eight lanes are summed across them, exactly, and the blocks' terms added in their order by shuffles: the CPU's bits.
+ * Needs subgroups of a known size, complete (spg_gpu_kernel_built() is false without them), of 8 or more.
+ */
+
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "common.glsl"
+#include "block.glsl"
+
+layout(constant_id = 0) const uint TYPE = 0;
+layout(constant_id = 2) const uint ACT = 0;
+layout(constant_id = 4) const uint PAIR = 0;
+layout(constant_id = 5) const uint THREADS = 64;        /* subgroups x SG */
+layout(constant_id = 6) const uint SG = 32;
+layout(constant_id = 7) const uint GATED = 0;           /* e0's values multiply the outputs */
+layout(local_size_x_id = 5) in;
+
+layout(push_constant) uniform Push {
+    U32 w;
+    U32 q;
+    F32 dx;
+    U32 xs;
+    F32 bias, y, e0;
+    uint rows, n, k, stride, r0, ldy;
+} p;
+
+const bool KQ = TYPE == B_Q2_K || TYPE == B_Q3_K || TYPE == B_Q4_K || TYPE == B_Q5_K || TYPE == B_Q6_K || TYPE == B_IQ4_XS;
+
+#include "bdot.glsl"
+
+float dot_lanes(uint row, uint r) {
+    const Row a = row_of(row, r);
+    const uint lane = gl_SubgroupInvocationID;
+    precise float acc = 0.0;
+    if (!KQ) {
+        const uint blocks = p.k / 32u;
+        for (uint b0 = 0u; b0 < blocks; b0 += SG) {
+            const uint b = b0 + lane;
+            const float term = b < blocks ? block_term(a, b) : 0.0;
+            const uint count = min(blocks - b0, SG);
+            for (uint g = 0u; g < count; g++) acc = acc + subgroupShuffle(term, g);
+        }
+        return acc;
+    }
+    const uint subs = p.k / 32u, blocks = p.k / 256u;
+    for (uint c0 = 0u; c0 < subs; c0 += SG) {
+        const uint c = c0 + lane, b = c / 8u;
+        int i1 = 0, i2 = 0;
+        if (c < subs) sub_block(a, c, i1, i2);
+        i1 = subgroupClusteredAdd(i1, 8);
+        i2 = subgroupClusteredAdd(i2, 8);
+        const float term = lane % 8u == 0u && b < blocks ? super_term(a, b, i1, i2) : 0.0;
+        const uint first = c0 / 8u, count = min(blocks - first, SG / 8u);
+        for (uint g = 0u; g < count; g++) acc = acc + subgroupShuffle(term, 8u * g);
+    }
+    return acc;
+}
+
+void main() {
+    const uint j = gl_WorkGroupID.x * (THREADS / SG) + gl_SubgroupID, r = p.r0 + gl_WorkGroupID.y;
+    if (j >= (PAIR != 0u ? p.n / 2u : p.n)) return;
+    const float a0 = dot_lanes(PAIR != 0u ? 2u * j : j, r), a1 = PAIR != 0u ? dot_lanes(2u * j + 1u, r) : 0.0;
+    if (gl_SubgroupInvocationID == 0u) block_out(j, r, a0, a1);
+}

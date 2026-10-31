@@ -268,7 +268,9 @@ static bool cub_mma_bf16(void) { return cub_open(); }          /* (Ampere and la
 static bool cub_bf16_storage(void) { return cub_open(); }
 static bool cub_host_writes(void) { return false; }
 /* (flash.comp and rattn.comp are Vulkan's: attention runs on attn's units of flash.cu and rattn.cu here) */
-static bool cub_kernel_built(SpgKernel kernel) { return kernel != SPG_KERNEL_flash && kernel != SPG_KERNEL_rattn; }
+static bool cub_kernel_built(SpgKernel kernel) {
+    return kernel != SPG_KERNEL_flash && kernel != SPG_KERNEL_rattn && kernel != SPG_KERNEL_bdots;
+}
 
 /* ------------------------------------------------------------------------- kernels */
 

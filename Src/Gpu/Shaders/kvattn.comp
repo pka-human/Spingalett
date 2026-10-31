@@ -17,7 +17,9 @@
  */
 
 #version 460
-#extension GL_EXT_buffer_reference_uvec2 : require
+#ifdef SPG_HALF
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #include "common.glsl"
 
 layout(local_size_x = 64) in;
@@ -29,12 +31,11 @@ layout(local_size_x = 64) in;
 #define TILE 256u
 
 layout(push_constant) uniform Push {
-    F32 x, q, keys, values, y, table;
-    uvec2 gq, gk;
+    F32 x, q, keys, values, y, table, gq, gk;
     U32 info;
     uint rows, heads, kv, head, rot, window, max_length, op;
     float eps, scale;
-    uint half_kv, half_q;
+    uint half_kv, half_q, gammas;
 } p;
 
 shared float ss[TILE], sr[THREADS];
@@ -58,9 +59,10 @@ void prepare(uint w) {
     const uint r = w / per, h = w % per, seq = p.info.v[2u * r], pos = p.info.v[2u * r + 1u];
     const bool query = h < p.heads;
     const uint src = r * C + h * D;
-    const uvec2 gamma = query ? p.gq : p.gk;
+    F32 gamma = query ? p.gq : p.gk;
+    const bool normalized = p.gammas != 0u;
     float rr = 1.0;
-    if (gamma != uvec2(0u)) {
+    if (normalized) {
         float s = 0.0;
         for (uint i = 0u; i < D; i++) s += p.x.v[src + i] * p.x.v[src + i];
         rr = 1.0 / sqrt(s * (1.0 / float(D)) + p.eps);
@@ -72,25 +74,35 @@ void prepare(uint w) {
         if (half_d != 0u && i >= half_d && i < 2u * half_d) continue;
         const uint o = half_d != 0u && i < half_d ? i + half_d : i;
         float a = p.x.v[src + i], b = p.x.v[src + o];
-        if (gamma != uvec2(0u)) {
-            a = a * rr * F32(gamma).v[i];
-            b = b * rr * F32(gamma).v[o];
+        if (normalized) {
+            a = a * rr * gamma.v[i];
+            b = b * rr * gamma.v[o];
         }
         if (half_d != 0u && i < half_d) {
             const float c = p.table.v[pos * half_d + i], s = p.table.v[(p.max_length + pos) * half_d + i], a0 = a;
             a = a0 * c - b * s;
             b = b * c + a0 * s;
         }
-        if (query) {
-            p.q.v[at + i] = a;
-            if (o != i) p.q.v[at + o] = b;
-        } else {
-            p.keys.v[at + i] = a;
-            if (o != i) p.keys.v[at + o] = b;
+        F32 to = query ? p.q : p.keys;
+#ifdef SPG_HALF
+        /* (flash.comp rounds them so as it reads them) */
+        if (query ? p.half_q != 0u : p.half_kv != 0u) {
+            BF16(to).v[at + i] = uint16_t(to_bf16(a));
+            if (o != i) BF16(to).v[at + o] = uint16_t(to_bf16(b));
+            continue;
         }
+#endif
+        to.v[at + i] = a;
+        if (o != i) to.v[at + o] = b;
     }
     if (query) return;
     const uint vs = r * C + (p.heads + p.kv + g) * D;
+#ifdef SPG_HALF
+    if (p.half_kv != 0u) {
+        for (uint i = 0u; i < D; i++) BF16(p.values).v[at + i] = uint16_t(to_bf16(p.x.v[vs + i]));
+        return;
+    }
+#endif
     for (uint i = 0u; i < D; i++) p.values.v[at + i] = p.x.v[vs + i];
 }
 

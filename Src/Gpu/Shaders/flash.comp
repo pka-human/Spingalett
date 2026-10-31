@@ -25,6 +25,11 @@
  * registers while the workgroup computes on the current one (rotated as they go to shared memory); tiles of
  * floats load as they are needed.
  *
+ * With CACHE, FORWARD over a session's caches (SpgFlashCachePush, Spingalett.GpuSession.c): a run of `cells` tokens of one
+ * sequence at consecutive positions, whose prepared queries x holds row after row, over the keys dy and values dx kept for
+ * each sequence and head [max_length][D], rotated already. Tiles of queries and keys stand at absolute positions and
+ * a row's scores mask what it does not attend to, so that a row gets the same bits whatever rows are fed with it.
+ *
  * Every product adds its 16 values of k at a time in the order of k (keys, queries, or the head's values),
  * every row's sums are combined in the same pattern: the same bits on every run. Spec: OP, D (32, 64, 128),
  * WARPS, BT, SG (the subgroup size, 16 or more), HALF (words: x 0, y 1, dy 2, dx 3), THREADS (WARPS SG).
@@ -53,6 +58,7 @@ layout(constant_id = 3) const uint BT = 64;
 layout(constant_id = 4) const uint SG = 32;
 layout(constant_id = 5) const uint HALF = 0;
 layout(constant_id = 6) const uint THREADS = 128;
+layout(constant_id = 7) const uint CACHE = 0;
 layout(local_size_x_id = 6) in;
 
 #define FORWARD 0u
@@ -66,7 +72,10 @@ layout(push_constant) uniform Push {
     F32 x, y, dy, dx, stats, table;
     uint n, cells, heads, kv, d, flags;
     float scale;
+    uint window;                            /* CACHE: a sliding window */
 } p;
+
+uint CELLS, FIRST, KEYS_AT;                 /* positions past the sample's (CACHE: the run's end), its first, its keys from */
 
 #include "half.glsl"
 
@@ -111,7 +120,7 @@ void load8(F32 x, uint at, uint w, out vec4 lo, out vec4 hi) {
 
 /* the rotation of values c .. c + 7 (a) and c + D / 2 .. (b) of a vector at position pos (ROPE) */
 void rotate8(uint pos, uint c, inout vec4 a0, inout vec4 a1, inout vec4 b0, inout vec4 b1) {
-    const uint at = pos * (D / 2u) + c, sn = p.cells * (D / 2u);
+    const uint at = pos * (D / 2u) + c, sn = CELLS * (D / 2u);
     const vec4 c0 = F32x4(p.table).v[at >> 2], c1 = F32x4(p.table).v[(at >> 2) + 1u];
     const vec4 s0 = F32x4(p.table).v[(sn + at) >> 2], s1 = F32x4(p.table).v[((sn + at) >> 2) + 1u];
     const vec4 x0 = a0, x1 = a1;
@@ -132,8 +141,8 @@ void load_rows(bool to_t, uint base, uint pitch, uint s, uint r0, uint count, ui
     for (uint e = first; e < count * chunks; e += threads) {
         const uint row = e / chunks, c = 8u * (e % chunks), pos = r0 + row;
         vec4 a0 = vec4(0.0), a1 = vec4(0.0), b0 = vec4(0.0), b1 = vec4(0.0);
-        if (pos < p.cells) {
-            const uint at = (s * p.cells + pos) * stride + head + c;
+        if (pos < CELLS && (CACHE == 0u || to_t || pos >= FIRST)) {
+            const uint at = (s * CELLS + pos) * stride + head + c;
             load8(x, at, w, a0, a1);
             if (rope) {
                 load8(x, at + D / 2u, w, b0, b1);
@@ -164,7 +173,7 @@ void load_rows_u(uint s, uint r0, uint head, uint stride, F32 x, uint w) {
     for (uint e = gl_LocalInvocationID.x; e < BT * (D / 8u); e += THREADS) {
         const uint row = e / (D / 8u), c = 8u * (e % (D / 8u)), pos = r0 + row;
         vec4 a0 = vec4(0.0), a1 = vec4(0.0);
-        if (pos < p.cells) load8(x, (s * p.cells + pos) * stride + head + c, w, a0, a1);
+        if (pos < CELLS) load8(x, (s * CELLS + pos) * stride + head + c, w, a0, a1);
         const uint i = (row * SD + c) >> 2;
         sU[i] = bf16vec4(a0);
         sU[i + 1u] = bf16vec4(a1);
@@ -181,7 +190,7 @@ void fetch_tile(uint s, uint r0, uint head, uint stride, F32 x, bool rope, out R
         const uint row = rope ? e / (D / 16u) : e / (D / 8u);
         const uint c = rope ? 8u * (e % (D / 16u)) + (k & 1u) * (D / 2u) : 8u * (e % (D / 8u)), pos = r0 + row;
         v[k] = Raw8(u16vec4(0us), u16vec4(0us));
-        if (pos < p.cells) v[k] = R8(x).v[((s * p.cells + pos) * stride + head + c) >> 3];
+        if (pos < CELLS) v[k] = R8(x).v[((s * CELLS + pos) * stride + head + c) >> 3];
     }
 }
 
@@ -208,7 +217,7 @@ void put_tile(bool to_t, uint r0, bool rope, Raw8 v[NCH]) {
         const uint i = (row * SD + c) >> 2;
         vec4 a0 = vec4(uintBitsToBFloat16EXT(v[k].lo)), a1 = vec4(uintBitsToBFloat16EXT(v[k].hi));
         vec4 b0 = vec4(uintBitsToBFloat16EXT(v[k + 1u].lo)), b1 = vec4(uintBitsToBFloat16EXT(v[k + 1u].hi));
-        if (r0 + row < p.cells) rotate8(r0 + row, c, a0, a1, b0, b1);
+        if (r0 + row < CELLS) rotate8(r0 + row, c, a0, a1, b0, b1);
         sT[i] = bf16vec4(a0);
         sT[i + 1u] = bf16vec4(a1);
         sT[i + D / 8u] = bf16vec4(b0);
@@ -250,10 +259,10 @@ void store_rows(ACC acc[DT], uint sub, uint lane, uint s, uint row0, uint head, 
             vec4 b0 = sS[fs + (16u * FB + r * FB + 8u * q) / 4u] * scale;
             vec4 b1 = sS[fs + (16u * FB + r * FB + 8u * q + 4u) / 4u] * scale;
             const uint c = 16u * j + 8u * q;
-            if (i < p.cells) {
+            if (i < CELLS && (CACHE == 0u || i >= FIRST)) {
                 if (rope) {
                     /* (the inverse rotation: a cos + b sin, b cos - a sin) */
-                    const uint at = i * (D / 2u) + c, sn = p.cells * (D / 2u);
+                    const uint at = i * (D / 2u) + c, sn = CELLS * (D / 2u);
                     const vec4 c0 = F32x4(p.table).v[at >> 2], c1 = F32x4(p.table).v[(at >> 2) + 1u];
                     const vec4 s0 = F32x4(p.table).v[(sn + at) >> 2], s1 = F32x4(p.table).v[((sn + at) >> 2) + 1u];
                     const vec4 x0 = a0, x1 = a1;
@@ -262,7 +271,7 @@ void store_rows(ACC acc[DT], uint sub, uint lane, uint s, uint row0, uint head, 
                     b0 = b0 * c0 - x0 * s0;
                     b1 = b1 * c1 - x1 * s1;
                 }
-                const uint at = (s * p.cells + i) * stride + head + c;
+                const uint at = (s * CELLS + i) * stride + head + c;
                 store8(x, at, w, a0, a1);
                 store8(x, at + D / 2u, w, b0, b1);
             }
@@ -273,18 +282,33 @@ void store_rows(ACC acc[DT], uint sub, uint lane, uint s, uint row0, uint head, 
 
 void main() {
     const uint tid = gl_LocalInvocationID.x, sub = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    CELLS = p.cells;
+    if (CACHE != 0u) {
+        /* (read as the commands run, which are recorded once: the sequence and position of the run's first row) */
+        const uint sequence = U32(p.stats).v[0], position = U32(p.stats).v[1];
+        FIRST = position;
+        CELLS = position + p.cells;
+        KEYS_AT = sequence * p.kv * p.n * p.d;
+    }
     const uint C = (p.heads + 2u * p.kv) * D, out_c = p.heads * D, group = p.heads / p.kv;
     const bool causal = (p.flags & FLAG_CAUSAL) != 0u;
     const float scale = p.scale;
-    const uint s = gl_WorkGroupID.z, rows_all = p.n * p.heads * p.cells, ROWS = 16u * WARPS;
+    const uint s = gl_WorkGroupID.z, rows_all = p.n * p.heads * CELLS, ROWS = 16u * WARPS;
     const uint r = lane % 16u, h = lane / 16u;          /* this invocation's row of the subgroup's, and part */
     const uint pbase = sub * NP * 16u * PS;              /* the subgroup's P (bfloat16) */
     const uint fs = sub * (FS / 4u);                     /* and scratch (vec4) */
     if (OP == FORWARD || OP == DQ) {
-        const uint hq = gl_WorkGroupID.y, kh = hq / group, i0 = gl_WorkGroupID.x * ROWS, q0 = i0 + 16u * sub;
+        const uint hq = gl_WorkGroupID.y, kh = hq / group, i0 = (gl_WorkGroupID.x + (CACHE != 0u ? FIRST / ROWS : 0u)) * ROWS;
+        const uint q0 = i0 + 16u * sub;
+        if (CACHE != 0u && i0 >= CELLS) return;
+        /* (with CACHE, positions: the run's rows from its first; the keys and values of the sequence's head) */
+        const uint qhead = CACHE != 0u ? hq * D - FIRST * out_c : hq * D, qstride = CACHE != 0u ? out_c : C;
+        const uint khead = CACHE != 0u ? KEYS_AT + kh * p.n * D : (p.heads + kh) * D;
+        const uint vhead = CACHE != 0u ? khead : (p.heads + p.kv + kh) * D, kstride = CACHE != 0u ? D : C;
+        F32 kx = CACHE != 0u ? p.dy : p.x, vx = CACHE != 0u ? p.dx : p.x;
         /* the subgroup's queries (and with DQ the outputs' gradient) through its P into registers */
         MATA qa[KS], da[OP == DQ ? KS : 1u];
-        load_rows(false, pbase, PS, s, q0, 16u, hq * D, C, p.x, 0u, true, lane, SG);
+        load_rows(false, pbase, PS, s, q0, 16u, qhead, qstride, p.x, 0u, true, lane, SG);
         sync_subgroup();
         [[unroll]] for (uint k = 0u; k < KS; k++)
             coopMatLoad(qa[k], sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
@@ -296,21 +320,21 @@ void main() {
                 coopMatLoad(da[k], sP, (pbase + 16u * k) / 4u, PS / 4u, gl_CooperativeMatrixLayoutRowMajor);
         }
         sync_subgroup();
-        const uint row = q0 + r, sa = (s * p.heads + hq) * p.cells;
+        const uint row = q0 + r, sa = (s * p.heads + hq) * CELLS;
         float lse = 0.0, del = 0.0;
-        if (OP == DQ && row < p.cells) {
+        if (OP == DQ && row < CELLS) {
             lse = p.stats.v[sa + row];
             del = p.stats.v[rows_all + sa + row];
         }
         ACC o[DT];
         [[unroll]] for (uint j = 0u; j < DT; j++) o[j] = ACC(0.0);
         float m = NEG, l = 0.0;                         /* (FORWARD: the row's maximum, this invocation's part of its sum) */
-        const uint keys = causal ? min(p.cells, i0 + ROWS) : p.cells;
+        const uint keys = causal ? min(CELLS, i0 + ROWS) : CELLS;
         const bool fast = (HALF & 1u) != 0u;            /* (x kept as bfloat16: its tiles a step ahead) */
         Raw8 rk[NCH], rv[NCH];
         if (fast) {
-            fetch_tile(s, 0u, (p.heads + kh) * D, C, p.x, true, rk);
-            fetch_tile(s, 0u, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+            fetch_tile(s, 0u, khead, kstride, kx, true, rk);
+            fetch_tile(s, 0u, vhead, kstride, vx, false, rv);
         }
         for (uint j0 = 0u; j0 < keys; j0 += BT) {
             barrier();
@@ -318,16 +342,18 @@ void main() {
                 put_tile(true, j0, true, rk);
                 put_tile(false, j0, false, rv);
             } else {
-                load_rows(true, 0u, SD, s, j0, BT, (p.heads + kh) * D, C, p.x, 0u, true, tid, THREADS);
-                load_rows_u(s, j0, (p.heads + p.kv + kh) * D, C, p.x, 0u);
+                load_rows(true, 0u, SD, s, j0, BT, khead, kstride, kx, 0u, true, tid, THREADS);
+                load_rows_u(s, j0, vhead, kstride, vx, 0u);
             }
             barrier();
             if (fast && j0 + BT < keys) {
-                fetch_tile(s, j0 + BT, (p.heads + kh) * D, C, p.x, true, rk);
-                fetch_tile(s, j0 + BT, (p.heads + p.kv + kh) * D, C, p.x, false, rv);
+                fetch_tile(s, j0 + BT, khead, kstride, kx, true, rk);
+                fetch_tile(s, j0 + BT, vhead, kstride, vx, false, rv);
             }
             /* (causal: a tile of keys all after the subgroup's queries adds nothing to them) */
             if (causal && j0 >= q0 + 16u) continue;
+            /* (and with CACHE a subgroup without rows of the run, or a tile before every key its rows attend to) */
+            if (CACHE != 0u && (q0 >= CELLS || q0 + 16u <= FIRST || (p.window != 0u && j0 + BT + p.window <= q0 + 1u))) continue;
             if (OP == FORWARD) {
                 ACC sc[BB];
                 [[unroll]] for (uint j = 0u; j < BB; j++) sc[j] = ACC(0.0);
@@ -344,13 +370,14 @@ void main() {
                 const uint c0 = h * CPL;
                 vec4 v[CPL / 4u];
                 float top = NEG;
-                const bool edge = j0 + BT > p.cells || q0 + 16u > p.cells || (causal && j0 + BT - 1u > q0);
+                const bool edge = j0 + BT > CELLS || q0 + 16u > CELLS || (causal && j0 + BT - 1u > q0) || CACHE != 0u;
                 [[unroll]] for (uint e = 0u; e < CPL / 4u; e++) {
                     vec4 x = sS[fs + (r * (BT + 4u) + c0 + 4u * e) / 4u] * scale;
                     if (edge)
                         [[unroll]] for (uint k = 0u; k < 4u; k++) {
                             const uint key = j0 + c0 + 4u * e + k;
-                            if (!(key < p.cells && row < p.cells && (!causal || key <= row))) x[k] = NEG;
+                            if (!(key < CELLS && row < CELLS && (!causal || key <= row) &&
+                                  (CACHE == 0u || (row >= FIRST && (p.window == 0u || key + p.window > row))))) x[k] = NEG;
                         }
                     v[e] = x;
                     top = max(top, max(max(x.x, x.y), max(x.z, x.w)));
@@ -402,7 +429,7 @@ void main() {
                         vec4 ds;
                         [[unroll]] for (uint k = 0u; k < 4u; k++) {
                             const uint key = j0 + 16u * jb + 4u * q + k;
-                            const bool valid = key < p.cells && row < p.cells && (!causal || key <= row);
+                            const bool valid = key < CELLS && row < CELLS && (!causal || key <= row);
                             const float pv = valid ? exp(x[k] * scale - lse) : 0.0;
                             ds[k] = pv * (y[k] - del);
                         }
@@ -431,8 +458,8 @@ void main() {
             coopMatLoad(f, sV, 16u * sub, 0u, gl_CooperativeMatrixLayoutColumnMajor);
             [[unroll]] for (uint j = 0u; j < DT; j++) o[j] = o[j] * f;
             sync_subgroup();
-            store_rows(o, sub, lane, s, q0, hq * D, out_c, p.y, 1u, 1.0, false);
-            if ((p.flags & FLAG_STATS) != 0u && h == 0u && row < p.cells) p.stats.v[sa + row] = m + log(l);
+            store_rows(o, sub, lane, s, q0, qhead, out_c, p.y, 1u, 1.0, false);
+            if ((p.flags & FLAG_STATS) != 0u && h == 0u && row < CELLS) p.stats.v[sa + row] = m + log(l);
             return;
         }
         /* dQ: the scale, rotated back */
@@ -461,12 +488,12 @@ void main() {
     const bool fast = (HALF & 5u) == 5u;                /* (x and dy kept as bfloat16: their tiles a step ahead) */
     Raw8 rq[NCH], rg[NCH];
     for (uint hq = kh * group; hq < (kh + 1u) * group; hq++) {
-        const uint sa = (s * p.heads + hq) * p.cells, first = causal ? (j0 / BT) * BT : 0u;
+        const uint sa = (s * p.heads + hq) * CELLS, first = causal ? (j0 / BT) * BT : 0u;
         if (fast) {
             fetch_tile(s, first, hq * D, C, p.x, true, rq);
             fetch_tile(s, first, hq * D, out_c, p.dy, false, rg);
         }
-        for (uint q0 = first; q0 < p.cells; q0 += BT) {
+        for (uint q0 = first; q0 < CELLS; q0 += BT) {
             barrier();
             if (fast) {
                 put_tile(true, q0, true, rq);
@@ -476,12 +503,12 @@ void main() {
                 load_rows_u(s, q0, hq * D, out_c, p.dy, 2u);
             }
             for (uint e = tid; e < BT; e += THREADS) {
-                const bool live = q0 + e < p.cells;
+                const bool live = q0 + e < CELLS;
                 sL[e] = live ? p.stats.v[sa + q0 + e] : 0.0;
                 sDl[e] = live ? p.stats.v[rows_all + sa + q0 + e] : 0.0;
             }
             barrier();
-            if (fast && q0 + BT < p.cells) {
+            if (fast && q0 + BT < CELLS) {
                 fetch_tile(s, q0 + BT, hq * D, C, p.x, true, rq);
                 fetch_tile(s, q0 + BT, hq * D, out_c, p.dy, false, rg);
             }
@@ -504,7 +531,7 @@ void main() {
                     vec4 pt, ds;
                     [[unroll]] for (uint k = 0u; k < 4u; k++) {
                         const uint qc = 16u * qb + 4u * q + k, query = q0 + qc;
-                        const bool valid = query < p.cells && key < p.cells && (!causal || key <= query);
+                        const bool valid = query < CELLS && key < CELLS && (!causal || key <= query);
                         pt[k] = valid ? exp(x[k] * scale - sL[qc]) : 0.0;
                         ds[k] = pt[k] * (y[k] - sDl[qc]);
                     }

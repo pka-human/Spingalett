@@ -15,7 +15,6 @@
  */
 
 #version 460
-#extension GL_EXT_buffer_reference_uvec2 : require
 #include "common.glsl"
 #include "block.glsl"
 
@@ -23,134 +22,22 @@ layout(constant_id = 0) const uint TYPE = 0;
 layout(constant_id = 2) const uint ACT = 0;
 layout(constant_id = 3) const uint PACKED = 1;
 layout(constant_id = 4) const uint PAIR = 0;
+layout(constant_id = 7) const uint GATED = 0;           /* e0's values multiply the outputs */
 layout(local_size_x = 64) in;
-
-layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 { uvec4 v[]; };
 
 layout(push_constant) uniform Push {
     U32 w;
     U32 q;
     F32 dx;
     U32 xs;
-    F32 bias, y;
-    uvec2 e0;
+    F32 bias, y, e0;
     uint rows, n, k, stride, r0, ldy;
 } p;
 
 const bool KQ = TYPE == B_Q2_K || TYPE == B_Q3_K || TYPE == B_Q4_K || TYPE == B_Q5_K || TYPE == B_Q6_K || TYPE == B_IQ4_XS;
 const uint BYTES = TYPE == B_Q2_K ? 84u : 110u;     /* (the types kept as stored) */
 
-/* four signed bytes' products with four */
-int dot4(uint a, uint b) {
-    return (int(a << 24) >> 24) * (int(b << 24) >> 24) + (int(a << 16) >> 24) * (int(b << 16) >> 24) +
-           (int(a << 8) >> 24) * (int(b << 8) >> 24) + (int(a) >> 24) * (int(b) >> 24);
-}
-
-uint nl_values(uint q) {
-    return (uint(iq4_value(q & 15u)) & 0xFFu) | (uint(iq4_value((q >> 8) & 15u)) & 0xFFu) << 8 |
-           (uint(iq4_value((q >> 16) & 15u)) & 0xFFu) << 16 | (uint(iq4_value((q >> 24) & 15u)) & 0xFFu) << 24;
-}
-
-/* the low four bits of x at bit 4 of a word's four bytes */
-uint spread1(uint x) { return ((x * 0x00204081u) & 0x01010101u) << 4; }
-
-/* The products of sixteen bytes of 32 4-bit codes (byte i the code of value i, then of value i + 16 above it) with x0 and x1,
-   with fifth bits f above them, or their values in IQ4's table */
-int nibbles_dot(uvec4 w, uvec4 x0, uvec4 x1, uint f) {
-    const bool nl = TYPE == B_IQ4_NL || TYPE == B_IQ4_XS, five = TYPE == B_Q5_0 || TYPE == B_Q5_1 || TYPE == B_Q5_K;
-    int s = 0;
-    for (uint k = 0u; k < 4u; k++) {
-        uint lo = w[k] & 0x0F0F0F0Fu, hi = (w[k] >> 4) & 0x0F0F0F0Fu;
-        if (five) {
-            lo |= spread1((f >> (4u * k)) & 0xFu);
-            hi |= spread1((f >> (16u + 4u * k)) & 0xFu);
-        }
-        if (nl) {
-            lo = nl_values(lo);
-            hi = nl_values(hi);
-        }
-        s += dot4(lo, x0[k]) + dot4(hi, x1[k]);
-    }
-    return s;
-}
-
-/* Row `row` of weights packed: blocks of one sub-block (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL) */
-float dot_blocks(uint row, uint r) {
-    const uint blocks = p.k / 32u, at = row * p.stride, x = r * p.k, xs = r * (p.k / 16u), dx = r * blocks;
-    const bool one = TYPE == B_Q4_1 || TYPE == B_Q5_1, five = TYPE == B_Q5_0 || TYPE == B_Q5_1;
-    const int off = TYPE == B_Q4_0 ? 8 : TYPE == B_Q5_0 ? 16 : 0;
-    const uint aux = at + (TYPE == B_Q8_0 ? p.k : p.k / 2u), scales = aux + (five ? 4u * blocks : 0u);
-    precise float acc = 0.0;
-    for (uint b = 0u; b < blocks; b++) {
-        const uvec4 x0 = U32x4(p.q).v[(x + 32u * b) >> 4], x1 = U32x4(p.q).v[((x + 32u * b) >> 4) + 1u];
-        int i1, sum = 0;
-        if (TYPE == B_Q8_0) {
-            const uvec4 w0 = U32x4(p.w).v[(at + 32u * b) >> 4], w1 = U32x4(p.w).v[((at + 32u * b) >> 4) + 1u];
-            i1 = dot4(w0.x, x0.x) + dot4(w0.y, x0.y) + dot4(w0.z, x0.z) + dot4(w0.w, x0.w) +
-                 dot4(w1.x, x1.x) + dot4(w1.y, x1.y) + dot4(w1.z, x1.z) + dot4(w1.w, x1.w);
-        } else {
-            const uvec4 w = U32x4(p.w).v[(at + 16u * b) >> 4];
-            sum = int(p.xs.v[xs + 2u * b]) + int(p.xs.v[xs + 2u * b + 1u]);
-            i1 = nibbles_dot(w, x0, x1, five ? p.w.v[(aux + 4u * b) >> 2] : 0u) - off * sum;
-        }
-        const float dxv = p.dx.v[dx + b], d = from_half(half_at(p.w, scales + (one ? 4u : 2u) * b));
-        precise float term = (d * dxv) * float(i1);
-        if (one) term = term + (from_half(half_at(p.w, scales + 4u * b + 2u)) * dxv) * float(sum);
-        acc = acc + term;
-    }
-    return acc;
-}
-
-/* Row `row` of weights packed: super-blocks of eight sub-blocks (Q4_K, Q5_K, Q6_K, IQ4_XS) */
-float dot_super(uint row, uint r) {
-    const uint subs = p.k / 32u, blocks = p.k / 256u, at = row * p.stride, x = r * p.k, xs = r * (p.k / 16u), dx = r * blocks;
-    const bool six = TYPE == B_Q6_K, five = TYPE == B_Q5_K, xq = TYPE == B_IQ4_XS;
-    const uint codes = six ? p.k / 2u + p.k / 4u : p.k / 2u, aux = at + codes, highs = at + p.k / 2u;
-    const uint heads = aux + (five ? 4u * subs : 0u), scales = aux + 2u * subs;
-    precise float acc = 0.0;
-    for (uint b = 0u; b < blocks; b++) {
-        int i1 = 0, i2 = 0;
-        for (uint e = 0u; e < 8u; e++) {
-            const uint c = 8u * b + e;
-            const uvec4 w = U32x4(p.w).v[(at + 16u * c) >> 4];
-            const uvec4 x0 = U32x4(p.q).v[(x + 32u * c) >> 4], x1 = U32x4(p.q).v[((x + 32u * c) >> 4) + 1u];
-            if (six) {
-                /* (each half of 16 alone: four words of low bits, and the high two bits of the pair of sub-blocks' words:
-                   bits 0 to 3 of their bytes the first's, 4 to 7 the second's) */
-                const uvec4 hb = U32x4(p.w).v[(highs + 16u * (c / 2u)) >> 4];
-                const uint shift = 4u * (c % 2u);
-                int lo = 0, hi = 0;
-                for (uint k = 0u; k < 4u; k++) {
-                    const uint h = hb[k] >> shift;
-                    lo += dot4((w[k] & 0x0F0F0F0Fu) | (h & 0x03030303u) << 4, x0[k]);
-                    hi += dot4(((w[k] >> 4) & 0x0F0F0F0Fu) | (h & 0x0C0C0C0Cu) << 2, x1[k]);
-                }
-                const uint pr = half_at(p.w, aux + 2u * c);
-                i1 += (int(pr << 24) >> 24) * (lo - 32 * int(p.xs.v[xs + 2u * c]));
-                i1 += (int(pr << 16) >> 24) * (hi - 32 * int(p.xs.v[xs + 2u * c + 1u]));
-                continue;
-            }
-            const int s = nibbles_dot(w, x0, x1, five ? p.w.v[(aux + 4u * c) >> 2] : 0u);
-            if (xq) {
-                i1 += iq4xs_scale(word_at(p.w, heads + 8u * b), word_at(p.w, heads + 8u * b + 4u), e) * s;
-            } else {
-                int sc, mn;
-                scale_min_k4(p.w, heads + 16u * b + 4u, e, sc, mn);
-                i1 += sc * s;
-                i2 += mn * (int(p.xs.v[xs + 2u * c]) + int(p.xs.v[xs + 2u * c + 1u]));
-            }
-        }
-        const float dxv = p.dx.v[dx + b];
-        const float d = from_half(half_at(p.w, six ? scales + 2u * b : heads + (xq ? 8u : 16u) * b));
-        precise float term = (d * dxv) * float(i1);
-        if (!six && !xq) {
-            const float m = -from_half(half_at(p.w, heads + 16u * b + 2u));
-            term = term + (m * dxv) * float(i2);
-        }
-        acc = acc + term;
-    }
-    return acc;
-}
+#include "bdot.glsl"
 
 /* Row `row` of weights as GGUF stores them: Q2_K, Q3_K */
 float dot_stored(uint row, uint r) {
@@ -194,22 +81,23 @@ float dot_stored(uint row, uint r) {
 
 float dot_row(uint row, uint r) {
     if (PACKED == 0u) return dot_stored(row, r);
-    return KQ ? dot_super(row, r) : dot_blocks(row, r);
+    const Row a = row_of(row, r);
+    precise float acc = 0.0;
+    if (!KQ) {
+        for (uint b = 0u; b < p.k / 32u; b++) acc = acc + block_term(a, b);
+        return acc;
+    }
+    for (uint b = 0u; b < p.k / 256u; b++) {
+        int i1 = 0, i2 = 0;
+        for (uint e = 0u; e < 8u; e++) sub_block(a, 8u * b + e, i1, i2);
+        acc = acc + super_term(a, b, i1, i2);
+    }
+    return acc;
 }
 
 void main() {
     const uint j = gl_GlobalInvocationID.x, r = p.r0 + gl_WorkGroupID.y;
     if (j >= (PAIR != 0u ? p.n / 2u : p.n)) return;
-    const uint at = r * p.ldy + j;
-    float v;
-    if (PAIR != 0u) {
-        v = p.bias.v[2u * j] + dot_row(2u * j, r);
-        if (ACT != 0u) v = activate(v, ACT);
-        v = v * (p.bias.v[2u * j + 1u] + dot_row(2u * j + 1u, r));
-    } else {
-        v = p.bias.v[j] + dot_row(j, r);
-        if (ACT != 0u) v = activate(v, ACT);
-        if (p.e0 != uvec2(0u)) v = v * F32(p.e0).v[at];
-    }
-    p.y.v[at] = v;
+    if (PAIR != 0u) block_out(j, r, dot_row(2u * j, r), dot_row(2u * j + 1u, r));
+    else block_out(j, r, dot_row(j, r), 0.0);
 }

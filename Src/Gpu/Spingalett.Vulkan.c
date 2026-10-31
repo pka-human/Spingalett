@@ -64,6 +64,7 @@ static PFN_vkVoidFunction loader_symbol(void *lib, const char *name) {
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures2) \
     X(vkGetPhysicalDeviceProperties2) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) \
+    X(vkGetPhysicalDeviceMemoryProperties2) \
     X(vkEnumerateDeviceExtensionProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkDestroyInstance)
 #define VK_DEVICE_FUNCTIONS(X) \
     X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
@@ -100,6 +101,8 @@ typedef VkResult (VKAPI_PTR *CoopPropertiesFn)(VkPhysicalDevice, uint32_t *, Coo
 #define COOP_PROPERTIES_TYPE ((VkStructureType)1000506001)
 #define BF16_FEATURES_TYPE   ((VkStructureType)1000141000)
 #define COMPONENT_FLOAT32    1
+#define COMPONENT_SINT8      3
+#define COMPONENT_SINT32     5
 #define COMPONENT_BFLOAT16   1000141000
 #define SCOPE_SUBGROUP       3
 #define SPARE_COMMANDS       64      /* freed command buffers kept for reuse */
@@ -138,6 +141,11 @@ static struct {
     bool storage16;                 /* 16-bit values in storage buffers (bfloat16 activations) */
     bool storage8;                  /* 8-bit integers in storage buffers and arithmetic (graphs' booleans) */
     bool full_subgroups;            /* the matrix units' kernel can ask for subgroups without inactive lanes */
+    bool mma_i8;                    /* cooperative matrices of 8-bit integers, 16 x 16 x 32, sums in 32 bits */
+    bool sized_subgroups;           /* and pipelines for subgroups of a size */
+    bool budget;                    /* VK_EXT_memory_budget */
+    uint32_t heap_index;            /* the largest device-local heap */
+    bool lanes;                     /* bdots.comp can run: its subgroups complete and of a known size */
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     VkPipelineLayout layout;
     VkShaderModule modules[SPG_KERNEL_COUNT];
@@ -269,6 +277,7 @@ static bool open_device(void) {
             gpu.heap = gpu.memory.memoryHeaps[h].size;
             largest = h;
         }
+    gpu.heap_index = largest;
     /* resizable BAR or unified memory: not the window of 256 MB into device memory some have */
     const VkMemoryPropertyFlags writable = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -295,7 +304,7 @@ static bool open_device(void) {
         if (!extensions || vkEnumerateDeviceExtensionProperties(gpu.physical, NULL, &extension_count, extensions) < 0)
             extension_count = 0;
     }
-    const char *device_extensions[4];
+    const char *device_extensions[5];
     uint32_t enabled = 0;
     if (has_extension(extensions, extension_count, "VK_KHR_portability_subset"))
         device_extensions[enabled++] = "VK_KHR_portability_subset";
@@ -307,10 +316,11 @@ static bool open_device(void) {
     VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkBool32 int16 = VK_FALSE;
     /* (a build whose glslc could not compile the kernel holds an empty module for it) */
-    if (spg_kernel_spirv_size[SPG_KERNEL_gemm_mma] > 20u &&
-        has_extension(extensions, extension_count, "VK_KHR_cooperative_matrix") &&
-        has_extension(extensions, extension_count, "VK_KHR_shader_bfloat16")) {
-        coop.pNext = &bf16;
+    const bool has_bf16 = spg_kernel_spirv_size[SPG_KERNEL_gemm_mma] > 20u &&
+                          has_extension(extensions, extension_count, "VK_KHR_shader_bfloat16");
+    if ((has_bf16 || spg_kernel_spirv_size[SPG_KERNEL_bmm] > 20u) &&
+        has_extension(extensions, extension_count, "VK_KHR_cooperative_matrix")) {
+        coop.pNext = has_bf16 ? (void *)&bf16 : (void *)&have12;
         bf16.pNext = &have12;
         have12.pNext = &have11;
         VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &coop};
@@ -321,17 +331,23 @@ static bool open_device(void) {
         CoopPropertiesFn properties = (CoopPropertiesFn)vkGetInstanceProcAddr(gpu.instance,
                                                                               "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
         uint32_t count = 0;
-        if (coop.cooperativeMatrix && bf16.type && bf16.cooperative_matrix && have12.vulkanMemoryModel &&
-            have12.shaderFloat16 && properties &&
+        if (coop.cooperativeMatrix && have12.vulkanMemoryModel && properties &&
             properties(gpu.physical, &count, NULL) == VK_SUCCESS && count > 0) {
             CoopProperties *list = (CoopProperties *)calloc(count, sizeof *list);
             for (uint32_t k = 0; list && k < count; k++) list[k].sType = COOP_PROPERTIES_TYPE;
             if (list && properties(gpu.physical, &count, list) >= 0)
                 for (uint32_t k = 0; k < count; k++)
-                    if (list[k].M == 16 && list[k].N == 16 && list[k].K == 16 && list[k].a == COMPONENT_BFLOAT16 &&
-                        list[k].b == COMPONENT_BFLOAT16 && list[k].c == COMPONENT_FLOAT32 &&
-                        list[k].result == COMPONENT_FLOAT32 && list[k].scope == SCOPE_SUBGROUP)
-                        gpu.mma_bf16 = true;
+                    if (list[k].scope == SCOPE_SUBGROUP && list[k].M == 16 && list[k].N == 16) {
+                        if (has_bf16 && bf16.type && bf16.cooperative_matrix && have12.shaderFloat16 && list[k].K == 16 &&
+                            list[k].a == COMPONENT_BFLOAT16 && list[k].b == COMPONENT_BFLOAT16 &&
+                            list[k].c == COMPONENT_FLOAT32 && list[k].result == COMPONENT_FLOAT32)
+                            gpu.mma_bf16 = true;
+                        /* (bmm.comp's: 8-bit integers, sums in 32 bits, and its bytes in storage buffers and shared memory) */
+                        if (spg_kernel_spirv_size[SPG_KERNEL_bmm] > 20u && list[k].K == 32 && list[k].a == COMPONENT_SINT8 &&
+                            list[k].b == COMPONENT_SINT8 && list[k].c == COMPONENT_SINT32 && list[k].result == COMPONENT_SINT32 &&
+                            have12.shaderInt8)
+                            gpu.mma_i8 = true;
+                    }
             free(list);
         }
         /* the kernel keeps bfloat16 values in memory too, and moves their bits as 16-bit integers (16-bit
@@ -343,22 +359,26 @@ static bool open_device(void) {
        (VK_EXT_subgroup_size_control, core in Vulkan 1.3) */
     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT size_control = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
-    if (gpu.mma_bf16 && has_extension(extensions, extension_count, "VK_EXT_subgroup_size_control")) {
+    if (has_extension(extensions, extension_count, "VK_EXT_subgroup_size_control")) {
         VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &size_control};
         vkGetPhysicalDeviceFeatures2(gpu.physical, &f);
         gpu.full_subgroups = size_control.computeFullSubgroups;
-        size_control.subgroupSizeControl = VK_FALSE;
+        gpu.sized_subgroups = size_control.subgroupSizeControl;
     }
     if (gpu.mma_bf16) {
         device_extensions[enabled++] = "VK_KHR_cooperative_matrix";
         device_extensions[enabled++] = "VK_KHR_shader_bfloat16";
-        coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         bf16.dot_product = VK_FALSE;
-        if (gpu.full_subgroups) {
-            device_extensions[enabled++] = "VK_EXT_subgroup_size_control";
-            bf16.pNext = &size_control;
-        }
     }
+    if (gpu.mma_i8 && !gpu.mma_bf16) device_extensions[enabled++] = "VK_KHR_cooperative_matrix";
+    coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+    /* (the features' chain: coop, bf16 where it is enabled, then the size control) */
+    coop.pNext = gpu.mma_bf16 ? (void *)&bf16 : gpu.full_subgroups ? (void *)&size_control : NULL;
+    bf16.pNext = gpu.full_subgroups ? &size_control : NULL;
+    if (gpu.full_subgroups) device_extensions[enabled++] = "VK_EXT_subgroup_size_control";
+    /* what the device has free (spg_gpu_memory_free()) */
+    gpu.budget = has_extension(extensions, extension_count, "VK_EXT_memory_budget");
+    if (gpu.budget) device_extensions[enabled++] = "VK_EXT_memory_budget";
     free(extensions);
     /* bytes in storage buffers and 8-bit integers, which the kernels of graphs read and write (their booleans) */
     {
@@ -371,15 +391,30 @@ static bool open_device(void) {
     VkPhysicalDeviceProperties2 props2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroup};
     vkGetPhysicalDeviceProperties2(gpu.physical, &props2);
     gpu.subgroup = subgroup.subgroupSize ? subgroup.subgroupSize : 32u;
+    /* bdots.comp's subgroups: of a size asked for, complete, with the operations it takes on them */
+    VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sizes = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+    if (gpu.sized_subgroups) {
+        subgroup.pNext = &sizes;
+        vkGetPhysicalDeviceProperties2(gpu.physical, &props2);
+        subgroup.pNext = NULL;
+    }
+    gpu.lanes = gpu.full_subgroups && gpu.sized_subgroups && gpu.subgroup >= 8u && gpu.subgroup % 8u == 0u &&
+                gpu.subgroup >= sizes.minSubgroupSize && gpu.subgroup <= sizes.maxSubgroupSize &&
+                (sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) &&
+                (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT);
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gpu.family, 1, &priority};
     VkPhysicalDeviceVulkan11Features enable11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                  .storageBuffer16BitAccess = gpu.storage16,
-                                                 .pNext = gpu.mma_bf16 ? (void *)&coop : NULL};
+                                                 .pNext = gpu.mma_bf16 || gpu.mma_i8 ? (void *)&coop
+                                                          : gpu.full_subgroups ? (void *)&size_control : NULL};
     VkPhysicalDeviceVulkan12Features enable12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                                  .bufferDeviceAddress = VK_TRUE,
-                                                 .shaderFloat16 = gpu.mma_bf16, .vulkanMemoryModel = gpu.mma_bf16,
+                                                 .shaderFloat16 = gpu.mma_bf16, .vulkanMemoryModel = gpu.mma_bf16 || gpu.mma_i8,
                                                  .storageBuffer8BitAccess = gpu.storage8, .shaderInt8 = gpu.storage8,
                                                  .pNext = &enable11};
     VkPhysicalDeviceFeatures2 enable = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &enable12};
@@ -447,6 +482,7 @@ static const char *vkb_device_name(void) {
     return vkb_open() ? gpu.name : NULL;
 }
 
+static uint64_t vkb_memory_free(void);
 static uint64_t vkb_memory(void) {
     return vkb_open() ? gpu.heap : 0;
 }
@@ -457,6 +493,16 @@ static uint32_t vkb_shared_memory(void) {
 
 static uint32_t vkb_max_workgroups(uint32_t axis) {
     return vkb_open() && axis < 3 ? gpu.max_groups[axis] : 0;
+}
+
+static uint64_t vkb_memory_free(void) {
+    if (!vkb_open()) return 0;
+    if (!gpu.budget) return gpu.heap;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget};
+    vkGetPhysicalDeviceMemoryProperties2(gpu.physical, &properties);
+    const uint64_t have = budget.heapBudget[gpu.heap_index], used = budget.heapUsage[gpu.heap_index];
+    return have > used ? have - used : 0u;
 }
 
 static uint32_t vkb_subgroup_size(void) {
@@ -483,7 +529,9 @@ static bool vkb_kernel_built(SpgKernel kernel) {
          kernel == SPG_KERNEL_gattn) && !gpu.storage8)
         return false;               /* (they declare 8-bit storage) */
     if (kernel == SPG_KERNEL_gcvt && !gpu.storage16) return false;     /* (and this 16-bit storage) */
-    if (kernel == SPG_KERNEL_gflash || kernel == SPG_KERNEL_bmm || kernel == SPG_KERNEL_bnorm)
+    if (kernel == SPG_KERNEL_bdots && !gpu.lanes) return false;
+    if (kernel == SPG_KERNEL_bmm && (!gpu.lanes || !gpu.mma_i8 || !gpu.storage8)) return false;
+    if (kernel == SPG_KERNEL_gflash || kernel == SPG_KERNEL_bnorm)
         return false;                                                   /* (CUDA's alone) */
     return vkb_open() && kernel < SPG_KERNEL_COUNT && spg_kernel_spirv_size[kernel] > 20u;
 }
@@ -517,10 +565,15 @@ static VkPipeline pipeline(SpgKernel kernel, const uint32_t *spec, uint32_t coun
     VkSpecializationMapEntry entries[SPG_SPEC_MAX];
     for (uint32_t k = 0; k < count; k++) entries[k] = (VkSpecializationMapEntry){k, 4u * k, 4u};
     VkSpecializationInfo si = {count, entries, count * sizeof(uint32_t), spec};
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sized = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = gpu.subgroup};
     VkComputePipelineCreateInfo cci = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL,
-                  (kernel == SPG_KERNEL_gemm_mma || kernel == SPG_KERNEL_flash || kernel == SPG_KERNEL_rattn) && gpu.full_subgroups
+        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  kernel == SPG_KERNEL_bdots || kernel == SPG_KERNEL_bmm ? (const void *)&sized : NULL,
+                  (kernel == SPG_KERNEL_gemm_mma || kernel == SPG_KERNEL_flash || kernel == SPG_KERNEL_rattn ||
+                   kernel == SPG_KERNEL_bdots || kernel == SPG_KERNEL_bmm) && gpu.full_subgroups
                       ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT : 0u,
                   VK_SHADER_STAGE_COMPUTE_BIT, module, "main", count ? &si : NULL},
         .layout = gpu.layout,
@@ -1008,7 +1061,7 @@ static bool vkb_wait(void *c_) {
 }
 
 const SpgGpuOps spg_vulkan_ops = {
-    vkb_open, vkb_device_name, vkb_memory, vkb_memory, vkb_shared_memory, vkb_subgroup_size, vkb_max_workgroups, vkb_mma_bf16,
+    vkb_open, vkb_device_name, vkb_memory, vkb_memory_free, vkb_shared_memory, vkb_subgroup_size, vkb_max_workgroups, vkb_mma_bf16,
     vkb_bf16_storage, vkb_host_writes, vkb_kernel_built, vkb_buffer_create, vkb_buffer_free, vkb_arena_create,
     vkb_arena_add, vkb_arena_commit, vkb_arena_free, vkb_commands_create, vkb_commands_free, vkb_commands_untimed,
     vkb_commands_stamps, vkb_timestamp, vkb_timestamps, vkb_record_begin, vkb_dispatch, vkb_prepare, vkb_barrier,
