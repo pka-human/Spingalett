@@ -238,11 +238,11 @@ against llama.cpp. [Every feature](docs/Features.md).
 ## Install
 
 ```bash
-pip install spingalett                                                # Linux, Windows, macOS
+pip install spingalett
 brew tap pka-human/spingalett https://github.com/pka-human/Spingalett && brew install spingalett
 scoop bucket add spingalett https://github.com/pka-human/Spingalett && scoop install spingalett
 nix build github:pka-human/Spingalett
-docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.6.1         # the library, tools and Python, CUDA and Vulkan
+docker run --rm --gpus all ghcr.io/pka-human/spingalett:1.6.1
 ```
 
 [Releases](https://github.com/pka-human/Spingalett/releases) hold archives for Linux (x86-64, AArch64), Windows and macOS,
