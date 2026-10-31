@@ -7,6 +7,18 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-31
+
+1.6.0's code, with its GitHub release: the release run of the tag v1.6.0 published the wheels on PyPI and the container
+image, but stopped at DigitPad's AppImage, so 1.6.0 has no GitHub release or files. A new build of appimagetool's
+`continuous` release, which came out between the branch's run and the tag's, refuses an SVG as `.DirIcon`. The library,
+the runtime and the bindings change nothing but the version; [1.6.0's section of this file](https://github.com/pka-human/Spingalett/blob/v1.6.1/CHANGELOG.md#160---2026-10-31) lists what they hold.
+
+### Fixed
+
+- DigitPad's AppImage has a PNG icon (`Apps/DigitPad/Package/digitpad.png`, `digitpad.svg` at 256 pixels), and
+  `build-appimage.sh` takes appimagetool 1.9.1 by its checksum instead of whatever `continuous` holds that day.
+
 ## [1.6.0] - 2026-10-31
 
 "On the GPU": graphs of operators run on CUDA and Vulkan; GGUF's language models run on the GPU straight from their images,
@@ -1798,7 +1810,8 @@ A performance release: the same API and file formats, faster kernels.
 
 Initial release.
 
-[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/pka-human/Spingalett/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/pka-human/Spingalett/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/pka-human/Spingalett/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/pka-human/Spingalett/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/pka-human/Spingalett/compare/v1.4.0...v1.4.1

@@ -18,6 +18,7 @@ set -eu
 
 SDL_VERSION=2.32.10
 SDL_SHA256=5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165
+TOOL_VERSION=1.9.1
 
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 work="$root/build/appimage"
@@ -106,8 +107,8 @@ cp "$pkg/DigitPad.desktop" "$share/applications/"
 cp "$pkg/digitpad.svg" "$share/icons/hicolor/scalable/apps/"
 cp "$root/LICENSE" "$share/doc/digitpad/LICENSE"
 cp "$work/SDL2-$SDL_VERSION/LICENSE.txt" "$share/doc/digitpad/LICENSE.SDL2" 2>/dev/null || true
-cp "$pkg/DigitPad.desktop" "$pkg/digitpad.svg" "$appdir/"
-ln -s digitpad.svg "$appdir/.DirIcon"
+cp "$pkg/DigitPad.desktop" "$pkg/digitpad.png" "$appdir/"
+ln -s digitpad.png "$appdir/.DirIcon"
 cp "$pkg/AppRun" "$appdir/AppRun"
 chmod 755 "$appdir/AppRun"
 
@@ -122,10 +123,17 @@ echo "minimum glibc: $glibc"
 # ---- 5. the image
 tool=${APPIMAGETOOL:-$(command -v appimagetool || true)}
 if [ -z "$tool" ]; then
-    tool="$work/appimagetool-$arch.AppImage"
+    # A fixed release, not "continuous": a build that changes what it accepts must not stop a release's run.
+    case "$arch" in
+        x86_64) tool_sha256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 ;;
+        aarch64) tool_sha256=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158 ;;
+        *) echo "no checksum of appimagetool for $arch: set APPIMAGETOOL to one" >&2; exit 1 ;;
+    esac
+    tool="$work/appimagetool-$TOOL_VERSION-$arch.AppImage"
     if [ ! -x "$tool" ]; then
-        step "downloading appimagetool"
-        curl -fL -o "$tool" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$arch.AppImage"
+        step "downloading appimagetool $TOOL_VERSION"
+        curl -fL -o "$tool" "https://github.com/AppImage/appimagetool/releases/download/$TOOL_VERSION/appimagetool-$arch.AppImage"
+        echo "$tool_sha256  $tool" | sha256sum -c -
         chmod +x "$tool"
     fi
 fi

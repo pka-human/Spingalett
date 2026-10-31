@@ -1,6 +1,6 @@
 {
   "name": "spingalett",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Spingalett's inference engine in WebAssembly: .slett models from FP32 to INT2, transformers and text generation, in Node and browsers",
   "keywords": [
     "neural networks",
