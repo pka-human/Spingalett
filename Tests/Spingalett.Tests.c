@@ -6979,6 +6979,11 @@ static void operator_cases(const char *name_of_file, ComputeMode gpu, bool bf16)
             parsed = case_tensors(file, &p, end, ins, &nin, MOST) && case_tensors(file, &p, end, refs, &nout, MOST);
         }
         CHECK(parsed, "graph_cases.bin: case %u malformed", c);
+        /* (SPINGALETT_TEST_CASES=1 names every case as it starts: which one crashed) */
+        if (getenv("SPINGALETT_TEST_CASES")) {
+            printf("    %s\n", name);
+            fflush(stdout);
+        }
         if (!parsed) break;
         /* (SPINGALETT_TEST_CASE: the cases whose names hold it, alone) */
         const char *only_case = getenv("SPINGALETT_TEST_CASE");

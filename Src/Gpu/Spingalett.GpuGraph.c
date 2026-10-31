@@ -509,6 +509,21 @@ static uint64_t half_input(GCtx *c, uint32_t i, uint64_t count) {
 }
 
 /* A block of parameters for a kernel: asked for while planned (bytes), written while recorded: its device address. */
+/* Bytes of a parameter block at `at` in the device's memory at once, waited for; false when they could not be. */
+static bool param_upload(GCtx *c, uint64_t at, const void *data, uint32_t bytes) {
+    const SpgGpuBuffer *params = &c->piece->params;
+    SpgGpuBuffer stage;
+    if (!spg_gpu_buffer_create(&stage, bytes, true)) return false;
+    memcpy(stage.mapped, data, bytes);
+    SpgGpuCommands *cmd = spg_gpu_commands_create();
+    bool ok = cmd && spg_gpu_record_begin(cmd);
+    if (ok) spg_gpu_copy(cmd, &stage, 0, params, (size_t)(at - params->address), bytes);
+    ok = ok && spg_gpu_record_end(cmd) && spg_gpu_submit(cmd) && spg_gpu_wait(cmd);
+    if (cmd) spg_gpu_commands_free(cmd);
+    spg_gpu_buffer_free(&stage);
+    return ok;
+}
+
 static uint64_t param_put(GCtx *c, const void *data, uint32_t bytes) {
     if (!c->record) {
         c->param += (bytes + 15u) & ~15u;
@@ -1654,7 +1669,11 @@ static bool op_conv(GCtx *c, IrTensor *const *in, IrTensor **out) {
                          (uint32_t)geo.pb[2]);
     }
     const uint64_t geo_at = pointwise ? 0 : param_put(c, table, (uint32_t)(geo_size * sizeof(uint32_t)));
+    /* (now, not with the other parameters when the piece is recorded: the product's tiles are timed as it is recorded, on
+       this geometry; before it was there they read wherever garbage sent them, which faults on lavapipe, and at times on CUDA) */
+    const bool geo_ready = !c->record || pointwise || param_upload(c, geo_at, table, (uint32_t)(geo_size * sizeof(uint32_t)));
     free(table);
+    if (!geo_ready) return false;
     if (!c->record) {
         c->scratch = in_bytes + out_bytes;
         if (cl && half) c->half_out |= 1u, c->half_ins = 1u;
