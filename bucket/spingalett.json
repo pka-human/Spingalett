@@ -7,7 +7,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/pka-human/Spingalett/releases/download/v1.6.1/spingalett-1.6.1-windows-x86_64.zip",
-            "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "hash": "d835a3e493d16f4f183a24f63d1edac85e3dc05c18232ae45ee18d38f7ae9c9d",
             "extract_dir": "spingalett-1.6.1-windows-x86_64"
         }
     },
